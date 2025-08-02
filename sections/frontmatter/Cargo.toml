@@ -1,5 +1,5 @@
 [package]
-name = "comment"
+name = "frontmatter"
 version = "0.1.0"
 edition = "2024"
 
@@ -12,4 +12,5 @@ lazy_static.workspace = true
 regex.workspace = true
 
 common = { path = "../common" }
+
 document = { path = "../../document" }

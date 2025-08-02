@@ -1,22 +1,18 @@
-use std::io::Read;
-
+use document;
 use serde::{Deserialize, Serialize};
 
-use document;
-use lazy_static::lazy_static;
-use thiserror::Error;
+const COMMAND: &str = "/comment";
 
-const PATTERN: &str = "/comment";
-const ARGUMENT_DELIMITER: &str = ";";
-
-lazy_static! {
-    static ref PATTERN_REGEX: regex::Regex = regex::Regex::new(r"^/(\w+)\{([^}]*)\}$").unwrap();
-}
-
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum CommentError {
-    #[error("invalid arguments formation in the comment command")]
-    InvalidArguments,
+    #[error("empty arguments set provided")]
+    EmptyArgument,
+
+    #[error("invalid argument length {0}, expected {1}")]
+    InvalidArgumentLength(usize, usize),
+
+    #[error("invalid argument in comment declaration at argument position {0}: {1}")]
+    InvalidArguments(usize, String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -24,37 +20,30 @@ pub struct CommentV1 {
     parent_id: u64,
     timestamp: u64,
     author: String,
-    body: String,
+    body: Vec<String>,
 }
 
-impl CommentV1 {
-    pub fn try_match<R: Read>(
+impl common::Section for CommentV1 {
+    fn try_match<R: std::io::Read>(
         document: &mut document::DocumentBuffer<R>,
     ) -> anyhow::Result<Option<Self>> {
-        let match_result = document.try_match_command(PATTERN)?;
-        if !match_result {
-            return Ok(None);
-        }
+        let result = document.try_map_command_group(COMMAND, |arguments, body| match arguments {
+            None => Err(CommentError::EmptyArgument),
+            Some(arguments) if arguments.len() != 3 => Err(CommentError::InvalidArgumentLength(
+                arguments.len(),
+                3 as usize,
+            )),
+            Some(arguments) => Ok(Some(CommentV1 {
+                parent_id: u64::from_str_radix(arguments[1], 10)
+                    .map_err(|e| CommentError::InvalidArguments(1, e.to_string()))?,
+                timestamp: u64::from_str_radix(arguments[2], 10)
+                    .map_err(|e| CommentError::InvalidArguments(2, e.to_string()))?,
+                author: arguments[0].to_string(),
+                body: body,
+            })),
+        });
 
-        // extract the first line and parse the arguments
-        let Some(line) = document.try_read_line()? else {
-            return Ok(None);
-        };
-
-        let capture = PATTERN_REGEX
-            .captures(&line)
-            .ok_or(CommentError::InvalidArguments)?;
-
-        let author = capture.get(1).ok_or(CommentError::InvalidArguments)?;
-        let parent_id = capture.get(2).ok_or(CommentError::InvalidArguments)?;
-        let timestamp = capture.get(3).ok_or(CommentError::InvalidArguments)?;
-
-        Ok(Some(Self {
-            parent_id: parent_id.as_str().parse()?,
-            timestamp: timestamp.as_str().parse()?,
-            author: author.as_str().to_string(),
-            body: String::new(),
-        }))
+        Ok(result?)
     }
 }
 
@@ -63,10 +52,12 @@ mod tests {
     use document::DocumentBuffer;
 
     use super::*;
+    use common::Section;
 
     const SAMPLE_COMMENT: &str = r#"
 /comment{@author;12345;12345}
 This is a sample comment.
+Multiline xyz is also supported
 /comment
 "#;
 

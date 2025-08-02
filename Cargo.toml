@@ -5,7 +5,7 @@ edition = "2024"
 
 [workspace]
 resolver = "2"
-members = ["document", "sections/comment"]
+members = ["document", "sections/comment", "sections/common", "sections/frontmatter"]
 
 [workspace.dependencies]
 log = "0.4.27"

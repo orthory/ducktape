@@ -1,4 +1,5 @@
 mod buffer;
+mod variables;
 
 pub use buffer::{DocumentBuffer, DocumentBufferError};
 use thiserror::Error;
