@@ -1,3 +1,7 @@
+mod comment_v1;
+mod frontmatter_v1;
+
+// common
 use std::io::Read;
 
 /// Section is a trait that represents a section of a document.

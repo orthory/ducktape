@@ -1,5 +1,5 @@
 [package]
-name = "comment"
+name = "sections"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,5 +11,4 @@ anyhow.workspace = true
 lazy_static.workspace = true
 regex.workspace = true
 
-common = { path = "../common" }
-document = { path = "../../document" }
+document = { path = "../document" }

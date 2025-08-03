@@ -23,7 +23,7 @@ pub struct CommentV1 {
     body: Vec<String>,
 }
 
-impl common::Section for CommentV1 {
+impl crate::Section for CommentV1 {
     fn try_match<R: std::io::Read>(
         document: &mut document::DocumentBuffer<R>,
     ) -> anyhow::Result<Option<Self>> {

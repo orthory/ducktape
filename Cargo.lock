@@ -18,28 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
 
 [[package]]
-name = "comment"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "common",
- "document",
- "lazy_static",
- "log",
- "regex",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "document",
-]
-
-[[package]]
 name = "document"
 version = "0.1.0"
 dependencies = [
@@ -51,20 +29,6 @@ dependencies = [
 [[package]]
 name = "ducktape"
 version = "0.1.0"
-
-[[package]]
-name = "frontmatter"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "common",
- "document",
- "lazy_static",
- "log",
- "regex",
- "serde",
- "thiserror",
-]
 
 [[package]]
 name = "lazy_static"
@@ -130,6 +94,19 @@ name = "regex-syntax"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
+
+[[package]]
+name = "sections"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "document",
+ "lazy_static",
+ "log",
+ "regex",
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "serde"
