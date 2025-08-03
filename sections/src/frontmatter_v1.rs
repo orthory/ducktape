@@ -32,38 +32,38 @@ impl crate::Section for FrontmatterV1 {
         let result = document.try_map_command_group::<FrontmatterV1, FrontmatterError>(
             COMMAND,
             |_, body| {
-                let mut frontmatter = FrontmatterV1::default();
-
-                body.into_iter()
-                    .map(|line| line.split_once(":").ok_or(FrontmatterError::InvalidData))
-                    .try_for_each(|Ok((key, value))| {
-                        frontmatter.misc.insert(key.to_string(), value.to_string());
-                        Ok(())
-                    });
+                let misc: HashMap<String, String> = body
+                    .into_iter()
+                    .map(|line| {
+                        let (k, v) = line.split_once(":").ok_or(FrontmatterError::InvalidData)?;
+                        Ok((k.to_string(), v.to_string()))
+                    })
+                    .collect::<Result<HashMap<String, String>, FrontmatterError>>()?;
 
                 // promote some key frontmatter-related fields
-                frontmatter.title = frontmatter
-                    .misc
+                let title = misc
                     .get("title")
                     .ok_or(FrontmatterError::MissingData("title"))?
                     .clone();
 
-                frontmatter.author = frontmatter
-                    .misc
+                let author = misc
                     .get("author")
                     .ok_or(FrontmatterError::MissingData("author"))?
                     .clone();
 
-                frontmatter.timestamp = u64::from_str_radix(
-                    frontmatter
-                        .misc
-                        .get("timestamp")
+                let timestamp = u64::from_str_radix(
+                    misc.get("timestamp")
                         .ok_or(FrontmatterError::MissingData("timestamp"))?,
                     10,
                 )
-                .map_err(|e| FrontmatterError::MissingData("timestamp"))?;
+                .map_err(|_| FrontmatterError::Invariant("timestamp"))?;
 
-                Ok(Some(frontmatter))
+                Ok(Some(FrontmatterV1 {
+                    title: title,
+                    author: author,
+                    timestamp: timestamp,
+                    misc: misc,
+                }))
             },
         );
 
