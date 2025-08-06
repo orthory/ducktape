@@ -1,11 +1,4 @@
-mod buffer;
-mod variables;
+mod instance;
+mod sections;
 
-pub use buffer::{DocumentBuffer, DocumentBufferError};
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum DocumentError {
-    #[error("buffer error")]
-    BufferError(#[from] DocumentBufferError),
-}
+pub mod parser;

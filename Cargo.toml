@@ -5,7 +5,7 @@ edition = "2024"
 
 [workspace]
 resolver = "2"
-members = ["document", "sections"]
+members = ["auth", "bin", "doctree", "document", "tracker"]
 
 [workspace.dependencies]
 log = "0.4.27"
@@ -15,3 +15,7 @@ thiserror = "2.0.12"
 anyhow = "1.0.98"
 lazy_static = "1.5.0"
 regex = "1.11.1"
+
+[[bin]]
+name = "ducktape"
+path = "bin/src/main.rs"
