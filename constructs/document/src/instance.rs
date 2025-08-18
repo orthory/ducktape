@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{parser::Parser, sections::Sections};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct DocumentInstance {
+pub struct Document {
     // global body buffer as vector of lines
     body: Vec<String>,
 
@@ -26,7 +26,7 @@ pub enum DocumentInstanceError {
     ParseError(anyhow::Error, usize, String),
 }
 
-impl DocumentInstance {
+impl Document {
     pub fn from_path(path: PathBuf) -> Result<Self, DocumentInstanceError> {
         let file = std::fs::File::options()
             .read(true)
@@ -51,7 +51,7 @@ impl DocumentInstance {
             None => (None, None),
         };
 
-        Ok(DocumentInstance {
+        Ok(Document {
             body,
             sections,
             created_at,

@@ -1,4 +1,3 @@
-use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(thiserror::Error, Debug)]

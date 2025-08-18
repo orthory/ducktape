@@ -1,0 +1,12 @@
+[package]
+name = "doctree"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+sha2.workspace = true
+
+identifier = { path = "../identifier" }

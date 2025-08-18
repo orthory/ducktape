@@ -1,0 +1,13 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+poem.workspace = true
+
+doctree = { path = "../constructs/doctree" }
+document = { path = "../constructs/document" }
+identifier = { path = "../constructs/identifier" }
