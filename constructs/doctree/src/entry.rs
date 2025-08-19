@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use serde::Serialize;
 
 #[derive(thiserror::Error, Debug)]
 pub enum EntryError {
@@ -6,9 +6,9 @@ pub enum EntryError {
     Invariant(anyhow::Error),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 pub enum Entry<Doc> {
     None,
     File(Doc),
-    Directory(Vec<(/*absolute*/ PathBuf, Entry<Doc>)>),
+    Directory(Vec<(/*absolute*/ String, Entry<Doc>)>),
 }

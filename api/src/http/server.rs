@@ -1,29 +1,22 @@
 use std::sync::Arc;
 
-use poem::{
-    EndpointExt, Result, Route, Server, get, handler, listener::TcpListener, middleware::AddData,
-};
-use serde::Serialize;
+use poem::{EndpointExt, Route, Server, get, handler, listener::TcpListener, middleware::AddData};
 
-use crate::services::{DocumentService, Service};
+use crate::services::{DocumentService, get_documents};
 
-pub fn create_server<Document, Header, Comment, Task>(
-    addr: String,
-    service: Service<Document, Header, Comment, Task>,
-) where
-    Document: Serialize + 'static,
-    Header: Serialize + 'static,
-    Comment: Serialize + 'static,
-    Task: Serialize + 'static,
-{
+pub async fn create_server(addr: String, document_service: Arc<DocumentService>) {
     let app = Route::new()
-        .at("path", get(create_document))
-        .with(AddData::new(Arc::new(service)));
+        .at("/settings", get(todo))
+        .at("/new", get(todo))
+        .at("/comments", get(todo))
+        .at("/tasks", get(todo))
+        .at("/", get(get_documents))
+        .with(AddData::new(document_service));
 
-    Server::new(TcpListener::bind(addr)).run(app);
+    Server::new(TcpListener::bind(addr)).run(app).await.unwrap();
 }
 
 #[handler]
-pub fn create_document(svc: Arc) -> Result<()> {
-    Ok(())
+async fn todo() -> String {
+    "todo".to_string()
 }

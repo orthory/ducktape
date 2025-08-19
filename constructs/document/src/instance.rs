@@ -1,4 +1,9 @@
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::Path,
+    time::{self, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,8 +18,23 @@ pub struct Document {
     sections: Vec<Sections>,
 
     // misc data
-    created_at: Option<u64>,
-    updated_at: Option<u64>,
+    created_at: Option<u128>,
+    updated_at: Option<u128>,
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        let now = time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        Self {
+            body: Default::default(),
+            sections: Default::default(),
+            created_at: Some(now),
+            updated_at: Some(now),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -27,7 +47,7 @@ pub enum DocumentInstanceError {
 }
 
 impl Document {
-    pub fn from_path(path: PathBuf) -> Result<Self, DocumentInstanceError> {
+    pub fn from_path(path: &Path) -> Result<Self, DocumentInstanceError> {
         let file = std::fs::File::options()
             .read(true)
             .open(&path)

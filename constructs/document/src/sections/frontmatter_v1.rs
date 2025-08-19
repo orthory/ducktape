@@ -21,8 +21,8 @@ pub struct FrontmatterV1 {
     // required fields
     pub title: String,
     pub author: String,
-    pub created_at: u64,
-    pub updated_at: u64,
+    pub created_at: u128,
+    pub updated_at: u128,
 
     // hashmap for extra fields
     pub misc: HashMap<String, String>,
@@ -53,14 +53,14 @@ impl Section for FrontmatterV1 {
             .ok_or(FrontmatterError::MissingData("author"))?
             .clone();
 
-        let created_at = u64::from_str_radix(
+        let created_at = u128::from_str_radix(
             misc.get("created_at")
                 .ok_or(FrontmatterError::MissingData("created_at"))?,
             10,
         )
         .map_err(|e| FrontmatterError::Invariant(format!("created_at: {}", e.to_string())))?;
 
-        let updated_at = u64::from_str_radix(
+        let updated_at = u128::from_str_radix(
             misc.get("updated_at")
                 .ok_or(FrontmatterError::MissingData("updated_at"))?,
             10,

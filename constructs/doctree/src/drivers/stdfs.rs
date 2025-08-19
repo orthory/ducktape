@@ -1,7 +1,7 @@
 use super::{DriverError, DriverResult};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub fn load(path: &PathBuf) -> Result<DriverResult, DriverError> {
+pub fn load(path: &Path) -> Result<DriverResult, DriverError> {
     // skip if this file starts with "."
     if path
         .iter()
@@ -21,7 +21,7 @@ pub fn load(path: &PathBuf) -> Result<DriverResult, DriverError> {
             .map(|f| Ok(f?.path()))
             .collect::<Result<Vec<PathBuf>, DriverError>>()?;
 
-        return Ok(DriverResult::Directory(path.clone(), descendants));
+        return Ok(DriverResult::Directory(path.into(), descendants));
     }
 
     if path_metadata.is_file() {
@@ -29,7 +29,7 @@ pub fn load(path: &PathBuf) -> Result<DriverResult, DriverError> {
             .read(true)
             .write(true)
             .open(&path)?;
-        return Ok(DriverResult::File(path.clone(), file));
+        return Ok(DriverResult::File(path.into(), file));
     }
 
     // don't handle other cases

@@ -1,6 +1,4 @@
-use std::{fs::File, path::PathBuf};
-
-use identifier::{Identifiable, Identifier};
+use std::{fs::File, path::Path};
 
 use crate::{
     drivers::{DriverError, DriverResult},
@@ -20,102 +18,88 @@ pub enum TreeError {
 
     #[error("TreeError: entry not found: {0}")]
     NotFound(String),
+
+    #[error("TreeError: invalid path segment found: {0}")]
+    InvalidPathSegment(String),
 }
 
 pub struct Tree<Doc> {
-    basedir: PathBuf,
+    basedir: String,
     root: Entry<Doc>,
 }
 
-type Loader = fn(&PathBuf) -> Result<DriverResult, DriverError>;
+type Loader = fn(&Path) -> Result<DriverResult, DriverError>;
 type DocBuild<Doc> = fn(File) -> Result<Doc, anyhow::Error>;
 
-impl<Doc: Default + Identifiable> Tree<Doc> {
+impl<Doc: Default> Tree<Doc> {
     pub fn new(
-        basedir: &PathBuf,
+        basedir: &Path,
         load: Loader,
         doc_builder: DocBuild<Doc>,
     ) -> Result<Self, TreeError> {
+        let basedir_as_string = basedir.to_string_lossy().to_string();
+
         Ok(Self {
-            basedir: basedir.clone(),
-            root: build_in_recursion(basedir, load, doc_builder, 0, 10)?,
+            root: build_in_recursion(&basedir_as_string, load, doc_builder, 0, 10)?,
+            basedir: basedir_as_string,
         })
     }
 
-    pub fn get_document(&self, document_path: PathBuf) {}
+    pub fn basedir(&self) -> String {
+        self.basedir.clone()
+    }
+
+    pub fn get_entries(&self, document_path: String) -> Result<&Entry<Doc>, TreeError> {
+        search_in_recursion(document_path.split("/").collect(), &self.root)
+    }
 
     // create_document creates new document at the root,
     // and returns its identifier
-    pub fn create_document(&mut self) -> Result<Identifier, TreeError> {
+    pub fn create_document(&mut self) -> Result<String, TreeError> {
         let Entry::Directory(root) = &mut self.root else {
             return Err(TreeError::InvalidEntry(
                 "tried to create a new document, but root isn't a directory".to_string(),
             ));
         };
 
-        let temp_path: PathBuf = "/..".into();
+        let temp_path: String = "/tmp".into();
         let temp_doc: Doc = Default::default();
-        let Some(document_id) = temp_doc.identifier() else {
-            return Err(TreeError::InvalidEntry(
-                "tried to create a new document, but got a wrong identifier".to_string(),
-            ));
-        };
         let temp_entry: Entry<Doc> = Entry::File(temp_doc);
 
-        root.push((temp_path, temp_entry));
+        root.push((temp_path.clone(), temp_entry));
 
-        Ok(document_id)
+        Ok(temp_path)
     }
-}
-
-fn search_in_recursion<'app, Doc>(
-    path: &PathBuf,
-    load: Loader,
-    root: &'app Entry<Doc>,
-) -> Result<&'app Entry<Doc>, TreeError> {
-    let mut current = root;
-    for segment in path {
-        match &current {
-            &Entry::Directory(d) => {
-                let matching_descendant = d.iter().find(|(pb, _)| pb.starts_with(segment));
-                match matching_descendant {
-                    Some(matching_descendant) => current = &matching_descendant.1,
-                    None => return Err(TreeError::NotFound(path.to_string_lossy().to_string())),
-                }
-            }
-            &Entry::File(f) => current = &Entry::File(*f),
-            _ => return Err(TreeError::InvalidEntry("???".to_string())),
-        };
-    }
-
-    Ok(current)
 }
 
 pub fn build_in_recursion<Doc>(
-    path: &PathBuf,
+    load_path: &String,
     load: Loader,
     doc_builder: DocBuild<Doc>,
     current_depth: usize,
     max_depth: usize,
 ) -> Result<Entry<Doc>, TreeError> {
-    eprintln!("building tree ({})", path.to_string_lossy().to_string());
-    let load_result = load(path).map_err(|e| TreeError::Invariant(e.into()))?;
+    eprintln!("building tree ({})", &load_path);
+    let load_result = load(Path::new(load_path)).map_err(|e| TreeError::Invariant(e.into()))?;
     let next_entry = match load_result {
+        // todo: what is this?
+        DriverResult::Skip => Entry::None,
         DriverResult::File(_, file) => {
             Entry::File(doc_builder(file).map_err(|e| TreeError::DocBuilder(e))?)
         }
         DriverResult::Directory(_, path_bufs) => {
-            let descendants: Result<Vec<(PathBuf, Entry<Doc>)>, TreeError> = path_bufs
+            let descendants: Result<Vec<(String, Entry<Doc>)>, TreeError> = path_bufs
                 .iter()
                 .map(|descendant_path| {
+                    let desdendant_path_as_string = descendant_path.to_string_lossy().to_string();
                     match build_in_recursion(
-                        descendant_path,
+                        &desdendant_path_as_string,
                         load,
                         doc_builder,
                         current_depth + 1,
                         max_depth,
                     ) {
-                        Ok(entry) => Ok((descendant_path.clone(), entry)),
+                        Ok(entry) => Ok((desdendant_path_as_string, entry)),
                         Err(e) => Err(e),
                     }
                 })
@@ -123,12 +107,38 @@ pub fn build_in_recursion<Doc>(
 
             Entry::Directory(descendants?)
         }
-
-        // todo: what is this?
-        DriverResult::Skip => Entry::None,
     };
 
+    eprintln!("building tree done");
+
     Ok(next_entry)
+}
+
+fn search_in_recursion<'search, Doc>(
+    path_components: Vec<&str>,
+    current: &'search Entry<Doc>,
+) -> Result<&'search Entry<Doc>, TreeError> {
+    match current {
+        Entry::None => return Err(TreeError::InvalidEntry("???".to_string())),
+        Entry::File(_) => Ok(current),
+        Entry::Directory(items) => {
+            let (_, next_current) = items
+                .iter()
+                .find(|(pb, _)| {
+                    dbg!(&pb);
+
+                    pb == path_components[0]
+                })
+                .ok_or_else(|| TreeError::NotFound(path_components.join("/").to_string()))?;
+
+            if path_components.len() == 0 {
+                return Ok(current);
+            }
+
+            let next_path = path_components.into_iter().skip(1).collect();
+            search_in_recursion(next_path, next_current)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,9 +149,34 @@ mod tests {
 
     use super::*;
 
+    fn create_test_doctree() -> Tree<String> {
+        Tree {
+            basedir: "/".into(),
+            root: Entry::Directory(vec![
+                (
+                    "a".into(),
+                    Entry::Directory(vec![(
+                        "aa".into(),
+                        Entry::Directory(vec![("aaa".into(), Entry::File("hello".to_string()))]),
+                    )]),
+                ),
+                (
+                    "b".into(),
+                    Entry::Directory(vec![(
+                        "bb".into(),
+                        Entry::Directory(vec![("bbb".into(), Entry::File("world".to_string()))]),
+                    )]),
+                ),
+            ]),
+        }
+    }
+
     #[test]
     fn build_in_recursion_works() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let docbuilder: DocBuild<String> = |f| {
             let mut res: String = Default::default();
             let mut rb = BufReader::new(f);
@@ -153,5 +188,19 @@ mod tests {
         let yee = build_in_recursion(&cwd, drivers::stdfs::load, docbuilder, 0, 20).unwrap();
 
         dbg!(yee);
+    }
+
+    #[test]
+    fn search_in_recursion_works() {
+        let test_doc_tree = create_test_doctree();
+
+        {
+            // case found
+            let found = search_in_recursion(vec!["a", "aa", "aaa"], &test_doc_tree.root).unwrap();
+            match found {
+                Entry::File(f) => assert_eq!(*f, "hello".to_string()),
+                _ => panic!("expected found"),
+            }
+        }
     }
 }

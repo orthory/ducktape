@@ -12,7 +12,6 @@ members = [
     "constructs/document",
     "api",
     "constructs/tracker",
-    "constructs/identifier",
 ]
 
 [workspace.dependencies]
@@ -30,3 +29,8 @@ rand = "0.9.2"
 [[bin]]
 name = "ducktape"
 path = "bin/src/main.rs"
+
+[dependencies]
+clap = "4.5.45"
+tokio = { version = "1.47.1", features = ["full", "rt"] }
+api = { path = "./api" }
