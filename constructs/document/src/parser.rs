@@ -71,7 +71,6 @@ where
     pub fn try_map_command_group(
         &mut self,
         command: &str,
-        // processor: impl FnOnce(Option<Vec<&str>>, Vec<String>) -> Result<Option<ProcT>, ProcE>,
     ) -> Result<Option<(Option<Vec<String>>, Vec<String>)>, ParserError> {
         // if next line doesn't contain any command, skip
         if !self.try_match_command(command)? {

@@ -2,7 +2,7 @@ use super::{DriverError, DriverResult};
 use std::path::{Path, PathBuf};
 
 pub fn load(path: &Path) -> Result<DriverResult, DriverError> {
-    // skip if this file starts with "."
+    // skip if this file starts with "." (filtering out hidden files)
     if path
         .iter()
         .last()
