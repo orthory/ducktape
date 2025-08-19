@@ -1,9 +1,4 @@
-use std::{
-    fs::File,
-    io::Read,
-    path::Path,
-    time::{self, UNIX_EPOCH},
-};
+use std::{fs::File, io::Read, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,23 +11,13 @@ pub struct Document {
 
     // separate sections
     sections: Vec<Sections>,
-
-    // misc data
-    created_at: Option<u128>,
-    updated_at: Option<u128>,
 }
 
 impl Default for Document {
     fn default() -> Self {
-        let now = time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros();
         Self {
             body: Default::default(),
             sections: Default::default(),
-            created_at: Some(now),
-            updated_at: Some(now),
         }
     }
 }
@@ -61,22 +46,7 @@ impl Document {
         // and parse out all sections.
         let (body, sections) = try_instantiate_document(file)?;
 
-        let timestamps = sections.iter().find_map(|section| match section {
-            Sections::FrontmatterV1(fm) => Some((fm.created_at, fm.updated_at)),
-            _ => None,
-        });
-
-        let (created_at, updated_at) = match timestamps {
-            Some((c, u)) => (Some(c), Some(u)),
-            None => (None, None),
-        };
-
-        Ok(Document {
-            body,
-            sections,
-            created_at,
-            updated_at,
-        })
+        Ok(Document { body, sections })
     }
 
     // todo: from_buffer?
@@ -88,6 +58,9 @@ fn try_instantiate_document<R: Read>(
     // create parser
     let mut parser = Parser::new(reader);
 
+    // create holders for body and section
+    // note that body is really just a vector of string, carrying each line
+    // sections are enum defined by Sections
     let mut body: Vec<String> = Vec::new();
     let mut sections: Vec<Sections> = Vec::new();
 
