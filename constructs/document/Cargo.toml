@@ -7,8 +7,9 @@ edition = "2024"
 thiserror.workspace = true
 lazy_static.workspace = true
 regex.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 
 auth = { path = "../auth" }
 tracker = { path = "../tracker" }
+utils = { path = "../../utils" }

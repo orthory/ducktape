@@ -18,6 +18,7 @@ where
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "snake_case", tag = "@section_type")]
 pub enum Sections {
     FrontmatterV1(crate::sections::frontmatter_v1::FrontmatterV1),
     CommentV1(crate::sections::comment_v1::CommentV1),

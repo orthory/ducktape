@@ -10,7 +10,10 @@ pub async fn create_server(addr: String, document_service: Arc<DocumentService>)
         .at("/new", get(todo))
         .at("/comments", get(todo))
         .at("/tasks", get(todo))
-        .at("/", get(get_documents))
+        .at("/t", get(todo))
+        // documents
+        .at("/documents/*", get(get_documents))
+        .at("/d/*", get(get_documents))
         .with(AddData::new(document_service));
 
     Server::new(TcpListener::bind(addr)).run(app).await.unwrap();

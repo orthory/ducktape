@@ -18,6 +18,7 @@ pub enum CommentError {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct CommentV1 {
     parent_id: u64,
     timestamp: u64,

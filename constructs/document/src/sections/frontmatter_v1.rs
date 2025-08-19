@@ -17,6 +17,7 @@ pub enum FrontmatterError {
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(rename_all = "snake_case")]
 pub struct FrontmatterV1 {
     // required fields
     pub title: String,
@@ -53,19 +54,17 @@ impl Section for FrontmatterV1 {
             .ok_or(FrontmatterError::MissingData("author"))?
             .clone();
 
-        let created_at = u128::from_str_radix(
-            misc.get("created_at")
-                .ok_or(FrontmatterError::MissingData("created_at"))?,
-            10,
-        )
-        .map_err(|e| FrontmatterError::Invariant(format!("created_at: {}", e.to_string())))?;
+        let now = utils::time::now_string();
 
-        let updated_at = u128::from_str_radix(
-            misc.get("updated_at")
-                .ok_or(FrontmatterError::MissingData("updated_at"))?,
-            10,
-        )
-        .map_err(|e| FrontmatterError::Invariant(format!("updated_at: {}", e.to_string())))?;
+        let created_at = u128::from_str_radix(misc.get("created_at").unwrap_or_else(|| &now), 10)
+            .map_err(|e| {
+            FrontmatterError::Invariant(format!("created_at: {}", e.to_string()))
+        })?;
+
+        let updated_at = u128::from_str_radix(misc.get("updated_at").unwrap_or_else(|| &now), 10)
+            .map_err(|e| {
+            FrontmatterError::Invariant(format!("updated_at: {}", e.to_string()))
+        })?;
 
         Ok(Some(FrontmatterV1 {
             title: title,

@@ -40,7 +40,14 @@ impl<Doc: Default> Tree<Doc> {
         let basedir_as_string = basedir.to_string_lossy().to_string();
 
         Ok(Self {
-            root: build_in_recursion(&basedir_as_string, load, doc_builder, 0, 10)?,
+            root: build_in_recursion(
+                &basedir_as_string,
+                &basedir_as_string,
+                load,
+                doc_builder,
+                0,
+                10,
+            )?,
             basedir: basedir_as_string,
         })
     }
@@ -50,7 +57,13 @@ impl<Doc: Default> Tree<Doc> {
     }
 
     pub fn get_entries(&self, document_path: String) -> Result<&Entry<Doc>, TreeError> {
-        search_in_recursion(document_path.split("/").collect(), &self.root)
+        search_in_recursion(
+            document_path
+                .split("/")
+                .filter(|seg| !seg.is_empty())
+                .collect(),
+            &self.root,
+        )
     }
 
     // create_document creates new document at the root,
@@ -72,14 +85,14 @@ impl<Doc: Default> Tree<Doc> {
     }
 }
 
-pub fn build_in_recursion<Doc>(
+fn build_in_recursion<'build, Doc>(
+    base_path: &String,
     load_path: &String,
     load: Loader,
     doc_builder: DocBuild<Doc>,
     current_depth: usize,
     max_depth: usize,
 ) -> Result<Entry<Doc>, TreeError> {
-    eprintln!("building tree ({})", &load_path);
     let load_result = load(Path::new(load_path)).map_err(|e| TreeError::Invariant(e.into()))?;
     let next_entry = match load_result {
         // todo: what is this?
@@ -91,15 +104,29 @@ pub fn build_in_recursion<Doc>(
             let descendants: Result<Vec<(String, Entry<Doc>)>, TreeError> = path_bufs
                 .iter()
                 .map(|descendant_path| {
-                    let desdendant_path_as_string = descendant_path.to_string_lossy().to_string();
+                    // in case of directory, recursively all the way to children
+                    // while adjusting base_dir to the current path
+                    let descendant_path_as_string = descendant_path.to_string_lossy().to_string();
                     match build_in_recursion(
-                        &desdendant_path_as_string,
+                        base_path,
+                        &descendant_path_as_string,
                         load,
                         doc_builder,
                         current_depth + 1,
                         max_depth,
                     ) {
-                        Ok(entry) => Ok((desdendant_path_as_string, entry)),
+                        Ok(entry) => {
+                            let relative_path: Vec<&str> = Path::new(&descendant_path_as_string)
+                                .strip_prefix(base_path)
+                                .map_err(|e| TreeError::InvalidPathSegment(e.to_string()))?
+                                .iter()
+                                .map(|x| x.to_str().unwrap())
+                                .collect();
+
+                            let first_segment = relative_path[relative_path.len() - 1];
+
+                            Ok((first_segment.to_string(), entry))
+                        }
                         Err(e) => Err(e),
                     }
                 })
@@ -118,24 +145,20 @@ fn search_in_recursion<'search, Doc>(
     path_components: Vec<&str>,
     current: &'search Entry<Doc>,
 ) -> Result<&'search Entry<Doc>, TreeError> {
+    dbg!(&path_components);
     match current {
         Entry::None => return Err(TreeError::InvalidEntry("???".to_string())),
         Entry::File(_) => Ok(current),
         Entry::Directory(items) => {
             let (_, next_current) = items
                 .iter()
-                .find(|(pb, _)| {
-                    dbg!(&pb);
-
-                    pb == path_components[0]
-                })
+                .find(|(pb, _)| pb == path_components[0])
                 .ok_or_else(|| TreeError::NotFound(path_components.join("/").to_string()))?;
 
-            if path_components.len() == 0 {
-                return Ok(current);
+            let next_path: Vec<&str> = path_components.into_iter().skip(1).collect();
+            if next_path.len() == 0 {
+                return Ok(next_current);
             }
-
-            let next_path = path_components.into_iter().skip(1).collect();
             search_in_recursion(next_path, next_current)
         }
     }

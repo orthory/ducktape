@@ -8,7 +8,7 @@ use doctree::Entry;
 use document::Document;
 use poem::{
     Result, handler,
-    web::{Data, Json},
+    web::{Data, Json, Path},
 };
 
 pub struct DocumentService {
@@ -20,7 +20,7 @@ impl DocumentService {
         let next_doctree = doctree::Tree::<document::Document>::new(
             &PathBuf::from(basedir),
             |l| doctree::stdfs::load(l),
-            |f| document::Document::from_file(f).map_err(|e| anyhow::Error::from(e)),
+            |f| document::Document::from_file(f).map_err(anyhow::Error::from),
         )
         .unwrap();
 
@@ -32,11 +32,12 @@ impl DocumentService {
 
 #[handler]
 pub async fn get_documents(
+    Path(document_path): Path<String>,
     Data(docsvc): Data<&Arc<DocumentService>>,
 ) -> Result<Json<Entry<Document>>> {
     let doctree = docsvc.doctree.read().unwrap();
     let result = doctree
-        .get_entries("/a/aa".into())
+        .get_entries(document_path)
         .map_err(poem::error::InternalServerError)?;
 
     Ok(Json(result.clone()))

@@ -11,7 +11,7 @@ members = [
     "constructs/doctree",
     "constructs/document",
     "api",
-    "constructs/tracker",
+    "constructs/tracker", "utils",
 ]
 
 [workspace.dependencies]
