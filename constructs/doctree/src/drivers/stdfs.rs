@@ -35,3 +35,7 @@ pub fn load(path: &Path) -> Result<DriverResult, DriverError> {
     // don't handle other cases
     return Err(DriverError::Unreachable);
 }
+
+pub fn write(path: &Path) -> Result<DriverResult, DriverError> {
+    todo!()
+}

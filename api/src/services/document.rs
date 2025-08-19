@@ -19,8 +19,9 @@ impl DocumentService {
     pub fn new(basedir: String) -> Self {
         let next_doctree = doctree::Tree::<document::Document>::new(
             &PathBuf::from(basedir),
-            |l| doctree::stdfs::load(l),
             |f| document::Document::from_file(f).map_err(anyhow::Error::from),
+            |l| doctree::stdfs::load(l),
+            |w| doctree::stdfs::write(w),
         )
         .unwrap();
 

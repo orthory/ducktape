@@ -26,16 +26,21 @@ pub enum TreeError {
 pub struct Tree<Doc> {
     basedir: String,
     root: Entry<Doc>,
+
+    loader: Loader,
+    writer: Writer,
 }
 
 type Loader = fn(&Path) -> Result<DriverResult, DriverError>;
+type Writer = fn(&Path) -> Result<DriverResult, DriverError>;
 type DocBuild<Doc> = fn(File) -> Result<Doc, anyhow::Error>;
 
 impl<Doc: Default> Tree<Doc> {
     pub fn new(
         basedir: &Path,
-        load: Loader,
         doc_builder: DocBuild<Doc>,
+        loader: Loader,
+        writer: Writer,
     ) -> Result<Self, TreeError> {
         let basedir_as_string = basedir.to_string_lossy().to_string();
 
@@ -43,12 +48,14 @@ impl<Doc: Default> Tree<Doc> {
             root: build_in_recursion(
                 &basedir_as_string,
                 &basedir_as_string,
-                load,
+                loader,
                 doc_builder,
                 0,
                 10,
             )?,
             basedir: basedir_as_string,
+            loader,
+            writer,
         })
     }
 
