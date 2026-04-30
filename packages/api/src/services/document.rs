@@ -17,7 +17,7 @@ impl DocumentService {
         let driver = Stdfs;
         let basedir = PathBuf::from(basedir);
         let working = Arc::new(WorkingTree::from_persisted(&driver, &basedir).unwrap());
-        let persister = Persister::new(working.clone(), driver, basedir);
+        let persister = Persister::new(driver, basedir);
         DocumentService { persister, working }
     }
 }
@@ -41,7 +41,7 @@ pub async fn create_document(
 ) -> Result<Json<Identifier>> {
     let path = docsvc
         .persister
-        .create_document()
+        .create_document(&docsvc.working)
         .map_err(poem::error::InternalServerError)?;
 
     Ok(Json(Identifier::Document(path)))
