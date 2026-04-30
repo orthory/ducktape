@@ -44,24 +44,21 @@ impl Section for TaskV1 {
             return Ok(None);
         };
 
-        let args = matched.args.ok_or(TaskError::InvalidData)?;
+        let mut it = matched.args.ok_or(TaskError::InvalidData)?.into_iter();
 
-        let author_raw = args.get(0).ok_or(TaskError::MissingData("author"))?;
-        let title = args.get(1).ok_or(TaskError::MissingData("title"))?.clone();
-        let status_raw = args.get(2).ok_or(TaskError::MissingData("status"))?;
-
-        let author = auth::User::from_str(author_raw);
-        let status = TaskV1Status::from_argument(status_raw)?;
-        let start_at = parse_optional_u64(args.get(3), "start_at")?;
-        let end_at = parse_optional_u64(args.get(4), "end_at")?;
-
-        // Bounds-safe assignees slice — empty when args.len() <= 5.
-        let assignees: Vec<auth::User> = args
-            .get(5..)
-            .unwrap_or(&[])
-            .iter()
-            .map(|a| auth::User::from_str(a.as_str()))
-            .collect();
+        let author = auth::User::from_str(&it.next().ok_or(TaskError::MissingData("author"))?);
+        let title = it.next().ok_or(TaskError::MissingData("title"))?;
+        let status =
+            TaskV1Status::from_argument(&it.next().ok_or(TaskError::MissingData("status"))?)?;
+        let start_at = match it.next() {
+            Some(s) => parse_u64(&s, "start_at")?,
+            None => 0,
+        };
+        let end_at = match it.next() {
+            Some(s) => parse_u64(&s, "end_at")?,
+            None => 0,
+        };
+        let assignees: Vec<auth::User> = it.map(|a| auth::User::from_str(&a)).collect();
 
         Ok(Some(TaskV1 {
             title,
@@ -75,14 +72,12 @@ impl Section for TaskV1 {
     }
 }
 
-fn parse_optional_u64(value: Option<&String>, field: &'static str) -> Result<u64, TaskError> {
-    match value {
-        None => Ok(0),
-        Some(s) if s.is_empty() => Ok(0),
-        Some(s) => s
-            .parse::<u64>()
-            .map_err(|e| TaskError::InvalidArgument(field, e.to_string())),
+fn parse_u64(s: &str, field: &'static str) -> Result<u64, TaskError> {
+    if s.is_empty() {
+        return Ok(0);
     }
+    s.parse::<u64>()
+        .map_err(|e| TaskError::InvalidArgument(field, e.to_string()))
 }
 
 /// TaskV1Status

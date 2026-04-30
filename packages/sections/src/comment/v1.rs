@@ -33,22 +33,26 @@ impl Section for CommentV1 {
         };
 
         let args = matched.args.ok_or(CommentError::EmptyArgument)?;
-        if args.len() != 3 {
-            return Err(CommentError::InvalidArgumentLength(
-                args.join(";"),
-                args.len(),
-                3,
-            )
-            .into());
-        }
+        let joined = args.join(";");
+        let joined_comma = args.join(",");
+        let len = args.len();
+        let mut it = args.into_iter();
+        let too_short = || CommentError::InvalidArgumentLength(joined.clone(), len, 3);
 
-        let author = args[0].clone();
-        let parent_id = args[1]
+        let author = it.next().ok_or_else(too_short)?;
+        let parent_id = it
+            .next()
+            .ok_or_else(too_short)?
             .parse::<u64>()
-            .map_err(|e| CommentError::InvalidArguments(args.join(","), 1, e.to_string()))?;
-        let timestamp = args[2]
+            .map_err(|e| CommentError::InvalidArguments(joined_comma.clone(), 1, e.to_string()))?;
+        let timestamp = it
+            .next()
+            .ok_or_else(too_short)?
             .parse::<u64>()
-            .map_err(|e| CommentError::InvalidArguments(args.join(","), 2, e.to_string()))?;
+            .map_err(|e| CommentError::InvalidArguments(joined_comma, 2, e.to_string()))?;
+        if it.next().is_some() {
+            return Err(CommentError::InvalidArgumentLength(joined, len, 3).into());
+        }
 
         Ok(Some(CommentV1 {
             parent_id,
