@@ -22,8 +22,8 @@ pub struct FrontmatterV1 {
     // required fields
     pub title: String,
     pub author: String,
-    pub created_at: u128,
-    pub updated_at: u128,
+    pub created_at: u64,
+    pub updated_at: u64,
 
     // hashmap for extra fields
     pub misc: HashMap<String, String>,
@@ -56,15 +56,15 @@ impl Section for FrontmatterV1 {
 
         let now = utils::time::now_string();
 
-        let created_at = u128::from_str_radix(misc.get("created_at").unwrap_or_else(|| &now), 10)
+        let created_at = u64::from_str_radix(misc.get("created_at").unwrap_or_else(|| &now), 10)
             .map_err(|e| {
-            FrontmatterError::Invariant(format!("created_at: {}", e.to_string()))
-        })?;
+                FrontmatterError::Invariant(format!("created_at: {}", e.to_string()))
+            })?;
 
-        let updated_at = u128::from_str_radix(misc.get("updated_at").unwrap_or_else(|| &now), 10)
+        let updated_at = u64::from_str_radix(misc.get("updated_at").unwrap_or_else(|| &now), 10)
             .map_err(|e| {
-            FrontmatterError::Invariant(format!("updated_at: {}", e.to_string()))
-        })?;
+                FrontmatterError::Invariant(format!("updated_at: {}", e.to_string()))
+            })?;
 
         Ok(Some(FrontmatterV1 {
             title: title,
