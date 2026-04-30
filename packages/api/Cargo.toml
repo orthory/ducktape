@@ -9,5 +9,4 @@ anyhow.workspace = true
 poem.workspace = true
 
 doctree = { path = "../doctree" }
-driver = { path = "../driver" }
 document = { path = "../document" }

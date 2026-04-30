@@ -9,4 +9,3 @@ thiserror.workspace = true
 anyhow.workspace = true
 
 document = { path = "../document" }
-driver = { path = "../driver" }

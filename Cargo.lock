@@ -89,7 +89,6 @@ dependencies = [
  "anyhow",
  "doctree",
  "document",
- "driver",
  "poem",
  "serde",
 ]
@@ -244,7 +243,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "document",
- "driver",
  "serde",
  "thiserror",
 ]
@@ -256,14 +254,6 @@ dependencies = [
  "anyhow",
  "sections",
  "serde",
- "thiserror",
-]
-
-[[package]]
-name = "driver"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "thiserror",
 ]
 

@@ -1,14 +1,15 @@
 use std::{path::Path, sync::Arc};
 
 use document::Document;
-use driver::{Driver, DriverResult};
 
-use crate::{Entry, Tree, TreeError};
+use crate::{
+    Entry, Tree, TreeError,
+    drivers::{Driver, DriverResult},
+};
 
 /// Builds a `Tree` by recursively loading from `driver`, starting at
-/// `basedir`. The bridge between the storage layer (Driver) and the
-/// in-memory tree — both `Tree` (here) and `Driver` (in driver crate) stay
-/// independent; this function is the only place they meet.
+/// `basedir`. The bridge between the storage primitives (the `drivers`
+/// module) and the in-memory tree.
 pub fn build_tree(driver: &dyn Driver, basedir: &Path) -> Result<Tree, TreeError> {
     let basedir_as_string = basedir.to_string_lossy().to_string();
     let root = build_in_recursion(driver, &basedir_as_string, &basedir_as_string, 0, 10)?;
@@ -64,7 +65,7 @@ fn build_in_recursion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use driver::Vfs;
+    use crate::Vfs;
 
     #[test]
     fn build_tree_walks_vfs_fixture() {
