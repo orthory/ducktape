@@ -1,6 +1,7 @@
 use crate::{Section, parser::Parser};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use uid::{Identify, Uid, UidError};
 
 const COMMAND: &str = "---";
 
@@ -19,12 +20,17 @@ pub enum FrontmatterError {
     Invariant(String),
 }
 
-// Frontmatter is intrinsic to its parent Document and shares the document's
-// identity — no separate uid lives here. See `document::Document` for the uid
-// that covers the document (and therefore the frontmatter).
+// Frontmatter holds the document's identity — Document::uid() looks up the
+// frontmatter section and returns its uid. There's only ever one Frontmatter
+// per Document, so this is also the document's uid. Like every other section,
+// the server never mints; the uid arrives from the creator.
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct FrontmatterV1 {
+    // Document-level uid (frontmatter's uid IS the document's uid).
+    // Until the v2 on-disk format encodes it, parsing leaves this nil.
+    pub uid: Uid,
+
     // required fields
     pub title: String,
     pub author: String,
@@ -35,6 +41,16 @@ pub struct FrontmatterV1 {
 
     // hashmap for extra fields (excludes the promoted keys above)
     pub misc: HashMap<String, String>,
+}
+
+impl Identify for FrontmatterV1 {
+    fn try_uid(&self) -> Result<Uid, UidError> {
+        if self.uid.is_nil() {
+            Err(UidError::Unassigned)
+        } else {
+            Ok(self.uid)
+        }
+    }
 }
 
 impl Section for FrontmatterV1 {
@@ -65,6 +81,8 @@ impl Section for FrontmatterV1 {
         let misc = fields;
 
         Ok(Some(FrontmatterV1 {
+            // nil until v2 markdown format carries the uid in frontmatter
+            uid: Uid::default(),
             title,
             author,
             created_at,

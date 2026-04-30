@@ -1,6 +1,6 @@
 use crate::{Section, parser::Parser};
 use serde::{Deserialize, Serialize};
-use uid::{Identify, Uid};
+use uid::{Identify, Uid, UidError};
 
 const COMMAND: &str = "/comment.v1";
 
@@ -32,8 +32,12 @@ pub struct CommentV1 {
 }
 
 impl Identify for CommentV1 {
-    fn uid(&self) -> Uid {
-        self.uid
+    fn try_uid(&self) -> Result<Uid, UidError> {
+        if self.uid.is_nil() {
+            Err(UidError::Unassigned)
+        } else {
+            Ok(self.uid)
+        }
     }
 }
 

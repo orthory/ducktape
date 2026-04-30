@@ -3,16 +3,10 @@ use std::{collections::HashMap, io::Read, path::Path};
 use serde::{Deserialize, Serialize};
 
 use sections::{Sections, parser::Parser};
-use uid::{Identify, Uid};
+use uid::{Identify, Uid, UidError};
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Default, Deserialize, Serialize, Debug, Clone)]
 pub struct Document {
-    // Stable identity for the whole document. Frontmatter does NOT carry its
-    // own uid — it's intrinsic to the document and shares this one. Server
-    // never mints; documents fly in pre-uid'd. Parsing legacy on-disk format
-    // leaves this as the nil uuid until a v2 format encodes it.
-    pub(crate) uid: Uid,
-
     // global body buffer as vector of lines
     pub(crate) body: Vec<String>,
 
@@ -21,22 +15,21 @@ pub struct Document {
 
     // unordered map of sections for tracking individually;
     // must be in sync with sections.
-    pub(crate) sections_map: HashMap<Uid, Sections>
+    pub(crate) sections_map: HashMap<Uid, Sections>,
 }
 
-impl Default for Document {
-    fn default() -> Self {
-        Self {
-            uid: Uid::now_v7(),
-            body: Default::default(),
-            sections: Default::default(),
-        }
-    }
-}
-
+// The document's identity lives on its Frontmatter section — there's only ever
+// one. A document with no frontmatter (or one whose frontmatter uid is itself
+// unassigned) returns `Err(UidError::Unassigned)`.
 impl Identify for Document {
-    fn uid(&self) -> Uid {
-        self.uid
+    fn try_uid(&self) -> Result<Uid, UidError> {
+        self.sections
+            .iter()
+            .find_map(|s| match s {
+                Sections::Frontmatter(fm) => Some(fm.try_uid()),
+                _ => None,
+            })
+            .unwrap_or(Err(UidError::Unassigned))
     }
 }
 
@@ -61,12 +54,18 @@ impl Document {
 
     pub fn from_reader<R: Read>(reader: R) -> Result<Self, DocumentInstanceError> {
         let (body, sections) = try_instantiate_document(reader)?;
+        // Sections without an assigned uid (e.g. parsed from the legacy v1 on-disk
+        // format that doesn't carry uids) are left out of the index. They still
+        // live in `sections` and become indexable once their uid is assigned.
+        let sections_map = sections
+            .iter()
+            .filter_map(|s| s.try_uid().ok().map(|uid| (uid, s.clone())))
+            .collect::<HashMap<_, _>>();
 
         Ok(Document {
-            // nil until v2 on-disk format carries the document uid
-            uid: Uid::default(),
             body,
             sections,
+            sections_map,
         })
     }
 }

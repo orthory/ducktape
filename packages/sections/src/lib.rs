@@ -6,6 +6,7 @@ pub mod task;
 pub use comment::{CommentError, CommentLatest, CommentV1};
 pub use frontmatter::{FrontmatterError, FrontmatterLatest, FrontmatterV1};
 pub use task::{TaskError, TaskLatest, TaskV1, TaskV1Status};
+use uid::Identify;
 
 use std::io::Read;
 
@@ -13,10 +14,9 @@ use serde::{Deserialize, Serialize};
 
 /// Section is a trait that represents a section of a document.
 ///
-/// All sections must implement the `Section` trait. Identity (`uid::Identify`)
-/// is implemented on the section types that need it — Comment, Task — but NOT
-/// on Frontmatter, which is intrinsic to the parent document and shares the
-/// document's uid.
+/// All sections also implement [`uid::Identify`] (via `try_uid`) so consumers
+/// can ask any section for its identity. Frontmatter holds the document's uid
+/// — `Document::try_uid()` delegates to the frontmatter section.
 pub trait Section
 where
     Self: Sized,
@@ -34,6 +34,16 @@ pub enum Sections {
     Frontmatter(FrontmatterLatest),
     Comment(CommentLatest),
     Task(TaskLatest),
+}
+
+impl Identify for Sections {
+    fn try_uid(&self) -> Result<uid::Uid, uid::UidError> {
+        match self {
+            Sections::Frontmatter(s) => s.try_uid(),
+            Sections::Comment(s) => s.try_uid(),
+            Sections::Task(s) => s.try_uid(),
+        }
+    }
 }
 
 impl Sections {
