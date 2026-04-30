@@ -50,14 +50,14 @@ impl Document {
     /// Yields parsed sections one at a time, cloned, in document order. Pair with an
     /// fs driver or similar when a streamed read is preferable to materializing the
     /// whole vector.
-    pub fn read(&self) -> impl Iterator<Item = Sections> + '_ {
+    pub fn sections_iter(&self) -> impl Iterator<Item = Sections> + '_ {
         self.sections.iter().cloned()
     }
-
+ 
     /// Returns every parsed section in document order, cloned. This is the bulk
     /// "structured view" of the document — the primary entry point for consumers
     /// that want all sections at once before subscribing to incremental updates.
-    pub fn structured(&self) -> Vec<Sections> {
+    pub fn sections(&self) -> Vec<Sections> {
         self.sections.clone()
     }
 }
@@ -165,8 +165,8 @@ hello
 
         let doc = Document::from_reader(sample_document.as_bytes())?;
 
-        let bulk = doc.structured();
-        let streamed: Vec<_> = doc.read().collect();
+        let bulk = doc.sections();
+        let streamed: Vec<_> = doc.sections_iter().collect();
 
         assert_eq!(bulk.len(), 2);
         assert_eq!(streamed.len(), bulk.len());
