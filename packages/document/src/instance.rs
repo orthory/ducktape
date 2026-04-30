@@ -7,10 +7,10 @@ use sections::{Sections, parser::Parser};
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Document {
     // global body buffer as vector of lines
-    body: Vec<String>,
+    pub(crate) body: Vec<String>,
 
     // separate sections
-    sections: Vec<Sections>,
+    pub(crate) sections: Vec<Sections>,
 }
 
 impl Default for Document {
@@ -45,20 +45,6 @@ impl Document {
         let (body, sections) = try_instantiate_document(reader)?;
 
         Ok(Document { body, sections })
-    }
-
-    /// Yields parsed sections one at a time, cloned, in document order. Pair with an
-    /// fs driver or similar when a streamed read is preferable to materializing the
-    /// whole vector.
-    pub fn sections_iter(&self) -> impl Iterator<Item = Sections> + '_ {
-        self.sections.iter().cloned()
-    }
- 
-    /// Returns every parsed section in document order, cloned. This is the bulk
-    /// "structured view" of the document — the primary entry point for consumers
-    /// that want all sections at once before subscribing to incremental updates.
-    pub fn sections(&self) -> Vec<Sections> {
-        self.sections.clone()
     }
 }
 
