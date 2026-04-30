@@ -12,7 +12,6 @@ members = [
     "packages/document",
     "packages/sections",
     "packages/api",
-    "packages/tracker",
     "utils",
 ]
 
