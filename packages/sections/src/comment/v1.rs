@@ -1,5 +1,6 @@
 use crate::{Section, parser::Parser};
 use serde::{Deserialize, Serialize};
+use uid::{Identify, Uid};
 
 const COMMAND: &str = "/comment.v1";
 
@@ -20,10 +21,20 @@ pub enum CommentError {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct CommentV1 {
+    // Stable identity assigned by the creator (client / CRDT). Server never
+    // mints — sections fly in pre-uid'd. Until the on-disk v2 format carries
+    // the uid in args, parsing the v1 markdown leaves this as the nil uuid.
+    uid: Uid,
     parent_id: u64,
     timestamp: u64,
     author: String,
     body: Vec<String>,
+}
+
+impl Identify for CommentV1 {
+    fn uid(&self) -> Uid {
+        self.uid
+    }
 }
 
 impl Section for CommentV1 {
@@ -55,6 +66,8 @@ impl Section for CommentV1 {
         }
 
         Ok(Some(CommentV1 {
+            // nil until v2 markdown format carries the uid in args
+            uid: Uid::default(),
             parent_id,
             timestamp,
             author,

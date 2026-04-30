@@ -11,4 +11,5 @@ serde = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 
 auth = { path = "../auth" }
+uid = { path = "../uid" }
 utils = { path = "../../utils" }

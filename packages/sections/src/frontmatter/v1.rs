@@ -19,6 +19,9 @@ pub enum FrontmatterError {
     Invariant(String),
 }
 
+// Frontmatter is intrinsic to its parent Document and shares the document's
+// identity — no separate uid lives here. See `document::Document` for the uid
+// that covers the document (and therefore the frontmatter).
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct FrontmatterV1 {

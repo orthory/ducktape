@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use crate::{Section, parser::Parser};
 use serde::{Deserialize, Serialize};
+use uid::{Identify, Uid};
 
 const COMMAND: &str = "/task.v1";
 
@@ -29,6 +30,10 @@ pub enum TaskError {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TaskV1 {
+    // Stable identity assigned by the creator (client / CRDT). Server never
+    // mints — sections fly in pre-uid'd. Until the on-disk v2 format carries
+    // the uid in args, parsing the v1 markdown leaves this as the nil uuid.
+    pub uid: Uid,
     pub title: String,
     pub body: Vec<String>,
     pub author: auth::User,
@@ -36,6 +41,12 @@ pub struct TaskV1 {
     pub start_at: u64,
     pub end_at: u64,
     pub status: TaskV1Status,
+}
+
+impl Identify for TaskV1 {
+    fn uid(&self) -> Uid {
+        self.uid
+    }
 }
 
 impl Section for TaskV1 {
@@ -61,6 +72,8 @@ impl Section for TaskV1 {
         let assignees: Vec<auth::User> = it.map(|a| auth::User::from_str(&a)).collect();
 
         Ok(Some(TaskV1 {
+            // nil until v2 markdown format carries the uid in args
+            uid: Uid::default(),
             title,
             author,
             assignees,

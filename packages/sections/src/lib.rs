@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 
 /// Section is a trait that represents a section of a document.
 ///
-/// All sections must implement the `Section` trait.
+/// All sections must implement the `Section` trait. Identity (`uid::Identify`)
+/// is implemented on the section types that need it — Comment, Task — but NOT
+/// on Frontmatter, which is intrinsic to the parent document and shares the
+/// document's uid.
 pub trait Section
 where
     Self: Sized,
