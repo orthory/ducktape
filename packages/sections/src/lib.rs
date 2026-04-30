@@ -31,7 +31,6 @@ pub enum Sections {
     TaskV1(crate::task_v1::TaskV1),
 }
 
-// todo: move tehse to instance.rs?
 macro_rules! try_all_sections {
     ($parser:expr, $($variant:ident => $type:ty),* $(,)?) => {
         $(
