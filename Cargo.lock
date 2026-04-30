@@ -245,6 +245,7 @@ dependencies = [
  "document",
  "serde",
  "thiserror",
+ "utils",
 ]
 
 [[package]]

@@ -56,12 +56,15 @@ impl Tree {
         )
     }
 
-    // Returns a new `Tree` containing the new document, plus its identifier.
+    // Returns a new `Tree` with `path` registered as a child of the root.
     // Takes `&self` rather than `&mut self`: the caller owns the version-swap,
     // and concurrent readers continue to see the previous snapshot until the
     // swap is published. Cost is O(direct_root_children) — only the root Vec
     // is reallocated; sibling subtrees are ref-bumped, not copied.
-    pub fn create_document(&self) -> Result<(Self, String), TreeError> {
+    //
+    // The path here is the basename used as the lookup key (matches the
+    // convention used at each level: entries are keyed by basename).
+    pub fn with_new_document(&self, path: String) -> Result<Self, TreeError> {
         // Bump the refcount on the existing root, then `Arc::make_mut` clones
         // it (because `self` still holds a reference, count is >1). The clone
         // is shallow: the Vec is freshly allocated, but each child `Arc<Entry>`
@@ -72,23 +75,16 @@ impl Tree {
 
         let Entry::Directory(items) = next_root else {
             return Err(TreeError::InvalidEntry(
-                "tried to create a new document, but root isn't a directory".to_string(),
+                "tried to add a document, but root isn't a directory".to_string(),
             ));
         };
 
-        let temp_path: String = "/tmp".into();
-        items.push((
-            temp_path.clone(),
-            Arc::new(Entry::File(Document::default())),
-        ));
+        items.push((path, Arc::new(Entry::File(Document::default()))));
 
-        Ok((
-            Self {
-                basedir: self.basedir.clone(),
-                root: next_root_arc,
-            },
-            temp_path,
-        ))
+        Ok(Self {
+            basedir: self.basedir.clone(),
+            root: next_root_arc,
+        })
     }
 }
 
@@ -155,13 +151,12 @@ mod tests {
     }
 
     #[test]
-    fn create_document_returns_new_version_without_mutating_original() {
+    fn with_new_document_returns_new_version_without_mutating_original() {
         let original = create_test_doctree();
         let original_root_ptr = Arc::as_ptr(&original.root);
 
-        let (next, path) = original.create_document().unwrap();
+        let next = original.with_new_document("c.md".into()).unwrap();
 
-        assert_eq!(path, "/tmp");
         assert_eq!(Arc::as_ptr(&original.root), original_root_ptr);
         assert!(!Arc::ptr_eq(&original.root, &next.root));
 
@@ -172,5 +167,9 @@ mod tests {
             panic!("next root should be a Directory");
         };
         assert_eq!(orig_items.len() + 1, next_items.len());
+
+        // The new doc is reachable by the basename it was added under.
+        let found = next.get_entries("c.md".into()).unwrap();
+        assert!(matches!(found, Entry::File(_)));
     }
 }

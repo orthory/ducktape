@@ -1,9 +1,12 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, RwLock},
 };
 
-use crate::{Entry, Tree, TreeError, build_tree, drivers::Driver};
+use crate::{
+    Entry, Tree, TreeError, build_tree,
+    drivers::{Driver, DriverError},
+};
 
 /// `PersistedTree` is the persistence-aware wrapper around an in-memory
 /// `Tree`. It owns both the tree and the driver, and holds them behind their
@@ -24,6 +27,9 @@ pub struct PersistedTree {
 pub enum PersistedTreeError {
     #[error("PersistedTreeError: {0}")]
     Tree(#[from] TreeError),
+
+    #[error("PersistedTreeError: {0}")]
+    Driver(#[from] DriverError),
 
     #[error("PersistedTreeError: {0}")]
     Lock(String),
@@ -55,26 +61,32 @@ impl PersistedTree {
         Ok(entry.clone())
     }
 
-    /// Produces a new tree version with a fresh document and swaps it into
-    /// place. Driver write-through is not yet wired here — it'll plug in
-    /// once the Document → bytes serialization path lands. The locking
-    /// dance is in place so the wiring is a one-line addition.
+    /// Mints a new document, persists an empty buffer for it via the driver,
+    /// and swaps in a tree version that includes the new entry. Returns the
+    /// generated identifier (a basename within the tree's basedir).
+    ///
+    /// Order: write to driver first, then swap the tree. If the write fails,
+    /// the in-memory tree stays consistent with disk; if the swap somehow
+    /// failed afterwards, disk would be ahead but readers would converge on
+    /// the next reload. Never the other direction.
     pub fn create_document(&self) -> Result<String, PersistedTreeError> {
+        let basename = format!("untitled-{}.md", utils::time::now_micros());
+
         let mut tree_guard = self
             .tree
             .write()
             .map_err(|e| PersistedTreeError::Lock(e.to_string()))?;
-        let (next, path) = tree_guard.create_document()?;
+        let absolute_path = PathBuf::from(tree_guard.basedir()).join(&basename);
 
-        // Reserved spot for: serialize the new entry to bytes, then
-        // self.driver.lock().unwrap().write(Path::new(&path), &bytes)?;
-        // Order matters: persist before swap so a crash leaves the on-disk
-        // truth as either the old version or the new one, never an in-memory
-        // state that disagrees with disk.
-        let _ = &self.driver;
+        self.driver
+            .lock()
+            .map_err(|e| PersistedTreeError::Lock(e.to_string()))?
+            .write(&absolute_path, b"")?;
 
+        let next = tree_guard.with_new_document(basename.clone())?;
         *tree_guard = next;
-        Ok(path)
+
+        Ok(basename)
     }
 }
 
@@ -94,16 +106,22 @@ mod tests {
     }
 
     #[test]
-    fn create_document_returns_path_and_swaps_tree() {
+    fn create_document_persists_and_returns_resolvable_path() {
         let mut fs = Vfs::new();
         fs.write_file("/root/existing.md", b"".to_vec());
 
         let pt = PersistedTree::open(fs, Path::new("/root")).unwrap();
         let path = pt.create_document().unwrap();
-        assert_eq!(path, "/tmp");
 
-        // The original entry still resolves — the swap didn't blow away the
-        // existing tree.
+        assert!(path.starts_with("untitled-"));
+        assert!(path.ends_with(".md"));
+
+        // The new doc resolves through the api surface — it's a real entry,
+        // not just a stub.
+        let new_entry = pt.get_entries(path).unwrap();
+        assert!(matches!(new_entry, Entry::File(_)));
+
+        // The original entry still resolves — swap didn't blow it away.
         let existing = pt.get_entries("existing.md".into()).unwrap();
         assert!(matches!(existing, Entry::File(_)));
     }
