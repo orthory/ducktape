@@ -1,9 +1,8 @@
-use super::{DriverError, DriverResult};
+use super::{Driver, DriverError, DriverResult};
 use std::{
     collections::HashMap,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 #[derive(Default, Debug)]
@@ -62,9 +61,8 @@ impl Vfs {
     }
 }
 
-pub fn load(vfs: Arc<Vfs>) -> impl Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync {
-    move |path: &Path| {
-        // skip dotfiles, matching stdfs::load behavior
+impl Driver for Vfs {
+    fn load(&self, path: &Path) -> Result<DriverResult, DriverError> {
         if let Some(name) = path.file_name() {
             if name.to_string_lossy().starts_with(".") {
                 return Ok(DriverResult::Skip);
@@ -73,12 +71,12 @@ pub fn load(vfs: Arc<Vfs>) -> impl Fn(&Path) -> Result<DriverResult, DriverError
 
         let p = path.to_path_buf();
 
-        if let Some(contents) = vfs.files.get(&p) {
+        if let Some(contents) = self.files.get(&p) {
             let cursor = Cursor::new(contents.clone());
             return Ok(DriverResult::File(p, Box::new(cursor)));
         }
 
-        if let Some(children) = vfs.dirs.get(&p) {
+        if let Some(children) = self.dirs.get(&p) {
             return Ok(DriverResult::Directory(p, children.clone()));
         }
 
@@ -87,10 +85,6 @@ pub fn load(vfs: Arc<Vfs>) -> impl Fn(&Path) -> Result<DriverResult, DriverError
             format!("vfs: path not found: {}", p.display()),
         )))
     }
-}
-
-pub fn write(_path: &Path) -> Result<DriverResult, DriverError> {
-    todo!()
 }
 
 #[cfg(test)]
@@ -116,10 +110,7 @@ mod tests {
         let mut vfs = Vfs::new();
         vfs.write_file("/foo.txt", b"hello world".to_vec());
 
-        let load = load(Arc::new(vfs));
-        let result = load(Path::new("/foo.txt")).unwrap();
-
-        match result {
+        match vfs.load(Path::new("/foo.txt")).unwrap() {
             DriverResult::File(path, mut reader) => {
                 assert_eq!(path, PathBuf::from("/foo.txt"));
                 let mut buf = String::new();
@@ -136,10 +127,7 @@ mod tests {
         vfs.write_file("/dir/a.md", b"a".to_vec());
         vfs.write_file("/dir/b.md", b"b".to_vec());
 
-        let load = load(Arc::new(vfs));
-        let result = load(Path::new("/dir")).unwrap();
-
-        match result {
+        match vfs.load(Path::new("/dir")).unwrap() {
             DriverResult::Directory(path, children) => {
                 assert_eq!(path, PathBuf::from("/dir"));
                 assert_eq!(children.len(), 2);
@@ -155,17 +143,16 @@ mod tests {
         let mut vfs = Vfs::new();
         vfs.write_file("/.hidden", b"secret".to_vec());
 
-        let load = load(Arc::new(vfs));
-        let result = load(Path::new("/.hidden")).unwrap();
-
-        assert!(matches!(result, DriverResult::Skip));
+        assert!(matches!(
+            vfs.load(Path::new("/.hidden")).unwrap(),
+            DriverResult::Skip
+        ));
     }
 
     #[test]
     fn load_missing_path_errors() {
         let vfs = Vfs::new();
-        let load = load(Arc::new(vfs));
-        match load(Path::new("/nope")) {
+        match vfs.load(Path::new("/nope")) {
             Err(DriverError::IOError(_)) => (),
             Err(other) => panic!("expected IOError, got {:?}", other),
             Ok(_) => panic!("expected error for missing path"),

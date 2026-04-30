@@ -1,7 +1,9 @@
-use std::{io::Read, path::Path};
+use std::{path::Path, sync::Arc};
+
+use document::Document;
 
 use crate::{
-    drivers::{DriverError, DriverResult},
+    drivers::{Driver, DriverResult},
     entry::Entry,
 };
 
@@ -23,41 +25,28 @@ pub enum TreeError {
     InvalidPathSegment(String),
 }
 
-pub struct Tree<Doc> {
+// `Tree` is structurally shared and cheap to clone: `root` is an `Arc<Entry>`
+// (subtrees are also Arc'd inside the Directory variant) and `driver` is an
+// `Arc<dyn Driver>`. Mutations produce a new `Tree` rather than modifying in
+// place, so versions don't interfere with concurrent readers — the API surface
+// is shaped for MVCC even though the current swap is just a write-locked
+// pointer replacement at the api layer.
+#[derive(Clone)]
+pub struct Tree {
     basedir: String,
-    root: Entry<Doc>,
-
-    loader: Loader,
-    writer: Writer,
+    root: Arc<Entry>,
+    driver: Arc<dyn Driver>,
 }
 
-type Loader = Box<dyn Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync>;
-type Writer = Box<dyn Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync>;
-type DocBuild<Doc> = fn(Box<dyn Read + Send>) -> Result<Doc, anyhow::Error>;
-
-impl<Doc: Default> Tree<Doc> {
-    pub fn new(
-        basedir: &Path,
-        doc_builder: DocBuild<Doc>,
-        loader: impl Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync + 'static,
-        writer: impl Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync + 'static,
-    ) -> Result<Self, TreeError> {
+impl Tree {
+    pub fn new(basedir: &Path, driver: impl Driver + 'static) -> Result<Self, TreeError> {
         let basedir_as_string = basedir.to_string_lossy().to_string();
-        let loader: Loader = Box::new(loader);
-        let writer: Writer = Box::new(writer);
+        let driver: Arc<dyn Driver> = Arc::new(driver);
 
         Ok(Self {
-            root: build_in_recursion(
-                &basedir_as_string,
-                &basedir_as_string,
-                &*loader,
-                doc_builder,
-                0,
-                10,
-            )?,
+            root: build_in_recursion(&basedir_as_string, &basedir_as_string, &*driver, 0, 10)?,
             basedir: basedir_as_string,
-            loader,
-            writer,
+            driver,
         })
     }
 
@@ -65,62 +54,78 @@ impl<Doc: Default> Tree<Doc> {
         self.basedir.clone()
     }
 
-    pub fn get_entries(&self, document_path: String) -> Result<&Entry<Doc>, TreeError> {
+    pub fn get_entries(&self, document_path: String) -> Result<&Entry, TreeError> {
         search_in_recursion(
             document_path
                 .split("/")
                 .filter(|seg| !seg.is_empty())
                 .collect(),
-            &self.root,
+            self.root.as_ref(),
         )
     }
 
-    // create_document creates new document at the root,
-    // and returns its identifier
-    pub fn create_document(&mut self) -> Result<String, TreeError> {
-        let Entry::Directory(root) = &mut self.root else {
+    // Returns a new `Tree` containing the new document, plus its identifier.
+    // Takes `&self` rather than `&mut self`: the caller owns the version-swap,
+    // and concurrent readers continue to see the previous snapshot until the
+    // swap is published. Cost is roughly O(direct_root_children) — only the
+    // root Vec is reallocated; sibling subtrees are ref-bumped, not copied.
+    pub fn create_document(&self) -> Result<(Self, String), TreeError> {
+        // Bump the refcount on the existing root, then `Arc::make_mut` clones
+        // it (because `self` still holds a reference, count is >1). The clone
+        // is shallow: the Vec is freshly allocated, but each child `Arc<Entry>`
+        // inside it is just a refcount bump — untouched subtrees are shared
+        // with the previous version.
+        let mut next_root_arc = self.root.clone();
+        let next_root = Arc::make_mut(&mut next_root_arc);
+
+        let Entry::Directory(items) = next_root else {
             return Err(TreeError::InvalidEntry(
                 "tried to create a new document, but root isn't a directory".to_string(),
             ));
         };
 
         let temp_path: String = "/tmp".into();
-        let temp_doc: Doc = Default::default();
-        let temp_entry: Entry<Doc> = Entry::File(temp_doc);
+        items.push((
+            temp_path.clone(),
+            Arc::new(Entry::File(Document::default())),
+        ));
 
-        root.push((temp_path.clone(), temp_entry));
-
-        Ok(temp_path)
+        Ok((
+            Self {
+                basedir: self.basedir.clone(),
+                root: next_root_arc,
+                driver: self.driver.clone(),
+            },
+            temp_path,
+        ))
     }
 }
 
-fn build_in_recursion<'build, Doc>(
+fn build_in_recursion(
     base_path: &String,
     load_path: &String,
-    load: &(dyn Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync),
-    doc_builder: DocBuild<Doc>,
+    driver: &dyn Driver,
     current_depth: usize,
     max_depth: usize,
-) -> Result<Entry<Doc>, TreeError> {
-    let load_result = load(Path::new(load_path)).map_err(|e| TreeError::Invariant(e.into()))?;
+) -> Result<Arc<Entry>, TreeError> {
+    let load_result = driver
+        .load(Path::new(load_path))
+        .map_err(|e| TreeError::Invariant(e.into()))?;
     let next_entry = match load_result {
-        // todo: what is this?
         DriverResult::Skip => Entry::None,
-        DriverResult::File(_, file) => {
-            Entry::File(doc_builder(file).map_err(|e| TreeError::DocBuilder(e))?)
-        }
+        DriverResult::File(_, reader) => Entry::File(
+            Document::from_reader(reader)
+                .map_err(|e| TreeError::DocBuilder(anyhow::Error::msg(e.to_string())))?,
+        ),
         DriverResult::Directory(_, path_bufs) => {
-            let descendants: Result<Vec<(String, Entry<Doc>)>, TreeError> = path_bufs
+            let descendants: Result<Vec<(String, Arc<Entry>)>, TreeError> = path_bufs
                 .iter()
                 .map(|descendant_path| {
-                    // in case of directory, recursively all the way to children
-                    // while adjusting base_dir to the current path
                     let descendant_path_as_string = descendant_path.to_string_lossy().to_string();
                     match build_in_recursion(
                         base_path,
                         &descendant_path_as_string,
-                        load,
-                        doc_builder,
+                        driver,
                         current_depth + 1,
                         max_depth,
                     ) {
@@ -145,18 +150,15 @@ fn build_in_recursion<'build, Doc>(
         }
     };
 
-    eprintln!("building tree done");
-
-    Ok(next_entry)
+    Ok(Arc::new(next_entry))
 }
 
-fn search_in_recursion<'search, Doc>(
+fn search_in_recursion<'search>(
     path_components: Vec<&str>,
-    current: &'search Entry<Doc>,
-) -> Result<&'search Entry<Doc>, TreeError> {
-    dbg!(&path_components);
+    current: &'search Entry,
+) -> Result<&'search Entry, TreeError> {
     match current {
-        Entry::None => return Err(TreeError::InvalidEntry("???".to_string())),
+        Entry::None => Err(TreeError::InvalidEntry("???".to_string())),
         Entry::File(_) => Ok(current),
         Entry::Directory(items) => {
             let (_, next_current) = items
@@ -165,56 +167,46 @@ fn search_in_recursion<'search, Doc>(
                 .ok_or_else(|| TreeError::NotFound(path_components.join("/").to_string()))?;
 
             let next_path: Vec<&str> = path_components.into_iter().skip(1).collect();
-            if next_path.len() == 0 {
-                return Ok(next_current);
+            if next_path.is_empty() {
+                return Ok(next_current.as_ref());
             }
-            search_in_recursion(next_path, next_current)
+            search_in_recursion(next_path, next_current.as_ref())
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{BufReader, Read},
-        sync::Arc,
-    };
-
-    use crate::drivers::vfs::{self, Vfs};
+    use crate::drivers::vfs::Vfs;
 
     use super::*;
 
-    fn create_test_doctree() -> Tree<String> {
+    fn create_test_doctree() -> Tree {
         Tree {
             basedir: "/".into(),
-            root: Entry::Directory(vec![
+            root: Arc::new(Entry::Directory(vec![
                 (
                     "a".into(),
-                    Entry::Directory(vec![(
+                    Arc::new(Entry::Directory(vec![(
                         "aa".into(),
-                        Entry::Directory(vec![("aaa".into(), Entry::File("hello".to_string()))]),
-                    )]),
+                        Arc::new(Entry::Directory(vec![(
+                            "aaa".into(),
+                            Arc::new(Entry::File(Document::default())),
+                        )])),
+                    )])),
                 ),
                 (
                     "b".into(),
-                    Entry::Directory(vec![(
+                    Arc::new(Entry::Directory(vec![(
                         "bb".into(),
-                        Entry::Directory(vec![("bbb".into(), Entry::File("world".to_string()))]),
-                    )]),
+                        Arc::new(Entry::Directory(vec![(
+                            "bbb".into(),
+                            Arc::new(Entry::File(Document::default())),
+                        )])),
+                    )])),
                 ),
-            ]),
-            loader: Box::new(|_| Err(DriverError::Unreachable)),
-            writer: Box::new(|_| Err(DriverError::Unreachable)),
-        }
-    }
-
-    fn read_to_string_builder() -> DocBuild<String> {
-        |f| {
-            let mut res: String = Default::default();
-            let mut rb = BufReader::new(f);
-            rb.read_to_string(&mut res)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok(res)
+            ])),
+            driver: Arc::new(Vfs::new()),
         }
     }
 
@@ -224,38 +216,47 @@ mod tests {
         fs.write_file("/root/a/aa/aaa.md", b"hello".to_vec());
         fs.write_file("/root/b/bb/bbb.md", b"world".to_vec());
 
-        let tree = Tree::<String>::new(
-            Path::new("/root"),
-            read_to_string_builder(),
-            vfs::load(Arc::new(fs)),
-            |_| Err(DriverError::Unreachable),
-        )
-        .unwrap();
+        let tree = Tree::new(Path::new("/root"), fs).unwrap();
 
         let aaa = tree.get_entries("a/aa/aaa.md".into()).unwrap();
-        match aaa {
-            Entry::File(s) => assert_eq!(s, "hello"),
-            _ => panic!("expected file at a/aa/aaa.md"),
-        }
+        assert!(matches!(aaa, Entry::File(_)));
 
         let bbb = tree.get_entries("b/bb/bbb.md".into()).unwrap();
-        match bbb {
-            Entry::File(s) => assert_eq!(s, "world"),
-            _ => panic!("expected file at b/bb/bbb.md"),
-        }
+        assert!(matches!(bbb, Entry::File(_)));
     }
 
     #[test]
     fn search_in_recursion_works() {
         let test_doc_tree = create_test_doctree();
 
-        {
-            // case found
-            let found = search_in_recursion(vec!["a", "aa", "aaa"], &test_doc_tree.root).unwrap();
-            match found {
-                Entry::File(f) => assert_eq!(*f, "hello".to_string()),
-                _ => panic!("expected found"),
-            }
-        }
+        let found =
+            search_in_recursion(vec!["a", "aa", "aaa"], test_doc_tree.root.as_ref()).unwrap();
+        assert!(matches!(found, Entry::File(_)));
+    }
+
+    #[test]
+    fn create_document_returns_new_version_without_mutating_original() {
+        let mut fs = Vfs::new();
+        fs.write_file("/root/existing.md", b"".to_vec());
+        let original = Tree::new(Path::new("/root"), fs).unwrap();
+
+        // Snapshot the original's root pointer; after create_document, the
+        // original must still see the same root (no in-place mutation).
+        let original_root_ptr = Arc::as_ptr(&original.root);
+
+        let (next, path) = original.create_document().unwrap();
+
+        assert_eq!(path, "/tmp");
+        assert_eq!(Arc::as_ptr(&original.root), original_root_ptr);
+        assert!(!Arc::ptr_eq(&original.root, &next.root));
+
+        // The new version contains the new entry; the original does not.
+        let Entry::Directory(orig_items) = original.root.as_ref() else {
+            panic!("original root should be a Directory");
+        };
+        let Entry::Directory(next_items) = next.root.as_ref() else {
+            panic!("next root should be a Directory");
+        };
+        assert_eq!(orig_items.len() + 1, next_items.len());
     }
 }

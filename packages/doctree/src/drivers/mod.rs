@@ -1,4 +1,7 @@
-use std::{io::Read, path::PathBuf};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 pub mod stdfs;
 pub mod vfs;
@@ -19,4 +22,8 @@ pub enum DriverError {
 
     #[error("DriverError: code reached the unreachable")]
     Unreachable,
+}
+
+pub trait Driver: Send + Sync {
+    fn load(&self, path: &Path) -> Result<DriverResult, DriverError>;
 }
