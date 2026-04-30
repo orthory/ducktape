@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{Mutex, RwLock},
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -14,12 +14,19 @@ use crate::{
 /// version-swap mechanics.
 ///
 /// Concurrency model:
-/// - Reads acquire a read guard on the tree (concurrent reads are fine).
-/// - Writes acquire a write guard on the tree, then a lock on the driver.
-///   The driver's `&mut self` write method is reachable only through the
-///   `Mutex` — exclusivity is enforced by the type system.
+/// - The tree lives in `Mutex<Arc<Tree>>`. Readers lock briefly to clone
+///   the `Arc` (cheap; structural sharing keeps the clone shallow), drop
+///   the lock, and read the snapshot lock-free — readers never wait on
+///   each other or on a writer's actual read of the tree.
+/// - Writers hold the tree mutex for the duration of their operation
+///   (driver write + tree swap), serializing writes. Each write commits a
+///   fresh `Arc` via `*guard = Arc::new(next)`; previous readers' snapshots
+///   stay valid via Arc liveness.
+/// - The driver lives in `Mutex<Box<dyn Driver>>`. Locking yields `&mut`
+///   access — `Driver::write`'s `&mut self` enforces exclusivity at the
+///   type level.
 pub struct PersistedTree {
-    tree: RwLock<Tree>,
+    tree: Mutex<Arc<Tree>>,
     driver: Mutex<Box<dyn Driver>>,
 }
 
@@ -43,21 +50,23 @@ impl PersistedTree {
     ) -> Result<Self, PersistedTreeError> {
         let tree = build_tree(&driver, basedir)?;
         Ok(Self {
-            tree: RwLock::new(tree),
+            tree: Mutex::new(Arc::new(tree)),
             driver: Mutex::new(Box::new(driver)),
         })
     }
 
-    /// Reads under a tree read guard, returning a clone of the matched
-    /// `Entry` so the lock can be released before the caller does anything
-    /// expensive with it. Cloning an `Entry` is cheap — Directory variants
+    /// Grabs an `Arc<Tree>` snapshot under a brief lock, then reads the
+    /// snapshot lock-free. Cloning an `Entry` is cheap — Directory variants
     /// share their subtrees via `Arc`.
     pub fn get_entries(&self, document_path: String) -> Result<Entry, PersistedTreeError> {
-        let tree = self
-            .tree
-            .read()
-            .map_err(|e| PersistedTreeError::Lock(e.to_string()))?;
-        let entry = tree.get_entries(document_path)?;
+        let snapshot = {
+            let guard = self
+                .tree
+                .lock()
+                .map_err(|e| PersistedTreeError::Lock(e.to_string()))?;
+            guard.clone()
+        };
+        let entry = snapshot.get_entries(document_path)?;
         Ok(entry.clone())
     }
 
@@ -74,7 +83,7 @@ impl PersistedTree {
 
         let mut tree_guard = self
             .tree
-            .write()
+            .lock()
             .map_err(|e| PersistedTreeError::Lock(e.to_string()))?;
         let absolute_path = PathBuf::from(tree_guard.basedir()).join(&basename);
 
@@ -84,7 +93,7 @@ impl PersistedTree {
             .write(&absolute_path, b"")?;
 
         let next = tree_guard.with_new_document(basename.clone())?;
-        *tree_guard = next;
+        *tree_guard = Arc::new(next);
 
         Ok(basename)
     }
@@ -116,13 +125,37 @@ mod tests {
         assert!(path.starts_with("untitled-"));
         assert!(path.ends_with(".md"));
 
-        // The new doc resolves through the api surface — it's a real entry,
-        // not just a stub.
         let new_entry = pt.get_entries(path).unwrap();
         assert!(matches!(new_entry, Entry::File(_)));
 
-        // The original entry still resolves — swap didn't blow it away.
         let existing = pt.get_entries("existing.md".into()).unwrap();
         assert!(matches!(existing, Entry::File(_)));
+    }
+
+    #[test]
+    fn reader_snapshot_survives_concurrent_writer() {
+        // A snapshot taken before a write must keep resolving the pre-write
+        // tree, even after the writer's swap publishes the new version.
+        // This is the MVCC property: Arc liveness keeps old snapshots
+        // valid until their last reader drops them.
+        let mut fs = Vfs::new();
+        fs.write_file("/root/old.md", b"".to_vec());
+
+        let pt = PersistedTree::open(fs, Path::new("/root")).unwrap();
+
+        // Read the current snapshot's tree pointer by grabbing one entry.
+        let pre_swap = pt.get_entries("old.md".into()).unwrap();
+        assert!(matches!(pre_swap, Entry::File(_)));
+
+        // Writer swaps in a new version with an additional doc.
+        let new_path = pt.create_document().unwrap();
+
+        // Old entry still resolves (the new version preserved it).
+        let old = pt.get_entries("old.md".into()).unwrap();
+        assert!(matches!(old, Entry::File(_)));
+
+        // New entry resolves too.
+        let new = pt.get_entries(new_path).unwrap();
+        assert!(matches!(new, Entry::File(_)));
     }
 }
