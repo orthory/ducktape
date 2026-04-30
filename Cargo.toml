@@ -12,6 +12,7 @@ members = [
     "packages/document",
     "packages/sections",
     "packages/api",
+    "packages/uid",
     "utils",
 ]
 
@@ -26,6 +27,7 @@ regex = "1.11.1"
 poem = "3.1.12"
 sha2 = "0.10.9"
 rand = "0.9.2"
+uuid = { version = "1.11", features = ["v7", "serde"] }
 
 [[bin]]
 name = "ducktape"
