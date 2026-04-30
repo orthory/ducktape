@@ -1,14 +1,12 @@
-mod comment_v1;
-mod frontmatter_v1;
-mod task_v1;
-
+pub mod comment;
+pub mod frontmatter;
 pub mod parser;
+pub mod task;
 
-pub use comment_v1::*;
-pub use frontmatter_v1::*;
-pub use task_v1::*;
+pub use comment::{CommentError, CommentLatest, CommentV1};
+pub use frontmatter::{FrontmatterError, FrontmatterLatest, FrontmatterV1};
+pub use task::{TaskError, TaskLatest, TaskV1, TaskV1Status};
 
-// common
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
@@ -26,9 +24,9 @@ where
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", tag = "@section_type")]
 pub enum Sections {
-    FrontmatterV1(crate::frontmatter_v1::FrontmatterV1),
-    CommentV1(crate::comment_v1::CommentV1),
-    TaskV1(crate::task_v1::TaskV1),
+    FrontmatterV1(FrontmatterV1),
+    CommentV1(CommentV1),
+    TaskV1(TaskV1),
 }
 
 macro_rules! try_all_sections {
@@ -48,9 +46,9 @@ impl Sections {
     ) -> anyhow::Result<Option<Self>> {
         try_all_sections! {
             parser,
-            FrontmatterV1 => crate::frontmatter_v1::FrontmatterV1,
-            CommentV1 => crate::comment_v1::CommentV1,
-            TaskV1 => crate::task_v1::TaskV1,
+            FrontmatterV1 => FrontmatterV1,
+            CommentV1 => CommentV1,
+            TaskV1 => TaskV1,
         }
     }
 }

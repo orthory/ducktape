@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 const COMMAND: &str = "---";
 
+#[cfg(test)]
 const PROMOTED_KEYS: &[&str] = &["title", "author", "created_at", "updated_at"];
 
 #[derive(thiserror::Error, Debug)]
