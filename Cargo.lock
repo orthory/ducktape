@@ -89,6 +89,7 @@ dependencies = [
  "anyhow",
  "doctree",
  "document",
+ "driver",
  "poem",
  "serde",
 ]
@@ -254,6 +255,16 @@ dependencies = [
  "anyhow",
  "sections",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "doctree",
+ "document",
  "thiserror",
 ]
 

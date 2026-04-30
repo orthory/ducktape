@@ -35,7 +35,7 @@ impl Driver for Stdfs {
         Err(DriverError::Unreachable)
     }
 
-    fn write(&self, path: &Path, content: &[u8]) -> Result<(), DriverError> {
+    fn write(&mut self, path: &Path, content: &[u8]) -> Result<(), DriverError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

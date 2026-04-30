@@ -3,49 +3,39 @@ use std::{
     collections::HashMap,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::RwLock,
 };
 
-// Vfs's mutable state lives behind a RwLock because the Driver trait's methods
-// take `&self` (the tree holds `Arc<dyn Driver>` and can't get exclusive
-// access). Reads and writes both go through the lock.
-pub struct Vfs {
-    inner: RwLock<VfsInner>,
-}
-
+// Vfs is straightforwardly mutable: the Driver trait now takes `&mut self`
+// for `write`, so exclusivity is a type-level guarantee provided by the
+// caller (typically `PersistedTree`'s `RwLock<Box<dyn Driver>>`). No need
+// for internal locking — the lock lives one layer up.
 #[derive(Default, Debug)]
-struct VfsInner {
+pub struct Vfs {
     files: HashMap<PathBuf, Vec<u8>>,
     dirs: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl Vfs {
     pub fn new() -> Self {
-        let mut inner = VfsInner::default();
-        inner.dirs.insert(PathBuf::from("/"), Vec::new());
-        Self {
-            inner: RwLock::new(inner),
-        }
+        let mut vfs = Vfs::default();
+        vfs.dirs.insert(PathBuf::from("/"), Vec::new());
+        vfs
     }
 
-    pub fn write_file(&self, path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) {
+    pub fn write_file(&mut self, path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) {
         let path = path.into();
-        let mut inner = self.inner.write().unwrap();
-        inner.ensure_parents(&path);
-        inner.register_in_parent(&path);
-        inner.files.insert(path, contents.into());
+        self.ensure_parents(&path);
+        self.register_in_parent(&path);
+        self.files.insert(path, contents.into());
     }
 
-    pub fn mkdir(&self, path: impl Into<PathBuf>) {
+    pub fn mkdir(&mut self, path: impl Into<PathBuf>) {
         let path = path.into();
-        let mut inner = self.inner.write().unwrap();
-        inner.ensure_parents(&path);
-        inner.register_in_parent(&path);
-        inner.dirs.entry(path).or_default();
+        self.ensure_parents(&path);
+        self.register_in_parent(&path);
+        self.dirs.entry(path).or_default();
     }
-}
 
-impl VfsInner {
     fn ensure_parents(&mut self, path: &Path) {
         let Some(parent) = path.parent() else {
             return;
@@ -83,15 +73,14 @@ impl Driver for Vfs {
             }
         }
 
-        let inner = self.inner.read().unwrap();
         let p = path.to_path_buf();
 
-        if let Some(contents) = inner.files.get(&p) {
+        if let Some(contents) = self.files.get(&p) {
             let cursor = Cursor::new(contents.clone());
             return Ok(DriverResult::File(p, Box::new(cursor)));
         }
 
-        if let Some(children) = inner.dirs.get(&p) {
+        if let Some(children) = self.dirs.get(&p) {
             return Ok(DriverResult::Directory(p, children.clone()));
         }
 
@@ -101,7 +90,7 @@ impl Driver for Vfs {
         )))
     }
 
-    fn write(&self, path: &Path, content: &[u8]) -> Result<(), DriverError> {
+    fn write(&mut self, path: &Path, content: &[u8]) -> Result<(), DriverError> {
         self.write_file(path.to_path_buf(), content.to_vec());
         Ok(())
     }
@@ -114,10 +103,9 @@ mod tests {
 
     #[test]
     fn write_file_creates_intermediate_dirs() {
-        let vfs = Vfs::new();
+        let mut vfs = Vfs::new();
         vfs.write_file("/a/b/c.md", b"hello".to_vec());
 
-        // Verify dir structure via load() — we don't reach into private state.
         match vfs.load(Path::new("/a")).unwrap() {
             DriverResult::Directory(_, children) => {
                 assert!(children.contains(&PathBuf::from("/a/b")));
@@ -138,7 +126,7 @@ mod tests {
 
     #[test]
     fn load_returns_file_with_contents() {
-        let vfs = Vfs::new();
+        let mut vfs = Vfs::new();
         vfs.write_file("/foo.txt", b"hello world".to_vec());
 
         match vfs.load(Path::new("/foo.txt")).unwrap() {
@@ -154,7 +142,7 @@ mod tests {
 
     #[test]
     fn load_returns_directory_with_children() {
-        let vfs = Vfs::new();
+        let mut vfs = Vfs::new();
         vfs.write_file("/dir/a.md", b"a".to_vec());
         vfs.write_file("/dir/b.md", b"b".to_vec());
 
@@ -171,7 +159,7 @@ mod tests {
 
     #[test]
     fn load_skips_dotfiles() {
-        let vfs = Vfs::new();
+        let mut vfs = Vfs::new();
         vfs.write_file("/.hidden", b"secret".to_vec());
 
         assert!(matches!(
@@ -192,11 +180,9 @@ mod tests {
 
     #[test]
     fn driver_write_then_load_roundtrips() {
-        let vfs = Vfs::new();
+        let mut vfs = Vfs::new();
 
-        // Call through the Driver trait, not the convenience method, to exercise
-        // the trait surface a real consumer would use.
-        Driver::write(&vfs, Path::new("/round/trip.md"), b"persisted").unwrap();
+        Driver::write(&mut vfs, Path::new("/round/trip.md"), b"persisted").unwrap();
 
         match vfs.load(Path::new("/round/trip.md")).unwrap() {
             DriverResult::File(_, mut reader) => {
@@ -207,7 +193,6 @@ mod tests {
             _ => panic!("expected File after write"),
         }
 
-        // Parent directory listing should reflect the new entry.
         match vfs.load(Path::new("/round")).unwrap() {
             DriverResult::Directory(_, children) => {
                 assert!(children.contains(&PathBuf::from("/round/trip.md")));

@@ -9,6 +9,7 @@ members = [
     "packages/auth",
     "bin",
     "packages/doctree",
+    "packages/driver",
     "packages/document",
     "packages/sections",
     "packages/api",
