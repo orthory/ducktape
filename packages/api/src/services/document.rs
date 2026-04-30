@@ -1,20 +1,22 @@
 use crate::utils::identifier::Identifier;
 use std::{path::PathBuf, sync::Arc};
 
-use doctree::{Entry, PersistedTree, Stdfs};
+use doctree::{Entry, Persister, Stdfs, WorkingTree};
 use poem::{
     Result, handler,
     web::{Data, Json, Path},
 };
 
 pub struct DocumentService {
-    tree: PersistedTree,
+    persister: Persister,
+    working: Arc<WorkingTree>,
 }
 
 impl DocumentService {
     pub fn new(basedir: String) -> Self {
-        let tree = PersistedTree::open(Stdfs, &PathBuf::from(basedir)).unwrap();
-        DocumentService { tree }
+        let persister = Persister::open(Stdfs, &PathBuf::from(basedir)).unwrap();
+        let working = persister.working();
+        DocumentService { persister, working }
     }
 }
 
@@ -24,7 +26,7 @@ pub async fn get_documents(
     Data(docsvc): Data<&Arc<DocumentService>>,
 ) -> Result<Json<Entry>> {
     let entry = docsvc
-        .tree
+        .working
         .get_entries(document_path)
         .map_err(poem::error::InternalServerError)?;
 
@@ -36,7 +38,7 @@ pub async fn create_document(
     Data(docsvc): Data<&Arc<DocumentService>>,
 ) -> Result<Json<Identifier>> {
     let path = docsvc
-        .tree
+        .persister
         .create_document()
         .map_err(poem::error::InternalServerError)?;
 

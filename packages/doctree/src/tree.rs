@@ -25,8 +25,19 @@ pub enum TreeError {
 // `Tree` is a pure in-memory data structure — no persistence concerns. It's
 // structurally shared and cheap to clone: `root` is an `Arc<Entry>` whose
 // Directory variants also Arc their children. Mutations produce a new `Tree`
-// version; the persistence layer (driver crate) wraps Tree in `PersistedTree`
-// to coordinate with a `Driver` backend.
+// version; `WorkingTree` wraps `Mutex<Arc<Tree>>` to coordinate canonical
+// shared state, and `Persister` wraps `WorkingTree` to add disk-side
+// concerns (driver, dirty set, commit boundary).
+//
+// The MVCC shape (immutability + `with_X` builders + structural sharing) is
+// here for atomic version swap, lock-free reads, and in-flight read
+// consistency across concurrent writes — *not* for writer isolation.
+// `WorkingTree` deliberately exposes a single canonical view to all
+// participants, so the new version produced by `with_new_document` is
+// expected to be published immediately, not stashed as a private fork.
+// Cheap snapshotting also makes future features (e.g. retaining a
+// `last_committed` snapshot, time-travel over commit history) essentially
+// free thanks to subtree sharing.
 #[derive(Clone)]
 pub struct Tree {
     basedir: String,

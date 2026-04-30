@@ -7,7 +7,7 @@ use std::{
 
 // Vfs is straightforwardly mutable: the Driver trait now takes `&mut self`
 // for `write`, so exclusivity is a type-level guarantee provided by the
-// caller (typically `PersistedTree`'s `RwLock<Box<dyn Driver>>`). No need
+// caller (typically `Persister`'s `Mutex<Box<dyn Driver>>`). No need
 // for internal locking — the lock lives one layer up.
 #[derive(Default, Debug)]
 pub struct Vfs {
