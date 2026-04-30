@@ -46,6 +46,20 @@ impl Document {
 
         Ok(Document { body, sections })
     }
+
+    /// Yields parsed sections one at a time, cloned, in document order. Pair with an
+    /// fs driver or similar when a streamed read is preferable to materializing the
+    /// whole vector.
+    pub fn read(&self) -> impl Iterator<Item = Sections> + '_ {
+        self.sections.iter().cloned()
+    }
+
+    /// Returns every parsed section in document order, cloned. This is the bulk
+    /// "structured view" of the document — the primary entry point for consumers
+    /// that want all sections at once before subscribing to incremental updates.
+    pub fn structured(&self) -> Vec<Sections> {
+        self.sections.clone()
+    }
 }
 
 fn try_instantiate_document<R: Read>(
@@ -131,6 +145,34 @@ Multiline xyz is also supported
 
         let (body, sections) = try_instantiate_document(sample_document.as_bytes())?;
         dbg!(body, sections);
+        Ok(())
+    }
+
+    #[test]
+    pub fn read_and_structured_match_parsed_sections() -> anyhow::Result<()> {
+        let sample_document = r#"
+---
+title: t
+author: @a
+created_at: 1
+updated_at: 1
+---
+
+/comment.v1{@orthory;1234;1234}
+hello
+/comment.v1
+"#;
+
+        let doc = Document::from_reader(sample_document.as_bytes())?;
+
+        let bulk = doc.structured();
+        let streamed: Vec<_> = doc.read().collect();
+
+        assert_eq!(bulk.len(), 2);
+        assert_eq!(streamed.len(), bulk.len());
+        assert!(matches!(bulk[0], Sections::Frontmatter(_)));
+        assert!(matches!(bulk[1], Sections::Comment(_)));
+
         Ok(())
     }
 }
