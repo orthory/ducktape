@@ -1,24 +1,42 @@
-use std::{io::Read, path::Path};
+use std::{collections::HashMap, io::Read, path::Path};
 
 use serde::{Deserialize, Serialize};
 
 use sections::{Sections, parser::Parser};
+use uid::{Identify, Uid};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Document {
+    // Stable identity for the whole document. Frontmatter does NOT carry its
+    // own uid — it's intrinsic to the document and shares this one. Server
+    // never mints; documents fly in pre-uid'd. Parsing legacy on-disk format
+    // leaves this as the nil uuid until a v2 format encodes it.
+    pub(crate) uid: Uid,
+
     // global body buffer as vector of lines
     pub(crate) body: Vec<String>,
 
     // separate sections
     pub(crate) sections: Vec<Sections>,
+
+    // unordered map of sections for tracking individually;
+    // must be in sync with sections.
+    pub(crate) sections_map: HashMap<Uid, Sections>
 }
 
 impl Default for Document {
     fn default() -> Self {
         Self {
+            uid: Uid::now_v7(),
             body: Default::default(),
             sections: Default::default(),
         }
+    }
+}
+
+impl Identify for Document {
+    fn uid(&self) -> Uid {
+        self.uid
     }
 }
 
@@ -44,7 +62,12 @@ impl Document {
     pub fn from_reader<R: Read>(reader: R) -> Result<Self, DocumentInstanceError> {
         let (body, sections) = try_instantiate_document(reader)?;
 
-        Ok(Document { body, sections })
+        Ok(Document {
+            // nil until v2 on-disk format carries the document uid
+            uid: Uid::default(),
+            body,
+            sections,
+        })
     }
 }
 

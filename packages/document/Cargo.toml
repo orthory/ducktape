@@ -9,3 +9,4 @@ serde = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 
 sections = { path = "../sections" }
+uid = { path = "../uid" }
