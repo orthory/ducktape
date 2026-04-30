@@ -112,7 +112,7 @@ markdown directives, such as (-)
 
 Let's test some commands
 
-/comment{@orthory,1234;1234}
+/comment{@orthory;1234;1234}
 This is the comment block
 /comment
 

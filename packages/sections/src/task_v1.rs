@@ -1,19 +1,17 @@
 use std::str::FromStr;
 
 use crate::{Section, parser::Parser};
-use auth;
 use serde::{Deserialize, Serialize};
 
 const COMMAND: &str = "/task";
 
 /// TaskV1
 ///
-/// ```
+/// ```text
 /// /task{@author;title;status(TaskV1Status);(start_at);(end_at);(assignees)...}
 /// content...
 /// /task
-///
-
+/// ```
 #[derive(thiserror::Error, Debug, Deserialize, Serialize)]
 pub enum TaskError {
     #[error("invalid task data")]
@@ -46,51 +44,51 @@ impl Section for TaskV1 {
             return Ok(None);
         };
 
-        let variables = matched.args.ok_or(TaskError::InvalidData)?;
-        let body = matched.body;
+        let args = matched.args.ok_or(TaskError::InvalidData)?;
 
-        let author =
-            auth::User::from_str(variables.get(0).ok_or(TaskError::MissingData("author"))?);
-        let title = variables.get(1).ok_or(TaskError::MissingData("title"))?;
-        let start_at = variables
-            .get(3)
-            .unwrap_or(&"0".to_string())
-            .parse::<u64>()
-            .map_err(|e| TaskError::InvalidArgument("start_at", e.to_string()))?;
-        let end_at = variables
-            .get(4)
-            .unwrap_or(&"0".to_string())
-            .parse::<u64>()
-            .map_err(|e| TaskError::InvalidArgument("end_at", e.to_string()))?;
-        let assignees: Vec<auth::User> = variables
-            .split_at(5)
-            .1
-            .to_vec()
-            .into_iter()
-            .map(|assignee| auth::User::from_str(assignee.as_str()))
+        let author_raw = args.get(0).ok_or(TaskError::MissingData("author"))?;
+        let title = args.get(1).ok_or(TaskError::MissingData("title"))?.clone();
+        let status_raw = args.get(2).ok_or(TaskError::MissingData("status"))?;
+
+        let author = auth::User::from_str(author_raw);
+        let status = TaskV1Status::from_argument(status_raw)?;
+        let start_at = parse_optional_u64(args.get(3), "start_at")?;
+        let end_at = parse_optional_u64(args.get(4), "end_at")?;
+
+        // Bounds-safe assignees slice — empty when args.len() <= 5.
+        let assignees: Vec<auth::User> = args
+            .get(5..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|a| auth::User::from_str(a.as_str()))
             .collect();
 
-        // parse out status
-        let status = variables.get(2).ok_or(TaskError::MissingData("status"))?;
-        let status = TaskV1Status::from_argument(status)?;
-
         Ok(Some(TaskV1 {
-            title: title.to_string(),
-            author: author,
-            assignees: assignees,
-            start_at: start_at,
-            end_at: end_at,
-            status: status,
-
-            body,
+            title,
+            author,
+            assignees,
+            start_at,
+            end_at,
+            status,
+            body: matched.body,
         }))
+    }
+}
+
+fn parse_optional_u64(value: Option<&String>, field: &'static str) -> Result<u64, TaskError> {
+    match value {
+        None => Ok(0),
+        Some(s) if s.is_empty() => Ok(0),
+        Some(s) => s
+            .parse::<u64>()
+            .map_err(|e| TaskError::InvalidArgument(field, e.to_string())),
     }
 }
 
 /// TaskV1Status
 ///
-/// {status}(tracker)
-/// e.g. InProgress(https://github.com/newmetric/...)
+/// `{status}` or `{status}(tracker)` — tracker URL is optional.
+/// e.g. `InProgress(https://github.com/newmetric/...)` or `Backlog`.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum TaskV1Status {
     Backlog(Option<String>),
@@ -102,7 +100,9 @@ pub enum TaskV1Status {
 }
 
 lazy_static::lazy_static! {
-    static ref STATUS_PATTERN: regex::Regex = regex::Regex::new(r"(\w+)(\([\w\W]*\))").unwrap();
+    // status name (group 1), optional `(tracker)` (group 2 captures inner text).
+    static ref STATUS_PATTERN: regex::Regex =
+        regex::Regex::new(r"^([\w-]+)(?:\(([^)]*)\))?$").unwrap();
 }
 
 impl FromStr for TaskV1Status {
@@ -115,74 +115,93 @@ impl FromStr for TaskV1Status {
 
 impl TaskV1Status {
     pub fn from_argument(argument: &str) -> Result<Self, TaskError> {
-        match STATUS_PATTERN.captures(argument) {
-            // regex couldn't match with anything; return unknown
-            None => Ok(Self::Unknown),
+        let Some(captures) = STATUS_PATTERN.captures(argument) else {
+            return Ok(Self::Unknown);
+        };
 
-            // otherwise try to match
-            Some(captures) => {
-                // get the first signifier of TaskV1Status.
-                // since we're already in the Some block this should rarely happen,
-                // but just incase :)
-                let Some(status) = captures.get(1) else {
-                    return Err(TaskError::InvalidArgument(
-                        "status",
-                        format!("failed to parse status to TaskV1Status: {}", argument).to_string(),
-                    ));
-                };
+        let status = captures
+            .get(1)
+            .ok_or_else(|| {
+                TaskError::InvalidArgument(
+                    "status",
+                    format!("failed to parse status: {}", argument),
+                )
+            })?
+            .as_str();
+        let tracker = captures.get(2).map(|m| m.as_str().to_string());
 
-                let tracker = match captures.get(2) {
-                    None => None,
-
-                    // strip out ( and ) at the end
-                    Some(tracker_matched) => {
-                        let tracker = tracker_matched.as_str();
-                        let tracker = tracker
-                            .strip_prefix("(")
-                            .ok_or(TaskError::InvalidArgument(
-                                "status",
-                                "malformed tracker: expected ( at the beginning, found none"
-                                    .to_string(),
-                            ))?
-                            .strip_suffix(")")
-                            .ok_or(TaskError::InvalidArgument(
-                                "status",
-                                "malformed tracker: expected ) at the end, found none".to_string(),
-                            ))?;
-
-                        Some(tracker.to_string())
-                    }
-                };
-
-                match status.as_str() {
-                    "backlog" | "Backlog" => Ok(TaskV1Status::Backlog(tracker)),
-                    "inprogress" | "InProgress" | "in-progress" => {
-                        Ok(TaskV1Status::InProgress(tracker))
-                    }
-                    "inreivew" | "InReview" | "in-review" => Ok(TaskV1Status::InReview(tracker)),
-                    "done" | "Done" => Ok(TaskV1Status::Done(tracker)),
-                    "merged" | "Merged" => Ok(TaskV1Status::Merged(tracker)),
-                    _ => Ok(TaskV1Status::Unknown),
-                }
-            }
-        }
+        Ok(match status.to_ascii_lowercase().as_str() {
+            "backlog" => Self::Backlog(tracker),
+            "inprogress" | "in-progress" => Self::InProgress(tracker),
+            "inreview" | "in-review" => Self::InReview(tracker),
+            "done" => Self::Done(tracker),
+            "merged" => Self::Merged(tracker),
+            _ => Self::Unknown,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    const SAMPLE_COMMENT: &str = r#"
-/task{@author;some title;InProgress(https://github.com);12345;12345;@orthory;@ever0de;@lazka33;@0xF0D0;@jeffwoooo}
-This is a sample comment.
-Multiline xyz is also supported
-/task
-"#;
 
     #[test]
-    fn test_asdf() {
-        let mut buffer = Parser::new(SAMPLE_COMMENT.trim_start().as_bytes());
-        let comment = TaskV1::try_match(&mut buffer);
-        dbg!(comment);
+    fn parses_full_task() {
+        let input = "\
+/task{@author;some title;InProgress(https://github.com);12345;12346;@orthory;@ever0de}
+body line 1
+body line 2
+/task
+";
+        let mut buffer = Parser::new(input.as_bytes());
+        let task = TaskV1::try_match(&mut buffer)
+            .expect("parse ok")
+            .expect("matched");
+
+        assert_eq!(task.title, "some title");
+        assert_eq!(task.start_at, 12345);
+        assert_eq!(task.end_at, 12346);
+        assert_eq!(task.assignees.len(), 2);
+        assert_eq!(task.body.len(), 2);
+        assert!(matches!(task.status, TaskV1Status::InProgress(Some(ref u)) if u == "https://github.com"));
+    }
+
+    #[test]
+    fn minimal_task_does_not_panic() {
+        // Only the three required args — used to panic at variables.split_at(5).
+        let input = "\
+/task{@author;title;Backlog}
+body
+/task
+";
+        let mut buffer = Parser::new(input.as_bytes());
+        let task = TaskV1::try_match(&mut buffer)
+            .expect("parse ok")
+            .expect("matched");
+
+        assert_eq!(task.start_at, 0);
+        assert_eq!(task.end_at, 0);
+        assert!(task.assignees.is_empty());
+        assert!(matches!(task.status, TaskV1Status::Backlog(None)));
+    }
+
+    #[test]
+    fn bare_status_without_tracker_parses() {
+        assert!(matches!(
+            TaskV1Status::from_argument("Done").unwrap(),
+            TaskV1Status::Done(None)
+        ));
+        assert!(matches!(
+            TaskV1Status::from_argument("in-review").unwrap(),
+            TaskV1Status::InReview(None)
+        ));
+    }
+
+    #[test]
+    fn status_with_tracker_extracts_inner() {
+        assert!(matches!(
+            TaskV1Status::from_argument("Merged(https://example.com/pr/1)").unwrap(),
+            TaskV1Status::Merged(Some(ref u)) if u == "https://example.com/pr/1"
+        ));
     }
 }
