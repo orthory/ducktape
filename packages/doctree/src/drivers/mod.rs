@@ -25,5 +25,12 @@ pub enum DriverError {
 }
 
 pub trait Driver: Send + Sync {
+    /// Resolves an entry at `path`. Drivers may return `Skip` to filter out
+    /// paths the caller shouldn't see (e.g. dotfiles) without raising an error.
     fn load(&self, path: &Path) -> Result<DriverResult, DriverError>;
+
+    /// Persists `content` at `path` as a finalization step. The upper layer is
+    /// responsible for accumulating edits/events and serializing them into the
+    /// complete buffer passed here — drivers don't see the intermediate ops.
+    fn write(&self, path: &Path, content: &[u8]) -> Result<(), DriverError>;
 }

@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn tree_builds_from_vfs_fixture() {
-        let mut fs = Vfs::new();
+        let fs = Vfs::new();
         fs.write_file("/root/a/aa/aaa.md", b"hello".to_vec());
         fs.write_file("/root/b/bb/bbb.md", b"world".to_vec());
 
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn create_document_returns_new_version_without_mutating_original() {
-        let mut fs = Vfs::new();
+        let fs = Vfs::new();
         fs.write_file("/root/existing.md", b"".to_vec());
         let original = Tree::new(Path::new("/root"), fs).unwrap();
 
