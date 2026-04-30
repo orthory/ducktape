@@ -8,7 +8,11 @@ use crate::{Section, parser::Parser};
 
 pub type FrontmatterLatest = FrontmatterV1;
 
-/// See `comment::try_parse_latest` for the migration pattern; same shape applies here.
+/// Frontmatter has no on-disk version marker (the fence is just `---`). When V2 lands
+/// the convention can be a `version: N` key in the body — at which point this function
+/// will need to parse the block once into a HashMap and dispatch by version, rather
+/// than delegating to per-version `try_match`. See `comment::try_parse_latest` for the
+/// pattern that applies once each version has its own marker.
 pub fn try_parse_latest<R: Read>(
     parser: &mut Parser<R>,
 ) -> anyhow::Result<Option<FrontmatterLatest>> {

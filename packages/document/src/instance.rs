@@ -112,21 +112,21 @@ markdown directives, such as (-)
 
 Let's test some commands
 
-/comment{@orthory;1234;1234}
+/comment.v1{@orthory;1234;1234}
 This is the comment block
-/comment
+/comment.v1
 
 How about some tasks?
 
-/task{@author;some title;InProgress(https://github.com);12345;12345;@orthory;@ever0de;@lazka33;@0xF0D0;@jeffwoooo}
+/task.v1{@author;some title;InProgress(https://github.com);12345;12345;@orthory;@ever0de;@lazka33;@0xF0D0;@jeffwoooo}
 This is a sample comment.
 Multiline xyz is also supported
-/task
+/task.v1
 
-/task{@author;some title;InProgress(https://github.com);12345;12345;@orthory;@ever0de;@lazka33;@0xF0D0;@jeffwoooo}
+/task.v1{@author;some title;InProgress(https://github.com);12345;12345;@orthory;@ever0de;@lazka33;@0xF0D0;@jeffwoooo}
 This is a sample comment.
 Multiline xyz is also supported
-/task
+/task.v1
         "#;
 
         let (body, sections) = try_instantiate_document(sample_document.as_bytes())?;

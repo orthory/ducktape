@@ -3,14 +3,14 @@ use std::str::FromStr;
 use crate::{Section, parser::Parser};
 use serde::{Deserialize, Serialize};
 
-const COMMAND: &str = "/task";
+const COMMAND: &str = "/task.v1";
 
 /// TaskV1
 ///
 /// ```text
-/// /task{@author;title;status(TaskV1Status);(start_at);(end_at);(assignees)...}
+/// /task.v1{@author;title;status(TaskV1Status);(start_at);(end_at);(assignees)...}
 /// content...
-/// /task
+/// /task.v1
 /// ```
 #[derive(thiserror::Error, Debug, Deserialize, Serialize)]
 pub enum TaskError {
@@ -143,10 +143,10 @@ mod tests {
     #[test]
     fn parses_full_task() {
         let input = "\
-/task{@author;some title;InProgress(https://github.com);12345;12346;@orthory;@ever0de}
+/task.v1{@author;some title;InProgress(https://github.com);12345;12346;@orthory;@ever0de}
 body line 1
 body line 2
-/task
+/task.v1
 ";
         let mut buffer = Parser::new(input.as_bytes());
         let task = TaskV1::try_match(&mut buffer)
@@ -165,9 +165,9 @@ body line 2
     fn minimal_task_does_not_panic() {
         // Only the three required args — used to panic at variables.split_at(5).
         let input = "\
-/task{@author;title;Backlog}
+/task.v1{@author;title;Backlog}
 body
-/task
+/task.v1
 ";
         let mut buffer = Parser::new(input.as_bytes());
         let task = TaskV1::try_match(&mut buffer)

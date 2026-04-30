@@ -1,7 +1,7 @@
 use crate::{Section, parser::Parser};
 use serde::{Deserialize, Serialize};
 
-const COMMAND: &str = "/comment";
+const COMMAND: &str = "/comment.v1";
 
 #[derive(thiserror::Error, Debug)]
 pub enum CommentError {
@@ -67,10 +67,10 @@ impl Section for CommentV1 {
 mod tests {
     use super::*;
     const SAMPLE_COMMENT: &str = r#"
-/comment{@orthory;42;1700000000}
+/comment.v1{@orthory;42;1700000000}
 This is a sample comment.
 Multiline xyz is also supported
-/comment
+/comment.v1
 "#;
 
     #[test]
@@ -87,7 +87,7 @@ Multiline xyz is also supported
 
     #[test]
     fn rejects_wrong_arg_count() {
-        let input = "/comment{@only;one}\nbody\n/comment\n";
+        let input = "/comment.v1{@only;one}\nbody\n/comment.v1\n";
         let mut buffer = Parser::new(input.as_bytes());
         assert!(CommentV1::try_match(&mut buffer).is_err());
     }
