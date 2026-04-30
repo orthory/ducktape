@@ -1,1 +1,0 @@
-{"root":["./src/App.tsx","./src/main.tsx","./src/api/client.ts","./src/api/websocket.ts","./src/components/Editor.tsx","./src/components/FileNav.tsx","./src/types/slate.d.ts"],"version":"5.6.3"}
