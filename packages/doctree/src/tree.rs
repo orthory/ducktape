@@ -22,12 +22,13 @@ pub enum TreeError {
     InvalidPathSegment(String),
 }
 
-// `Tree` is a pure in-memory data structure — no persistence concerns. It's
-// structurally shared and cheap to clone: `root` is an `Arc<Entry>` whose
-// Directory variants also Arc their children. Mutations produce a new `Tree`
-// version; `WorkingTree` wraps `Mutex<Arc<Tree>>` to coordinate canonical
-// shared state, and `Persister` wraps `WorkingTree` to add disk-side
-// concerns (driver, dirty set, commit boundary).
+// `Tree` is a pure in-memory data structure — no persistence concerns, no
+// path/basedir, no concurrency primitives. It's structurally shared and
+// cheap to clone: `root` is an `Arc<Entry>` whose Directory variants also
+// Arc their children. Mutations produce a new `Tree` version; `WorkingTree`
+// wraps `Mutex<Arc<Tree>>` to coordinate canonical shared state, and
+// `Persister` wraps `WorkingTree` to add disk-side concerns (driver, dirty
+// set, basedir, commit boundary).
 //
 // The MVCC shape (immutability + `with_X` builders + structural sharing) is
 // here for atomic version swap, lock-free reads, and in-flight read
@@ -40,17 +41,12 @@ pub enum TreeError {
 // free thanks to subtree sharing.
 #[derive(Clone)]
 pub struct Tree {
-    basedir: String,
     root: Arc<Entry>,
 }
 
 impl Tree {
-    pub fn new(basedir: String, root: Arc<Entry>) -> Self {
-        Self { basedir, root }
-    }
-
-    pub fn basedir(&self) -> String {
-        self.basedir.clone()
+    pub fn new(root: Arc<Entry>) -> Self {
+        Self { root }
     }
 
     pub fn root(&self) -> &Arc<Entry> {
@@ -93,7 +89,6 @@ impl Tree {
         items.push((path, Arc::new(Entry::File(Document::default()))));
 
         Ok(Self {
-            basedir: self.basedir.clone(),
             root: next_root_arc,
         })
     }
@@ -126,7 +121,6 @@ mod tests {
 
     fn create_test_doctree() -> Tree {
         Tree {
-            basedir: "/".into(),
             root: Arc::new(Entry::Directory(vec![
                 (
                     "a".into(),

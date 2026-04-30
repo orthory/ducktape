@@ -9,7 +9,11 @@ use crate::{
 
 /// Builds a `Tree` by recursively loading from `driver`, starting at
 /// `basedir`. The bridge between the storage primitives (the `drivers`
-/// module) and the in-memory tree.
+/// module) and the in-memory tree. `basedir` is consumed only to walk the
+/// driver — it isn't baked into the resulting tree, since `Tree` is a pure
+/// in-memory structure with no path concept. Callers that need to remember
+/// where on disk the tree came from (e.g. `Persister` for write paths) keep
+/// the basedir alongside the tree, not inside it.
 pub fn build_tree(driver: &dyn Driver, basedir: &Path) -> Result<Tree, TreeError> {
     let basedir_as_string = basedir.to_string_lossy().to_string();
     let root = build_in_recursion(driver, &basedir_as_string, &basedir_as_string, 0, 10)?
@@ -19,7 +23,7 @@ pub fn build_tree(driver: &dyn Driver, basedir: &Path) -> Result<Tree, TreeError
                 basedir_as_string
             ))
         })?;
-    Ok(Tree::new(basedir_as_string, root))
+    Ok(Tree::new(root))
 }
 
 // Returns `Ok(None)` when the driver chose to skip the path — the caller is

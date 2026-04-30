@@ -1,6 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
-use crate::{Entry, Tree, TreeError};
+use crate::{Entry, Tree, TreeError, build_tree, drivers::Driver};
 
 /// `WorkingTree` is the canonical shared in-memory view: a `Mutex<Arc<Tree>>`
 /// that every participant in a workspace observes and mutates. There's no
@@ -38,6 +41,19 @@ impl WorkingTree {
         Self {
             inner: Mutex::new(Arc::new(tree)),
         }
+    }
+
+    /// Loads a tree from `driver` rooted at `basedir` and wraps it in a
+    /// `WorkingTree`. The driver is borrowed only for the duration of the
+    /// load — the caller can hand it off afterwards (e.g. into a `Persister`
+    /// for writes). `basedir` is similarly only used to walk the driver; the
+    /// resulting tree has no path concept and won't remember it.
+    pub fn from_persisted(
+        driver: &dyn Driver,
+        basedir: &Path,
+    ) -> Result<Self, WorkingTreeError> {
+        let tree = build_tree(driver, basedir)?;
+        Ok(Self::new(tree))
     }
 
     /// Briefly locks to clone the `Arc<Tree>`, then returns it for lock-free
@@ -83,14 +99,12 @@ impl WorkingTree {
 mod tests {
     use super::*;
     use crate::Vfs;
-    use crate::build_tree;
     use std::path::Path;
 
     fn working_with_seed() -> WorkingTree {
         let mut fs = Vfs::new();
         fs.write_file("/root/seed.md", b"".to_vec());
-        let tree = build_tree(&fs, Path::new("/root")).unwrap();
-        WorkingTree::new(tree)
+        WorkingTree::from_persisted(&fs, Path::new("/root")).unwrap()
     }
 
     #[test]

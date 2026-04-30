@@ -1,22 +1,30 @@
 use std::{
     collections::HashSet,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use crate::{
-    WorkingTree, WorkingTreeError, build_tree,
+    WorkingTree, WorkingTreeError,
     drivers::{Driver, DriverError},
     tree::TreeError,
 };
 
 /// `Persister` is the fs-side service for a `WorkingTree`. It owns the disk
-/// driver and the dirty set; it does *not* own the canonical tree state —
-/// that lives in `WorkingTree`, which is held behind an `Arc` and freely
-/// shareable with read-only consumers.
+/// driver, the basedir (where on disk the tree lives), and the dirty set;
+/// it does *not* own the canonical tree state — that lives in `WorkingTree`,
+/// which is held behind an `Arc` and freely shareable with read-only
+/// consumers.
+///
+/// `Persister` is glued to a `WorkingTree` externally: the api caller builds
+/// a `WorkingTree` first (e.g. via `WorkingTree::from_persisted`), then
+/// hands an `Arc` clone to `Persister::new` along with the driver and
+/// basedir. `Persister` plays no role in tree construction.
 ///
 /// Roles:
 /// - Wraps a `Driver` and serializes write access to it.
+/// - Holds the `basedir`. The in-memory tree itself has no path concept —
+///   path-on-disk is purely a persistence concern, so it lives here.
 /// - Tracks the **dirty set**: basenames whose in-memory state has diverged
 ///   from disk. Conceptually this is the `git status` "modified" list for
 ///   the working copy.
@@ -30,8 +38,8 @@ use crate::{
 /// path.
 ///
 /// Read consumers don't need a `Persister` at all: hold an `Arc<WorkingTree>`
-/// (via `Persister::working`) and you can resolve entries lock-freely
-/// without dragging a driver along.
+/// directly and you can resolve entries lock-freely without dragging a
+/// driver along.
 ///
 /// Explicit non-goals:
 /// - No MVCC isolation between editors. The whole point of the split is
@@ -55,6 +63,7 @@ use crate::{
 pub struct Persister {
     working: Arc<WorkingTree>,
     driver: Mutex<Box<dyn Driver>>,
+    basedir: PathBuf,
     pending: Mutex<HashSet<String>>,
 }
 
@@ -74,19 +83,28 @@ pub enum PersisterError {
 }
 
 impl Persister {
-    /// Builds the initial tree from the driver, wraps it in a `WorkingTree`,
-    /// and stores both behind locks. The pending set starts empty — `open`
-    /// reflects what's on disk.
-    pub fn open(
+    /// Glues the fs side onto an already-constructed `WorkingTree`. Takes
+    /// ownership of the driver (it'll be used for writes) and remembers
+    /// `basedir` so `commit` can compute absolute write paths.
+    ///
+    /// Typical wiring:
+    /// ```ignore
+    /// let driver = Stdfs;
+    /// let basedir = PathBuf::from("/path/to/workspace");
+    /// let working = Arc::new(WorkingTree::from_persisted(&driver, &basedir)?);
+    /// let persister = Persister::new(working.clone(), driver, basedir);
+    /// ```
+    pub fn new(
+        working: Arc<WorkingTree>,
         driver: impl Driver + 'static,
-        basedir: &Path,
-    ) -> Result<Self, PersisterError> {
-        let tree = build_tree(&driver, basedir)?;
-        Ok(Self {
-            working: Arc::new(WorkingTree::new(tree)),
+        basedir: PathBuf,
+    ) -> Self {
+        Self {
+            working,
             driver: Mutex::new(Box::new(driver)),
+            basedir,
             pending: Mutex::new(HashSet::new()),
-        })
+        }
     }
 
     /// Hands out the canonical `WorkingTree` for read consumers. Cloning the
@@ -119,9 +137,6 @@ impl Persister {
     /// content written is `b""`. Once Document → bytes serialization exists,
     /// this is where we serialize each pending basename's `Entry::File`.
     pub fn commit(&self) -> Result<(), PersisterError> {
-        let snapshot = self.working.snapshot()?;
-        let basedir = snapshot.basedir();
-
         let mut driver = self
             .driver
             .lock()
@@ -135,7 +150,7 @@ impl Persister {
         // if a write fails partway through.
         let to_flush: Vec<String> = pending.drain().collect();
         for basename in to_flush {
-            let absolute_path = PathBuf::from(&basedir).join(&basename);
+            let absolute_path = self.basedir.join(&basename);
             if let Err(e) = driver.write(&absolute_path, b"") {
                 // Re-insert this basename so a retry will pick it up.
                 pending.insert(basename);
@@ -152,12 +167,23 @@ mod tests {
     use super::*;
     use crate::{Entry, Vfs};
 
+    fn setup(seed_path: &str) -> Persister {
+        let mut fs = Vfs::new();
+        fs.write_file(seed_path, b"".to_vec());
+        let basedir = PathBuf::from("/root");
+        let working = Arc::new(WorkingTree::from_persisted(&fs, &basedir).unwrap());
+        Persister::new(working, fs, basedir)
+    }
+
     #[test]
-    fn open_then_read_via_working_returns_loaded_doc() {
+    fn read_via_working_returns_loaded_doc() {
         let mut fs = Vfs::new();
         fs.write_file("/root/a.md", b"hello".to_vec());
 
-        let p = Persister::open(fs, Path::new("/root")).unwrap();
+        let basedir = PathBuf::from("/root");
+        let working = Arc::new(WorkingTree::from_persisted(&fs, &basedir).unwrap());
+        let p = Persister::new(working, fs, basedir);
+
         let entry = p.working().get_entries("a.md".into()).unwrap();
         assert!(matches!(entry, Entry::File(_)));
     }
@@ -167,11 +193,7 @@ mod tests {
         // After create_document, the entry is reachable via the working tree
         // but the driver hasn't been written to yet — the basename sits in
         // the pending set until `commit` drains it.
-        let p = {
-            let mut fs = Vfs::new();
-            fs.write_file("/root/seed.md", b"".to_vec());
-            Persister::open(fs, Path::new("/root")).unwrap()
-        };
+        let p = setup("/root/seed.md");
 
         let basename = p.create_document().unwrap();
         assert!(basename.starts_with("untitled-"));
@@ -196,14 +218,12 @@ mod tests {
         // The Arc<WorkingTree> handed out by `working()` is the same one the
         // persister holds — mutations through the persister are visible to
         // anyone holding an external clone.
-        let mut fs = Vfs::new();
-        fs.write_file("/root/seed.md", b"".to_vec());
-        let p = Persister::open(fs, Path::new("/root")).unwrap();
-
+        let p = setup("/root/seed.md");
         let external = p.working();
 
         let new_basename = p.create_document().unwrap();
         let entry = external.get_entries(new_basename).unwrap();
         assert!(matches!(entry, Entry::File(_)));
     }
+
 }

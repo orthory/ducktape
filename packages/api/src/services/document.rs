@@ -14,8 +14,10 @@ pub struct DocumentService {
 
 impl DocumentService {
     pub fn new(basedir: String) -> Self {
-        let persister = Persister::open(Stdfs, &PathBuf::from(basedir)).unwrap();
-        let working = persister.working();
+        let driver = Stdfs;
+        let basedir = PathBuf::from(basedir);
+        let working = Arc::new(WorkingTree::from_persisted(&driver, &basedir).unwrap());
+        let persister = Persister::new(working.clone(), driver, basedir);
         DocumentService { persister, working }
     }
 }
