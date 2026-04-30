@@ -3,9 +3,9 @@ use std::{
     sync::{Mutex, RwLock},
 };
 
-use doctree::{Entry, Tree, TreeError};
+use driver::Driver;
 
-use crate::{Driver, build_tree};
+use crate::{Entry, Tree, TreeError, build_tree};
 
 /// `PersistedTree` is the persistence-aware wrapper around an in-memory
 /// `Tree`. It owns both the tree and the driver, and holds them behind their
@@ -83,8 +83,7 @@ impl PersistedTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Vfs;
-    use doctree::Entry;
+    use driver::Vfs;
 
     #[test]
     fn open_then_get_entries_returns_loaded_doc() {

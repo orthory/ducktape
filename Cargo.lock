@@ -244,6 +244,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "document",
+ "driver",
  "serde",
  "thiserror",
 ]
@@ -263,8 +264,6 @@ name = "driver"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "doctree",
- "document",
  "thiserror",
 ]
 

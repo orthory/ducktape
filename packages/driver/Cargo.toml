@@ -6,6 +6,3 @@ edition = "2024"
 [dependencies]
 thiserror.workspace = true
 anyhow.workspace = true
-
-doctree = { path = "../doctree" }
-document = { path = "../document" }
