@@ -2,7 +2,7 @@ use std::{fs::File, io::Read, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{parser::Parser, sections::Sections};
+use sections::{Sections, parser::Parser};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Document {

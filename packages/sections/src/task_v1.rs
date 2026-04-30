@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::{parser::Parser, sections::Section};
+use crate::{Section, parser::Parser};
 use auth;
 use serde::{Deserialize, Serialize};
 

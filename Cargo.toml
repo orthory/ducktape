@@ -6,12 +6,14 @@ edition = "2024"
 [workspace]
 resolver = "2"
 members = [
-    "constructs/auth",
+    "packages/auth",
     "bin",
-    "constructs/doctree",
-    "constructs/document",
-    "api",
-    "constructs/tracker", "utils",
+    "packages/doctree",
+    "packages/document",
+    "packages/sections",
+    "packages/api",
+    "packages/tracker",
+    "utils",
 ]
 
 [workspace.dependencies]
@@ -33,4 +35,4 @@ path = "bin/src/main.rs"
 [dependencies]
 clap = "4.5.45"
 tokio = { version = "1.47.1", features = ["full", "rt"] }
-api = { path = "./api" }
+api = { path = "./packages/api" }

@@ -1,0 +1,14 @@
+[package]
+name = "sections"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror.workspace = true
+lazy_static.workspace = true
+regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+anyhow.workspace = true
+
+auth = { path = "../auth" }
+utils = { path = "../../utils" }

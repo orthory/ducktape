@@ -2,6 +2,12 @@ mod comment_v1;
 mod frontmatter_v1;
 mod task_v1;
 
+pub mod parser;
+
+pub use comment_v1::*;
+pub use frontmatter_v1::*;
+pub use task_v1::*;
+
 // common
 use std::io::Read;
 
@@ -20,9 +26,9 @@ where
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", tag = "@section_type")]
 pub enum Sections {
-    FrontmatterV1(crate::sections::frontmatter_v1::FrontmatterV1),
-    CommentV1(crate::sections::comment_v1::CommentV1),
-    TaskV1(crate::sections::task_v1::TaskV1),
+    FrontmatterV1(crate::frontmatter_v1::FrontmatterV1),
+    CommentV1(crate::comment_v1::CommentV1),
+    TaskV1(crate::task_v1::TaskV1),
 }
 
 // todo: move tehse to instance.rs?
@@ -43,9 +49,9 @@ impl Sections {
     ) -> anyhow::Result<Option<Self>> {
         try_all_sections! {
             parser,
-            FrontmatterV1 => crate::sections::frontmatter_v1::FrontmatterV1,
-            CommentV1 => crate::sections::comment_v1::CommentV1,
-            TaskV1 => crate::sections::task_v1::TaskV1,
+            FrontmatterV1 => crate::frontmatter_v1::FrontmatterV1,
+            CommentV1 => crate::comment_v1::CommentV1,
+            TaskV1 => crate::task_v1::TaskV1,
         }
     }
 }

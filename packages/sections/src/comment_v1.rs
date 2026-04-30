@@ -1,4 +1,4 @@
-use crate::{parser::Parser, sections::Section};
+use crate::{Section, parser::Parser};
 use serde::{Deserialize, Serialize};
 
 const COMMAND: &str = "/comment";
