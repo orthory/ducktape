@@ -21,34 +21,31 @@ where
     fn try_match<R: Read>(document: &mut crate::parser::Parser<R>) -> anyhow::Result<Option<Self>>;
 }
 
+/// `Sections` holds parsed sections at their *latest* in-memory shape — older on-disk
+/// versions are migrated forward by each section module's `try_parse_latest`. Variants
+/// here are version-agnostic on purpose so consumers don't break when a new version of
+/// a section type is added.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", tag = "@section_type")]
 pub enum Sections {
-    FrontmatterV1(FrontmatterV1),
-    CommentV1(CommentV1),
-    TaskV1(TaskV1),
-}
-
-macro_rules! try_all_sections {
-    ($parser:expr, $($variant:ident => $type:ty),* $(,)?) => {
-        $(
-            if let Some(section) = <$type>::try_match($parser)? {
-                return Ok(Some(Sections::$variant(section)));
-            }
-        )*
-        Ok(None)
-    };
+    Frontmatter(FrontmatterLatest),
+    Comment(CommentLatest),
+    Task(TaskLatest),
 }
 
 impl Sections {
     pub fn try_parse_sections<R: Read>(
         parser: &mut crate::parser::Parser<R>,
     ) -> anyhow::Result<Option<Self>> {
-        try_all_sections! {
-            parser,
-            FrontmatterV1 => FrontmatterV1,
-            CommentV1 => CommentV1,
-            TaskV1 => TaskV1,
+        if let Some(s) = frontmatter::try_parse_latest(parser)? {
+            return Ok(Some(Sections::Frontmatter(s)));
         }
+        if let Some(s) = comment::try_parse_latest(parser)? {
+            return Ok(Some(Sections::Comment(s)));
+        }
+        if let Some(s) = task::try_parse_latest(parser)? {
+            return Ok(Some(Sections::Task(s)));
+        }
+        Ok(None)
     }
 }
