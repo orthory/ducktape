@@ -15,14 +15,10 @@ use crate::{
 /// where on disk the tree came from (e.g. `Persister` for write paths) keep
 /// the basedir alongside the tree, not inside it.
 pub fn build_tree(driver: &dyn Driver, basedir: &Path) -> Result<Tree, TreeError> {
-    let basedir_as_string = basedir.to_string_lossy().to_string();
-    let root = build_in_recursion(driver, &basedir_as_string, &basedir_as_string, 0, 10)?
-        .ok_or_else(|| {
-            TreeError::InvalidEntry(format!(
-                "basedir was skipped by driver: {}",
-                basedir_as_string
-            ))
-        })?;
+    let basedir_str = basedir.to_string_lossy().to_string();
+    let root = build_in_recursion(driver, &basedir_str, &basedir_str)?.ok_or_else(|| {
+        TreeError::InvalidEntry(format!("basedir was skipped by driver: {}", basedir_str))
+    })?;
     Ok(Tree::new(root))
 }
 
@@ -31,10 +27,8 @@ pub fn build_tree(driver: &dyn Driver, basedir: &Path) -> Result<Tree, TreeError
 // as a present-but-empty child.
 fn build_in_recursion(
     driver: &dyn Driver,
-    base_path: &String,
-    load_path: &String,
-    current_depth: usize,
-    max_depth: usize,
+    base_path: &str,
+    load_path: &str,
 ) -> Result<Option<Arc<Entry>>, TreeError> {
     let load_result = driver
         .load(Path::new(load_path))
@@ -49,24 +43,19 @@ fn build_in_recursion(
             let descendants: Result<Vec<(String, Arc<Entry>)>, TreeError> = path_bufs
                 .iter()
                 .filter_map(|descendant_path| {
-                    let descendant_path_as_string = descendant_path.to_string_lossy().to_string();
-                    let entry = match build_in_recursion(
-                        driver,
-                        base_path,
-                        &descendant_path_as_string,
-                        current_depth + 1,
-                        max_depth,
-                    ) {
+                    let descendant_str = descendant_path.to_string_lossy().to_string();
+                    let entry = match build_in_recursion(driver, base_path, &descendant_str) {
                         Ok(Some(e)) => e,
                         Ok(None) => return None,
                         Err(e) => return Some(Err(e)),
                     };
-                    let relative_path: Vec<&str> = match Path::new(&descendant_path_as_string)
-                        .strip_prefix(base_path)
-                    {
-                        Ok(p) => p.iter().map(|x| x.to_str().unwrap()).collect(),
-                        Err(e) => return Some(Err(TreeError::InvalidPathSegment(e.to_string()))),
-                    };
+                    let relative_path: Vec<&str> =
+                        match Path::new(&descendant_str).strip_prefix(base_path) {
+                            Ok(p) => p.iter().map(|x| x.to_str().unwrap()).collect(),
+                            Err(e) => {
+                                return Some(Err(TreeError::InvalidPathSegment(e.to_string())));
+                            }
+                        };
                     let first_segment = relative_path[relative_path.len() - 1];
                     Some(Ok((first_segment.to_string(), entry)))
                 })
