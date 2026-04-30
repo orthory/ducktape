@@ -28,28 +28,34 @@ pub struct CommentV1 {
 
 impl Section for CommentV1 {
     fn try_match<R: std::io::Read>(document: &mut Parser<R>) -> anyhow::Result<Option<Self>> {
-        let Some((variables, body)) = document.try_map_command_group(COMMAND)? else {
+        let Some(matched) = document.try_map_command_group(COMMAND)? else {
             return Ok(None);
         };
 
-        Ok(match variables {
-            None => Err(CommentError::EmptyArgument),
-            Some(variables) if variables.len() != 3 => Err(CommentError::InvalidArgumentLength(
-                variables.join(";"),
-                variables.len(),
-                3 as usize,
-            )),
-            Some(variables) => Ok(Some(CommentV1 {
-                author: variables[0].to_string(),
-                parent_id: u64::from_str_radix(&variables[1], 10).map_err(|e| {
-                    CommentError::InvalidArguments(variables.join(","), 1, e.to_string())
-                })?,
-                timestamp: u64::from_str_radix(&variables[2], 10).map_err(|e| {
-                    CommentError::InvalidArguments(variables.join(","), 2, e.to_string())
-                })?,
-                body: body,
-            })),
-        }?)
+        let args = matched.args.ok_or(CommentError::EmptyArgument)?;
+        if args.len() != 3 {
+            return Err(CommentError::InvalidArgumentLength(
+                args.join(";"),
+                args.len(),
+                3,
+            )
+            .into());
+        }
+
+        let author = args[0].clone();
+        let parent_id = args[1]
+            .parse::<u64>()
+            .map_err(|e| CommentError::InvalidArguments(args.join(","), 1, e.to_string()))?;
+        let timestamp = args[2]
+            .parse::<u64>()
+            .map_err(|e| CommentError::InvalidArguments(args.join(","), 2, e.to_string()))?;
+
+        Ok(Some(CommentV1 {
+            parent_id,
+            timestamp,
+            author,
+            body: matched.body,
+        }))
     }
 }
 
@@ -57,16 +63,28 @@ impl Section for CommentV1 {
 mod tests {
     use super::*;
     const SAMPLE_COMMENT: &str = r#"
-/comment{@author;12345;12345}
+/comment{@orthory;42;1700000000}
 This is a sample comment.
 Multiline xyz is also supported
 /comment
 "#;
 
     #[test]
-    fn test_asdf() {
+    fn parses_comment() {
         let mut buffer = Parser::new(SAMPLE_COMMENT.trim_start().as_bytes());
-        let comment = CommentV1::try_match(&mut buffer);
-        dbg!(comment);
+        let comment = CommentV1::try_match(&mut buffer)
+            .expect("parse ok")
+            .expect("comment matched");
+        assert_eq!(comment.author, "@orthory");
+        assert_eq!(comment.parent_id, 42);
+        assert_eq!(comment.timestamp, 1700000000);
+        assert_eq!(comment.body.len(), 2);
+    }
+
+    #[test]
+    fn rejects_wrong_arg_count() {
+        let input = "/comment{@only;one}\nbody\n/comment\n";
+        let mut buffer = Parser::new(input.as_bytes());
+        assert!(CommentV1::try_match(&mut buffer).is_err());
     }
 }

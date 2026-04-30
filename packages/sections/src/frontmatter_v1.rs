@@ -31,11 +31,12 @@ pub struct FrontmatterV1 {
 
 impl Section for FrontmatterV1 {
     fn try_match<R: std::io::Read>(document: &mut Parser<R>) -> anyhow::Result<Option<Self>> {
-        let Some((_, body)) = document.try_map_command_group(COMMAND)? else {
+        let Some(matched) = document.try_map_command_group(COMMAND)? else {
             return Ok(None);
         };
 
-        let misc: HashMap<String, String> = body
+        let misc: HashMap<String, String> = matched
+            .body
             .into_iter()
             .map(|line| {
                 let (k, v) = line.split_once(":").ok_or(FrontmatterError::InvalidData)?;

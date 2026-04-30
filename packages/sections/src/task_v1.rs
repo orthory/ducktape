@@ -42,11 +42,12 @@ pub struct TaskV1 {
 
 impl Section for TaskV1 {
     fn try_match<R: std::io::Read>(document: &mut Parser<R>) -> anyhow::Result<Option<Self>> {
-        let Some((variables, body)) = document.try_map_command_group(COMMAND)? else {
+        let Some(matched) = document.try_map_command_group(COMMAND)? else {
             return Ok(None);
         };
 
-        let variables = variables.ok_or(TaskError::InvalidData)?;
+        let variables = matched.args.ok_or(TaskError::InvalidData)?;
+        let body = matched.body;
 
         let author =
             auth::User::from_str(variables.get(0).ok_or(TaskError::MissingData("author"))?);

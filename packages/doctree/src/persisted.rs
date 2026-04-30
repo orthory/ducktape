@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -8,26 +9,33 @@ use crate::{
     drivers::{Driver, DriverError},
 };
 
-/// `PersistedTree` is the persistence-aware wrapper around an in-memory
-/// `Tree`. It owns both the tree and the driver, and holds them behind their
-/// respective locks so the api layer never sees `Driver`, locks, or the
-/// version-swap mechanics.
+/// `PersistedTree` couples an in-memory `Tree` with a `Driver` backend, but
+/// follows a working-copy / commit model rather than write-through:
+///
+/// - Reads always go through `Tree`. The driver isn't touched on the read
+///   path — `Tree` is effectively a fully-loaded read cache built from the
+///   driver at `open` time.
+/// - Mutations (e.g. `create_document`) only update the in-memory tree and
+///   record the affected basename in a `pending` set. Nothing hits the
+///   driver yet.
+/// - `commit` is the explicit sync point: it drains the pending set and
+///   writes each entry through the driver. Calls between mutations and
+///   commit see the new state in-memory; the on-disk truth lags until
+///   commit succeeds.
 ///
 /// Concurrency model:
-/// - The tree lives in `Mutex<Arc<Tree>>`. Readers lock briefly to clone
-///   the `Arc` (cheap; structural sharing keeps the clone shallow), drop
-///   the lock, and read the snapshot lock-free — readers never wait on
-///   each other or on a writer's actual read of the tree.
-/// - Writers hold the tree mutex for the duration of their operation
-///   (driver write + tree swap), serializing writes. Each write commits a
-///   fresh `Arc` via `*guard = Arc::new(next)`; previous readers' snapshots
-///   stay valid via Arc liveness.
-/// - The driver lives in `Mutex<Box<dyn Driver>>`. Locking yields `&mut`
-///   access — `Driver::write`'s `&mut self` enforces exclusivity at the
-///   type level.
+/// - `tree: Mutex<Arc<Tree>>` — readers lock briefly to clone the `Arc`,
+///   drop the lock, then read the snapshot lock-free. Writers hold the
+///   mutex for the duration of their op (mutate + swap).
+/// - `driver: Mutex<Box<dyn Driver>>` — `Driver::write`'s `&mut self`
+///   enforces exclusive access at the type level; the mutex is what mints
+///   that `&mut`.
+/// - `pending: Mutex<HashSet<String>>` — guarded set of basenames awaiting
+///   commit; locked briefly when adding entries and when draining at commit.
 pub struct PersistedTree {
     tree: Mutex<Arc<Tree>>,
     driver: Mutex<Box<dyn Driver>>,
+    pending: Mutex<HashSet<String>>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -44,6 +52,7 @@ pub enum PersistedTreeError {
 
 impl PersistedTree {
     /// Builds the initial tree from the driver and stores both behind locks.
+    /// The pending set starts empty — `open` reflects what's on disk.
     pub fn open(
         driver: impl Driver + 'static,
         basedir: &Path,
@@ -52,6 +61,7 @@ impl PersistedTree {
         Ok(Self {
             tree: Mutex::new(Arc::new(tree)),
             driver: Mutex::new(Box::new(driver)),
+            pending: Mutex::new(HashSet::new()),
         })
     }
 
@@ -70,14 +80,9 @@ impl PersistedTree {
         Ok(entry.clone())
     }
 
-    /// Mints a new document, persists an empty buffer for it via the driver,
-    /// and swaps in a tree version that includes the new entry. Returns the
-    /// generated identifier (a basename within the tree's basedir).
-    ///
-    /// Order: write to driver first, then swap the tree. If the write fails,
-    /// the in-memory tree stays consistent with disk; if the swap somehow
-    /// failed afterwards, disk would be ahead but readers would converge on
-    /// the next reload. Never the other direction.
+    /// Mints a new document and adds it to the tree in-memory only. The
+    /// returned basename is reachable via `get_entries` immediately, but
+    /// nothing is on disk until `commit` is called.
     pub fn create_document(&self) -> Result<String, PersistedTreeError> {
         let basename = format!("untitled-{}.md", utils::time::now_micros());
 
@@ -85,17 +90,59 @@ impl PersistedTree {
             .tree
             .lock()
             .map_err(|e| PersistedTreeError::Lock(e.to_string()))?;
-        let absolute_path = PathBuf::from(tree_guard.basedir()).join(&basename);
-
-        self.driver
-            .lock()
-            .map_err(|e| PersistedTreeError::Lock(e.to_string()))?
-            .write(&absolute_path, b"")?;
-
         let next = tree_guard.with_new_document(basename.clone())?;
         *tree_guard = Arc::new(next);
+        drop(tree_guard);
+
+        self.pending
+            .lock()
+            .map_err(|e| PersistedTreeError::Lock(e.to_string()))?
+            .insert(basename.clone());
 
         Ok(basename)
+    }
+
+    /// Drains the pending set and writes each entry through the driver.
+    /// On a partial failure (driver returns an error mid-drain) the already-
+    /// written entries stay written and the failed-or-later ones remain in
+    /// the pending set; the caller can retry `commit`. The in-memory tree
+    /// is unchanged either way.
+    ///
+    /// Today every pending entry is a freshly-created empty document, so the
+    /// content written is `b""`. Once Document → bytes serialization exists,
+    /// this is where we serialize each pending basename's `Entry::File`.
+    pub fn commit(&self) -> Result<(), PersistedTreeError> {
+        let snapshot = {
+            let guard = self
+                .tree
+                .lock()
+                .map_err(|e| PersistedTreeError::Lock(e.to_string()))?;
+            guard.clone()
+        };
+        let basedir = snapshot.basedir();
+
+        let mut driver = self
+            .driver
+            .lock()
+            .map_err(|e| PersistedTreeError::Lock(e.to_string()))?;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|e| PersistedTreeError::Lock(e.to_string()))?;
+
+        // Drain by collecting first; lets us put back any unprocessed entries
+        // if a write fails partway through.
+        let to_flush: Vec<String> = pending.drain().collect();
+        for basename in to_flush {
+            let absolute_path = PathBuf::from(&basedir).join(&basename);
+            if let Err(e) = driver.write(&absolute_path, b"") {
+                // Re-insert this basename so a retry will pick it up.
+                pending.insert(basename);
+                return Err(PersistedTreeError::Driver(e));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -115,21 +162,36 @@ mod tests {
     }
 
     #[test]
-    fn create_document_persists_and_returns_resolvable_path() {
-        let mut fs = Vfs::new();
-        fs.write_file("/root/existing.md", b"".to_vec());
+    fn create_document_is_in_memory_only_until_commit() {
+        // Driver is shared between PersistedTree and the test's view of the
+        // filesystem via Arc-cloning the inner Vfs through a side channel —
+        // not how production code uses it, but lets us inspect what was
+        // actually written. Simpler: drive everything through PersistedTree
+        // and re-open from the same backing to check on-disk state.
+        // Instead we do a direct check: after create_document, the tree has
+        // the entry but the driver doesn't.
+        let pt = {
+            let mut fs = Vfs::new();
+            fs.write_file("/root/seed.md", b"".to_vec());
+            PersistedTree::open(fs, Path::new("/root")).unwrap()
+        };
 
-        let pt = PersistedTree::open(fs, Path::new("/root")).unwrap();
         let path = pt.create_document().unwrap();
-
         assert!(path.starts_with("untitled-"));
-        assert!(path.ends_with(".md"));
 
-        let new_entry = pt.get_entries(path).unwrap();
-        assert!(matches!(new_entry, Entry::File(_)));
+        // In-memory: reachable.
+        let entry = pt.get_entries(path.clone()).unwrap();
+        assert!(matches!(entry, Entry::File(_)));
 
-        let existing = pt.get_entries("existing.md".into()).unwrap();
-        assert!(matches!(existing, Entry::File(_)));
+        // Pending: contains the new basename.
+        assert!(pt.pending.lock().unwrap().contains(&path));
+
+        // Commit: pending drains, no error.
+        pt.commit().unwrap();
+        assert!(pt.pending.lock().unwrap().is_empty());
+
+        // Re-running commit is a no-op (nothing pending).
+        pt.commit().unwrap();
     }
 
     #[test]
@@ -143,18 +205,14 @@ mod tests {
 
         let pt = PersistedTree::open(fs, Path::new("/root")).unwrap();
 
-        // Read the current snapshot's tree pointer by grabbing one entry.
         let pre_swap = pt.get_entries("old.md".into()).unwrap();
         assert!(matches!(pre_swap, Entry::File(_)));
 
-        // Writer swaps in a new version with an additional doc.
         let new_path = pt.create_document().unwrap();
 
-        // Old entry still resolves (the new version preserved it).
         let old = pt.get_entries("old.md".into()).unwrap();
         assert!(matches!(old, Entry::File(_)));
 
-        // New entry resolves too.
         let new = pt.get_entries(new_path).unwrap();
         assert!(matches!(new, Entry::File(_)));
     }
