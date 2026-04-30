@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, path::Path};
+use std::{io::Read, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,18 +38,14 @@ impl Document {
             .open(&path)
             .map_err(|e| DocumentInstanceError::IOError(e.to_string()))?;
 
-        Self::from_file(file)
+        Self::from_reader(file)
     }
 
-    pub fn from_file(file: File) -> Result<Self, DocumentInstanceError> {
-        // create parser instance against the entire file,
-        // and parse out all sections.
-        let (body, sections) = try_instantiate_document(file)?;
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self, DocumentInstanceError> {
+        let (body, sections) = try_instantiate_document(reader)?;
 
         Ok(Document { body, sections })
     }
-
-    // todo: from_buffer?
 }
 
 fn try_instantiate_document<R: Read>(

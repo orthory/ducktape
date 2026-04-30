@@ -1,10 +1,10 @@
-use std::{fs::File, path::PathBuf};
+use std::{io::Read, path::PathBuf};
 
 pub mod stdfs;
 pub mod vfs;
 
 pub enum DriverResult {
-    File(PathBuf, File),
+    File(PathBuf, Box<dyn Read + Send>),
     Directory(PathBuf, Vec<PathBuf>),
     Skip,
 }

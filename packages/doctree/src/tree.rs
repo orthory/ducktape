@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path};
+use std::{io::Read, path::Path};
 
 use crate::{
     drivers::{DriverError, DriverResult},
@@ -31,24 +31,26 @@ pub struct Tree<Doc> {
     writer: Writer,
 }
 
-type Loader = fn(&Path) -> Result<DriverResult, DriverError>;
-type Writer = fn(&Path) -> Result<DriverResult, DriverError>;
-type DocBuild<Doc> = fn(File) -> Result<Doc, anyhow::Error>;
+type Loader = Box<dyn Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync>;
+type Writer = Box<dyn Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync>;
+type DocBuild<Doc> = fn(Box<dyn Read + Send>) -> Result<Doc, anyhow::Error>;
 
 impl<Doc: Default> Tree<Doc> {
     pub fn new(
         basedir: &Path,
         doc_builder: DocBuild<Doc>,
-        loader: Loader,
-        writer: Writer,
+        loader: impl Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync + 'static,
+        writer: impl Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync + 'static,
     ) -> Result<Self, TreeError> {
         let basedir_as_string = basedir.to_string_lossy().to_string();
+        let loader: Loader = Box::new(loader);
+        let writer: Writer = Box::new(writer);
 
         Ok(Self {
             root: build_in_recursion(
                 &basedir_as_string,
                 &basedir_as_string,
-                loader,
+                &*loader,
                 doc_builder,
                 0,
                 10,
@@ -95,7 +97,7 @@ impl<Doc: Default> Tree<Doc> {
 fn build_in_recursion<'build, Doc>(
     base_path: &String,
     load_path: &String,
-    load: Loader,
+    load: &(dyn Fn(&Path) -> Result<DriverResult, DriverError> + Send + Sync),
     doc_builder: DocBuild<Doc>,
     current_depth: usize,
     max_depth: usize,
@@ -173,9 +175,12 @@ fn search_in_recursion<'search, Doc>(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufReader, Read};
+    use std::{
+        io::{BufReader, Read},
+        sync::Arc,
+    };
 
-    use crate::drivers;
+    use crate::drivers::vfs::{self, Vfs};
 
     use super::*;
 
@@ -198,26 +203,46 @@ mod tests {
                     )]),
                 ),
             ]),
+            loader: Box::new(|_| Err(DriverError::Unreachable)),
+            writer: Box::new(|_| Err(DriverError::Unreachable)),
         }
     }
 
-    #[test]
-    fn build_in_recursion_works() {
-        let cwd = std::env::current_dir()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let docbuilder: DocBuild<String> = |f| {
+    fn read_to_string_builder() -> DocBuild<String> {
+        |f| {
             let mut res: String = Default::default();
             let mut rb = BufReader::new(f);
             rb.read_to_string(&mut res)
                 .map_err(|e| anyhow::anyhow!(e))?;
             Ok(res)
-        };
+        }
+    }
 
-        let yee = build_in_recursion(&cwd, drivers::stdfs::load, docbuilder, 0, 20).unwrap();
+    #[test]
+    fn tree_builds_from_vfs_fixture() {
+        let mut fs = Vfs::new();
+        fs.write_file("/root/a/aa/aaa.md", b"hello".to_vec());
+        fs.write_file("/root/b/bb/bbb.md", b"world".to_vec());
 
-        dbg!(yee);
+        let tree = Tree::<String>::new(
+            Path::new("/root"),
+            read_to_string_builder(),
+            vfs::load(Arc::new(fs)),
+            |_| Err(DriverError::Unreachable),
+        )
+        .unwrap();
+
+        let aaa = tree.get_entries("a/aa/aaa.md".into()).unwrap();
+        match aaa {
+            Entry::File(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected file at a/aa/aaa.md"),
+        }
+
+        let bbb = tree.get_entries("b/bb/bbb.md".into()).unwrap();
+        match bbb {
+            Entry::File(s) => assert_eq!(s, "world"),
+            _ => panic!("expected file at b/bb/bbb.md"),
+        }
     }
 
     #[test]

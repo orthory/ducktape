@@ -29,7 +29,7 @@ pub fn load(path: &Path) -> Result<DriverResult, DriverError> {
             .read(true)
             .write(true)
             .open(&path)?;
-        return Ok(DriverResult::File(path.into(), file));
+        return Ok(DriverResult::File(path.into(), Box::new(file)));
     }
 
     // don't handle other cases
