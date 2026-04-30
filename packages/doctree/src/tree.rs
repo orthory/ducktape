@@ -27,8 +27,9 @@ pub enum TreeError {
 // cheap to clone: `root` is an `Arc<Entry>` whose Directory variants also
 // Arc their children. Mutations produce a new `Tree` version; `WorkingTree`
 // wraps `Mutex<Arc<Tree>>` to coordinate canonical shared state, and
-// `Persister` wraps `WorkingTree` to add disk-side concerns (driver, dirty
-// set, basedir, commit boundary).
+// `Persister` glues disk-side concerns (driver, dirty set, basedir, commit
+// boundary) onto an externally-owned `WorkingTree` — it doesn't hold one
+// itself.
 //
 // The MVCC shape (immutability + `with_X` builders + structural sharing) is
 // here for atomic version swap, lock-free reads, and in-flight read

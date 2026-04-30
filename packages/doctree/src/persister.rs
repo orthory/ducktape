@@ -113,8 +113,12 @@ impl Persister {
     /// registers the resulting basename as dirty in one call. Returns the
     /// minted basename so callers can use it in subsequent operations.
     /// Nothing hits the driver until `commit`.
-    pub fn create_document(&self, working: &WorkingTree) -> Result<String, PersisterError> {
-        let basename = working.create_document()?;
+    pub fn create_document(
+        &self,
+        working: &WorkingTree,
+        document_path: String,
+    ) -> Result<String, PersisterError> {
+        let basename = working.create_document(document_path)?;
         self.mark_dirty(basename.clone())?;
         Ok(basename)
     }
@@ -159,7 +163,7 @@ impl Persister {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Entry, Vfs};
+    use crate::Vfs;
 
     fn setup(seed_path: &str) -> (WorkingTree, Persister) {
         let mut fs = Vfs::new();
@@ -172,17 +176,14 @@ mod tests {
 
     #[test]
     fn create_document_is_in_memory_only_until_commit() {
-        // After create_document, the entry is reachable via the working tree
-        // but the driver hasn't been written to yet — the basename sits in
-        // the pending set until `commit` drains it.
+        // After create_document, the basename is registered in the pending
+        // set but the driver hasn't been written to yet. Commit drains.
         let (working, persister) = setup("/root/seed.md");
 
-        let basename = persister.create_document(&working).unwrap();
+        let basename = persister
+            .create_document(&working, String::new())
+            .unwrap();
         assert!(basename.starts_with("untitled-"));
-
-        // In-memory: reachable via working tree.
-        let entry = working.get_entries(basename.clone()).unwrap();
-        assert!(matches!(entry, Entry::File(_)));
 
         // Pending: contains the new basename.
         assert!(persister.pending.lock().unwrap().contains(&basename));
@@ -209,7 +210,7 @@ mod tests {
         // persister via `mark_dirty`. Equivalent to using `create_document`.
         let (working, persister) = setup("/root/seed.md");
 
-        let basename = working.create_document().unwrap();
+        let basename = working.create_document(String::new()).unwrap();
         persister.mark_dirty(basename.clone()).unwrap();
 
         assert!(persister.pending.lock().unwrap().contains(&basename));

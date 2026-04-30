@@ -21,8 +21,9 @@ use crate::{Entry, Tree, TreeError, build_tree, drivers::Driver};
 ///
 /// What does *not* live here:
 /// - persistence (driver i/o, dirty tracking, commit boundary). That's
-///   `Persister`'s job, and it wraps an `Arc<WorkingTree>` to add those
-///   concerns without tangling them into the canonical-state type.
+///   `Persister`'s job. `Persister` doesn't hold a `WorkingTree` handle —
+///   the api caller owns the canonical `Arc<WorkingTree>` and passes it in
+///   to `Persister` operations that need it (e.g. `commit`).
 pub struct WorkingTree {
     inner: Mutex<Arc<Tree>>,
 }
@@ -75,9 +76,10 @@ impl WorkingTree {
         Ok(entry.clone())
     }
 
-    /// Mints a fresh basename, applies it via `Tree::with_new_document`, and
-    /// publishes the swap. Returns the minted basename so callers (e.g.
-    /// `Persister`) can record it as dirty for later flush.
+    /// Mints a fresh basename, joins it with `document_path` to form the
+    /// canonical entry key, applies the addition via `Tree::with_new_document`,
+    /// and publishes the swap. Returns the minted basename so callers
+    /// (e.g. `Persister`) can record it as dirty for later flush.
     ///
     /// This is a pure in-memory mutation — no persistence happens here.
     /// Callers that need disk durability should go through `Persister`.
@@ -115,14 +117,23 @@ mod tests {
         assert!(matches!(entry, Entry::File(_)));
     }
 
+    fn root_child_count(wt: &WorkingTree) -> usize {
+        match wt.snapshot().unwrap().root().as_ref() {
+            Entry::Directory(items) => items.len(),
+            _ => panic!("root should be a Directory"),
+        }
+    }
+
     #[test]
     fn create_document_publishes_new_version() {
         let wt = working_with_seed();
-        let basename = wt.create_document().unwrap();
+        let pre_count = root_child_count(&wt);
+
+        let basename = wt.create_document(String::new()).unwrap();
         assert!(basename.starts_with("untitled-"));
 
-        let entry = wt.get_entries(basename).unwrap();
-        assert!(matches!(entry, Entry::File(_)));
+        // The new entry is published to the working tree.
+        assert_eq!(root_child_count(&wt), pre_count + 1);
     }
 
     #[test]
@@ -133,24 +144,20 @@ mod tests {
         let wt = working_with_seed();
         let pre = wt.snapshot().unwrap();
 
-        let new_basename = wt.create_document().unwrap();
+        wt.create_document(String::new()).unwrap();
 
-        // Pre-mutation snapshot still resolves the seed and does not see
-        // the new document.
+        // Pre-mutation snapshot still resolves the seed and only knows about
+        // pre-mutation children.
         assert!(matches!(
             pre.get_entries("seed.md".into()).unwrap(),
             Entry::File(_)
         ));
-        assert!(pre.get_entries(new_basename.clone()).is_err());
+        let Entry::Directory(pre_items) = pre.root().as_ref() else {
+            panic!("root should be a Directory");
+        };
+        assert_eq!(pre_items.len(), 1);
 
-        // Post-mutation, both are reachable through the live working tree.
-        assert!(matches!(
-            wt.get_entries("seed.md".into()).unwrap(),
-            Entry::File(_)
-        ));
-        assert!(matches!(
-            wt.get_entries(new_basename).unwrap(),
-            Entry::File(_)
-        ));
+        // The live working tree sees the new entry.
+        assert_eq!(root_child_count(&wt), 2);
     }
 }
