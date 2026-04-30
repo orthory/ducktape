@@ -81,14 +81,15 @@ impl WorkingTree {
     ///
     /// This is a pure in-memory mutation — no persistence happens here.
     /// Callers that need disk durability should go through `Persister`.
-    pub fn create_document(&self) -> Result<String, WorkingTreeError> {
+    pub fn create_document(&self, document_path: String) -> Result<String, WorkingTreeError> {
         let basename = format!("untitled-{}.md", utils::time::now_micros());
 
         let mut guard = self
             .inner
             .lock()
             .map_err(|e| WorkingTreeError::Lock(e.to_string()))?;
-        let next = guard.with_new_document(basename.clone())?;
+        let canonical_file_path = Path::new(&basename).join(document_path).display().to_string();
+        let next = guard.with_new_document(canonical_file_path)?;
         *guard = Arc::new(next);
 
         Ok(basename)

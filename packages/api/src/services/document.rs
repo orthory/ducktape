@@ -37,11 +37,12 @@ pub async fn get_documents(
 
 #[handler]
 pub async fn create_document(
+    Path(document_path): Path<String>,
     Data(docsvc): Data<&Arc<DocumentService>>,
 ) -> Result<Json<Identifier>> {
     let path = docsvc
-        .persister
-        .create_document(&docsvc.working)
+        .working
+        .create_document(document_path)
         .map_err(poem::error::InternalServerError)?;
 
     Ok(Json(Identifier::Document(path)))
