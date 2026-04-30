@@ -97,7 +97,6 @@ fn search_in_recursion<'search>(
     current: &'search Entry,
 ) -> Result<&'search Entry, TreeError> {
     match current {
-        Entry::None => Err(TreeError::InvalidEntry("???".to_string())),
         Entry::File(_) => Ok(current),
         Entry::Directory(items) => {
             let (_, next_current) = items
