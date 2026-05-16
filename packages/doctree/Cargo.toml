@@ -8,5 +8,5 @@ serde = { workspace = true, features = ["derive", "rc"] }
 thiserror.workspace = true
 anyhow.workspace = true
 
-document = { path = "../document" }
-utils = { path = "../../utils" }
+document.workspace = true
+utils.workspace = true

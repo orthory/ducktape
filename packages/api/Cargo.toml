@@ -8,5 +8,5 @@ serde.workspace = true
 anyhow.workspace = true
 poem.workspace = true
 
-doctree = { path = "../doctree" }
-document = { path = "../document" }
+doctree.workspace = true
+document.workspace = true

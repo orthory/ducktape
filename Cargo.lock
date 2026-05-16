@@ -544,6 +544,7 @@ name = "journal"
 version = "0.1.0"
 dependencies = [
  "nodes",
+ "thiserror",
  "uid",
 ]
 
