@@ -1,4 +1,4 @@
-use crate::{Section, parser::Parser};
+use crate::{Node, parser::Parser};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uid::{Identify, Uid, UidError};
@@ -21,8 +21,8 @@ pub enum FrontmatterError {
 }
 
 // Frontmatter holds the document's identity — Document::uid() looks up the
-// frontmatter section and returns its uid. There's only ever one Frontmatter
-// per Document, so this is also the document's uid. Like every other section,
+// frontmatter node and returns its uid. There's only ever one Frontmatter
+// per Document, so this is also the document's uid. Like every other node,
 // the server never mints; the uid arrives from the creator.
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -53,7 +53,7 @@ impl Identify for FrontmatterV1 {
     }
 }
 
-impl Section for FrontmatterV1 {
+impl Node for FrontmatterV1 {
     fn try_match<R: std::io::Read>(document: &mut Parser<R>) -> anyhow::Result<Option<Self>> {
         let Some(matched) = document.try_map_command_group(COMMAND)? else {
             return Ok(None);

@@ -10,10 +10,10 @@ members = [
     "bin",
     "packages/doctree",
     "packages/document",
-    "packages/sections",
+    "packages/nodes",
     "packages/api",
     "packages/uid",
-    "utils",
+    "utils", "packages/journal",
 ]
 
 [workspace.dependencies]

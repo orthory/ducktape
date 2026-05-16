@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::{Section, parser::Parser};
+use crate::{Node, parser::Parser};
 use serde::{Deserialize, Serialize};
 use uid::{Identify, Uid, UidError};
 
@@ -31,7 +31,7 @@ pub enum TaskError {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TaskV1 {
     // Stable identity assigned by the creator (client / CRDT). Server never
-    // mints — sections fly in pre-uid'd. Until the on-disk v2 format carries
+    // mints — nodes fly in pre-uid'd. Until the on-disk v2 format carries
     // the uid in args, parsing the v1 markdown leaves this as the nil uuid.
     pub uid: Uid,
     pub title: String,
@@ -53,7 +53,7 @@ impl Identify for TaskV1 {
     }
 }
 
-impl Section for TaskV1 {
+impl Node for TaskV1 {
     fn try_match<R: std::io::Read>(document: &mut Parser<R>) -> anyhow::Result<Option<Self>> {
         let Some(matched) = document.try_map_command_group(COMMAND)? else {
             return Ok(None);

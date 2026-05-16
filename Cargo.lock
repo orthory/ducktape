@@ -259,7 +259,7 @@ name = "document"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "sections",
+ "nodes",
  "serde",
  "thiserror",
  "uid",
@@ -540,6 +540,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
+name = "journal"
+version = "0.1.0"
+dependencies = [
+ "nodes",
+ "uid",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -615,6 +623,20 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nodes"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "auth",
+ "lazy_static",
+ "regex",
+ "serde",
+ "thiserror",
+ "uid",
+ "utils",
 ]
 
 [[package]]
@@ -827,20 +849,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "sections"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "auth",
- "lazy_static",
- "regex",
- "serde",
- "thiserror",
- "uid",
- "utils",
-]
 
 [[package]]
 name = "serde"

@@ -4,7 +4,7 @@ pub use v1::{FrontmatterError, FrontmatterV1};
 
 use std::io::Read;
 
-use crate::{Section, parser::Parser};
+use crate::{Node, parser::Parser};
 
 pub type FrontmatterLatest = FrontmatterV1;
 

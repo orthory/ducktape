@@ -2,31 +2,37 @@ use std::{collections::HashMap, io::Read, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use sections::{Sections, parser::Parser};
+use nodes::{Nodes, parser::Parser};
 use uid::{Identify, Uid, UidError};
+
+use crate::Container;
 
 #[derive(Default, Deserialize, Serialize, Debug, Clone)]
 pub struct Document {
+
+    pub(crate) container: Container,
+
+
     // global body buffer as vector of lines
     pub(crate) body: Vec<String>,
 
-    // separate sections
-    pub(crate) sections: Vec<Sections>,
+    // separate nodes
+    pub(crate) nodes: Vec<Nodes>,
 
-    // unordered map of sections for tracking individually;
-    // must be in sync with sections.
-    pub(crate) sections_map: HashMap<Uid, Sections>,
+    // unordered map of nodes for tracking individually;
+    // must be in sync with nodes.
+    pub(crate) nodes_map: HashMap<Uid, Nodes>,
 }
 
-// The document's identity lives on its Frontmatter section — there's only ever
+// The document's identity lives on its Frontmatter node — there's only ever
 // one. A document with no frontmatter (or one whose frontmatter uid is itself
 // unassigned) returns `Err(UidError::Unassigned)`.
 impl Identify for Document {
     fn try_uid(&self) -> Result<Uid, UidError> {
-        self.sections
+        self.nodes
             .iter()
             .find_map(|s| match s {
-                Sections::Frontmatter(fm) => Some(fm.try_uid()),
+                Nodes::Frontmatter(fm) => Some(fm.try_uid()),
                 _ => None,
             })
             .unwrap_or(Err(UidError::Unassigned))
@@ -53,43 +59,43 @@ impl Document {
     }
 
     pub fn from_reader<R: Read>(reader: R) -> Result<Self, DocumentInstanceError> {
-        let (body, sections) = try_instantiate_document(reader)?;
-        // Sections without an assigned uid (e.g. parsed from the legacy v1 on-disk
+        let (body, nodes) = try_instantiate_document(reader)?;
+        // Nodes without an assigned uid (e.g. parsed from the legacy v1 on-disk
         // format that doesn't carry uids) are left out of the index. They still
-        // live in `sections` and become indexable once their uid is assigned.
-        let sections_map = sections
+        // live in `nodes` and become indexable once their uid is assigned.
+        let nodes_map = nodes
             .iter()
             .filter_map(|s| s.try_uid().ok().map(|uid| (uid, s.clone())))
             .collect::<HashMap<_, _>>();
 
         Ok(Document {
             body,
-            sections,
-            sections_map,
+            nodes,
+            nodes_map,
         })
     }
 }
 
 fn try_instantiate_document<R: Read>(
     reader: R,
-) -> Result<(Vec<String>, Vec<Sections>), DocumentInstanceError> {
+) -> Result<(Vec<String>, Vec<Nodes>), DocumentInstanceError> {
     // create parser
     let mut parser = Parser::new(reader);
 
-    // create holders for body and section
+    // create holders for body and node
     // note that body is really just a vector of string, carrying each line
-    // sections are enum defined by Sections
+    // nodes are enum defined by Nodes
     let mut body: Vec<String> = Vec::new();
-    let mut sections: Vec<Sections> = Vec::new();
+    let mut nodes: Vec<Nodes> = Vec::new();
 
     // loop over the buffer and parse out
     loop {
-        match Sections::try_parse_sections(&mut parser) {
-            Ok(Some(section)) => {
-                sections.push(section);
+        match Nodes::try_parse_nodes(&mut parser) {
+            Ok(Some(node)) => {
+                nodes.push(node);
             }
             Ok(None) => {
-                // No section found, try matching body
+                // No node found, try matching body
                 let next_line = parser.try_read_line().map_err(|e| {
                     let (line_pos, line) = parser.current_line();
                     DocumentInstanceError::ParseError(e.into(), line_pos, line)
@@ -106,7 +112,7 @@ fn try_instantiate_document<R: Read>(
         }
     }
 
-    Ok((body, sections))
+    Ok((body, nodes))
 }
 
 #[cfg(test)]
@@ -151,13 +157,13 @@ Multiline xyz is also supported
 /task.v1
         "#;
 
-        let (body, sections) = try_instantiate_document(sample_document.as_bytes())?;
-        dbg!(body, sections);
+        let (body, nodes) = try_instantiate_document(sample_document.as_bytes())?;
+        dbg!(body, nodes);
         Ok(())
     }
 
     #[test]
-    pub fn read_and_structured_match_parsed_sections() -> anyhow::Result<()> {
+    pub fn read_and_structured_match_parsed_nodes() -> anyhow::Result<()> {
         let sample_document = r#"
 ---
 title: t
@@ -173,13 +179,13 @@ hello
 
         let doc = Document::from_reader(sample_document.as_bytes())?;
 
-        let bulk = doc.sections();
-        let streamed: Vec<_> = doc.sections_iter().collect();
+        let bulk = doc.nodes();
+        let streamed: Vec<_> = doc.nodes_iter().collect();
 
         assert_eq!(bulk.len(), 2);
         assert_eq!(streamed.len(), bulk.len());
-        assert!(matches!(bulk[0], Sections::Frontmatter(_)));
-        assert!(matches!(bulk[1], Sections::Comment(_)));
+        assert!(matches!(bulk[0], Nodes::Frontmatter(_)));
+        assert!(matches!(bulk[1], Nodes::Comment(_)));
 
         Ok(())
     }

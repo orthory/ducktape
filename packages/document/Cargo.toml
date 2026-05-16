@@ -8,5 +8,5 @@ thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 
-sections = { path = "../sections" }
+nodes = { path = "../nodes" }
 uid = { path = "../uid" }

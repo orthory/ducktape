@@ -1,6 +1,6 @@
 # ducktape
 
-a markdown-document tree with an in-memory cache and explicit-commit persistence. backing format is plain markdown files with structured `/comment`, `/task`, and `---` frontmatter sections.
+a markdown-document tree with an in-memory cache and explicit-commit persistence. backing format is plain markdown files with structured `/comment`, `/task`, and `---` frontmatter nodes.
 
 ## layout
 
@@ -13,7 +13,7 @@ bin / ducktape (entrypoint, clap + tokio)
         ↓
    document  (Document::from_reader; the parsed-document type)
         ↓
-   sections  (Section trait; comment/, frontmatter/, task/ versioned subpkgs; Parser)
+     nodes  (Node trait; comment/, frontmatter/, task/ versioned subpkgs; Parser)
        ↓ ↓
     auth   utils  (leaves: User type, time helpers)
 ```
@@ -32,7 +32,7 @@ doctree is the meaty crate — it holds the in-memory tree (pure data structure)
 - `commit()` is the explicit sync point: drains pending and writes each entry through the driver. on partial failure unprocessed entries return to pending so retry works
 - concurrency: `tree: Mutex<Arc<Tree>>` (readers grab arc + drop lock), `driver: Mutex<Box<dyn Driver>>` (writes serialize)
 
-**`Sections`** (sections::lib) — version-agnostic discriminated union (`Frontmatter`, `Comment`, `Task`) holding the `*Latest` shape of each section. parser-side dispatch lives in `try_parse_sections`, which delegates to per-section `try_parse_latest` functions. each version implements `Section::try_match`; per-section `try_parse_latest` tries versions newest-first and migrates older shapes forward to `*Latest`. add a new version by dropping `vN.rs` next to `mod.rs`, repointing `*Latest`, and prepending the new try in `try_parse_latest`.
+**`Nodes`** (nodes::lib) — version-agnostic discriminated union (`Frontmatter`, `Comment`, `Task`) holding the `*Latest` shape of each node. parser-side dispatch lives in `try_parse_nodes`, which delegates to per-node `try_parse_latest` functions. each version implements `Node::try_match`; per-node `try_parse_latest` tries versions newest-first and migrates older shapes forward to `*Latest`. add a new version by dropping `vN.rs` next to `mod.rs`, repointing `*Latest`, and prepending the new try in `try_parse_latest`.
 
 ## known stubs / gaps
 

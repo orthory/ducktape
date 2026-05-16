@@ -4,7 +4,7 @@ pub use v1::{TaskError, TaskV1, TaskV1Status};
 
 use std::io::Read;
 
-use crate::{Section, parser::Parser};
+use crate::{Node, parser::Parser};
 
 pub type TaskLatest = TaskV1;
 
