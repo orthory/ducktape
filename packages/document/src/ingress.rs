@@ -1,26 +1,16 @@
-use std::ops::Range;
-
-use nodes::{Node, Nodes};
+use nodes::Nodes;
 use uid::Uid;
 
-use crate::{Document, DocumentInstanceError};
+use crate::{Document, Errors};
 
-pub enum DocumentIngressError {
-
-}
+pub enum DocumentIngressError {}
 
 impl Document {
-    pub fn write(&mut self, pos: usize, node: Nodes) -> Result<Uid, DocumentInstanceError> {
-        let splice_range =
-
-        self.nodes.
-
+    pub fn write(&mut self, _pos: usize, _node: Nodes) -> Result<Uid, Errors> {
         todo!()
     }
 
-    pub fn write_nodes() -> Result<String, DocumentInstanceError> {
+    pub fn write_nodes() -> Result<String, Errors> {
         todo!()
     }
-
-
 }

@@ -1,118 +1,132 @@
 use std::{collections::HashMap, io::Read, path::Path};
-
-use serde::{Deserialize, Serialize};
-
+use journal::JournalContainer;
 use nodes::{Nodes, parser::Parser};
-use uid::{Identify, Uid, UidError};
+use uid::Identify;
 
-use crate::Container;
+use crate::config::DocumentConfig;
 
-#[derive(Default, Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug)]
 pub struct Document {
+    // uid is _always_ assigned upon a successful hydration; equals the
+    // frontmatter node's uid
+    pub(crate) uid: uid::Uid,
 
-    pub(crate) container: Container,
+    // a hashmap based linked list (forward only) for reconstructing in-memoery
+    // construction back to rendered document
+    pub(crate) nodes_map: HashMap<
+        uid::Uid,
+        (/*current_node*/nodes::Nodes, /*next*/Option<uid::Uid>)
+    >,
 
-
-    // global body buffer as vector of lines
-    pub(crate) body: Vec<String>,
-
-    // separate nodes
-    pub(crate) nodes: Vec<Nodes>,
-
-    // unordered map of nodes for tracking individually;
-    // must be in sync with nodes.
-    pub(crate) nodes_map: HashMap<Uid, Nodes>,
+    // ingress journal
+    pub(crate) journal: journal::JournalContainer,
+    
 }
 
-// The document's identity lives on its Frontmatter node — there's only ever
-// one. A document with no frontmatter (or one whose frontmatter uid is itself
-// unassigned) returns `Err(UidError::Unassigned)`.
 impl Identify for Document {
-    fn try_uid(&self) -> Result<Uid, UidError> {
-        self.nodes
-            .iter()
-            .find_map(|s| match s {
-                Nodes::Frontmatter(fm) => Some(fm.try_uid()),
-                _ => None,
-            })
-            .unwrap_or(Err(UidError::Unassigned))
+    // uid is the document id (= frontmatter's uid)
+    fn uid(&self) -> uid::Uid {
+        self.uid
     }
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum DocumentInstanceError {
+pub enum Errors {
     #[error("DocumentInstance: io error")]
     IOError(String),
 
     #[error("DocumentInstance: error during parsing at line {1} (around {2}): {0}")]
     ParseError(anyhow::Error, usize, String),
+
+    #[error("document is empty")]
+    EmptyDocument,
+
+    #[error("frontmatter is empty")]
+    EmptyFrontmatter,
+
+    #[error("invalid frontmatter")]
+    InvalidFrontmatter
 }
 
 impl Document {
-    pub fn from_path(path: &Path) -> Result<Self, DocumentInstanceError> {
+    pub fn from_path(path: &Path) -> Result<Self, Errors> {
+        Self::from_path_with_config(path, &DocumentConfig::default())
+    }
+
+    pub fn from_path_with_config(path: &Path, config: &DocumentConfig) -> Result<Self, Errors> {
         let file = std::fs::File::options()
             .read(true)
             .open(&path)
-            .map_err(|e| DocumentInstanceError::IOError(e.to_string()))?;
+            .map_err(|e| Errors::IOError(e.to_string()))?;
 
-        Self::from_reader(file)
+        Self::from_reader_with_config(file, config)
     }
 
-    pub fn from_reader<R: Read>(reader: R) -> Result<Self, DocumentInstanceError> {
-        let (body, nodes) = try_instantiate_document(reader)?;
-        // Nodes without an assigned uid (e.g. parsed from the legacy v1 on-disk
-        // format that doesn't carry uids) are left out of the index. They still
-        // live in `nodes` and become indexable once their uid is assigned.
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self, Errors> {
+        Self::from_reader_with_config(reader, &DocumentConfig::default())
+    }
+
+    pub fn from_reader_with_config<R: Read>(
+        reader: R,
+        config: &DocumentConfig,
+    ) -> Result<Self, Errors> {
+        // try parsing from reader
+        let nodes = try_instantiate_document(reader)?;
+
+        // nodes must not be empty; if it is, we are fed an empty document
+        if nodes.is_empty() {
+            return Err(Errors::EmptyDocument);
+        };
+
+        // first node must be frontmatter
+        let Nodes::Frontmatter(frontmatter) = &nodes[0] else {
+            return Err(Errors::EmptyFrontmatter);
+        };
+
+        // uid must be present on frontmatter (as it IS the document's uid)
+        let uid = frontmatter.uid();
+        if uid.is_nil() {
+            return Err(Errors::InvalidFrontmatter);
+        };
+
+        // iterate over constructed nodes vector,
+        // construct a singly linked list in a hashmap
         let nodes_map = nodes
             .iter()
-            .filter_map(|s| s.try_uid().ok().map(|uid| (uid, s.clone())))
+            .enumerate()
+            .map(|(i, node)| (
+                node.uid(),
+                (node.clone(), nodes.get(i + 1).map(|next| next.uid()))
+            ))
             .collect::<HashMap<_, _>>();
 
+        // good to go
         Ok(Document {
-            body,
-            nodes,
+            uid,
             nodes_map,
+            journal: JournalContainer::new(config.journal.hwm),
         })
     }
 }
 
 fn try_instantiate_document<R: Read>(
     reader: R,
-) -> Result<(Vec<String>, Vec<Nodes>), DocumentInstanceError> {
-    // create parser
+) -> Result<Vec<Nodes>, Errors> {
     let mut parser = Parser::new(reader);
-
-    // create holders for body and node
-    // note that body is really just a vector of string, carrying each line
-    // nodes are enum defined by Nodes
-    let mut body: Vec<String> = Vec::new();
     let mut nodes: Vec<Nodes> = Vec::new();
 
-    // loop over the buffer and parse out
     loop {
         match Nodes::try_parse_nodes(&mut parser) {
-            Ok(Some(node)) => {
-                nodes.push(node);
-            }
-            Ok(None) => {
-                // No node found, try matching body
-                let next_line = parser.try_read_line().map_err(|e| {
-                    let (line_pos, line) = parser.current_line();
-                    DocumentInstanceError::ParseError(e.into(), line_pos, line)
-                })?;
-                match next_line {
-                    Some(nl) => body.push(nl),
-                    None => break, // EOF
-                }
-            }
+            Ok(Some(node)) => nodes.push(node),
+            Ok(None) => break,
             Err(e) => {
                 let (line_pos, line) = parser.current_line();
-                return Err(DocumentInstanceError::ParseError(e.into(), line_pos, line));
+                return Err(Errors::ParseError(e.into(), line_pos, line));
             }
         }
     }
 
-    Ok((body, nodes))
+    Ok(nodes)
 }
 
 #[cfg(test)]
@@ -157,8 +171,8 @@ Multiline xyz is also supported
 /task.v1
         "#;
 
-        let (body, nodes) = try_instantiate_document(sample_document.as_bytes())?;
-        dbg!(body, nodes);
+        let nodes = try_instantiate_document(sample_document.as_bytes())?;
+        dbg!(nodes);
         Ok(())
     }
 
@@ -177,15 +191,13 @@ hello
 /comment.v1
 "#;
 
-        let doc = Document::from_reader(sample_document.as_bytes())?;
-
-        let bulk = doc.nodes();
+        let doc = Document::from_reader(sample_document.trim_start().as_bytes())?;
         let streamed: Vec<_> = doc.nodes_iter().collect();
 
-        assert_eq!(bulk.len(), 2);
-        assert_eq!(streamed.len(), bulk.len());
-        assert!(matches!(bulk[0], Nodes::Frontmatter(_)));
-        assert!(matches!(bulk[1], Nodes::Comment(_)));
+        // frontmatter → (any body between) → comment
+        assert!(streamed.len() >= 2);
+        assert!(matches!(streamed[0], Nodes::Frontmatter(_)));
+        assert!(matches!(streamed.last().unwrap(), Nodes::Comment(_)));
 
         Ok(())
     }

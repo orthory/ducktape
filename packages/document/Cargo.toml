@@ -7,6 +7,8 @@ edition = "2024"
 thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
+toml.workspace = true
 
 nodes.workspace = true
 uid.workspace = true
+journal.workspace = true

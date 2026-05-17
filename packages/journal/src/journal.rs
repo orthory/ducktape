@@ -1,46 +1,51 @@
-use std::{collections::VecDeque};
+use std::collections::VecDeque;
 
 use crate::operation::Operation;
 
 #[derive(Debug)]
-pub struct JournalContainer<const HWM: usize> {
-    backlog: VecDeque<Journal<HWM>>
+pub struct JournalContainer {
+    backlog: VecDeque<Journal>,
+    /// High-water mark: capacity of each Journal in this container.
+    high_water: usize,
 }
 
 pub enum ContainerResult {
     Inserted,
-    Flush
+    Flush,
 }
 
-impl <const HWM: usize>JournalContainer<HWM> {
-    pub fn new() -> Self {
+impl JournalContainer {
+    pub fn new(high_water: usize) -> Self {
+        let mut backlog = VecDeque::new();
+        backlog.push_back(Journal::new(high_water));
         Self {
-            backlog: VecDeque::from(vec![Journal::<HWM>::new()]),
+            backlog,
+            high_water,
         }
     }
 
     pub fn insert_op(&mut self, op: Operation) -> ContainerResult {
-        let current = self.backlog.back_mut()
+        let current = self
+            .backlog
+            .back_mut()
             .expect("backlog should never be empty");
-        
+
         match current.insert_op(op) {
-            OperationResult::JournalInserted => {
-                ContainerResult::Inserted
-            },
+            OperationResult::JournalInserted => ContainerResult::Inserted,
 
             // this journal is full; create anew
             OperationResult::JournalFull(op) => {
-                self.backlog.push_back(Journal::<HWM>::new());
+                self.backlog.push_back(Journal::new(self.high_water));
 
                 // lossy result but should be fine as the journal semantic only allows
                 // either Inserted or Flush anyways
                 let _ = self.insert_op(op);
                 ContainerResult::Flush
-            },
+            }
         }
     }
 
-    pub fn drain_flushable(&mut self) -> Vec<Journal<HWM>> {
+    pub fn drain_flushable(&mut self) -> Vec<Journal> {
         self.backlog
             .drain(..self.backlog.len().saturating_sub(1))
             .collect()
@@ -49,38 +54,32 @@ impl <const HWM: usize>JournalContainer<HWM> {
 
 // individual journals
 #[derive(Debug)]
-struct Journal<const HWM: usize> {
+pub struct Journal {
     tip: usize,
-    ops: [Option<Operation>; HWM]
+    /// Fixed-size buffer; capacity == `ops.len()`. Allocated once at construction,
+    /// never resized.
+    ops: Box<[Option<Operation>]>,
 }
 
 pub enum OperationResult {
     JournalInserted,
-    JournalFull(Operation)
+    JournalFull(Operation),
 }
 
-impl <const HWM: usize>Journal<HWM> {
-    pub(crate) fn new() -> Self {
-        Self {
-            tip: 0,
-            ops: std::array::from_fn(|_| None),
-        }
+impl Journal {
+    pub(crate) fn new(capacity: usize) -> Self {
+        let ops = std::iter::repeat_with(|| None).take(capacity).collect();
+        Self { tip: 0, ops }
     }
-    
+
     pub fn insert_op(&mut self, op: Operation) -> OperationResult {
-        if self.tip >= HWM {
-            return OperationResult::JournalFull(op)
+        if self.tip >= self.ops.len() {
+            return OperationResult::JournalFull(op);
         }
-        self.ops[self.tip] = Some(op); 
+        self.ops[self.tip] = Some(op);
         self.tip += 1;
 
         OperationResult::JournalInserted
-    }
-}
-
-impl <const HWM: usize>Default for Journal<HWM> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -110,14 +109,14 @@ mod tests {
 
     #[test]
     fn new_container_holds_one_empty_journal() {
-        let c = JournalContainer::<3>::new();
+        let c = JournalContainer::new(3);
         assert_eq!(c.backlog.len(), 1);
         assert_eq!(c.backlog.back().unwrap().tip, 0);
     }
 
     #[test]
     fn insert_below_capacity_returns_inserted() {
-        let mut c = JournalContainer::<3>::new();
+        let mut c = JournalContainer::new(3);
         for k in 1..=3 {
             let result = c.insert_op(op(k));
             assert!(matches!(result, ContainerResult::Inserted));
@@ -129,7 +128,7 @@ mod tests {
 
     #[test]
     fn insert_past_capacity_rolls_over_and_returns_flush() {
-        let mut c = JournalContainer::<3>::new();
+        let mut c = JournalContainer::new(3);
         c.insert_op(op(1));
         c.insert_op(op(2));
         c.insert_op(op(3));
@@ -149,7 +148,7 @@ mod tests {
 
     #[test]
     fn drain_returns_empty_when_only_current() {
-        let mut c = JournalContainer::<3>::new();
+        let mut c = JournalContainer::new(3);
         c.insert_op(op(1));
         c.insert_op(op(2));
         let drained = c.drain_flushable();
@@ -161,7 +160,7 @@ mod tests {
 
     #[test]
     fn drain_takes_full_journals_keeps_current() {
-        let mut c = JournalContainer::<3>::new();
+        let mut c = JournalContainer::new(3);
         // 5 ops: first journal full (1,2,3), second has 4,5
         for k in 1..=5 {
             c.insert_op(op(k));
@@ -189,7 +188,7 @@ mod tests {
 
     #[test]
     fn multiple_rollovers_drain_in_order() {
-        let mut c = JournalContainer::<3>::new();
+        let mut c = JournalContainer::new(3);
         // 7 ops: 3 + 3 + 1
         for k in 1..=7 {
             c.insert_op(op(k));
@@ -211,7 +210,7 @@ mod tests {
 
     #[test]
     fn insert_continues_after_drain() {
-        let mut c = JournalContainer::<2>::new();
+        let mut c = JournalContainer::new(2);
         c.insert_op(op(1));
         c.insert_op(op(2)); // fills first journal
         c.insert_op(op(3)); // rollover
@@ -228,14 +227,14 @@ mod tests {
 
     #[test]
     fn new_journal_is_empty() {
-        let j = Journal::<3>::new();
+        let j = Journal::new(3);
         assert_eq!(j.tip, 0);
         assert!(j.ops.iter().all(|slot| slot.is_none()));
     }
 
     #[test]
     fn journal_inserts_in_order_and_advances_tip() {
-        let mut j = Journal::<3>::new();
+        let mut j = Journal::new(3);
         for k in 1..=3 {
             assert!(matches!(j.insert_op(op(k)), OperationResult::JournalInserted));
         }
@@ -247,7 +246,7 @@ mod tests {
 
     #[test]
     fn journal_returns_full_at_capacity() {
-        let mut j = Journal::<2>::new();
+        let mut j = Journal::new(2);
         j.insert_op(op(1));
         j.insert_op(op(2));
         let rejected = j.insert_op(op(3));
@@ -258,13 +257,13 @@ mod tests {
             }
             _ => panic!("expected JournalFull"),
         }
-        // tip didn't advance past HWM
+        // tip didn't advance past capacity
         assert_eq!(j.tip, 2);
     }
 
     #[test]
     fn full_journal_stays_full_on_repeated_attempts() {
-        let mut j = Journal::<1>::new();
+        let mut j = Journal::new(1);
         j.insert_op(op(1));
         // every further attempt rejects without panic
         for k in 2..=5 {
