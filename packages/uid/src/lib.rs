@@ -1,21 +1,11 @@
 pub use uuid::Uuid as Uid;
 
-#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UidError {
-    #[error("uid is unassigned (nil) — likely forcibly removed or never set")]
-    Unassigned,
-}
-
 /// Capability trait — types that carry a stable, system-unique identity expose
-/// it here. `try_uid` is the canonical accessor: it returns
-/// `Err(UidError::Unassigned)` when the underlying value is the nil uuid (e.g.
-/// a section parsed from a legacy on-disk format that didn't carry a uid, or a
-/// section whose uid was forcibly cleared).
-///
-/// Impls typically check `Uid::is_nil()` on a stored field and return
-/// `Err(Unassigned)` for nil, `Ok(uid)` otherwise.
+/// it here. Identity is **always present** for types implementing this trait;
+/// uids are minted at construction (or at parse time, by the parser) and never
+/// observed in an unassigned state.
 pub trait Identify {
-    fn try_uid(&self) -> Result<Uid, UidError>;
+    fn uid(&self) -> Uid;
 }
 
 /// Mint a fresh Uid. v7 is timestamp-prefixed + random-suffixed, so ids sort
@@ -43,29 +33,14 @@ mod tests {
     }
 
     #[test]
-    fn try_uid_ok_when_assigned() {
+    fn uid_returns_stored_value() {
         struct Thing { id: Uid }
         impl Identify for Thing {
-            fn try_uid(&self) -> Result<Uid, UidError> {
-                if self.id.is_nil() { Err(UidError::Unassigned) } else { Ok(self.id) }
-            }
+            fn uid(&self) -> Uid { self.id }
         }
 
         let id = new();
         let t = Thing { id };
-        assert_eq!(t.try_uid(), Ok(id));
-    }
-
-    #[test]
-    fn try_uid_err_when_nil() {
-        struct Thing { id: Uid }
-        impl Identify for Thing {
-            fn try_uid(&self) -> Result<Uid, UidError> {
-                if self.id.is_nil() { Err(UidError::Unassigned) } else { Ok(self.id) }
-            }
-        }
-
-        let t = Thing { id: Uid::default() };
-        assert_eq!(t.try_uid(), Err(UidError::Unassigned));
+        assert_eq!(t.uid(), id);
     }
 }
