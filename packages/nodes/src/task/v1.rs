@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use crate::{Node, parser::Parser};
 use serde::{Deserialize, Serialize};
-use uid::{Identify, Uid, UidError};
+use uid::{Identify, Uid};
 
 const COMMAND: &str = "/task.v1";
 
@@ -30,9 +30,8 @@ pub enum TaskError {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TaskV1 {
-    // Stable identity assigned by the creator (client / CRDT). Server never
-    // mints — nodes fly in pre-uid'd. Until the on-disk v2 format carries
-    // the uid in args, parsing the v1 markdown leaves this as the nil uuid.
+    // Stable identity. v1 on-disk format doesn't carry uids; the parser mints
+    // a fresh one at parse time. v2 will carry it in args.
     pub uid: Uid,
     pub title: String,
     pub body: Vec<String>,
@@ -44,12 +43,8 @@ pub struct TaskV1 {
 }
 
 impl Identify for TaskV1 {
-    fn try_uid(&self) -> Result<Uid, UidError> {
-        if self.uid.is_nil() {
-            Err(UidError::Unassigned)
-        } else {
-            Ok(self.uid)
-        }
+    fn uid(&self) -> Uid {
+        self.uid
     }
 }
 
@@ -76,8 +71,9 @@ impl Node for TaskV1 {
         let assignees: Vec<auth::User> = it.map(|a| auth::User::from_str(&a)).collect();
 
         Ok(Some(TaskV1 {
-            // nil until v2 markdown format carries the uid in args
-            uid: Uid::default(),
+            // v1 markdown doesn't carry a uid; mint a fresh one at parse time.
+            // v2 will read it from args.
+            uid: uid::new(),
             title,
             author,
             assignees,

@@ -1,7 +1,7 @@
 use crate::{Node, parser::Parser};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uid::{Identify, Uid, UidError};
+use uid::{Identify, Uid};
 
 const COMMAND: &str = "---";
 
@@ -20,15 +20,14 @@ pub enum FrontmatterError {
     Invariant(String),
 }
 
-// Frontmatter holds the document's identity — Document::uid() looks up the
-// frontmatter node and returns its uid. There's only ever one Frontmatter
-// per Document, so this is also the document's uid. Like every other node,
-// the server never mints; the uid arrives from the creator.
+// Frontmatter holds the document's identity — Document::uid() returns this
+// node's uid. There's only ever one Frontmatter per Document, so this is also
+// the document's uid. v1 on-disk format doesn't carry uids; the parser mints
+// a fresh one at parse time. v2 will read it from the frontmatter body.
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct FrontmatterV1 {
     // Document-level uid (frontmatter's uid IS the document's uid).
-    // Until the v2 on-disk format encodes it, parsing leaves this nil.
     pub uid: Uid,
 
     // required fields
@@ -44,12 +43,8 @@ pub struct FrontmatterV1 {
 }
 
 impl Identify for FrontmatterV1 {
-    fn try_uid(&self) -> Result<Uid, UidError> {
-        if self.uid.is_nil() {
-            Err(UidError::Unassigned)
-        } else {
-            Ok(self.uid)
-        }
+    fn uid(&self) -> Uid {
+        self.uid
     }
 }
 
@@ -81,8 +76,9 @@ impl Node for FrontmatterV1 {
         let misc = fields;
 
         Ok(Some(FrontmatterV1 {
-            // nil until v2 markdown format carries the uid in frontmatter
-            uid: Uid::default(),
+            // v1 markdown doesn't carry a uid; mint a fresh one at parse time.
+            // v2 will read it from the frontmatter body.
+            uid: uid::new(),
             title,
             author,
             created_at,

@@ -57,6 +57,18 @@ where
         (self.current_line_pos, peeked)
     }
 
+    /// Peek the next line without consuming it. Returns `Ok(None)` at EOF.
+    pub fn peek_line(&mut self) -> Result<Option<String>, ParserError> {
+        match self.linefeed.peek() {
+            Some(Ok(line)) => Ok(Some(line.clone())),
+            Some(Err(e)) => Err(ParserError::IOError {
+                kind: e.kind().to_string(),
+                message: e.to_string(),
+            }),
+            None => Ok(None),
+        }
+    }
+
     /// Returns true when the peeked line opens a `command` group: either an
     /// exact match (`---`) or `command{...args}` form. Trailing whitespace
     /// or junk between the command and `{` is rejected — the close marker

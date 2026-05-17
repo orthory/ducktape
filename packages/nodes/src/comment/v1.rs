@@ -1,6 +1,6 @@
 use crate::{Node, parser::Parser};
 use serde::{Deserialize, Serialize};
-use uid::{Identify, Uid, UidError};
+use uid::{Identify, Uid};
 
 const COMMAND: &str = "/comment.v1";
 
@@ -21,9 +21,8 @@ pub enum CommentError {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct CommentV1 {
-    // Stable identity assigned by the creator (client / CRDT). Server never
-    // mints — nodes fly in pre-uid'd. Until the on-disk v2 format carries
-    // the uid in args, parsing the v1 markdown leaves this as the nil uuid.
+    // Stable identity. v1 on-disk format doesn't carry uids; the parser mints
+    // a fresh one at parse time. v2 will carry it in args.
     uid: Uid,
     parent_id: u64,
     timestamp: u64,
@@ -32,12 +31,8 @@ pub struct CommentV1 {
 }
 
 impl Identify for CommentV1 {
-    fn try_uid(&self) -> Result<Uid, UidError> {
-        if self.uid.is_nil() {
-            Err(UidError::Unassigned)
-        } else {
-            Ok(self.uid)
-        }
+    fn uid(&self) -> Uid {
+        self.uid
     }
 }
 
@@ -70,8 +65,9 @@ impl Node for CommentV1 {
         }
 
         Ok(Some(CommentV1 {
-            // nil until v2 markdown format carries the uid in args
-            uid: Uid::default(),
+            // v1 markdown doesn't carry a uid; mint a fresh one at parse time.
+            // v2 will read it from args.
+            uid: uid::new(),
             parent_id,
             timestamp,
             author,

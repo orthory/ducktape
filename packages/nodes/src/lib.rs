@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 
 /// Node is a trait that represents a node of a document.
 ///
-/// All nodes also implement [`uid::Identify`] (via `try_uid`) so consumers
-/// can ask any node for its identity. Frontmatter holds the document's uid
-/// — `Document::try_uid()` delegates to the frontmatter node.
+/// All nodes also implement [`uid::Identify`] so consumers can ask any node
+/// for its identity. Frontmatter holds the document's uid — `Document::uid()`
+/// returns the frontmatter node's uid.
 pub trait Node
 where
     Self: Sized,
@@ -37,11 +37,11 @@ pub enum Nodes {
 }
 
 impl Identify for Nodes {
-    fn try_uid(&self) -> Result<uid::Uid, uid::UidError> {
+    fn uid(&self) -> uid::Uid {
         match self {
-            Nodes::Frontmatter(s) => s.try_uid(),
-            Nodes::Comment(s) => s.try_uid(),
-            Nodes::Task(s) => s.try_uid(),
+            Nodes::Frontmatter(s) => s.uid(),
+            Nodes::Comment(s) => s.uid(),
+            Nodes::Task(s) => s.uid(),
         }
     }
 }
