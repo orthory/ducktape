@@ -1,8 +1,10 @@
+pub mod body;
 pub mod comment;
 pub mod frontmatter;
 pub mod parser;
 pub mod task;
 
+pub use body::{BodyError, BodyLatest, BodyV1};
 pub use comment::{CommentError, CommentLatest, CommentV1};
 pub use frontmatter::{FrontmatterError, FrontmatterLatest, FrontmatterV1};
 pub use task::{TaskError, TaskLatest, TaskV1, TaskV1Status};
@@ -34,6 +36,7 @@ pub enum Nodes {
     Frontmatter(FrontmatterLatest),
     Comment(CommentLatest),
     Task(TaskLatest),
+    Body(BodyLatest),
 }
 
 impl Identify for Nodes {
@@ -42,6 +45,7 @@ impl Identify for Nodes {
             Nodes::Frontmatter(s) => s.uid(),
             Nodes::Comment(s) => s.uid(),
             Nodes::Task(s) => s.uid(),
+            Nodes::Body(s) => s.uid(),
         }
     }
 }
@@ -58,6 +62,11 @@ impl Nodes {
         }
         if let Some(s) = task::try_parse_latest(parser)? {
             return Ok(Some(Nodes::Task(s)));
+        }
+        // Body is the catch-all — soaks up any non-command lines into prose.
+        // Must come last so structured commands get first chance.
+        if let Some(s) = body::try_parse_latest(parser)? {
+            return Ok(Some(Nodes::Body(s)));
         }
         Ok(None)
     }
