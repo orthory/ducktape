@@ -27,7 +27,7 @@ pub struct CommentV1 {
     parent_id: u64,
     timestamp: u64,
     author: String,
-    body: Vec<String>,
+    pub body: String,
 }
 
 impl Identify for CommentV1 {
@@ -71,7 +71,7 @@ impl Node for CommentV1 {
             parent_id,
             timestamp,
             author,
-            body: matched.body,
+            body: matched.body.join("\n"),
         }))
     }
 }
@@ -95,7 +95,7 @@ Multiline xyz is also supported
         assert_eq!(comment.author, "@orthory");
         assert_eq!(comment.parent_id, 42);
         assert_eq!(comment.timestamp, 1700000000);
-        assert_eq!(comment.body.len(), 2);
+        assert_eq!(comment.body, "This is a sample comment.\nMultiline xyz is also supported");
     }
 
     #[test]

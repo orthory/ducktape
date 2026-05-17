@@ -34,7 +34,7 @@ pub struct TaskV1 {
     // a fresh one at parse time. v2 will carry it in args.
     pub uid: Uid,
     pub title: String,
-    pub body: Vec<String>,
+    pub body: String,
     pub author: auth::User,
     pub assignees: Vec<auth::User>,
     pub start_at: u64,
@@ -80,7 +80,7 @@ impl Node for TaskV1 {
             start_at,
             end_at,
             status,
-            body: matched.body,
+            body: matched.body.join("\n"),
         }))
     }
 }
@@ -170,7 +170,7 @@ body line 2
         assert_eq!(task.start_at, 12345);
         assert_eq!(task.end_at, 12346);
         assert_eq!(task.assignees.len(), 2);
-        assert_eq!(task.body.len(), 2);
+        assert_eq!(task.body, "body line 1\nbody line 2");
         assert!(matches!(task.status, TaskV1Status::InProgress(Some(ref u)) if u == "https://github.com"));
     }
 

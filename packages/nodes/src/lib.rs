@@ -51,6 +51,20 @@ impl Identify for Nodes {
 }
 
 impl Nodes {
+    /// Run a closure against the node's editable text as a flat `String`.
+    /// Frontmatter exposes `title`; everything else exposes its body buffer.
+    pub fn with_editable_text<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut String) -> R,
+    {
+        match self {
+            Nodes::Body(b) => f(&mut b.text),
+            Nodes::Comment(c) => f(&mut c.body),
+            Nodes::Task(t) => f(&mut t.body),
+            Nodes::Frontmatter(fm) => f(&mut fm.title),
+        }
+    }
+
     pub fn try_parse_nodes<R: Read>(
         parser: &mut crate::parser::Parser<R>,
     ) -> anyhow::Result<Option<Self>> {

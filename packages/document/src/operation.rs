@@ -29,7 +29,8 @@ pub enum Operation {
     },
     RemoveNode {
         op_id: OpId,
-        anchor_id: uid::Uid
+        anchor_id: uid::Uid,
+        node_id: uid::Uid,
     },
 
     // intra-node operation

@@ -14,7 +14,7 @@ pub struct BodyV1 {
     // Body lines have no on-disk uid (they're just text). Parser mints one
     // at parse time so every node carries a stable identity.
     uid: Uid,
-    pub lines: Vec<String>,
+    pub text: String,
 }
 
 impl Identify for BodyV1 {
@@ -25,28 +25,32 @@ impl Identify for BodyV1 {
 
 impl Node for BodyV1 {
     fn try_match<R: std::io::Read>(parser: &mut Parser<R>) -> anyhow::Result<Option<Self>> {
-        let mut lines = Vec::new();
+        let mut text = String::new();
+        let mut matched_any = false;
 
         loop {
             match parser.peek_line()? {
                 None => break, // EOF
                 Some(line) if looks_like_command(&line) => break,
                 Some(_) => {
-                    // safe to advance — we just peeked a body line
                     let line = parser
                         .try_read_line()?
                         .expect("peek_line returned Some, so try_read_line must too");
-                    lines.push(line);
+                    if matched_any {
+                        text.push('\n');
+                    }
+                    text.push_str(&line);
+                    matched_any = true;
                 }
             }
         }
 
-        if lines.is_empty() {
+        if !matched_any {
             Ok(None)
         } else {
             Ok(Some(BodyV1 {
                 uid: uid::new(),
-                lines,
+                text,
             }))
         }
     }
@@ -70,7 +74,7 @@ mod tests {
         let body = BodyV1::try_match(&mut p)
             .expect("parse ok")
             .expect("body matched");
-        assert_eq!(body.lines, vec!["first line", "second line", "third line"]);
+        assert_eq!(body.text, "first line\nsecond line\nthird line");
     }
 
     #[test]
@@ -80,7 +84,7 @@ mod tests {
         let body = BodyV1::try_match(&mut p)
             .expect("parse ok")
             .expect("body matched");
-        assert_eq!(body.lines, vec!["prose"]);
+        assert_eq!(body.text, "prose");
         // `---` should still be at the head of the parser
         assert_eq!(p.peek_line().unwrap(), Some("---".to_string()));
     }
@@ -92,7 +96,7 @@ mod tests {
         let body = BodyV1::try_match(&mut p)
             .expect("parse ok")
             .expect("body matched");
-        assert_eq!(body.lines, vec!["prose"]);
+        assert_eq!(body.text, "prose");
     }
 
     #[test]
@@ -116,7 +120,6 @@ mod tests {
         let body = BodyV1::try_match(&mut p)
             .expect("parse ok")
             .expect("body matched");
-        assert_eq!(body.lines.len(), 3);
-        assert_eq!(body.lines[1], "");
+        assert_eq!(body.text, "paragraph one\n\nstill body — blank line is content");
     }
 }
