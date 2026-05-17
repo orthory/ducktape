@@ -1,9 +1,9 @@
 use std::{collections::HashMap, io::Read, path::Path};
-use journal::JournalContainer;
 use nodes::{Nodes, parser::Parser};
 use uid::Identify;
 
 use crate::config::DocumentConfig;
+use crate::journal::JournalContainer;
 
 #[derive(Debug)]
 pub struct Document {
@@ -19,7 +19,7 @@ pub struct Document {
     >,
 
     // ingress journal
-    pub(crate) journal: journal::JournalContainer,
+    pub(crate) journal: JournalContainer,
     
 }
 

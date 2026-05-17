@@ -1,9 +1,0 @@
-[package]
-name = "journal"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-nodes.workspace = true
-uid.workspace = true
-thiserror.workspace = true

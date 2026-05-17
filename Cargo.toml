@@ -13,7 +13,7 @@ members = [
     "packages/nodes",
     "packages/api",
     "packages/uid",
-    "utils", "packages/journal",
+    "utils",
 ]
 
 [workspace.dependencies]
@@ -35,7 +35,6 @@ auth     = { path = "packages/auth" }
 api      = { path = "packages/api" }
 doctree  = { path = "packages/doctree" }
 document = { path = "packages/document" }
-journal  = { path = "packages/journal" }
 nodes    = { path = "packages/nodes" }
 uid      = { path = "packages/uid" }
 utils    = { path = "utils" }

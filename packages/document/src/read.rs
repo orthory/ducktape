@@ -28,7 +28,7 @@ impl<'nodes> Iterator for NodesIter<'nodes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use journal::JournalContainer;
+    use crate::journal::JournalContainer;
     use nodes::{FrontmatterV1, Nodes};
     use std::collections::HashMap;
 
