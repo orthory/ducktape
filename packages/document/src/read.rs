@@ -28,11 +28,8 @@ impl<'nodes> Iterator for NodesIter<'nodes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::JournalContainer;
     use nodes::{FrontmatterV1, Nodes};
     use std::collections::HashMap;
-
-    const HWM: usize = 8;
 
     /// Build a Document containing a chain of `n` Frontmatter nodes, each titled
     /// `"node-{i}"` so iteration order can be verified by reading titles back out.
@@ -53,7 +50,6 @@ mod tests {
 
         Document {
             uid: uids[0],
-            journal: JournalContainer::new(HWM),
             nodes_map,
         }
     }
@@ -113,7 +109,6 @@ mod tests {
         // yields nothing rather than panicking.
         let doc = Document {
             uid: uid::new(),
-            journal: JournalContainer::new(HWM),
             nodes_map: HashMap::new(),
         };
         assert_eq!(doc.nodes_iter().count(), 0);

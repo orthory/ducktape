@@ -2,7 +2,8 @@ use std::collections::hash_map::Entry::{Occupied, Vacant};
 
 use uid::Identify;
 
-use crate::{Document, journal::ContainerResult, operation::Operation};
+use crate::{Document};
+use operation::{Operation as Op};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Errors {
@@ -32,9 +33,9 @@ impl Document {
     /// server-side serialization is done here, but leader must be elected elsewhere
     /// 
     /// note: this must be single producer
-    pub fn apply(&mut self, op: Operation) -> Result<(), Errors> {
+    pub fn apply(&mut self, op: Op) -> Result<(), Errors> {
         match &op {
-            Operation::InsertAfter { anchor_id, node, .. } => {
+            Op::InsertAfter { anchor_id, node, .. } => {
                 let anchor_next_uid = self.resolve_next_uid(anchor_id)?;
                 let node_uid = node.uid();
                 let _ = match self.nodes_map.entry(node_uid) {
@@ -52,7 +53,7 @@ impl Document {
                     .expect("anchor shouuld exist at this point")
                     .1 = Some(node_uid);
             },
-            Operation::RemoveNode { anchor_id, node_id, .. } => {
+            Op::RemoveNode { anchor_id, node_id, .. } => {
                 let node_next = self.nodes_map
                     .get(node_id)
                     .ok_or(Errors::InvalidNode)?.1;
@@ -70,7 +71,7 @@ impl Document {
 
                 self.nodes_map.remove(node_id);
             },
-            Operation::OnUserWrite { node_id, pos, text, .. } => {
+            Op::OnUserWrite { node_id, pos, text, .. } => {
                 let (node, _) = self.nodes_map
                     .get_mut(node_id)
                     .ok_or(Errors::InvalidNode)?;
@@ -83,7 +84,7 @@ impl Document {
                     Ok(())
                 })?;
             },
-            Operation::OnUserDelete { node_id, start, len, .. } => {
+            Op::OnUserDelete { node_id, start, len, .. } => {
                 let (node, _) = self.nodes_map
                     .get_mut(node_id)
                     .ok_or(Errors::InvalidNode)?;
@@ -102,22 +103,11 @@ impl Document {
                     Ok(())
                 })?;
             },
-            Operation::OnUserCaret { .. } => todo!(),
-            Operation::OnUserBlur => todo!(),
-        }
+            Op::OnUserCaret { .. } => todo!(),
+            Op::OnUserBlur => todo!(),
+        };
 
-        // insert to journal
-        match self.journal.insert_op(op) {
-            ContainerResult::Inserted => Ok(()),
-            ContainerResult::Flush => {
-                let _flushable = self.journal.drain_flushable();
-
-                // at this point, journal is already flushed.
-                // really apply the changes
-                // TODO: that's not true
-                Ok(())
-            }
-        }
+        Ok(())
     }
 
     fn resolve_next_uid(&self, anchor_id: &uid::Uid) -> Result<Option<uid::Uid>, Errors> {

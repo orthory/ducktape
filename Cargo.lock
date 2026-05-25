@@ -260,6 +260,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nodes",
+ "operation",
  "serde",
  "thiserror",
  "toml",
@@ -473,6 +474,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "hydration"
+version = "0.1.0"
+dependencies = [
+ "operation",
+ "serde",
+ "thiserror",
+ "tokio",
+ "toml",
+ "uid",
+]
+
+[[package]]
 name = "hyper"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,6 +665,15 @@ name = "once_cell_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
+
+[[package]]
+name = "operation"
+version = "0.1.0"
+dependencies = [
+ "nodes",
+ "thiserror",
+ "uid",
+]
 
 [[package]]
 name = "parking_lot"

@@ -2,9 +2,6 @@ use std::{collections::HashMap, io::Read, path::Path};
 use nodes::{Nodes, parser::Parser};
 use uid::Identify;
 
-use crate::config::DocumentConfig;
-use crate::journal::JournalContainer;
-
 #[derive(Debug)]
 pub struct Document {
     // uid is _always_ assigned upon a successful hydration; equals the
@@ -16,11 +13,7 @@ pub struct Document {
     pub(crate) nodes_map: HashMap<
         uid::Uid,
         (/*current_node*/nodes::Nodes, /*next*/Option<uid::Uid>)
-    >,
-
-    // ingress journal
-    pub(crate) journal: JournalContainer,
-    
+    >
 }
 
 impl Identify for Document {
@@ -50,25 +43,16 @@ pub enum Errors {
 
 impl Document {
     pub fn from_path(path: &Path) -> Result<Self, Errors> {
-        Self::from_path_with_config(path, &DocumentConfig::default())
-    }
-
-    pub fn from_path_with_config(path: &Path, config: &DocumentConfig) -> Result<Self, Errors> {
         let file = std::fs::File::options()
             .read(true)
             .open(&path)
             .map_err(|e| Errors::IOError(e.to_string()))?;
 
-        Self::from_reader_with_config(file, config)
+        Self::from_reader(file)
     }
-
-    pub fn from_reader<R: Read>(reader: R) -> Result<Self, Errors> {
-        Self::from_reader_with_config(reader, &DocumentConfig::default())
-    }
-
-    pub fn from_reader_with_config<R: Read>(
-        reader: R,
-        config: &DocumentConfig,
+    
+    pub fn from_reader<R: Read>(
+        reader: R
     ) -> Result<Self, Errors> {
         // try parsing from reader
         let nodes = try_instantiate_document(reader)?;
@@ -104,7 +88,6 @@ impl Document {
         Ok(Document {
             uid,
             nodes_map,
-            journal: JournalContainer::new(config.journal.hwm),
         })
     }
 }

@@ -13,7 +13,7 @@ members = [
     "packages/nodes",
     "packages/api",
     "packages/uid",
-    "utils",
+    "utils", "packages/hydration", "packages/operation",
 ]
 
 [workspace.dependencies]
@@ -29,6 +29,7 @@ sha2 = "0.10.9"
 rand = "0.9.2"
 uuid = { version = "1.11", features = ["v7", "serde"] }
 toml = "0.8"
+tokio = { version = "1.47.1", features = ["full", "rt"] }
 
 # internal
 auth     = { path = "packages/auth" }
@@ -38,6 +39,8 @@ document = { path = "packages/document" }
 nodes    = { path = "packages/nodes" }
 uid      = { path = "packages/uid" }
 utils    = { path = "utils" }
+hydration = { path = "packages/hydration"}
+operation = { path = "packages/operation"}
 
 [[bin]]
 name = "ducktape"
@@ -45,5 +48,5 @@ path = "bin/src/main.rs"
 
 [dependencies]
 clap = "4.5.45"
-tokio = { version = "1.47.1", features = ["full", "rt"] }
 api.workspace = true
+tokio = { workspace = true, features = ["rt", "full"] }
