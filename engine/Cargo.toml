@@ -11,12 +11,13 @@ hydration.workspace = true
 vcs.workspace = true
 control.workspace = true
 transport.workspace = true
+agent.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 nodes.workspace = true
 uid.workspace = true
-agent.workspace = true

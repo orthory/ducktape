@@ -14,6 +14,9 @@
 use hydration::Hydratable;
 use workspace::Workspace;
 
+mod node;
+pub use node::{Config, Node, NoopWorker};
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     /// a bare top-level `Op::Document` arrived with no entry context. document

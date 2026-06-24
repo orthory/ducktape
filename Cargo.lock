@@ -1353,6 +1353,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "toml 0.8.23",
  "transport",
  "uid",
  "vcs",
