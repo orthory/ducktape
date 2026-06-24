@@ -5,3 +5,4 @@
 //! grow a spec-directive parser and an orchestrator on top of it.
 
 pub mod driver;
+pub mod spec;
