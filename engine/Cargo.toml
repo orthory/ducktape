@@ -19,3 +19,4 @@ serde_json.workspace = true
 [dev-dependencies]
 nodes.workspace = true
 uid.workspace = true
+agent.workspace = true
