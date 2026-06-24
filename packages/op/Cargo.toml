@@ -9,3 +9,6 @@ workspace = { workspace = true }
 vcs.workspace = true
 control.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+uid.workspace = true

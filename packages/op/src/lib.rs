@@ -41,4 +41,10 @@ mod tests {
         let op = Op::Vcs(vcs::op::Op::Init);
         assert_eq!(op.lane(), Lane::Consensus);
     }
+
+    #[test]
+    fn workspace_structural_op_routes_consensus() {
+        let op = Op::Workspace(workspace::op::Op::RemoveEntry { entry_id: uid::new() });
+        assert_eq!(op.lane(), Lane::Consensus);
+    }
 }

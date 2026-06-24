@@ -683,6 +683,7 @@ dependencies = [
  "control",
  "document",
  "serde",
+ "uid",
  "vcs",
  "workspace",
 ]
