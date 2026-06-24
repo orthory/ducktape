@@ -15,6 +15,11 @@ commonware-cryptography = "2026.5.0"
 commonware-utils = "2026.5.0"
 commonware-macros = "2026.5.0"
 rand_core = "0.6.4"
+commonware-consensus = "2026.5.0"
+commonware-storage = "2026.5.0"
+commonware-parallel = "2026.5.0"
+commonware-formatting = "2026.5.0"
+commonware-actor = "2026.5.0"
 
 [dev-dependencies]
 vcs.workspace = true

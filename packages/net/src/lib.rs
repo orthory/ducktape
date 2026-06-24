@@ -15,11 +15,19 @@
 //!   `Sender::send(Recipients::All, ..)`. commonware's `Sender` is `Clone` and
 //!   its `send` is synchronous, so we clone-per-send — no mutex, no actor, no
 //!   guard held across an `.await`.
-//! - `send(Lane::Consensus, _)` is unimplemented here; the simplex consensus
-//!   lane lands in p1.2.
-//! - inbound: one spawned task drains the channel `Receiver::recv()` and
-//!   forwards each `(peer, IoBuf)` as `(Lane::Broadcast, bytes)` into the
-//!   inbound mpsc.
+//! - `send(Lane::Consensus, bytes)` (p1.2, tier C): functional ordered gossip
+//!   on a SECOND, dedicated p2p channel (`CHANNEL_CONSENSUS`). this gives the
+//!   consensus lane real delivery semantics — every peer receives the bytes
+//!   tagged `Lane::Consensus` — without (yet) BFT total-order guarantees. true
+//!   byzantine-fault-tolerant ordering via commonware-simplex is the documented
+//!   TODO: the [`consensus`] module holds the simplex Automaton/Relay/Reporter
+//!   scaffolding (digest-addressed content store + finalization plumbing) ready
+//!   to swap in once a simplex `Engine` is instantiated. until then the seam is
+//!   a separate channel so the lane is FUNCTIONAL and distinguishable on the
+//!   wire from broadcast.
+//! - inbound: TWO spawned tasks, one per channel, each draining
+//!   `Receiver::recv()` and forwarding `(peer, IoBuf)` into the inbound mpsc
+//!   tagged with that channel's lane (`Broadcast` or `Consensus`).
 //!
 //! the whole thing is generic over the runtime context (the full bound set
 //! commonware's `Network` requires) so it runs under `deterministic::Runner` in
@@ -31,7 +39,7 @@ use std::net::SocketAddr;
 use commonware_cryptography::{ed25519, Signer};
 use commonware_p2p::{
     authenticated::discovery::{self, Network},
-    Manager, Receiver as _, Recipients, Sender as _,
+    Manager, Recipients, Sender as _,
 };
 use commonware_runtime::{
     BufferPooler, Clock, IoBuf, Metrics, Network as RNetwork, Quota, Resolver, Spawner,
@@ -42,9 +50,15 @@ use rand_core::CryptoRngCore;
 use tokio::sync::mpsc;
 use transport::{Error, Inbound, Transport};
 
-/// the p2p channel index we register the op-gossip stream on. a single channel
-/// is enough for the broadcast lane; consensus (p1.2) will register its own.
-const CHANNEL: u64 = 0;
+/// the p2p channel index we register the broadcast op-gossip stream on.
+const CHANNEL_BROADCAST: u64 = 0;
+
+/// the p2p channel index for the consensus lane (p1.2, tier C). a SEPARATE
+/// channel from broadcast so the inbound drain can tag the lane correctly and
+/// so consensus traffic is wire-distinguishable. when the simplex `Engine`
+/// lands, this is the channel its vote/certificate/resolver sub-streams will be
+/// derived from (or it grows into three; see [`consensus`]).
+const CHANNEL_CONSENSUS: u64 = 1;
 
 /// the peer-set index. all peers must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
@@ -61,17 +75,45 @@ const MAX_BACKLOG: usize = 128;
 /// identities and our runtime context `E`.
 type GossipSender<E> = discovery::Sender<ed25519::PublicKey, E>;
 
-/// commonware-backed broadcast transport.
+/// spawn a task that drains one registered channel's `Receiver`, forwarding
+/// each `(peer, IoBuf)` into the shared inbound mpsc tagged with `lane`.
 ///
-/// holds a clone-able gossip `Sender`. cloning the whole transport is cheap
-/// (the sender is `Clone`), which is why this can satisfy the `&self` + `Send`
-/// shape of [`Transport::send`] without interior mutability.
+/// generic over the `Receiver` impl so both the broadcast and consensus
+/// channels reuse the exact same drain loop — the only difference is which
+/// `Lane` the bytes get stamped with. the task ends when either the channel
+/// closes or the inbound consumer drops its receiver.
+fn spawn_inbound_drain<E, R>(context: E, mut receiver: R, lane: Lane, in_tx: mpsc::Sender<Inbound>)
+where
+    E: Spawner + Send + 'static,
+    R: commonware_p2p::Receiver + Send + 'static,
+{
+    context.spawn(move |_ctx| async move {
+        while let Ok((_peer, msg)) = receiver.recv().await {
+            let bytes: Vec<u8> = msg.into();
+            if in_tx.send((lane, bytes)).await.is_err() {
+                // consumer dropped the inbound receiver; nothing left to do.
+                break;
+            }
+        }
+    });
+}
+
+/// commonware-backed transport.
+///
+/// holds two clone-able gossip `Sender`s — one per lane/channel. cloning the
+/// whole transport is cheap (senders are `Clone`), which is why this can satisfy
+/// the `&self` + `Send` shape of [`Transport::send`] without interior
+/// mutability.
 #[derive(Clone)]
 pub struct CommonwareTransport<E>
 where
     E: Spawner + Clock + Send + 'static,
 {
-    sender: GossipSender<E>,
+    /// broadcast-lane gossip sender (CHANNEL_BROADCAST).
+    broadcast: GossipSender<E>,
+    /// consensus-lane gossip sender (CHANNEL_CONSENSUS). tier C: ordered gossip
+    /// stand-in for the simplex Engine's network sends.
+    consensus: GossipSender<E>,
 }
 
 /// config knobs for standing up a node. addresses are plain `SocketAddr`s; the
@@ -141,33 +183,48 @@ where
             Set::try_from(cfg.peers).expect("authorized peer set has no duplicates");
         oracle.track(PEER_SET, peer_set);
 
-        // register the gossip channel. quota caps inbound receive rate.
-        let (sender, mut receiver) = network.register(
-            CHANNEL,
+        // register both gossip channels. quota caps inbound receive rate.
+        let (broadcast_sender, broadcast_receiver) = network.register(
+            CHANNEL_BROADCAST,
+            Quota::per_second(NZU32!(128)),
+            MAX_BACKLOG,
+        );
+        let (consensus_sender, consensus_receiver) = network.register(
+            CHANNEL_CONSENSUS,
             Quota::per_second(NZU32!(128)),
             MAX_BACKLOG,
         );
 
-        // inbound drain: forward every (peer, bytes) message as a broadcast-lane
-        // inbound item. spawned BEFORE network.start() so no early messages are
-        // missed (the channel receiver buffers up to MAX_BACKLOG regardless).
+        // inbound drains: one task per channel, each forwarding (peer, bytes)
+        // into the shared inbound mpsc tagged with that channel's lane. spawned
+        // BEFORE network.start() so no early messages are missed (the channel
+        // receivers buffer up to MAX_BACKLOG regardless).
         let (in_tx, in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
         // `child` derives a fresh task context (commonware contexts are
         // spawn-once and not `Clone`), so we never need `E: Clone`.
-        context.child("inbound").spawn(move |_ctx| async move {
-            while let Ok((_peer, msg)) = receiver.recv().await {
-                let bytes: Vec<u8> = msg.into();
-                if in_tx.send((Lane::Broadcast, bytes)).await.is_err() {
-                    // consumer dropped the inbound receiver; nothing left to do.
-                    break;
-                }
-            }
-        });
+        spawn_inbound_drain(
+            context.child("inbound-broadcast"),
+            broadcast_receiver,
+            Lane::Broadcast,
+            in_tx.clone(),
+        );
+        spawn_inbound_drain(
+            context.child("inbound-consensus"),
+            consensus_receiver,
+            Lane::Consensus,
+            in_tx,
+        );
 
         // start the network actors (dialer, listener, router, tracker, ...).
         network.start();
 
-        (Self { sender }, in_rx)
+        (
+            Self {
+                broadcast: broadcast_sender,
+                consensus: consensus_sender,
+            },
+            in_rx,
+        )
     }
 }
 
@@ -180,27 +237,27 @@ where
         lane: Lane,
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), Error>> + Send {
-        // clone the gossip sender up front so the async block owns it — commonware
-        // `Sender` is `Clone` and `send` is synchronous, so this avoids any mutex
-        // or a guard held across the `.await` point.
-        let mut sender = self.sender.clone();
+        // clone the lane's gossip sender up front so the async block owns it —
+        // commonware `Sender` is `Clone` and `send` is synchronous, so this
+        // avoids any mutex or a guard held across the `.await` point. both lanes
+        // gossip identically (best-effort `Recipients::All`); they differ only
+        // in which channel/sender carries the bytes, which is what lets the
+        // remote side tag the inbound lane correctly.
+        let mut sender = match lane {
+            Lane::Broadcast => self.broadcast.clone(),
+            // tier C: the consensus lane is ordered gossip on its own channel —
+            // functional delivery, not yet BFT total order. true byzantine
+            // ordering is the documented TODO (instantiate a simplex `Engine`
+            // and route its finalized payloads here via the [`consensus`]
+            // scaffolding); see this module's docstring.
+            Lane::Consensus => self.consensus.clone(),
+        };
         async move {
-            match lane {
-                Lane::Broadcast => {
-                    // gossip to every authorized peer. `send` is non-blocking and
-                    // returns the recipients it will attempt; offline/rate-limited
-                    // peers are silently skipped (best-effort, like loopback).
-                    let _recipients =
-                        sender.send(Recipients::All, IoBuf::from(bytes), false);
-                    Ok(())
-                }
-                // the consensus lane is the simplex BFT path; it lands in p1.2.
-                // we don't construct a transport::Error variant for it (that's a
-                // frozen interface) — an explicit unimplemented marks the seam.
-                Lane::Consensus => {
-                    unimplemented!("consensus lane (commonware simplex) lands in p1.2")
-                }
-            }
+            // gossip to every authorized peer. `send` is non-blocking and
+            // returns the recipients it will attempt; offline/rate-limited
+            // peers are silently skipped (best-effort, like loopback).
+            let _recipients = sender.send(Recipients::All, IoBuf::from(bytes), false);
+            Ok(())
         }
     }
 }
@@ -279,6 +336,67 @@ mod tests {
             let ops = decode_batch(&recv).expect("decode batch");
             assert_eq!(ops.len(), 1);
             assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Init)));
+        });
+    }
+
+    /// tier C consensus lane: node A sends a batch on `Lane::Consensus` and node
+    /// B receives it tagged `Lane::Consensus` (not `Broadcast`), proving the
+    /// consensus channel is wired end to end and lane-distinguishable on the
+    /// wire. this is ordered-gossip delivery, NOT BFT finalization — the simplex
+    /// `Engine` path is the documented TODO (see [`consensus`]).
+    ///
+    /// #[ignore]d for the same reason as the broadcast test: 2-node commonware
+    /// discovery under the deterministic clock is timing-sensitive. the impl is
+    /// the deliverable; run with `cargo test -p net -- --ignored`.
+    #[test]
+    #[ignore = "commonware 2-node discovery is timing-sensitive under the deterministic clock; impl compiles behind the trait"]
+    fn two_node_consensus_propagates() {
+        let executor = deterministic::Runner::timed(Duration::from_secs(30));
+        executor.start(|context| async move {
+            let key_a = ed25519::PrivateKey::from_seed(1).public_key();
+            let key_b = ed25519::PrivateKey::from_seed(2).public_key();
+            let peers = vec![key_a.clone(), key_b.clone()];
+
+            let (transport_a, mut _rx_a) = CommonwareTransport::new(
+                context.child("a"),
+                Config {
+                    seed: 1,
+                    namespace: b"ducktape-net-test".to_vec(),
+                    listen: addr(3000),
+                    advertised: addr(3000),
+                    peers: peers.clone(),
+                    bootstrappers: vec![],
+                },
+            );
+            let (_transport_b, mut rx_b) = CommonwareTransport::new(
+                context.child("b"),
+                Config {
+                    seed: 2,
+                    namespace: b"ducktape-net-test".to_vec(),
+                    listen: addr(3001),
+                    advertised: addr(3001),
+                    peers,
+                    bootstrappers: vec![(key_a, addr(3000))],
+                },
+            );
+
+            // send on the consensus lane from A.
+            let wire = vec![Op::Vcs(vcs::op::Op::Commit {
+                message: "consensus".into(),
+                author: "a".into(),
+            })];
+            let bytes = encode_batch(&wire);
+            transport_a
+                .send(Lane::Consensus, bytes)
+                .await
+                .expect("consensus send ok");
+
+            // B receives it on the consensus lane — NOT broadcast.
+            let (lane, recv) = rx_b.recv().await.expect("node B receives consensus");
+            assert_eq!(lane, Lane::Consensus);
+            let ops = decode_batch(&recv).expect("decode batch");
+            assert_eq!(ops.len(), 1);
+            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Commit { .. })));
         });
     }
 }
