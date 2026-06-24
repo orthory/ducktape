@@ -75,6 +75,24 @@ impl<Op> Batch<Op> {
 
         OperationResult::JournalInserted
     }
+
+    /// borrow the batch's ops in insertion order. this is what an `OnHydrate`
+    /// callback reads when a batch drains — the callback gets `&Batch`, so it
+    /// can only borrow (never move) the ops out.
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
+    /// number of ops currently in the batch.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// whether the batch carries no ops (the interval drain fires on an empty
+    /// journal — callbacks should skip these).
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
 }
 
 #[cfg(test)]
