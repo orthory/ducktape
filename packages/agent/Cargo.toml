@@ -12,3 +12,5 @@ thiserror.workspace = true
 document.workspace = true
 nodes.workspace = true
 uid.workspace = true
+op.workspace = true
+control.workspace = true
