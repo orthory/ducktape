@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 document.workspace = true
 workspace = { workspace = true }
+vcs.workspace = true
+control.workspace = true
 serde.workspace = true

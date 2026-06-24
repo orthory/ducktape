@@ -14,6 +14,7 @@ members = [
     "packages/api",
     "packages/uid",
     "utils", "packages/hydration", "packages/workspace", "packages/op", "engine",
+    "packages/vcs", "packages/control",
 ]
 
 [workspace.dependencies]
@@ -42,6 +43,8 @@ utils    = { path = "utils" }
 hydration = { path = "packages/hydration"}
 workspace = { path = "packages/workspace"}
 op = { path = "packages/op"}
+vcs = { path = "packages/vcs" }
+control = { path = "packages/control" }
 
 [[bin]]
 name = "ducktape"
