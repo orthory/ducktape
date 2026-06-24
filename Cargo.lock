@@ -1438,6 +1438,7 @@ version = "0.1.0"
 dependencies = [
  "document",
  "hydration",
+ "nodes",
  "serde",
  "thiserror",
  "uid",

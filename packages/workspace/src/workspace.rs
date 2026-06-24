@@ -40,6 +40,12 @@ impl Workspace {
         &self.root
     }
 
+    /// Mutable access to the root arc. Used by `hydrate` (the one allowed
+    /// `&mut self` mutation point) to fold ops into the tree in place.
+    pub(crate) fn root_mut(&mut self) -> &mut Arc<Entry> {
+        &mut self.root
+    }
+
     pub fn get_entries(&self, document_path: String) -> Result<&Entry, Error> {
         search_in_recursion(
             document_path

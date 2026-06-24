@@ -10,3 +10,6 @@ document.workspace = true
 utils.workspace = true
 uid.workspace = true
 hydration.workspace = true
+
+[dev-dependencies]
+nodes.workspace = true
