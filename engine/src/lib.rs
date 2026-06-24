@@ -15,7 +15,7 @@ use hydration::Hydratable;
 use workspace::Workspace;
 
 mod node;
-pub use node::{Config, Node, NoopWorker};
+pub use node::{Config, Node, NoopWorker, run_loopback_demo};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

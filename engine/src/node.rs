@@ -334,6 +334,64 @@ impl<T: Transport + Clone + 'static> Node<T> {
     }
 }
 
+/// a single-process two-node loopback demo: build nodes A and B on one
+/// [`LoopbackHub`], drive an `AddEntry` op into A, and log B converging. this is
+/// the body behind the bin's `node` subcommand — it lives here (not in main.rs)
+/// so main.rs stays a thin clap shim and the binary's only engine touch-point is
+/// this one call.
+///
+/// `config` labels node A (the driver); node B is minted with id+1. returns once
+/// B has applied the propagated op.
+pub async fn run_loopback_demo(config: Config) {
+    use transport::LoopbackHub;
+    use workspace::Entry;
+
+    // a frontmatter-only seed doc so both nodes start from an identical tree.
+    const SEED: &str = "---\ntitle: demo\nauthor: @a\ncreated_at: 1\nupdated_at: 1\n---\n";
+    let seed = document::Document::from_reader(SEED.as_bytes()).expect("seed doc parses");
+    let ws_a = Workspace::new_from_entry(Entry::Directory(vec![("seed.md".into(), Entry::File(seed))]));
+    let ws_b = ws_a.clone();
+
+    let hub = LoopbackHub::new();
+    let (transport_a, rx_a) = hub.node();
+    let (transport_b, rx_b) = hub.node();
+
+    let id_a = config.id;
+    let mut cfg_b = config.clone();
+    cfg_b.id = config.id + 1;
+
+    let node_a = Node::new(config, Engine::new(ws_a), transport_a, rx_a);
+    let node_b = Node::new(cfg_b, Engine::new(ws_b), transport_b, rx_b);
+
+    println!(
+        "[node] loopback demo: A=#{id_a} B=#{} — driving an AddEntry into A",
+        node_b.config().id
+    );
+
+    let new_doc = document::Document::from_reader(SEED.as_bytes()).expect("new doc parses");
+    let op = op::Op::Workspace(workspace::op::Op::AddEntry {
+        path: "added-by-a.md".into(),
+        entry: Entry::File(new_doc),
+    });
+    node_a
+        .apply_local_direct(op)
+        .await
+        .expect("A applies + propagates");
+    println!("[node] A applied the op locally; awaiting B...");
+
+    node_b.wait_inbound().await;
+
+    // count B's entries to show the propagation took effect.
+    let b_ws = node_b.workspace_snapshot().await;
+    let entry_count = match b_ws.root().as_ref() {
+        Entry::Directory(items) => items.len(),
+        Entry::File(_) => 1,
+    };
+    println!(
+        "[node] B received + applied the op; B now has {entry_count} top-level entries (seed + added)"
+    );
+}
+
 /// encode a batch held as a slice of refs (the on_hydrate callback path holds
 /// `&op::Op`, not owned ops).
 fn encode_batch_refs(ops: &[&op::Op]) -> Vec<u8> {

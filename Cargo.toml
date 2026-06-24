@@ -49,12 +49,14 @@ control = { path = "packages/control" }
 transport = { path = "packages/transport" }
 agent = { path = "packages/agent" }
 net = { path = "packages/net" }
+engine = { path = "engine" }
 
 [[bin]]
 name = "ducktape"
 path = "bin/src/main.rs"
 
 [dependencies]
-clap = "4.5.45"
+clap = { version = "4.5.45", features = ["derive"] }
 api.workspace = true
+engine.workspace = true
 tokio = { workspace = true, features = ["rt", "full"] }
