@@ -4,3 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+op.workspace = true
+workspace.workspace = true
+document.workspace = true
+hydration.workspace = true
+vcs.workspace = true
+control.workspace = true
+transport.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+nodes.workspace = true
+uid.workspace = true

@@ -286,6 +286,21 @@ dependencies = [
 [[package]]
 name = "engine"
 version = "0.1.0"
+dependencies = [
+ "control",
+ "document",
+ "hydration",
+ "nodes",
+ "op",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "transport",
+ "uid",
+ "vcs",
+ "workspace",
+]
 
 [[package]]
 name = "equivalent"
