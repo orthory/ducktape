@@ -5,4 +5,5 @@ mod workspace;
 mod entry;
 mod hydration;
 
+pub use self::entry::Entry;
 pub use self::workspace::*;

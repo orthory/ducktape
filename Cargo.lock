@@ -1139,10 +1139,16 @@ dependencies = [
 name = "transport"
 version = "0.1.0"
 dependencies = [
+ "document",
+ "hydration",
+ "nodes",
  "op",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "uid",
+ "workspace",
 ]
 
 [[package]]

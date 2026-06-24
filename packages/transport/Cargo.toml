@@ -8,3 +8,11 @@ op.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+workspace.workspace = true
+document.workspace = true
+hydration.workspace = true
+nodes.workspace = true
+uid.workspace = true
+serde.workspace = true
