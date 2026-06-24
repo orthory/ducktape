@@ -205,10 +205,9 @@ impl<T: Transport + Clone + 'static> Node<T> {
                 if ops.is_empty() {
                     continue;
                 }
-                // encode_batch wants &[Op]; we hold &Op refs, so copy the refs
-                // into an owned-ref slice via collect, then encode by reborrow.
-                let owned: Vec<&op::Op> = ops;
-                let bytes = encode_batch_refs(&owned);
+                // we hold `&op::Op` refs (the callback only borrows the batch);
+                // serialize the ref-slice directly.
+                let bytes = encode_batch_refs(&ops);
                 let _ = callback_tx.send((lane, bytes));
             }
         }));
