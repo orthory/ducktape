@@ -1,0 +1,9 @@
+[package]
+name = "op"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+document.workspace = true
+workspace = { workspace = true }
+serde.workspace = true

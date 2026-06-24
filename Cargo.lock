@@ -87,7 +87,7 @@ name = "api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "doctree",
+ "doctree_legacy",
  "document",
  "poem",
  "serde",
@@ -244,7 +244,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "doctree"
+name = "doctree_legacy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -260,7 +260,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nodes",
- "operation",
  "serde",
  "thiserror",
  "toml",
@@ -275,6 +274,10 @@ dependencies = [
  "clap",
  "tokio",
 ]
+
+[[package]]
+name = "engine"
+version = "0.1.0"
 
 [[package]]
 name = "equivalent"
@@ -477,7 +480,6 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 name = "hydration"
 version = "0.1.0"
 dependencies = [
- "operation",
  "serde",
  "thiserror",
  "tokio",
@@ -667,12 +669,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
 
 [[package]]
-name = "operation"
+name = "op"
 version = "0.1.0"
 dependencies = [
- "nodes",
- "thiserror",
- "uid",
+ "document",
+ "serde",
+ "workspace",
 ]
 
 [[package]]
@@ -1412,3 +1414,15 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "workspace"
+version = "0.1.0"
+dependencies = [
+ "document",
+ "hydration",
+ "serde",
+ "thiserror",
+ "uid",
+ "utils",
+]

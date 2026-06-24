@@ -8,12 +8,12 @@ resolver = "2"
 members = [
     "packages/auth",
     "bin",
-    "packages/doctree",
+    "packages/doctree_legacy",
     "packages/document",
     "packages/nodes",
     "packages/api",
     "packages/uid",
-    "utils", "packages/hydration", "packages/operation",
+    "utils", "packages/hydration", "packages/workspace", "packages/op", "engine",
 ]
 
 [workspace.dependencies]
@@ -34,13 +34,14 @@ tokio = { version = "1.47.1", features = ["full", "rt"] }
 # internal
 auth     = { path = "packages/auth" }
 api      = { path = "packages/api" }
-doctree  = { path = "packages/doctree" }
+doctree_legacy = { path = "packages/doctree_legacy" }
 document = { path = "packages/document" }
 nodes    = { path = "packages/nodes" }
 uid      = { path = "packages/uid" }
 utils    = { path = "utils" }
 hydration = { path = "packages/hydration"}
-operation = { path = "packages/operation"}
+workspace = { path = "packages/workspace"}
+op = { path = "packages/op"}
 
 [[bin]]
 name = "ducktape"

@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-operation.workspace = true
 uid.workspace = true
 serde.workspace = true
 thiserror.workspace = true

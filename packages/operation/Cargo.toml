@@ -1,9 +1,0 @@
-[package]
-name = "operation"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-uid.workspace = true
-thiserror.workspace = true
-nodes.workspace = true

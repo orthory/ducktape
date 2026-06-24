@@ -1,7 +1,7 @@
 use crate::utils::identifier::Identifier;
 use std::{path::PathBuf, sync::Arc};
 
-use doctree::{Entry, Persister, Stdfs, WorkingTree};
+use doctree_legacy::{Entry, Persister, Stdfs, WorkingTree};
 use poem::{
     Result, handler,
     web::{Data, Json, Path},

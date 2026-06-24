@@ -8,5 +8,5 @@ serde.workspace = true
 anyhow.workspace = true
 poem.workspace = true
 
-doctree.workspace = true
+doctree_legacy.workspace = true
 document.workspace = true

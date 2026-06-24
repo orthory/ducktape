@@ -2,10 +2,10 @@ use crate::config::Config;
 use crate::journal::{InsertResult, Journal, Batch};
 use tokio::time;
 
-enum ControlSequence {
-    InsertOp(operation::Operation),
+enum ControlSequence<Op> {
+    InsertOp(Op),
     Drain,
-    Register(OnHydrate),
+    Register(OnHydrate<Op>),
     Destroy,
 }
 
@@ -15,15 +15,16 @@ pub enum HydratorError {
     Closed
 }
 
-pub type OnHydrate = Box<dyn Fn(&Batch) + Send + Sync>;
+pub type OnHydrate<Op> = Box<dyn Fn(&Batch<Op>) + Send + Sync>;
 
 #[derive(Clone)]
-pub struct Hydrator {
-    tx: tokio::sync::mpsc::UnboundedSender<ControlSequence>,
+pub struct Hydrator<Op> {
+    tx: tokio::sync::mpsc::UnboundedSender<ControlSequence<Op>>,
 }
 
 /// main controller
-impl Hydrator {
+impl<Op> Hydrator<Op>
+where Op: Send + 'static {
     pub fn new_with_config(config: Config) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -42,13 +43,13 @@ impl Hydrator {
         }
     }
 
-    pub fn register_on_hydrate(&self, on_hydrate: OnHydrate) -> Result<(), HydratorError> {
+    pub fn register_on_hydrate(&self, on_hydrate: OnHydrate<Op>) -> Result<(), HydratorError> {
         self.tx
             .send(ControlSequence::Register(on_hydrate))
             .map_err(|_| HydratorError::Closed)
     }
 
-    pub fn insert_op(&self, op: operation::Operation) -> Result<(), HydratorError> {
+    pub fn insert_op(&self, op: Op) -> Result<(), HydratorError> {
         self.tx
             .send(ControlSequence::InsertOp(op))
             .map_err(|_| HydratorError::Closed)
@@ -61,16 +62,17 @@ impl Hydrator {
     }
 }
 
-struct HydratorInner {
+struct HydratorInner<Op> {
     config: Config,
-    journal: Journal,
-    on_hydrate_callbacks: Vec<OnHydrate>,
-    tx: tokio::sync::mpsc::UnboundedSender<ControlSequence>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<ControlSequence>,
+    journal: Journal<Op>,
+    on_hydrate_callbacks: Vec<OnHydrate<Op>>,
+    tx: tokio::sync::mpsc::UnboundedSender<ControlSequence<Op>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<ControlSequence<Op>>,
 }
 
-impl HydratorInner {
-    fn flush(&self, batch: Batch) {
+impl<Op> HydratorInner<Op>
+where Op: Send + 'static {
+    fn flush(&self, batch: Batch<Op>) {
         for f in self.on_hydrate_callbacks.iter() {
             f(&batch)
         }

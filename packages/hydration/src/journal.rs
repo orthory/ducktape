@@ -1,20 +1,18 @@
-use operation::Operation;
-
 use crate::config;
 
 #[derive(Debug)]
 /// Journal is 
-pub struct Journal {
-    current: Batch,
+pub struct Journal<Op> {
+    current: Batch<Op>,
     high_water: usize,
 }
 
-pub enum InsertResult {
+pub enum InsertResult<Op> {
     Inserted,
-    Flush(Batch),
+    Flush(Batch<Op>),
 }
 
-impl Journal {
+impl<Op> Journal<Op> {
     pub fn new(config: &config::journal::Config) -> Self {
         Self {
             current: Batch::new(config.hwm),
@@ -22,7 +20,7 @@ impl Journal {
         }
     }
     
-    pub(crate) fn insert_op(&mut self, op: Operation) -> InsertResult {
+    pub(crate) fn insert_op(&mut self, op: Op) -> InsertResult<Op> {
         let current = &mut self.current;
         match current.insert_op(op) {
             OperationResult::JournalInserted => InsertResult::Inserted,
@@ -43,32 +41,32 @@ impl Journal {
     /// 
     /// this could totally be just returning an Iterator but collect() into Vec is going to be done anyways
     /// somewhere up the stack, so better do it here (and it's clearner as well)
-    pub(crate) fn drain(&mut self) -> Batch {
+    pub(crate) fn drain(&mut self) -> Batch<Op> {
         std::mem::replace(&mut self.current, Batch::new(self.high_water))
     }
 }
 
 // individual journals
 #[derive(Debug)]
-pub struct Batch {
+pub struct Batch<Op> {
     tip: usize,
     /// Logical capacity — fixed at construction. Backing `ops` grows lazily
     /// via `push`; rollover triggers when `tip >= hwm`.
     hwm: usize,
-    ops: Vec<Operation>,
+    ops: Vec<Op>,
 }
 
-pub enum OperationResult {
+pub enum OperationResult<Op> {
     JournalInserted,
-    JournalFull(Operation),
+    JournalFull(Op),
 }
 
-impl Batch {
+impl<Op> Batch<Op> {
     pub(crate) fn new(hwm: usize) -> Self {
         Self { tip: 0, hwm, ops: Vec::with_capacity(hwm) }
     }
 
-    pub fn insert_op(&mut self, op: Operation) -> OperationResult {
+    pub fn insert_op(&mut self, op: Op) -> OperationResult<Op> {
         if self.tip >= self.hwm {
             return OperationResult::JournalFull(op);
         }
@@ -82,22 +80,18 @@ impl Batch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use operation::OpId;
 
-    // distinguish test ops by their `start` field — keeps assertions simple
-    fn op(k: u32) -> Operation {
-        Operation::OnUserDelete {
-            op_id: OpId::new(1, k),
-            node_id: uid::new(),
-            start: k,
-            len: 1,
-        }
+    // hydration is op-agnostic; tests use a trivial local op carrying a marker
+    #[derive(Debug)]
+    enum Op { Mark(u32) }
+
+    fn op(k: u32) -> Op {
+        Op::Mark(k)
     }
 
-    fn op_marker(o: &Operation) -> u32 {
+    fn op_marker(o: &Op) -> u32 {
         match o {
-            Operation::OnUserDelete { start, .. } => *start,
-            _ => panic!("unexpected op variant in test"),
+            Op::Mark(k) => *k,
         }
     }
 
@@ -105,7 +99,7 @@ mod tests {
 
     #[test]
     fn new_journal_starts_with_empty_current() {
-        let c = Journal::new(&config::journal::Config { hwm: 3 });
+        let c: Journal<Op> = Journal::new(&config::journal::Config { hwm: 3 });
         assert_eq!(c.current.tip, 0);
         assert!(c.current.ops.is_empty());
     }
@@ -218,7 +212,7 @@ mod tests {
 
     #[test]
     fn new_journal_is_empty() {
-        let j = Batch::new(3);
+        let j: Batch<Op> = Batch::new(3);
         assert_eq!(j.tip, 0);
         assert!(j.ops.is_empty());
     }

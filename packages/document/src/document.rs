@@ -1,8 +1,9 @@
 use std::{collections::HashMap, io::Read, path::Path};
 use nodes::{Nodes, parser::Parser};
+use serde::{Deserialize, Serialize};
 use uid::Identify;
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Document {
     // uid is _always_ assigned upon a successful hydration; equals the
     // frontmatter node's uid
@@ -24,7 +25,7 @@ impl Identify for Document {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum Errors {
+pub enum Error {
     #[error("DocumentInstance: io error")]
     IOError(String),
 
@@ -42,35 +43,35 @@ pub enum Errors {
 }
 
 impl Document {
-    pub fn from_path(path: &Path) -> Result<Self, Errors> {
+    pub fn from_path(path: &Path) -> Result<Self, Error> {
         let file = std::fs::File::options()
             .read(true)
             .open(&path)
-            .map_err(|e| Errors::IOError(e.to_string()))?;
+            .map_err(|e| Error::IOError(e.to_string()))?;
 
         Self::from_reader(file)
     }
     
     pub fn from_reader<R: Read>(
         reader: R
-    ) -> Result<Self, Errors> {
+    ) -> Result<Self, Error> {
         // try parsing from reader
         let nodes = try_instantiate_document(reader)?;
 
         // nodes must not be empty; if it is, we are fed an empty document
         if nodes.is_empty() {
-            return Err(Errors::EmptyDocument);
+            return Err(Error::EmptyDocument);
         };
 
         // first node must be frontmatter
         let Nodes::Frontmatter(frontmatter) = &nodes[0] else {
-            return Err(Errors::EmptyFrontmatter);
+            return Err(Error::EmptyFrontmatter);
         };
 
         // uid must be present on frontmatter (as it IS the document's uid)
         let uid = frontmatter.uid();
         if uid.is_nil() {
-            return Err(Errors::InvalidFrontmatter);
+            return Err(Error::InvalidFrontmatter);
         };
 
         // iterate over constructed nodes vector,
@@ -92,9 +93,15 @@ impl Document {
     }
 }
 
+impl Default for Document {
+    fn default() -> Self {
+        Self { uid: uid::new(), nodes_map: Default::default() }
+    }
+}
+
 fn try_instantiate_document<R: Read>(
     reader: R,
-) -> Result<Vec<Nodes>, Errors> {
+) -> Result<Vec<Nodes>, Error> {
     let mut parser = Parser::new(reader);
     let mut nodes: Vec<Nodes> = Vec::new();
 
@@ -104,7 +111,7 @@ fn try_instantiate_document<R: Read>(
             Ok(None) => break,
             Err(e) => {
                 let (line_pos, line) = parser.current_line();
-                return Err(Errors::ParseError(e.into(), line_pos, line));
+                return Err(Error::ParseError(e.into(), line_pos, line));
             }
         }
     }

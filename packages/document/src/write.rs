@@ -2,8 +2,7 @@ use std::collections::hash_map::Entry::{Occupied, Vacant};
 
 use uid::Identify;
 
-use crate::{Document};
-use operation::{Operation as Op};
+use crate::{Document, op::Op};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Errors {

@@ -1,4 +1,5 @@
 mod document;
+pub mod op;
 mod read;
 mod write;
 

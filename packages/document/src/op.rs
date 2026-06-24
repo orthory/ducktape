@@ -1,10 +1,12 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(thiserror::Error, Debug)]
 pub enum OperationError {
     #[error("asdf {0}")]
     NodeNotFound(String)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpId {
     client_id: u16,
     client_k: u32,
@@ -19,8 +21,8 @@ impl OpId {
     pub fn client_k(&self) -> u32 { self.client_k }
 }
 
-#[derive(Debug)]
-pub enum Operation {
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Op {
     // node-wise operations
     InsertAfter {
         op_id: OpId,
@@ -55,5 +57,5 @@ pub enum Operation {
         pos: usize
     },
     OnUserBlur,
-    
+
 }
