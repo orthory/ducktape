@@ -33,19 +33,16 @@ fn apply_one(root: &mut Entry, op: Op) {
             }
         }
 
-        // structural: drop the new entry into the root directory. the op only
-        // carries the `Entry` (no path), so for a file we name it after its
-        // document uid; directories get a uid-derived name too. callers that
-        // need stable paths should mint them upstream — this keeps the tree
-        // green without inventing a path scheme.
-        Op::AddEntry { entry } => {
-            if let Entry::Directory(items) = root {
-                let name = match &entry {
-                    Entry::File(doc) => doc.uid().to_string(),
-                    Entry::Directory(_) => uid::new().to_string(),
-                };
-                items.push((name, entry));
-            }
+        // structural: drop the new entry at an explicit slash-delimited path.
+        // intermediate segments are find-or-created as directories; the final
+        // segment is the basename the entry lands under. an empty path is a
+        // no-op, and if an intermediate segment collides with an existing
+        // `File` we bail rather than clobber it. callers mint the path upstream
+        // so every node inserts at the same place — that's what keeps the tree
+        // convergent across peers.
+        Op::AddEntry { path, entry } => {
+            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            insert_at_path(root, &segments, entry);
         }
 
         // structural: remove the file entry whose document uid matches.
@@ -68,6 +65,35 @@ fn apply_one(root: &mut Entry, op: Op) {
             }
         }
     }
+}
+
+/// insert `entry` at a slash-delimited path under `current`, creating missing
+/// intermediate directories as we go. the final segment is the basename. a
+/// no-op if `segments` is empty, if `current` isn't a directory, or if an
+/// intermediate segment collides with an existing `File` (we won't clobber it).
+fn insert_at_path(current: &mut Entry, segments: &[&str], entry: Entry) {
+    let Entry::Directory(items) = current else {
+        return;
+    };
+    let Some((head, rest)) = segments.split_first() else {
+        return;
+    };
+
+    // leaf: push the entry under its basename.
+    if rest.is_empty() {
+        items.push((head.to_string(), entry));
+        return;
+    }
+
+    // intermediate: find-or-create the child directory, then recurse.
+    let idx = match items.iter().position(|(name, _)| name == head) {
+        Some(i) => i,
+        None => {
+            items.push((head.to_string(), Entry::Directory(Vec::new())));
+            items.len() - 1
+        }
+    };
+    insert_at_path(&mut items[idx].1, rest, entry);
 }
 
 /// depth-first search for the `Entry::File` whose document uid equals `id`,
@@ -179,6 +205,25 @@ mod tests {
         ws.hydrate(ops.into_iter());
 
         assert_eq!(title_of(&ws, doc_id), "hello t");
+    }
+
+    #[test]
+    fn hydrate_add_entry_lands_at_nested_path() {
+        let doc = sample_doc();
+        let doc_id = doc.uid();
+        // start from an empty root so the "a/" parent dir must be created.
+        let mut ws = Workspace::new_from_entry(Entry::Directory(Vec::new()));
+
+        ws.hydrate(std::iter::once(Op::AddEntry {
+            path: "a/b.md".into(),
+            entry: Entry::File(doc),
+        }));
+
+        // retrievable at exactly the path we asked for...
+        let found = ws.get_entries("a/b.md".into()).expect("entry present");
+        assert!(matches!(found, Entry::File(_)));
+        // ...and it's the document we inserted.
+        assert_eq!(title_of(&ws, doc_id), "t");
     }
 
     #[test]

@@ -2,18 +2,17 @@
 //!
 //! phase-0's spine only crossed the BROADCAST lane (a document `EntryMut`). this
 //! proves the CONSENSUS lane end-to-end + the structural apply path:
-//! - the op is `Op::Workspace(workspace::op::Op::AddEntry { entry })`, whose
-//!   `lane()` is `Lane::Consensus` (only `EntryMut` rides broadcast; every other
-//!   workspace op rides consensus).
+//! - the op is `Op::Workspace(workspace::op::Op::AddEntry { path, entry })`,
+//!   whose `lane()` is `Lane::Consensus` (only `EntryMut` rides broadcast; every
+//!   other workspace op rides consensus).
 //! - it routes through `Engine::apply`, which folds it into the workspace via
 //!   `Workspace::hydrate` — the same structural `AddEntry` path the real node
 //!   will use.
 //!
-//! convergence holds because `AddEntry` names the new file after its document's
-//! uid (`doc.uid().to_string()`), and that uid survives the serde round-trip
-//! through `encode_batch`/`decode_batch` (`Document` serializes its `uid`
-//! field). so A (applying the original op) and B (applying the decoded op) push
-//! an identically-named entry to the end of the same root directory.
+//! convergence holds because `AddEntry` carries an explicit `path`, and that
+//! path survives the serde round-trip through `encode_batch`/`decode_batch`. so
+//! A (applying the original op) and B (applying the decoded op) insert the same
+//! entry at the same path in the same root directory.
 //!
 //! the fingerprint mirrors `transport/tests/convergence.rs`: a canonical,
 //! hashmap-order-independent string over the tree.
@@ -83,10 +82,11 @@ async fn consensus_add_entry_propagates_identically_to_b() {
 
     // --- the consensus-lane op: add a brand-new document entry ----------
     // the new doc is parsed once into a concrete `Document` carried by the op;
-    // its uid is fixed and survives the wire, so both nodes name the entry the
-    // same way under `AddEntry`'s `doc.uid().to_string()` rule.
+    // the op also carries an explicit `path`, which survives the wire, so both
+    // nodes insert the entry at the same place in the tree.
     let new_doc = Document::from_reader(SAMPLE.as_bytes()).expect("parse new doc");
     let wire = vec![Op::Workspace(workspace::op::Op::AddEntry {
+        path: "new.md".into(),
         entry: Entry::File(new_doc),
     })];
 
