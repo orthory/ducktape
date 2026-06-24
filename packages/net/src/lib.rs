@@ -33,6 +33,8 @@
 //! commonware's `Network` requires) so it runs under `deterministic::Runner` in
 //! tests AND a real tokio runtime in production.
 
+pub mod consensus;
+
 use std::future::Future;
 use std::net::SocketAddr;
 
