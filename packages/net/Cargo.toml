@@ -1,0 +1,20 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+transport.workspace = true
+op.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+commonware-runtime = "2026.5.0"
+commonware-p2p = "2026.5.0"
+commonware-cryptography = "2026.5.0"
+commonware-utils = "2026.5.0"
+commonware-macros = "2026.5.0"
+rand_core = "0.6.4"
+
+[dev-dependencies]
+vcs.workspace = true
