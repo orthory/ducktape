@@ -1,9 +1,14 @@
 //! commonware-backed transport: the broadcast lane over real p2p gossip.
 //!
 //! this satisfies the same [`transport::Transport`] seam the loopback impl does,
-//! but instead of an in-process channel it speaks commonware's
-//! `authenticated::discovery` dialect — ed25519-identified, encrypted,
-//! fully-connected peers with automatic address discovery.
+//! but instead of an in-process channel it speaks a real commonware p2p
+//! dialect. the production path ([`CommonwareTransport::new`]) uses
+//! `authenticated::discovery` — ed25519-identified, encrypted, fully-connected
+//! peers with automatic address discovery. the transport itself is generic over
+//! the gossip `Sender`, so tests drive it over the deterministic
+//! `p2p::simulated` dialect via [`CommonwareTransport::from_channels`] (instant
+//! links, no dial/handshake/discovery) — matching how commonware's own
+//! consensus tests run multi-node sims.
 //!
 //! shape (mirrors the loopback contract so the convergence test can target it):
 //! - [`CommonwareTransport::new`] is context-bound: commonware only lives inside
