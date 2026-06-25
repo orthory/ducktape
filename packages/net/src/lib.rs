@@ -41,7 +41,7 @@ use std::net::SocketAddr;
 use commonware_cryptography::{ed25519, Signer};
 use commonware_p2p::{
     authenticated::discovery::{self, Network},
-    Manager, Recipients, Sender as _,
+    Manager, Recipients,
 };
 use commonware_runtime::{
     BufferPooler, Clock, IoBuf, Metrics, Network as RNetwork, Quota, Resolver, Spawner,
@@ -73,8 +73,9 @@ const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// inbound backlog before the channel applies backpressure on receive.
 const MAX_BACKLOG: usize = 128;
 
-/// the sender half commonware's `register` hands back, specialized to ed25519
-/// identities and our runtime context `E`.
+/// the sender half commonware's discovery `register` hands back, specialized to
+/// ed25519 identities and our runtime context `E`. this is the concrete `S` the
+/// production authenticated path plugs into the generic transport.
 type GossipSender<E> = discovery::Sender<ed25519::PublicKey, E>;
 
 /// spawn a task that drains one registered channel's `Receiver`, forwarding
@@ -100,22 +101,28 @@ where
     });
 }
 
-/// commonware-backed transport.
+/// commonware-backed transport, generic over the gossip `Sender` `S`.
 ///
 /// holds two clone-able gossip `Sender`s — one per lane/channel. cloning the
 /// whole transport is cheap (senders are `Clone`), which is why this can satisfy
 /// the `&self` + `Send` shape of [`Transport::send`] without interior
 /// mutability.
+///
+/// the struct is decoupled from the p2p dialect: the production authenticated
+/// path instantiates `S = GossipSender<E>` (see [`CommonwareTransport::new`]),
+/// while tests instantiate `S = simulated::Sender<..>` via
+/// [`CommonwareTransport::from_channels`]. both lanes share the same `S` because
+/// they only differ in which channel/sender carries the bytes.
 #[derive(Clone)]
-pub struct CommonwareTransport<E>
+pub struct CommonwareTransport<S>
 where
-    E: Spawner + Clock + Send + 'static,
+    S: commonware_p2p::Sender + Clone + Send + Sync + 'static,
 {
     /// broadcast-lane gossip sender (CHANNEL_BROADCAST).
-    broadcast: GossipSender<E>,
+    broadcast: S,
     /// consensus-lane gossip sender (CHANNEL_CONSENSUS). tier C: ordered gossip
     /// stand-in for the simplex Engine's network sends.
-    consensus: GossipSender<E>,
+    consensus: S,
 }
 
 /// config knobs for standing up a node. addresses are plain `SocketAddr`s; the
@@ -139,7 +146,66 @@ pub struct Config {
     pub bootstrappers: Vec<(ed25519::PublicKey, SocketAddr)>,
 }
 
-impl<E> CommonwareTransport<E>
+impl<S> CommonwareTransport<S>
+where
+    S: commonware_p2p::Sender + Clone + Send + Sync + 'static,
+{
+    /// wire a transport from already-registered channel pairs, decoupled from
+    /// the p2p dialect.
+    ///
+    /// takes the broadcast and consensus `(sender, receiver)` pairs (whatever
+    /// network minted them — discovery in production, simulated in tests),
+    /// spawns one inbound drain per receiver into a shared inbound mpsc, and
+    /// holds the two senders. returns the transport plus the inbound receiver
+    /// (the same `(Lane, Vec<u8>)` tuple shape the trait's inbound side uses).
+    ///
+    /// the `context` is only used to derive child spawn contexts for the two
+    /// inbound drains, so it's bounded by just `Spawner` — independent of the
+    /// heavy `RNetwork`/`Resolver`/… bounds the authenticated `new` needs.
+    pub fn from_channels<E, RB, RC>(
+        context: E,
+        broadcast: (S, RB),
+        consensus: (S, RC),
+    ) -> (Self, mpsc::Receiver<Inbound>)
+    where
+        E: Spawner + Send + 'static,
+        RB: commonware_p2p::Receiver + Send + 'static,
+        RC: commonware_p2p::Receiver + Send + 'static,
+    {
+        let (broadcast_sender, broadcast_receiver) = broadcast;
+        let (consensus_sender, consensus_receiver) = consensus;
+
+        // inbound drains: one task per channel, each forwarding (peer, bytes)
+        // into the shared inbound mpsc tagged with that channel's lane. the
+        // registered receivers buffer their channel's backlog regardless of
+        // when these tasks start, so ordering vs network.start() is immaterial.
+        let (in_tx, in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+        // `child` derives a fresh task context (commonware contexts are
+        // spawn-once and not `Clone`), so we never need `E: Clone`.
+        spawn_inbound_drain(
+            context.child("inbound-broadcast"),
+            broadcast_receiver,
+            Lane::Broadcast,
+            in_tx.clone(),
+        );
+        spawn_inbound_drain(
+            context.child("inbound-consensus"),
+            consensus_receiver,
+            Lane::Consensus,
+            in_tx,
+        );
+
+        (
+            Self {
+                broadcast: broadcast_sender,
+                consensus: consensus_sender,
+            },
+            in_rx,
+        )
+    }
+}
+
+impl<E> CommonwareTransport<GossipSender<E>>
 where
     E: Spawner
         + BufferPooler
@@ -149,6 +215,7 @@ where
         + Resolver
         + Metrics
         + Send
+        + Sync
         + 'static,
 {
     /// stand up a commonware node on the given runtime `context`.
@@ -186,53 +253,34 @@ where
         oracle.track(PEER_SET, peer_set);
 
         // register both gossip channels. quota caps inbound receive rate.
-        let (broadcast_sender, broadcast_receiver) = network.register(
+        let broadcast = network.register(
             CHANNEL_BROADCAST,
             Quota::per_second(NZU32!(128)),
             MAX_BACKLOG,
         );
-        let (consensus_sender, consensus_receiver) = network.register(
+        let consensus = network.register(
             CHANNEL_CONSENSUS,
             Quota::per_second(NZU32!(128)),
             MAX_BACKLOG,
         );
 
-        // inbound drains: one task per channel, each forwarding (peer, bytes)
-        // into the shared inbound mpsc tagged with that channel's lane. spawned
-        // BEFORE network.start() so no early messages are missed (the channel
-        // receivers buffer up to MAX_BACKLOG regardless).
-        let (in_tx, in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
-        // `child` derives a fresh task context (commonware contexts are
-        // spawn-once and not `Clone`), so we never need `E: Clone`.
-        spawn_inbound_drain(
-            context.child("inbound-broadcast"),
-            broadcast_receiver,
-            Lane::Broadcast,
-            in_tx.clone(),
-        );
-        spawn_inbound_drain(
-            context.child("inbound-consensus"),
-            consensus_receiver,
-            Lane::Consensus,
-            in_tx,
-        );
+        // wire the two channel pairs into a dialect-agnostic transport (spawns
+        // the inbound drains, holds the senders). the registered receivers
+        // buffer up to MAX_BACKLOG regardless, so it's fine to start the network
+        // after building the transport.
+        let (transport, in_rx) =
+            Self::from_channels(context.child("transport"), broadcast, consensus);
 
         // start the network actors (dialer, listener, router, tracker, ...).
         network.start();
 
-        (
-            Self {
-                broadcast: broadcast_sender,
-                consensus: consensus_sender,
-            },
-            in_rx,
-        )
+        (transport, in_rx)
     }
 }
 
-impl<E> Transport for CommonwareTransport<E>
+impl<S> Transport for CommonwareTransport<S>
 where
-    E: Spawner + Clock + Send + Sync + 'static,
+    S: commonware_p2p::Sender + Clone + Send + Sync + 'static,
 {
     fn send(
         &self,
