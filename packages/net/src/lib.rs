@@ -183,13 +183,13 @@ where
         // `child` derives a fresh task context (commonware contexts are
         // spawn-once and not `Clone`), so we never need `E: Clone`.
         spawn_inbound_drain(
-            context.child("inbound-broadcast"),
+            context.child("inbound_broadcast"),
             broadcast_receiver,
             Lane::Broadcast,
             in_tx.clone(),
         );
         spawn_inbound_drain(
-            context.child("inbound-consensus"),
+            context.child("inbound_consensus"),
             consensus_receiver,
             Lane::Consensus,
             in_tx,
@@ -315,7 +315,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use commonware_p2p::simulated::{self, Link};
+    use commonware_p2p::Provider as _;
     use commonware_runtime::{deterministic, Runner, Supervisor as _};
+    use commonware_utils::{ordered::Set, NZUsize};
     use op::Op;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
@@ -325,54 +328,104 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 
-    /// 2-node deterministic sim: node A broadcasts an encoded op batch and node B
-    /// receives + decodes it. exercises the real commonware discovery stack
-    /// (handshake, dial, gossip) under the deterministic runner.
+    /// 2-node deterministic sim over `p2p::simulated`: node A broadcasts an
+    /// encoded op batch and node B receives + decodes it. this is a REAL
+    /// distributed proof — two transports wired through commonware's simulated
+    /// network (instant deterministic links, no dial/handshake/discovery), so it
+    /// actually runs and terminates under the deterministic clock.
     ///
-    /// #[ignore]d for the green-gate: getting two commonware nodes to fully
-    /// establish (handshake + discovery + dial) under the deterministic clock and
-    /// land a gossip message reliably is timing-sensitive and flaky in a unit
-    /// test. the IMPL is the deliverable — it compiles behind the trait and the
-    /// happy path is wired end to end. run explicitly with
-    /// `cargo test -p net -- --ignored` to exercise it.
+    /// the production `authenticated::discovery` path is unchanged; only the
+    /// TEST path swaps in `simulated`, which is exactly how commonware's own
+    /// consensus tests drive deterministic multi-node sims. n=2 is fine for a
+    /// best-effort broadcast (no BFT quorum involved).
     #[test]
-    #[ignore = "commonware 2-node discovery is timing-sensitive under the deterministic clock; impl compiles behind the trait"]
     fn two_node_broadcast_propagates() {
-        // `timed` bounds simulated time so that if discovery never establishes
-        // (the recv below never lands), the deterministic executor hits its
-        // deadline and panics rather than live-locking forever. without this an
-        // accidental `--ignored` run would hang indefinitely.
+        // `timed` bounds simulated time: if the link/track wiring were wrong and
+        // B's recv never landed, the executor hits its deadline and panics
+        // rather than live-locking. a pass therefore means B genuinely received
+        // + decoded within simulated time, not a stubbed assert.
         let executor = deterministic::Runner::timed(Duration::from_secs(30));
         executor.start(|context| async move {
             let key_a = ed25519::PrivateKey::from_seed(1).public_key();
             let key_b = ed25519::PrivateKey::from_seed(2).public_key();
             let peers = vec![key_a.clone(), key_b.clone()];
 
-            // node A is the bootstrapper; node B dials it.
-            let (transport_a, mut _rx_a) = CommonwareTransport::new(
-                context.child("a"),
-                Config {
-                    seed: 1,
-                    namespace: b"ducktape-net-test".to_vec(),
-                    listen: addr(3000),
-                    advertised: addr(3000),
-                    peers: peers.clone(),
-                    bootstrappers: vec![],
+            // stand up the simulated network + oracle. one tracked peer set is
+            // all a 2-node gossip needs.
+            let (network, oracle) = simulated::Network::new(
+                context.child("network"),
+                simulated::Config {
+                    max_size: MAX_MESSAGE_SIZE,
+                    disconnect_on_block: true,
+                    tracked_peer_sets: NZUsize!(1),
                 },
             );
-            let (_transport_b, mut rx_b) = CommonwareTransport::new(
-                context.child("b"),
-                Config {
-                    seed: 2,
-                    namespace: b"ducktape-net-test".to_vec(),
-                    listen: addr(3001),
-                    advertised: addr(3001),
-                    peers,
-                    bootstrappers: vec![(key_a, addr(3000))],
-                },
+            network.start();
+
+            // register BOTH channels on BOTH peers — `from_channels` needs a
+            // broadcast + consensus pair each. the idle consensus drains block on
+            // recv() forever, which is harmless: the runner stops when the root
+            // future (rx_b.recv below) returns and aborts spawned tasks.
+            let quota = Quota::per_second(NZU32!(128));
+            let (a_bcast_tx, a_bcast_rx) = oracle
+                .control(key_a.clone())
+                .register(CHANNEL_BROADCAST, quota)
+                .await
+                .expect("A registers broadcast channel");
+            let (a_cons_tx, a_cons_rx) = oracle
+                .control(key_a.clone())
+                .register(CHANNEL_CONSENSUS, quota)
+                .await
+                .expect("A registers consensus channel");
+            let (b_bcast_tx, b_bcast_rx) = oracle
+                .control(key_b.clone())
+                .register(CHANNEL_BROADCAST, quota)
+                .await
+                .expect("B registers broadcast channel");
+            let (b_cons_tx, b_cons_rx) = oracle
+                .control(key_b.clone())
+                .register(CHANNEL_CONSENSUS, quota)
+                .await
+                .expect("B registers consensus channel");
+
+            // track the authorized peer set, then await it landing before
+            // linking/sending so peers are connectable when A sends.
+            let mut manager = oracle.manager();
+            manager.track(PEER_SET, Set::from_iter_dedup(peers));
+            assert!(
+                manager.peer_set(PEER_SET).await.is_some(),
+                "peer set tracked"
             );
 
-            // give discovery time to establish, then broadcast from A.
+            // link both directions with a perfect link (success_rate 1.0) so the
+            // single gossip message is delivered deterministically.
+            let link = Link {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(1),
+                success_rate: 1.0,
+            };
+            oracle
+                .add_link(key_a.clone(), key_b.clone(), link.clone())
+                .await
+                .expect("link a->b");
+            oracle
+                .add_link(key_b.clone(), key_a.clone(), link)
+                .await
+                .expect("link b->a");
+
+            // build both transports from the registered channel pairs.
+            let (transport_a, mut _rx_a) = CommonwareTransport::from_channels(
+                context.child("a"),
+                (a_bcast_tx, a_bcast_rx),
+                (a_cons_tx, a_cons_rx),
+            );
+            let (_transport_b, mut rx_b) = CommonwareTransport::from_channels(
+                context.child("b"),
+                (b_bcast_tx, b_bcast_rx),
+                (b_cons_tx, b_cons_rx),
+            );
+
+            // A broadcasts an encoded op batch.
             let wire = vec![Op::Vcs(vcs::op::Op::Init)];
             let bytes = encode_batch(&wire);
             transport_a
