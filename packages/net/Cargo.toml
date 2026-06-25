@@ -23,3 +23,10 @@ commonware-actor = "2026.5.0"
 
 [dev-dependencies]
 vcs.workspace = true
+
+# test-only: the simplex Engine baseline (CW.2a) drives commonware's OWN mocks
+# (application/reporter/relay/genesis/fixture). the `mocks` feature is a
+# dev-only flag that cascades to commonware-cryptography/mocks and
+# commonware-p2p/mocks, so a single feature-enabled dev-dep is enough — feature
+# unification turns the mocks on for the test build only, never production.
+commonware-consensus = { version = "2026.5.0", features = ["mocks"] }

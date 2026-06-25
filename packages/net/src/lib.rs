@@ -507,4 +507,218 @@ mod tests {
             assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Commit { .. })));
         });
     }
+
+    /// CW.2a — the known-good baseline: a REAL commonware simplex `Engine`
+    /// reaching `Activity::Finalization` on a `p2p::simulated` network, driven
+    /// entirely by commonware's OWN mocks. this is a faithful replica of
+    /// commonware-consensus's internal `all_online` test (consensus
+    /// `src/simplex/mod.rs`), specialized to the ed25519 scheme and with the
+    /// three crate-private helpers (`start_test_network_with_peers`,
+    /// `register_validators`, `link_validators`) inlined.
+    ///
+    /// why this lives here: it's the bisect baseline for swapping our own
+    /// Automaton/Relay/Reporter into the engine (CW.2b). proving the engine
+    /// finalizes with commonware's mocks first isolates "does simplex run under
+    /// our test harness at all" from "do our traits satisfy its contracts".
+    ///
+    /// n = 5 is the CANONICAL validator count from `all_online` (BFT needs
+    /// n >= 3f+1 and a 2f+1 quorum; the all_online fixture uses 5). the wait
+    /// mirrors all_online exactly: each validator's mock reporter exposes a
+    /// `subscribe()` monitor that only emits on `finalization.view()`, so a
+    /// completed wait IS proof of real finalization — not a stubbed assert.
+    /// `Runner::timed(300s)` bounds simulated time, so a wiring bug surfaces as
+    /// a deadline panic rather than a live-lock.
+    #[test]
+    fn simplex_finalizes_with_mocks() {
+        use commonware_consensus::simplex::{
+            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
+            elector::RoundRobin,
+            mocks,
+            scheme::ed25519 as simplex_ed25519,
+            Engine,
+        };
+        use commonware_consensus::types::{Epoch, View, ViewDelta};
+        use commonware_consensus::Monitor as _;
+        use commonware_cryptography::Sha256;
+        use commonware_parallel::Sequential;
+        use commonware_runtime::buffer::paged::CacheRef;
+        use commonware_utils::{NZUsize, NZU16};
+        use std::sync::Arc;
+
+        // canonical fixture params, lifted verbatim from all_online.
+        let n: u32 = 5;
+        let required_containers = View::new(100);
+        let activity_timeout = ViewDelta::new(10);
+        let skip_timeout = ViewDelta::new(5);
+        let namespace = b"consensus".to_vec();
+        let page_size = NZU16!(1024);
+        let page_cache_size = NZUsize!(10);
+
+        let executor = deterministic::Runner::timed(Duration::from_secs(300));
+        executor.start(|mut context| async move {
+            // build the ed25519 scheme fixture: n sorted participants, each with
+            // a per-validator simplex scheme instance. `deterministic::Context`
+            // is the rng source (it impls RngCore + CryptoRng).
+            let fixture = simplex_ed25519::fixture(&mut context, &namespace, n);
+            let participants = fixture.participants.clone();
+            let schemes = fixture.schemes.clone();
+
+            // stand up the simulated network seeded with the participant set
+            // (the all_online path: `new_with_peers`, NOT new + manual track).
+            // links are instant/deterministic — no dial/handshake/discovery.
+            let (network, oracle) = simulated::Network::new_with_peers(
+                context.child("network"),
+                simulated::Config {
+                    max_size: 1024 * 1024,
+                    disconnect_on_block: true,
+                    tracked_peer_sets: NZUsize!(1),
+                },
+                participants.clone(),
+            )
+            .await;
+            network.start();
+
+            // register all validators: three channels each — vote(0),
+            // certificate(1), resolver(2) — in that order, since the engine's
+            // `start(vote, cert, resolver)` consumes them positionally.
+            let quota = Quota::per_second(NZU32!(128));
+            let mut registrations = std::collections::HashMap::new();
+            for validator in participants.iter() {
+                let control = oracle.control(validator.clone());
+                let vote = control
+                    .register(0, quota)
+                    .await
+                    .expect("register vote channel");
+                let certificate = control
+                    .register(1, quota)
+                    .await
+                    .expect("register certificate channel");
+                let resolver = control
+                    .register(2, quota)
+                    .await
+                    .expect("register resolver channel");
+                registrations.insert(validator.clone(), (vote, certificate, resolver));
+            }
+
+            // link every ordered pair of distinct validators with a perfect
+            // link (success_rate 1.0) so votes/certs propagate deterministically.
+            let link = Link {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(1),
+                success_rate: 1.0,
+            };
+            for v1 in participants.iter() {
+                for v2 in participants.iter() {
+                    if v1 == v2 {
+                        continue;
+                    }
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .expect("link validators");
+                }
+            }
+
+            // build + start one engine per validator. all engines share a single
+            // mock relay (the proposed-payload broadcast bus); each gets its own
+            // mock application (automaton + relay role) and mock reporter.
+            let elector = RoundRobin::<Sha256>::default();
+            let relay = Arc::new(mocks::relay::Relay::new());
+            let mut reporters = Vec::new();
+            let mut engine_handlers = Vec::new();
+            for (idx, validator) in participants.iter().enumerate() {
+                let v_ctx = context.child("validator");
+
+                let reporter_config = mocks::reporter::Config {
+                    participants: participants.clone().try_into().unwrap(),
+                    scheme: schemes[idx].clone(),
+                    elector: elector.clone(),
+                };
+                let reporter =
+                    mocks::reporter::Reporter::new(v_ctx.child("reporter"), reporter_config);
+                reporters.push(reporter.clone());
+
+                let application_cfg = mocks::application::Config {
+                    hasher: Sha256::default(),
+                    relay: relay.clone(),
+                    me: validator.clone(),
+                    propose_latency: (10.0, 5.0),
+                    verify_latency: (10.0, 5.0),
+                    certify_latency: (10.0, 5.0),
+                    should_certify: mocks::application::Certifier::Always,
+                };
+                let (actor, application) = mocks::application::Application::new(
+                    v_ctx.child("application"),
+                    application_cfg,
+                );
+                // the application actor runs as its own task; we deliberately
+                // drop its handle (mirror all_online) — only the engine handles
+                // must be kept alive.
+                actor.start();
+
+                let blocker = oracle.control(validator.clone());
+                let cfg = SimplexConfig {
+                    scheme: schemes[idx].clone(),
+                    elector: elector.clone(),
+                    blocker,
+                    automaton: application.clone(),
+                    relay: application.clone(),
+                    reporter: reporter.clone(),
+                    strategy: Sequential,
+                    partition: validator.to_string(),
+                    mailbox_size: NZUsize!(1024),
+                    epoch: Epoch::new(333),
+                    floor: Floor::Genesis(mocks::application::genesis::<Sha256>(Epoch::new(333))),
+                    leader_timeout: Duration::from_secs(1),
+                    certification_timeout: Duration::from_secs(2),
+                    timeout_retry: Duration::from_secs(10),
+                    fetch_timeout: Duration::from_secs(1),
+                    activity_timeout,
+                    skip_timeout,
+                    fetch_concurrent: NZUsize!(4),
+                    replay_buffer: NZUsize!(1024 * 1024),
+                    write_buffer: NZUsize!(1024 * 1024),
+                    page_cache: CacheRef::from_pooler(&context, page_size, page_cache_size),
+                    forwarding: ForwardingPolicy::Disabled,
+                };
+                let engine = Engine::new(v_ctx.child("engine"), cfg);
+
+                let (vote, certificate, resolver) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                // KEEP the handle alive — dropping a returned engine handle can
+                // abort the engine task and stall finalization.
+                engine_handlers.push(engine.start(vote, certificate, resolver));
+            }
+
+            // await each validator's reporter monitor until `required_containers`
+            // finalizes. the reporter only pushes on `finalization.view()`, so a
+            // completed loop proves a real `Activity::Finalization` was reported.
+            let mut finalizers = Vec::new();
+            for reporter in reporters.iter_mut() {
+                let (mut latest, mut monitor) = reporter.subscribe().await;
+                finalizers.push(context.child("finalizer").spawn(move |_| async move {
+                    while latest < required_containers {
+                        latest = monitor.recv().await.expect("finalization event missing");
+                    }
+                }));
+            }
+            // sequential await: each finalizer future resolves once its validator
+            // crosses the target view; all engines run concurrently regardless,
+            // so this converges and avoids a `futures::join_all` dep.
+            for finalizer in finalizers {
+                finalizer.await.expect("finalizer task joined");
+            }
+
+            // sanity: no equivocation/invalid-signature faults were observed on
+            // the path to finalization (cheap, public reporter asserts).
+            for reporter in reporters.iter() {
+                reporter.assert_no_faults();
+                reporter.assert_no_invalid();
+            }
+
+            // keep engines alive until the very end (drop is the implicit abort).
+            drop(engine_handlers);
+        });
+    }
 }
