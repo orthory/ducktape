@@ -325,13 +325,8 @@ mod tests {
     use commonware_runtime::{deterministic, Runner, Supervisor as _};
     use commonware_utils::{ordered::Set, NZUsize};
     use op::Op;
-    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
     use transport::{decode_batch, encode_batch};
-
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
-    }
 
     /// 2-node deterministic sim over `p2p::simulated`: node A broadcasts an
     /// encoded op batch and node B receives + decodes it. this is a REAL
@@ -447,64 +442,223 @@ mod tests {
         });
     }
 
-    /// tier C consensus lane: node A sends a batch on `Lane::Consensus` and node
-    /// B receives it tagged `Lane::Consensus` (not `Broadcast`), proving the
-    /// consensus channel is wired end to end and lane-distinguishable on the
-    /// wire. this is ordered-gossip delivery, NOT BFT finalization — the simplex
-    /// `Engine` path is the documented TODO (see [`consensus`]).
+    /// CW.2b — the REAL consensus lane: a commonware simplex `Engine` reaching
+    /// `Activity::Finalization`, driven by OUR own
+    /// [`consensus::ConsensusAutomaton`] / [`consensus::ConsensusRelay`] /
+    /// [`consensus::ConsensusReporter`] (not commonware's mocks), with the
+    /// finalized op-batch bytes resolved through OUR [`consensus::ContentStore`]
+    /// and delivered into an inbound mpsc tagged `Lane::Consensus`.
     ///
-    /// #[ignore]d for the same reason as the broadcast test: 2-node commonware
-    /// discovery under the deterministic clock is timing-sensitive. the impl is
-    /// the deliverable; run with `cargo test -p net -- --ignored`.
+    /// this is the production-shaped round trip: `store.put(bytes)` →
+    /// `automaton.enqueue(digest)` on a designated PROPOSER, the engine orders
+    /// that digest via BFT consensus, and the proposer's `ConsensusReporter`
+    /// resolves the finalized digest back to bytes and forwards `(Lane::Consensus,
+    /// bytes)` on finalization. it keeps CW.2a's wiring (same simulated network,
+    /// same canonical n=5, same per-validator real `Engine::new`/`start`) and
+    /// only swaps the application/relay/reporter triple.
+    ///
+    /// finalization proof: `ConsensusReporter::report` forwards onto the inbound
+    /// mpsc ONLY in the `Activity::Finalization` arm (notarizations/votes never
+    /// touch it). so `inbound_rx.recv().await` returning the proposed bytes is
+    /// itself proof that a real `Activity::Finalization` was reported by an actual
+    /// `Engine` — no View(100) wait needed. `Runner::timed(300s)` is the liveness
+    /// guard: if nothing ever finalizes, the deadline panics rather than hanging.
+    ///
+    /// per decision #3 we assert on the PROPOSER (whose `ContentStore` holds the
+    /// bytes). peer nodes resolve `store.get(digest) -> None` and drop — cross-node
+    /// payload delivery via the resolver channel is out of scope here.
+    ///
+    /// non-proposer leaders propose against an empty queue, so their `propose`
+    /// drops the sender → that view nullifies (leader_timeout) and advances. that
+    /// is standard simplex liveness; within at most n views the proposer is
+    /// leader, pops its one digest, and perfect links + our `verify -> true` mean
+    /// every validator notarizes + finalizes that view.
     #[test]
-    #[ignore = "commonware 2-node discovery is timing-sensitive under the deterministic clock; impl compiles behind the trait"]
-    fn two_node_consensus_propagates() {
-        let executor = deterministic::Runner::timed(Duration::from_secs(30));
-        executor.start(|context| async move {
-            let key_a = ed25519::PrivateKey::from_seed(1).public_key();
-            let key_b = ed25519::PrivateKey::from_seed(2).public_key();
-            let peers = vec![key_a.clone(), key_b.clone()];
+    fn simplex_finalizes_and_delivers_on_proposer() {
+        use commonware_consensus::simplex::{
+            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
+            elector::RoundRobin,
+            mocks,
+            scheme::ed25519 as simplex_ed25519,
+            Engine,
+        };
+        use commonware_consensus::types::{Epoch, ViewDelta};
+        use commonware_cryptography::Sha256;
+        use commonware_parallel::Sequential;
+        use commonware_runtime::buffer::paged::CacheRef;
+        use commonware_utils::{NZUsize, NZU16};
 
-            let (transport_a, mut _rx_a) = CommonwareTransport::new(
-                context.child("a"),
-                Config {
-                    seed: 1,
-                    namespace: b"ducktape-net-test".to_vec(),
-                    listen: addr(3000),
-                    advertised: addr(3000),
-                    peers: peers.clone(),
-                    bootstrappers: vec![],
-                },
-            );
-            let (_transport_b, mut rx_b) = CommonwareTransport::new(
-                context.child("b"),
-                Config {
-                    seed: 2,
-                    namespace: b"ducktape-net-test".to_vec(),
-                    listen: addr(3001),
-                    advertised: addr(3001),
-                    peers,
-                    bootstrappers: vec![(key_a, addr(3000))],
-                },
-            );
+        use crate::consensus::{
+            ConsensusAutomaton, ConsensusRelay, ConsensusReporter, ContentStore,
+        };
 
-            // send on the consensus lane from A.
+        // canonical fixture params, lifted verbatim from all_online / CW.2a.
+        let n: u32 = 5;
+        let activity_timeout = ViewDelta::new(10);
+        let skip_timeout = ViewDelta::new(5);
+        let namespace = b"consensus".to_vec();
+        let page_size = NZU16!(1024);
+        let page_cache_size = NZUsize!(10);
+
+        let executor = deterministic::Runner::timed(Duration::from_secs(300));
+        executor.start(|mut context| async move {
+            // the ed25519 scheme fixture: n sorted participants + per-validator
+            // scheme instances. `deterministic::Context` is the rng source.
+            let fixture = simplex_ed25519::fixture(&mut context, &namespace, n);
+            let participants = fixture.participants.clone();
+            let schemes = fixture.schemes.clone();
+
+            // simulated network seeded with the participant set (instant,
+            // deterministic links — no dial/handshake/discovery).
+            let (network, oracle) = simulated::Network::new_with_peers(
+                context.child("network"),
+                simulated::Config {
+                    max_size: 1024 * 1024,
+                    disconnect_on_block: true,
+                    tracked_peer_sets: NZUsize!(1),
+                },
+                participants.clone(),
+            )
+            .await;
+            network.start();
+
+            // register all validators: vote(0), certificate(1), resolver(2) — in
+            // that order; the engine's `start(vote, cert, resolver)` consumes them
+            // positionally.
+            let quota = Quota::per_second(NZU32!(128));
+            let mut registrations = std::collections::HashMap::new();
+            for validator in participants.iter() {
+                let control = oracle.control(validator.clone());
+                let vote = control.register(0, quota).await.expect("register vote");
+                let certificate = control
+                    .register(1, quota)
+                    .await
+                    .expect("register certificate");
+                let resolver = control.register(2, quota).await.expect("register resolver");
+                registrations.insert(validator.clone(), (vote, certificate, resolver));
+            }
+
+            // perfect all-pairs links so votes/certs propagate deterministically.
+            let link = Link {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(1),
+                success_rate: 1.0,
+            };
+            for v1 in participants.iter() {
+                for v2 in participants.iter() {
+                    if v1 == v2 {
+                        continue;
+                    }
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .expect("link validators");
+                }
+            }
+
+            // the PROPOSER: participant 0. it (and only it) gets the op-batch
+            // staged into its ContentStore + enqueued for proposal, and its
+            // reporter is wired to an inbound mpsc we read in the test.
+            let proposer = participants[0].clone();
+
+            // the op-batch we expect to see finalized + delivered. a Vcs::Commit
+            // is a consensus-lane op (`op::Op::lane()` routes Vcs to Consensus).
             let wire = vec![Op::Vcs(vcs::op::Op::Commit {
                 message: "consensus".into(),
-                author: "a".into(),
+                author: "proposer".into(),
             })];
-            let bytes = encode_batch(&wire);
-            transport_a
-                .send(Lane::Consensus, bytes)
-                .await
-                .expect("consensus send ok");
+            let proposed_bytes = encode_batch(&wire);
 
-            // B receives it on the consensus lane — NOT broadcast.
-            let (lane, recv) = rx_b.recv().await.expect("node B receives consensus");
+            // the proposer's inbound side: ConsensusReporter forwards finalized
+            // bytes here on `Activity::Finalization`. recv on this rx is the
+            // finalization proof.
+            let (proposer_in_tx, mut proposer_in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+
+            // build + start one engine per validator with OUR triple.
+            let elector = RoundRobin::<Sha256>::default();
+            let mut engine_handlers = Vec::new();
+            for (idx, validator) in participants.iter().enumerate() {
+                let v_ctx = context.child("validator");
+                let is_proposer = *validator == proposer;
+
+                // each validator owns its own content store. only the proposer's
+                // gets the payload staged (peers resolve None on finalization and
+                // drop — out of scope here).
+                let store = ContentStore::new();
+
+                // P = ed25519::PublicKey (the fixture's key) for Automaton/Relay.
+                let automaton =
+                    ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new();
+                if is_proposer {
+                    let digest = store.put(proposed_bytes.clone());
+                    automaton.enqueue(digest);
+                }
+                let relay =
+                    ConsensusRelay::<commonware_cryptography::ed25519::PublicKey>::new(store.clone());
+
+                // S = the type of schemes[idx] for ConsensusReporter::<S> (phantom,
+                // named explicitly at construction). the proposer's reporter feeds
+                // the inbound rx we keep; peers get throwaway senders.
+                let inbound = if is_proposer {
+                    proposer_in_tx.clone()
+                } else {
+                    let (throwaway, _drop) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+                    throwaway
+                };
+                let reporter =
+                    ConsensusReporter::<simplex_ed25519::Scheme>::new(store.clone(), inbound);
+
+                let blocker = oracle.control(validator.clone());
+                let cfg = SimplexConfig {
+                    scheme: schemes[idx].clone(),
+                    elector: elector.clone(),
+                    blocker,
+                    automaton,
+                    relay,
+                    reporter,
+                    strategy: Sequential,
+                    partition: validator.to_string(),
+                    mailbox_size: NZUsize!(1024),
+                    epoch: Epoch::new(333),
+                    floor: Floor::Genesis(mocks::application::genesis::<Sha256>(Epoch::new(333))),
+                    leader_timeout: Duration::from_secs(1),
+                    certification_timeout: Duration::from_secs(2),
+                    timeout_retry: Duration::from_secs(10),
+                    fetch_timeout: Duration::from_secs(1),
+                    activity_timeout,
+                    skip_timeout,
+                    fetch_concurrent: NZUsize!(4),
+                    replay_buffer: NZUsize!(1024 * 1024),
+                    write_buffer: NZUsize!(1024 * 1024),
+                    page_cache: CacheRef::from_pooler(&context, page_size, page_cache_size),
+                    forwarding: ForwardingPolicy::Disabled,
+                };
+                let engine = Engine::new(v_ctx.child("engine"), cfg);
+
+                let (vote, certificate, resolver) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                // KEEP the handle alive — dropping it can abort the engine task.
+                engine_handlers.push(engine.start(vote, certificate, resolver));
+            }
+
+            // await the finalized delivery. recv resolving with the proposed bytes
+            // means the proposer's reporter hit `Activity::Finalization`, resolved
+            // the digest in its ContentStore, and forwarded the op-batch — a REAL
+            // simplex finalization round trip. (timed runner panics on no-show.)
+            let (lane, recv) = proposer_in_rx
+                .recv()
+                .await
+                .expect("proposer receives a finalized consensus batch");
             assert_eq!(lane, Lane::Consensus);
-            let ops = decode_batch(&recv).expect("decode batch");
+            let ops = decode_batch(&recv).expect("decode finalized batch");
             assert_eq!(ops.len(), 1);
             assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Commit { .. })));
+            // exact round-trip: finalized bytes are byte-identical to what we put.
+            assert_eq!(recv, proposed_bytes);
+
+            // keep engines alive until the very end (drop is the implicit abort).
+            drop(engine_handlers);
         });
     }
 
