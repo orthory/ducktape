@@ -125,9 +125,30 @@ where
 {
     /// broadcast-lane gossip sender (CHANNEL_BROADCAST).
     broadcast: S,
-    /// consensus-lane gossip sender (CHANNEL_CONSENSUS). tier C: ordered gossip
-    /// stand-in for the simplex Engine's network sends.
-    consensus: S,
+    /// how the consensus lane carries bytes out — see [`ConsensusLane`].
+    consensus: ConsensusLane<S>,
+}
+
+/// the two ways the consensus lane can ship an op-batch, chosen at construction;
+/// [`Transport::send`] dispatches on it for [`Lane::Consensus`].
+///
+/// - [`ConsensusLane::Gossip`] — tier C: ordered best-effort gossip on
+///   `CHANNEL_CONSENSUS`. functional delivery, NO BFT total order. this is what
+///   the production [`CommonwareTransport::new`] path and [`from_channels`]
+///   still build, so wiring the engine in is purely ADDITIVE — nothing that
+///   constructs a `Gossip` transport changes behavior.
+/// - [`ConsensusLane::Engine`] — tier A: stage the bytes into a [`ContentStore`]
+///   and queue their digest for a live simplex
+///   [`Engine`](commonware_consensus::simplex::Engine) to BFT-order, via the
+///   [`ConsensusHandle`](consensus::ConsensusHandle) intake. the engine runs as
+///   spawned tasks alongside; this lane only holds its (cheap, `Arc`-backed)
+///   submit handle, so the whole transport stays `Clone`.
+///
+/// [`from_channels`]: CommonwareTransport::from_channels
+#[derive(Clone)]
+enum ConsensusLane<S> {
+    Gossip(S),
+    Engine(consensus::ConsensusHandle),
 }
 
 /// config knobs for standing up a node. addresses are plain `SocketAddr`s; the
@@ -203,10 +224,26 @@ where
         (
             Self {
                 broadcast: broadcast_sender,
-                consensus: consensus_sender,
+                consensus: ConsensusLane::Gossip(consensus_sender),
             },
             in_rx,
         )
+    }
+
+    /// build a transport whose consensus lane feeds a LIVE simplex engine via
+    /// `consensus` (tier A), while broadcast still gossips on `broadcast`.
+    ///
+    /// the caller stands up + keeps the engine alive separately (its handle must
+    /// outlive the transport — dropping it aborts the engine task); this just
+    /// holds the engine's submit handle. `send(Lane::Consensus, ..)` then does
+    /// `store.put + enqueue` instead of gossip. dialect-agnostic: `S` and the
+    /// handle are minted by whatever network registered the channels (simulated
+    /// in tests, discovery in production).
+    pub fn with_consensus_engine(broadcast: S, consensus: consensus::ConsensusHandle) -> Self {
+        Self {
+            broadcast,
+            consensus: ConsensusLane::Engine(consensus),
+        }
     }
 }
 
@@ -292,28 +329,34 @@ where
         lane: Lane,
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), Error>> + Send {
-        // clone the lane's gossip sender up front so the async block owns it —
-        // commonware `Sender` is `Clone` and `send` is synchronous, so this
-        // avoids any mutex or a guard held across the `.await` point. both lanes
-        // gossip identically (best-effort `Recipients::All`); they differ only
-        // in which channel/sender carries the bytes, which is what lets the
-        // remote side tag the inbound lane correctly.
-        let mut sender = match lane {
-            Lane::Broadcast => self.broadcast.clone(),
-            // tier C: the consensus lane is ordered gossip on its own channel —
-            // functional delivery, not yet BFT total order. true byzantine
-            // ordering is the documented TODO (instantiate a simplex `Engine`
-            // and route its finalized payloads here via the [`consensus`]
-            // scaffolding); see this module's docstring.
-            Lane::Consensus => self.consensus.clone(),
-        };
-        async move {
-            // gossip to every authorized peer. `send` is non-blocking and
-            // returns the recipients it will attempt; offline/rate-limited
-            // peers are silently skipped (best-effort, like loopback).
-            let _recipients = sender.send(Recipients::All, IoBuf::from(bytes), false);
-            Ok(())
+        // dispatch the lane synchronously, then return a trivially-ready future.
+        // commonware `Sender::send` is non-blocking (returns the recipients it
+        // will attempt) and the engine intake `submit` is just a lock-and-push,
+        // so neither needs an `.await`; doing the work BEFORE the async block
+        // unifies both arms to the same future type and never holds a guard
+        // across a suspension point.
+        match lane {
+            // gossip to every authorized peer; best-effort, offline/rate-limited
+            // peers are silently skipped (like loopback).
+            Lane::Broadcast => {
+                let mut sender = self.broadcast.clone();
+                let _ = sender.send(Recipients::All, IoBuf::from(bytes), false);
+            }
+            Lane::Consensus => match &self.consensus {
+                // tier C: ordered best-effort gossip on the dedicated consensus
+                // channel — functional delivery, not BFT total order.
+                ConsensusLane::Gossip(sender) => {
+                    let mut sender = sender.clone();
+                    let _ = sender.send(Recipients::All, IoBuf::from(bytes), false);
+                }
+                // tier A: stage the bytes + queue their digest for the live
+                // simplex engine to BFT-order. nothing goes on the wire HERE —
+                // the engine's own vote/cert/resolver channels carry the protocol
+                // and finalized batches arrive via the reporter, not this send.
+                ConsensusLane::Engine(handle) => handle.submit(bytes),
+            },
         }
+        async move { Ok(()) }
     }
 }
 
@@ -658,6 +701,206 @@ mod tests {
             assert_eq!(recv, proposed_bytes);
 
             // keep engines alive until the very end (drop is the implicit abort).
+            drop(engine_handlers);
+        });
+    }
+
+    /// the production-shaped consensus send: prove that calling the REAL
+    /// [`Transport::send`]`(Lane::Consensus, bytes)` on a [`CommonwareTransport`]
+    /// whose consensus lane is wired to a live simplex engine
+    /// ([`ConsensusLane::Engine`]) drives that batch through BFT finalization and
+    /// delivers it on the proposer.
+    ///
+    /// this is strictly MORE than [`simplex_finalizes_and_delivers_on_proposer`]:
+    /// that test pokes `store.put` + `automaton.enqueue` directly, bypassing the
+    /// transport; here the ONLY way the digest reaches the engine is through
+    /// `transport.send`, so a pass proves the SEND-PATH wiring (not just the
+    /// engine) is correct. everything else is identical — n=5, simulated network,
+    /// per-validator real `Engine::new`/`start`, our Automaton/Relay/Reporter
+    /// triple, proposer-only `ContentStore`. cross-node delivery to non-proposers
+    /// stays out of scope (that's #2: Relay/resolver).
+    ///
+    /// finalization proof is the same mechanism: the proposer's
+    /// `ConsensusReporter` forwards onto `proposer_in_rx` ONLY in the
+    /// `Activity::Finalization` arm, so `recv().await` returning the proposed
+    /// bytes IS proof a real engine finalized them. `Runner::timed(300s)` guards
+    /// liveness (a wiring bug surfaces as a deadline panic, not a hang).
+    #[test]
+    fn transport_send_consensus_finalizes_on_proposer() {
+        use commonware_consensus::simplex::{
+            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
+            elector::RoundRobin,
+            mocks,
+            scheme::ed25519 as simplex_ed25519,
+            Engine,
+        };
+        use commonware_consensus::types::{Epoch, ViewDelta};
+        use commonware_cryptography::Sha256;
+        use commonware_parallel::Sequential;
+        use commonware_runtime::buffer::paged::CacheRef;
+        use commonware_utils::{NZUsize, NZU16};
+
+        use crate::consensus::{ConsensusAutomaton, ConsensusRelay, ConsensusReporter, ContentStore};
+
+        // canonical fixture params, identical to the direct-enqueue test.
+        let n: u32 = 5;
+        let activity_timeout = ViewDelta::new(10);
+        let skip_timeout = ViewDelta::new(5);
+        let namespace = b"consensus".to_vec();
+        let page_size = NZU16!(1024);
+        let page_cache_size = NZUsize!(10);
+
+        let executor = deterministic::Runner::timed(Duration::from_secs(300));
+        executor.start(|mut context| async move {
+            let fixture = simplex_ed25519::fixture(&mut context, &namespace, n);
+            let participants = fixture.participants.clone();
+            let schemes = fixture.schemes.clone();
+
+            let (network, oracle) = simulated::Network::new_with_peers(
+                context.child("network"),
+                simulated::Config {
+                    max_size: 1024 * 1024,
+                    disconnect_on_block: true,
+                    tracked_peer_sets: NZUsize!(1),
+                },
+                participants.clone(),
+            )
+            .await;
+            network.start();
+
+            // register all validators: vote(0)/certificate(1)/resolver(2), the
+            // order engine.start consumes positionally.
+            let quota = Quota::per_second(NZU32!(128));
+            let mut registrations = std::collections::HashMap::new();
+            for validator in participants.iter() {
+                let control = oracle.control(validator.clone());
+                let vote = control.register(0, quota).await.expect("register vote");
+                let certificate = control
+                    .register(1, quota)
+                    .await
+                    .expect("register certificate");
+                let resolver = control.register(2, quota).await.expect("register resolver");
+                registrations.insert(validator.clone(), (vote, certificate, resolver));
+            }
+
+            let link = Link {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(1),
+                success_rate: 1.0,
+            };
+            for v1 in participants.iter() {
+                for v2 in participants.iter() {
+                    if v1 == v2 {
+                        continue;
+                    }
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .expect("link validators");
+                }
+            }
+
+            let proposer = participants[0].clone();
+            let wire = vec![Op::Vcs(vcs::op::Op::Commit {
+                message: "consensus".into(),
+                author: "proposer".into(),
+            })];
+            let proposed_bytes = encode_batch(&wire);
+
+            let (proposer_in_tx, mut proposer_in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+
+            let elector = RoundRobin::<Sha256>::default();
+            let mut engine_handlers = Vec::new();
+            for (idx, validator) in participants.iter().enumerate() {
+                let v_ctx = context.child("validator");
+                let is_proposer = *validator == proposer;
+
+                let store = ContentStore::new();
+                let automaton =
+                    ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new();
+
+                // THE CHANGE under test: the proposer stages its op-batch by
+                // calling the REAL `transport.send(Lane::Consensus, ..)`, not
+                // `store.put` + `enqueue` directly. building a transport needs a
+                // broadcast sender, so register one throwaway channel for it; the
+                // consensus lane here is Engine-backed, so that broadcast sender
+                // is never exercised by the send under test — it only satisfies
+                // the transport's shape. `handle()` shares THIS automaton's
+                // pending FIFO + store, so the submit lands on the very queue the
+                // engine's `propose` pops from.
+                if is_proposer {
+                    let (bcast_tx, _bcast_rx) = oracle
+                        .control(validator.clone())
+                        .register(3, quota)
+                        .await
+                        .expect("proposer registers a broadcast channel");
+                    let transport = CommonwareTransport::with_consensus_engine(
+                        bcast_tx,
+                        automaton.handle(store.clone()),
+                    );
+                    transport
+                        .send(Lane::Consensus, proposed_bytes.clone())
+                        .await
+                        .expect("consensus send ok");
+                }
+
+                let relay =
+                    ConsensusRelay::<commonware_cryptography::ed25519::PublicKey>::new(store.clone());
+
+                let inbound = if is_proposer {
+                    proposer_in_tx.clone()
+                } else {
+                    let (throwaway, _drop) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+                    throwaway
+                };
+                let reporter =
+                    ConsensusReporter::<simplex_ed25519::Scheme>::new(store.clone(), inbound);
+
+                let blocker = oracle.control(validator.clone());
+                let cfg = SimplexConfig {
+                    scheme: schemes[idx].clone(),
+                    elector: elector.clone(),
+                    blocker,
+                    automaton,
+                    relay,
+                    reporter,
+                    strategy: Sequential,
+                    partition: validator.to_string(),
+                    mailbox_size: NZUsize!(1024),
+                    epoch: Epoch::new(333),
+                    floor: Floor::Genesis(mocks::application::genesis::<Sha256>(Epoch::new(333))),
+                    leader_timeout: Duration::from_secs(1),
+                    certification_timeout: Duration::from_secs(2),
+                    timeout_retry: Duration::from_secs(10),
+                    fetch_timeout: Duration::from_secs(1),
+                    activity_timeout,
+                    skip_timeout,
+                    fetch_concurrent: NZUsize!(4),
+                    replay_buffer: NZUsize!(1024 * 1024),
+                    write_buffer: NZUsize!(1024 * 1024),
+                    page_cache: CacheRef::from_pooler(&context, page_size, page_cache_size),
+                    forwarding: ForwardingPolicy::Disabled,
+                };
+                let engine = Engine::new(v_ctx.child("engine"), cfg);
+
+                let (vote, certificate, resolver) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                engine_handlers.push(engine.start(vote, certificate, resolver));
+            }
+
+            // recv resolving with the proposed bytes means the send drove a real
+            // `Activity::Finalization` — the round trip through `transport.send`.
+            let (lane, recv) = proposer_in_rx
+                .recv()
+                .await
+                .expect("proposer receives a finalized consensus batch");
+            assert_eq!(lane, Lane::Consensus);
+            let ops = decode_batch(&recv).expect("decode finalized batch");
+            assert_eq!(ops.len(), 1);
+            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Commit { .. })));
+            assert_eq!(recv, proposed_bytes);
+
             drop(engine_handlers);
         });
     }

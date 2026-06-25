@@ -117,6 +117,39 @@ impl ContentStore {
     }
 }
 
+/// the transport-facing intake for the consensus lane: stage op-batch bytes and
+/// queue their digest for the simplex [`Engine`](commonware_consensus::simplex::Engine)
+/// to order. this is the seam `CommonwareTransport::send(Lane::Consensus, ..)`
+/// drives once the live engine is wired — replacing the tier-C ordered gossip
+/// with `store.put(bytes)` + `enqueue(digest)`.
+///
+/// deliberately NON-generic: it shares the [`ContentStore`] and the
+/// [`ConsensusAutomaton`]'s pending FIFO (both `Arc`-backed), but never the
+/// automaton's phantom public-key parameter — the enqueue path only ever pushes
+/// a [`Digest`], so a transport holding this handle stays free of consensus
+/// scheme/key generics. clone shares the backing store + queue.
+#[derive(Clone)]
+pub struct ConsensusHandle {
+    store: ContentStore,
+    /// the same FIFO [`ConsensusAutomaton::propose`] pops from. wired via
+    /// [`ConsensusAutomaton::handle`] so a `send` and the automaton agree on the
+    /// queue they share.
+    pending: Arc<Mutex<VecDeque<Digest>>>,
+}
+
+impl ConsensusHandle {
+    /// stage `bytes` for consensus: content-address them into the store (so the
+    /// digest resolves on finalization) and queue that digest for proposal. this
+    /// is the entire `send(Lane::Consensus, ..)` body under a live engine.
+    pub fn submit(&self, bytes: Vec<u8>) {
+        let digest = self.store.put(bytes);
+        self.pending
+            .lock()
+            .expect("pending queue poisoned")
+            .push_back(digest);
+    }
+}
+
 /// the application automaton: proposes the next queued op-batch digest, and
 /// (trivially) verifies/certifies everything.
 ///
@@ -150,6 +183,17 @@ impl<P> ConsensusAutomaton<P> {
             .lock()
             .expect("pending queue poisoned")
             .push_back(digest);
+    }
+
+    /// mint a transport-facing [`ConsensusHandle`] that shares THIS automaton's
+    /// pending queue and the given `store`. `handle.submit(bytes)` then stages +
+    /// enqueues onto the very FIFO this automaton's `propose` pops from — the
+    /// glue that lets `send(Lane::Consensus, ..)` feed a live engine.
+    pub fn handle(&self, store: ContentStore) -> ConsensusHandle {
+        ConsensusHandle {
+            store,
+            pending: Arc::clone(&self.pending),
+        }
     }
 }
 
