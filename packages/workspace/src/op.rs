@@ -10,6 +10,7 @@ pub enum Op {
     },
 
     AddEntry {
+        path: String,
         entry: entry::Entry
     },
 

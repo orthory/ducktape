@@ -1,0 +1,16 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+document.workspace = true
+nodes.workspace = true
+uid.workspace = true
+op.workspace = true
+control.workspace = true

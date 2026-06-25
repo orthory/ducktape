@@ -1,0 +1,32 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+transport.workspace = true
+op.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+commonware-runtime = "2026.5.0"
+commonware-p2p = "2026.5.0"
+commonware-cryptography = "2026.5.0"
+commonware-utils = "2026.5.0"
+commonware-macros = "2026.5.0"
+rand_core = "0.6.4"
+commonware-consensus = "2026.5.0"
+commonware-storage = "2026.5.0"
+commonware-parallel = "2026.5.0"
+commonware-formatting = "2026.5.0"
+commonware-actor = "2026.5.0"
+
+[dev-dependencies]
+vcs.workspace = true
+
+# test-only: the simplex Engine baseline (CW.2a) drives commonware's OWN mocks
+# (application/reporter/relay/genesis/fixture). the `mocks` feature is a
+# dev-only flag that cascades to commonware-cryptography/mocks and
+# commonware-p2p/mocks, so a single feature-enabled dev-dep is enough — feature
+# unification turns the mocks on for the test build only, never production.
+commonware-consensus = { version = "2026.5.0", features = ["mocks"] }

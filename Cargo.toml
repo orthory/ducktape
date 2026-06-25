@@ -14,6 +14,8 @@ members = [
     "packages/api",
     "packages/uid",
     "utils", "packages/hydration", "packages/workspace", "packages/op", "engine",
+    "packages/vcs", "packages/control", "packages/transport",
+    "packages/agent", "packages/net",
 ]
 
 [workspace.dependencies]
@@ -42,12 +44,19 @@ utils    = { path = "utils" }
 hydration = { path = "packages/hydration"}
 workspace = { path = "packages/workspace"}
 op = { path = "packages/op"}
+vcs = { path = "packages/vcs" }
+control = { path = "packages/control" }
+transport = { path = "packages/transport" }
+agent = { path = "packages/agent" }
+net = { path = "packages/net" }
+engine = { path = "engine" }
 
 [[bin]]
 name = "ducktape"
 path = "bin/src/main.rs"
 
 [dependencies]
-clap = "4.5.45"
+clap = { version = "4.5.45", features = ["derive"] }
 api.workspace = true
+engine.workspace = true
 tokio = { workspace = true, features = ["rt", "full"] }
