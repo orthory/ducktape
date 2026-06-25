@@ -106,18 +106,18 @@ where
     });
 }
 
-/// commonware-backed transport, generic over the gossip `Sender` `S`.
+/// commonware-backed transport, generic over the broadcast gossip `Sender` `S`.
 ///
-/// holds two clone-able gossip `Sender`s — one per lane/channel. cloning the
-/// whole transport is cheap (senders are `Clone`), which is why this can satisfy
-/// the `&self` + `Send` shape of [`Transport::send`] without interior
-/// mutability.
+/// holds a clone-able broadcast gossip `Sender` plus a [`ConsensusLane`] for the
+/// consensus side (either a gossip `Sender` of the same `S`, or a live-engine
+/// submit handle). every field is cheap to clone (`Sender`s are `Clone`; the
+/// engine handle is `Arc`-backed), which is why this can satisfy the `&self` +
+/// `Send` shape of [`Transport::send`] without interior mutability.
 ///
 /// the struct is decoupled from the p2p dialect: the production authenticated
 /// path instantiates `S = GossipSender<E>` (see [`CommonwareTransport::new`]),
 /// while tests instantiate `S = simulated::Sender<..>` via
-/// [`CommonwareTransport::from_channels`]. both lanes share the same `S` because
-/// they only differ in which channel/sender carries the bytes.
+/// [`CommonwareTransport::from_channels`] / [`CommonwareTransport::with_consensus_engine`].
 #[derive(Clone)]
 pub struct CommonwareTransport<S>
 where
@@ -320,6 +320,17 @@ where
     }
 }
 
+/// what a [`Transport::send`] call will do once its future is awaited, resolved
+/// up front (cloning the one sender/handle it needs) so the future owns its
+/// inputs — no borrow of `self` held across the await — yet stays LAZY: a future
+/// that's constructed and dropped without `.await` performs no effect. `Gossip`
+/// covers BOTH the broadcast lane and the tier-C consensus lane (byte-identical
+/// gossip); `Engine` is the tier-A simplex submit.
+enum Outbound<S> {
+    Gossip(S),
+    Engine(consensus::ConsensusHandle),
+}
+
 impl<S> Transport for CommonwareTransport<S>
 where
     S: commonware_p2p::Sender + Clone + Send + Sync + 'static,
@@ -329,34 +340,33 @@ where
         lane: Lane,
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), Error>> + Send {
-        // dispatch the lane synchronously, then return a trivially-ready future.
-        // commonware `Sender::send` is non-blocking (returns the recipients it
-        // will attempt) and the engine intake `submit` is just a lock-and-push,
-        // so neither needs an `.await`; doing the work BEFORE the async block
-        // unifies both arms to the same future type and never holds a guard
-        // across a suspension point.
-        match lane {
-            // gossip to every authorized peer; best-effort, offline/rate-limited
-            // peers are silently skipped (like loopback).
-            Lane::Broadcast => {
-                let mut sender = self.broadcast.clone();
-                let _ = sender.send(Recipients::All, IoBuf::from(bytes), false);
-            }
-            Lane::Consensus => match &self.consensus {
-                // tier C: ordered best-effort gossip on the dedicated consensus
-                // channel — functional delivery, not BFT total order.
-                ConsensusLane::Gossip(sender) => {
-                    let mut sender = sender.clone();
+        // resolve WHICH effect this lane takes (cloning the one sender/handle it
+        // needs), then defer the effect into the returned future so `send` stays
+        // lazy. the flat tuple match keeps dispatch at a single level, and
+        // `Outbound` lets the broadcast arm, the tier-C consensus-gossip arm, and
+        // the tier-A engine arm all unify to one future type without holding a
+        // borrow of `self` across the await.
+        let outbound = match (lane, &self.consensus) {
+            (Lane::Broadcast, _) => Outbound::Gossip(self.broadcast.clone()),
+            (Lane::Consensus, ConsensusLane::Gossip(sender)) => Outbound::Gossip(sender.clone()),
+            (Lane::Consensus, ConsensusLane::Engine(handle)) => Outbound::Engine(handle.clone()),
+        };
+        async move {
+            match outbound {
+                // gossip to every authorized peer; best-effort, offline/rate-
+                // limited peers are silently skipped (like loopback). `send` is
+                // synchronous (returns the recipients it will attempt), no await.
+                Outbound::Gossip(mut sender) => {
                     let _ = sender.send(Recipients::All, IoBuf::from(bytes), false);
                 }
                 // tier A: stage the bytes + queue their digest for the live
-                // simplex engine to BFT-order. nothing goes on the wire HERE —
-                // the engine's own vote/cert/resolver channels carry the protocol
-                // and finalized batches arrive via the reporter, not this send.
-                ConsensusLane::Engine(handle) => handle.submit(bytes),
-            },
+                // simplex engine to BFT-order. nothing goes on the wire HERE — the
+                // engine's own vote/cert/resolver channels carry the protocol and
+                // finalized batches arrive via the reporter, not this send.
+                Outbound::Engine(handle) => handle.submit(bytes),
+            }
+            Ok(())
         }
-        async move { Ok(()) }
     }
 }
 

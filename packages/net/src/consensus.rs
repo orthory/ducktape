@@ -189,6 +189,15 @@ impl<P> ConsensusAutomaton<P> {
     /// pending queue and the given `store`. `handle.submit(bytes)` then stages +
     /// enqueues onto the very FIFO this automaton's `propose` pops from — the
     /// glue that lets `send(Lane::Consensus, ..)` feed a live engine.
+    ///
+    /// PRECONDITION (load-bearing, not type-enforced): `store` MUST be the same
+    /// [`ContentStore`] handed to this validator's [`ConsensusReporter`] (and
+    /// [`ConsensusRelay`]). the handle `put`s bytes under their digest; the
+    /// reporter `get`s by that digest on finalization. give them different stores
+    /// and a finalized digest resolves to `None` in the reporter — the batch is
+    /// SILENTLY DROPPED, never delivered. clone one `ContentStore` into all three
+    /// (they're `Arc`-backed). the tier-A wiring helper will mint the store once
+    /// and enforce this structurally; until then it's the caller's contract.
     pub fn handle(&self, store: ContentStore) -> ConsensusHandle {
         ConsensusHandle {
             store,
@@ -297,6 +306,10 @@ pub struct ConsensusReporter<S> {
 }
 
 impl<S> ConsensusReporter<S> {
+    /// `store` MUST be the same [`ContentStore`] the proposing side staged bytes
+    /// into (see [`ConsensusAutomaton::handle`]'s precondition) — finalization
+    /// resolves the digest via `store.get`, so a mismatched store silently drops
+    /// the finalized batch.
     pub fn new(store: ContentStore, inbound: mpsc::Sender<Inbound>) -> Self {
         Self {
             store,
