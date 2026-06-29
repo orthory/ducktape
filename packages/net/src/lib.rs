@@ -915,6 +915,112 @@ mod tests {
         });
     }
 
+    /// PROBE — production `new()` over REAL sockets (de-risks the engine flip).
+    ///
+    /// every other net test drives [`CommonwareTransport::from_channels`] over the
+    /// instant `p2p::simulated` dialect; this one stands up N nodes through the
+    /// PRODUCTION [`CommonwareTransport::new`] — real `authenticated::discovery`,
+    /// real ed25519 handshakes, real localhost TCP — under `tokio::Runner`, and
+    /// proves a `send(Lane::Broadcast)` from the bootstrapper reaches a peer's
+    /// inbound mpsc. it gives `new()` its first coverage and is the harness the
+    /// simplex-engine flip will reuse.
+    ///
+    /// why tokio, not deterministic: `authenticated::discovery`'s dial/gossip
+    /// timers don't make progress under the deterministic clock — but commonware's
+    /// own `test_tokio_connectivity` proves discovery DOES converge in-process
+    /// under `tokio::Runner`, so this rides the same grain.
+    ///
+    /// `#[ignore]` keeps the default `cargo test -p net` hermetic (no real ports);
+    /// run explicitly with `cargo test -p net -- --ignored`.
+    #[test]
+    #[ignore = "real-socket: binds localhost TCP; run with --ignored"]
+    fn new_broadcast_propagates_over_real_sockets() {
+        use commonware_macros::select;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        const N: usize = 3;
+        const BASE_PORT: u16 = 52111;
+
+        let executor = commonware_runtime::tokio::Runner::default();
+        executor.start(|context| async move {
+            // every node agrees on the authorized peer set (n keys from seeds
+            // 0..N) and — except node 0 — bootstraps off node 0's address.
+            let keys: Vec<ed25519::PublicKey> = (0..N as u64)
+                .map(|i| ed25519::PrivateKey::from_seed(i).public_key())
+                .collect();
+            let node0_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BASE_PORT);
+
+            // stand up all N nodes through the PRODUCTION new(). keep every handle
+            // (a dropped transport's inbound drain would exit; the spawned network
+            // actors live on the runtime regardless). per-node `with_attribute`
+            // keeps each node's metric paths distinct — reusing one child label
+            // across nodes would collide in the registry.
+            let mut transports = Vec::new();
+            let mut inboxes = Vec::new();
+            for i in 0..N {
+                let addr =
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BASE_PORT + i as u16);
+                let bootstrappers = if i == 0 {
+                    Vec::new()
+                } else {
+                    vec![(keys[0].clone(), node0_addr)]
+                };
+                let cfg = Config {
+                    seed: i as u64,
+                    namespace: b"ducktape-probe".to_vec(),
+                    listen: addr,
+                    advertised: addr,
+                    peers: keys.clone(),
+                    bootstrappers,
+                };
+                let node_ctx = context.child("node").with_attribute("index", i);
+                let (transport, inbox) = CommonwareTransport::new(node_ctx, cfg);
+                transports.push(transport);
+                inboxes.push(inbox);
+            }
+
+            // the batch node 0 gossips to ALL peers.
+            let wire = vec![Op::Vcs(vcs::op::Op::Init)];
+            let expected = encode_batch(&wire);
+
+            // resend on a loop: right after start() the mesh isn't formed, so a
+            // single Recipients::All gossip reaches nobody and is silently dropped.
+            // keep sending until a peer's drain delivers it — exactly how
+            // commonware's own connectivity test drives sends (retry until landed).
+            // hold the spawn handle so the task isn't aborted on drop.
+            let sender = transports[0].clone();
+            let resend = expected.clone();
+            let _resend_handle = context.child("resend").spawn(move |ctx| async move {
+                loop {
+                    let _ = sender.send(Lane::Broadcast, resend.clone()).await;
+                    ctx.sleep(Duration::from_millis(250)).await;
+                }
+            });
+
+            // node 1 must receive the gossip. a converged mesh delivers in well
+            // under a second; the 60s ceiling only exists so a non-converging
+            // discovery fails fast (deadline panic) instead of hanging the suite.
+            let mut node1 = inboxes.remove(1);
+            select! {
+                received = node1.recv() => {
+                    let (lane, msg) = received.expect("node 1 inbound channel closed");
+                    assert_eq!(lane, Lane::Broadcast);
+                    assert_eq!(msg, expected, "node 1 got the exact gossiped batch");
+                },
+                _timeout = context.sleep(Duration::from_secs(60)) => {
+                    panic!(
+                        "broadcast did not propagate over real sockets within 60s — \
+                         discovery never converged through production new()"
+                    );
+                },
+            }
+
+            // hold everything until the assert resolves.
+            drop(transports);
+            drop(inboxes);
+        });
+    }
+
     /// CW.2a — the known-good baseline: a REAL commonware simplex `Engine`
     /// reaching `Activity::Finalization` on a `p2p::simulated` network, driven
     /// entirely by commonware's OWN mocks. this is a faithful replica of
