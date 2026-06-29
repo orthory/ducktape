@@ -11,6 +11,8 @@
 pub mod cmd;
 pub mod git;
 pub mod object;
+pub mod odb;
 pub mod op;
 
 pub use object::ObjectId;
+pub use odb::GitOdb;
