@@ -5,12 +5,13 @@
 //! taxonomy and routes each to its handler. document/workspace state lives
 //! inline as a [`Workspace`] hydrated in place; vcs + control are injectable
 //! handler traits so the layers behind them plug in without this file changing
-//! shape. the git layer (p1.3) has landed — [`GitVcs`] is the real vcs handler;
+//! shape. [`GitVcs`] is the inbound vcs (ref-move) handler — the wire ops
+//! `RefUpdate`/`Announce`, with the real `git update-ref` path landing in A4;
 //! the agentic supervisor (p2.1) still slots into the control seam later.
 //!
 //! handlers can emit follow-up ops: `apply` returns `Vec<op::Op>`. today only
-//! [`ControlApply`] uses this (a control op may want a `Vcs::Commit` to follow);
-//! the workspace/vcs arms return an empty vec.
+//! [`ControlApply`] uses this (a control op may want a `Vcs(RefUpdate)` to
+//! follow); the workspace/vcs arms return an empty vec.
 
 use hydration::Hydratable;
 use workspace::Workspace;
@@ -40,15 +41,16 @@ pub enum EngineError {
     Control(String),
 }
 
-/// seam for the vcs (git) layer. the real impl is [`GitVcs`] (p1.3, runs `git`
-/// against a working repo); [`NoopVcs`] is the default no-side-effect handler.
+/// seam for the vcs (git) layer. the real impl is [`GitVcs`] (applies the
+/// `RefUpdate`/`Announce` wire ops by ref-move; the `git update-ref` path lands
+/// in A4); [`NoopVcs`] is the default no-side-effect handler.
 pub trait VcsApply: Send {
     fn apply(&mut self, op: &vcs::op::Op) -> Result<(), EngineError>;
 }
 
 /// seam for the agentic control/supervisor layer — implemented for real in p2.1.
-/// a control op may emit follow-up ops (e.g. a `Vcs::Commit`) for the engine to
-/// route, hence the `Vec<op::Op>` return.
+/// a control op may emit follow-up ops (e.g. a `Vcs(RefUpdate)`) for the engine
+/// to route, hence the `Vec<op::Op>` return.
 pub trait ControlApply: Send {
     fn apply(&mut self, op: &control::op::Op) -> Result<Vec<op::Op>, EngineError>;
 }
