@@ -74,6 +74,19 @@ impl Node for CommentV1 {
             body: matched.body.join("\n"),
         }))
     }
+
+    // `/comment.v1{author;parent_id;timestamp}\n<body>\n/comment.v1`. Arg order
+    // mirrors the parser (author, parent_id, timestamp); no spaces around the
+    // `;` separators because the parser trims each arg, so emitting them bare
+    // keeps the round-trip exact. body is rendered verbatim (it was joined with
+    // '\n' at parse time). uid is not rendered. lives here because parent_id /
+    // timestamp / author are private to this module.
+    fn render(&self) -> String {
+        format!(
+            "/comment.v1{{{};{};{}}}\n{}\n/comment.v1",
+            self.author, self.parent_id, self.timestamp, self.body
+        )
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +109,24 @@ Multiline xyz is also supported
         assert_eq!(comment.parent_id, 42);
         assert_eq!(comment.timestamp, 1700000000);
         assert_eq!(comment.body, "This is a sample comment.\nMultiline xyz is also supported");
+    }
+
+    #[test]
+    fn render_round_trips_through_parse() {
+        let mut p = Parser::new(SAMPLE_COMMENT.trim_start().as_bytes());
+        let c = CommentV1::try_match(&mut p)
+            .expect("parse ok")
+            .expect("matched");
+        let rendered = c.render();
+
+        let mut p2 = Parser::new(rendered.as_bytes());
+        let c2 = CommentV1::try_match(&mut p2)
+            .expect("reparse ok")
+            .expect("rematched");
+        assert_eq!(c2.author, c.author);
+        assert_eq!(c2.parent_id, c.parent_id);
+        assert_eq!(c2.timestamp, c.timestamp);
+        assert_eq!(c2.body, c.body);
     }
 
     #[test]

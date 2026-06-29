@@ -86,6 +86,28 @@ impl Node for FrontmatterV1 {
             misc,
         }))
     }
+
+    // `---\n<key: value lines>\n---`. Promoted keys come first in a fixed order,
+    // then misc keys sorted lexically — HashMap iteration order is not stable,
+    // so sorting is what makes the render deterministic. uid is not rendered
+    // (v1 mints it at parse time and it never appears on disk). No trailing
+    // newline after the closing `---`; the orchestrator joins nodes with '\n'.
+    fn render(&self) -> String {
+        let mut out = String::from("---\n");
+        out.push_str(&format!("title: {}\n", self.title));
+        out.push_str(&format!("author: {}\n", self.author));
+        out.push_str(&format!("created_at: {}\n", self.created_at));
+        out.push_str(&format!("updated_at: {}\n", self.updated_at));
+
+        let mut keys: Vec<&String> = self.misc.keys().collect();
+        keys.sort();
+        for k in keys {
+            out.push_str(&format!("{}: {}\n", k, self.misc[k]));
+        }
+
+        out.push_str("---");
+        out
+    }
 }
 
 fn parse_optional_u64(value: Option<&str>, field: &'static str) -> Result<u64, FrontmatterError> {
@@ -149,6 +171,39 @@ author: a
             .expect("matched");
         assert_eq!(fm.created_at, 0);
         assert_eq!(fm.updated_at, 0);
+    }
+
+    #[test]
+    fn render_round_trips_and_sorts_misc() {
+        let input = "\
+---
+title: my title
+author: @orthory
+created_at: 100
+updated_at: 200
+zeta: z
+alpha: a
+---
+";
+        let mut p = Parser::new(input.as_bytes());
+        let fm = FrontmatterV1::try_match(&mut p)
+            .expect("parse ok")
+            .expect("matched");
+        let rendered = fm.render();
+
+        // misc keys are emitted in sorted order (alpha before zeta) — the
+        // determinism that makes the storage form HashMap-iteration-independent.
+        assert!(rendered.contains("alpha: a\nzeta: z"));
+
+        let mut p2 = Parser::new(rendered.as_bytes());
+        let fm2 = FrontmatterV1::try_match(&mut p2)
+            .expect("reparse ok")
+            .expect("rematched");
+        assert_eq!(fm2.title, fm.title);
+        assert_eq!(fm2.author, fm.author);
+        assert_eq!(fm2.created_at, fm.created_at);
+        assert_eq!(fm2.updated_at, fm.updated_at);
+        assert_eq!(fm2.misc, fm.misc);
     }
 
     #[test]

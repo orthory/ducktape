@@ -24,6 +24,13 @@ where
     Self: Sized,
 {
     fn try_match<R: Read>(document: &mut crate::parser::Parser<R>) -> anyhow::Result<Option<Self>>;
+
+    /// Serialize this node back to its on-disk markdown form — the inverse of
+    /// `try_match`. Each version renders to *its own* format (v1 renders v1
+    /// markdown), so this is a version-stable storage contract, not a display
+    /// helper. `render` and `try_match` are a symmetric pair: a node version
+    /// that can parse itself must also serialize itself.
+    fn render(&self) -> String;
 }
 
 /// `Nodes` holds parsed nodes at their *latest* in-memory shape — older on-disk
@@ -62,6 +69,18 @@ impl Nodes {
             Nodes::Comment(c) => f(&mut c.body),
             Nodes::Task(t) => f(&mut t.body),
             Nodes::Frontmatter(fm) => f(&mut fm.title),
+        }
+    }
+
+    /// Render this node to its on-disk markdown form by dispatching to the
+    /// concrete version's `Node::render`. The orchestrator (`document::render`)
+    /// joins these per-node renders into a whole-document serialization.
+    pub fn render(&self) -> String {
+        match self {
+            Nodes::Frontmatter(s) => s.render(),
+            Nodes::Comment(s) => s.render(),
+            Nodes::Task(s) => s.render(),
+            Nodes::Body(s) => s.render(),
         }
     }
 
