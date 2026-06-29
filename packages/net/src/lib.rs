@@ -86,6 +86,16 @@ const CHANNEL_VOTE: u64 = 1;
 const CHANNEL_CERTIFICATE: u64 = 2;
 const CHANNEL_RESOLVER: u64 = 3;
 
+/// the dedicated channel the live engine's
+/// [`ConsensusRelay`](consensus::ConsensusRelay) gossips proposed op-batch
+/// PAYLOADS on — the bytes behind a digest — so a non-proposer can resolve a
+/// finalized digest it only learned through consensus. distinct from the
+/// vote/cert/resolver protocol channels above: those carry BFT metadata, this
+/// carries the application bytes. peers drain it STORE-ONLY (see
+/// [`spawn_payload_drain`]) — never into the app inbound mpsc — so delivery stays
+/// exclusively in the reporter's `Activity::Finalization` arm, in BFT order.
+const CHANNEL_PAYLOAD: u64 = 4;
+
 /// the peer-set index. all peers must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
 const PEER_SET: u64 = 0;
@@ -121,6 +131,37 @@ where
                 // consumer dropped the inbound receiver; nothing left to do.
                 break;
             }
+        }
+    });
+}
+
+/// spawn a task that drains the payload-gossip channel ([`CHANNEL_PAYLOAD`]),
+/// caching each received op-batch's bytes into the shared
+/// [`ContentStore`](consensus::ContentStore) and doing NOTHING else.
+///
+/// this is how a non-proposer obtains the bytes behind a digest the leader's
+/// [`ConsensusRelay`](consensus::ConsensusRelay) broadcast, so that when that
+/// digest later finalizes the reporter's `store.get(&digest)` resolves and
+/// delivers it — in BFT-agreed order, via the SAME finalization path the
+/// proposer uses.
+///
+/// CRUCIAL — and the one real trap of this design: unlike [`spawn_inbound_drain`]
+/// this NEVER forwards into the inbound app mpsc. emitting the batch here would
+/// surface it to the application pre-finalization (out of BFT order, and then
+/// AGAIN on finalization). a payload receipt does exactly one thing — populate
+/// the store. `ContentStore::put` re-hashes the bytes as the key, so byzantine
+/// garbage simply stores under its own hash and can never match a finalized
+/// digest; content-addressing is the whole verification.
+fn spawn_payload_drain<E, R>(context: E, mut receiver: R, store: consensus::ContentStore)
+where
+    E: Spawner + Send + 'static,
+    R: commonware_p2p::Receiver + Send + 'static,
+{
+    context.spawn(move |_ctx| async move {
+        while let Ok((_peer, msg)) = receiver.recv().await {
+            let bytes: Vec<u8> = msg.into();
+            // store-only: NO inbound forward. delivery is the reporter's job.
+            store.put(bytes);
         }
     });
 }
@@ -284,9 +325,10 @@ where
     /// simplex BFT engine driving the consensus lane.
     ///
     /// builds the real `authenticated::discovery` network — broadcast gossip on
-    /// [`CHANNEL_BROADCAST`] plus the engine's three sub-channels
-    /// ([`CHANNEL_VOTE`]/[`CHANNEL_CERTIFICATE`]/[`CHANNEL_RESOLVER`]) — AND a real
-    /// [`Engine`](commonware_consensus::simplex::Engine) wired to our
+    /// [`CHANNEL_BROADCAST`], the engine's three sub-channels
+    /// ([`CHANNEL_VOTE`]/[`CHANNEL_CERTIFICATE`]/[`CHANNEL_RESOLVER`]), and the
+    /// payload channel ([`CHANNEL_PAYLOAD`]) the relay gossips op-batch bytes on —
+    /// AND a real [`Engine`](commonware_consensus::simplex::Engine) wired to our
     /// [`ConsensusAutomaton`](consensus::ConsensusAutomaton) /
     /// [`ConsensusRelay`](consensus::ConsensusRelay) /
     /// [`ConsensusReporter`](consensus::ConsensusReporter) triple over one shared
@@ -294,6 +336,13 @@ where
     /// stages a batch into that store and queues its digest; the engine BFT-orders
     /// it; on `Activity::Finalization` the reporter delivers the finalized bytes
     /// back out the returned inbound receiver, tagged [`Lane::Consensus`].
+    ///
+    /// cross-node delivery: when the leader proposes a batch its relay gossips the
+    /// bytes on [`CHANNEL_PAYLOAD`]; every peer's payload drain caches them
+    /// store-only ahead of finalization, so the reporter resolves the finalized
+    /// digest and delivers on EVERY node — not just the proposer. (a node that
+    /// finalizes a digest it never saw broadcast — late-join via certificate
+    /// backfill — still can't resolve it; that catch-up path is a resolver follow-on.)
     ///
     /// returns three things:
     /// - the transport (cheap-clone: holds the broadcast `Sender` plus the
@@ -355,7 +404,8 @@ where
             Set::try_from(cfg.peers).expect("authorized peer set has no duplicates");
         oracle.track(PEER_SET, participants.clone());
 
-        // register the broadcast gossip channel + the engine's three sub-channels.
+        // register the broadcast gossip channel, the engine's three sub-channels,
+        // and the payload channel the relay gossips finalizable op-batches on.
         // quota caps inbound receive rate; `Quota` is `Copy`, so one suffices.
         let quota = Quota::per_second(NZU32!(128));
         let (broadcast_sender, broadcast_receiver) =
@@ -363,6 +413,8 @@ where
         let vote = network.register(CHANNEL_VOTE, quota, MAX_BACKLOG);
         let certificate = network.register(CHANNEL_CERTIFICATE, quota, MAX_BACKLOG);
         let resolver = network.register(CHANNEL_RESOLVER, quota, MAX_BACKLOG);
+        let (payload_sender, payload_receiver) =
+            network.register(CHANNEL_PAYLOAD, quota, MAX_BACKLOG);
 
         // one shared inbound mpsc: the broadcast drain feeds it (Lane::Broadcast)
         // and the consensus reporter feeds it on finalization (Lane::Consensus), so
@@ -385,9 +437,24 @@ where
         // automaton's pending FIFO (peek-until-finalized: propose peeks the front,
         // the reporter removes on finalization).
         let store = ContentStore::new();
+        // a non-proposer learns a finalized digest through consensus but not its
+        // bytes. the payload drain caches every relay-broadcast payload into THIS
+        // store (store-only — see `spawn_payload_drain`, NOT the inbound drain),
+        // so on finalization the reporter's `store.get(&digest)` resolves and
+        // delivers on EVERY node, not just the one that proposed it.
+        spawn_payload_drain(
+            context.child("inbound_payload"),
+            payload_receiver,
+            store.clone(),
+        );
         let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
         let consensus_handle = automaton.handle(store.clone());
-        let relay = ConsensusRelay::<ed25519::PublicKey>::new(store.clone());
+        // the relay gossips a proposed batch's bytes out on CHANNEL_PAYLOAD so
+        // peers' drains can cache them ahead of finalization.
+        let relay = ConsensusRelay::<GossipSender<E>, ed25519::PublicKey>::new(
+            payload_sender,
+            store.clone(),
+        );
         let reporter =
             ConsensusReporter::<simplex_ed25519::Scheme>::new(store.clone(), automaton.pending(), in_tx);
 
@@ -624,39 +691,37 @@ mod tests {
         });
     }
 
-    /// CW.2b — the REAL consensus lane: a commonware simplex `Engine` reaching
-    /// `Activity::Finalization`, driven by OUR own
-    /// [`consensus::ConsensusAutomaton`] / [`consensus::ConsensusRelay`] /
-    /// [`consensus::ConsensusReporter`] (not commonware's mocks), with the
-    /// finalized op-batch bytes resolved through OUR [`consensus::ContentStore`]
-    /// and delivered into an inbound mpsc tagged `Lane::Consensus`.
+    /// CW.2b+ — the REAL consensus lane delivering to EVERY validator: a
+    /// commonware simplex `Engine` reaching `Activity::Finalization`, driven by OUR
+    /// own [`consensus::ConsensusAutomaton`] / [`consensus::ConsensusRelay`] /
+    /// [`consensus::ConsensusReporter`] (not commonware's mocks), with the finalized
+    /// op-batch bytes resolved through OUR [`consensus::ContentStore`] and delivered
+    /// into a PER-VALIDATOR inbound mpsc tagged `Lane::Consensus`.
     ///
-    /// this is the production-shaped round trip: `store.put(bytes)` →
-    /// `automaton.enqueue(digest)` on a designated PROPOSER, the engine orders
-    /// that digest via BFT consensus, and the proposer's `ConsensusReporter`
-    /// resolves the finalized digest back to bytes and forwards `(Lane::Consensus,
-    /// bytes)` on finalization. it keeps CW.2a's wiring (same simulated network,
-    /// same canonical n=5, same per-validator real `Engine::new`/`start`) and
-    /// only swaps the application/relay/reporter triple.
+    /// the cross-node payload path under test: ONLY participant 0 (the proposer)
+    /// stages the op-batch into its store + enqueues the digest. when it leads and
+    /// proposes, its `ConsensusRelay` gossips the bytes on `CHANNEL_PAYLOAD`; every
+    /// other validator's STORE-ONLY payload drain caches them. so when the digest
+    /// finalizes, ALL n validators — not just the proposer — resolve
+    /// `store.get(&digest)` and deliver. that is exactly what the no-op relay used
+    /// to prevent (peers finalized the digest but `store.get -> None` and dropped);
+    /// this test is the regression guard that they now deliver.
     ///
-    /// finalization proof: `ConsensusReporter::report` forwards onto the inbound
-    /// mpsc ONLY in the `Activity::Finalization` arm (notarizations/votes never
-    /// touch it). so `inbound_rx.recv().await` returning the proposed bytes is
-    /// itself proof that a real `Activity::Finalization` was reported by an actual
-    /// `Engine` — no View(100) wait needed. `Runner::timed(300s)` is the liveness
-    /// guard: if nothing ever finalizes, the deadline panics rather than hanging.
+    /// finalization proof, per validator: `ConsensusReporter::report` forwards onto
+    /// its inbound mpsc ONLY in the `Activity::Finalization` arm. so each of the n
+    /// `inbox.recv().await` returning the byte-identical batch proves THAT validator
+    /// hit a real finalization AND resolved the payload — which a non-proposer could
+    /// obtain ONLY via the relay broadcast, since it never staged the bytes itself.
+    /// `Runner::timed(300s)` is the liveness guard: a wiring bug (relay not
+    /// gossiping, drain forwarding to the wrong place) surfaces as a deadline panic.
     ///
-    /// per decision #3 we assert on the PROPOSER (whose `ContentStore` holds the
-    /// bytes). peer nodes resolve `store.get(digest) -> None` and drop — cross-node
-    /// payload delivery via the resolver channel is out of scope here.
-    ///
-    /// non-proposer leaders propose against an empty queue, so their `propose`
-    /// drops the sender → that view nullifies (leader_timeout) and advances. that
-    /// is standard simplex liveness; within at most n views the proposer is
-    /// leader, pops its one digest, and perfect links + our `verify -> true` mean
-    /// every validator notarizes + finalizes that view.
+    /// non-proposer leaders propose against an empty queue, so their `propose` drops
+    /// the sender → that view nullifies (leader_timeout) and advances. that is
+    /// standard simplex liveness; within at most n views the proposer is leader,
+    /// proposes its one digest (re-gossiping the payload each turn), and perfect
+    /// links + our `verify -> true` mean every validator notarizes + finalizes it.
     #[test]
-    fn simplex_finalizes_and_delivers_on_proposer() {
+    fn simplex_relay_delivers_finalized_payload_to_all_validators() {
         use commonware_consensus::simplex::{
             config::{Config as SimplexConfig, Floor, ForwardingPolicy},
             elector::RoundRobin,
@@ -705,10 +770,12 @@ mod tests {
             network.start();
 
             // register all validators: vote(0), certificate(1), resolver(2) — in
-            // that order; the engine's `start(vote, cert, resolver)` consumes them
-            // positionally.
+            // that order, since the engine's `start(vote, cert, resolver)` consumes
+            // them positionally — plus the payload channel (CHANNEL_PAYLOAD) the
+            // relay gossips op-batch bytes on, one per validator.
             let quota = Quota::per_second(NZU32!(128));
             let mut registrations = std::collections::HashMap::new();
+            let mut payload_chans = std::collections::HashMap::new();
             for validator in participants.iter() {
                 let control = oracle.control(validator.clone());
                 let vote = control.register(0, quota).await.expect("register vote");
@@ -717,7 +784,12 @@ mod tests {
                     .await
                     .expect("register certificate");
                 let resolver = control.register(2, quota).await.expect("register resolver");
+                let payload = control
+                    .register(CHANNEL_PAYLOAD, quota)
+                    .await
+                    .expect("register payload");
                 registrations.insert(validator.clone(), (vote, certificate, resolver));
+                payload_chans.insert(validator.clone(), payload);
             }
 
             // perfect all-pairs links so votes/certs propagate deterministically.
@@ -738,9 +810,9 @@ mod tests {
                 }
             }
 
-            // the PROPOSER: participant 0. it (and only it) gets the op-batch
-            // staged into its ContentStore + enqueued for proposal, and its
-            // reporter is wired to an inbound mpsc we read in the test.
+            // the PROPOSER: participant 0. it (and only it) stages the op-batch into
+            // its ContentStore + enqueues the digest. every OTHER validator obtains
+            // the bytes solely through the relay's CHANNEL_PAYLOAD broadcast.
             let proposer = participants[0].clone();
 
             // the op-batch we expect to see finalized + delivered. a RefUpdate to
@@ -752,22 +824,28 @@ mod tests {
             })];
             let proposed_bytes = encode_batch(&wire);
 
-            // the proposer's inbound side: ConsensusReporter forwards finalized
-            // bytes here on `Activity::Finalization`. recv on this rx is the
-            // finalization proof.
-            let (proposer_in_tx, mut proposer_in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
-
-            // build + start one engine per validator with OUR triple.
+            // build + start one engine per validator with OUR triple. EVERY
+            // validator's reporter feeds its OWN inbound mpsc; we collect all n
+            // receivers and assert each delivers the finalized batch.
             let elector = RoundRobin::<Sha256>::default();
             let mut engine_handlers = Vec::new();
+            let mut inboxes = Vec::new();
             for (idx, validator) in participants.iter().enumerate() {
                 let v_ctx = context.child("validator");
                 let is_proposer = *validator == proposer;
 
                 // each validator owns its own content store. only the proposer's
-                // gets the payload staged (peers resolve None on finalization and
-                // drop — out of scope here).
+                // gets the payload staged directly; peers fill theirs from the relay
+                // broadcast via the store-only payload drain below.
                 let store = ContentStore::new();
+
+                // the store-only payload drain: cache every relay-broadcast batch
+                // into THIS validator's store (NOT into the inbound mpsc — delivery
+                // stays the reporter's job, on finalization, in BFT order).
+                let (payload_tx, payload_rx) = payload_chans
+                    .remove(validator)
+                    .expect("validator payload channel registered");
+                spawn_payload_drain(v_ctx.child("payload_drain"), payload_rx, store.clone());
 
                 // P = ed25519::PublicKey (the fixture's key) for Automaton/Relay.
                 let automaton =
@@ -776,22 +854,22 @@ mod tests {
                     let digest = store.put(proposed_bytes.clone());
                     automaton.enqueue(digest);
                 }
-                let relay =
-                    ConsensusRelay::<commonware_cryptography::ed25519::PublicKey>::new(store.clone());
+                // the relay gossips proposed bytes on the payload channel so peers'
+                // drains can cache them ahead of finalization.
+                let relay = ConsensusRelay::<_, commonware_cryptography::ed25519::PublicKey>::new(
+                    payload_tx,
+                    store.clone(),
+                );
 
                 // S = the type of schemes[idx] for ConsensusReporter::<S> (phantom,
-                // named explicitly at construction). the proposer's reporter feeds
-                // the inbound rx we keep; peers get throwaway senders.
-                let inbound = if is_proposer {
-                    proposer_in_tx.clone()
-                } else {
-                    let (throwaway, _drop) = mpsc::channel::<Inbound>(MAX_BACKLOG);
-                    throwaway
-                };
+                // named explicitly at construction). EVERY validator's reporter feeds
+                // its OWN inbound rx, kept in `inboxes` for the all-n delivery assert.
+                let (in_tx, in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+                inboxes.push(in_rx);
                 let reporter = ConsensusReporter::<simplex_ed25519::Scheme>::new(
                     store.clone(),
                     automaton.pending(),
-                    inbound,
+                    in_tx,
                 );
 
                 let blocker = oracle.control(validator.clone());
@@ -828,20 +906,26 @@ mod tests {
                 engine_handlers.push(engine.start(vote, certificate, resolver));
             }
 
-            // await the finalized delivery. recv resolving with the proposed bytes
-            // means the proposer's reporter hit `Activity::Finalization`, resolved
-            // the digest in its ContentStore, and forwarded the op-batch — a REAL
-            // simplex finalization round trip. (timed runner panics on no-show.)
-            let (lane, recv) = proposer_in_rx
-                .recv()
-                .await
-                .expect("proposer receives a finalized consensus batch");
-            assert_eq!(lane, Lane::Consensus);
-            let ops = decode_batch(&recv).expect("decode finalized batch");
-            assert_eq!(ops.len(), 1);
-            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::RefUpdate { .. })));
-            // exact round-trip: finalized bytes are byte-identical to what we put.
-            assert_eq!(recv, proposed_bytes);
+            // await the finalized delivery on EVERY validator. each recv resolving
+            // with the proposed bytes means THAT validator's reporter hit
+            // `Activity::Finalization`, resolved the digest in its ContentStore (the
+            // proposer's from staging, every peer's from the relay broadcast), and
+            // forwarded the op-batch — a REAL simplex finalization round trip,
+            // delivered cross-node. (timed runner panics on any no-show.)
+            for (i, mut inbox) in inboxes.into_iter().enumerate() {
+                let (lane, recv) = inbox.recv().await.unwrap_or_else(|| {
+                    panic!("validator {i} receives a finalized consensus batch")
+                });
+                assert_eq!(lane, Lane::Consensus);
+                let ops = decode_batch(&recv).expect("decode finalized batch");
+                assert_eq!(ops.len(), 1);
+                assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::RefUpdate { .. })));
+                // exact round-trip: byte-identical to what the proposer staged.
+                assert_eq!(
+                    recv, proposed_bytes,
+                    "validator {i} delivered the byte-identical finalized batch"
+                );
+            }
 
             // keep engines alive until the very end (drop is the implicit abort).
             drop(engine_handlers);
@@ -854,14 +938,16 @@ mod tests {
     /// ([`ConsensusLane::Engine`]) drives that batch through BFT finalization and
     /// delivers it on the proposer.
     ///
-    /// this is strictly MORE than [`simplex_finalizes_and_delivers_on_proposer`]:
-    /// that test pokes `store.put` + `automaton.enqueue` directly, bypassing the
-    /// transport; here the ONLY way the digest reaches the engine is through
-    /// `transport.send`, so a pass proves the SEND-PATH wiring (not just the
-    /// engine) is correct. everything else is identical — n=5, simulated network,
-    /// per-validator real `Engine::new`/`start`, our Automaton/Relay/Reporter
-    /// triple, proposer-only `ContentStore`. cross-node delivery to non-proposers
-    /// stays out of scope (that's #2: Relay/resolver).
+    /// this is strictly MORE than
+    /// [`simplex_relay_delivers_finalized_payload_to_all_validators`]: that test
+    /// pokes `store.put` + `automaton.enqueue` directly, bypassing the transport;
+    /// here the ONLY way the digest reaches the engine is through `transport.send`,
+    /// so a pass proves the SEND-PATH wiring (not just the engine) is correct.
+    /// everything else is identical — n=5, simulated network, per-validator real
+    /// `Engine::new`/`start`, our Automaton/Relay/Reporter triple. this test
+    /// deliberately wires NO payload drains and asserts only the proposer: its axis
+    /// is the send path; cross-node delivery to non-proposers is proven by the
+    /// all-validators test above.
     ///
     /// finalization proof is the same mechanism: the proposer's
     /// `ConsensusReporter` forwards onto `proposer_in_rx` ONLY in the
@@ -912,9 +998,11 @@ mod tests {
             network.start();
 
             // register all validators: vote(0)/certificate(1)/resolver(2), the
-            // order engine.start consumes positionally.
+            // order engine.start consumes positionally — plus the payload channel
+            // (CHANNEL_PAYLOAD) every relay now needs a live sender for.
             let quota = Quota::per_second(NZU32!(128));
             let mut registrations = std::collections::HashMap::new();
+            let mut payload_chans = std::collections::HashMap::new();
             for validator in participants.iter() {
                 let control = oracle.control(validator.clone());
                 let vote = control.register(0, quota).await.expect("register vote");
@@ -923,7 +1011,12 @@ mod tests {
                     .await
                     .expect("register certificate");
                 let resolver = control.register(2, quota).await.expect("register resolver");
+                let payload = control
+                    .register(CHANNEL_PAYLOAD, quota)
+                    .await
+                    .expect("register payload");
                 registrations.insert(validator.clone(), (vote, certificate, resolver));
+                payload_chans.insert(validator.clone(), payload);
             }
 
             let link = Link {
@@ -955,6 +1048,11 @@ mod tests {
 
             let elector = RoundRobin::<Sha256>::default();
             let mut engine_handlers = Vec::new();
+            // this test asserts ONLY proposer delivery (its axis is the send path,
+            // not cross-node), so it wires no payload drains; but each relay still
+            // needs a live CHANNEL_PAYLOAD sender to construct. hold the receivers
+            // open for the run so those senders stay connected.
+            let mut payload_keepalive = Vec::new();
             for (idx, validator) in participants.iter().enumerate() {
                 let v_ctx = context.child("validator");
                 let is_proposer = *validator == proposer;
@@ -988,8 +1086,14 @@ mod tests {
                         .expect("consensus send ok");
                 }
 
-                let relay =
-                    ConsensusRelay::<commonware_cryptography::ed25519::PublicKey>::new(store.clone());
+                let (payload_tx, payload_rx) = payload_chans
+                    .remove(validator)
+                    .expect("validator payload channel registered");
+                payload_keepalive.push(payload_rx);
+                let relay = ConsensusRelay::<_, commonware_cryptography::ed25519::PublicKey>::new(
+                    payload_tx,
+                    store.clone(),
+                );
 
                 let inbound = if is_proposer {
                     proposer_in_tx.clone()
@@ -1185,10 +1289,16 @@ mod tests {
     /// batch back out its inbound receiver IS proof that real signed votes crossed
     /// real TCP and a quorum agreed on exactly the bytes we submitted.
     ///
-    /// only node 0 (the submitter) is asserted to deliver. cross-node payload
-    /// delivery to non-proposers is still scaffolded (`ConsensusRelay::broadcast` is
-    /// a no-op), so peers finalize the DIGEST but can't resolve bytes they never
-    /// stored — a known follow-on, orthogonal to "does `new()` finalize".
+    /// cross-node delivery is now LIVE: the leader's `ConsensusRelay` gossips the
+    /// proposed bytes on `CHANNEL_PAYLOAD` and peers cache them store-only, so a
+    /// non-proposer resolves the finalized digest too. this test asserts BOTH the
+    /// submitter (node 0) AND a non-proposer (node 1) deliver the byte-identical
+    /// batch over real sockets. the deterministic-sim
+    /// `simplex_relay_delivers_finalized_payload_to_all_validators` is the
+    /// guaranteed all-n proof; this confirms it holds over production discovery +
+    /// real TCP. (a node that finalizes via certificate backfill WITHOUT seeing a
+    /// live payload broadcast — late-join/catch-up — still can't resolve it; that's
+    /// a resolver follow-on, orthogonal to "does `new()` deliver cross-node".)
     ///
     /// the deadline is a wall-clock `select!`/`sleep`, NOT `Runner::timed` (which
     /// bounds *simulated* time — 60 REAL seconds of hang under tokio). a single
@@ -1260,20 +1370,28 @@ mod tests {
                 .await
                 .expect("submit to node 0's consensus lane");
 
-            // node 0's reporter forwards finalized bytes to its inbound receiver on
-            // Activity::Finalization — recv == a real BFT round trip over sockets.
+            // shared finalization check: right lane, decodes to the one RefUpdate,
+            // byte-identical to what node 0 submitted. (nested fn — captures nothing,
+            // takes everything it needs.)
+            fn assert_finalized(who: &str, lane: Lane, recv: &[u8], expected: &[u8]) {
+                assert_eq!(lane, Lane::Consensus, "{who}: lane");
+                let ops = decode_batch(recv).expect("decode finalized batch");
+                assert_eq!(ops.len(), 1, "{who}: one op");
+                assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::RefUpdate { .. })));
+                assert_eq!(recv, expected, "{who}: finalized bytes byte-identical to node 0's submission");
+            }
+
+            // grab node 1's inbox BEFORE node 0's: remove(0) shifts later indices
+            // down, so pulling node 0 first would renumber node 1.
+            let mut node1_in = inboxes.remove(1);
             let mut node0_in = inboxes.remove(0);
+
+            // node 0 (the submitter) delivers from its own staged ContentStore on
+            // Activity::Finalization — recv == a real BFT round trip over sockets.
             select! {
                 received = node0_in.recv() => {
                     let (lane, recv) = received.expect("node 0 inbound channel closed");
-                    assert_eq!(lane, Lane::Consensus);
-                    let ops = decode_batch(&recv).expect("decode finalized batch");
-                    assert_eq!(ops.len(), 1);
-                    assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::RefUpdate { .. })));
-                    assert_eq!(
-                        recv, proposed_bytes,
-                        "finalized bytes byte-identical to what we submitted"
-                    );
+                    assert_finalized("node 0 (submitter)", lane, &recv, &proposed_bytes);
                 },
                 _timeout = context.sleep(Duration::from_secs(60)) => {
                     panic!(
@@ -1283,7 +1401,24 @@ mod tests {
                 },
             }
 
-            // hold everything until the assert resolves.
+            // node 1 (a NON-proposer) delivers ONLY because the leader's relay
+            // gossiped the payload on CHANNEL_PAYLOAD and node 1's store-only drain
+            // cached it ahead of finalization — the cross-node-payload proof over
+            // real discovery + TCP (the sim test guarantees it for all n).
+            select! {
+                received = node1_in.recv() => {
+                    let (lane, recv) = received.expect("node 1 inbound channel closed");
+                    assert_finalized("node 1 (non-proposer)", lane, &recv, &proposed_bytes);
+                },
+                _timeout = context.sleep(Duration::from_secs(60)) => {
+                    panic!(
+                        "node 1 (non-proposer) never delivered the finalized batch within 60s — \
+                         the relay payload broadcast or the store-only drain is broken"
+                    );
+                },
+            }
+
+            // hold everything until the asserts resolve.
             drop(transports);
             drop(inboxes);
             drop(engines);
