@@ -124,13 +124,18 @@ mod tests {
     use super::*;
 
     fn fresh_repo() -> GitOdb {
+        // process-wide counter for collision-proof temp dirs: see cmd.rs::tmpdir
+        // — {pid}-{nanos} alone can collide under parallel init on macos.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "vcs-odb-test-{}-{}",
+            "vcs-odb-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         GitOdb::init(&dir).expect("init sha256 odb")
     }
