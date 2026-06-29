@@ -21,6 +21,13 @@ commonware-storage = "2026.5.0"
 commonware-parallel = "2026.5.0"
 commonware-formatting = "2026.5.0"
 commonware-actor = "2026.5.0"
+# the p2p resolver engine that backs the catch-up fetch: a node that finalizes a
+# digest whose payload bytes are missing from its ContentStore fetches them from
+# peers by digest, verifies on receipt (sha256), stores, and delivers.
+commonware-resolver = "2026.5.0"
+# the resolver Consumer's Value is `Bytes`; we convert ContentStore Vec<u8> at the
+# boundary. version unifies with the resolver's bytes 1.7.x.
+bytes = "1"
 
 [dev-dependencies]
 vcs.workspace = true
