@@ -59,17 +59,25 @@ pub fn run(repo: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<RawOutput
     });
 
     let output = child.wait_with_output()?;
-    if let Some(handle) = writer {
-        // surface a stdin write failure (e.g. git closed the pipe early).
-        handle.join().expect("stdin writer thread panicked")?;
-    }
 
+    // check git's exit status BEFORE the writer thread's result. a stdin-
+    // consuming command that fails early (e.g. a corrupt pack to
+    // `unpack-objects`) closes its stdin, so the writer hits BrokenPipe — that
+    // is a *symptom* of git's failure, not the cause. surface git's real error
+    // (exit code + stderr); only propagate a writer error when git succeeded.
     if !output.status.success() {
+        if let Some(handle) = writer {
+            let _ = handle.join(); // discard: broken-pipe is expected on early exit
+        }
         let code = output.status.code().unwrap_or(-1);
         return Err(Error::NonZeroExit(
             code,
             String::from_utf8_lossy(&output.stderr).into_owned(),
         ));
+    }
+    if let Some(handle) = writer {
+        // git succeeded -> a stdin write failure here is a genuine fault.
+        handle.join().expect("stdin writer thread panicked")?;
     }
     Ok(RawOutput {
         stdout: output.stdout,
