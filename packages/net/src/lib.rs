@@ -608,7 +608,7 @@ mod tests {
             );
 
             // A broadcasts an encoded op batch.
-            let wire = vec![Op::Vcs(vcs::op::Op::Init)];
+            let wire = vec![Op::Vcs(vcs::op::Op::Announce { objects: Vec::new() })];
             let bytes = encode_batch(&wire);
             transport_a
                 .send(Lane::Broadcast, bytes)
@@ -620,7 +620,7 @@ mod tests {
             assert_eq!(lane, Lane::Broadcast);
             let ops = decode_batch(&recv).expect("decode batch");
             assert_eq!(ops.len(), 1);
-            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Init)));
+            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Announce { .. })));
         });
     }
 
@@ -743,11 +743,12 @@ mod tests {
             // reporter is wired to an inbound mpsc we read in the test.
             let proposer = participants[0].clone();
 
-            // the op-batch we expect to see finalized + delivered. a Vcs::Commit
-            // is a consensus-lane op (`op::Op::lane()` routes Vcs to Consensus).
-            let wire = vec![Op::Vcs(vcs::op::Op::Commit {
-                message: "consensus".into(),
-                author: "proposer".into(),
+            // the op-batch we expect to see finalized + delivered. a RefUpdate to
+            // MAIN_REF is a consensus-lane op (`op::Op::lane()` routes it there).
+            let wire = vec![Op::Vcs(vcs::op::Op::RefUpdate {
+                name: vcs::op::MAIN_REF.to_string(),
+                target: vcs::ObjectId::from_bytes([0u8; 32]),
+                prev: None,
             })];
             let proposed_bytes = encode_batch(&wire);
 
@@ -838,7 +839,7 @@ mod tests {
             assert_eq!(lane, Lane::Consensus);
             let ops = decode_batch(&recv).expect("decode finalized batch");
             assert_eq!(ops.len(), 1);
-            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Commit { .. })));
+            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::RefUpdate { .. })));
             // exact round-trip: finalized bytes are byte-identical to what we put.
             assert_eq!(recv, proposed_bytes);
 
@@ -943,9 +944,10 @@ mod tests {
             }
 
             let proposer = participants[0].clone();
-            let wire = vec![Op::Vcs(vcs::op::Op::Commit {
-                message: "consensus".into(),
-                author: "proposer".into(),
+            let wire = vec![Op::Vcs(vcs::op::Op::RefUpdate {
+                name: vcs::op::MAIN_REF.to_string(),
+                target: vcs::ObjectId::from_bytes([0u8; 32]),
+                prev: None,
             })];
             let proposed_bytes = encode_batch(&wire);
 
@@ -1043,7 +1045,7 @@ mod tests {
             assert_eq!(lane, Lane::Consensus);
             let ops = decode_batch(&recv).expect("decode finalized batch");
             assert_eq!(ops.len(), 1);
-            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Commit { .. })));
+            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::RefUpdate { .. })));
             assert_eq!(recv, proposed_bytes);
 
             drop(engine_handlers);
@@ -1124,7 +1126,7 @@ mod tests {
             }
 
             // the batch node 0 gossips to ALL peers.
-            let wire = vec![Op::Vcs(vcs::op::Op::Init)];
+            let wire = vec![Op::Vcs(vcs::op::Op::Announce { objects: Vec::new() })];
             let expected = encode_batch(&wire);
 
             // resend on a loop: right after start() the mesh isn't formed, so a
@@ -1241,10 +1243,11 @@ mod tests {
             }
 
             // the op-batch node 0 submits and we expect to see finalized. a
-            // Vcs::Commit routes to the consensus lane (op::Op::lane()).
-            let wire = vec![Op::Vcs(vcs::op::Op::Commit {
-                message: "consensus-over-sockets".into(),
-                author: "proposer".into(),
+            // RefUpdate to MAIN_REF routes to the consensus lane (op::Op::lane()).
+            let wire = vec![Op::Vcs(vcs::op::Op::RefUpdate {
+                name: vcs::op::MAIN_REF.to_string(),
+                target: vcs::ObjectId::from_bytes([0u8; 32]),
+                prev: None,
             })];
             let proposed_bytes = encode_batch(&wire);
 
@@ -1266,7 +1269,7 @@ mod tests {
                     assert_eq!(lane, Lane::Consensus);
                     let ops = decode_batch(&recv).expect("decode finalized batch");
                     assert_eq!(ops.len(), 1);
-                    assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Commit { .. })));
+                    assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::RefUpdate { .. })));
                     assert_eq!(
                         recv, proposed_bytes,
                         "finalized bytes byte-identical to what we submitted"
