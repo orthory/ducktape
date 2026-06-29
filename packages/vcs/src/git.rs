@@ -125,13 +125,18 @@ mod tests {
     use std::fs;
 
     fn sha256_repo() -> std::path::PathBuf {
+        // process-wide counter for collision-proof temp dirs: see cmd.rs::tmpdir
+        // — {pid}-{nanos} alone can collide under parallel init on macos.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "vcs-git-test-{}-{}",
+            "vcs-git-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&dir).unwrap();
         // `--template=` keeps init hermetic (no shared-template-dir race).
