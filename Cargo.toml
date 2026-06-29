@@ -15,7 +15,7 @@ members = [
     "packages/uid",
     "utils", "packages/hydration", "packages/workspace", "packages/op", "engine",
     "packages/vcs", "packages/control", "packages/transport",
-    "packages/agent", "packages/net",
+    "packages/agent", "packages/net", "packages/objstore",
 ]
 
 [workspace.dependencies]
@@ -49,6 +49,7 @@ control = { path = "packages/control" }
 transport = { path = "packages/transport" }
 agent = { path = "packages/agent" }
 net = { path = "packages/net" }
+objstore = { path = "packages/objstore" }
 engine = { path = "engine" }
 
 [[bin]]
