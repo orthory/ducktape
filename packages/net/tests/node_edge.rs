@@ -56,12 +56,13 @@ fn runtime_nesting_spike() {
 /// LANE NOTE (the honest mechanism): `AddEntry` routes to [`Lane::Consensus`]
 /// (only `EntryMut` is `Broadcast` — see `op::Op::lane`). so
 /// [`Node::apply_local_direct`] applies node 0's local echo and sends ONCE on the
-/// consensus lane — which exercises Node's real outbound seam over the live
-/// simplex engine, but does NOT deliver the payload to node 1 (the engine's
-/// `ConsensusRelay::broadcast` is a no-op for non-proposers). convergence at node
-/// 1 is carried entirely by the explicit Broadcast resend loop: Node's inbound
-/// task is lane-agnostic (it decodes any batch regardless of the lane tag), so
-/// the same `AddEntry` bytes gossiped on `Broadcast` apply identically at node 1.
+/// consensus lane — exercising Node's real outbound seam over the live simplex
+/// engine. that consensus send now CAN reach node 1 (the relay gossips the
+/// payload on `CHANNEL_PAYLOAD`, so node 1 resolves it on finalization), but this
+/// test does NOT wait on a BFT finalization: convergence at node 1 is carried
+/// deterministically by the explicit Broadcast resend loop. Node's inbound task
+/// is lane-agnostic (it decodes any batch regardless of the lane tag), so the
+/// same `AddEntry` bytes gossiped on `Broadcast` apply identically at node 1.
 ///
 /// `#[ignore]` keeps the default `cargo test -p net` hermetic; run explicitly with
 /// `cargo test -p net --test node_edge -- --ignored`.
