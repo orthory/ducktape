@@ -2124,6 +2124,7 @@ dependencies = [
  "commonware-utils",
  "document",
  "engine",
+ "objstore",
  "op",
  "rand_core 0.6.4",
  "thiserror",
@@ -2251,6 +2252,10 @@ dependencies = [
  "libc",
  "objc2-core-foundation",
 ]
+
+[[package]]
+name = "objstore"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"
@@ -3715,6 +3720,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "vcs"
 version = "0.1.0"
 dependencies = [
+ "objstore",
  "serde",
  "thiserror",
 ]
