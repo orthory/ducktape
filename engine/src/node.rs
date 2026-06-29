@@ -74,6 +74,40 @@ pub struct Config {
     /// hydrator high-water mark — ops per batch before a forced rollover.
     #[serde(default = "default_hwm")]
     pub hwm: usize,
+
+    // --- real-commonware-node fields (net-agnostic plain data) -------------
+    // engine stays transport-agnostic: these are strings/ints the bin maps into
+    // a `net::Config`, NOT net/commonware types. their presence (`listen`) is
+    // what flips the bin from the loopback demo to a real p2p node.
+    /// socket addr to bind/listen on, e.g. "127.0.0.1:52200". **its presence is
+    /// the signal** to run a real commonware node instead of the loopback demo
+    /// (see [`Config::is_commonware`]). absent → loopback demo.
+    #[serde(default)]
+    pub listen: Option<String>,
+
+    /// address advertised to peers for dialing. defaults to `listen` when absent
+    /// (the common single-host case where bind addr == dial addr).
+    #[serde(default)]
+    pub advertised: Option<String>,
+
+    /// application namespace — domain-separates the handshake + consensus genesis
+    /// so distinct apps never interfere. all peers must agree. defaults to
+    /// "ducktape-local" when absent.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// the authorized participant set, each entry a SEED for an ed25519 key
+    /// (dev/local identity model — real key files are a production follow-on).
+    /// this node's own seed is `id as u64`, so it must appear in this list. the
+    /// bin maps each seed → `ed25519::PrivateKey::from_seed(s).public_key()`.
+    #[serde(default)]
+    pub peer_seeds: Vec<u64>,
+
+    /// node 0's dialable address. every non-zero node points here to bootstrap
+    /// into the mesh; node 0 (id == 0) leaves it empty and bootstraps nobody.
+    /// the bootstrapper's key is derived from `peer_seeds[0]`.
+    #[serde(default)]
+    pub bootstrapper_addr: Option<String>,
 }
 
 fn default_drain_interval_ms() -> u64 {
@@ -95,6 +129,13 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         Self::from_toml_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// whether this config asks for a real commonware p2p node (vs the
+    /// single-process loopback demo). the presence of a `listen` addr is the
+    /// signal: a config with no `listen` runs the loopback demo as before.
+    pub fn is_commonware(&self) -> bool {
+        self.listen.is_some()
     }
 
     fn hydration_config(&self) -> hydration::Config {

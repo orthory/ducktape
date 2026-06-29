@@ -66,6 +66,8 @@ use commonware_consensus::{
 };
 use commonware_cryptography::certificate::Scheme;
 use commonware_cryptography::{sha256, Hasher, Sha256};
+use commonware_p2p::{Recipients, Sender};
+use commonware_runtime::IoBuf;
 use commonware_utils::channel::{fallible::OneshotExt, oneshot};
 use op::Lane;
 use tokio::sync::mpsc;
@@ -295,30 +297,51 @@ where
 
 impl<P> CertifiableAutomaton for ConsensusAutomaton<P> where P: commonware_cryptography::PublicKey {}
 
-/// the relay: broadcasts a finalized-but-only-digest-known payload's full bytes
-/// so peers that don't already have it can resolve the digest.
+/// the relay: gossips a proposed payload's full bytes to every peer so
+/// non-proposers — which learn only the DIGEST through consensus — can resolve
+/// it. simplex hands `broadcast` the digest of the batch the leader is
+/// proposing; we look those bytes up in the [`ContentStore`] (the proposer
+/// staged them on `send(Lane::Consensus, ..)`) and `send(Recipients::All, ..)`
+/// them out on a dedicated payload channel ([`CHANNEL_PAYLOAD`](crate)). peers
+/// drain that channel STORE-ONLY (see `crate::spawn_payload_drain`), so when the
+/// digest later finalizes their [`ConsensusReporter`] resolves
+/// `store.get(&digest)` and delivers — via the SAME finalization path the
+/// proposer already used.
 ///
-/// in tier C the actual byte gossip is handled by the dedicated consensus
-/// channel in [`crate`]; here `broadcast` is the seam where, under a live
-/// engine, we'd push `store.get(payload)` out on that channel. it returns
-/// `Feedback::Ok` (accepted) so the engine never backs off on our account.
+/// content-addressing IS the verification: the receiver re-hashes the bytes as
+/// the store key, so byzantine garbage stores under its own hash and can never
+/// match a finalized digest — no signature check needed.
+///
+/// generic over the gossip `Sender` `S` (mirroring
+/// [`CommonwareTransport`](crate::CommonwareTransport)) so the production
+/// discovery sender and the test simulated sender both plug in, and over the
+/// public key `P` for the [`Relay`] trait. `broadcast` is synchronous and
+/// `Sender::send` is too, so this fits the trait with no actor/await — it clones
+/// the (cheap) sender per call, exactly like the broadcast lane in [`crate`].
 #[derive(Clone)]
-pub struct ConsensusRelay<P> {
+pub struct ConsensusRelay<S, P> {
     store: ContentStore,
+    /// gossip sender for the dedicated payload channel. cloned per `broadcast`.
+    sender: S,
     _marker: std::marker::PhantomData<fn() -> P>,
 }
 
-impl<P> ConsensusRelay<P> {
-    pub fn new(store: ContentStore) -> Self {
+impl<S, P> ConsensusRelay<S, P> {
+    /// `sender` gossips on the payload channel; `store` MUST be the same
+    /// [`ContentStore`] the proposer staged into and the reporter resolves from
+    /// (see [`ConsensusAutomaton::handle`]'s precondition).
+    pub fn new(sender: S, store: ContentStore) -> Self {
         Self {
             store,
+            sender,
             _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl<P> Relay for ConsensusRelay<P>
+impl<S, P> Relay for ConsensusRelay<S, P>
 where
+    S: Sender + Clone + Send + Sync + 'static,
     P: commonware_cryptography::PublicKey,
 {
     type Digest = Digest;
@@ -326,11 +349,17 @@ where
     type Plan = Plan<P>;
 
     fn broadcast(&mut self, payload: Self::Digest, _plan: Self::Plan) -> Feedback {
-        // a live engine would gossip the resolved bytes here; for the dormant
-        // scaffolding we just confirm the payload is resolvable and accept. the
-        // lookup keeps `store` load-bearing (and asserts the propose path stored
-        // the bytes before proposing the digest).
-        let _ = self.store.get(&payload);
+        // gossip the proposed payload's bytes to every peer so non-proposers can
+        // resolve the digest when it finalizes. if we don't hold the bytes (we're
+        // not the proposer, or never staged this digest) there's nothing to relay
+        // — accept and move on. `Sender::send` is synchronous (returns the
+        // recipients it will attempt, no await), so this fits the sync signature;
+        // best-effort like the broadcast lane — offline peers are skipped and the
+        // proposer re-gossips each leadership turn (propose re-fires until commit).
+        if let Some(bytes) = self.store.get(&payload) {
+            let mut sender = self.sender.clone();
+            let _ = sender.send(Recipients::All, IoBuf::from(bytes), false);
+        }
         Feedback::Ok
     }
 }

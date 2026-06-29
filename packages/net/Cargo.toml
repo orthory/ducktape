@@ -31,3 +31,19 @@ vcs.workspace = true
 # commonware-p2p/mocks, so a single feature-enabled dev-dep is enough — feature
 # unification turns the mocks on for the test build only, never production.
 commonware-consensus = { version = "2026.5.0", features = ["mocks"] }
+
+# the engine→net edge proof (tests/node_edge.rs) is a SEPARATE crate: it only
+# sees `net` + dev-deps, NOT net's regular deps transitively. so every crate the
+# test names by path must be re-declared here. tokio/op/transport and the
+# commonware-runtime/-cryptography/-macros crates are already net [dependencies],
+# but the test crate can't reach those — re-declaring is fine, cargo unifies
+# versions/features. (no cycle: engine doesn't depend on net.)
+engine.workspace = true
+workspace.workspace = true
+document.workspace = true
+op.workspace = true
+transport.workspace = true
+tokio.workspace = true
+commonware-runtime = "2026.5.0"
+commonware-cryptography = "2026.5.0"
+commonware-macros = "2026.5.0"

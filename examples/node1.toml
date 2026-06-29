@@ -1,0 +1,8 @@
+# node 1 — dials node 0 to join the mesh, then converges on node 0's AddEntry
+# over the broadcast lane. binds a DISTINCT port and points `bootstrapper_addr`
+# at node 0's listen addr. `namespace` + `peer_seeds` are identical to node 0's.
+id = 1
+listen = "127.0.0.1:52201"
+namespace = "ducktape-demo"
+peer_seeds = [0, 1]
+bootstrapper_addr = "127.0.0.1:52200"

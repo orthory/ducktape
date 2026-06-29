@@ -33,6 +33,12 @@ uuid = { version = "1.11", features = ["v7", "serde"] }
 toml = "0.8"
 tokio = { version = "1.47.1", features = ["full", "rt"] }
 
+# commonware (kept at the SAME version `net` uses — see packages/net/Cargo.toml).
+# the bin needs these to run the runtime + derive ed25519 identities for the real
+# commonware node path; `engine` deliberately does NOT depend on them.
+commonware-runtime = "2026.5.0"
+commonware-cryptography = "2026.5.0"
+
 # internal
 auth     = { path = "packages/auth" }
 api      = { path = "packages/api" }
@@ -61,3 +67,12 @@ clap = { version = "4.5.45", features = ["derive"] }
 api.workspace = true
 engine.workspace = true
 tokio = { workspace = true, features = ["rt", "full"] }
+# the real commonware-node path (bin/src/main.rs is the bin target of BOTH this
+# root `ducktape` package and the `bin` member, so both manifests carry these).
+net.workspace = true
+op.workspace = true
+transport.workspace = true
+workspace.workspace = true
+document.workspace = true
+commonware-runtime.workspace = true
+commonware-cryptography.workspace = true
