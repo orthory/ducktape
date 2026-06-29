@@ -4,8 +4,9 @@
 //! node it landed at) flows through: `apply(op::Op)` matches the four-arm
 //! taxonomy and routes each to its handler. document/workspace state lives
 //! inline as a [`Workspace`] hydrated in place; vcs + control are injectable
-//! handler traits so the git layer (p1.3) and the agentic supervisor (p2.1) can
-//! plug in later without this file changing shape.
+//! handler traits so the layers behind them plug in without this file changing
+//! shape. the git layer (p1.3) has landed — [`GitVcs`] is the real vcs handler;
+//! the agentic supervisor (p2.1) still slots into the control seam later.
 //!
 //! handlers can emit follow-up ops: `apply` returns `Vec<op::Op>`. today only
 //! [`ControlApply`] uses this (a control op may want a `Vcs::Commit` to follow);
@@ -14,7 +15,9 @@
 use hydration::Hydratable;
 use workspace::Workspace;
 
+mod git;
 mod node;
+pub use git::GitVcs;
 pub use node::{Config, Node, NoopWorker, run_loopback_demo};
 
 #[derive(Debug, thiserror::Error)]
@@ -37,7 +40,8 @@ pub enum EngineError {
     Control(String),
 }
 
-/// seam for the vcs (git) layer — implemented for real in p1.3.
+/// seam for the vcs (git) layer. the real impl is [`GitVcs`] (p1.3, runs `git`
+/// against a working repo); [`NoopVcs`] is the default no-side-effect handler.
 pub trait VcsApply: Send {
     fn apply(&mut self, op: &vcs::op::Op) -> Result<(), EngineError>;
 }
@@ -49,8 +53,9 @@ pub trait ControlApply: Send {
     fn apply(&mut self, op: &control::op::Op) -> Result<Vec<op::Op>, EngineError>;
 }
 
-/// default vcs handler: accepts everything, does nothing. lets the engine
-/// compile + run before the real git layer lands.
+/// default vcs handler: accepts everything, does nothing. the no-side-effect
+/// choice for engines that don't want a real repo (most tests); inject
+/// [`GitVcs`] with [`Engine::with_vcs`] for the real git layer.
 pub struct NoopVcs;
 
 impl VcsApply for NoopVcs {
