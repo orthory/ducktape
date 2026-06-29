@@ -439,8 +439,15 @@ version = "0.1.0"
 dependencies = [
  "api",
  "clap",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "document",
  "engine",
+ "net",
+ "op",
  "tokio",
+ "transport",
+ "workspace",
 ]
 
 [[package]]
@@ -1293,8 +1300,15 @@ version = "0.1.0"
 dependencies = [
  "api",
  "clap",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "document",
  "engine",
+ "net",
+ "op",
  "tokio",
+ "transport",
+ "workspace",
 ]
 
 [[package]]
@@ -2108,12 +2122,15 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "document",
+ "engine",
  "op",
  "rand_core 0.6.4",
  "thiserror",
  "tokio",
  "transport",
  "vcs",
+ "workspace",
 ]
 
 [[package]]
