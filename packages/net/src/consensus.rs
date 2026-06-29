@@ -65,13 +65,23 @@ use commonware_consensus::{
     Automaton, CertifiableAutomaton, Relay, Reporter,
 };
 use commonware_cryptography::certificate::Scheme;
-use commonware_cryptography::{sha256, Hasher, Sha256};
+use commonware_cryptography::{ed25519, sha256, Hasher, Sha256};
 use commonware_p2p::{Recipients, Sender};
+use commonware_resolver::Resolver as _;
 use commonware_runtime::IoBuf;
 use commonware_utils::channel::{fallible::OneshotExt, oneshot};
 use op::Lane;
 use tokio::sync::mpsc;
 use transport::Inbound;
+
+/// the concrete catch-up fetch handle the reporter holds: a
+/// [`commonware_resolver`] p2p mailbox keyed by op-batch [`Digest`], over our
+/// ed25519 peer identities, with no subscriber annotation (`()`). fetches are
+/// fire-and-forget — `fetch(digest)` enqueues a request and the resolver's
+/// consumer (see [`crate::payload_fetch`]) verifies + stores + delivers when the
+/// bytes arrive. concrete (NOT a new generic on the reporter) so the existing
+/// reporter call sites are untouched.
+pub type PayloadFetcher = commonware_resolver::p2p::Mailbox<Digest, ed25519::PublicKey, ()>;
 
 /// the concrete digest the consensus lane orders over: a sha256 of the op-batch
 /// bytes. simplex is digest-agnostic, but fixing it here lets the
@@ -364,6 +374,30 @@ where
     }
 }
 
+/// resolve a finalized `digest`'s bytes from `store` and forward them onto the
+/// inbound mpsc, tagged [`Lane::Consensus`]. returns `true` if the payload was
+/// present and forwarded, `false` on a store miss (the caller may then fetch it
+/// from peers). this is the single content-addressing forward seam: both the
+/// finalization reporter (its hit arm) and the catch-up resolver consumer (after
+/// it re-hashes + stores the fetched bytes) deliver through here, so delivery
+/// happens in exactly one place.
+pub(crate) fn deliver_payload(
+    store: &ContentStore,
+    inbound: &mpsc::Sender<Inbound>,
+    digest: Digest,
+) -> bool {
+    if let Some(bytes) = store.get(&digest) {
+        // best-effort, non-blocking handoff to the inbound side. we use try_send
+        // (not an await) because the sync reporter calls this; if the inbound
+        // consumer is backed up the message is dropped, matching the best-effort
+        // delivery the loopback/gossip paths already use.
+        let _ = inbound.try_send((Lane::Consensus, bytes));
+        true
+    } else {
+        false
+    }
+}
+
 /// the reporter: the delivery seam. simplex calls `report` for every consensus
 /// activity; we care about exactly one — `Activity::Finalization`. when a
 /// proposal finalizes we resolve its payload digest in the [`ContentStore`] and
@@ -383,6 +417,14 @@ pub struct ConsensusReporter<S> {
     /// [`ConsensusAutomaton::pending`].
     pending: Arc<Mutex<VecDeque<Digest>>>,
     inbound: mpsc::Sender<Inbound>,
+    /// the catch-up fetch handle, if wired. on a finalization whose payload is
+    /// MISSING from the store (no eager relay broadcast reached us), the reporter
+    /// asks this to fetch the bytes from peers by digest. `None` preserves the
+    /// pre-fetch behavior (silent drop on a miss) so existing call sites compile
+    /// unchanged — production wiring installs it via [`with_payload_fetcher`].
+    ///
+    /// [`with_payload_fetcher`]: ConsensusReporter::with_payload_fetcher
+    fetcher: Option<PayloadFetcher>,
     _marker: std::marker::PhantomData<fn() -> S>,
 }
 
@@ -393,6 +435,11 @@ impl<S> ConsensusReporter<S> {
     /// the finalized batch. `pending` MUST be the paired automaton's FIFO (from
     /// [`ConsensusAutomaton::pending`]) — that's what closes the
     /// peek-until-finalized loop: the automaton peeks, this reporter removes.
+    ///
+    /// the catch-up fetcher defaults to `None` (miss => silent drop, the
+    /// pre-fetch behavior); wire it with [`with_payload_fetcher`].
+    ///
+    /// [`with_payload_fetcher`]: ConsensusReporter::with_payload_fetcher
     pub fn new(
         store: ContentStore,
         pending: Arc<Mutex<VecDeque<Digest>>>,
@@ -402,8 +449,19 @@ impl<S> ConsensusReporter<S> {
             store,
             pending,
             inbound,
+            fetcher: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// install the catch-up [`PayloadFetcher`]: on a finalization whose payload is
+    /// missing from the store, the reporter fetches the bytes from peers by digest
+    /// instead of dropping the batch. without this the miss path silently drops —
+    /// so a `new()` that forgets to call this regresses to that drop. wire it on
+    /// the SAME path production `new()` uses so a missing wire fails loudly.
+    pub fn with_payload_fetcher(mut self, fetcher: PayloadFetcher) -> Self {
+        self.fetcher = Some(fetcher);
+        self
     }
 }
 
@@ -429,15 +487,22 @@ where
                     queue.remove(pos);
                 }
             }
-            if let Some(bytes) = self.store.get(&digest) {
-                // best-effort, non-blocking handoff to the inbound side. we use
-                // try_send (not an await) because `report` is sync; if the
-                // inbound consumer is backed up the message is dropped, matching
-                // the best-effort delivery the loopback/gossip paths already use.
-                let _ = self.inbound.try_send((Lane::Consensus, bytes));
+            // resolve + forward through the one delivery seam. a miss means we
+            // finalized a digest whose bytes we never cached (no eager relay
+            // broadcast reached us — a late join, or we simply missed the gossip).
+            if !deliver_payload(&self.store, &self.inbound, digest) {
+                if let Some(fetcher) = self.fetcher.as_mut() {
+                    // backstop: fetch the bytes from peers by digest. the resolver
+                    // consumer (see `crate::payload_fetch`) re-hashes on receipt,
+                    // stores, and delivers through `deliver_payload` — so the
+                    // caught-up batch reaches the inbound the same way an eager one
+                    // does. fire-and-forget: `report` is sync, and `fetch` only
+                    // enqueues a request (the delivery happens later, off this call).
+                    let _ = fetcher.fetch(digest);
+                }
+                // with no fetcher wired this is the pre-fetch behavior: the
+                // finalized batch is dropped. production `new()` always wires one.
             }
-            // a missing payload would mean we finalized a digest we never
-            // resolved — a real node fetches it via the resolver channel here.
         }
         Feedback::Ok
     }

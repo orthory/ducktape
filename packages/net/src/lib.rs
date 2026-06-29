@@ -39,6 +39,7 @@
 //! tests AND a real tokio runtime in production.
 
 pub mod consensus;
+pub mod payload_fetch;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -95,6 +96,17 @@ const CHANNEL_RESOLVER: u64 = 3;
 /// [`spawn_payload_drain`]) — never into the app inbound mpsc — so delivery stays
 /// exclusively in the reporter's `Activity::Finalization` arm, in BFT order.
 const CHANNEL_PAYLOAD: u64 = 4;
+
+/// the dedicated channel the catch-up payload fetch runs its request/response
+/// protocol on — the [`commonware_resolver`] p2p engine that backs
+/// [`ConsensusReporter`](consensus::ConsensusReporter)'s miss-path
+/// [`PayloadFetcher`](consensus::PayloadFetcher). distinct from [`CHANNEL_PAYLOAD`]:
+/// that EAGERLY gossips a proposed batch's bytes one-way ahead of finalization;
+/// this one carries on-demand fetch requests + responses for a digest a node
+/// finalized but whose bytes never reached its store. a validator serves peers'
+/// requests from its store (producer) and receives + verifies fetched bytes
+/// (consumer) over this one channel.
+const CHANNEL_PAYLOAD_FETCH: u64 = 5;
 
 /// the peer-set index. all peers must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
@@ -232,6 +244,26 @@ pub struct Config {
     pub bootstrappers: Vec<(ed25519::PublicKey, SocketAddr)>,
 }
 
+/// the live background engines a node stood up by [`CommonwareTransport::new`]
+/// must keep alive for its entire lifetime. each field is a spawned worker's
+/// [`Handle`]; DROPPING EITHER ABORTS THAT WORKER:
+///
+/// - `consensus` — the simplex BFT engine. dropping it stops finalization.
+/// - `payload_fetch` — the [`commonware_resolver`] p2p engine backing the
+///   catch-up fetch. dropping it stops serving payloads to peers AND fetching
+///   missing finalized payloads, silently regressing the miss path to a drop
+///   with no compile error.
+///
+/// `new` hands this back (rather than hiding it inside the clonable transport)
+/// precisely so the caller is forced to hold it. callers bind it opaquely and
+/// keep it; they never need to name the inner handles.
+pub struct NodeEngines {
+    /// the simplex BFT consensus engine handle.
+    pub consensus: Handle<()>,
+    /// the catch-up payload-fetch resolver engine handle.
+    pub payload_fetch: Handle<()>,
+}
+
 impl<S> CommonwareTransport<S>
 where
     S: commonware_p2p::Sender + Clone + Send + Sync + 'static,
@@ -349,9 +381,10 @@ where
     ///   engine's `Arc`-backed submit handle),
     /// - the inbound receiver (the `(Lane, Vec<u8>)` tuple shape; it carries BOTH
     ///   gossip-broadcast bytes AND engine-finalized consensus bytes),
-    /// - the engine task [`Handle`]. **the caller MUST keep this alive** — dropping
-    ///   it aborts the consensus engine. that's why `new` returns it rather than
-    ///   hiding it inside the clonable transport.
+    /// - the [`NodeEngines`] keepalive bundle: the consensus engine handle AND the
+    ///   catch-up payload-fetch resolver handle. **the caller MUST keep this
+    ///   alive** — dropping either handle aborts that engine. that's why `new`
+    ///   returns it rather than hiding it inside the clonable transport.
     ///
     /// the engine config derives entirely from `cfg`: participants are the
     /// authorized peer set (so simplex's participant indices line up with
@@ -359,7 +392,7 @@ where
     /// `Scheme::signer` (this node signs as exactly the participant its discovery
     /// identity represents), and genesis is domain-separated by `namespace` so
     /// distinct apps can never share a `Floor`. timeouts are tuned defaults.
-    pub fn new(context: E, cfg: Config) -> (Self, mpsc::Receiver<Inbound>, Handle<()>) {
+    pub fn new(context: E, cfg: Config) -> (Self, mpsc::Receiver<Inbound>, NodeEngines) {
         use commonware_consensus::simplex::{
             config::{Config as SimplexConfig, Floor, ForwardingPolicy},
             elector::RoundRobin,
@@ -376,6 +409,7 @@ where
         use crate::consensus::{
             ConsensusAutomaton, ConsensusRelay, ConsensusReporter, ContentStore, Digest,
         };
+        use crate::payload_fetch::{PayloadConsumer, PayloadProducer};
 
         let signer = ed25519::PrivateKey::from_seed(cfg.seed);
 
@@ -415,6 +449,11 @@ where
         let resolver = network.register(CHANNEL_RESOLVER, quota, MAX_BACKLOG);
         let (payload_sender, payload_receiver) =
             network.register(CHANNEL_PAYLOAD, quota, MAX_BACKLOG);
+        // the catch-up fetch's request/response channel: the resolver engine
+        // serves peers' payload requests from our store and receives the bytes we
+        // fetch for a finalized-but-missing digest.
+        let (fetch_sender, fetch_receiver) =
+            network.register(CHANNEL_PAYLOAD_FETCH, quota, MAX_BACKLOG);
 
         // one shared inbound mpsc: the broadcast drain feeds it (Lane::Broadcast)
         // and the consensus reporter feeds it on finalization (Lane::Consensus), so
@@ -455,8 +494,40 @@ where
             payload_sender,
             store.clone(),
         );
-        let reporter =
-            ConsensusReporter::<simplex_ed25519::Scheme>::new(store.clone(), automaton.pending(), in_tx);
+
+        // the catch-up fetch engine: a commonware-resolver p2p engine over the
+        // SAME store + inbound this validator's reporter uses. its producer serves
+        // peers' requests from our store; its consumer re-hashes + stores + delivers
+        // bytes we fetch. the discovery oracle satisfies BOTH the resolver's
+        // peer_provider (Provider) and blocker (Blocker) bounds, so `oracle.clone()`
+        // covers both. `me: Some(..)` excludes self from fetch targets, so a node
+        // that lacks a payload genuinely fetches it from a peer that has it.
+        let fetch_cfg = commonware_resolver::p2p::Config {
+            peer_provider: oracle.clone(),
+            blocker: oracle.clone(),
+            consumer: PayloadConsumer::new(store.clone(), in_tx.clone()),
+            producer: PayloadProducer::new(store.clone()),
+            mailbox_size: NZUsize!(1024),
+            me: Some(signer.public_key()),
+            initial: Duration::from_secs(1),
+            timeout: Duration::from_secs(2),
+            fetch_retry_timeout: Duration::from_secs(1),
+            priority_requests: false,
+            priority_responses: false,
+        };
+        let (fetch_engine, fetcher) =
+            commonware_resolver::p2p::Engine::new(context.child("payload_fetch"), fetch_cfg);
+        let fetch_handle = fetch_engine.start((fetch_sender, fetch_receiver));
+
+        // the reporter delivers finalized payloads; wire the fetcher so a
+        // finalized-but-missing digest fetches its bytes instead of dropping. this
+        // is the load-bearing wire: forget it and the miss path silently regresses.
+        let reporter = ConsensusReporter::<simplex_ed25519::Scheme>::new(
+            store.clone(),
+            automaton.pending(),
+            in_tx,
+        )
+        .with_payload_fetcher(fetcher);
 
         // genesis domain-separated by namespace: distinct apps never share a Floor,
         // every peer in THIS app computes the identical digest.
@@ -512,7 +583,13 @@ where
             consensus: ConsensusLane::Engine(consensus_handle),
         };
 
-        (transport, in_rx, engine_handle)
+        // bundle BOTH engine handles so the caller keeps each alive — dropping the
+        // payload-fetch handle would silently stop catch-up with no compile error.
+        let engines = NodeEngines {
+            consensus: engine_handle,
+            payload_fetch: fetch_handle,
+        };
+        (transport, in_rx, engines)
     }
 }
 
@@ -929,6 +1006,275 @@ mod tests {
 
             // keep engines alive until the very end (drop is the implicit abort).
             drop(engine_handlers);
+        });
+    }
+
+    /// the catch-up FETCH backstop: a validator that FINALIZES a digest whose
+    /// payload bytes are MISSING from its store fetches them from peers by digest,
+    /// verifies on receipt, stores, and delivers — the miss-path counterpart to the
+    /// eager relay push.
+    ///
+    /// built off [`simplex_relay_delivers_finalized_payload_to_all_validators`]:
+    /// n=5 real simplex `Engine`s on a simulated all-pairs network. ADDED here: a
+    /// real [`commonware_resolver`] p2p `Engine` on EVERY validator
+    /// (CHANNEL_PAYLOAD_FETCH) — its producer serves that validator's store, its
+    /// consumer verifies + stores + delivers — installed on the reporter via the
+    /// SAME [`with_payload_fetcher`](consensus::ConsensusReporter::with_payload_fetcher)
+    /// path production `new()` uses, so forgetting the wire surfaces as a deadline
+    /// panic, not a silent pass.
+    ///
+    /// the load-bearing isolation: ONE non-proposer validator (the CATCH-UP node)
+    /// deliberately does NOT drain CHANNEL_PAYLOAD, so the leader's eager broadcast
+    /// never reaches its store. its store starts empty and STAYS empty until the
+    /// resolver consumer fills it — that consumer is the ONLY path bytes can reach
+    /// it. the resolver excludes `self` from fetch targets (fetcher.rs), so it
+    /// CANNOT self-serve; it must fetch from a peer that DID drain the eager payload
+    /// (the other validators do, and serve as producers — mandatory).
+    ///
+    /// the negative control IS the deadline: a broken or unwired resolver leaves the
+    /// catch-up store empty forever, so its reporter never delivers and
+    /// `Runner::timed(300s)` panics. so the catch-up node's `inbox.recv()` returning
+    /// the byte-identical finalized batch on `Lane::Consensus` proves the bytes
+    /// genuinely traveled the fetch channel: it finalized the digest, its reporter
+    /// hit a store miss, fetched from a peer, and the consumer verified + delivered.
+    #[test]
+    fn validator_without_eager_payload_delivers_finalized_batch_via_fetch() {
+        use commonware_consensus::simplex::{
+            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
+            elector::RoundRobin,
+            mocks,
+            scheme::ed25519 as simplex_ed25519,
+            Engine,
+        };
+        use commonware_consensus::types::{Epoch, ViewDelta};
+        use commonware_cryptography::Sha256;
+        use commonware_parallel::Sequential;
+        use commonware_runtime::buffer::paged::CacheRef;
+        use commonware_utils::{NZUsize, NZU16};
+
+        use crate::consensus::{
+            ConsensusAutomaton, ConsensusRelay, ConsensusReporter, ContentStore,
+        };
+        use crate::payload_fetch::{PayloadConsumer, PayloadProducer};
+
+        let n: u32 = 5;
+        let activity_timeout = ViewDelta::new(10);
+        let skip_timeout = ViewDelta::new(5);
+        let namespace = b"consensus".to_vec();
+        let page_size = NZU16!(1024);
+        let page_cache_size = NZUsize!(10);
+
+        let executor = deterministic::Runner::timed(Duration::from_secs(300));
+        executor.start(|mut context| async move {
+            let fixture = simplex_ed25519::fixture(&mut context, &namespace, n);
+            let participants = fixture.participants.clone();
+            let schemes = fixture.schemes.clone();
+
+            let (network, oracle) = simulated::Network::new_with_peers(
+                context.child("network"),
+                simulated::Config {
+                    max_size: 1024 * 1024,
+                    disconnect_on_block: true,
+                    tracked_peer_sets: NZUsize!(1),
+                },
+                participants.clone(),
+            )
+            .await;
+            network.start();
+
+            // register every validator: vote(0)/certificate(1)/resolver(2) for the
+            // simplex engine (positional in `start`), the EAGER payload channel
+            // (CHANNEL_PAYLOAD), AND the catch-up FETCH channel (CHANNEL_PAYLOAD_FETCH).
+            let quota = Quota::per_second(NZU32!(128));
+            let mut registrations = std::collections::HashMap::new();
+            let mut payload_chans = std::collections::HashMap::new();
+            let mut fetch_chans = std::collections::HashMap::new();
+            for validator in participants.iter() {
+                let control = oracle.control(validator.clone());
+                let vote = control.register(0, quota).await.expect("register vote");
+                let certificate = control
+                    .register(1, quota)
+                    .await
+                    .expect("register certificate");
+                let resolver = control.register(2, quota).await.expect("register resolver");
+                let payload = control
+                    .register(CHANNEL_PAYLOAD, quota)
+                    .await
+                    .expect("register payload");
+                let fetch = control
+                    .register(CHANNEL_PAYLOAD_FETCH, quota)
+                    .await
+                    .expect("register payload fetch");
+                registrations.insert(validator.clone(), (vote, certificate, resolver));
+                payload_chans.insert(validator.clone(), payload);
+                fetch_chans.insert(validator.clone(), fetch);
+            }
+
+            let link = Link {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(1),
+                success_rate: 1.0,
+            };
+            for v1 in participants.iter() {
+                for v2 in participants.iter() {
+                    if v1 == v2 {
+                        continue;
+                    }
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .expect("link validators");
+                }
+            }
+
+            // participant 0 proposes (stages + enqueues); participant 1 is the
+            // CATCH-UP node — a non-proposer whose eager payload drain is left UNWIRED.
+            let proposer = participants[0].clone();
+            let catch_up = participants[1].clone();
+
+            let wire = vec![Op::Vcs(vcs::op::Op::RefUpdate {
+                name: vcs::op::MAIN_REF.to_string(),
+                target: vcs::ObjectId::from_bytes([0u8; 32]),
+                prev: None,
+            })];
+            let proposed_bytes = encode_batch(&wire);
+
+            let elector = RoundRobin::<Sha256>::default();
+            let mut engine_handlers = Vec::new();
+            // keep EVERY resolver engine handle alive — a dropped producer engine
+            // can't serve the catch-up node's fetch.
+            let mut fetch_handlers = Vec::new();
+            // hold the catch-up node's UNDRAINED payload receiver open so the leader's
+            // eager broadcasts to it don't fail on a dropped channel.
+            let mut payload_keepalive = Vec::new();
+            // the catch-up node's inbound — the ONLY one we assert on.
+            let mut catch_up_inbox = None;
+
+            for (idx, validator) in participants.iter().enumerate() {
+                let v_ctx = context.child("validator");
+                let is_proposer = *validator == proposer;
+                let is_catch_up = *validator == catch_up;
+
+                let store = ContentStore::new();
+
+                let (payload_tx, payload_rx) =
+                    payload_chans.remove(validator).expect("payload channel");
+                if is_catch_up {
+                    // NO drain: the eager push never reaches THIS node's store, so the
+                    // resolver consumer is the only path bytes can arrive. hold the
+                    // receiver undrained so the proposer's sender stays connected.
+                    payload_keepalive.push(payload_rx);
+                } else {
+                    // the other validators DO drain — they hold the payload and serve
+                    // it as resolver producers (the catch-up node can't self-serve).
+                    spawn_payload_drain(v_ctx.child("payload_drain"), payload_rx, store.clone());
+                }
+
+                let automaton =
+                    ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new();
+                if is_proposer {
+                    let digest = store.put(proposed_bytes.clone());
+                    automaton.enqueue(digest);
+                }
+                let relay = ConsensusRelay::<_, commonware_cryptography::ed25519::PublicKey>::new(
+                    payload_tx,
+                    store.clone(),
+                );
+
+                let (in_tx, in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+                if is_catch_up {
+                    catch_up_inbox = Some(in_rx);
+                }
+
+                // THE catch-up fetch engine for this validator, over its store +
+                // inbound. installed on the reporter via with_payload_fetcher — the
+                // SAME wiring production `new()` uses. me: Some(validator) excludes
+                // self from fetch targets. peer_provider/blocker come from the
+                // simulated oracle (Manager is the Provider; Control is the Blocker).
+                let (fetch_tx, fetch_rx) = fetch_chans.remove(validator).expect("fetch channel");
+                let fetch_cfg = commonware_resolver::p2p::Config {
+                    peer_provider: oracle.manager(),
+                    blocker: oracle.control(validator.clone()),
+                    consumer: PayloadConsumer::new(store.clone(), in_tx.clone()),
+                    producer: PayloadProducer::new(store.clone()),
+                    mailbox_size: NZUsize!(1024),
+                    me: Some(validator.clone()),
+                    initial: Duration::from_millis(100),
+                    timeout: Duration::from_millis(400),
+                    fetch_retry_timeout: Duration::from_millis(100),
+                    priority_requests: false,
+                    priority_responses: false,
+                };
+                let (fetch_engine, fetcher) = commonware_resolver::p2p::Engine::new(
+                    v_ctx.child("payload_fetch"),
+                    fetch_cfg,
+                );
+                fetch_handlers.push(fetch_engine.start((fetch_tx, fetch_rx)));
+
+                let reporter = ConsensusReporter::<simplex_ed25519::Scheme>::new(
+                    store.clone(),
+                    automaton.pending(),
+                    in_tx,
+                )
+                .with_payload_fetcher(fetcher);
+
+                let blocker = oracle.control(validator.clone());
+                let cfg = SimplexConfig {
+                    scheme: schemes[idx].clone(),
+                    elector: elector.clone(),
+                    blocker,
+                    automaton,
+                    relay,
+                    reporter,
+                    strategy: Sequential,
+                    partition: validator.to_string(),
+                    mailbox_size: NZUsize!(1024),
+                    epoch: Epoch::new(333),
+                    floor: Floor::Genesis(mocks::application::genesis::<Sha256>(Epoch::new(333))),
+                    leader_timeout: Duration::from_secs(1),
+                    certification_timeout: Duration::from_secs(2),
+                    timeout_retry: Duration::from_secs(10),
+                    fetch_timeout: Duration::from_secs(1),
+                    activity_timeout,
+                    skip_timeout,
+                    fetch_concurrent: NZUsize!(4),
+                    replay_buffer: NZUsize!(1024 * 1024),
+                    write_buffer: NZUsize!(1024 * 1024),
+                    page_cache: CacheRef::from_pooler(&context, page_size, page_cache_size),
+                    forwarding: ForwardingPolicy::Disabled,
+                };
+                let engine = Engine::new(v_ctx.child("engine"), cfg);
+
+                let (vote, certificate, resolver) = registrations
+                    .remove(validator)
+                    .expect("validator should be registered");
+                engine_handlers.push(engine.start(vote, certificate, resolver));
+            }
+
+            // the catch-up node delivers ONLY via the fetch path: its store starts
+            // empty (no eager drain), so its reporter hits a store miss on
+            // finalization, fetches the bytes from a peer over CHANNEL_PAYLOAD_FETCH,
+            // and the consumer verifies + stores + forwards. a recv here is the whole
+            // backstop, end to end. (timed runner panics on a no-show.)
+            let mut inbox = catch_up_inbox.expect("catch-up node inbound");
+            let (lane, recv) = inbox
+                .recv()
+                .await
+                .expect("catch-up validator receives the finalized batch via fetch");
+            assert_eq!(lane, Lane::Consensus);
+            let ops = decode_batch(&recv).expect("decode finalized batch");
+            assert_eq!(ops.len(), 1);
+            assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::RefUpdate { .. })));
+            assert_eq!(
+                recv, proposed_bytes,
+                "catch-up node delivered the byte-identical finalized batch via fetch"
+            );
+
+            // keep all engines (consensus + resolver) and the undrained payload
+            // receiver alive until the assert resolves (drop is the implicit abort).
+            drop(engine_handlers);
+            drop(fetch_handlers);
+            drop(payload_keepalive);
         });
     }
 
