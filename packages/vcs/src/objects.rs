@@ -63,6 +63,54 @@ pub fn update_ref(repo: &Path, name: &str, target: &ObjectId) -> Result<(), Erro
     Ok(())
 }
 
+/// is the entire object closure reachable from `tip` present in this repo? this
+/// is the gate on applying a finalized ref move: the ref advances only once the
+/// commit, every tree under it, and every blob it names are all stored locally —
+/// so the move can never land a ref pointing into a hole.
+///
+/// there are three independent ways the closure can be incomplete, each with its
+/// own probe:
+/// - the tip commit isn't here at all (`cat-file -e`) — `Ok(false)`;
+/// - a commit/tree the walk must read is unreadable, so `rev-list --objects`
+///   can't enumerate the closure and exits non-zero — `Ok(false)`;
+/// - `rev-list` named a blob oid straight from a tree entry without proving it's
+///   stored; `cat-file --batch-check` probes each oid and reports any absent one
+///   as `missing` — `Ok(false)`.
+///
+/// (some git builds make `rev-list` itself verify blobs and fail at the second
+/// probe; others list the oid and leave the catch to `batch-check`. both holes
+/// are covered either way.) only when all three pass is the closure whole
+/// (`Ok(true)`). a spawn/io fault still propagates as `Err`.
+pub fn closure_complete(repo: &Path, tip: &ObjectId) -> Result<bool, Error> {
+    // the tip commit must be present before anything else is worth checking.
+    if !git::run_ok(repo, &["cat-file", "-e", &tip.to_hex()])? {
+        return Ok(false);
+    }
+
+    // enumerate the closure. a missing object the walk has to read makes
+    // rev-list exit non-zero — that's "incomplete", not a fault to propagate.
+    let revs = match git::run(
+        repo,
+        &["rev-list", "--objects", "--no-object-names", &tip.to_hex()],
+        None,
+    ) {
+        Ok(out) => out.stdout,
+        Err(Error::NonZeroExit(..)) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+
+    // rev-list can list a blob oid from a tree entry without opening the blob;
+    // batch-check is what actually probes presence. a present object's line ends
+    // in its type/size; an absent one's line ends in "missing".
+    let check = git::run(repo, &["cat-file", "--batch-check"], Some(&revs))?.stdout;
+    let text = String::from_utf8_lossy(&check);
+    if text.lines().any(|line| line.ends_with("missing")) {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
 /// resolve ref `name` to its current target, or `Ok(None)` if it doesn't exist.
 pub fn resolve_ref(repo: &Path, name: &str) -> Result<Option<ObjectId>, Error> {
     if !git::run_ok(repo, &["rev-parse", "--verify", "--quiet", name])? {
@@ -117,6 +165,106 @@ mod tests {
 
     fn cleanup(odb: &GitOdb) {
         std::fs::remove_dir_all(odb.repo()).ok();
+    }
+
+    /// snapshot a one-file worktree into a commit and return the repo plus the
+    /// three oids of its closure: `(repo, commit, root_tree, blob)`. selectively
+    /// deleting one of these loose objects is how the closure-hole tests below
+    /// construct "commit present, but a tree/blob absent".
+    fn build_closure(tag: &str) -> (GitOdb, std::path::PathBuf, ObjectId, ObjectId, ObjectId) {
+        let odb = fresh_repo(tag);
+        let repo = odb.repo().to_path_buf();
+        std::fs::write(repo.join("doc.md"), b"payload\n").unwrap();
+        let commit = snapshot_worktree(&repo, "snap").expect("snapshot");
+
+        let tree_hex = String::from_utf8(
+            git::run(&repo, &["rev-parse", &format!("{}^{{tree}}", commit.to_hex())], None)
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let tree = ObjectId::from_hex(&tree_hex).unwrap();
+
+        let blob_hex = String::from_utf8(
+            git::run(&repo, &["rev-parse", &format!("{}:doc.md", commit.to_hex())], None)
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let blob = ObjectId::from_hex(&blob_hex).unwrap();
+
+        (odb, repo, commit, tree, blob)
+    }
+
+    /// delete the loose object file for `oid` (`.git/objects/<2>/<62>`), so the
+    /// object is genuinely gone from the store. freshly-written objects are loose
+    /// (no pack/gc), so this reliably removes them.
+    fn delete_loose(repo: &Path, oid: &ObjectId) {
+        let hex = oid.to_hex();
+        let path = repo.join(".git/objects").join(&hex[..2]).join(&hex[2..]);
+        std::fs::remove_file(&path).unwrap_or_else(|e| panic!("remove loose {}: {e}", oid.to_hex()));
+    }
+
+    #[test]
+    fn closure_complete_when_whole_closure_present() {
+        let (odb, repo, commit, _tree, _blob) = build_closure("closure-full");
+        assert!(
+            closure_complete(&repo, &commit).unwrap(),
+            "commit + tree + blob all present -> complete"
+        );
+        cleanup(&odb);
+    }
+
+    #[test]
+    fn closure_incomplete_when_tip_commit_absent() {
+        // nothing about the tip is here. the cheapest probe (`cat-file -e`)
+        // short-circuits before any walk.
+        let odb = fresh_repo("closure-absent");
+        let repo = odb.repo().to_path_buf();
+        let absent = ObjectId::from_hex(&"0".repeat(64)).unwrap();
+        assert!(
+            !closure_complete(&repo, &absent).unwrap(),
+            "absent tip commit -> incomplete"
+        );
+        cleanup(&odb);
+    }
+
+    #[test]
+    fn closure_incomplete_when_root_tree_missing() {
+        // dangling commit: the commit's loose bytes are present, but its root
+        // tree is gone, so the walk can't enumerate the closure. a has(tip)-only
+        // guard would wrongly pass this.
+        let (odb, repo, commit, tree, _blob) = build_closure("closure-tree");
+        delete_loose(&repo, &tree);
+        assert!(odb.has(&commit).unwrap(), "commit still present");
+        assert!(!odb.has(&tree).unwrap(), "root tree removed");
+        assert!(
+            !closure_complete(&repo, &commit).unwrap(),
+            "missing root tree -> incomplete"
+        );
+        cleanup(&odb);
+    }
+
+    #[test]
+    fn closure_incomplete_when_blob_missing() {
+        // commit + root tree present, one referenced blob gone. the tree is
+        // readable, so the walk reaches the blob entry; whether the rev-list walk
+        // or the batch-check probe flags it depends on the git build, but the
+        // closure is incomplete either way.
+        let (odb, repo, commit, tree, blob) = build_closure("closure-blob");
+        delete_loose(&repo, &blob);
+        assert!(odb.has(&commit).unwrap(), "commit still present");
+        assert!(odb.has(&tree).unwrap(), "root tree still present");
+        assert!(!odb.has(&blob).unwrap(), "blob removed");
+        assert!(
+            !closure_complete(&repo, &commit).unwrap(),
+            "missing blob -> incomplete"
+        );
+        cleanup(&odb);
     }
 
     #[test]
