@@ -103,9 +103,11 @@ impl Consumer for PayloadConsumer {
             // ORDERED-DELIVERY CURSOR (future): a round/view-ordered consensus
             // would interpose HERE — between verify+store and the inbound forward
             // — to release a caught-up payload only in its finalization slot.
-            // today there is no cursor: the reporter already gates delivery on
-            // BFT finalization, so forwarding immediately is in-order. (no round
-            // or view state lives on this consumer yet.)
+            // today there is no cursor: forwarding immediately is SAFE (these are
+            // post-finalization, BFT-committed bytes), though a catch-up delivery
+            // can land out of finalization order relative to eager deliveries —
+            // imposing that order is exactly what this cursor would add. no round
+            // or view state lives on this consumer yet.
             deliver_payload(&self.store, &self.inbound, digest);
             let _ = tx.send(true);
         } else {
