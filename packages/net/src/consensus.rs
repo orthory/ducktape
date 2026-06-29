@@ -125,6 +125,24 @@ impl ContentStore {
     }
 }
 
+/// `ContentStore` is the sha256 half of the substrate's one storage contract
+/// ([`objstore::ObjectStore`]) — the same trait the git ODB implements, over a
+/// different id space (consensus op-batch payloads keyed by sha256 of the bytes,
+/// NOT git oids). the in-memory map never faults, so the error is [`Infallible`].
+/// the inherent `put`/`get` stay for existing consensus callers; the trait
+/// methods delegate to them (disambiguated via `ContentStore::`, never `self.`).
+impl objstore::ObjectStore<Digest> for ContentStore {
+    type Error = std::convert::Infallible;
+
+    fn put(&self, bytes: Vec<u8>) -> Result<Digest, Self::Error> {
+        Ok(ContentStore::put(self, bytes))
+    }
+
+    fn get(&self, id: &Digest) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(ContentStore::get(self, id))
+    }
+}
+
 /// the transport-facing intake for the consensus lane: stage op-batch bytes and
 /// queue their digest for the simplex [`Engine`](commonware_consensus::simplex::Engine)
 /// to order. this is the seam `CommonwareTransport::send(Lane::Consensus, ..)`
@@ -410,6 +428,20 @@ mod tests {
         assert_eq!(store.get(&digest), Some(bytes));
         // a digest we never stored resolves to nothing.
         assert_eq!(store.get(&digest_of(b"unseen")), None);
+    }
+
+    #[test]
+    fn content_store_satisfies_object_store_trait() {
+        use objstore::ObjectStore;
+        let store = ContentStore::new();
+        let bytes = b"payload via the trait".to_vec();
+
+        // through the generic trait surface (Infallible, so unwrap is total).
+        let id = ObjectStore::put(&store, bytes.clone()).unwrap();
+        assert_eq!(id, digest_of(&bytes));
+        assert_eq!(ObjectStore::get(&store, &id).unwrap(), Some(bytes));
+        assert!(ObjectStore::has(&store, &id).unwrap());
+        assert!(!ObjectStore::has(&store, &digest_of(b"nope")).unwrap());
     }
 
     #[test]

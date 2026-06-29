@@ -2108,6 +2108,7 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "objstore",
  "op",
  "rand_core 0.6.4",
  "thiserror",

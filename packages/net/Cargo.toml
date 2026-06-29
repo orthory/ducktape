@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 transport.workspace = true
 op.workspace = true
+objstore.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 
