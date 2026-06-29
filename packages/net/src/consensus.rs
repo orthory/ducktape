@@ -364,6 +364,30 @@ where
     }
 }
 
+/// resolve a finalized `digest`'s bytes from `store` and forward them onto the
+/// inbound mpsc, tagged [`Lane::Consensus`]. returns `true` if the payload was
+/// present and forwarded, `false` on a store miss (the caller may then fetch it
+/// from peers). this is the single content-addressing forward seam: both the
+/// finalization reporter (its hit arm) and the catch-up resolver consumer (after
+/// it re-hashes + stores the fetched bytes) deliver through here, so delivery
+/// happens in exactly one place.
+pub(crate) fn deliver_payload(
+    store: &ContentStore,
+    inbound: &mpsc::Sender<Inbound>,
+    digest: Digest,
+) -> bool {
+    if let Some(bytes) = store.get(&digest) {
+        // best-effort, non-blocking handoff to the inbound side. we use try_send
+        // (not an await) because the sync reporter calls this; if the inbound
+        // consumer is backed up the message is dropped, matching the best-effort
+        // delivery the loopback/gossip paths already use.
+        let _ = inbound.try_send((Lane::Consensus, bytes));
+        true
+    } else {
+        false
+    }
+}
+
 /// the reporter: the delivery seam. simplex calls `report` for every consensus
 /// activity; we care about exactly one — `Activity::Finalization`. when a
 /// proposal finalizes we resolve its payload digest in the [`ContentStore`] and
@@ -429,13 +453,8 @@ where
                     queue.remove(pos);
                 }
             }
-            if let Some(bytes) = self.store.get(&digest) {
-                // best-effort, non-blocking handoff to the inbound side. we use
-                // try_send (not an await) because `report` is sync; if the
-                // inbound consumer is backed up the message is dropped, matching
-                // the best-effort delivery the loopback/gossip paths already use.
-                let _ = self.inbound.try_send((Lane::Consensus, bytes));
-            }
+            // resolve + forward through the one delivery seam.
+            deliver_payload(&self.store, &self.inbound, digest);
             // a missing payload would mean we finalized a digest we never
             // resolved — a real node fetches it via the resolver channel here.
         }
