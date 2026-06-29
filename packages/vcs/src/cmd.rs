@@ -13,19 +13,15 @@
 //! cannot be wrapped in `op::Op` or sent over a lane, only run here.
 
 use std::path::Path;
-// our `Command` enum below is the imperative verb; the std process builder is
-// aliased so the names don't collide.
-use std::process::Command as Process;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("failed to spawn git: {0}")]
-    Spawn(#[from] std::io::Error),
-    #[error("git exited with status {0}: {1}")]
-    NonZeroExit(i32, String),
-}
+use crate::git;
+// the porcelain shares the crate-wide git error (re-exported so existing
+// `cmd::Error` references keep resolving).
+pub use crate::git::Error;
 
-/// the captured result of a successful `git` invocation.
+/// the captured result of a successful porcelain `git` invocation, decoded as
+/// text. the verbs here all produce utf-8 output (or none); binary-producing
+/// plumbing lives in [`crate::odb`] / [`crate::objects`] and stays on raw bytes.
 #[derive(Debug, Clone)]
 pub struct Output {
     pub stdout: String,
@@ -45,35 +41,27 @@ pub enum Command {
     Tag { name: String, message: Option<String> },
 }
 
-/// fallback identity used for object-creating git actions (commit, annotated
-/// tag, non-ff merge) so they work on hosts without a global git identity (CI).
-/// injected via `-c` per-invocation; never touches global config.
-fn identity_args(name: &str) -> [String; 4] {
-    [
-        "-c".to_string(),
-        format!("user.name={name}"),
-        "-c".to_string(),
-        format!("user.email={name}@localhost"),
-    ]
-}
+use crate::git::identity_args;
 
-/// run `git` with `args` in `repo`, capturing stdout/stderr. non-zero exit maps
-/// to [`Error::NonZeroExit`].
+/// run `git` with `args` in `repo` via the shared primitive, decoding the
+/// (text) output. binary-safe capture lives in [`crate::git::run`]; the
+/// porcelain only ever runs verbs whose output is utf-8.
 fn run_git(repo: &Path, args: &[&str]) -> Result<Output, Error> {
-    let output = Process::new("git").current_dir(repo).args(args).output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
-        return Err(Error::NonZeroExit(code, stderr));
-    }
-    Ok(Output { stdout, stderr })
+    let raw = git::run(repo, args, None)?;
+    Ok(Output {
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
+    })
 }
 
 /// perform `cmd` as a local side-effect against the working repo at `repo`.
 pub fn run_local(cmd: &Command, repo: &Path) -> Result<Output, Error> {
     match cmd {
-        Command::Init => run_git(repo, &["init"]),
+        // `--template=` skips git's default template dir: ducktape repos are
+        // machine-managed substrate and want no sample hooks / info-exclude.
+        // it also makes init hermetic — concurrent inits otherwise race on the
+        // shared system template dir (a macOS git flake under parallel tests).
+        Command::Init => run_git(repo, &["init", "--template="]),
         Command::Add { paths } => {
             let mut args = vec!["add"];
             args.extend(paths.iter().map(String::as_str));

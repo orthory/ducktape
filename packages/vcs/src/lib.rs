@@ -9,6 +9,7 @@
 //! everything is content-addressed by [`ObjectId`] (a git oid).
 
 pub mod cmd;
+pub mod git;
 pub mod object;
 pub mod op;
 
