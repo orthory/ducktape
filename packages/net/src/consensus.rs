@@ -20,12 +20,20 @@
 //! ```text
 //!   send(Consensus, bytes)
 //!     -> digest = sha256(bytes); store.put(digest, bytes); enqueue(digest)
-//!     -> Automaton::propose pops the digest -> simplex orders it
+//!     -> Automaton::propose PEEKS the front digest -> simplex orders it
 //!     -> ... 2f+1 finalize votes ...
 //!     -> Reporter::report(Activity::Finalization(f))
 //!     -> bytes = store.get(f.proposal.payload)
+//!     -> remove that digest from the pending FIFO (now committed)
 //!     -> forward (Lane::Consensus, bytes) into the inbound mpsc
 //! ```
+//!
+//! propose PEEKS rather than pops: a leader view that nullifies before quorum
+//! (routine over a real network while the peer mesh is still forming) must NOT
+//! lose the batch — it stays queued and is re-proposed next time we lead.
+//! removal happens at exactly one point, finalization (in the reporter), so the
+//! digest survives any number of nullified views yet is proposed at most once
+//! more after it commits.
 //!
 //! ## why DORMANT (what's left for tier A)
 //!
@@ -153,8 +161,10 @@ impl ConsensusHandle {
 /// the application automaton: proposes the next queued op-batch digest, and
 /// (trivially) verifies/certifies everything.
 ///
-/// `propose` pops a digest off a shared FIFO that `send(Consensus, ..)` pushes
-/// onto. verification is a no-op `true` because in this single-app sim every
+/// `propose` PEEKS the front of a shared FIFO that `send(Consensus, ..)` pushes
+/// onto (the paired [`ConsensusReporter`] removes a digest only once it
+/// finalizes — see [`ConsensusReporter::report`]). verification is a no-op
+/// `true` because in this single-app sim every
 /// payload we'd be asked about is one we ourselves stored — a real deployment
 /// would check the payload resolves and is structurally valid (and keep the
 /// channel pending, never resolving `false` for "not yet", per the trait docs).
@@ -204,6 +214,18 @@ impl<P> ConsensusAutomaton<P> {
             pending: Arc::clone(&self.pending),
         }
     }
+
+    /// share THIS automaton's pending FIFO with its paired
+    /// [`ConsensusReporter`], so the reporter can remove a digest once it
+    /// finalizes (the peek-until-finalized contract: `propose` peeks the front,
+    /// the reporter removes on `Activity::Finalization`). the reporter MUST be
+    /// the one configured on the same validator's engine as this automaton —
+    /// they have to agree on the queue, exactly like [`handle`] and `propose` do.
+    ///
+    /// [`handle`]: ConsensusAutomaton::handle
+    pub fn pending(&self) -> Arc<Mutex<VecDeque<Digest>>> {
+        Arc::clone(&self.pending)
+    }
 }
 
 impl<P> Default for ConsensusAutomaton<P> {
@@ -221,14 +243,21 @@ where
 
     async fn propose(&mut self, _context: Self::Context) -> oneshot::Receiver<Self::Digest> {
         let (tx, rx) = oneshot::channel();
-        // pop the next queued digest. if nothing is queued we drop `tx`, which
-        // the trait documents as "can't propose right now" — the engine moves on
-        // and we'll get another turn as leader.
+        // PEEK the front queued digest — do NOT remove it. if this view fails to
+        // reach quorum and nullifies (routine while a real network's peer mesh is
+        // still forming), the digest must stay queued so we re-propose it next
+        // time we lead; popping here would lose it forever and stall the lane.
+        // the digest is removed at exactly one point — finalization, in
+        // `ConsensusReporter::report` — so it commits at most once.
+        //
+        // if nothing is queued we drop `tx`, which the trait documents as "can't
+        // propose right now" — the engine moves on and we'll get another turn.
         if let Some(digest) = self
             .pending
             .lock()
             .expect("pending queue poisoned")
-            .pop_front()
+            .front()
+            .copied()
         {
             tx.send_lossy(digest);
         }
@@ -301,6 +330,11 @@ where
 #[derive(Clone)]
 pub struct ConsensusReporter<S> {
     store: ContentStore,
+    /// the paired automaton's pending FIFO. on finalization we remove the
+    /// committed digest from it so `propose` advances past it (and the
+    /// peek-until-finalized contract terminates). shared via
+    /// [`ConsensusAutomaton::pending`].
+    pending: Arc<Mutex<VecDeque<Digest>>>,
     inbound: mpsc::Sender<Inbound>,
     _marker: std::marker::PhantomData<fn() -> S>,
 }
@@ -309,10 +343,17 @@ impl<S> ConsensusReporter<S> {
     /// `store` MUST be the same [`ContentStore`] the proposing side staged bytes
     /// into (see [`ConsensusAutomaton::handle`]'s precondition) — finalization
     /// resolves the digest via `store.get`, so a mismatched store silently drops
-    /// the finalized batch.
-    pub fn new(store: ContentStore, inbound: mpsc::Sender<Inbound>) -> Self {
+    /// the finalized batch. `pending` MUST be the paired automaton's FIFO (from
+    /// [`ConsensusAutomaton::pending`]) — that's what closes the
+    /// peek-until-finalized loop: the automaton peeks, this reporter removes.
+    pub fn new(
+        store: ContentStore,
+        pending: Arc<Mutex<VecDeque<Digest>>>,
+        inbound: mpsc::Sender<Inbound>,
+    ) -> Self {
         Self {
             store,
+            pending,
             inbound,
             _marker: std::marker::PhantomData,
         }
@@ -330,6 +371,17 @@ where
         // certificate — that's the BFT-agreed "this payload is committed".
         if let Activity::Finalization(finalization) = activity {
             let digest = finalization.proposal.payload;
+            // committed: drop it from the pending FIFO so `propose` (which only
+            // PEEKS the front) advances to the next batch and never re-proposes
+            // this one. remove by value, not blind pop_front — on a node that
+            // didn't propose this digest the queue won't contain it (no-op), and
+            // we never want to discard a different node's still-pending batch.
+            {
+                let mut queue = self.pending.lock().expect("pending queue poisoned");
+                if let Some(pos) = queue.iter().position(|d| *d == digest) {
+                    queue.remove(pos);
+                }
+            }
             if let Some(bytes) = self.store.get(&digest) {
                 // best-effort, non-blocking handoff to the inbound side. we use
                 // try_send (not an await) because `report` is sync; if the
@@ -378,5 +430,61 @@ mod tests {
         assert_eq!(q.pop_front(), Some(d1));
         assert_eq!(q.pop_front(), Some(d2));
         assert_eq!(q.pop_front(), None);
+    }
+
+    #[test]
+    fn propose_peeks_so_a_nullified_view_can_repropose() {
+        // the load-bearing guard for the peek-not-pop fix in `propose`.
+        //
+        // a proposed view that NULLIFIES (never reaches quorum) must not lose the
+        // queued batch — the engine just calls `propose` again next time this node
+        // leads. driving `propose` twice with NO finalization in between models
+        // exactly that nullify-then-re-lead path. with peek, both calls yield the
+        // same digest. with the old `pop_front`, the second call finds an empty
+        // queue, drops its sender, and the receiver resolves to `Err` — the lane
+        // stalls forever. removal happens at one place only: `ConsensusReporter`
+        // on finalization, which this test deliberately never triggers.
+        use commonware_consensus::types::{Epoch, Round, View};
+        use commonware_cryptography::Signer;
+        use commonware_runtime::{deterministic, Runner};
+
+        let executor = deterministic::Runner::timed(std::time::Duration::from_secs(5));
+        executor.start(|_context| async move {
+            let store = ContentStore::new();
+            let digest = store.put(b"queued batch".to_vec());
+
+            let mut automaton =
+                ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new();
+            automaton.enqueue(digest);
+
+            // `propose` ignores its Context; build a minimal valid one to pass in.
+            let leader = commonware_cryptography::ed25519::PrivateKey::from_seed(0).public_key();
+            let context = || Context {
+                round: Round::new(Epoch::new(0), View::new(1)),
+                leader: leader.clone(),
+                parent: (View::new(0), digest),
+            };
+
+            // first time we lead: offer the queued digest.
+            let first = automaton
+                .propose(context())
+                .await
+                .await
+                .expect("first propose yields the queued digest");
+            assert_eq!(first, digest, "propose should offer the queued batch");
+
+            // that view nullified — no finalization fired, nothing was removed.
+            // lead again: the SAME digest must still be proposable. (with the old
+            // pop_front this await is Err on a dropped sender and the batch is lost.)
+            let second = automaton
+                .propose(context())
+                .await
+                .await
+                .expect("a nullified view keeps the batch queued — re-propose succeeds");
+            assert_eq!(
+                second, digest,
+                "peek must keep the batch proposable after a nullified view"
+            );
+        });
     }
 }

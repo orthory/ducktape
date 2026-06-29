@@ -658,8 +658,11 @@ mod tests {
                     let (throwaway, _drop) = mpsc::channel::<Inbound>(MAX_BACKLOG);
                     throwaway
                 };
-                let reporter =
-                    ConsensusReporter::<simplex_ed25519::Scheme>::new(store.clone(), inbound);
+                let reporter = ConsensusReporter::<simplex_ed25519::Scheme>::new(
+                    store.clone(),
+                    automaton.pending(),
+                    inbound,
+                );
 
                 let blocker = oracle.control(validator.clone());
                 let cfg = SimplexConfig {
@@ -863,8 +866,11 @@ mod tests {
                     let (throwaway, _drop) = mpsc::channel::<Inbound>(MAX_BACKLOG);
                     throwaway
                 };
-                let reporter =
-                    ConsensusReporter::<simplex_ed25519::Scheme>::new(store.clone(), inbound);
+                let reporter = ConsensusReporter::<simplex_ed25519::Scheme>::new(
+                    store.clone(),
+                    automaton.pending(),
+                    inbound,
+                );
 
                 let blocker = oracle.control(validator.clone());
                 let cfg = SimplexConfig {
