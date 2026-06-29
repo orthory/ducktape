@@ -39,6 +39,7 @@
 //! tests AND a real tokio runtime in production.
 
 pub mod consensus;
+pub mod payload_fetch;
 
 use std::future::Future;
 use std::net::SocketAddr;
