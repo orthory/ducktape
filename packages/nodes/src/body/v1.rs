@@ -54,6 +54,15 @@ impl Node for BodyV1 {
             }))
         }
     }
+
+    // Body is raw prose — its on-disk form is the text verbatim. The parser
+    // coalesces consecutive non-command lines into one `text` (joined by '\n'),
+    // and rendering them back is the identity. Caveat (no escaping in v1): if
+    // `text` contains a line starting with '/' or equal to '---', reparsing it
+    // breaks at that line — see the precondition on `document::render::canonical`.
+    fn render(&self) -> String {
+        self.text.clone()
+    }
 }
 
 /// Body boundary heuristic: a line is a command opener if it's the literal
@@ -111,6 +120,16 @@ mod tests {
         let input = "";
         let mut p = Parser::new(input.as_bytes());
         assert!(BodyV1::try_match(&mut p).expect("parse ok").is_none());
+    }
+
+    #[test]
+    fn render_is_text_verbatim() {
+        let input = "first\nsecond\nthird\n";
+        let mut p = Parser::new(input.as_bytes());
+        let body = BodyV1::try_match(&mut p).unwrap().unwrap();
+        // render is the identity on the coalesced text (no trailing newline).
+        assert_eq!(body.render(), "first\nsecond\nthird");
+        assert_eq!(body.render(), body.text);
     }
 
     #[test]

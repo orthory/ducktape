@@ -83,6 +83,28 @@ impl Node for TaskV1 {
             body: matched.body.join("\n"),
         }))
     }
+
+    // `/task.v1{author;title;status;start_at;end_at;assignee...}\n<body>\n/task.v1`.
+    // Arg order mirrors the parser. start_at/end_at are always emitted (even 0),
+    // assignees are appended one-per-arg. author/assignees render through
+    // `auth::User`'s Display; status through `TaskV1Status::render`. Bare `;`
+    // separators (parser trims args). uid is not rendered, body is verbatim.
+    fn render(&self) -> String {
+        let mut args = format!(
+            "{};{};{};{};{}",
+            self.author,
+            self.title,
+            self.status.render(),
+            self.start_at,
+            self.end_at,
+        );
+        for assignee in &self.assignees {
+            args.push(';');
+            args.push_str(&assignee.to_string());
+        }
+
+        format!("/task.v1{{{}}}\n{}\n/task.v1", args, self.body)
+    }
 }
 
 fn parse_u64(s: &str, field: &'static str) -> Result<u64, TaskError> {
@@ -122,6 +144,27 @@ impl FromStr for TaskV1Status {
 }
 
 impl TaskV1Status {
+    /// Render to the `Status` or `Status(tracker)` form `from_argument` parses.
+    /// Names are the canonical capitalization (`InProgress`, not `in-progress`);
+    /// `from_argument` lowercases before matching, so they round-trip. Note the
+    /// parse is lossy for unrecognized input — any unknown string becomes
+    /// `Unknown`, which renders as `"Unknown"`; byte-idempotence still holds
+    /// (`Unknown` re-parses to `Unknown`), but the original text isn't recovered.
+    pub fn render(&self) -> String {
+        let (name, tracker) = match self {
+            TaskV1Status::Backlog(t) => ("Backlog", t),
+            TaskV1Status::InProgress(t) => ("InProgress", t),
+            TaskV1Status::InReview(t) => ("InReview", t),
+            TaskV1Status::Done(t) => ("Done", t),
+            TaskV1Status::Merged(t) => ("Merged", t),
+            TaskV1Status::Unknown => return "Unknown".to_string(),
+        };
+        match tracker {
+            Some(url) => format!("{}({})", name, url),
+            None => name.to_string(),
+        }
+    }
+
     pub fn from_argument(argument: &str) -> Result<Self, TaskError> {
         let Some(captures) = STATUS_PATTERN.captures(argument) else {
             return Ok(Self::Unknown);
@@ -172,6 +215,33 @@ body line 2
         assert_eq!(task.assignees.len(), 2);
         assert_eq!(task.body, "body line 1\nbody line 2");
         assert!(matches!(task.status, TaskV1Status::InProgress(Some(ref u)) if u == "https://github.com"));
+    }
+
+    #[test]
+    fn render_round_trips_through_parse() {
+        let input = "\
+/task.v1{@author;some title;InProgress(https://github.com);12345;12346;@orthory;@ever0de}
+body line 1
+body line 2
+/task.v1
+";
+        let mut p = Parser::new(input.as_bytes());
+        let t = TaskV1::try_match(&mut p).expect("parse ok").expect("matched");
+        let rendered = t.render();
+
+        let mut p2 = Parser::new(rendered.as_bytes());
+        let t2 = TaskV1::try_match(&mut p2)
+            .expect("reparse ok")
+            .expect("rematched");
+        assert_eq!(t2.title, t.title);
+        assert_eq!(t2.author.to_string(), t.author.to_string());
+        assert_eq!(t2.start_at, t.start_at);
+        assert_eq!(t2.end_at, t.end_at);
+        assert_eq!(t2.body, t.body);
+        assert_eq!(t2.status.render(), t.status.render());
+        let a1: Vec<String> = t.assignees.iter().map(|u| u.to_string()).collect();
+        let a2: Vec<String> = t2.assignees.iter().map(|u| u.to_string()).collect();
+        assert_eq!(a1, a2);
     }
 
     #[test]
