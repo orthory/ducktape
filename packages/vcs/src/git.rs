@@ -11,6 +11,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command as Process, Stdio};
 
+use crate::object::ObjectId;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("git io error: {0}")]
@@ -87,6 +89,14 @@ pub fn run_ok(repo: &Path, args: &[&str]) -> Result<bool, Error> {
         .stderr(Stdio::null())
         .status()?;
     Ok(status.success())
+}
+
+/// parse a git oid printed on stdout (hex + trailing whitespace/newline) into an
+/// [`ObjectId`]. shared by [`crate::odb`] and [`crate::objects`].
+pub(crate) fn parse_oid(stdout: &[u8]) -> Result<ObjectId, Error> {
+    let hex = String::from_utf8_lossy(stdout);
+    let hex = hex.trim();
+    ObjectId::from_hex(hex).map_err(|_| Error::BadOid(hex.to_string()))
 }
 
 /// fallback identity for object-creating actions (commit, commit-tree, annotated

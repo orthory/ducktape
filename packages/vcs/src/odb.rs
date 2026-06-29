@@ -72,7 +72,7 @@ impl ObjectStore<ObjectId> for GitOdb {
             &["hash-object", "-w", "-t", typ, "--stdin"],
             Some(body),
         )?;
-        parse_oid(&out.stdout)
+        git::parse_oid(&out.stdout)
     }
 
     /// fetch an object as loose-object bytes, or `Ok(None)` if absent. the type
@@ -117,13 +117,6 @@ fn loose(typ: &str, body: &[u8]) -> Vec<u8> {
     out.push(0);
     out.extend_from_slice(body);
     out
-}
-
-/// parse a git oid printed on stdout (hex + trailing newline) into [`ObjectId`].
-fn parse_oid(stdout: &[u8]) -> Result<ObjectId, Error> {
-    let hex = String::from_utf8_lossy(stdout);
-    let hex = hex.trim();
-    ObjectId::from_hex(hex).map_err(|_| Error::BadOid(hex.to_string()))
 }
 
 #[cfg(test)]

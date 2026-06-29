@@ -11,6 +11,7 @@
 pub mod cmd;
 pub mod git;
 pub mod object;
+pub mod objects;
 pub mod odb;
 pub mod op;
 
