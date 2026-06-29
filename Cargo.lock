@@ -2108,12 +2108,15 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "document",
+ "engine",
  "op",
  "rand_core 0.6.4",
  "thiserror",
  "tokio",
  "transport",
  "vcs",
+ "workspace",
 ]
 
 [[package]]
