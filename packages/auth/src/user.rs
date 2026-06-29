@@ -14,3 +14,12 @@ impl User {
         }
     }
 }
+
+// canonical render of a User is its display_name verbatim — the exact inverse
+// of `from_str`. `provider` is never serialized (from_str always sets it None),
+// so a User round-trips through `from_str(user.to_string())` losslessly.
+impl std::fmt::Display for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display_name)
+    }
+}
