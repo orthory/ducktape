@@ -26,6 +26,7 @@ use bytes::Bytes;
 use commonware_resolver::p2p::Producer;
 use commonware_resolver::{Consumer, Delivery};
 use commonware_utils::channel::oneshot;
+#[cfg(test)]
 use op::Lane;
 use tokio::sync::mpsc;
 use transport::Inbound;
@@ -94,7 +95,9 @@ impl Consumer for PayloadConsumer {
         value: Self::Value,
     ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
-        let bytes: Vec<u8> = value.to_vec();
+        // `into` is zero-copy when the fetched `Bytes` uniquely owns its buffer
+        // (it does here), unlike `to_vec` which always allocates + copies.
+        let bytes: Vec<u8> = value.into();
         if digest_of(&bytes) == delivery.key {
             // content address verified: the fetched bytes hash to the digest we
             // asked for. cache them so the store resolves this (and any future)
