@@ -49,7 +49,8 @@ use commonware_p2p::{
     Manager, Recipients,
 };
 use commonware_runtime::{
-    BufferPooler, Clock, IoBuf, Metrics, Network as RNetwork, Quota, Resolver, Spawner,
+    BufferPooler, Clock, Handle, IoBuf, Metrics, Network as RNetwork, Quota, Resolver, Spawner,
+    Storage,
 };
 use commonware_utils::{ordered::Set, NZU32};
 use op::Lane;
@@ -60,12 +61,30 @@ use transport::{Error, Inbound, Transport};
 /// the p2p channel index we register the broadcast op-gossip stream on.
 const CHANNEL_BROADCAST: u64 = 0;
 
-/// the p2p channel index for the consensus lane (p1.2, tier C). a SEPARATE
-/// channel from broadcast so the inbound drain can tag the lane correctly and
-/// so consensus traffic is wire-distinguishable. when the simplex `Engine`
-/// lands, this is the channel its vote/certificate/resolver sub-streams will be
-/// derived from (or it grows into three; see [`consensus`]).
+/// the p2p channel index for the tier-C consensus GOSSIP lane (p1.2). a SEPARATE
+/// channel from broadcast so the inbound drain can tag the lane correctly and so
+/// consensus traffic is wire-distinguishable. still used by the gossip-lane path
+/// ([`CommonwareTransport::from_channels`] and the hermetic tests). the live
+/// simplex engine that [`CommonwareTransport::new`] now builds does NOT use this
+/// single channel — it splits into the three dedicated channels below.
+///
+/// `allow(dead_code)`: since the engine flip, only the gossip-lane tests (built
+/// on [`CommonwareTransport::from_channels`]) register this channel, so a non-test
+/// build sees no use. it stays as the named protocol index for that still-public
+/// path — `from_channels` callers register their own consensus channel against it.
+#[allow(dead_code)]
 const CHANNEL_CONSENSUS: u64 = 1;
+
+/// the simplex engine's three sub-channels, registered by the production
+/// [`CommonwareTransport::new`] path alongside [`CHANNEL_BROADCAST`]. the engine
+/// consumes these positionally in `engine.start(vote, certificate, resolver)`;
+/// they carry the BFT protocol traffic (individual votes, finalized
+/// certificates, and request/response certificate fetches respectively) — NOT
+/// op-batch payloads, which ride out-of-band through the [`consensus`]
+/// `ContentStore`. distinct indices from broadcast since they share one network.
+const CHANNEL_VOTE: u64 = 1;
+const CHANNEL_CERTIFICATE: u64 = 2;
+const CHANNEL_RESOLVER: u64 = 3;
 
 /// the peer-set index. all peers must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
@@ -255,18 +274,60 @@ where
         + CryptoRngCore
         + RNetwork
         + Resolver
+        + Storage
         + Metrics
         + Send
         + Sync
         + 'static,
 {
-    /// stand up a commonware node on the given runtime `context`.
+    /// stand up a commonware node on the given runtime `context`, with a LIVE
+    /// simplex BFT engine driving the consensus lane.
     ///
-    /// returns the transport handle and the inbound receiver (the same
-    /// `(Lane, Vec<u8>)` tuple shape the trait's inbound side uses). the network
-    /// is started before returning, and a background task is spawned to drain
-    /// inbound gossip into the returned receiver.
-    pub fn new(context: E, cfg: Config) -> (Self, mpsc::Receiver<Inbound>) {
+    /// builds the real `authenticated::discovery` network — broadcast gossip on
+    /// [`CHANNEL_BROADCAST`] plus the engine's three sub-channels
+    /// ([`CHANNEL_VOTE`]/[`CHANNEL_CERTIFICATE`]/[`CHANNEL_RESOLVER`]) — AND a real
+    /// [`Engine`](commonware_consensus::simplex::Engine) wired to our
+    /// [`ConsensusAutomaton`](consensus::ConsensusAutomaton) /
+    /// [`ConsensusRelay`](consensus::ConsensusRelay) /
+    /// [`ConsensusReporter`](consensus::ConsensusReporter) triple over one shared
+    /// [`ContentStore`](consensus::ContentStore). `send(Lane::Consensus, ..)`
+    /// stages a batch into that store and queues its digest; the engine BFT-orders
+    /// it; on `Activity::Finalization` the reporter delivers the finalized bytes
+    /// back out the returned inbound receiver, tagged [`Lane::Consensus`].
+    ///
+    /// returns three things:
+    /// - the transport (cheap-clone: holds the broadcast `Sender` plus the
+    ///   engine's `Arc`-backed submit handle),
+    /// - the inbound receiver (the `(Lane, Vec<u8>)` tuple shape; it carries BOTH
+    ///   gossip-broadcast bytes AND engine-finalized consensus bytes),
+    /// - the engine task [`Handle`]. **the caller MUST keep this alive** — dropping
+    ///   it aborts the consensus engine. that's why `new` returns it rather than
+    ///   hiding it inside the clonable transport.
+    ///
+    /// the engine config derives entirely from `cfg`: participants are the
+    /// authorized peer set (so simplex's participant indices line up with
+    /// discovery's sorted set), the scheme is built the production way via
+    /// `Scheme::signer` (this node signs as exactly the participant its discovery
+    /// identity represents), and genesis is domain-separated by `namespace` so
+    /// distinct apps can never share a `Floor`. timeouts are tuned defaults.
+    pub fn new(context: E, cfg: Config) -> (Self, mpsc::Receiver<Inbound>, Handle<()>) {
+        use commonware_consensus::simplex::{
+            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
+            elector::RoundRobin,
+            scheme::ed25519 as simplex_ed25519,
+            Engine,
+        };
+        use commonware_consensus::types::{Epoch, ViewDelta};
+        use commonware_cryptography::{Hasher, Sha256};
+        use commonware_parallel::Sequential;
+        use commonware_runtime::buffer::paged::CacheRef;
+        use commonware_utils::{NZUsize, NZU16};
+        use std::time::Duration;
+
+        use crate::consensus::{
+            ConsensusAutomaton, ConsensusRelay, ConsensusReporter, ContentStore, Digest,
+        };
+
         let signer = ed25519::PrivateKey::from_seed(cfg.seed);
 
         // build the discovery config. `local` is the dev/sim-friendly preset
@@ -287,36 +348,104 @@ where
 
         let (mut network, mut oracle) = Network::new(context.child("network"), p2p_cfg);
 
-        // register the authorized peer set at PEER_SET. `track` is synchronous
-        // (enqueues onto the tracker mailbox); the set must include our own key
-        // so every node agrees on the sorted ordering.
-        let peer_set: Set<ed25519::PublicKey> =
+        // the authorized participant set, SORTED — shared by discovery (the
+        // tracked peer set, which must include our own key so everyone agrees on
+        // the ordering) AND the simplex scheme (participant indices line up).
+        let participants: Set<ed25519::PublicKey> =
             Set::try_from(cfg.peers).expect("authorized peer set has no duplicates");
-        oracle.track(PEER_SET, peer_set);
+        oracle.track(PEER_SET, participants.clone());
 
-        // register both gossip channels. quota caps inbound receive rate.
-        let broadcast = network.register(
-            CHANNEL_BROADCAST,
-            Quota::per_second(NZU32!(128)),
-            MAX_BACKLOG,
+        // register the broadcast gossip channel + the engine's three sub-channels.
+        // quota caps inbound receive rate; `Quota` is `Copy`, so one suffices.
+        let quota = Quota::per_second(NZU32!(128));
+        let (broadcast_sender, broadcast_receiver) =
+            network.register(CHANNEL_BROADCAST, quota, MAX_BACKLOG);
+        let vote = network.register(CHANNEL_VOTE, quota, MAX_BACKLOG);
+        let certificate = network.register(CHANNEL_CERTIFICATE, quota, MAX_BACKLOG);
+        let resolver = network.register(CHANNEL_RESOLVER, quota, MAX_BACKLOG);
+
+        // one shared inbound mpsc: the broadcast drain feeds it (Lane::Broadcast)
+        // and the consensus reporter feeds it on finalization (Lane::Consensus), so
+        // the single receiver we return carries both lanes. (no consensus-channel
+        // drain — the engine consumes vote/cert/resolver itself; finalized payloads
+        // arrive via the reporter, not a gossip drain.)
+        let (in_tx, in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+        spawn_inbound_drain(
+            context.child("inbound_broadcast"),
+            broadcast_receiver,
+            Lane::Broadcast,
+            in_tx.clone(),
         );
-        let consensus = network.register(
-            CHANNEL_CONSENSUS,
-            Quota::per_second(NZU32!(128)),
-            MAX_BACKLOG,
-        );
 
-        // wire the two channel pairs into a dialect-agnostic transport (spawns
-        // the inbound drains, holds the senders). the registered receivers
-        // buffer up to MAX_BACKLOG regardless, so it's fine to start the network
-        // after building the transport.
-        let (transport, in_rx) =
-            Self::from_channels(context.child("transport"), broadcast, consensus);
+        // our consensus triple over ONE shared ContentStore. `new` mints the store
+        // once and clones it into the handle, relay, and reporter — so the
+        // shared-store precondition `ConsensusAutomaton::handle` documents (handle
+        // puts under a digest, reporter gets by it on finalization) is satisfied
+        // STRUCTURALLY here, not just by convention. the reporter also shares the
+        // automaton's pending FIFO (peek-until-finalized: propose peeks the front,
+        // the reporter removes on finalization).
+        let store = ContentStore::new();
+        let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
+        let consensus_handle = automaton.handle(store.clone());
+        let relay = ConsensusRelay::<ed25519::PublicKey>::new(store.clone());
+        let reporter =
+            ConsensusReporter::<simplex_ed25519::Scheme>::new(store.clone(), automaton.pending(), in_tx);
 
-        // start the network actors (dialer, listener, router, tracker, ...).
+        // genesis domain-separated by namespace: distinct apps never share a Floor,
+        // every peer in THIS app computes the identical digest.
+        let genesis: Digest = {
+            let mut hasher = Sha256::default();
+            hasher.update(b"ducktape:consensus:genesis:v1:");
+            hasher.update(&cfg.namespace);
+            hasher.finalize()
+        };
+
+        // scheme built the production way: `signer` finds OUR private key's index
+        // in the sorted participant set, so we sign as exactly the participant our
+        // discovery identity represents.
+        let scheme = simplex_ed25519::Scheme::signer(&cfg.namespace, participants.clone(), signer.clone())
+            .expect("our key is in the authorized peer set");
+
+        let engine_cfg = SimplexConfig {
+            scheme,
+            elector: RoundRobin::<Sha256>::default(),
+            // the discovery Oracle IS the Blocker (impl Blocker for Oracle).
+            blocker: oracle.clone(),
+            automaton,
+            relay,
+            reporter,
+            strategy: Sequential,
+            // pubkey hex is FS-safe → isolated storage partition per node.
+            partition: signer.public_key().to_string(),
+            mailbox_size: NZUsize!(1024),
+            epoch: Epoch::new(0),
+            floor: Floor::Genesis(genesis),
+            leader_timeout: Duration::from_secs(1),
+            certification_timeout: Duration::from_secs(2),
+            timeout_retry: Duration::from_secs(10),
+            fetch_timeout: Duration::from_secs(1),
+            activity_timeout: ViewDelta::new(10),
+            skip_timeout: ViewDelta::new(5),
+            fetch_concurrent: NZUsize!(4),
+            replay_buffer: NZUsize!(1024 * 1024),
+            write_buffer: NZUsize!(1024 * 1024),
+            page_cache: CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10)),
+            forwarding: ForwardingPolicy::Disabled,
+        };
+
+        // start the network actors (dialer, listener, router, tracker, ...), then
+        // the engine on its three channels. the registered receivers buffer up to
+        // MAX_BACKLOG regardless, so starting the network here is fine.
         network.start();
+        let engine = Engine::new(context.child("engine"), engine_cfg);
+        let engine_handle = engine.start(vote, certificate, resolver);
 
-        (transport, in_rx)
+        let transport = Self {
+            broadcast: broadcast_sender,
+            consensus: ConsensusLane::Engine(consensus_handle),
+        };
+
+        (transport, in_rx, engine_handle)
     }
 }
 
@@ -944,7 +1073,11 @@ mod tests {
         use commonware_macros::select;
         use std::net::{IpAddr, Ipv4Addr};
 
-        const N: usize = 3;
+        // n=5: `new()` now also builds a live simplex engine, which wants the
+        // canonical BFT participant count (3f+1). the engines just idle here (no
+        // consensus submits) — this test only exercises the broadcast lane — but
+        // they must stand up cleanly, so we give them a healthy set.
+        const N: usize = 5;
         const BASE_PORT: u16 = 52111;
 
         let executor = commonware_runtime::tokio::Runner::default();
@@ -963,6 +1096,10 @@ mod tests {
             // across nodes would collide in the registry.
             let mut transports = Vec::new();
             let mut inboxes = Vec::new();
+            // keep every engine handle alive — dropping one aborts that node's
+            // consensus engine. we never assert on consensus here, but a node whose
+            // engine task died is not a faithful production node.
+            let mut engines = Vec::new();
             for i in 0..N {
                 let addr =
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BASE_PORT + i as u16);
@@ -980,9 +1117,10 @@ mod tests {
                     bootstrappers,
                 };
                 let node_ctx = context.child("node").with_attribute("index", i);
-                let (transport, inbox) = CommonwareTransport::new(node_ctx, cfg);
+                let (transport, inbox, engine) = CommonwareTransport::new(node_ctx, cfg);
                 transports.push(transport);
                 inboxes.push(inbox);
+                engines.push(engine);
             }
 
             // the batch node 0 gossips to ALL peers.
@@ -1024,99 +1162,85 @@ mod tests {
             // hold everything until the assert resolves.
             drop(transports);
             drop(inboxes);
+            drop(engines);
         });
     }
 
-    /// PROBE — the simplex ENGINE finalizing over REAL sockets (the substrate
-    /// proof for the `new()` flip). this is
-    /// [`simplex_finalizes_and_delivers_on_proposer`] with ONLY the substrate
-    /// swapped: `deterministic::Runner` → `tokio::Runner` (real clock + FS
-    /// storage), one shared `p2p::simulated` network → one real
-    /// `authenticated::discovery` `Network` PER NODE (real localhost TCP,
-    /// bootstrapping off node 0). everything else is identical — n=5, our
-    /// Automaton/Relay/Reporter triple, per-validator partition, the proposer-only
-    /// `ContentStore` + direct enqueue — so a diff against that green simulated
-    /// test isolates "does the engine finalize over real sockets + FS" from our
-    /// wiring. this is the exact engine-building body that relocates into `new()`.
+    /// PROOF — production [`CommonwareTransport::new`] finalizes a
+    /// `send(Lane::Consensus, ..)` over REAL sockets. this is the end-to-end test
+    /// of the engine flip: it drives the PUBLIC seam through the REAL production
+    /// constructor — real `authenticated::discovery`, real ed25519 handshakes, real
+    /// localhost TCP, real per-node FS storage partitions, a real simplex `Engine` —
+    /// to a real `Activity::Finalization`, with NO inline wiring and NO mocks. it
+    /// supersedes the earlier inline substrate probe: that hand-built the engine to
+    /// de-risk the wiring; now `new()` OWNS that wiring, so the proof goes through
+    /// `new()` itself.
     ///
-    /// schemes are built the PRODUCTION way (`Scheme::signer(namespace,
-    /// participants, from_seed(i))`) rather than via the test `fixture`: each
-    /// node's discovery identity is `from_seed(i)`, and it must sign as the
-    /// participant with that key — `signer` finds that key's index in the sorted
-    /// set, aligning the p2p identity with the consensus identity. genesis is a
-    /// fixed `Sha256` of a ducktape constant (NO `mocks`, which is a dev feature),
-    /// so all nodes agree on `Floor::Genesis`.
-    ///
-    /// the deadline is a wall-clock `select!`/`sleep`, NOT `Runner::timed` —
-    /// that bounds *simulated* time, which under tokio would be 60 REAL seconds of
-    /// hang. mesh formation plus a few nullified early views should finalize in
-    /// seconds; the ceiling only turns a never-finalize into a fast failure.
-    ///
-    /// what a pass proves (this is genuine BFT, not a local short-circuit):
+    /// what a pass proves (genuine BFT, not a local short-circuit):
     /// `Activity::Finalization` only fires when the engine recovers a finalization
-    /// CERTIFICATE — 2f+1 distinct validators' signed votes — which a single node
-    /// cannot manufacture (it holds one key). so the proposer's reporter
-    /// delivering the byte-identical batch IS proof that real signed votes crossed
-    /// real localhost TCP and a quorum agreed on this exact payload. the value
-    /// here is the SUBSTRATE (engine + discovery + FS storage finalize together);
-    /// this is the body that relocates into `new()`.
+    /// CERTIFICATE — 2f+1 distinct validators' signed votes — which one node holding
+    /// one key cannot manufacture. so node 0's reporter delivering the byte-identical
+    /// batch back out its inbound receiver IS proof that real signed votes crossed
+    /// real TCP and a quorum agreed on exactly the bytes we submitted.
     ///
-    /// NOTE: this does NOT exercise the peek-until-finalized fix. on a fast,
-    /// synchronized localhost mesh node 0's first leader view already has quorum,
-    /// so no view nullifies — the negative control passes with pop_front too. that
-    /// fix is guarded deterministically by
-    /// [`consensus::tests::propose_peeks_so_a_nullified_view_can_repropose`]
-    /// instead; real-world nullification (formation/partition/loss) is what makes
-    /// it load-bearing in production.
+    /// only node 0 (the submitter) is asserted to deliver. cross-node payload
+    /// delivery to non-proposers is still scaffolded (`ConsensusRelay::broadcast` is
+    /// a no-op), so peers finalize the DIGEST but can't resolve bytes they never
+    /// stored — a known follow-on, orthogonal to "does `new()` finalize".
+    ///
+    /// the deadline is a wall-clock `select!`/`sleep`, NOT `Runner::timed` (which
+    /// bounds *simulated* time — 60 REAL seconds of hang under tokio). a single
+    /// `send` enqueues the digest persistently — peek-until-finalized keeps it
+    /// across any nullified early views while the mesh forms — so one submit
+    /// suffices; finalization lands in seconds and the ceiling only fails-fast a
+    /// stall.
     #[test]
     #[ignore = "real-socket: binds localhost TCP + writes FS storage; run with --ignored"]
-    fn new_engine_finalizes_over_real_sockets() {
-        use commonware_consensus::simplex::{
-            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
-            elector::RoundRobin,
-            scheme::ed25519 as simplex_ed25519,
-            Engine,
-        };
-        use commonware_consensus::types::{Epoch, ViewDelta};
-        use commonware_cryptography::{Hasher, Sha256};
+    fn new_finalizes_consensus_send_over_real_sockets() {
         use commonware_macros::select;
-        use commonware_parallel::Sequential;
-        use commonware_runtime::buffer::paged::CacheRef;
-        use commonware_utils::NZU16;
         use std::net::{IpAddr, Ipv4Addr};
-
-        use crate::consensus::{
-            ConsensusAutomaton, ConsensusRelay, ConsensusReporter, ContentStore, Digest,
-        };
 
         const N: usize = 5;
         const BASE_PORT: u16 = 52120;
-        let namespace = b"ducktape-consensus-probe".to_vec();
-        let activity_timeout = ViewDelta::new(10);
-        let skip_timeout = ViewDelta::new(5);
-        let page_size = NZU16!(1024);
-        let page_cache_size = NZUsize!(10);
 
         let executor = commonware_runtime::tokio::Runner::default();
         executor.start(|context| async move {
-            // identities: node i = from_seed(i). the authorized participant set is
-            // the SORTED set of their pubkeys — shared by discovery (the tracked
-            // peer set) AND the simplex scheme (participant indices line up).
-            let privs: Vec<ed25519::PrivateKey> =
-                (0..N as u64).map(ed25519::PrivateKey::from_seed).collect();
-            let keys: Vec<ed25519::PublicKey> = privs.iter().map(|p| p.public_key()).collect();
-            let participants: Set<ed25519::PublicKey> =
-                Set::try_from(keys.clone()).expect("participant set has no duplicates");
+            // every node agrees on the authorized peer set (n keys from seeds
+            // 0..N) and — except node 0 — bootstraps off node 0's address.
+            let keys: Vec<ed25519::PublicKey> = (0..N as u64)
+                .map(|i| ed25519::PrivateKey::from_seed(i).public_key())
+                .collect();
             let node0_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BASE_PORT);
 
-            // fixed genesis (no mocks): identical across nodes → agree on Floor.
-            let genesis: Digest = {
-                let mut hasher = Sha256::default();
-                hasher.update(b"ducktape:consensus:genesis:v1");
-                hasher.finalize()
-            };
+            // stand up all N nodes through production new(); keep every handle alive
+            // (a dropped engine handle aborts that node's consensus task).
+            let mut transports = Vec::new();
+            let mut inboxes = Vec::new();
+            let mut engines = Vec::new();
+            for i in 0..N {
+                let addr =
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BASE_PORT + i as u16);
+                let bootstrappers = if i == 0 {
+                    Vec::new()
+                } else {
+                    vec![(keys[0].clone(), node0_addr)]
+                };
+                let cfg = Config {
+                    seed: i as u64,
+                    namespace: b"ducktape-consensus-proof".to_vec(),
+                    listen: addr,
+                    advertised: addr,
+                    peers: keys.clone(),
+                    bootstrappers,
+                };
+                let node_ctx = context.child("node").with_attribute("index", i);
+                let (transport, inbox, engine) = CommonwareTransport::new(node_ctx, cfg);
+                transports.push(transport);
+                inboxes.push(inbox);
+                engines.push(engine);
+            }
 
-            // the op-batch node 0 stages and we expect to see finalized. a
+            // the op-batch node 0 submits and we expect to see finalized. a
             // Vcs::Commit routes to the consensus lane (op::Op::lane()).
             let wire = vec![Op::Vcs(vcs::op::Op::Commit {
                 message: "consensus-over-sockets".into(),
@@ -1124,130 +1248,42 @@ mod tests {
             })];
             let proposed_bytes = encode_batch(&wire);
 
-            // node 0's inbound: its ConsensusReporter forwards finalized bytes here
-            // on Activity::Finalization. recv == finalization proof.
-            let (proposer_in_tx, mut proposer_in_rx) = mpsc::channel::<Inbound>(MAX_BACKLOG);
+            // drive the REAL public seam: stage the batch on node 0's consensus
+            // lane. one call enqueues the digest persistently; the engine BFT-orders
+            // it once node 0 leads with a formed quorum (peek keeps it queued across
+            // any nullified early views while the mesh is still forming).
+            transports[0]
+                .send(Lane::Consensus, proposed_bytes.clone())
+                .await
+                .expect("submit to node 0's consensus lane");
 
-            let elector = RoundRobin::<Sha256>::default();
-            let quota = Quota::per_second(NZU32!(128));
-            let mut engine_handlers = Vec::new();
-            for i in 0..N {
-                let node_ctx = context.child("node").with_attribute("index", i);
-                let is_proposer = i == 0;
-                let private = privs[i].clone();
-                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BASE_PORT + i as u16);
-                let bootstrappers: Vec<(ed25519::PublicKey, _)> = if is_proposer {
-                    Vec::new()
-                } else {
-                    vec![(keys[0].clone(), node0_addr.into())]
-                };
-
-                // a real authenticated::discovery network per node — SAME config
-                // production new() uses (`Config::local`), bootstrapping off node 0.
-                let p2p_cfg = discovery::Config::local(
-                    private.clone(),
-                    &namespace,
-                    addr,
-                    addr,
-                    bootstrappers,
-                    MAX_MESSAGE_SIZE,
-                );
-                let (mut network, mut oracle) = Network::new(node_ctx.child("network"), p2p_cfg);
-                oracle.track(PEER_SET, participants.clone());
-
-                // the engine's three sub-channels: vote(0)/certificate(1)/
-                // resolver(2), consumed positionally by engine.start.
-                let vote = network.register(0, quota, MAX_BACKLOG);
-                let certificate = network.register(1, quota, MAX_BACKLOG);
-                let resolver = network.register(2, quota, MAX_BACKLOG);
-
-                // our triple, sharing one ContentStore; the reporter also shares
-                // the automaton's pending FIFO (peek-until-finalized contract).
-                let store = ContentStore::new();
-                let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
-                if is_proposer {
-                    let digest = store.put(proposed_bytes.clone());
-                    automaton.enqueue(digest);
-                }
-                let relay = ConsensusRelay::<ed25519::PublicKey>::new(store.clone());
-                let inbound = if is_proposer {
-                    proposer_in_tx.clone()
-                } else {
-                    let (throwaway, _drop) = mpsc::channel::<Inbound>(MAX_BACKLOG);
-                    throwaway
-                };
-                let reporter = ConsensusReporter::<simplex_ed25519::Scheme>::new(
-                    store.clone(),
-                    automaton.pending(),
-                    inbound,
-                );
-
-                // scheme built the PRODUCTION way: signer finds THIS private key's
-                // index in the sorted participant set, so the node signs as exactly
-                // the participant its discovery identity represents.
-                let scheme = simplex_ed25519::Scheme::signer(
-                    &namespace,
-                    participants.clone(),
-                    private.clone(),
-                )
-                .expect("our key is in the participant set");
-
-                let cfg = SimplexConfig {
-                    scheme,
-                    elector: elector.clone(),
-                    // the discovery Oracle IS the Blocker (impl Blocker for Oracle).
-                    blocker: oracle.clone(),
-                    automaton,
-                    relay,
-                    reporter,
-                    strategy: Sequential,
-                    // distinct per node (pubkey hex is FS-safe) → isolated storage
-                    // partitions under the runtime's single temp root.
-                    partition: keys[i].to_string(),
-                    mailbox_size: NZUsize!(1024),
-                    epoch: Epoch::new(333),
-                    floor: Floor::Genesis(genesis),
-                    leader_timeout: Duration::from_secs(1),
-                    certification_timeout: Duration::from_secs(2),
-                    timeout_retry: Duration::from_secs(10),
-                    fetch_timeout: Duration::from_secs(1),
-                    activity_timeout,
-                    skip_timeout,
-                    fetch_concurrent: NZUsize!(4),
-                    replay_buffer: NZUsize!(1024 * 1024),
-                    write_buffer: NZUsize!(1024 * 1024),
-                    page_cache: CacheRef::from_pooler(&context, page_size, page_cache_size),
-                    forwarding: ForwardingPolicy::Disabled,
-                };
-
-                // start the network actors, then the engine on its three channels.
-                network.start();
-                let engine = Engine::new(node_ctx.child("engine"), cfg);
-                // KEEP the handle alive — dropping it aborts the engine task.
-                engine_handlers.push(engine.start(vote, certificate, resolver));
-            }
-
-            // recv resolving with the proposed bytes means node 0's reporter hit a
-            // real Activity::Finalization and resolved the digest in its store — a
-            // genuine BFT round trip over real sockets.
+            // node 0's reporter forwards finalized bytes to its inbound receiver on
+            // Activity::Finalization — recv == a real BFT round trip over sockets.
+            let mut node0_in = inboxes.remove(0);
             select! {
-                received = proposer_in_rx.recv() => {
-                    let (lane, recv) = received.expect("proposer inbound channel closed");
+                received = node0_in.recv() => {
+                    let (lane, recv) = received.expect("node 0 inbound channel closed");
                     assert_eq!(lane, Lane::Consensus);
                     let ops = decode_batch(&recv).expect("decode finalized batch");
                     assert_eq!(ops.len(), 1);
                     assert!(matches!(ops[0], Op::Vcs(vcs::op::Op::Commit { .. })));
-                    assert_eq!(recv, proposed_bytes, "finalized bytes byte-identical to staged");
+                    assert_eq!(
+                        recv, proposed_bytes,
+                        "finalized bytes byte-identical to what we submitted"
+                    );
                 },
                 _timeout = context.sleep(Duration::from_secs(60)) => {
                     panic!(
-                        "simplex did not finalize over real sockets within 60s — \
+                        "production new() did not finalize a consensus send within 60s — \
                          discovery never converged or the engine stalled"
                     );
                 },
             }
 
-            drop(engine_handlers);
+            // hold everything until the assert resolves.
+            drop(transports);
+            drop(inboxes);
+            drop(engines);
         });
     }
 
