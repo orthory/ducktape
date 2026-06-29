@@ -1,0 +1,9 @@
+# node 0 — the bootstrapper. binds :52200, drives ONE AddEntry into the mesh and
+# resends it on a 250ms loop until peers converge. id 0 ⇒ it bootstraps nobody
+# (everyone else dials it). the presence of `listen` is what flips `ducktape
+# node` from the loopback demo to a real commonware p2p node.
+id = 0
+listen = "127.0.0.1:52200"
+# namespace + peer_seeds MUST match every other node in the mesh.
+namespace = "ducktape-demo"
+peer_seeds = [0, 1]

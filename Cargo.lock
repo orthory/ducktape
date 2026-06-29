@@ -439,8 +439,15 @@ version = "0.1.0"
 dependencies = [
  "api",
  "clap",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "document",
  "engine",
+ "net",
+ "op",
  "tokio",
+ "transport",
+ "workspace",
 ]
 
 [[package]]
@@ -1293,8 +1300,15 @@ version = "0.1.0"
 dependencies = [
  "api",
  "clap",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "document",
  "engine",
+ "net",
+ "op",
  "tokio",
+ "transport",
+ "workspace",
 ]
 
 [[package]]

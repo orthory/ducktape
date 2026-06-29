@@ -8,3 +8,11 @@ clap = { version = "4.5.45", features = ["derive"] }
 tokio = { version = "1.47.1", features = ["full", "rt"] }
 api.workspace = true
 engine.workspace = true
+# the real commonware-node path (see bin/src/main.rs::run_commonware_node).
+net.workspace = true
+op.workspace = true
+transport.workspace = true
+workspace.workspace = true
+document.workspace = true
+commonware-runtime.workspace = true
+commonware-cryptography.workspace = true
