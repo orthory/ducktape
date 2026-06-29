@@ -86,6 +86,16 @@ const CHANNEL_VOTE: u64 = 1;
 const CHANNEL_CERTIFICATE: u64 = 2;
 const CHANNEL_RESOLVER: u64 = 3;
 
+/// the dedicated channel the live engine's
+/// [`ConsensusRelay`](consensus::ConsensusRelay) gossips proposed op-batch
+/// PAYLOADS on — the bytes behind a digest — so a non-proposer can resolve a
+/// finalized digest it only learned through consensus. distinct from the
+/// vote/cert/resolver protocol channels above: those carry BFT metadata, this
+/// carries the application bytes. peers drain it STORE-ONLY (see
+/// [`spawn_payload_drain`]) — never into the app inbound mpsc — so delivery stays
+/// exclusively in the reporter's `Activity::Finalization` arm, in BFT order.
+const CHANNEL_PAYLOAD: u64 = 4;
+
 /// the peer-set index. all peers must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
 const PEER_SET: u64 = 0;
@@ -121,6 +131,37 @@ where
                 // consumer dropped the inbound receiver; nothing left to do.
                 break;
             }
+        }
+    });
+}
+
+/// spawn a task that drains the payload-gossip channel ([`CHANNEL_PAYLOAD`]),
+/// caching each received op-batch's bytes into the shared
+/// [`ContentStore`](consensus::ContentStore) and doing NOTHING else.
+///
+/// this is how a non-proposer obtains the bytes behind a digest the leader's
+/// [`ConsensusRelay`](consensus::ConsensusRelay) broadcast, so that when that
+/// digest later finalizes the reporter's `store.get(&digest)` resolves and
+/// delivers it — in BFT-agreed order, via the SAME finalization path the
+/// proposer uses.
+///
+/// CRUCIAL — and the one real trap of this design: unlike [`spawn_inbound_drain`]
+/// this NEVER forwards into the inbound app mpsc. emitting the batch here would
+/// surface it to the application pre-finalization (out of BFT order, and then
+/// AGAIN on finalization). a payload receipt does exactly one thing — populate
+/// the store. `ContentStore::put` re-hashes the bytes as the key, so byzantine
+/// garbage simply stores under its own hash and can never match a finalized
+/// digest; content-addressing is the whole verification.
+fn spawn_payload_drain<E, R>(context: E, mut receiver: R, store: consensus::ContentStore)
+where
+    E: Spawner + Send + 'static,
+    R: commonware_p2p::Receiver + Send + 'static,
+{
+    context.spawn(move |_ctx| async move {
+        while let Ok((_peer, msg)) = receiver.recv().await {
+            let bytes: Vec<u8> = msg.into();
+            // store-only: NO inbound forward. delivery is the reporter's job.
+            store.put(bytes);
         }
     });
 }
@@ -284,9 +325,10 @@ where
     /// simplex BFT engine driving the consensus lane.
     ///
     /// builds the real `authenticated::discovery` network — broadcast gossip on
-    /// [`CHANNEL_BROADCAST`] plus the engine's three sub-channels
-    /// ([`CHANNEL_VOTE`]/[`CHANNEL_CERTIFICATE`]/[`CHANNEL_RESOLVER`]) — AND a real
-    /// [`Engine`](commonware_consensus::simplex::Engine) wired to our
+    /// [`CHANNEL_BROADCAST`], the engine's three sub-channels
+    /// ([`CHANNEL_VOTE`]/[`CHANNEL_CERTIFICATE`]/[`CHANNEL_RESOLVER`]), and the
+    /// payload channel ([`CHANNEL_PAYLOAD`]) the relay gossips op-batch bytes on —
+    /// AND a real [`Engine`](commonware_consensus::simplex::Engine) wired to our
     /// [`ConsensusAutomaton`](consensus::ConsensusAutomaton) /
     /// [`ConsensusRelay`](consensus::ConsensusRelay) /
     /// [`ConsensusReporter`](consensus::ConsensusReporter) triple over one shared
@@ -294,6 +336,13 @@ where
     /// stages a batch into that store and queues its digest; the engine BFT-orders
     /// it; on `Activity::Finalization` the reporter delivers the finalized bytes
     /// back out the returned inbound receiver, tagged [`Lane::Consensus`].
+    ///
+    /// cross-node delivery: when the leader proposes a batch its relay gossips the
+    /// bytes on [`CHANNEL_PAYLOAD`]; every peer's payload drain caches them
+    /// store-only ahead of finalization, so the reporter resolves the finalized
+    /// digest and delivers on EVERY node — not just the proposer. (a node that
+    /// finalizes a digest it never saw broadcast — late-join via certificate
+    /// backfill — still can't resolve it; that catch-up path is a resolver follow-on.)
     ///
     /// returns three things:
     /// - the transport (cheap-clone: holds the broadcast `Sender` plus the
@@ -355,7 +404,8 @@ where
             Set::try_from(cfg.peers).expect("authorized peer set has no duplicates");
         oracle.track(PEER_SET, participants.clone());
 
-        // register the broadcast gossip channel + the engine's three sub-channels.
+        // register the broadcast gossip channel, the engine's three sub-channels,
+        // and the payload channel the relay gossips finalizable op-batches on.
         // quota caps inbound receive rate; `Quota` is `Copy`, so one suffices.
         let quota = Quota::per_second(NZU32!(128));
         let (broadcast_sender, broadcast_receiver) =
@@ -363,6 +413,8 @@ where
         let vote = network.register(CHANNEL_VOTE, quota, MAX_BACKLOG);
         let certificate = network.register(CHANNEL_CERTIFICATE, quota, MAX_BACKLOG);
         let resolver = network.register(CHANNEL_RESOLVER, quota, MAX_BACKLOG);
+        let (payload_sender, payload_receiver) =
+            network.register(CHANNEL_PAYLOAD, quota, MAX_BACKLOG);
 
         // one shared inbound mpsc: the broadcast drain feeds it (Lane::Broadcast)
         // and the consensus reporter feeds it on finalization (Lane::Consensus), so
@@ -385,9 +437,24 @@ where
         // automaton's pending FIFO (peek-until-finalized: propose peeks the front,
         // the reporter removes on finalization).
         let store = ContentStore::new();
+        // a non-proposer learns a finalized digest through consensus but not its
+        // bytes. the payload drain caches every relay-broadcast payload into THIS
+        // store (store-only — see `spawn_payload_drain`, NOT the inbound drain),
+        // so on finalization the reporter's `store.get(&digest)` resolves and
+        // delivers on EVERY node, not just the one that proposed it.
+        spawn_payload_drain(
+            context.child("inbound_payload"),
+            payload_receiver,
+            store.clone(),
+        );
         let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
         let consensus_handle = automaton.handle(store.clone());
-        let relay = ConsensusRelay::<ed25519::PublicKey>::new(store.clone());
+        // the relay gossips a proposed batch's bytes out on CHANNEL_PAYLOAD so
+        // peers' drains can cache them ahead of finalization.
+        let relay = ConsensusRelay::<GossipSender<E>, ed25519::PublicKey>::new(
+            payload_sender,
+            store.clone(),
+        );
         let reporter =
             ConsensusReporter::<simplex_ed25519::Scheme>::new(store.clone(), automaton.pending(), in_tx);
 
