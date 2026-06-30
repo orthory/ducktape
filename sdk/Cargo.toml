@@ -1,0 +1,9 @@
+[package]
+name = "sdk"
+edition.workspace = true
+version.workspace = true
+
+# the interface crate. ZERO dependencies on purpose — this is the ONLY crate a
+# module is allowed to depend on, so anything that lands here becomes a shared
+# surface for every module. keep it types + traits.
+[dependencies]

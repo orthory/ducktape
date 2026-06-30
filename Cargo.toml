@@ -1,0 +1,32 @@
+# super-app workspace — a consensus-based platform whose features (documents,
+# forge, chat, tasks, …) are isolated MODULES. a module is a crate that depends
+# ONLY on `sdk` (interface/types); the host dispatches it over consensus and
+# composes its authenticated root into the global app-hash. cosmwasm's isolation
+# *pattern*, native rust (no wasm sandbox).
+#
+# virtual manifest on purpose: the root is NOT also a package (the old repo's
+# root-is-a-package shape forced double-declared bin deps — see git history).
+
+[workspace]
+resolver = "2"
+members = ["sdk", "state"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+# commonware — pinned to the SAME version line the p2p substrate runs on, so the
+# qmdb store, runtime, and crypto all come from one ecosystem (see auto-memory
+# reference_qmdb_commonware: qmdb lives in commonware-storage, version-aligned).
+commonware-storage = "2026.5.0"
+commonware-runtime = "2026.5.0"
+commonware-cryptography = "2026.5.0"
+
+# internal
+sdk = { path = "sdk" }
+state = { path = "state" }

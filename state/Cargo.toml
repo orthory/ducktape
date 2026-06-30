@@ -1,0 +1,8 @@
+[package]
+name = "state"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+sha2 = { workspace = true }
