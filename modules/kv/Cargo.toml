@@ -1,0 +1,15 @@
+[package]
+name = "kv"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+commonware-storage = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-parallel = "2026.5.0"
+commonware-codec = "2026.5.0"
+
+[dev-dependencies]
+state = { workspace = true }

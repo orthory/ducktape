@@ -9,7 +9,7 @@
 
 [workspace]
 resolver = "2"
-members = ["sdk", "state"]
+members = ["sdk", "state", "modules/kv"]
 
 [workspace.package]
 edition = "2024"
