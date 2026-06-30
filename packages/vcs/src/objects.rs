@@ -7,6 +7,7 @@
 //! pack, then moves its ref via [`update_ref`] — never by replaying a `git
 //! commit` (which would produce a different sha and never converge).
 
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
 use crate::git::{self, Error};
@@ -109,6 +110,83 @@ pub fn closure_complete(repo: &Path, tip: &ObjectId) -> Result<bool, Error> {
     }
 
     Ok(true)
+}
+
+/// the next layer of objects to fetch toward completing `tip`'s closure: oids
+/// referenced by an object present locally but not themselves present. each
+/// fetched object reveals the next frontier on the following call, so repeated
+/// `missing_frontier` + fetch converges a partial repo onto the whole closure.
+///
+/// `closure_complete` / `export_reachable` both shell to `rev-list`, which
+/// ABORTS when an intermediate object is absent — so neither can enumerate what
+/// is still missing on a partial repo. this walks only PRESENT objects (commit
+/// -> root tree + parent commits; tree -> entry oids; blob -> leaf) and collects
+/// the absent oids they reference, order-stable. if `tip` itself is absent the
+/// frontier is just `[tip]` — nothing deeper is knowable until it lands. (no
+/// submodules in ducktape worktrees, so a tree's gitlink entries aren't
+/// expected; were one present it would be reported as an absent child.)
+pub fn missing_frontier(repo: &Path, tip: &ObjectId) -> Result<Vec<ObjectId>, Error> {
+    if !git::run_ok(repo, &["cat-file", "-e", &tip.to_hex()])? {
+        return Ok(vec![*tip]);
+    }
+    let mut seen: HashSet<ObjectId> = HashSet::new(); // present objects already walked
+    let mut queue: VecDeque<ObjectId> = VecDeque::new();
+    let mut frontier: Vec<ObjectId> = Vec::new(); // absent referenced oids, order-stable
+    let mut in_frontier: HashSet<ObjectId> = HashSet::new();
+    seen.insert(*tip);
+    queue.push_back(*tip);
+    while let Some(oid) = queue.pop_front() {
+        for child in referenced_oids(repo, &oid)? {
+            if git::run_ok(repo, &["cat-file", "-e", &child.to_hex()])? {
+                if seen.insert(child) {
+                    queue.push_back(child);
+                }
+            } else if in_frontier.insert(child) {
+                frontier.push(child);
+            }
+        }
+    }
+    Ok(frontier)
+}
+
+/// the oids an object directly references: a commit names its root tree and its
+/// parents; a tree names its entries; a blob references nothing.
+fn referenced_oids(repo: &Path, oid: &ObjectId) -> Result<Vec<ObjectId>, Error> {
+    let hex = oid.to_hex();
+    let typ = String::from_utf8_lossy(&git::run(repo, &["cat-file", "-t", &hex], None)?.stdout)
+        .trim()
+        .to_string();
+    match typ.as_str() {
+        "commit" => {
+            let body = git::run(repo, &["cat-file", "-p", &hex], None)?.stdout;
+            let text = String::from_utf8_lossy(&body);
+            let mut out = Vec::new();
+            for line in text.lines() {
+                if line.is_empty() {
+                    break; // commit headers end at the blank line before the message
+                }
+                if let Some(rest) = line.strip_prefix("tree ") {
+                    out.push(git::parse_oid(rest.as_bytes())?);
+                } else if let Some(rest) = line.strip_prefix("parent ") {
+                    out.push(git::parse_oid(rest.as_bytes())?);
+                }
+            }
+            Ok(out)
+        }
+        "tree" => {
+            // `<mode> SP <type> SP <oid> TAB <name>` per entry; oid is the 3rd token.
+            let body = git::run(repo, &["ls-tree", &hex], None)?.stdout;
+            let text = String::from_utf8_lossy(&body);
+            let mut out = Vec::new();
+            for line in text.lines() {
+                if let Some(h) = line.split_whitespace().nth(2) {
+                    out.push(git::parse_oid(h.as_bytes())?);
+                }
+            }
+            Ok(out)
+        }
+        _ => Ok(Vec::new()), // blob / tag: leaf
+    }
 }
 
 /// resolve ref `name` to its current target, or `Ok(None)` if it doesn't exist.
@@ -351,6 +429,48 @@ mod tests {
         .to_string();
         let blob = ObjectId::from_hex(&blob_hex).unwrap();
         assert!(dst.has(&blob).unwrap(), "referenced blob landed on dst too");
+
+        cleanup(&src);
+        cleanup(&dst);
+    }
+
+    #[test]
+    fn missing_frontier_returns_the_tip_when_it_is_absent() {
+        // nothing about the tip is here — the deepest knowable layer is the tip
+        // itself; nothing it references can be named until it lands.
+        let odb = fresh_repo("frontier-absent");
+        let repo = odb.repo().to_path_buf();
+        let absent = ObjectId::from_hex(&"0".repeat(64)).unwrap();
+        assert_eq!(missing_frontier(&repo, &absent).unwrap(), vec![absent]);
+        cleanup(&odb);
+    }
+
+    #[test]
+    fn missing_frontier_is_empty_when_the_whole_closure_is_present() {
+        // the dual of closure_complete: a whole closure has no absent frontier.
+        let (odb, repo, commit, _tree, _blob) = build_closure("frontier-whole");
+        assert!(missing_frontier(&repo, &commit).unwrap().is_empty());
+        cleanup(&odb);
+    }
+
+    #[test]
+    fn missing_frontier_surfaces_one_layer_at_a_time() {
+        // SOURCE holds the whole closure; TARGET is seeded one object at a time,
+        // so each call must surface exactly the next layer — proving the walk
+        // descends only through PRESENT objects (a rev-list walk would abort on
+        // the absent tree; descending past an absent object would skip a layer).
+        let (src, _srepo, commit, tree, blob) = build_closure("frontier-src");
+        let dst = fresh_repo("frontier-dst");
+        let drepo = dst.repo().to_path_buf();
+
+        dst.put(src.get(&commit).unwrap().unwrap()).unwrap(); // commit only
+        assert_eq!(missing_frontier(&drepo, &commit).unwrap(), vec![tree]);
+
+        dst.put(src.get(&tree).unwrap().unwrap()).unwrap(); // + root tree
+        assert_eq!(missing_frontier(&drepo, &commit).unwrap(), vec![blob]);
+
+        dst.put(src.get(&blob).unwrap().unwrap()).unwrap(); // + blob -> whole
+        assert!(missing_frontier(&drepo, &commit).unwrap().is_empty());
 
         cleanup(&src);
         cleanup(&dst);
