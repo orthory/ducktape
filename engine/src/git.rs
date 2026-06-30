@@ -265,4 +265,46 @@ mod tests {
         std::fs::remove_dir_all(&source).ok();
         std::fs::remove_dir_all(&target).ok();
     }
+
+    #[test]
+    fn an_immediately_applied_move_drops_a_stale_parked_move_for_the_same_ref() {
+        // the load-bearing supersede path: a parked move is dropped by a LATER
+        // move that lands IMMEDIATELY (its closure already present). only the
+        // explicit `pending.remove(name)` on the apply path drops the stale entry
+        // here — the both-absent supersede above can't exercise it (the second
+        // park's `insert` overwrites anyway). so once the stale move's closure
+        // later lands, `poll` must NOT regress the ref back to the superseded
+        // target. delete that `remove` and this test fails by regressing to c1.
+        let (source, c1) = repo_with_commit("drop-source");
+        std::fs::write(source.join("doc.md"), b"newer payload\n").unwrap();
+        let c2 = snapshot_worktree(&source, "newer").expect("second snapshot");
+        assert_ne!(c1, c2, "the two snapshots are distinct commits");
+
+        let target = empty_repo("drop-target");
+        let mut vcs = GitVcs::new(&target);
+
+        // park c1 — its closure is absent in the target.
+        vcs.apply(&Op::RefUpdate { name: MAIN_REF.to_string(), target: c1, prev: None })
+            .expect("park c1");
+
+        // land c2's closure, then apply c2: it advances the ref immediately and,
+        // crucially, drops the still-parked c1 for this ref.
+        import(&target, &export_reachable(&source, &c2).expect("export c2")).expect("import c2");
+        vcs.apply(&Op::RefUpdate { name: MAIN_REF.to_string(), target: c2, prev: None })
+            .expect("apply c2 immediately");
+        assert_eq!(resolve_ref(&target, MAIN_REF).unwrap(), Some(c2), "c2 advances the ref now");
+
+        // c1's closure now lands too. if c1 were still parked, poll would move the
+        // ref BACKWARD to the superseded c1 — the convergence hazard the drop prevents.
+        import(&target, &export_reachable(&source, &c1).expect("export c1")).expect("import c1");
+        vcs.poll().expect("poll after the stale closure lands");
+        assert_eq!(
+            resolve_ref(&target, MAIN_REF).unwrap(),
+            Some(c2),
+            "poll must not regress the ref to the superseded target",
+        );
+
+        std::fs::remove_dir_all(&source).ok();
+        std::fs::remove_dir_all(&target).ok();
+    }
 }
