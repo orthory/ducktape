@@ -128,36 +128,40 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use vcs::objects::{resolve_ref, snapshot_worktree};
+    use vcs::objects::{export_reachable, import, resolve_ref, snapshot_worktree};
     use vcs::op::{Op, MAIN_REF};
     use vcs::{GitOdb, ObjectId};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    /// a unique temp dir under a process-wide counter — same collision-proofing
+    /// as [`repo_with_commit`], so parallel tests in one binary can't share a path.
+    fn temp_repo_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ducktape-git-apply-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    /// a fresh empty sha256 repo with no objects and no refs — the receiving end
+    /// of a transfer, before any closure has landed.
+    fn empty_repo(tag: &str) -> PathBuf {
+        GitOdb::init(&temp_repo_dir(tag))
+            .expect("init sha256 odb")
+            .repo()
+            .to_path_buf()
+    }
+
     /// a fresh sha256 repo holding one committed file, returned with the tip
     /// commit oid — its whole closure (commit, root tree, blob) is present and
     /// loose. the commit exists but no ref points at it yet.
     fn repo_with_commit(tag: &str) -> (PathBuf, ObjectId) {
-        // process-wide counter (not just pid+nanos) so parallel tests in one
-        // binary can't collide on a temp dir under coarse clock resolution.
-        let dir = std::env::temp_dir().join(format!(
-            "ducktape-git-apply-{tag}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed),
-        ));
-        let odb = GitOdb::init(&dir).expect("init sha256 odb");
+        let odb = GitOdb::init(&temp_repo_dir(tag)).expect("init sha256 odb");
         let repo = odb.repo().to_path_buf();
         std::fs::write(repo.join("doc.md"), b"payload\n").unwrap();
         let commit = snapshot_worktree(&repo, "snap").expect("snapshot");
         (repo, commit)
-    }
-
-    /// remove the loose object file for `oid` (`.git/objects/<2>/<62>`) so the
-    /// object is genuinely gone — freshly-written objects are loose (no pack).
-    fn delete_loose(repo: &Path, oid: &ObjectId) {
-        let hex = oid.to_hex();
-        let path = repo.join(".git/objects").join(&hex[..2]).join(&hex[2..]);
-        std::fs::remove_file(&path).unwrap_or_else(|e| panic!("remove loose {hex}: {e}"));
     }
 
     #[test]
@@ -171,27 +175,94 @@ mod tests {
     }
 
     #[test]
-    fn refuses_and_leaves_the_ref_unmoved_when_a_blob_is_missing() {
-        let (repo, commit) = repo_with_commit("missing-blob");
-        // delete the one blob the root tree names: the closure is now incomplete
-        // even though `cat-file -e <commit>` still succeeds. this proves apply
-        // gates on the DEEP closure check, not a shallow tip-present probe — and
-        // that a rejected move leaves the ref untouched (no half-applied state).
-        let blob_hex = String::from_utf8(
-            vcs::git::run(&repo, &["rev-parse", &format!("{}:doc.md", commit.to_hex())], None)
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-        let blob = ObjectId::from_hex(&blob_hex).unwrap();
-        delete_loose(&repo, &blob);
+    fn parks_a_ref_move_whose_closure_is_missing_then_advances_it_when_the_closure_lands() {
+        // SOURCE holds a full closure -> commit C. a SEPARATE empty target repo R
+        // has none of C's objects, mirroring a receiver before the transport has
+        // delivered them.
+        let (source, commit) = repo_with_commit("park-source");
+        let target = empty_repo("park-target");
 
-        let mut vcs = GitVcs::new(&repo);
+        // apply on the missing closure PARKS the move: it succeeds (no longer an
+        // Err) and leaves the ref unmoved — the move can't land into a hole.
+        let mut vcs = GitVcs::new(&target);
         let op = Op::RefUpdate { name: MAIN_REF.to_string(), target: commit, prev: None };
-        assert!(vcs.apply(&op).is_err(), "an incomplete closure must not move the ref");
-        assert_eq!(resolve_ref(&repo, MAIN_REF).unwrap(), None, "the ref must stay unset");
+        vcs.apply(&op).expect("apply parks the move when the closure is missing");
+        assert_eq!(
+            resolve_ref(&target, MAIN_REF).unwrap(),
+            None,
+            "the ref must stay unset while the closure is absent",
+        );
+
+        // land C's whole closure into R the way the real transport will: export
+        // the reachable pack from source, unpack it into the target.
+        let pack = export_reachable(&source, &commit).expect("export closure from source");
+        import(&target, &pack).expect("import closure into target");
+
+        // poll re-fires the parked move now that the objects are present.
+        vcs.poll().expect("poll advances the parked move once the closure lands");
+        assert_eq!(
+            resolve_ref(&target, MAIN_REF).unwrap(),
+            Some(commit),
+            "the ref advances to the finalized commit after its closure lands",
+        );
+
+        std::fs::remove_dir_all(&source).ok();
+        std::fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn poll_is_a_noop_with_nothing_parked() {
+        let repo = empty_repo("poll-noop");
+        let mut vcs = GitVcs::new(&repo);
+        vcs.poll().expect("poll on a fresh handler is Ok");
+        assert_eq!(
+            resolve_ref(&repo, MAIN_REF).unwrap(),
+            None,
+            "poll moves no ref when nothing is parked",
+        );
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_newer_parked_move_supersedes_an_older_one_for_the_same_ref() {
+        // SOURCE holds two distinct parentless commits, C1 then C2, each with its
+        // own full (independent) closure.
+        let (source, c1) = repo_with_commit("supersede-source");
+        std::fs::write(source.join("doc.md"), b"newer payload\n").unwrap();
+        let c2 = snapshot_worktree(&source, "newer").expect("second snapshot");
+        assert_ne!(c1, c2, "the two snapshots are distinct commits");
+
+        // SEPARATE empty target: neither closure is present yet.
+        let target = empty_repo("supersede-target");
+        let mut vcs = GitVcs::new(&target);
+
+        // park C1, then park C2 for the same ref — C2 supersedes C1.
+        vcs.apply(&Op::RefUpdate { name: MAIN_REF.to_string(), target: c1, prev: None })
+            .expect("park C1");
+        vcs.apply(&Op::RefUpdate { name: MAIN_REF.to_string(), target: c2, prev: None })
+            .expect("park C2 supersedes C1");
+
+        // land ONLY C1's closure. if C1 were still parked it would advance the
+        // ref here; because C2 superseded it and C2's closure is still absent,
+        // poll fires nothing and the ref stays unset.
+        import(&target, &export_reachable(&source, &c1).expect("export C1")).expect("import C1");
+        vcs.poll().expect("poll with only the superseded closure present");
+        assert_eq!(
+            resolve_ref(&target, MAIN_REF).unwrap(),
+            None,
+            "the superseded older move must not advance the ref",
+        );
+
+        // land C2's closure: now the surviving parked move fires.
+        import(&target, &export_reachable(&source, &c2).expect("export C2")).expect("import C2");
+        vcs.poll().expect("poll once C2's closure lands");
+        assert_eq!(
+            resolve_ref(&target, MAIN_REF).unwrap(),
+            Some(c2),
+            "the newer move is the one that advances the ref",
+        );
+
+        std::fs::remove_dir_all(&source).ok();
+        std::fs::remove_dir_all(&target).ok();
     }
 }
