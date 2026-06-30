@@ -17,6 +17,18 @@
 //! length-prefixed before hashing (otherwise ("ab", r) and ("a", "b"||r) would
 //! collide — a classic concatenation ambiguity).
 
+//!
+//! ## why a plain hash and not a qmdb-of-heads
+//!
+//! tempting to make the global head itself a qmdb (module ids -> roots) for
+//! "uniform machinery" — DON'T. qmdb's root is an op-log / HISTORY commitment
+//! (order-dependent, non-idempotent: re-writing an unchanged head still moves
+//! it). an app-hash must be `f(current state)` — order-independent + idempotent —
+//! so a node that state-synced from a snapshot computes the same root. this
+//! sorted hash already is that; qmdb stays the per-module primitive (`system/kv`),
+//! not the global composition. upgrade THIS to a small merkle tree only when a
+//! light client needs log-n membership proofs — not before.
+
 use sdk::{Module, ModuleId, StateRoot};
 use sha2::{Digest, Sha256};
 
