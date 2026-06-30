@@ -1,0 +1,20 @@
+[package]
+name = "host"
+edition.workspace = true
+version.workspace = true
+
+# the deterministic state-machine spine: a module registry, the dispatch +
+# local-only follow-up drain, and app-hash composition over the registered
+# modules. depends on sdk (the contract) + state (root composition); it knows
+# nothing of any concrete module beyond `dyn Module`.
+[dependencies]
+sdk = { workspace = true }
+state = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# the end-to-end test stands a real qmdb-backed module on the deterministic
+# runtime and drives it through the host.
+kv = { workspace = true }
+commonware-runtime = { workspace = true }
+serde_json = "1"

@@ -5,6 +5,8 @@ version.workspace = true
 
 [dependencies]
 sdk = { workspace = true }
+async-trait = "0.1"
+serde_json = "1"
 commonware-storage = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }

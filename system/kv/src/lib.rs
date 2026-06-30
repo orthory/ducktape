@@ -6,8 +6,12 @@
 //! commitment to every key currently in the store, refreshed on every write —
 //! so it flows directly into the global app-hash via `state::global_root`.
 //!
-//! the only sdk-facing surface is [`Module`]; no commonware type leaks through
-//! `root()`, `id()`, or any other `Module` method.
+//! the sdk-facing surface is [`Module`]: `id`/`root` for app-hash composition,
+//! plus `execute` for host dispatch. an inbound [`Msg`] payload is the json
+//! encoding of `(key, value)` byte vectors — a trivial deterministic wire so the
+//! host can drive a write without any commonware type leaking through the seam.
+//! `query` keeps the default (Unsupported): qmdb reads are async, the sync query
+//! projection lands in a later slice.
 
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
@@ -22,7 +26,7 @@ use commonware_storage::{
     Context,
 };
 
-use sdk::{Module, ModuleId, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 
 /// the concrete qmdb store: arbitrary byte keys and values, sha256 hasher,
 /// two-byte translator, sequential (deterministic) merkle strategy.
@@ -110,6 +114,7 @@ where
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl<E> Module for Kv<E>
 where
     E: Context + BufferPooler,
@@ -124,6 +129,16 @@ where
     fn root(&self) -> StateRoot {
         StateRoot(self.db.root().0)
     }
+
+    /// interpret the payload as a json-encoded `(key, value)` write and apply it
+    /// to own state. the only `.await` is on own qmdb state — deterministic, so
+    /// this is replay-safe across validators.
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        let (key, value): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&msg.payload).map_err(|e| Error::Module(e.to_string()))?;
+        self.set(key, value).await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -135,12 +150,16 @@ mod tests {
     // a fixed-root stand-in module, so we can prove the kv root composes into the
     // global app-hash alongside another module.
     struct StubModule;
+    #[async_trait::async_trait(?Send)]
     impl Module for StubModule {
         fn id(&self) -> ModuleId {
             "stub".to_string()
         }
         fn root(&self) -> StateRoot {
             StateRoot([7u8; sdk::ROOT_LEN])
+        }
+        async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+            Ok(())
         }
     }
 

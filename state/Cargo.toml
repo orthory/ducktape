@@ -6,3 +6,7 @@ version.workspace = true
 [dependencies]
 sdk = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+# the test StubModule must satisfy the widened Module (async execute).
+async-trait = "0.1"

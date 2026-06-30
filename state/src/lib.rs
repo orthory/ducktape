@@ -59,12 +59,20 @@ mod tests {
         id: &'static str,
         root: StateRoot,
     }
+    #[async_trait::async_trait(?Send)]
     impl Module for StubModule {
         fn id(&self) -> ModuleId {
             self.id.to_string()
         }
         fn root(&self) -> StateRoot {
             self.root
+        }
+        async fn execute(
+            &mut self,
+            _ctx: &mut dyn sdk::Ctx,
+            _msg: &sdk::Msg,
+        ) -> Result<(), sdk::Error> {
+            Ok(())
         }
     }
 

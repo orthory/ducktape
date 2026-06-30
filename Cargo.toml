@@ -9,7 +9,7 @@
 
 [workspace]
 resolver = "2"
-members = ["sdk", "state", "system/kv"]
+members = ["sdk", "state", "system/kv", "host"]
 
 [workspace.package]
 edition = "2024"
@@ -19,6 +19,7 @@ version = "0.1.0"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+async-trait = "0.1"
 
 # commonware — pinned to the SAME version line the p2p substrate runs on, so the
 # qmdb store, runtime, and crypto all come from one ecosystem (see auto-memory
@@ -30,3 +31,4 @@ commonware-cryptography = "2026.5.0"
 # internal
 sdk = { path = "sdk" }
 state = { path = "state" }
+kv = { path = "system/kv" }
