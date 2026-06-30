@@ -46,6 +46,13 @@ pub enum EngineError {
 /// in A4); [`NoopVcs`] is the default no-side-effect handler.
 pub trait VcsApply: Send {
     fn apply(&mut self, op: &vcs::op::Op) -> Result<(), EngineError>;
+
+    /// re-fire any ref moves parked because their object closure wasn't present
+    /// locally when first applied. the default is a no-op — a handler that never
+    /// parks (e.g. [`NoopVcs`]) inherits it.
+    fn poll(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 /// seam for the agentic control/supervisor layer — implemented for real in p2.1.
@@ -129,6 +136,14 @@ impl Engine {
 
             op::Op::Control(c) => self.control.apply(&c),
         }
+    }
+
+    /// drive the vcs handler's retry of parked ref moves. a ref move whose
+    /// object closure wasn't present when first applied is parked, not failed;
+    /// this re-fires it once the objects land locally. a future node-tick calls
+    /// this so parked moves eventually advance.
+    pub fn poll_vcs(&mut self) -> Result<(), EngineError> {
+        self.vcs.poll()
     }
 
     /// read-only view of the engine's workspace state.
