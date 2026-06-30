@@ -16,10 +16,12 @@
 //! ([`vcs::objects::closure_complete`]): the ref advances only once the commit,
 //! every tree under it, and every blob it names are stored here, so a move can
 //! never land a ref pointing into a hole. a target whose closure is incomplete
-//! surfaces an [`EngineError::Vcs`] rather than moving the ref — fetching a
-//! missing closure by address, and parking the move until it lands, are separate
-//! seams. `Announce` (an availability hint) isn't wired into a live node yet.
+//! is PARKED rather than failed — recorded as a pending move and re-fired by
+//! [`VcsApply::poll`] once the objects land locally — so `apply` succeeds and
+//! the ref simply waits. fetching a missing closure by address is a separate
+//! seam. `Announce` (an availability hint) isn't wired into a live node yet.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::{EngineError, VcsApply};
@@ -27,8 +29,21 @@ use crate::{EngineError, VcsApply};
 /// a [`VcsApply`] handler that applies vcs wire ops against a single working
 /// repo. holds the repo path; moves a ref with `git update-ref` once the
 /// target's object closure is present locally.
+///
+/// a move whose closure isn't present yet is parked in `pending` (ref name ->
+/// the move's `(target, prev)`) instead of failing, and re-fired by [`poll`]
+/// once the objects land. only one move per ref is kept — a newer move for a
+/// ref supersedes any older parked one (last-write-wins; no compare-and-set).
+///
+/// [`poll`]: VcsApply::poll
 pub struct GitVcs {
     repo: PathBuf,
+    /// ref moves parked because their object closure wasn't present locally
+    /// when applied: ref name -> `(target, prev)`. drained by [`poll`] as the
+    /// objects land.
+    ///
+    /// [`poll`]: VcsApply::poll
+    pending: HashMap<vcs::op::RefName, (vcs::ObjectId, Option<vcs::ObjectId>)>,
 }
 
 impl GitVcs {
@@ -36,7 +51,10 @@ impl GitVcs {
     /// a worker `init`s it locally via [`vcs::cmd::Command::Init`]; the engine
     /// only ever applies ref-moves here.
     pub fn new(repo: impl Into<PathBuf>) -> Self {
-        Self { repo: repo.into() }
+        Self {
+            repo: repo.into(),
+            pending: HashMap::new(),
+        }
     }
 
     /// the working repo this handler operates on (the `git update-ref` target).
@@ -49,29 +67,59 @@ impl VcsApply for GitVcs {
     /// apply a vcs wire op against the bound repo.
     ///
     /// `RefUpdate` advances `name` to `target` with `git update-ref`, but only
-    /// once `target`'s whole object closure is present locally — an incomplete
-    /// closure surfaces an [`EngineError::Vcs`] instead of moving the ref into a
-    /// hole. `Announce` isn't wired into a live node yet and surfaces an error.
+    /// once `target`'s whole object closure is present locally. an incomplete
+    /// closure PARKS the move — it's recorded in `pending` and `apply` returns
+    /// `Ok` — rather than moving the ref into a hole or failing; [`VcsApply::poll`]
+    /// re-fires it once the objects land. a newer move for a ref supersedes any
+    /// older parked one (last-write-wins; no compare-and-set). `Announce` isn't
+    /// wired into a live node yet and surfaces an error.
     fn apply(&mut self, op: &vcs::op::Op) -> Result<(), EngineError> {
         match op {
-            vcs::op::Op::RefUpdate { name, target, .. } => {
+            vcs::op::Op::RefUpdate { name, target, prev } => {
+                // a newer move for this ref supersedes an older parked one —
+                // last-write-wins, matching the no-compare-and-set decision.
+                self.pending.remove(name);
                 if vcs::objects::closure_complete(&self.repo, target)
                     .map_err(|e| EngineError::Vcs(e.to_string()))?
                 {
                     vcs::objects::update_ref(&self.repo, name, target)
                         .map_err(|e| EngineError::Vcs(e.to_string()))?;
-                    Ok(())
                 } else {
-                    Err(EngineError::Vcs(format!(
-                        "RefUpdate({name}): object closure for {} not present locally",
-                        target.to_hex()
-                    )))
+                    // closure isn't here yet — park the move; poll re-fires it
+                    // once the objects land locally.
+                    self.pending.insert(name.clone(), (*target, *prev));
                 }
+                Ok(())
             }
             vcs::op::Op::Announce { .. } => Err(EngineError::Vcs(
                 "Announce handling (object fetch by address) is not yet wired".into(),
             )),
         }
+    }
+
+    /// re-fire parked ref moves whose object closure is now present locally.
+    ///
+    /// each pending `(name, (target, _))` whose closure is complete advances its
+    /// ref with `git update-ref` and is dropped from `pending`; still-incomplete
+    /// ones stay parked for a later poll. a genuine `closure_complete` /
+    /// `update_ref` io fault propagates as an [`EngineError::Vcs`].
+    fn poll(&mut self) -> Result<(), EngineError> {
+        // collect the refs that landed, then drop them — don't mutate `pending`
+        // while iterating it.
+        let mut landed = Vec::new();
+        for (name, (target, _prev)) in &self.pending {
+            if vcs::objects::closure_complete(&self.repo, target)
+                .map_err(|e| EngineError::Vcs(e.to_string()))?
+            {
+                vcs::objects::update_ref(&self.repo, name, target)
+                    .map_err(|e| EngineError::Vcs(e.to_string()))?;
+                landed.push(name.clone());
+            }
+        }
+        for name in landed {
+            self.pending.remove(&name);
+        }
+        Ok(())
     }
 }
 
