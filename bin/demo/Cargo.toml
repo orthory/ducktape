@@ -20,3 +20,12 @@ sdk = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
+
+[dev-dependencies]
+saga = { workspace = true }
+saga-interface = { workspace = true }
+state = { workspace = true }
+async-trait = { workspace = true }
+# dev-only: the joiner test reads a rebuilt repo's blobs back out through git2
+# directly — proof the pack landed real objects. same vendored build forge uses.
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
