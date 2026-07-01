@@ -33,6 +33,10 @@ futures = "0.3"
 # qmdb-backed kv module (order-DEPENDENT root), on the deterministic runtime.
 kv = { workspace = true }
 kv-interface = { workspace = true }
+# the oracle-over-consensus test: a saga tracker module + a mock worker prove an
+# async saga settles to Done when the OracleResult op finalizes on every node.
+saga = { workspace = true }
+saga-interface = { workspace = true }
 # a probe module (impl sdk::Module) in the env-from-view test needs async-trait.
 async-trait = { workspace = true }
 state = { workspace = true }

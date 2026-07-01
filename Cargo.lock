@@ -2042,6 +2042,8 @@ dependencies = [
  "host",
  "kv",
  "kv-interface",
+ "saga",
+ "saga-interface",
  "sdk",
  "serde",
  "serde_json",
@@ -2633,6 +2635,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "reactor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "host",
+ "saga",
+ "saga-interface",
+ "sdk",
+]
+
+[[package]]
 name = "readme-rustdocifier"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2752,6 +2766,25 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "saga"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "saga-interface",
+ "sdk",
+ "sha2",
+]
+
+[[package]]
+name = "saga-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "same-file"

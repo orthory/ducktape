@@ -39,7 +39,7 @@ use std::sync::mpsc;
 use serde::{Deserialize, Serialize};
 
 use host::{BlockContext, BlockOutcome, Host};
-use sdk::{Msg, StateRoot};
+use sdk::{Effect, Msg, StateRoot};
 
 /// the bytes delivered on the inbound channel: a serialized msg-batch.
 pub type Inbound = Vec<u8>;
@@ -450,11 +450,16 @@ impl Orderer for ArrivalOrderer {
 pub struct OrderedNode<O: Orderer> {
     host: Host,
     orderer: O,
+    /// effects surfaced by every block APPLIED via `drain_delivered` and not yet
+    /// taken. the host itself ignores its effect sink; on the ordered lane this is
+    /// where the reactor's worker driver reads finalized `WorkerRequest`s from
+    /// (via `take_effects`). accumulates in agreed-delivery order.
+    effects: Vec<Effect>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
     pub fn new(host: Host, orderer: O) -> Self {
-        Self { host, orderer }
+        Self { host, orderer, effects: Vec::new() }
     }
 
     /// SUBMIT — propose a locally-originated msg into the agreed order. framed
@@ -486,7 +491,12 @@ impl<O: Orderer> OrderedNode<O> {
             // (a logical, agreed, monotonic clock — identical on every validator).
             // the frame carries the op's real submitter as the root origin.
             let ctx = BlockContext { height: view, consensus_time: view, origin };
-            let _ = self.host.submit_at(ctx, msg).await;
+            // surface each finalized block's effects for the reactor's worker
+            // driver. a rejected op yields no outcome (deterministic no-op) and so
+            // contributes no effects — same on every validator.
+            if let Ok(outcome) = self.host.submit_at(ctx, msg).await {
+                self.effects.extend(outcome.effects);
+            }
         }
         Ok(applied)
     }
@@ -494,6 +504,14 @@ impl<O: Orderer> OrderedNode<O> {
     /// the current app-hash of the wrapped host.
     pub fn app_hash(&self) -> StateRoot {
         self.host.app_hash()
+    }
+
+    /// take the effects accumulated by applied blocks since the last call. the
+    /// host-owned reactor drains these, runs the assigned worker on each
+    /// `WorkerRequest`, and submits the resulting `OracleResult` op back through
+    /// the ordered lane (the oracle-as-op over consensus).
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
     }
 
     /// borrow the wrapped host (queries, module_root inspection, ...).

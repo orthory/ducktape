@@ -1,0 +1,14 @@
+[package]
+name = "reactor"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+host = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+saga = { workspace = true }
+saga-interface = { workspace = true }

@@ -15,10 +15,11 @@ resolver = "2"
 members = [
     # kernel — the platform (contract + dispatch + transport + BFT ordering)
     "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
-    "crates/kernel/node", "crates/kernel/consensus",
+    "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
     # system — consensus infrastructure modules
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
+    "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
     # examples — demo / test scaffolding modules
@@ -58,14 +59,17 @@ state = { path = "crates/kernel/state" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
+reactor = { path = "crates/kernel/reactor" }
 # internal — module impl crates
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
+saga = { path = "crates/system/saga" }
 forge = { path = "crates/apps/forge" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "crates/system/kv-interface" }
 valset-interface = { path = "crates/system/valset-interface" }
+saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 directory-interface = { path = "crates/examples/directory-interface" }
