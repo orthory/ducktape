@@ -1791,6 +1791,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "node"
+version = "0.1.0"
+dependencies = [
+ "directory",
+ "directory-interface",
+ "futures",
+ "host",
+ "sdk",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "nonzero_ext"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

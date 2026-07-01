@@ -1,0 +1,26 @@
+[package]
+name = "node"
+edition.workspace = true
+version.workspace = true
+
+# the replication layer: wraps a `host::Host` with a byte-oriented transport
+# seam so a locally-originated msg is applied locally AND propagated to peers,
+# while a msg arriving from a peer is applied locally but NEVER re-propagated
+# (the wire-level local-only rule that stops a 2-node loop from ping-ponging).
+# depends on sdk (Msg) + host (the state machine); the wire codec lives here so
+# sdk stays dep-clean. the real commonware p2p transport is a later slice; this
+# crate ships the in-process LoopbackHub that the same convergence test targets.
+[dependencies]
+sdk = { workspace = true }
+host = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# the convergence test stands two nodes on one LoopbackHub over a pair of
+# in-memory directory modules (state-based root -> converges without a total
+# order) and drives them on a plain futures executor -- no runtime/commonware.
+directory = { workspace = true }
+directory-interface = { workspace = true }
+futures = "0.3"

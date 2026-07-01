@@ -12,6 +12,7 @@ members = [
     "system/kv", "system/kv-interface",
     "modules/directory", "modules/directory-interface", "modules/greeter",
     "modules/forge", "modules/forge-interface",
+    "node",
     "demo",
 ]
 
@@ -39,6 +40,7 @@ kv = { path = "system/kv" }
 directory = { path = "modules/directory" }
 greeter = { path = "modules/greeter" }
 forge = { path = "modules/forge" }
+node = { path = "node" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "system/kv-interface" }
 directory-interface = { path = "modules/directory-interface" }
