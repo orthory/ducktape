@@ -10,5 +10,7 @@ kv-interface = { workspace = true }
 directory = { workspace = true }
 greeter = { workspace = true }
 directory-interface = { workspace = true }
+forge = { workspace = true }
+forge-interface = { workspace = true }
 sdk = { workspace = true }
 commonware-runtime = { workspace = true }
