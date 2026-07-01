@@ -37,6 +37,27 @@ use sdk::{Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRo
 /// loop is guaranteed to terminate regardless of module behavior.
 pub const MAX_DISPATCHES: u32 = 1024;
 
+/// the block-constant consensus context for one [`Host::submit_at`]: the agreed
+/// `height` / `consensus_time` (identical on every validator — sourced from the
+/// finalized view) and the ROOT op's `origin`. these are constant across every
+/// dispatch in the block; per-follow-up origin is set by the drain.
+pub struct BlockContext {
+    /// the finalized block height (the agreed simplex view).
+    pub height: u64,
+    /// the agreed logical clock (the finalized view) — NOT wall clock.
+    pub consensus_time: u64,
+    /// the root op's real submitter. follow-ups override with `Origin::Module`.
+    pub origin: Origin,
+}
+
+impl Default for BlockContext {
+    /// the pre-consensus default: height/time 0 and an empty external origin, so
+    /// [`Host::submit`] is byte-for-byte the old hardcoded behavior.
+    fn default() -> Self {
+        Self { height: 0, consensus_time: 0, origin: Origin::External(Vec::new()) }
+    }
+}
+
 /// the result of applying one block (`submit`).
 #[derive(Debug)]
 pub struct BlockOutcome {
@@ -116,11 +137,23 @@ impl Host {
     /// value. the app-hash is recomposed AFTER the commit, so it reflects exactly
     /// the committed state.
     pub async fn submit(&mut self, msg: Msg) -> Result<BlockOutcome, Error> {
+        self.submit_at(BlockContext::default(), msg).await
+    }
+
+    /// apply one inbound message as a block with an EXPLICIT [`BlockContext`] —
+    /// the agreed `height` / `consensus_time` and the root op's `origin`, sourced
+    /// from the finalized view by the ordered lane. otherwise identical to
+    /// [`Host::submit`] (which is just `submit_at(BlockContext::default(), msg)`).
+    pub async fn submit_at(
+        &mut self,
+        ctx: BlockContext,
+        msg: Msg,
+    ) -> Result<BlockOutcome, Error> {
         // every module dispatched this block, in deterministic order — the set
         // the host commits or aborts at the boundary.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
 
-        match self.drain(msg, &mut touched).await {
+        match self.drain(ctx, msg, &mut touched).await {
             Ok((events, effects)) => {
                 // clean drain: publish every touched module's staged writes. this
                 // is the ONLY place a module's state advances, so recompose the
@@ -153,14 +186,16 @@ impl Host {
     /// can reach exactly the modules that may hold staged writes.
     async fn drain(
         &mut self,
+        ctx: BlockContext,
         msg: Msg,
         touched: &mut BTreeSet<ModuleId>,
     ) -> Result<(Vec<Event>, Vec<Effect>), Error> {
-        let height = 0;
-        let consensus_time = 0;
+        // block-constant across every dispatch this block — the agreed values.
+        let height = ctx.height;
+        let consensus_time = ctx.consensus_time;
 
-        let mut queue: VecDeque<(Origin, Msg)> =
-            VecDeque::from([(Origin::External(Vec::new()), msg)]);
+        // the root op carries the real submitter's origin; follow-ups override.
+        let mut queue: VecDeque<(Origin, Msg)> = VecDeque::from([(ctx.origin, msg)]);
         let mut events: Vec<Event> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
         let mut n: u32 = 0;

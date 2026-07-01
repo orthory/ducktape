@@ -379,10 +379,11 @@ impl FinalizedInbox {
         }
     }
 
-    /// take every ready frame in ascending-view order. non-blocking.
-    fn drain(&self) -> Vec<Vec<u8>> {
+    /// take every ready frame paired with its finalized VIEW, in ascending-view
+    /// order (the BTreeMap key IS the agreed view). non-blocking.
+    fn drain(&self) -> Vec<(u64, Vec<u8>)> {
         let mut inner = self.inner.lock().expect("finalized inbox poisoned");
-        std::mem::take(&mut inner.ready).into_values().collect()
+        std::mem::take(&mut inner.ready).into_iter().collect()
     }
 }
 
@@ -481,8 +482,9 @@ impl node::Orderer for SimplexOrderer {
         }
     }
 
-    fn poll_delivered(&mut self) -> Vec<Vec<u8>> {
-        // drain the finalization buffer in ascending-view order (BTreeMap).
+    fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
+        // drain the finalization buffer in ascending-view order (BTreeMap). the
+        // view is the agreed block height the host stamps into `Env`.
         self.inbox.drain()
     }
 }
@@ -728,7 +730,7 @@ mod tests {
         // insert the HIGHER view first — the drain must still yield lo before hi.
         inbox.deliver(2, d_hi, &store);
         inbox.deliver(1, d_lo, &store);
-        assert_eq!(inbox.drain(), vec![b"view 1".to_vec(), b"view 2".to_vec()]);
+        assert_eq!(inbox.drain(), vec![(1, b"view 1".to_vec()), (2, b"view 2".to_vec())]);
         // a second drain is empty (take semantics).
         assert!(inbox.drain().is_empty());
     }
@@ -741,7 +743,7 @@ mod tests {
         let inbox = FinalizedInbox::new();
         inbox.deliver(1, d, &store);
         inbox.deliver(1, d, &store); // same digest again -> ignored by `seen`.
-        assert_eq!(inbox.drain(), vec![b"once".to_vec()]);
+        assert_eq!(inbox.drain(), vec![(1, b"once".to_vec())]);
     }
 
     #[test]

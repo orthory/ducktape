@@ -33,5 +33,7 @@ futures = "0.3"
 # qmdb-backed kv module (order-DEPENDENT root), on the deterministic runtime.
 kv = { workspace = true }
 kv-interface = { workspace = true }
+# a probe module (impl sdk::Module) in the env-from-view test needs async-trait.
+async-trait = { workspace = true }
 state = { workspace = true }
 commonware-runtime = { workspace = true }

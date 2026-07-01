@@ -38,7 +38,7 @@ use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 
-use host::{BlockOutcome, Host};
+use host::{BlockContext, BlockOutcome, Host};
 use sdk::{Msg, StateRoot};
 
 /// the bytes delivered on the inbound channel: a serialized msg-batch.
@@ -329,7 +329,8 @@ pub fn encode_frame(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
 }
 
 /// decode a delivered frame back to a `(Origin, Msg)` the host can submit. the
-/// `seq` is ordering/replay metadata and is not (yet) surfaced to the host.
+/// `origin` becomes the block's root `Origin::External(..)`; the `seq` is
+/// ordering/replay metadata and is not surfaced to the host.
 pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
     let frame: Frame = serde_json::from_slice(bytes)?;
     let origin = Origin::External(frame.origin);
@@ -346,8 +347,9 @@ pub trait Orderer {
     /// propose an opaque frame into the agreed order. no local apply.
     fn submit(&mut self, frame: Vec<u8>) -> impl std::future::Future<Output = Result<(), Error>>;
     /// the newly-ordered frames since the last call, in agreed order (may be
-    /// empty). non-blocking.
-    fn poll_delivered(&mut self) -> Vec<Vec<u8>>;
+    /// empty), each paired with its agreed VIEW/height — the block coordinate the
+    /// host stamps into `Env` (identical on every validator). non-blocking.
+    fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)>;
 }
 
 /// the deterministic agreed-order impl: accumulate a round's proposed frames,
@@ -360,6 +362,10 @@ pub trait Orderer {
 #[derive(Default)]
 pub struct RoundOrderer {
     pending: Vec<Vec<u8>>,
+    /// the next agreed view to stamp. monotonic across rounds, assigned per frame
+    /// in delivered order — deterministic because the delivery order is (the same
+    /// node-independent sort on every validator).
+    next_view: u64,
 }
 
 impl RoundOrderer {
@@ -376,12 +382,20 @@ impl Orderer for RoundOrderer {
         }
     }
 
-    fn poll_delivered(&mut self) -> Vec<Vec<u8>> {
+    fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
         let mut out = std::mem::take(&mut self.pending);
         // the agreed order: a deterministic, node-independent total order over
         // the round's distinct frames. NOT arrival order.
         out.sort();
-        out
+        // stamp each frame with a monotonic agreed view. the sort makes
+        // frame->view identical across validators, so height/consensus_time agree.
+        out.into_iter()
+            .map(|f| {
+                let view = self.next_view;
+                self.next_view += 1;
+                (view, f)
+            })
+            .collect()
     }
 }
 
@@ -394,6 +408,9 @@ impl Orderer for RoundOrderer {
 #[derive(Default)]
 pub struct ArrivalOrderer {
     pending: Vec<Vec<u8>>,
+    /// per-frame ascending view, arrival-ordered — deliberately NOT node-agreed
+    /// (this is the negative control; opposite arrival -> opposite view stamps).
+    next_view: u64,
 }
 
 impl ArrivalOrderer {
@@ -410,10 +427,17 @@ impl Orderer for ArrivalOrderer {
         }
     }
 
-    fn poll_delivered(&mut self) -> Vec<Vec<u8>> {
+    fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
         // NO sort: raw arrival order is exactly the no-agreed-order fork the
         // total order prevents.
         std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|f| {
+                let view = self.next_view;
+                self.next_view += 1;
+                (view, f)
+            })
+            .collect()
     }
 }
 
@@ -448,11 +472,13 @@ impl<O: Orderer> OrderedNode<O> {
     pub async fn drain_delivered(&mut self) -> Result<usize, Error> {
         let delivered = self.orderer.poll_delivered();
         let mut applied = 0usize;
-        for frame in delivered {
-            let (_origin, msg) = decode_frame(&frame)?;
-            // origin plumbing into Env is a later slice (host still hardcodes
-            // height/time/origin); the ORDER is the sole variable under test.
-            self.host.submit(msg).await?;
+        for (view, frame) in delivered {
+            let (origin, msg) = decode_frame(&frame)?;
+            // the agreed view is the block coordinate: height + consensus_time
+            // (a logical, agreed, monotonic clock — identical on every validator).
+            // the frame carries the op's real submitter as the root origin.
+            let ctx = BlockContext { height: view, consensus_time: view, origin };
+            self.host.submit_at(ctx, msg).await?;
             applied += 1;
         }
         Ok(applied)
