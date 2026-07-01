@@ -13,6 +13,7 @@ commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-parallel = "2026.5.0"
 commonware-codec = "2026.5.0"
+commonware-utils = { workspace = true }
 
 [dev-dependencies]
 state = { workspace = true }
