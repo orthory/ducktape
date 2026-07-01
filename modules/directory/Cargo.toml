@@ -1,0 +1,10 @@
+[package]
+name = "directory"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+directory-interface = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }

@@ -35,8 +35,11 @@ impl Module for Relay {
     async fn execute(&mut self, ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
         // NOT a reentrant call into kv — an intent the host re-dispatches as a
         // follow-up op after this execute returns.
-        let payload = serde_json::to_vec(&(WRITE_KEY.to_vec(), WRITE_VAL.to_vec()))
-            .map_err(|e| Error::Module(e.to_string()))?;
+        // typed follow-up write via kv's interface crate (not an ad-hoc encoding).
+        let payload = kv_interface::encode(&kv_interface::KvMsg::Set {
+            key: WRITE_KEY.to_vec(),
+            value: WRITE_VAL.to_vec(),
+        });
         ctx.emit_msg(Msg { target: KV_ID.to_string(), payload });
         Ok(())
     }

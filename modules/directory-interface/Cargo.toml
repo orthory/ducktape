@@ -1,0 +1,9 @@
+[package]
+name = "directory-interface"
+edition.workspace = true
+version.workspace = true
+
+# types-only: the wire surface of the directory module.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -65,6 +65,29 @@ impl Host {
         self.registry.insert(module.id(), module);
     }
 
+    /// build a host from a declared module set (registry-as-genesis-state). errors
+    /// on a duplicate module id, since dispatch addresses modules by id.
+    pub fn genesis(modules: Vec<Box<dyn Module>>) -> Result<Self, Error> {
+        let mut host = Self::new();
+        for m in modules {
+            let id = m.id();
+            if host.registry.contains_key(&id) {
+                return Err(Error::Module(format!("duplicate module id: {id}")));
+            }
+            host.registry.insert(id, m);
+        }
+        Ok(host)
+    }
+
+    /// external read-only query of a registered module (sync, like [`Ctx::query`]
+    /// but from outside a dispatch). routes to [`Module::query`].
+    pub fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match self.registry.get(target) {
+            Some(m) => m.query(req),
+            None => Err(Error::UnknownModule(target.to_string())),
+        }
+    }
+
     /// the current app-hash: [`state::global_root`] over the registered modules.
     pub fn app_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();

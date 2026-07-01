@@ -16,5 +16,9 @@ async-trait = { workspace = true }
 # the end-to-end test stands a real qmdb-backed module on the deterministic
 # runtime and drives it through the host.
 kv = { workspace = true }
+directory = { workspace = true }
+greeter = { workspace = true }
+directory-interface = { workspace = true }
+kv-interface = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"

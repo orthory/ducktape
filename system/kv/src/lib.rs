@@ -134,9 +134,9 @@ where
     /// to own state. the only `.await` is on own qmdb state — deterministic, so
     /// this is replay-safe across validators.
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let (key, value): (Vec<u8>, Vec<u8>) =
-            serde_json::from_slice(&msg.payload).map_err(|e| Error::Module(e.to_string()))?;
-        self.set(key, value).await;
+        match kv_interface::decode(&msg.payload).map_err(Error::Module)? {
+            kv_interface::KvMsg::Set { key, value } => self.set(key, value).await,
+        }
         Ok(())
     }
 }

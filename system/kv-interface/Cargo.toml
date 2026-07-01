@@ -1,0 +1,9 @@
+[package]
+name = "kv-interface"
+edition.workspace = true
+version.workspace = true
+
+# types-only: the wire surface of the kv module. NO logic, NO sdk dep.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
