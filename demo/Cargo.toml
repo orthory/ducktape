@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 host = { workspace = true }
 kv = { workspace = true }
+kv-interface = { workspace = true }
 directory = { workspace = true }
 greeter = { workspace = true }
 directory-interface = { workspace = true }

@@ -58,8 +58,9 @@ impl Module for Directory {
         Ok(())
     }
 
-    /// SYNC read projection — serves other modules' `ctx.query` + external reads.
-    fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+    /// read projection — serves other modules' `ctx.query` + external reads.
+    /// async per the trait, though the in-memory body has nothing to await.
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             DirQuery::Get { key } => {
                 Ok(encode_reply(&DirReply::Value(self.entries.get(&key).cloned())))
@@ -81,7 +82,7 @@ mod tests {
         let r1 = d.root();
         assert_ne!(r0, r1, "a write must move the root");
 
-        let reply = d.query(&encode_query(&DirQuery::Get { key: "a".into() })).unwrap();
+        let reply = futures::executor::block_on(d.query(&encode_query(&DirQuery::Get { key: "a".into() }))).unwrap();
         assert_eq!(
             directory_interface::decode_reply(&reply).unwrap(),
             DirReply::Value(Some("1".into()))

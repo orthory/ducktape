@@ -143,9 +143,10 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// the deterministic surface a module touches during state-machine application.
-/// object-safe on purpose (no async methods) so it can be passed as
+/// object-safe via async-trait (its one async method is boxed) so it can be passed as
 /// `&mut dyn Ctx`: own-state r/w is private to `self`; cross-module reads are
 /// sync and host-routed; writes are emitted as intents, never reentrant calls.
+#[async_trait::async_trait(?Send)]
 pub trait Ctx {
     /// the deterministic environment for this dispatch.
     fn env(&self) -> &Env;
@@ -157,7 +158,7 @@ pub trait Ctx {
 
     /// live, read-only, host-routed read of another module. `target == env.me`
     /// is rejected with [`Error::SelfQuery`]. backed by [`Module::query`].
-    fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error>;
+    async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error>;
 
     /// emit a write intent — collected, re-dispatched as a follow-up op; never
     /// executed reentrantly.
@@ -190,10 +191,10 @@ pub trait Module {
     /// deterministic resource (own qmdb state, a query) — NEVER a network/effect.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error>;
 
-    /// read-only projection serving other modules' [`Ctx::query`]. defaults to
-    /// [`Error::QueryUnsupported`]: async-backed stores (e.g. qmdb) have no sync
-    /// read projection yet, so they keep the default this slice.
-    fn query(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
+    /// read-only projection serving other modules' [`Ctx::query`]. async, so a
+    /// qmdb-backed module can serve a real read (`self.db.get(..).await`). defaults
+    /// to [`Error::QueryUnsupported`] for modules with no read path.
+    async fn query(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::QueryUnsupported)
     }
 }

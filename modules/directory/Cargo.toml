@@ -8,3 +8,6 @@ sdk = { workspace = true }
 directory-interface = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"

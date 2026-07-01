@@ -38,7 +38,7 @@ impl Module for Greeter {
             .map_err(|e| Error::Module(e.to_string()))?;
 
         // typed cross-module READ (sync, host-routed) of the directory module.
-        let reply = ctx.query(&self.directory, &encode_query(&DirQuery::Get { key: key.clone() }))?;
+        let reply = ctx.query(&self.directory, &encode_query(&DirQuery::Get { key: key.clone() })).await?;
         let name = match decode_reply(&reply).map_err(Error::Module)? {
             DirReply::Value(Some(v)) => v,
             DirReply::Value(None) => return Ok(()), // nothing to greet — no-op

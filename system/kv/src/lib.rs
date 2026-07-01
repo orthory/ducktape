@@ -139,6 +139,15 @@ where
         }
         Ok(())
     }
+
+    /// real async read of own qmdb state — the async-query seam in action.
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match kv_interface::decode_query(req).map_err(Error::Module)? {
+            kv_interface::KvQuery::Get { key } => Ok(kv_interface::encode_reply(
+                &kv_interface::KvReply::Value(self.get(&key).await),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

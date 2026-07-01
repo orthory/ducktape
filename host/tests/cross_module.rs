@@ -37,8 +37,16 @@ fn greeter_reads_directory_and_writes_a_derived_greeting() {
         // the greeting is DERIVED from the cross-module query (name=world), not hardcoded.
         let reply = host
             .query("directory", &encode_query(&DirQuery::Get { key: "greeting:name".into() }))
+            .await
             .unwrap();
         assert_eq!(decode_reply(&reply).unwrap(), DirReply::Value(Some("hello world".into())));
+
+        // the greeting is also readable from the QMDB kv module via a real async query.
+        let kvr = host
+            .query("kv", &kv_interface::encode_query(&kv_interface::KvQuery::Get { key: b"greeting:name".to_vec() }))
+            .await
+            .unwrap();
+        assert_eq!(kv_interface::decode_reply(&kvr).unwrap(), kv_interface::KvReply::Value(Some(b"hello world".to_vec())));
 
         // and the typed follow-up reached the qmdb kv module too (its real root moved).
         assert_ne!(host.module_root("kv").unwrap(), kv_root_before, "greeter's kv write must land");

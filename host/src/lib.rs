@@ -81,9 +81,9 @@ impl Host {
 
     /// external read-only query of a registered module (sync, like [`Ctx::query`]
     /// but from outside a dispatch). routes to [`Module::query`].
-    pub fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+    pub async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
         match self.registry.get(target) {
-            Some(m) => m.query(req),
+            Some(m) => m.query(req).await,
             None => Err(Error::UnknownModule(target.to_string())),
         }
     }
@@ -179,6 +179,7 @@ struct HostCtx<'a> {
     out_effects: Vec<Effect>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Ctx for HostCtx<'_> {
     fn env(&self) -> &Env {
         &self.env
@@ -188,12 +189,12 @@ impl Ctx for HostCtx<'_> {
         self.snapshot.get(target).copied()
     }
 
-    fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+    async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
         if target == self.env.me {
             return Err(Error::SelfQuery);
         }
         match self.registry.get(target) {
-            Some(m) => m.query(req),
+            Some(m) => m.query(req).await,
             None => Err(Error::UnknownModule(target.to_string())),
         }
     }

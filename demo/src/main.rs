@@ -50,8 +50,19 @@ fn main() {
         // read the derived greeting back out of the directory (sync typed query).
         let reply = host
             .query("directory", &encode_query(&DirQuery::Get { key: "greeting:name".into() }))
+            .await
             .expect("query directory");
         println!("\ndirectory[greeting:name] = {:?}", decode_reply(&reply).unwrap());
+
+        // and read it back out of the QMDB kv module — a real async cross-module read,
+        // which was impossible before query went async.
+        let kv_reply = host
+            .query("kv", &kv_interface::encode_query(&kv_interface::KvQuery::Get { key: b"greeting:name".to_vec() }))
+            .await
+            .expect("query kv");
+        if let kv_interface::KvReply::Value(Some(v)) = kv_interface::decode_reply(&kv_reply).unwrap() {
+            println!("kv[greeting:name]        = {:?}", String::from_utf8_lossy(&v));
+        }
 
         println!("\nmodule roots:");
         for id in ["directory", "greeter", "kv"] {
