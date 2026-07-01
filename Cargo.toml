@@ -13,6 +13,7 @@ members = [
     "modules/directory", "modules/directory-interface", "modules/greeter",
     "modules/forge", "modules/forge-interface",
     "node",
+    "consensus",
     "demo",
 ]
 
@@ -31,6 +32,13 @@ async-trait = "0.1"
 commonware-storage = "2026.5.0"
 commonware-runtime = "2026.5.0"
 commonware-cryptography = "2026.5.0"
+# the simplex BFT stack — used by the `consensus` crate (the real orderer);
+# pinned here so every commonware crate stays on the one version.
+commonware-consensus = "2026.5.0"
+commonware-p2p = "2026.5.0"
+commonware-parallel = "2026.5.0"
+commonware-utils = "2026.5.0"
+commonware-actor = "2026.5.0"
 
 # internal — impl crates
 sdk = { path = "sdk" }
@@ -41,6 +49,7 @@ directory = { path = "modules/directory" }
 greeter = { path = "modules/greeter" }
 forge = { path = "modules/forge" }
 node = { path = "node" }
+consensus = { path = "consensus" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "system/kv-interface" }
 directory-interface = { path = "modules/directory-interface" }

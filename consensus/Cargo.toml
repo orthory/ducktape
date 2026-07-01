@@ -1,0 +1,34 @@
+[package]
+name = "consensus"
+edition.workspace = true
+version.workspace = true
+
+# the real commonware-simplex BFT orderer behind node's async `Orderer` seam.
+# additive: `SimplexOrderer` is a drop-in for `RoundOrderer` — `submit` stages an
+# opaque frame + queues its digest, a live simplex `Engine` BFT-orders it, and
+# `poll_delivered` non-blocking-drains the finalized frames in ascending-view
+# order. isolated in its own crate so the commonware C toolchain never touches
+# node's toolchain-free lib tests. depends on `node` only for the trait it impls
+# (orphan rule: trait foreign, type local).
+[dependencies]
+node = { workspace = true }
+commonware-consensus = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-p2p = { workspace = true }
+commonware-parallel = { workspace = true }
+commonware-utils = { workspace = true }
+commonware-actor = { workspace = true }
+commonware-runtime = { workspace = true }
+rand_core = "0.6.4"
+
+[dev-dependencies]
+# the N-validator convergence harness: real simplex Engines over one simulated
+# commonware network, each wrapping a host::Host with a qmdb kv module.
+host = { workspace = true }
+sdk = { workspace = true }
+kv = { workspace = true }
+kv-interface = { workspace = true }
+directory = { workspace = true }
+directory-interface = { workspace = true }
+commonware-consensus = { workspace = true, features = ["mocks"] }
+commonware-cryptography = { workspace = true, features = ["mocks"] }
