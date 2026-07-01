@@ -22,6 +22,7 @@ members = [
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
+    "crates/apps/document", "crates/apps/document-interface",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
     # bin — runnable binaries
@@ -65,6 +66,7 @@ kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
 saga = { path = "crates/system/saga" }
 forge = { path = "crates/apps/forge" }
+document = { path = "crates/apps/document" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
@@ -72,4 +74,5 @@ kv-interface = { path = "crates/system/kv-interface" }
 valset-interface = { path = "crates/system/valset-interface" }
 saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
+document-interface = { path = "crates/apps/document-interface" }
 directory-interface = { path = "crates/examples/directory-interface" }

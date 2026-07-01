@@ -1136,6 +1136,8 @@ dependencies = [
  "commonware-runtime",
  "directory",
  "directory-interface",
+ "document",
+ "document-interface",
  "forge",
  "forge-interface",
  "greeter",
@@ -1197,6 +1199,30 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "document"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-storage",
+ "document-interface",
+ "sdk",
+ "serde_json",
+ "state",
+]
+
+[[package]]
+name = "document-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

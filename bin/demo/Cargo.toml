@@ -12,6 +12,8 @@ greeter = { workspace = true }
 directory-interface = { workspace = true }
 forge = { workspace = true }
 forge-interface = { workspace = true }
+document = { workspace = true }
+document-interface = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }

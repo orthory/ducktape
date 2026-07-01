@@ -1,17 +1,21 @@
-//! a runnable super-app demo: five isolated modules — a qmdb-backed kv, a sync
-//! in-memory directory, a stateless greeter, a GIT-backed forge, and an ed25519
-//! permissionless VALSET — dispatched over ONE host, showing the app-hash evolve
-//! as typed cross-module ops flow, forge's git HEAD oid compose into that same
-//! app-hash as its root, and a new validator JOIN move the valset root off ZERO.
+//! a runnable super-app demo: six isolated modules — a qmdb-backed kv, a sync
+//! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
+//! block DOCUMENT module, and an ed25519 permissionless VALSET — dispatched over
+//! ONE host, showing the app-hash evolve as typed cross-module ops flow, forge's
+//! git HEAD oid compose into that same app-hash as its root, a document's qmdb
+//! merkle root do the same, and a new validator JOIN move the valset root off ZERO.
 //!
 //! run: `cargo run -p demo`
 
-use commonware_runtime::{deterministic, Runner as _};
+use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
 use directory::Directory;
 use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery};
 use forge::Forge;
 use forge_interface::{decode_reply as forge_decode_reply, encode_msg as forge_encode_msg,
     encode_query as forge_encode_query, ForgeMsg, ForgeQuery, ForgeReply};
+use document::Document;
+use document_interface::{decode_reply as doc_decode_reply, encode_msg as doc_encode_msg,
+    encode_query as doc_encode_query, Block, BlockKind, DocMsg, DocQuery, DocReply};
 use greeter::Greeter;
 use host::Host;
 use sdk::Msg;
@@ -29,6 +33,7 @@ fn main() {
 
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real chain).
+        let document = Document::init(context.child("document"), "document").await;
         let kv = kv::Kv::init(context, "kv").await;
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
@@ -39,15 +44,17 @@ fn main() {
             Box::new(directory),
             Box::new(greeter),
             Box::new(forge),
+            Box::new(document),
             Box::new(valset),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 5 isolated modules over one host ===");
+        println!("=== super-app demo — 6 isolated modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!("genesis forge root (unborn git repo): {:?}", host.module_root("forge").unwrap());
         println!("genesis valset root (empty set)     : {:?}", host.module_root("valset").unwrap());
+        println!("genesis document root (no docs)     : {:?}", host.module_root("document").unwrap());
 
         // block 1: a typed Set to the in-memory directory module.
         let out = host
@@ -141,8 +148,56 @@ fn main() {
         println!("  valset root    : {:?}", host.module_root("valset").unwrap());
         println!("  app-hash       : {:?}", out.app_hash);
 
+        // block 5: the DOCUMENT module (ducktape's founding product, reborn as a
+        // simple block-based store on qmdb). create a doc, insert two blocks, then
+        // update one. each op is its own block (documents emit no follow-ups), and
+        // the document's qmdb merkle root moves into the app-hash on every commit.
+        println!("\n[block 5] document <- CreateDoc + 2x InsertBlock + UpdateBlock");
+        host.submit(Msg {
+            target: "document".into(),
+            payload: doc_encode_msg(&DocMsg::CreateDoc { doc_id: "readme".into() }),
+        }).await.expect("doc create");
+        host.submit(Msg {
+            target: "document".into(),
+            payload: doc_encode_msg(&DocMsg::InsertBlock {
+                doc_id: "readme".into(),
+                after: None,
+                block: Block { id: "title".into(), kind: BlockKind::Heading, text: "ducktape".into() },
+            }),
+        }).await.expect("doc insert 1");
+        host.submit(Msg {
+            target: "document".into(),
+            payload: doc_encode_msg(&DocMsg::InsertBlock {
+                doc_id: "readme".into(),
+                after: Some("title".into()),
+                block: Block { id: "intro".into(), kind: BlockKind::Paragraph, text: "a block document".into() },
+            }),
+        }).await.expect("doc insert 2");
+        let out = host.submit(Msg {
+            target: "document".into(),
+            payload: doc_encode_msg(&DocMsg::UpdateBlock {
+                doc_id: "readme".into(),
+                block_id: "intro".into(),
+                text: "a simple, block-based document on qmdb".into(),
+            }),
+        }).await.expect("doc update");
+        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  document root  : {:?}", host.module_root("document").unwrap());
+
+        // read the whole doc back out (typed query) — the ordered blocks.
+        let reply = host
+            .query("document", &doc_encode_query(&DocQuery::GetDoc { doc_id: "readme".into() }))
+            .await
+            .expect("query document");
+        if let DocReply::Doc(Some(blocks)) = doc_decode_reply(&reply).unwrap() {
+            println!("  readme blocks  :");
+            for b in &blocks {
+                println!("    - [{:?}] {} = {:?}", b.kind, b.id, b.text);
+            }
+        }
+
         println!("\nmodule roots:");
-        for id in ["directory", "forge", "greeter", "kv", "valset"] {
+        for id in ["directory", "document", "forge", "greeter", "kv", "valset"] {
             println!("  {id:>10} : {:?}", host.module_root(id).unwrap());
         }
         println!("\nfinal app-hash   : {:?}", host.app_hash());
