@@ -197,4 +197,23 @@ pub trait Module {
     async fn query(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::QueryUnsupported)
     }
+
+    /// BLOCK-BOUNDARY COMMIT. a module STAGES its writes during `execute` and
+    /// publishes them here, once, when the host declares the block a success.
+    /// after this returns, `root()` MUST reflect the staged writes. the default
+    /// is a no-op — for stateless modules and any module that has no staging
+    /// seam. called by the host in deterministic (registry) order over exactly
+    /// the modules dispatched this block.
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// BLOCK-BOUNDARY ABORT. the host calls this on EVERY module it dispatched
+    /// when the block fails partway (a later `execute` errored, or the dispatch
+    /// budget was exceeded): the module MUST discard its staged writes so the
+    /// block leaves no trace — `root()` is byte-identical to its pre-block value.
+    /// the default is a no-op.
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }

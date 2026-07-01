@@ -13,12 +13,17 @@ use sha2::{Digest, Sha256};
 
 pub struct Directory {
     id: ModuleId,
+    /// committed state — what `root()` and the app-hash commit to.
     entries: BTreeMap<String, String>,
+    /// writes staged during the current block: read ahead of `entries` (read-
+    /// your-writes) but merged in — and reflected in `root()` — only when the
+    /// host calls `commit_block`.
+    pending: BTreeMap<String, String>,
 }
 
 impl Directory {
     pub fn new(id: impl Into<ModuleId>) -> Self {
-        Self { id: id.into(), entries: BTreeMap::new() }
+        Self { id: id.into(), entries: BTreeMap::new(), pending: BTreeMap::new() }
     }
 
     /// direct sync write (used by `execute` and handy for tests/genesis seeding).
@@ -26,8 +31,16 @@ impl Directory {
         self.entries.insert(key, value);
     }
 
+    /// stage `key -> value` for this block WITHOUT committing — visible to reads
+    /// at once (read-your-writes), merged into committed state (and `root()`)
+    /// only when the host calls `commit_block` at the block boundary.
+    pub fn stage(&mut self, key: String, value: String) {
+        self.pending.insert(key, value);
+    }
+
+    /// read `key`: a STAGED (this-block) write shadows committed state.
     pub fn get(&self, key: &str) -> Option<&String> {
-        self.entries.get(key)
+        self.pending.get(key).or_else(|| self.entries.get(key))
     }
 }
 
@@ -53,7 +66,7 @@ impl Module for Directory {
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            DirMsg::Set { key, value } => self.set(key, value),
+            DirMsg::Set { key, value } => self.stage(key, value),
         }
         Ok(())
     }
@@ -63,9 +76,25 @@ impl Module for Directory {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             DirQuery::Get { key } => {
-                Ok(encode_reply(&DirReply::Value(self.entries.get(&key).cloned())))
+                Ok(encode_reply(&DirReply::Value(self.get(&key).cloned())))
             }
         }
+    }
+
+    /// merge the block's staged writes into committed state — `root()` now
+    /// reflects them. no-op if nothing was staged.
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        for (k, v) in std::mem::take(&mut self.pending) {
+            self.entries.insert(k, v);
+        }
+        Ok(())
+    }
+
+    /// discard the block's staged writes — committed state (and `root()`) is
+    /// unchanged.
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.pending.clear();
+        Ok(())
     }
 }
 

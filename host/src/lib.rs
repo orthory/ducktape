@@ -28,7 +28,7 @@
 //! the `.await`. the module is reinserted before any error propagates, so it can
 //! never vanish from the registry.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sdk::{Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 
@@ -100,9 +100,62 @@ impl Host {
     }
 
     /// apply one inbound message as a block: route, execute, drain follow-ups,
-    /// recompose the app-hash. `height`/`consensus_time` are block-constant; the
-    /// root op's origin is `External`, follow-ups carry `Origin::Module(emitter)`.
+    /// then COMMIT the block at its boundary. `height`/`consensus_time` are
+    /// block-constant; the root op's origin is `External`, follow-ups carry
+    /// `Origin::Module(emitter)`.
+    ///
+    /// ## per-block atomicity
+    ///
+    /// a module STAGES its writes during the drain and never commits mid-block.
+    /// the host owns the commit lifecycle: on a clean drain it calls
+    /// [`Module::commit_block`] on every touched module (deterministic registry
+    /// order) to publish their staged writes together; on ANY drain failure (a
+    /// later `execute` erroring, or [`Error::BudgetExceeded`]) it calls
+    /// [`Module::abort_block`] on every touched module, so a half-applied block
+    /// leaves NO trace — every module root is byte-identical to its pre-block
+    /// value. the app-hash is recomposed AFTER the commit, so it reflects exactly
+    /// the committed state.
     pub async fn submit(&mut self, msg: Msg) -> Result<BlockOutcome, Error> {
+        // every module dispatched this block, in deterministic order — the set
+        // the host commits or aborts at the boundary.
+        let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
+
+        match self.drain(msg, &mut touched).await {
+            Ok((events, effects)) => {
+                // clean drain: publish every touched module's staged writes. this
+                // is the ONLY place a module's state advances, so recompose the
+                // app-hash AFTER.
+                for id in &touched {
+                    if let Some(m) = self.registry.get_mut(id) {
+                        m.commit_block().await?;
+                    }
+                }
+                Ok(BlockOutcome { app_hash: self.app_hash(), events, effects })
+            }
+            Err(e) => {
+                // failure anywhere in the drain: discard every touched module's
+                // staged writes. no root moves — the block leaves no trace.
+                for id in &touched {
+                    if let Some(m) = self.registry.get_mut(id) {
+                        let _ = m.abort_block().await;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// the block's dispatch DRAIN: route the root op, run its `execute`, and
+    /// re-dispatch every emitted follow-up FIFO until the queue empties or the
+    /// dispatch budget is hit. modules only STAGE here — nothing is committed;
+    /// [`submit`](Self::submit) commits (or aborts) the touched set at the block
+    /// boundary. every dispatched target is recorded in `touched` so the boundary
+    /// can reach exactly the modules that may hold staged writes.
+    async fn drain(
+        &mut self,
+        msg: Msg,
+        touched: &mut BTreeSet<ModuleId>,
+    ) -> Result<(Vec<Event>, Vec<Effect>), Error> {
         let height = 0;
         let consensus_time = 0;
 
@@ -123,6 +176,10 @@ impl Host {
                 .registry
                 .remove(&msg.target)
                 .ok_or_else(|| Error::UnknownModule(msg.target.clone()))?;
+            // record it as touched only after a successful remove: an unknown
+            // target never staged anything, but everything dispatched before it
+            // did and must still be aborted.
+            touched.insert(msg.target.clone());
 
             // dispatch-start snapshot: the rest of the registry, plus self.
             let mut snapshot: BTreeMap<ModuleId, StateRoot> =
@@ -163,7 +220,7 @@ impl Host {
             effects.extend(out_effects);
         }
 
-        Ok(BlockOutcome { app_hash: self.app_hash(), events, effects })
+        Ok((events, effects))
     }
 }
 

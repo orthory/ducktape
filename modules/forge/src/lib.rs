@@ -69,11 +69,17 @@ pub struct Forge {
     repo: PathBuf,
     /// the object format the repo was initialized in (drives oid -> root mapping).
     fmt: ObjectFormat,
-    /// write-through mirror of `MAIN_REF`: written last in `execute` (and at
-    /// genesis), read ONLY by `root()`/`query`. the repo/ref is the source of
-    /// truth for the parent — this cache never feeds a commit's parent, so an
-    /// error mid-commit can't strand a stale head. `None` == unborn repo.
+    /// write-through mirror of the COMMITTED `MAIN_REF`: refreshed at genesis and
+    /// by `commit_block`, read by `root()`. the repo/ref is the source of truth
+    /// for the committed parent; this cache never feeds a commit's parent. `None`
+    /// == unborn repo.
     head: Option<String>,
+    /// the head STAGED by commits made this block: `execute` builds the commit
+    /// object and points this at it WITHOUT moving the ref. later commits in the
+    /// same block chain on it (read-your-writes via `query`); `commit_block`
+    /// publishes it (moves the ref), `abort_block` drops it. `None` == nothing
+    /// staged this block. NOT reflected in `root()` until committed.
+    staged: Option<String>,
 }
 
 impl Forge {
@@ -89,7 +95,7 @@ impl Forge {
             git::init(&repo).map_err(|e| Error::Module(e.to_string()))?
         };
         let head = git::resolve_ref(&repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?;
-        Ok(Self { id: id.into(), repo, fmt, head })
+        Ok(Self { id: id.into(), repo, fmt, head, staged: None })
     }
 
     /// map a HEAD oid hex into the fixed-width state root per the repo's format.
@@ -141,9 +147,15 @@ impl Module for Forge {
         let ForgeMsg::Commit { path, content, message } =
             decode_msg(&msg.payload).map_err(Error::Module)?;
 
-        // 1. parent := the REPO's current head (source of truth, not the cache).
-        let parent =
-            git::resolve_ref(&self.repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?;
+        // 1. parent := the STAGED head if this block already committed here,
+        //    else the REPO's current (committed) head. chaining on the staged
+        //    head gives multi-commit-in-one-block the correct parent.
+        let parent = match &self.staged {
+            Some(s) => Some(s.clone()),
+            None => {
+                git::resolve_ref(&self.repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?
+            }
+        };
         let parent_tree = match &parent {
             Some(p) => Some(
                 git::commit_tree_oid(&self.repo, p).map_err(|e| Error::Module(e.to_string()))?,
@@ -169,14 +181,11 @@ impl Module for Forge {
         let commit = git::commit_tree(&self.repo, &tree, parent.as_deref(), &message, ts)
             .map_err(|e| Error::Module(e.to_string()))?;
 
-        // 4. move the local ref (single-node). multi-node applies this same
-        //    primitive on receipt of a wire RefUpdate — never a fresh commit.
-        git::update_ref(&self.repo, MAIN_REF, &commit)
-            .map_err(|e| Error::Module(e.to_string()))?;
-
-        // 5. LAST + infallible: refresh the write-through head mirror. an error
-        //    before this can't leave a stale cached head (step 1 re-reads the repo).
-        self.head = Some(commit);
+        // 4. STAGE the new head — do NOT move the ref. the host publishes it at
+        //    the block boundary (`commit_block` -> `update_ref`); on abort the ref
+        //    never moves and these commit objects stay orphaned in the odb (node-
+        //    local, not authenticated state — no trace in `root()`/app-hash).
+        self.staged = Some(commit);
         Ok(())
     }
 
@@ -186,8 +195,30 @@ impl Module for Forge {
     /// identity (root is `sha256(oid)`) but the raw oid hex is still returned here.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            ForgeQuery::Head => Ok(encode_reply(&ForgeReply::Head(self.head.clone()))),
+            // read-your-writes: a staged (this-block) head shadows the committed
+            // one; `root()` still reflects only the committed head.
+            ForgeQuery::Head => Ok(encode_reply(&ForgeReply::Head(
+                self.staged.clone().or_else(|| self.head.clone()),
+            ))),
         }
+    }
+
+    /// publish the staged head: move `MAIN_REF` and refresh the committed mirror
+    /// so `root()` now reflects it. no-op if nothing was staged this block.
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        if let Some(oid) = self.staged.take() {
+            git::update_ref(&self.repo, MAIN_REF, &oid)
+                .map_err(|e| Error::Module(e.to_string()))?;
+            self.head = Some(oid);
+        }
+        Ok(())
+    }
+
+    /// discard the staged head — the ref was never moved, so `root()` is
+    /// unchanged; the built commit objects linger unreferenced in the odb.
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.staged = None;
+        Ok(())
     }
 }
 
@@ -262,6 +293,7 @@ mod tests {
             forge.execute(&mut TestCtx::at(100), &commit_msg("a.txt", "hello", "first")),
         )
         .unwrap();
+        futures::executor::block_on(forge.commit_block()).unwrap();
 
         assert_ne!(forge.root(), StateRoot::ZERO, "a commit must move the root off ZERO");
 
@@ -289,11 +321,13 @@ mod tests {
             forge.execute(&mut TestCtx::at(1), &commit_msg("a.txt", "one", "c1")),
         )
         .unwrap();
+        futures::executor::block_on(forge.commit_block()).unwrap();
         let r1 = forge.root();
         futures::executor::block_on(
             forge.execute(&mut TestCtx::at(2), &commit_msg("b.txt", "two", "c2")),
         )
         .unwrap();
+        futures::executor::block_on(forge.commit_block()).unwrap();
         let r2 = forge.root();
         assert_ne!(r1, r2, "a second commit must advance the root");
         assert_eq!(r2, forge.oid_to_root(&git_head_hex(&dir)).unwrap());
@@ -309,6 +343,7 @@ mod tests {
             forge.execute(&mut TestCtx::at(7), &commit_msg("a.txt", "x", "c")),
         )
         .unwrap();
+        futures::executor::block_on(forge.commit_block()).unwrap();
         let after = state::global_root(&[&forge as &dyn Module]);
         assert_ne!(before, after, "forge's git-backed root must move the global app-hash");
         let _ = std::fs::remove_dir_all(&dir);
@@ -325,10 +360,12 @@ mod tests {
             fa.execute(&mut TestCtx::at(555), &commit_msg("f.txt", "same", "same-msg")),
         )
         .unwrap();
+        futures::executor::block_on(fa.commit_block()).unwrap();
         futures::executor::block_on(
             fb.execute(&mut TestCtx::at(555), &commit_msg("f.txt", "same", "same-msg")),
         )
         .unwrap();
+        futures::executor::block_on(fb.commit_block()).unwrap();
         assert_eq!(fa.root(), fb.root(), "pinned identity+date -> reproducible commit oid");
         let _ = std::fs::remove_dir_all(&da);
         let _ = std::fs::remove_dir_all(&db);

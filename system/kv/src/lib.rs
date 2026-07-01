@@ -13,6 +13,7 @@
 //! `query` keeps the default (Unsupported): qmdb reads are async, the sync query
 //! projection lands in a later slice.
 
+use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 use commonware_codec::RangeCfg;
@@ -39,6 +40,10 @@ where
 {
     id: ModuleId,
     db: KvDb<E>,
+    /// writes staged during the current block, keyed by qmdb key. read ahead of
+    /// committed state by `get` (read-your-writes) and flushed to qmdb in one
+    /// batch by `commit_block`; NOT reflected in `root()` until then.
+    pending: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl<E> Kv<E>
@@ -91,7 +96,7 @@ where
             .await
             .expect("qmdb init failed");
 
-        Self { id, db }
+        Self { id, db, pending: BTreeMap::new() }
     }
 
     /// upsert `key -> value`, re-merkleize, apply, and flush. after this returns
@@ -108,8 +113,19 @@ where
         self.db.commit().await.expect("commit failed");
     }
 
-    /// read the value currently associated with `key`, if any.
+    /// stage `key -> value` for this block WITHOUT committing. visible to `get`
+    /// at once (read-your-writes) but folded into the qmdb store — and `root()` —
+    /// only when the host calls `commit_block` at the block boundary.
+    pub fn stage(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.pending.insert(key, value);
+    }
+
+    /// read `key`: a STAGED (this-block) write shadows committed qmdb state, so a
+    /// later op in the same block sees an earlier staged write.
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if let Some(v) = self.pending.get(key) {
+            return Some(v.clone());
+        }
         self.db.get(&key.to_vec()).await.expect("get failed")
     }
 }
@@ -135,18 +151,49 @@ where
     /// this is replay-safe across validators.
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match kv_interface::decode(&msg.payload).map_err(Error::Module)? {
-            kv_interface::KvMsg::Set { key, value } => self.set(key, value).await,
+            kv_interface::KvMsg::Set { key, value } => self.stage(key, value),
         }
         Ok(())
     }
 
     /// real async read of own qmdb state — the async-query seam in action.
+    /// serves STAGED-over-committed via `get`, so cross-module reads within a
+    /// block observe this block's staged writes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match kv_interface::decode_query(req).map_err(Error::Module)? {
             kv_interface::KvQuery::Get { key } => Ok(kv_interface::encode_reply(
                 &kv_interface::KvReply::Value(self.get(&key).await),
             )),
         }
+    }
+
+    /// publish the block's staged writes in ONE qmdb batch: write every pending
+    /// key, merkleize, apply, commit. no-op (and no root movement) if nothing was
+    /// staged. a single-write block issues the exact same sequence `set` did, so
+    /// its committed root is byte-identical to the old per-op path.
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut batch = self.db.new_batch();
+        for (key, value) in &self.pending {
+            batch = batch.write(key.clone(), Some(value.clone()));
+        }
+        let batch = batch
+            .merkleize(&self.db, None::<Vec<u8>>)
+            .await
+            .expect("merkleize failed");
+        self.db.apply_batch(batch).await.expect("apply_batch failed");
+        self.db.commit().await.expect("commit failed");
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// discard the block's staged writes — nothing reached qmdb, so `root()` is
+    /// unchanged.
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.pending.clear();
+        Ok(())
     }
 }
 
