@@ -473,13 +473,20 @@ impl<O: Orderer> OrderedNode<O> {
         let delivered = self.orderer.poll_delivered();
         let mut applied = 0usize;
         for (view, frame) in delivered {
-            let (origin, msg) = decode_frame(&frame)?;
+            // a FINALIZED op counts as processed whether or not it applies cleanly.
+            // one that fails to decode, or that a module rejects, is a DETERMINISTIC
+            // no-op: every honest validator finalized the identical op and handles it
+            // identically (host-lent rolls back a rejected block, root unchanged), so
+            // the chain cannot fork — AND a byzantine proposer cannot HALT honest nodes
+            // by getting a malformed op finalized. (the `?`-propagate that used to be
+            // here stalled the whole drain on one bad op — the liveness gap.)
+            applied += 1;
+            let Ok((origin, msg)) = decode_frame(&frame) else { continue };
             // the agreed view is the block coordinate: height + consensus_time
             // (a logical, agreed, monotonic clock — identical on every validator).
             // the frame carries the op's real submitter as the root origin.
             let ctx = BlockContext { height: view, consensus_time: view, origin };
-            self.host.submit_at(ctx, msg).await?;
-            applied += 1;
+            let _ = self.host.submit_at(ctx, msg).await;
         }
         Ok(applied)
     }
