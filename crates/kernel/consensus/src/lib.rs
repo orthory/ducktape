@@ -36,7 +36,7 @@
 //! codec / `RoundOrderer` are all UNCHANGED — `SimplexOrderer` slots in behind
 //! the identical trait.
 
-use std::collections::{BTreeMap, HashSet, HashMap, VecDeque};
+use std::collections::{HashSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use commonware_actor::Feedback;
@@ -54,9 +54,20 @@ use commonware_utils::channel::fallible::OneshotExt;
 use commonware_p2p::{Recipients, Sender};
 use commonware_runtime::IoBuf;
 
+use bytes::Bytes;
+use commonware_resolver::p2p::{
+    Config as ResolverConfig, Engine as ResolverEngine, Mailbox as ResolverMailbox,
+    Producer as ResolverProducer,
+};
+use commonware_resolver::{Consumer as ResolverConsumer, Delivery, Resolver as _};
+
 /// the concrete digest the consensus lane orders over: a sha256 of the frame
 /// bytes. fixing it here lets the [`ContentStore`] key on a plain `Copy` type.
 pub type Digest = sha256::Digest;
+
+/// the resolver mailbox this node's reporter fetches missing finalized payloads
+/// through — keyed by [`Digest`], over ed25519 peers, no subscribers.
+type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::PublicKey, ()>;
 
 /// hash a frame's bytes into the [`Digest`] simplex will order — the
 /// content-address (identical bytes always map to the same digest).
@@ -336,6 +347,88 @@ where
     });
 }
 
+/// drain a payload-gossip channel to a BLACK HOLE: receive every message and
+/// DISCARD it. STARVES a node of the eager payload cache so every finalization it
+/// did not originate misses the store and routes through the resolver fetch path
+/// — the deterministic knob behind [`SimplexOrderer::spawn_with_resolver`]'s
+/// `starve`. consuming (not dropping) the receiver keeps the channel from backing
+/// up while still leaving the store cold.
+fn spawn_blackhole_drain<E, R>(context: E, mut receiver: R)
+where
+    E: commonware_runtime::Spawner + Send + 'static,
+    R: commonware_p2p::Receiver + Send + 'static,
+{
+    context.spawn(move |_ctx| async move {
+        while receiver.recv().await.is_ok() {}
+    });
+}
+
+// ============================================================================
+// the lazy catch-up fetch — resolver Producer/Consumer over the ContentStore.
+// ============================================================================
+
+/// serves payload bytes by digest from the local [`ContentStore`] to peers that
+/// fetch them over the resolver. clone shares the backing store (`Arc`). a local
+/// miss drops the sender UNSENT — the resolver reads that as "no data" and retries
+/// another peer, never a wrong payload under the digest.
+#[derive(Clone)]
+struct PayloadProducer {
+    store: ContentStore,
+}
+
+impl ResolverProducer for PayloadProducer {
+    type Key = Digest;
+
+    fn produce(&mut self, key: Self::Key) -> oneshot::Receiver<Bytes> {
+        let (tx, rx) = oneshot::channel();
+        if let Some(bytes) = self.store.get(&key) {
+            tx.send_lossy(Bytes::from(bytes));
+        }
+        rx
+    }
+}
+
+/// receives fetched payload bytes, verifies the content address, stores them, and
+/// FILLS the awaiting slot in the ordered gate ([`FinalizedInbox`]). this is the
+/// async delivery seam a SYNC [`SimplexReporter::report`] can't drive: the reporter
+/// only LOGS a missing finalized slot + issues the fetch; the bytes arrive HERE,
+/// off that sync path, and complete the slot so the next `poll_delivered` releases
+/// it in finalization order. content-addressing IS the verification — bytes that
+/// do not hash to the requested digest resolve `false` (blocking the lying peer)
+/// and touch neither the store nor the gate.
+#[derive(Clone)]
+struct PayloadConsumer {
+    store: ContentStore,
+    inbox: FinalizedInbox,
+}
+
+impl ResolverConsumer for PayloadConsumer {
+    type Key = Digest;
+    type Value = Bytes;
+    type Subscriber = ();
+
+    fn deliver(
+        &mut self,
+        delivery: Delivery<Self::Key, Self::Subscriber>,
+        value: Self::Value,
+    ) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        let bytes: Vec<u8> = value.into();
+        if digest_of(&bytes) == delivery.key {
+            // verified: cache under the content address AND fill the gate slot the
+            // reporter logged for this digest, so ordered release can advance.
+            let digest = self.store.put(bytes.clone());
+            self.inbox.fill_fetched(digest, bytes);
+            tx.send_lossy(true);
+        } else {
+            // the bytes do NOT hash to the requested digest — a lying peer. `false`
+            // tells the resolver to block it and retry another.
+            tx.send_lossy(false);
+        }
+        rx
+    }
+}
+
 // ============================================================================
 // the finalized inbox — the sync-reporter -> async-drain buffer (cost 1).
 // ============================================================================
@@ -356,9 +449,29 @@ pub struct FinalizedInbox {
     inner: Arc<Mutex<FinalizedInner>>,
 }
 
+/// the dense-index ordered-release gate. the SYNC reporter records each
+/// finalization in ascending-view order onto `log`; a store HIT resolves its
+/// bytes into `ready` at once (the eager path), a MISS leaves the slot AWAITING an
+/// async resolver fetch that later calls [`FinalizedInbox::fill_fetched`]. `drain`
+/// releases the LONGEST all-ready PREFIX from `released`, so a slot still waiting
+/// on a fetch HALTS the prefix — everything behind it waits, never dropped, never
+/// reordered. `submit_at` applies in call order and the qmdb root is
+/// order-dependent, so this is what makes a fetched (late) op converge.
+///
+/// on an all-HIT (eager) node every slot is ready the instant it lands, so the
+/// prefix is always the whole log: behavior is byte-identical to a take-all drain
+/// and every existing eager-path suite stays green. `seen` makes `record`
+/// exactly-once; `fill_fetched` is deliberately NOT seen-gated — it completes a
+/// slot `record` already logged. the `released` cursor makes release exactly-once.
 #[derive(Default)]
 struct FinalizedInner {
-    ready: BTreeMap<u64, Vec<u8>>,
+    /// committed digests in finalization (ascending-view) order — the release order.
+    log: Vec<(u64, Digest)>,
+    /// resolved bytes per digest (store hit at `record`, or fetched later).
+    ready: HashMap<Digest, Vec<u8>>,
+    /// index into `log` of the next slot to release.
+    released: usize,
+    /// exactly-once guard on `record` (NOT on `fill_fetched`).
     seen: HashSet<Digest>,
 }
 
@@ -367,23 +480,63 @@ impl FinalizedInbox {
         Self::default()
     }
 
-    /// record a finalized `(view, digest)` whose bytes resolve in `store`. keyed
-    /// by view for ascending-order drain; deduped by digest for exactly-once.
-    fn deliver(&self, view: u64, digest: Digest, store: &ContentStore) {
+    /// record a finalized `(view, digest)`. appends to the ordered log and, on a
+    /// store HIT, resolves its bytes now. returns `true` when the slot is left
+    /// AWAITING a fetch (a store miss WITH the resolver enabled) so the caller
+    /// issues `resolver.fetch(digest)`. a miss WITHOUT a resolver drops the slot
+    /// entirely (never logged) — exactly the old behavior. deduped by `seen`.
+    fn record(
+        &self,
+        view: u64,
+        digest: Digest,
+        store: &ContentStore,
+        resolver_enabled: bool,
+    ) -> bool {
         let mut inner = self.inner.lock().expect("finalized inbox poisoned");
-        if inner.seen.insert(digest) {
-            if let Some(bytes) = store.get(&digest) {
-                inner.ready.insert(view, bytes);
-            }
-            // a miss is impossible in-sim (shared store); a real node fetches.
+        if !inner.seen.insert(digest) {
+            return false;
+        }
+        if let Some(bytes) = store.get(&digest) {
+            inner.log.push((view, digest));
+            inner.ready.insert(digest, bytes);
+            false
+        } else if resolver_enabled {
+            // miss: log the slot so it holds its place; the async fetch fills it.
+            inner.log.push((view, digest));
+            true
+        } else {
+            // no resolver: nothing can ever resolve this digest — drop (old path).
+            false
         }
     }
 
-    /// take every ready frame paired with its finalized VIEW, in ascending-view
-    /// order (the BTreeMap key IS the agreed view). non-blocking.
+    /// complete an AWAITING slot with fetched bytes, off the sync reporter (from
+    /// the resolver's `Consumer::deliver`). NOT seen-gated: `record` already logged
+    /// the slot; this only supplies its bytes so the next `drain` can release it. a
+    /// fill for a digest not (yet) logged simply waits in `ready` for its `record`.
+    fn fill_fetched(&self, digest: Digest, bytes: Vec<u8>) {
+        let mut inner = self.inner.lock().expect("finalized inbox poisoned");
+        inner.ready.insert(digest, bytes);
+    }
+
+    /// release the longest all-ready PREFIX of the log from the cursor, in
+    /// finalization (ascending-view) order. a slot whose bytes have not resolved
+    /// yet halts the prefix; the cursor advances past each released slot so every
+    /// frame emits exactly once. non-blocking.
     fn drain(&self) -> Vec<(u64, Vec<u8>)> {
         let mut inner = self.inner.lock().expect("finalized inbox poisoned");
-        std::mem::take(&mut inner.ready).into_iter().collect()
+        let mut out = Vec::new();
+        while inner.released < inner.log.len() {
+            let (view, digest) = inner.log[inner.released];
+            match inner.ready.remove(&digest) {
+                Some(bytes) => {
+                    out.push((view, bytes));
+                    inner.released += 1;
+                }
+                None => break,
+            }
+        }
+        out
     }
 }
 
@@ -405,6 +558,10 @@ pub struct SimplexReporter<S> {
     store: ContentStore,
     pending: Arc<Mutex<VecDeque<Digest>>>,
     inbox: FinalizedInbox,
+    /// the catch-up fetch mailbox, `Some` only when a resolver engine is wired
+    /// (see [`SimplexOrderer::spawn_with_resolver`]). on a finalization MISS the
+    /// reporter fetches through this instead of dropping the frame.
+    mailbox: Option<PayloadMailbox>,
     _marker: std::marker::PhantomData<fn() -> S>,
 }
 
@@ -417,8 +574,9 @@ impl<S> SimplexReporter<S> {
         store: ContentStore,
         pending: Arc<Mutex<VecDeque<Digest>>>,
         inbox: FinalizedInbox,
+        mailbox: Option<PayloadMailbox>,
     ) -> Self {
-        Self { store, pending, inbox, _marker: std::marker::PhantomData }
+        Self { store, pending, inbox, mailbox, _marker: std::marker::PhantomData }
     }
 }
 
@@ -444,8 +602,18 @@ where
                     queue.remove(pos);
                 }
             }
-            // buffer for the async drain, keyed by view (agreed order), deduped.
-            self.inbox.deliver(view, digest, &self.store);
+            // buffer for the async drain in ascending-view order (deduped). a
+            // store HIT resolves NOW (the eager path, unchanged); a MISS with a
+            // resolver enabled logs an AWAITING slot and we fetch the bytes —
+            // moving delivery for the fetched case OFF this sync path into the
+            // resolver's `Consumer::deliver`, which fills the slot.
+            let need_fetch =
+                self.inbox.record(view, digest, &self.store, self.mailbox.is_some());
+            if need_fetch {
+                if let Some(mailbox) = self.mailbox.as_mut() {
+                    let _ = mailbox.fetch(digest);
+                }
+            }
         }
         Feedback::Ok
     }
@@ -466,6 +634,9 @@ pub struct SimplexOrderer {
     inbox: FinalizedInbox,
     /// the engine task keepalive: dropping the orderer aborts its engine.
     _engine: commonware_runtime::Handle<()>,
+    /// the payload-fetch resolver engine keepalive — `Some` only when built via
+    /// [`SimplexOrderer::spawn_with_resolver`]. dropping it stops catch-up fetch.
+    _resolver: Option<commonware_runtime::Handle<()>>,
 }
 
 impl node::Orderer for SimplexOrderer {
@@ -564,7 +735,7 @@ impl SimplexOrderer {
         let inbox = FinalizedInbox::new();
         let reporter = SimplexReporter::<
             commonware_consensus::simplex::scheme::ed25519::Scheme,
-        >::new(store.clone(), automaton.pending(), inbox.clone());
+        >::new(store.clone(), automaton.pending(), inbox.clone(), None);
 
         // page cache borrows the pooler context BEFORE we hand a child to Engine.
         let page_cache = CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10));
@@ -598,7 +769,7 @@ impl SimplexOrderer {
         // KEEP the handle alive inside the orderer — dropping it aborts the engine.
         let engine_handle = engine.start(vote, certificate, resolver);
 
-        SimplexOrderer { handle, inbox, _engine: engine_handle }
+        SimplexOrderer { handle, inbox, _engine: engine_handle, _resolver: None }
     }
 
     /// stand up a live simplex engine with a [`NoopRelay`] — the in-process-sim
@@ -703,6 +874,171 @@ impl SimplexOrderer {
             certificate, resolver,
         )
     }
+
+    /// stand up a live simplex engine WITH the lazy [`commonware_resolver`]
+    /// catch-up fetch backstop, over a PER-PROCESS [`ContentStore`]. this is the
+    /// eager relay path of [`spawn_with_relay`] PLUS a second
+    /// [`commonware_resolver::p2p::Engine`] on a dedicated `fetch` channel:
+    ///
+    /// - [`PayloadProducer`] serves this node's stored bytes by digest to peers
+    ///   fetching them, and
+    /// - [`PayloadConsumer`] receives fetched bytes, verifies the content address,
+    ///   stores them, and FILLS the awaiting gate slot — the async delivery seam a
+    ///   SYNC reporter can't drive.
+    ///
+    /// on a finalization the reporter resolves the bytes eagerly when the store
+    /// already holds them (unchanged) and on a MISS fetches through the resolver
+    /// instead of dropping. the ordered gate releases the fetched op ONLY in its
+    /// finalization-order slot, so a node that missed the eager broadcast for some
+    /// views still converges on the identical order-dependent root.
+    ///
+    /// `provider` gives the resolver its fetch candidates (in the sim,
+    /// `oracle.manager()`); `me` excludes self from those candidates; `blocker`
+    /// (cloned) blocks peers that serve garbage. `starve`, when true, BLACK-HOLES
+    /// the eager payload drain so this node never caches a relayed payload — every
+    /// finalization it did not originate misses and routes through the fetch path.
+    /// it exists to exercise the miss/fetch/ordered-release path deterministically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_resolver<E, B, D, PS, PR, FS, FR, VS, VR, CS, CR, RS, RR>(
+        context: E,
+        scheme: commonware_consensus::simplex::scheme::ed25519::Scheme,
+        blocker: B,
+        provider: D,
+        me: commonware_cryptography::ed25519::PublicKey,
+        partition: String,
+        epoch: commonware_consensus::types::Epoch,
+        genesis: Digest,
+        store: ContentStore,
+        vote: (VS, VR),
+        certificate: (CS, CR),
+        resolver: (RS, RR),
+        payload: (PS, PR),
+        fetch: (FS, FR),
+        starve: bool,
+    ) -> Self
+    where
+        E: commonware_runtime::Spawner
+            + commonware_runtime::Clock
+            + commonware_runtime::Storage
+            + commonware_runtime::Metrics
+            + commonware_runtime::BufferPooler
+            + rand_core::CryptoRngCore
+            + Send
+            + Sync
+            + 'static,
+        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>
+            + Clone,
+        D: commonware_p2p::Provider<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        PS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        PR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>
+            + Send
+            + 'static,
+        FS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        VS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        VR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        CS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        CR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        RS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        RR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    {
+        use commonware_consensus::simplex::{
+            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
+            elector::RoundRobin,
+            Engine,
+        };
+        use commonware_consensus::types::ViewDelta;
+        use commonware_cryptography::{ed25519, Sha256};
+        use commonware_parallel::Sequential;
+        use commonware_runtime::buffer::paged::CacheRef;
+        use commonware_utils::{NZUsize, NZU16};
+        use std::time::Duration;
+
+        let (payload_sender, payload_receiver) = payload;
+        let (fetch_sender, fetch_receiver) = fetch;
+
+        // eager drain: cache peer-relayed frames store-only — UNLESS starved, in
+        // which case receive+discard so the store stays cold and every
+        // non-originated finalization routes through the resolver fetch path.
+        if starve {
+            spawn_blackhole_drain(context.child("payload_starve"), payload_receiver);
+        } else {
+            spawn_payload_drain(context.child("payload_drain"), payload_receiver, store.clone());
+        }
+
+        let relay = ConsensusRelay::<PS, ed25519::PublicKey>::new(payload_sender, store.clone());
+
+        // the consensus triple; its ordered gate `inbox` is SHARED with the
+        // resolver's consumer so a fetched payload FILLS the exact slot the reporter
+        // logged for that digest.
+        let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
+        let handle = automaton.handle(store.clone());
+        let inbox = FinalizedInbox::new();
+
+        // the catch-up fetch engine: producer serves our store to peers; consumer
+        // verifies + stores + fills the gate. short timeouts so a miss retries
+        // quickly within the deterministic pump loop.
+        let fetch_cfg = ResolverConfig {
+            peer_provider: provider,
+            blocker: blocker.clone(),
+            consumer: PayloadConsumer { store: store.clone(), inbox: inbox.clone() },
+            producer: PayloadProducer { store: store.clone() },
+            mailbox_size: NZUsize!(1024),
+            me: Some(me),
+            initial: Duration::from_millis(100),
+            timeout: Duration::from_millis(400),
+            fetch_retry_timeout: Duration::from_millis(100),
+            priority_requests: false,
+            priority_responses: false,
+        };
+        let (fetch_engine, mailbox) =
+            ResolverEngine::new(context.child("payload_fetch"), fetch_cfg);
+        // KEEP the fetch handle alive inside the orderer — dropping it stops catch-up.
+        let fetch_handle = fetch_engine.start((fetch_sender, fetch_receiver));
+
+        let reporter = SimplexReporter::<
+            commonware_consensus::simplex::scheme::ed25519::Scheme,
+        >::new(store.clone(), automaton.pending(), inbox.clone(), Some(mailbox));
+
+        let page_cache = CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10));
+        let cfg = SimplexConfig {
+            scheme,
+            elector: RoundRobin::<Sha256>::default(),
+            blocker,
+            automaton,
+            relay,
+            reporter,
+            strategy: Sequential,
+            partition,
+            mailbox_size: NZUsize!(1024),
+            epoch,
+            floor: Floor::Genesis(genesis),
+            leader_timeout: Duration::from_secs(1),
+            certification_timeout: Duration::from_secs(2),
+            timeout_retry: Duration::from_secs(10),
+            fetch_timeout: Duration::from_secs(1),
+            activity_timeout: ViewDelta::new(10),
+            skip_timeout: ViewDelta::new(5),
+            fetch_concurrent: NZUsize!(4),
+            replay_buffer: NZUsize!(1024 * 1024),
+            write_buffer: NZUsize!(1024 * 1024),
+            page_cache,
+            forwarding: ForwardingPolicy::Disabled,
+        };
+        let engine = Engine::new(context.child("engine"), cfg);
+        let engine_handle = engine.start(vote, certificate, resolver);
+
+        SimplexOrderer {
+            handle,
+            inbox,
+            _engine: engine_handle,
+            _resolver: Some(fetch_handle),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -720,19 +1056,72 @@ mod tests {
     }
 
     #[test]
-    fn finalized_inbox_drains_in_ascending_view_order() {
-        // the reporter observes finalizations ascending per node; the BTreeMap
-        // keeps a single drain in that order even if inserts arrive out of order.
+    fn finalized_inbox_releases_in_finalization_order() {
+        // the reporter records finalizations in ascending view order; each is a
+        // store HIT so the gate resolves it at once and releases the whole log as
+        // one ready prefix. a second drain is empty (the cursor advanced).
         let store = ContentStore::new();
         let d_lo = store.put(b"view 1".to_vec());
         let d_hi = store.put(b"view 2".to_vec());
         let inbox = FinalizedInbox::new();
-        // insert the HIGHER view first — the drain must still yield lo before hi.
-        inbox.deliver(2, d_hi, &store);
-        inbox.deliver(1, d_lo, &store);
+        // resolver disabled: both are hits, logged + ready immediately (no await).
+        assert!(!inbox.record(1, d_lo, &store, false));
+        assert!(!inbox.record(2, d_hi, &store, false));
         assert_eq!(inbox.drain(), vec![(1, b"view 1".to_vec()), (2, b"view 2".to_vec())]);
-        // a second drain is empty (take semantics).
         assert!(inbox.drain().is_empty());
+    }
+
+    #[test]
+    fn finalized_inbox_holds_a_missing_slot_until_its_fetch_fills() {
+        // the ordered-release gate — the load-bearing convergence guard. a MISS at
+        // view 1 (resolver enabled) HOLDS the whole prefix, even though view 2 is
+        // ready, until the async fetch fills view 1's bytes. THEN both release, in
+        // finalization order. this is what keeps a late/fetched op from applying
+        // out of order (which would fork the order-dependent qmdb root).
+        let store = ContentStore::new();
+        let d1 = digest_of(b"view 1"); // NOT in the store: a missed eager broadcast.
+        let d2 = store.put(b"view 2".to_vec());
+        let inbox = FinalizedInbox::new();
+        assert!(inbox.record(1, d1, &store, true), "miss + resolver -> awaiting (fetch)");
+        assert!(!inbox.record(2, d2, &store, true), "hit -> ready, but held behind view 1");
+        assert!(inbox.drain().is_empty(), "gate holds the prefix behind the missing slot");
+        // the fetch resolves view 1's bytes (as the resolver's Consumer would).
+        inbox.fill_fetched(d1, b"view 1".to_vec());
+        assert_eq!(inbox.drain(), vec![(1, b"view 1".to_vec()), (2, b"view 2".to_vec())]);
+        assert!(inbox.drain().is_empty());
+    }
+
+    #[test]
+    fn payload_consumer_rejects_bytes_that_mismatch_the_fetched_digest() {
+        // content-addressing IS the verification: a peer that returns bytes which
+        // do NOT hash to the requested digest is rejected — `deliver` resolves
+        // `false` (blocking it), the store is untouched, and the gate slot stays
+        // unfilled. the matching bytes DO verify: stored, gate filled, releasable.
+        use commonware_runtime::{deterministic, Runner};
+        use commonware_utils::vec::NonEmptyVec;
+
+        deterministic::Runner::timed(std::time::Duration::from_secs(5)).start(|_ctx| async move {
+            let store = ContentStore::new();
+            let inbox = FinalizedInbox::new();
+            let mut consumer = PayloadConsumer { store: store.clone(), inbox: inbox.clone() };
+
+            let key = digest_of(b"the real finalized frame");
+            let tampered = Bytes::from_static(b"byzantine garbage");
+            let bad = Delivery { key, subscribers: NonEmptyVec::new(()) };
+            let valid = consumer.deliver(bad, tampered).await.expect("verdict");
+            assert!(!valid, "a hash mismatch resolves false (blocks the lying peer)");
+            assert_eq!(store.get(&key), None, "reject must not store the garbage");
+
+            let good = b"the real finalized frame".to_vec();
+            let dg = digest_of(&good);
+            let ok = Delivery { key: dg, subscribers: NonEmptyVec::new(()) };
+            let valid = consumer.deliver(ok, Bytes::from(good.clone())).await.expect("verdict");
+            assert!(valid, "matching bytes verify (resolves true)");
+            assert_eq!(store.get(&dg), Some(good.clone()), "accepted bytes are stored");
+            // once the reporter logs this finalized slot, the filled bytes release.
+            inbox.record(1, dg, &store, true);
+            assert_eq!(inbox.drain(), vec![(1, good)], "the filled slot releases in order");
+        });
     }
 
     #[test]
@@ -741,8 +1130,8 @@ mod tests {
         let store = ContentStore::new();
         let d = store.put(b"once".to_vec());
         let inbox = FinalizedInbox::new();
-        inbox.deliver(1, d, &store);
-        inbox.deliver(1, d, &store); // same digest again -> ignored by `seen`.
+        assert!(!inbox.record(1, d, &store, false));
+        inbox.record(1, d, &store, false); // same digest again -> ignored by `seen`.
         assert_eq!(inbox.drain(), vec![(1, b"once".to_vec())]);
     }
 

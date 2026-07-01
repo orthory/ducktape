@@ -19,6 +19,8 @@ commonware-parallel = { workspace = true }
 commonware-utils = { workspace = true }
 commonware-actor = { workspace = true }
 commonware-runtime = { workspace = true }
+commonware-resolver = { workspace = true }
+bytes = "1"
 rand_core = "0.6.4"
 
 [dev-dependencies]

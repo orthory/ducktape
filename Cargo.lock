@@ -910,11 +910,13 @@ dependencies = [
 name = "consensus"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "commonware-actor",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
  "commonware-parallel",
+ "commonware-resolver",
  "commonware-runtime",
  "commonware-utils",
  "directory",
