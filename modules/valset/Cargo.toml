@@ -1,0 +1,20 @@
+[package]
+name = "valset"
+edition.workspace = true
+version.workspace = true
+
+# the ed25519 permissionless validator set as replicated state. depends only on
+# sdk + its own interface (+ sha2 for the state-based root, commonware-cryptography
+# for ed25519 key validation, and commonware-codec for the from-bytes decode api).
+[dependencies]
+sdk = { workspace = true }
+valset-interface = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+commonware-cryptography = { workspace = true }
+# required for the PublicKey-from-bytes api: PublicKey has no TryFrom<&[u8]>, so
+# `PublicKey::decode` (DecodeExt) is the crate's own canonical validation path.
+commonware-codec = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"

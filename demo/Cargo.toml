@@ -12,5 +12,9 @@ greeter = { workspace = true }
 directory-interface = { workspace = true }
 forge = { workspace = true }
 forge-interface = { workspace = true }
+valset = { workspace = true }
+valset-interface = { workspace = true }
 sdk = { workspace = true }
 commonware-runtime = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }

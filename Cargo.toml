@@ -12,6 +12,7 @@ members = [
     "system/kv", "system/kv-interface",
     "modules/directory", "modules/directory-interface", "modules/greeter",
     "modules/forge", "modules/forge-interface",
+    "modules/valset", "modules/valset-interface",
     "node",
     "consensus",
     "demo",
@@ -32,6 +33,7 @@ async-trait = "0.1"
 commonware-storage = "2026.5.0"
 commonware-runtime = "2026.5.0"
 commonware-cryptography = "2026.5.0"
+commonware-codec = "2026.5.0"
 # the simplex BFT stack — used by the `consensus` crate (the real orderer);
 # pinned here so every commonware crate stays on the one version.
 commonware-consensus = "2026.5.0"
@@ -48,9 +50,11 @@ kv = { path = "system/kv" }
 directory = { path = "modules/directory" }
 greeter = { path = "modules/greeter" }
 forge = { path = "modules/forge" }
+valset = { path = "modules/valset" }
 node = { path = "node" }
 consensus = { path = "consensus" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "system/kv-interface" }
 directory-interface = { path = "modules/directory-interface" }
 forge-interface = { path = "modules/forge-interface" }
+valset-interface = { path = "modules/valset-interface" }

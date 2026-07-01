@@ -1,7 +1,8 @@
-//! a runnable super-app demo: four isolated modules — a qmdb-backed kv, a sync
-//! in-memory directory, a stateless greeter, and a GIT-backed forge — dispatched
-//! over ONE host, showing the app-hash evolve as typed cross-module ops flow, and
-//! showing forge's git HEAD oid compose into that same app-hash as its root.
+//! a runnable super-app demo: five isolated modules — a qmdb-backed kv, a sync
+//! in-memory directory, a stateless greeter, a GIT-backed forge, and an ed25519
+//! permissionless VALSET — dispatched over ONE host, showing the app-hash evolve
+//! as typed cross-module ops flow, forge's git HEAD oid compose into that same
+//! app-hash as its root, and a new validator JOIN move the valset root off ZERO.
 //!
 //! run: `cargo run -p demo`
 
@@ -14,6 +15,11 @@ use forge_interface::{decode_reply as forge_decode_reply, encode_msg as forge_en
 use greeter::Greeter;
 use host::Host;
 use sdk::Msg;
+use valset::Valset;
+use valset_interface::{decode_reply as valset_decode_reply, encode_msg as valset_encode_msg,
+    encode_query as valset_encode_query, ValsetMsg, ValsetQuery, ValsetReply};
+use commonware_cryptography::{ed25519::PrivateKey, Signer as _};
+use commonware_codec::DecodeExt as _;
 
 fn main() {
     // forge's substrate is a real git repo on disk. wipe any prior run's dir so
@@ -27,18 +33,21 @@ fn main() {
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
         let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
+        let valset = Valset::new("valset");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
             Box::new(greeter),
             Box::new(forge),
+            Box::new(valset),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 4 isolated modules over one host ===");
+        println!("=== super-app demo — 5 isolated modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!("genesis forge root (unborn git repo): {:?}", host.module_root("forge").unwrap());
+        println!("genesis valset root (empty set)     : {:?}", host.module_root("valset").unwrap());
 
         // block 1: a typed Set to the in-memory directory module.
         let out = host
@@ -105,8 +114,35 @@ fn main() {
             println!("kv[greeting:name]        = {:?}", String::from_utf8_lossy(&v));
         }
 
+        // block 4: a NEW validator JOINs the permissionless ed25519 valset. derive
+        // the key deterministically from a fixed seed (any 32 bytes is a valid
+        // ed25519 seed) so the demo is reproducible. the valset root moves off
+        // ZERO and folds a 5th module's commitment into the app-hash.
+        let seed = [7u8; 32];
+        let new_validator = PrivateKey::decode(&seed[..])
+            .expect("32-byte seed is a valid ed25519 private key")
+            .public_key()
+            .as_ref()
+            .to_vec();
+        let out = host
+            .submit(Msg {
+                target: "valset".into(),
+                payload: valset_encode_msg(&ValsetMsg::Join { key: new_validator.clone() }),
+            })
+            .await
+            .expect("submit block 4");
+        println!("\n[block 4] valset <- Join(ed25519 pubkey) — a new validator joins");
+        let reply = host
+            .query("valset", &valset_encode_query(&ValsetQuery::Validators))
+            .await
+            .expect("query valset");
+        let ValsetReply::Validators(vs) = valset_decode_reply(&reply).unwrap();
+        println!("  validator count: {} (was 0 at genesis)", vs.len());
+        println!("  valset root    : {:?}", host.module_root("valset").unwrap());
+        println!("  app-hash       : {:?}", out.app_hash);
+
         println!("\nmodule roots:");
-        for id in ["directory", "forge", "greeter", "kv"] {
+        for id in ["directory", "forge", "greeter", "kv", "valset"] {
             println!("  {id:>10} : {:?}", host.module_root(id).unwrap());
         }
         println!("\nfinal app-hash   : {:?}", host.app_hash());

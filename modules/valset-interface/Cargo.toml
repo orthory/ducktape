@@ -1,0 +1,10 @@
+[package]
+name = "valset-interface"
+edition.workspace = true
+version.workspace = true
+
+# types-only: the wire surface of the valset module. each key is a 32-byte
+# ed25519 public key (validated by the impl crate, not here).
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
