@@ -1,9 +1,10 @@
-//! a runnable super-app demo: six isolated modules — a qmdb-backed kv, a sync
+//! a runnable super-app demo: seven isolated modules — a qmdb-backed kv, a sync
 //! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
-//! block DOCUMENT module, and an ed25519 permissionless VALSET — dispatched over
-//! ONE host, showing the app-hash evolve as typed cross-module ops flow, forge's
-//! git HEAD oid compose into that same app-hash as its root, a document's qmdb
-//! merkle root do the same, and a new validator JOIN move the valset root off ZERO.
+//! block DOCUMENT module, an in-memory messaging app with channels, and an
+//! ed25519 permissionless VALSET — dispatched over ONE host, showing the app-hash
+//! evolve as typed cross-module ops flow, forge's git HEAD oid compose into that
+//! same app-hash as its root, document and messaging roots do the same, and a new
+//! validator JOIN move the valset root off ZERO.
 //!
 //! run: `cargo run -p demo`
 
@@ -18,6 +19,9 @@ use document_interface::{decode_reply as doc_decode_reply, encode_msg as doc_enc
     encode_query as doc_encode_query, Block, BlockKind, DocMsg, DocQuery, DocReply};
 use greeter::Greeter;
 use host::Host;
+use messaging::Messaging;
+use messaging_interface::{decode_reply as messaging_decode_reply, encode_msg as messaging_encode_msg,
+    encode_query as messaging_encode_query, MessagingMsg, MessagingQuery, MessagingReply};
 use sdk::Msg;
 use valset::Valset;
 use valset_interface::{decode_reply as valset_decode_reply, encode_msg as valset_encode_msg,
@@ -38,6 +42,7 @@ fn main() {
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
         let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
+        let messaging = Messaging::new("messaging");
         let valset = Valset::new("valset");
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -45,16 +50,18 @@ fn main() {
             Box::new(greeter),
             Box::new(forge),
             Box::new(document),
+            Box::new(messaging),
             Box::new(valset),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 6 isolated modules over one host ===");
+        println!("=== super-app demo — 7 isolated modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!("genesis forge root (unborn git repo): {:?}", host.module_root("forge").unwrap());
         println!("genesis valset root (empty set)     : {:?}", host.module_root("valset").unwrap());
         println!("genesis document root (no docs)     : {:?}", host.module_root("document").unwrap());
+        println!("genesis messaging root (no channels): {:?}", host.module_root("messaging").unwrap());
 
         // block 1: a typed Set to the in-memory directory module.
         let out = host
@@ -121,10 +128,50 @@ fn main() {
             println!("kv[greeting:name]        = {:?}", String::from_utf8_lossy(&v));
         }
 
-        // block 4: a NEW validator JOINs the permissionless ed25519 valset. derive
+        // block 4: create a channel, then block 5 posts a message into that
+        // channel. messaging is an isolated product app module with a typed wire
+        // surface and a state-based root.
+        let out = host
+            .submit(Msg {
+                target: "messaging".into(),
+                payload: messaging_encode_msg(&MessagingMsg::CreateChannel {
+                    channel_id: "general".into(),
+                    name: "General".into(),
+                }),
+            })
+            .await
+            .expect("submit block 4");
+        println!("\n[block 4] messaging <- CreateChannel(general)");
+        println!("  messaging root : {:?}", host.module_root("messaging").unwrap());
+        println!("  app-hash       : {:?}", out.app_hash);
+
+        let out = host
+            .submit(Msg {
+                target: "messaging".into(),
+                payload: messaging_encode_msg(&MessagingMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "m1".into(),
+                    author: "demo".into(),
+                    body: "hello channel".into(),
+                }),
+            })
+            .await
+            .expect("submit block 5");
+        let reply = host
+            .query("messaging", &messaging_encode_query(&MessagingQuery::Messages { channel_id: "general".into() }))
+            .await
+            .expect("query messaging");
+        if let MessagingReply::Messages(messages) = messaging_decode_reply(&reply).unwrap() {
+            println!("\n[block 5] messaging <- PostMessage(general, m1)");
+            println!("  message count  : {}", messages.len());
+            println!("  messaging root : {:?}", host.module_root("messaging").unwrap());
+            println!("  app-hash       : {:?}", out.app_hash);
+        }
+
+        // block 6: a NEW validator JOINs the permissionless ed25519 valset. derive
         // the key deterministically from a fixed seed (any 32 bytes is a valid
         // ed25519 seed) so the demo is reproducible. the valset root moves off
-        // ZERO and folds a 5th module's commitment into the app-hash.
+        // ZERO and folds another module's commitment into the app-hash.
         let seed = [7u8; 32];
         let new_validator = PrivateKey::decode(&seed[..])
             .expect("32-byte seed is a valid ed25519 private key")
@@ -137,8 +184,8 @@ fn main() {
                 payload: valset_encode_msg(&ValsetMsg::Join { key: new_validator.clone() }),
             })
             .await
-            .expect("submit block 4");
-        println!("\n[block 4] valset <- Join(ed25519 pubkey) — a new validator joins");
+            .expect("submit block 6");
+        println!("\n[block 6] valset <- Join(ed25519 pubkey) — a new validator joins");
         let reply = host
             .query("valset", &valset_encode_query(&ValsetQuery::Validators))
             .await
@@ -148,11 +195,11 @@ fn main() {
         println!("  valset root    : {:?}", host.module_root("valset").unwrap());
         println!("  app-hash       : {:?}", out.app_hash);
 
-        // block 5: the DOCUMENT module (ducktape's founding product, reborn as a
+        // block 7: the DOCUMENT module (ducktape's founding product, reborn as a
         // simple block-based store on qmdb). create a doc, insert two blocks, then
         // update one. each op is its own block (documents emit no follow-ups), and
         // the document's qmdb merkle root moves into the app-hash on every commit.
-        println!("\n[block 5] document <- CreateDoc + 2x InsertBlock + UpdateBlock");
+        println!("\n[block 7] document <- CreateDoc + 2x InsertBlock + UpdateBlock");
         host.submit(Msg {
             target: "document".into(),
             payload: doc_encode_msg(&DocMsg::CreateDoc { doc_id: "readme".into() }),
@@ -197,7 +244,7 @@ fn main() {
         }
 
         println!("\nmodule roots:");
-        for id in ["directory", "document", "forge", "greeter", "kv", "valset"] {
+        for id in ["directory", "document", "forge", "greeter", "kv", "messaging", "valset"] {
             println!("  {id:>10} : {:?}", host.module_root(id).unwrap());
         }
         println!("\nfinal app-hash   : {:?}", host.app_hash());
