@@ -42,6 +42,108 @@ impl Directory {
     pub fn get(&self, key: &str) -> Option<&String> {
         self.pending.get(key).or_else(|| self.entries.get(key))
     }
+
+    /// the state-based commitment for `entries`: a length-prefixed sha256 over
+    /// the sorted pairs. shared by `root()` and `install` so the root recomputed
+    /// from a decoded snapshot can never drift from the live algorithm.
+    fn root_of(entries: &BTreeMap<String, String>) -> StateRoot {
+        let mut h = Sha256::new();
+        h.update((entries.len() as u64).to_le_bytes());
+        for (k, v) in entries {
+            h.update((k.len() as u64).to_le_bytes());
+            h.update(k.as_bytes());
+            h.update((v.len() as u64).to_le_bytes());
+            h.update(v.as_bytes());
+        }
+        StateRoot(h.finalize().into())
+    }
+
+    // ---- state-sync ---------------------------------------------------------
+    // rebuild committed state from a peer's snapshot. the peer is untrusted —
+    // the expected root (obtained from consensus, not from the peer) is the
+    // trust anchor, and install fully verifies before it mutates.
+
+    /// deterministic canonical encoding of COMMITTED state: exactly the byte
+    /// stream `root()` hashes (le-u64 entry count, then sorted le-u64
+    /// length-prefixed key/value pairs), so `sha256(snapshot()) == root()` by
+    /// construction. staged writes are excluded — a snapshot is a
+    /// committed-state artifact.
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
+        for (k, v) in &self.entries {
+            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            out.extend_from_slice(k.as_bytes());
+            out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            out.extend_from_slice(v.as_bytes());
+        }
+        out
+    }
+
+    /// replace COMMITTED state with a peer-provided snapshot, gated on
+    /// `expected`. the bytes arrive from a byzantine peer, so decode is strict:
+    /// every declared length is checked against the remaining buffer before
+    /// anything is allocated, keys must be strictly ascending (the one order
+    /// `snapshot` emits — rejects duplicates and re-encodings), trailing bytes
+    /// are rejected, and the decoded state's recomputed root must equal
+    /// `expected`. verification completes BEFORE any mutation: on Err this
+    /// module's state (and `root()`) is byte-identical to before the call.
+    /// success also drops the staged overlay — the snapshot is the whole truth.
+    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
+        let mut off = 0usize;
+        let count = read_u64(bytes, &mut off)?;
+        // an entry costs at least its two 8-byte length prefixes, so a count the
+        // remaining buffer cannot possibly hold is rejected before the loop.
+        if count > ((bytes.len() - off) / 16) as u64 {
+            return Err(Error::Module("snapshot truncated".into()));
+        }
+        let mut entries: BTreeMap<String, String> = BTreeMap::new();
+        for _ in 0..count {
+            let key = read_string(bytes, &mut off)?;
+            let value = read_string(bytes, &mut off)?;
+            if entries.last_key_value().is_some_and(|(last, _)| *last >= key) {
+                return Err(Error::Module("snapshot keys not strictly ascending".into()));
+            }
+            entries.insert(key, value);
+        }
+        if off != bytes.len() {
+            return Err(Error::Module("snapshot has trailing bytes".into()));
+        }
+        if Self::root_of(&entries) != expected {
+            return Err(Error::Module("snapshot root mismatch".into()));
+        }
+        self.entries = entries;
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+/// read a le-u64 at `*off`, advancing it. the buffer is untrusted: truncation
+/// is an Err, never a panic.
+fn read_u64(bytes: &[u8], off: &mut usize) -> Result<u64, Error> {
+    let end = off
+        .checked_add(8)
+        .filter(|&end| end <= bytes.len())
+        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[*off..end]);
+    *off = end;
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// read a length-prefixed utf-8 string at `*off`. the declared length is
+/// validated against the REMAINING buffer before any allocation, so a forged
+/// length can neither oversize-allocate nor read out of bounds.
+fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, Error> {
+    let len = read_u64(bytes, off)?;
+    let len = usize::try_from(len).map_err(|_| Error::Module("snapshot truncated".into()))?;
+    if len > bytes.len() - *off {
+        return Err(Error::Module("snapshot truncated".into()));
+    }
+    let s = std::str::from_utf8(&bytes[*off..*off + len])
+        .map_err(|_| Error::Module("snapshot string is not utf-8".into()))?;
+    *off += len;
+    Ok(s.to_owned())
 }
 
 #[async_trait::async_trait(?Send)]
@@ -53,15 +155,7 @@ impl Module for Directory {
     /// state-based commitment: a length-prefixed sha256 over the sorted entries.
     /// order-independent (BTreeMap) and idempotent — f(current state), unlike qmdb.
     fn root(&self) -> StateRoot {
-        let mut h = Sha256::new();
-        h.update((self.entries.len() as u64).to_le_bytes());
-        for (k, v) in &self.entries {
-            h.update((k.len() as u64).to_le_bytes());
-            h.update(k.as_bytes());
-            h.update((v.len() as u64).to_le_bytes());
-            h.update(v.as_bytes());
-        }
-        StateRoot(h.finalize().into())
+        Directory::root_of(&self.entries)
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

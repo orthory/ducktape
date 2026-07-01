@@ -19,6 +19,12 @@
 //! hash differently: the `Trigger` block moves the app-hash even before any result
 //! exists, and the `OracleResult` block moves it again. that is what makes the
 //! async boundary observable in the authenticated state.
+//!
+//! a joiner rebuilds this module from a peer via [`SagaModule::snapshot`] /
+//! [`SagaModule::install`]: the snapshot ships the committed map in the exact
+//! canonical encoding `root()` hashes, and install re-derives the root from the
+//! decoded temporaries before adopting them — the consensus-agreed root, not the
+//! peer, is the trust anchor.
 
 use std::collections::BTreeMap;
 
@@ -37,6 +43,119 @@ struct Saga {
     status: SagaStatus,
     /// the oracle's agreed output, once `Done`.
     result: Option<Vec<u8>>,
+}
+
+/// canonical byte encoding of a committed saga map: u64-le count, then per saga
+/// in sorted-id order — u64-le id length + id bytes, u32-le step, one status
+/// discriminant byte, one result tag byte (0 absent / 1 present) with a u64-le
+/// length prefix when present. this is the exact preimage [`Module::root`]
+/// hashes, so a snapshot and the root that must authenticate it cannot drift.
+fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(sagas.len() as u64).to_le_bytes());
+    for (id, s) in sagas {
+        out.extend_from_slice(&(id.len() as u64).to_le_bytes());
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(&s.step.to_le_bytes());
+        out.push(match s.status {
+            SagaStatus::Pending => 0,
+            SagaStatus::Done => 1,
+        });
+        match &s.result {
+            None => out.push(0),
+            Some(r) => {
+                out.push(1);
+                out.extend_from_slice(&(r.len() as u64).to_le_bytes());
+                out.extend_from_slice(r);
+            }
+        }
+    }
+    out
+}
+
+/// the state-based commitment over a committed saga map — shared by `root()` and
+/// `install()` so the verification a snapshot must pass is definitionally the
+/// same algorithm the live module answers with.
+fn committed_root(sagas: &BTreeMap<String, Saga>) -> StateRoot {
+    StateRoot(Sha256::digest(encode_committed(sagas)).into())
+}
+
+/// pull `n` bytes off the front of `buf`, checked against the remaining input
+/// BEFORE any slicing — a lying length cannot over-read or panic.
+fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
+    if n > buf.len() {
+        return Err("snapshot truncated".into());
+    }
+    let (head, tail) = buf.split_at(n);
+    *buf = tail;
+    Ok(head)
+}
+
+fn take_u64(buf: &mut &[u8]) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(take(buf, 8)?.try_into().expect("8 bytes")))
+}
+
+fn take_u32(buf: &mut &[u8]) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(take(buf, 4)?.try_into().expect("4 bytes")))
+}
+
+/// a length prefix, validated against the remaining input before the caller
+/// allocates anything of that size.
+fn take_len(buf: &mut &[u8]) -> Result<usize, String> {
+    let n = take_u64(buf)?;
+    if n > buf.len() as u64 {
+        return Err("snapshot length prefix exceeds input".into());
+    }
+    Ok(n as usize)
+}
+
+/// strict decode of an [`encode_committed`] snapshot. the input is UNTRUSTED —
+/// it arrives from an arbitrary peer — so every count and length is bounded by
+/// the remaining input before allocation, ids must be strictly ascending (one
+/// byte encoding per state, and uniqueness for free), unknown discriminants are
+/// rejected, and trailing bytes are rejected. never panics on malformed input.
+fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
+    let count = take_u64(&mut buf)?;
+    // every saga costs at least its fixed-width fields, so a count the input
+    // cannot possibly hold is rejected before the loop builds anything.
+    const MIN_SAGA_BYTES: u64 = 8 + 4 + 1 + 1;
+    if count
+        .checked_mul(MIN_SAGA_BYTES)
+        .map_or(true, |need| need > buf.len() as u64)
+    {
+        return Err("snapshot saga count exceeds input".into());
+    }
+    let mut sagas: BTreeMap<String, Saga> = BTreeMap::new();
+    for _ in 0..count {
+        let id_len = take_len(&mut buf)?;
+        let id = std::str::from_utf8(take(&mut buf, id_len)?)
+            .map_err(|_| "snapshot saga id is not utf-8".to_string())?
+            .to_owned();
+        if let Some((last, _)) = sagas.iter().next_back() {
+            if last.as_str() >= id.as_str() {
+                return Err("snapshot saga ids not strictly ascending".into());
+            }
+        }
+        let step = take_u32(&mut buf)?;
+        let status = match take(&mut buf, 1)?[0] {
+            0 => SagaStatus::Pending,
+            1 => SagaStatus::Done,
+            d => return Err(format!("snapshot has unknown status discriminant {d}")),
+        };
+        let result = match take(&mut buf, 1)?[0] {
+            0 => None,
+            1 => {
+                let len = take_len(&mut buf)?;
+                Some(take(&mut buf, len)?.to_vec())
+            }
+            t => return Err(format!("snapshot has unknown result tag {t}")),
+        };
+        sagas.insert(id, Saga { step, status, result });
+    }
+    if !buf.is_empty() {
+        return Err("snapshot has trailing bytes".into());
+    }
+    Ok(sagas)
 }
 
 pub struct SagaModule {
@@ -67,6 +186,33 @@ impl SagaModule {
     fn view(saga: &Saga) -> SagaView {
         SagaView { step: saga.step, status: saga.status, result: saga.result.clone() }
     }
+
+    // ---- state-sync ---------------------------------------------------------
+    // hand a joiner the committed continuation state as canonical bytes; the
+    // consensus-agreed root — never the serving peer — decides whether they land.
+
+    /// serialize the COMMITTED continuation state (never the staged overlay) into
+    /// the canonical encoding `root()` commits to: sorted ids, fixed-width length
+    /// prefixes, single-byte enum discriminants. deterministic across nodes.
+    pub fn snapshot(&self) -> Vec<u8> {
+        encode_committed(&self.sagas)
+    }
+
+    /// adopt a peer's snapshot as own committed state — but only after the
+    /// decoded temporaries re-derive `expected` via the exact `root()` algorithm,
+    /// so a byzantine snapshot cannot land under an agreed root it doesn't match.
+    /// all-or-nothing: on any Err this module (and its root) is byte-identical to
+    /// before the call. on success the staged overlay is dropped — a snapshot
+    /// describes a block boundary, and nothing half-applied may shadow it.
+    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
+        let sagas = decode_committed(bytes).map_err(Error::Module)?;
+        if committed_root(&sagas) != expected {
+            return Err(Error::Module("snapshot does not match expected root".into()));
+        }
+        self.sagas = sagas;
+        self.pending.clear();
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -75,32 +221,13 @@ impl Module for SagaModule {
         self.id.clone()
     }
 
-    /// state-based commitment: a length-prefixed sha256 over the sorted sagas,
-    /// folding in (id, step, status-discriminant, result). order-independent and
-    /// idempotent — and, crucially, status-sensitive, so `Pending` and `Done`
-    /// yield distinct roots.
+    /// state-based commitment: sha256 over the canonical committed encoding — a
+    /// length-prefixed fold of (id, step, status-discriminant, result) in sorted
+    /// order. insertion-order-independent and idempotent — and, crucially,
+    /// status-sensitive, so `Pending` and `Done` yield distinct roots. the
+    /// preimage IS the snapshot encoding (see [`SagaModule::snapshot`]).
     fn root(&self) -> StateRoot {
-        let mut h = Sha256::new();
-        h.update((self.sagas.len() as u64).to_le_bytes());
-        for (id, s) in &self.sagas {
-            h.update((id.len() as u64).to_le_bytes());
-            h.update(id.as_bytes());
-            h.update(s.step.to_le_bytes());
-            let status: u8 = match s.status {
-                SagaStatus::Pending => 0,
-                SagaStatus::Done => 1,
-            };
-            h.update([status]);
-            match &s.result {
-                None => h.update([0u8]),
-                Some(r) => {
-                    h.update([1u8]);
-                    h.update((r.len() as u64).to_le_bytes());
-                    h.update(r);
-                }
-            }
-        }
-        StateRoot(h.finalize().into())
+        committed_root(&self.sagas)
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

@@ -13,6 +13,14 @@
 //! merges pending into committed; `abort_block` drops pending; `root()`
 //! reflects COMMITTED state only — a state-based (sorted, length-prefixed)
 //! sha256 over the validator set, so it is order-independent and idempotent.
+//!
+//! ## state-sync
+//!
+//! a joiner rebuilds this module from a peer via [`Valset::snapshot`] /
+//! [`Valset::install`]. the snapshot is the exact preimage of `root()`, so the
+//! joiner needs no trust in the serving peer: install recomputes the root of
+//! whatever bytes arrived and refuses to adopt them unless it matches the
+//! expected root consensus already agreed on.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,6 +93,118 @@ impl Valset {
         }
         set.into_iter().collect()
     }
+
+    // ---- state-sync ---------------------------------------------------------
+    // ship the committed set as its root preimage; adopt a peer's bytes only
+    // after re-deriving the root consensus expects — the root, not the peer, is
+    // the trust anchor.
+
+    /// canonical bytes of the COMMITTED set — exactly the byte stream `root()`
+    /// hashes: count u64-le, then per sorted key its len u64-le + key bytes. so
+    /// for a non-empty set `sha256(snapshot()) == root()`; an empty set snapshots
+    /// to a lone zero count (whose root is still `ZERO`, unhashed). pending is
+    /// deliberately excluded — a snapshot ships what consensus committed to, and
+    /// staged-but-uncommitted changes are not that.
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            8 + self.validators.iter().map(|k| 8 + k.len()).sum::<usize>(),
+        );
+        out.extend_from_slice(&(self.validators.len() as u64).to_le_bytes());
+        for k in &self.validators {
+            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            out.extend_from_slice(k);
+        }
+        out
+    }
+
+    /// replace committed state with a decoded snapshot, iff the decoded set's
+    /// recomputed root equals `expected`. decode and verification land in a
+    /// temporary: self is mutated only after both pass, so on any `Err` committed
+    /// state, pending, and `root()` are byte-identical to before the call.
+    /// success clears pending — staged changes belong to the state being
+    /// replaced, not the state being adopted.
+    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
+        let decoded = Self::decode_snapshot(bytes)?;
+        let root = Self::root_of(&decoded);
+        if root != expected {
+            return Err(Error::Module(format!(
+                "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
+            )));
+        }
+        self.validators = decoded;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves them).
+    /// the count and every key length are checked against the remaining buffer
+    /// BEFORE any allocation, truncation and trailing bytes both reject, and
+    /// keys must arrive strictly increasing — a given set has exactly one valid
+    /// encoding, so a peer cannot mint alternative byte streams for one state.
+    fn decode_snapshot(bytes: &[u8]) -> Result<BTreeSet<Vec<u8>>, Error> {
+        fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
+            let Some((head, rest)) = (*buf).split_first_chunk::<8>() else {
+                return Err(Error::Module("snapshot truncated".into()));
+            };
+            *buf = rest;
+            Ok(u64::from_le_bytes(*head))
+        }
+
+        let mut buf = bytes;
+        let count = take_u64(&mut buf)?;
+        // each entry costs at least its 8-byte length prefix, so a count the
+        // remaining bytes cannot possibly hold is rejected up front — a forged
+        // count never drives allocation.
+        if count > (buf.len() / 8) as u64 {
+            return Err(Error::Module(format!(
+                "snapshot count {count} exceeds the {} remaining bytes",
+                buf.len()
+            )));
+        }
+        let mut set = BTreeSet::new();
+        let mut prev: Option<&[u8]> = None;
+        for _ in 0..count {
+            let len = take_u64(&mut buf)?;
+            if len > buf.len() as u64 {
+                return Err(Error::Module(format!(
+                    "snapshot key length {len} exceeds the {} remaining bytes",
+                    buf.len()
+                )));
+            }
+            let (key, rest) = buf.split_at(len as usize);
+            buf = rest;
+            if prev.is_some_and(|p| p >= key) {
+                return Err(Error::Module(
+                    "snapshot keys must be strictly increasing".into(),
+                ));
+            }
+            prev = Some(key);
+            set.insert(key.to_vec());
+        }
+        if !buf.is_empty() {
+            return Err(Error::Module(format!(
+                "snapshot carries {} trailing bytes",
+                buf.len()
+            )));
+        }
+        Ok(set)
+    }
+
+    /// the state-based commitment for `set`: `ZERO` when empty, else sha256 over
+    /// exactly the bytes `snapshot` emits. shared by `root()` (committed state)
+    /// and `install` (a decoded candidate), so the two can never drift.
+    fn root_of(set: &BTreeSet<Vec<u8>>) -> StateRoot {
+        if set.is_empty() {
+            return StateRoot::ZERO;
+        }
+        let mut h = Sha256::new();
+        h.update((set.len() as u64).to_le_bytes());
+        for k in set {
+            h.update((k.len() as u64).to_le_bytes());
+            h.update(k);
+        }
+        StateRoot(h.finalize().into())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -98,16 +218,7 @@ impl Module for Valset {
     /// an empty set reports `ZERO` — an empty/uninitialized module (matching the
     /// sdk `StateRoot::ZERO` doc and forge's unborn-repo root).
     fn root(&self) -> StateRoot {
-        if self.validators.is_empty() {
-            return StateRoot::ZERO;
-        }
-        let mut h = Sha256::new();
-        h.update((self.validators.len() as u64).to_le_bytes());
-        for k in &self.validators {
-            h.update((k.len() as u64).to_le_bytes());
-            h.update(k);
-        }
-        StateRoot(h.finalize().into())
+        Self::root_of(&self.validators)
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -302,5 +413,124 @@ mod tests {
 
         assert!(validators(&v).is_empty(), "aborted join added no validator");
         assert_eq!(v.root(), before, "root is unchanged after a rolled-back block");
+    }
+
+    #[test]
+    fn snapshot_install_round_trip_reconstructs_root_and_membership() {
+        // SOURCE: three validators through the real execute(Join)+commit_block
+        // path, so the snapshot ships state that consensus actually committed.
+        let mut src = Valset::new("valset");
+        let mut ctx = TestCtx::new();
+        for b in [1u8, 2, 3] {
+            futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
+        }
+        futures::executor::block_on(src.commit_block()).unwrap();
+        let src_root = src.root();
+        assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
+
+        // the snapshot IS the root preimage: hashing it reproduces root(), so
+        // snapshot and root can never encode two different states.
+        let bytes = src.snapshot();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(StateRoot(digest), src_root, "sha256(snapshot()) == root()");
+
+        // TARGET: a fresh set with an unrelated join STAGED — install must drop
+        // it, or the stale stage would leak into the post-install view.
+        let mut dst = Valset::new("valset");
+        let mut dctx = TestCtx::new();
+        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
+
+        dst.install(&bytes, src_root).unwrap();
+        assert_eq!(dst.root(), src_root, "installed root equals the source root");
+        assert_eq!(validators(&dst), validators(&src), "query parity after install");
+    }
+
+    #[test]
+    fn tampered_snapshot_is_rejected_and_the_target_is_untouched() {
+        let mut src = Valset::new("valset");
+        let mut ctx = TestCtx::new();
+        for b in [4u8, 5] {
+            futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
+        }
+        futures::executor::block_on(src.commit_block()).unwrap();
+        let src_root = src.root();
+
+        // flip one bit inside the LAST key: count, lengths, and sort order all
+        // still hold, so structural decode alone cannot catch it — only the
+        // recomputed-root check can. exactly the byzantine-payload case.
+        let mut bytes = src.snapshot();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+
+        // the TARGET already holds committed membership AND a staged join: a
+        // failed install must leave every layer untouched, not merely "still
+        // empty" — a cleared-on-err bug is invisible against an empty target.
+        let mut dst = Valset::new("valset");
+        let mut dctx = TestCtx::new();
+        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(8)))).unwrap();
+        futures::executor::block_on(dst.commit_block()).unwrap();
+        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
+        let pre_root = dst.root();
+        let pre_view = validators(&dst);
+
+        let err = dst.install(&bytes, src_root).unwrap_err();
+        assert!(matches!(err, Error::Module(_)), "tampered snapshot errs with Module");
+        assert_eq!(dst.root(), pre_root, "failed install leaves the committed root untouched");
+        assert_eq!(validators(&dst), pre_view, "failed install leaves membership and stage untouched");
+    }
+
+    #[test]
+    fn truncated_or_trailing_bytes_are_rejected_and_leave_state_intact() {
+        let mut src = Valset::new("valset");
+        let mut ctx = TestCtx::new();
+        for b in [6u8, 7] {
+            futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
+        }
+        futures::executor::block_on(src.commit_block()).unwrap();
+        let src_root = src.root();
+        let bytes = src.snapshot();
+
+        // the target has COMMITTED state of its own plus a STAGED join — every
+        // failed install must leave both exactly as they were, a stronger claim
+        // than "empty stays empty".
+        let mut dst = Valset::new("valset");
+        let mut dctx = TestCtx::new();
+        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(8)))).unwrap();
+        futures::executor::block_on(dst.commit_block()).unwrap();
+        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
+        let before_root = dst.root();
+        let before_view = validators(&dst);
+
+        // truncation: the final key byte is missing.
+        assert!(dst.install(&bytes[..bytes.len() - 1], src_root).is_err());
+        // trailing garbage: one byte past a well-formed stream.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(dst.install(&trailing, src_root).is_err());
+        // forged count: claims more entries than the buffer could possibly hold —
+        // rejected before any allocation.
+        let mut forged = bytes.clone();
+        forged[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(dst.install(&forged, src_root).is_err());
+
+        assert_eq!(dst.root(), before_root, "a failed install moved the root");
+        assert_eq!(
+            validators(&dst),
+            before_view,
+            "a failed install changed membership or dropped the stage"
+        );
+    }
+
+    #[test]
+    fn empty_snapshot_installs_onto_an_empty_set() {
+        let src = Valset::new("valset");
+        assert_eq!(src.root(), StateRoot::ZERO);
+        let bytes = src.snapshot();
+        assert_eq!(bytes, 0u64.to_le_bytes().to_vec(), "an empty set is a lone zero count");
+
+        let mut dst = Valset::new("valset");
+        dst.install(&bytes, StateRoot::ZERO).unwrap();
+        assert_eq!(dst.root(), StateRoot::ZERO);
+        assert!(validators(&dst).is_empty());
     }
 }
