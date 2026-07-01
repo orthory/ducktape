@@ -14,19 +14,21 @@
 //! (b) `discovery::Network` channels instead of `simulated::Network`, and (c) a
 //! per-process `ContentStore`.
 //!
-//! payload dissemination is sidestepped honestly by CONTENT-ADDRESSING: every
-//! node submits the byte-identical startup op, so every process independently
-//! `put`s the same bytes under the same sha256 digest into its own store. when
-//! simplex finalizes that digest each node's reporter resolves it locally — no
-//! shared store, no gossip relay needed (the crate's `NoopRelay` is correct
-//! as-is). this removes the payload-availability problem; it does NOT remove the
-//! cross-process AGREEMENT requirement — with N nodes, quorum votes still have to
-//! cross the real TCP mesh before anything finalizes.
+//! payload dissemination is REAL: each process submits a DISTINCT op (node N
+//! writes directory key `kN`), so a peer that finalizes another node's op-digest
+//! has NO local bytes for it. `SimplexOrderer::spawn_with_relay` wires a
+//! `ConsensusRelay` that, at propose time, gossips the proposed frame's bytes to
+//! all peers on `CHANNEL_PAYLOAD`; every peer's STORE-ONLY drain caches them, so
+//! when that digest finalizes the reporter resolves it locally and delivers it in
+//! BFT order. content-addressing IS the verification (the drain re-hashes on
+//! receipt). this is what lets DISTINCT ops converge across processes with
+//! per-process stores — quorum votes still cross the real TCP mesh to finalize.
 //!
-//! each process prints two greppable lines: its GENESIS app-hash at startup and
-//! its CONVERGED app-hash the first time consensus moves it off genesis. the demo
-//! script asserts every process's genesis line agrees (no pre-op fork) and every
-//! process's converged line agrees (real cross-process BFT convergence).
+//! each process prints its GENESIS app-hash at startup and its CONVERGED app-hash
+//! once it has applied ALL N ops (its own AND every peer's). the demo script
+//! asserts every process's genesis line agrees (no pre-op fork) and every
+//! process's converged line agrees (both distinct ops applied everywhere — real
+//! cross-process BFT convergence over relayed payloads).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -44,7 +46,7 @@ use consensus::{digest_of, ContentStore, Digest, SimplexOrderer};
 use directory::Directory;
 use host::Host;
 use kv::Kv;
-use kv_interface::{encode, KvMsg};
+use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
 use node::OrderedNode;
 use sdk::{Msg, StateRoot};
 
@@ -56,6 +58,12 @@ const PEER_SET: u64 = 0;
 const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
+/// the dedicated channel the eager relay gossips proposed op-batch PAYLOAD
+/// bytes on. vote(0)/cert(1)/resolver(2) are the simplex engine's; 3 is the
+/// next free index (the leader broadcasts here at propose time; every peer's
+/// store-only drain caches the bytes so its reporter resolves the finalized
+/// digest for an op it did NOT originate).
+const CHANNEL_PAYLOAD: u64 = 3;
 
 /// the plain-data node config, parsed from toml. mirrors legacy examples/node*.toml
 /// (seed identity, listen/advertised addrs, shared namespace + authorized peer
@@ -186,13 +194,18 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         oracle.track(PEER_SET, participants.clone());
 
         // the simplex engine's three sub-channels, consumed positionally by
-        // `engine.start(vote, certificate, resolver)`. no payload/fetch channels —
-        // content-addressing (identical op on every node) makes the NoopRelay
-        // correct, so dissemination is unnecessary.
+        // `engine.start(vote, certificate, resolver)`, PLUS a fourth for eager
+        // payload dissemination (CHANNEL_PAYLOAD): with per-process stores and
+        // DISTINCT ops, a peer finalizes a digest whose bytes it never staged, so
+        // the leader must gossip the payload for the reporter to resolve it.
         let quota = Quota::per_second(NZU32!(128));
         let vote = network.register(0, quota, MAX_BACKLOG);
         let certificate = network.register(1, quota, MAX_BACKLOG);
         let resolver = network.register(2, quota, MAX_BACKLOG);
+        // the eager relay's gossip lane. registered BEFORE network.start() so its
+        // receiver buffers from the start; the drain is spawned inside
+        // `spawn_with_relay`.
+        let payload = network.register(CHANNEL_PAYLOAD, quota, MAX_BACKLOG);
 
         // start the network actors (dialer/listener/router/tracker). registered
         // receivers buffer regardless, so starting before the engine is fine.
@@ -217,8 +230,9 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         let genesis_floor: Digest =
             digest_of(&[b"ducktape:consensus:genesis:v1:".as_ref(), &namespace].concat());
 
-        // per-process content store (NOT shared across processes). the identical
-        // startup op means every process holds the finalized digest's bytes.
+        // per-process content store (NOT shared across processes). the ONLY paths
+        // into it are this node's own `submit` and the payload drain (peer-relayed
+        // bytes) — so applying a peer's op is proof the relay crossed the wire.
         let store = ContentStore::new();
 
         // the live simplex Engine, wired to a fresh SimplexOrderer — REUSED
@@ -226,7 +240,7 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         // is an FS-safe per-node partition. the engine keepalive handle lives
         // inside the returned orderer (held by the OrderedNode below, which the
         // loop never drops — so the engine never aborts).
-        let orderer = SimplexOrderer::spawn(
+        let orderer = SimplexOrderer::spawn_with_relay(
             context.child("consensus"),
             scheme,
             oracle.clone(),
@@ -237,6 +251,7 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
             vote,
             certificate,
             resolver,
+            payload,
         );
         let mut node = OrderedNode::new(host, orderer);
 
@@ -245,29 +260,52 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         let genesis_hash = node.app_hash();
         println!("[node #{id}] genesis app_hash={}", hex(&genesis_hash));
 
-        // introduce the op: EVERY node submits the byte-identical startup frame.
-        // identical (origin, seq, msg) -> identical frame -> identical digest, so
-        // every node's store already holds the bytes when that digest finalizes.
-        // ONE submit — the automaton PEEKS (never pops), so the digest rides out
-        // every nullified early view until the mesh forms and a leader proposes it
-        // (no resend loop needed — that was the gossip lane's crutch).
+        // introduce a DISTINCT op per process: node N writes directory key "kN" =
+        // "node-N". distinct key + distinct origin -> distinct frame -> distinct
+        // sha256 digest, so a peer that finalizes THIS op's digest has NO local
+        // bytes for it — unless the leader's relay gossiped them on CHANNEL_PAYLOAD
+        // and this process's store-only drain cached them. directory is order-
+        // INDEPENDENT, so both nodes converge on {k0=node-0, k1=node-1} under any
+        // interleaving, isolating the property under test (did the peer's payload
+        // cross the wire?) from op ordering. ONE submit — the automaton PEEKS
+        // (never pops), so the digest rides out every nullified early view until
+        // the mesh forms and this node leads and proposes it.
         let op = Msg {
-            target: "kv".into(),
-            payload: encode(&KvMsg::Set { key: b"startup".to_vec(), value: b"1".to_vec() }),
+            target: "directory".into(),
+            payload: encode_msg(&DirMsg::Set { key: format!("k{id}"), value: format!("node-{id}") }),
         };
-        node.submit(b"startup", 0, op).await.expect("submit startup op");
+        node.submit(format!("node{id}").as_bytes(), 0, op).await.expect("submit op");
 
         // pump: drain finalized frames on an interval and apply them in agreed
-        // (ascending-view) order. print ONCE the first time the app-hash moves off
-        // genesis — that only happens after a real simplex finalization delivered
-        // the op across the mesh. this infinite loop IS the "run forever" park.
+        // (ascending-view) order. print `converged` ONCE this node has applied ALL
+        // N ops — CRUCIALLY including the peer's op it never originated, whose bytes
+        // reached this process ONLY via the relay -> store-only drain. a node that
+        // only ever got its own op stalls at applied < N and never prints — that is
+        // the relay-broken / broadcast-lost signature. because the per-process
+        // store fills from exactly two sources (own submit + payload drain),
+        // applied == N is unforgeable evidence the peer's bytes crossed the wire.
+        // this infinite loop IS the "run forever" park (keeps the mesh alive).
+        let expected = cfg.peer_seeds.len();
+        let mut applied = 0usize;
         let mut converged = false;
         loop {
             context.sleep(Duration::from_millis(100)).await;
-            node.drain_delivered().await.expect("drain delivered");
-            let h = node.app_hash();
-            if !converged && h != genesis_hash {
+            applied += node.drain_delivered().await.expect("drain delivered");
+            if !converged && applied >= expected {
+                let h = node.app_hash();
                 println!("[node #{id}] converged app_hash={}", hex(&h));
+                // dump every directory key so the demo can eyeball BOTH ops applied
+                // (each node ends holding the op it originated AND the peer's).
+                for k in 0..expected {
+                    let reply = node
+                        .host()
+                        .query("directory", &encode_query(&DirQuery::Get { key: format!("k{k}") }))
+                        .await
+                        .expect("directory query");
+                    if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
+                        println!("[node #{id}]   directory k{k}={v:?}");
+                    }
+                }
                 converged = true;
             }
         }

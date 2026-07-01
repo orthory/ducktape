@@ -21,6 +21,7 @@ sdk = { workspace = true }
 kv = { workspace = true }
 kv-interface = { workspace = true }
 directory = { workspace = true }
+directory-interface = { workspace = true }
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }

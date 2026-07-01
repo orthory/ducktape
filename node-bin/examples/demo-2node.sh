@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # two REAL commonware ducktape nodes as separate OS processes — the payoff: both
-# processes CONVERGE on a byte-identical app-hash over real localhost TCP, driven
-# by a live simplex BFT engine (NOT gossip). each node submits the identical
-# startup op; simplex finalizes it; every node applies it in agreed order and
-# prints its converged app-hash. the two commands that matter:
+# processes CONVERGE on a byte-identical app-hash over real localhost TCP after
+# each applies BOTH nodes' ops, driven by a live simplex BFT engine (NOT gossip).
+# node 0 submits DISTINCT op A (directory k0=node-0), node 1 submits DISTINCT op B
+# (k1=node-1). with PER-PROCESS content stores a node has NO bytes for the op it
+# did not originate, so it can only apply the peer's op if the leader's eager
+# relay gossiped the payload on CHANNEL_PAYLOAD and this node's store-only drain
+# cached it. each node prints `converged` only once it has applied ALL N ops. the
+# two commands that matter:
 #
 #   ducktape-node --config examples/node0.toml   # bootstrapper
 #   ducktape-node --config examples/node1.toml   # dials node 0
 #
-# the assertion is three-part (each part diagnoses a distinct failure mode):
+# the assertion is four-part (each part diagnoses a distinct failure mode):
 #   1. both GENESIS app-hashes agree      -> no pre-op fork (genesis determinism)
-#   2. both CONVERGED app-hashes present  -> consensus actually finalized (no stall)
+#   2. both CONVERGED app-hashes present  -> both nodes applied BOTH ops; a node
+#      stuck at only its own op never prints (relay broken OR broadcast lost)
 #   3. both CONVERGED app-hashes agree    -> real cross-process BFT convergence
+#   4. converged != genesis               -> ops actually applied
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -67,7 +73,7 @@ if [ -z "$gen0" ] || [ "$gen0" != "$gen1" ]; then
   echo "FAIL: genesis app-hashes disagree or missing (pre-op fork / genesis nondeterminism)"; exit 1
 fi
 if [ "$status" -ne 0 ] || [ -z "$conv0" ] || [ -z "$conv1" ]; then
-  echo "FAIL: a node did not converge within ~60s (consensus stalled — mesh never formed / no quorum)"; exit 1
+  echo "FAIL: a node never converged within ~60s — it applied only its own op; the peer payload never delivered (relay broken or broadcast lost / mesh never formed / no quorum)"; exit 1
 fi
 if [ "$conv0" != "$conv1" ]; then
   echo "FAIL: converged app-hashes DISAGREE (cross-process fork): $conv0 != $conv1"; exit 1

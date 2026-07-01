@@ -22,12 +22,15 @@
 //!    an op survives any number of nullified views yet applies at most once.
 //!
 //! 3. **payload availability.** simplex orders opaque `sha256(frame)` DIGESTS,
-//!    not payloads. the frame bytes reach non-proposers via a shared
-//!    [`ContentStore`] (the deterministic-in-process-sim simplification — one
-//!    store cloned into every validator's handle + reporter). the ORDER still
-//!    comes purely from finalization; the store only resolves an already-agreed
-//!    digest back to bytes. a real deployment swaps this for the legacy relay +
-//!    resolver dissemination behind the same seam.
+//!    not payloads. two constructors resolve the bytes behind a finalized digest:
+//!    [`SimplexOrderer::spawn`] uses a [`NoopRelay`] over one shared
+//!    [`ContentStore`] (the in-process-sim simplification — one store cloned into
+//!    every validator), while [`SimplexOrderer::spawn_with_relay`] runs a real
+//!    [`ConsensusRelay`] over a PER-PROCESS store: the leader gossips a proposed
+//!    frame's bytes at propose time, peers cache them STORE-ONLY (see
+//!    [`spawn_payload_drain`]), so a non-proposer resolves a digest for an op it
+//!    never originated. either way the ORDER comes purely from finalization; the
+//!    store only resolves an already-agreed digest back to bytes.
 //!
 //! the whole thing is additive: `node::Orderer` / `OrderedNode` / the frame
 //! codec / `RoundOrderer` are all UNCHANGED — `SimplexOrderer` slots in behind
@@ -48,6 +51,8 @@ use commonware_cryptography::certificate::Scheme;
 use commonware_cryptography::{sha256, Hasher, Sha256};
 use commonware_utils::channel::oneshot;
 use commonware_utils::channel::fallible::OneshotExt;
+use commonware_p2p::{Recipients, Sender};
+use commonware_runtime::IoBuf;
 
 /// the concrete digest the consensus lane orders over: a sha256 of the frame
 /// bytes. fixing it here lets the [`ContentStore`] key on a plain `Copy` type.
@@ -241,6 +246,97 @@ where
 }
 
 // ============================================================================
+// the eager gossip relay — disseminates a proposed frame's bytes to peers.
+// ============================================================================
+
+/// the real relay: on the leader's propose, gossips the proposed frame's full
+/// bytes to every peer so non-proposers — which learn only the DIGEST through
+/// consensus — can resolve it. simplex hands `broadcast` the digest of the frame
+/// the leader is proposing; we look those bytes up in the per-process
+/// [`ContentStore`] (the proposer staged them on `submit`) and `send` them to
+/// `Recipients::All` on a dedicated payload channel. peers drain that channel
+/// STORE-ONLY (see [`spawn_payload_drain`]), so when the digest later finalizes
+/// their reporter resolves `store.get(&digest)` and delivers — via the SAME
+/// finalization path the proposer uses.
+///
+/// content-addressing IS the verification: the receiver re-hashes the bytes as
+/// the store key, so byzantine garbage stores under its own hash and can never
+/// match a finalized digest — no signature check needed.
+///
+/// generic over the gossip `Sender` `S` (so the production discovery sender and a
+/// test simulated sender both plug in) and over the public key `P` for the
+/// [`Relay`] trait. `broadcast` is synchronous and `Sender::send` is too, so this
+/// fits the trait with no actor/await — it clones the (cheap) sender per call.
+#[derive(Clone)]
+pub struct ConsensusRelay<S, P> {
+    store: ContentStore,
+    /// gossip sender for the dedicated payload channel. cloned per `broadcast`.
+    sender: S,
+    _marker: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<S, P> ConsensusRelay<S, P> {
+    /// `sender` gossips on the payload channel; `store` MUST be the same
+    /// [`ContentStore`] the proposer staged into and the reporter resolves from.
+    pub fn new(sender: S, store: ContentStore) -> Self {
+        Self { store, sender, _marker: std::marker::PhantomData }
+    }
+}
+
+impl<S, P> Relay for ConsensusRelay<S, P>
+where
+    S: Sender + Clone + Send + Sync + 'static,
+    P: commonware_cryptography::PublicKey,
+{
+    type Digest = Digest;
+    type PublicKey = P;
+    type Plan = Plan<P>;
+
+    fn broadcast(&mut self, payload: Self::Digest, _plan: Self::Plan) -> Feedback {
+        // gossip the proposed frame's bytes to every peer so non-proposers can
+        // resolve the digest when it finalizes. if we don't hold the bytes (we're
+        // not the proposer, or never staged this digest) there's nothing to relay
+        // — accept and move on. `Sender::send` is synchronous (returns the
+        // recipients it will attempt, no await), so this fits the sync signature;
+        // best-effort — offline peers are skipped and the proposer re-gossips each
+        // leadership turn (propose peeks-until-finalized, re-firing until commit).
+        if let Some(bytes) = self.store.get(&payload) {
+            let mut sender = self.sender.clone();
+            let _ = sender.send(Recipients::All, IoBuf::from(bytes), false);
+        }
+        Feedback::Ok
+    }
+}
+
+/// spawn a task that drains the payload-gossip channel, caching each received
+/// frame's bytes into the per-process [`ContentStore`] and doing NOTHING else.
+///
+/// this is how a non-proposer obtains the bytes behind a digest the leader's
+/// [`ConsensusRelay`] broadcast, so that when that digest later finalizes the
+/// reporter's `store.get(&digest)` resolves and delivers it — in BFT-agreed
+/// order, via the SAME finalization path the proposer uses.
+///
+/// THE ONE TRAP OF THIS DESIGN: this NEVER forwards into the app's finalized
+/// inbox / the pending FIFO. emitting the frame here would surface it to the app
+/// pre-finalization (out of BFT order, and then AGAIN on finalization). a payload
+/// receipt does exactly one thing — `store.put`. `ContentStore::put` re-hashes
+/// the bytes as the key, so byzantine garbage stores under its own hash and can
+/// never match a finalized digest; content-addressing is the whole verification.
+fn spawn_payload_drain<E, R>(context: E, mut receiver: R, store: ContentStore)
+where
+    E: commonware_runtime::Spawner + Send + 'static,
+    R: commonware_p2p::Receiver + Send + 'static,
+{
+    context.spawn(move |_ctx| async move {
+        while let Ok((_peer, msg)) = receiver.recv().await {
+            let bytes: Vec<u8> = msg.into();
+            // store-ONLY: NO delivery. delivery stays the reporter's finalization arm.
+            store.put(bytes);
+        }
+    });
+}
+
+// ============================================================================
 // the finalized inbox — the sync-reporter -> async-drain buffer (cost 1).
 // ============================================================================
 
@@ -410,7 +506,7 @@ impl SimplexOrderer {
     /// `engine.start`). config is the tuned legacy default. the engine's keepalive
     /// handle lives inside the returned orderer — dropping it aborts the engine.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn<E, B, VS, VR, CS, CR, RS, RR>(
+    fn build<E, B, R, VS, VR, CS, CR, RS, RR>(
         context: E,
         scheme: commonware_consensus::simplex::scheme::ed25519::Scheme,
         blocker: B,
@@ -418,6 +514,7 @@ impl SimplexOrderer {
         epoch: commonware_consensus::types::Epoch,
         genesis: Digest,
         store: ContentStore,
+        relay: R,
         vote: (VS, VR),
         certificate: (CS, CR),
         resolver: (RS, RR),
@@ -433,6 +530,11 @@ impl SimplexOrderer {
             + Sync
             + 'static,
         B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        R: Relay<
+                Digest = Digest,
+                PublicKey = commonware_cryptography::ed25519::PublicKey,
+                Plan = Plan<commonware_cryptography::ed25519::PublicKey>,
+            > + Send + 'static,
         VS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         VR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         CS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
@@ -461,7 +563,6 @@ impl SimplexOrderer {
         let reporter = SimplexReporter::<
             commonware_consensus::simplex::scheme::ed25519::Scheme,
         >::new(store.clone(), automaton.pending(), inbox.clone());
-        let relay = NoopRelay::<ed25519::PublicKey>::new();
 
         // page cache borrows the pooler context BEFORE we hand a child to Engine.
         let page_cache = CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10));
@@ -496,6 +597,109 @@ impl SimplexOrderer {
         let engine_handle = engine.start(vote, certificate, resolver);
 
         SimplexOrderer { handle, inbox, _engine: engine_handle }
+    }
+
+    /// stand up a live simplex engine with a [`NoopRelay`] — the in-process-sim
+    /// path where ONE [`ContentStore`] is cloned into every validator, so there is
+    /// nothing to disseminate. signature UNCHANGED from before the relay split, so
+    /// the in-sim proof calls this untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn<E, B, VS, VR, CS, CR, RS, RR>(
+        context: E,
+        scheme: commonware_consensus::simplex::scheme::ed25519::Scheme,
+        blocker: B,
+        partition: String,
+        epoch: commonware_consensus::types::Epoch,
+        genesis: Digest,
+        store: ContentStore,
+        vote: (VS, VR),
+        certificate: (CS, CR),
+        resolver: (RS, RR),
+    ) -> Self
+    where
+        E: commonware_runtime::Spawner
+            + commonware_runtime::Clock
+            + commonware_runtime::Storage
+            + commonware_runtime::Metrics
+            + commonware_runtime::BufferPooler
+            + rand_core::CryptoRngCore
+            + Send
+            + Sync
+            + 'static,
+        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        VS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        VR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        CS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        CR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        RS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        RR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    {
+        let relay = NoopRelay::<commonware_cryptography::ed25519::PublicKey>::new();
+        Self::build(
+            context, scheme, blocker, partition, epoch, genesis, store, relay, vote,
+            certificate, resolver,
+        )
+    }
+
+    /// stand up a live simplex engine with a real [`ConsensusRelay`] over a
+    /// PER-PROCESS [`ContentStore`] — the real-socket path. `payload` is a
+    /// dedicated p2p channel pair: at propose time the relay gossips the proposed
+    /// frame's bytes to all peers on its sender, and a STORE-ONLY drain
+    /// ([`spawn_payload_drain`]) caches every peer-relayed frame into `store` from
+    /// its receiver. a peer thereby holds the bytes behind a digest it never
+    /// originated, so when that digest finalizes its reporter resolves and delivers
+    /// it — in BFT order, via the SAME finalization arm the proposer uses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_relay<E, B, PS, PR, VS, VR, CS, CR, RS, RR>(
+        context: E,
+        scheme: commonware_consensus::simplex::scheme::ed25519::Scheme,
+        blocker: B,
+        partition: String,
+        epoch: commonware_consensus::types::Epoch,
+        genesis: Digest,
+        store: ContentStore,
+        vote: (VS, VR),
+        certificate: (CS, CR),
+        resolver: (RS, RR),
+        payload: (PS, PR),
+    ) -> Self
+    where
+        E: commonware_runtime::Spawner
+            + commonware_runtime::Clock
+            + commonware_runtime::Storage
+            + commonware_runtime::Metrics
+            + commonware_runtime::BufferPooler
+            + rand_core::CryptoRngCore
+            + Send
+            + Sync
+            + 'static,
+        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        PS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        PR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>
+            + Send
+            + 'static,
+        VS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        VR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        CS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        CR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        RS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        RR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    {
+        let (payload_sender, payload_receiver) = payload;
+        // store-ONLY drain: cache peer-relayed frames into THIS process's store.
+        spawn_payload_drain(context.child("payload_drain"), payload_receiver, store.clone());
+        let relay = ConsensusRelay::<PS, commonware_cryptography::ed25519::PublicKey>::new(
+            payload_sender,
+            store.clone(),
+        );
+        Self::build(
+            context, scheme, blocker, partition, epoch, genesis, store, relay, vote,
+            certificate, resolver,
+        )
     }
 }
 
