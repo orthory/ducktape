@@ -2,11 +2,20 @@
 //!
 //! a document is an ORDERED LIST of [`Block`]s (no markdown), keyed by `doc_id`.
 //! many documents live in ONE qmdb `any/unordered/variable` database: the qmdb
-//! key is the `doc_id` bytes and the value is the whole document serialized as a
+//! key is `sha256(doc_id)` and the value is the whole document serialized as a
 //! json `Vec<Block>` (whole-doc-per-key — the simple MVP; a per-block ordered-KV
 //! is a later optimization). the module's authenticated [`StateRoot`] IS the
 //! qmdb merkle root, refreshed on every committed write, so it folds straight
 //! into the global app-hash next to a git HEAD oid or another qmdb root.
+//!
+//! ## keys are hashed to a fixed width
+//!
+//! the logical key is the `doc_id` string at the interface seam, but the qmdb
+//! key is `sha256(doc_id)` — a fixed 32-byte [`commonware_utils`] `Array`. this
+//! mirrors the kv module and is load-bearing: commonware's state-sync resolvers
+//! for the overwriteable variable db are bounded on `K: Array`. the cost is that
+//! the store commits to `hash(doc_id) -> doc` and cannot enumerate doc ids — a
+//! by-id document store never needs to.
 //!
 //! ## host-lent staging (mirrors the `kv` module)
 //!
@@ -17,30 +26,111 @@
 //! `abort_block` drops the overlay so a failed block leaves no trace. this is
 //! kv's staging pattern verbatim; the only document-specific code is the
 //! `Vec<Block>` (de)serialization and the per-op list surgery.
+//!
+//! ## state-sync
+//!
+//! a joiner (dynamic-valset catch-up, a fresh full node, crash recovery) rebuilds
+//! this store from a peer via [`Document::sync_target`] / [`Document::sync_from`],
+//! delegating to commonware's qmdb `sync` engine: the reconstructed store's root
+//! equals the source root, and every fetched batch is merkle-verified against
+//! that root, so the source is untrusted — the root is the trust anchor.
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 
 use commonware_codec::RangeCfg;
-use commonware_cryptography::Sha256;
+use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::Sequential;
 use commonware_runtime::{buffer::paged::CacheRef, BufferPooler};
 use commonware_storage::{
     journal, mmr,
-    qmdb::any::{unordered::variable::Db, VariableConfig},
+    qmdb::{
+        any::{unordered::variable::Db, VariableConfig},
+        sync::{self, engine::Config as SyncConfig, DbResolver, Target},
+    },
     translator::TwoCap,
     Context,
 };
+use commonware_utils::range::NonEmptyRange;
 
 use document_interface::{
     decode_msg, decode_query, encode_reply, Block, DocMsg, DocQuery, DocReply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 
-/// the concrete qmdb store — byte keys/values, sha256 hasher, two-byte
-/// translator, sequential (deterministic) merkle strategy. identical params to
-/// the kv module's `KvDb`, so all qmdb plumbing is shared verbatim.
-type DocDb<E> = Db<mmr::Family, E, Vec<u8>, Vec<u8>, Sha256, TwoCap, Sequential>;
+/// the qmdb key: a fixed 32-byte sha256 digest of the `doc_id`. fixed width is
+/// what lets a store be state-synced (commonware's resolvers require `K: Array`).
+type DocKey = <Sha256 as Hasher>::Digest;
+
+/// the concrete qmdb store — 32-byte hashed doc-id keys, variable byte values,
+/// sha256 hasher, two-byte translator, sequential (deterministic) merkle
+/// strategy. identical params to the kv module's `KvDb`, so all qmdb plumbing is
+/// shared verbatim.
+type DocDb<E> = Db<mmr::Family, E, DocKey, Vec<u8>, Sha256, TwoCap, Sequential>;
+
+/// the qmdb configuration for a document store — shared by [`Document::init`]
+/// (fresh open) and [`Document::sync_from`] (state-sync target) so a synced
+/// store's storage layout is byte-identical to a freshly-opened one. the key
+/// codec cfg is `()` (fixed width); only the variable value carries a
+/// [`RangeCfg`].
+type DocConfig = VariableConfig<TwoCap, ((), (RangeCfg<usize>, ())), Sequential>;
+
+/// a state-sync target: a qmdb merkle root plus the operation range a joiner
+/// must pull to reconstruct a store with an identical root. produced by
+/// [`Document::sync_target`], consumed by [`Document::sync_from`].
+pub type DocTarget = Target<mmr::Family, DocKey>;
+
+/// hash a `doc_id` to its fixed-width qmdb key. deterministic, so every
+/// validator maps a given doc to the same store slot.
+fn hash_key(doc_id: &[u8]) -> DocKey {
+    let mut h = Sha256::new();
+    h.update(doc_id);
+    h.finalize()
+}
+
+/// build the qmdb [`VariableConfig`] for module `id` on `context`. partitions
+/// are namespaced by `id` so several qmdb-backed modules can share one runtime
+/// context without colliding on storage. the single source of truth for a
+/// document store's storage layout, so [`Document::init`] and
+/// [`Document::sync_from`] can never drift apart.
+fn doc_config<E>(context: &E, id: &str) -> DocConfig
+where
+    E: Context + BufferPooler,
+{
+    // a single page-cache handle shared by both sub-configs (cheap to clone).
+    let page_cache = CacheRef::from_pooler(
+        context,
+        NonZeroU16::new(128).unwrap(),
+        NonZeroUsize::new(64).unwrap(),
+    );
+
+    // codec config for Operation<.., DocKey, Vec<u8>>: (key_cfg, value_cfg). the
+    // key is a fixed-width digest so its cfg is `()`; the value is a Vec<u8>
+    // whose <Vec<u8> as Read>::Cfg == (RangeCfg<usize>, ()). bound generously;
+    // a whole serialized doc rides in one value.
+    let codec_config = ((), (RangeCfg::from(0..=1 << 20), ()));
+
+    VariableConfig {
+        merkle_config: mmr::full::Config {
+            journal_partition: format!("{id}-merkle-journal"),
+            metadata_partition: format!("{id}-merkle-meta"),
+            items_per_blob: NonZeroU64::new(64).unwrap(),
+            write_buffer: NonZeroUsize::new(1024).unwrap(),
+            strategy: Sequential,
+            page_cache: page_cache.clone(),
+        },
+        journal_config: journal::contiguous::variable::Config {
+            partition: format!("{id}-log"),
+            items_per_section: NonZeroU64::new(64).unwrap(),
+            write_buffer: NonZeroUsize::new(1024).unwrap(),
+            compression: None,
+            codec_config,
+            page_cache,
+        },
+        translator: TwoCap,
+    }
+}
 
 /// per-op failures. mapped to [`Error::Module`] so any error aborts the whole
 /// block (the sdk `abort_block` contract), rolling back the staged overlay.
@@ -88,9 +178,10 @@ where
 {
     id: ModuleId,
     db: DocDb<E>,
-    /// docs written this block, keyed by `doc_id` bytes -> serialized `Vec<Block>`.
-    /// read ahead of committed state by `get` (read-your-writes) and flushed to
-    /// qmdb in one batch by `commit_block`; NOT reflected in `root()` until then.
+    /// docs written this block, keyed by LOGICAL `doc_id` bytes -> serialized
+    /// `Vec<Block>`. read ahead of committed state by `get` (read-your-writes)
+    /// and flushed to qmdb (under the hashed key) in one batch by
+    /// `commit_block`; NOT reflected in `root()` until then.
     pending: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
@@ -101,55 +192,24 @@ where
     /// open (or recover) the store on `context` under module identity `id`.
     /// qmdb partitions are namespaced by `id`, so a document module shares one
     /// runtime context with kv/other qmdb modules without colliding — the demo
-    /// hookup is purely additive. copied verbatim from the kv module.
+    /// hookup is purely additive.
     pub async fn init(context: E, id: impl Into<ModuleId>) -> Self {
         let id = id.into();
-        let page_cache = CacheRef::from_pooler(
-            &context,
-            NonZeroU16::new(128).unwrap(),
-            NonZeroUsize::new(64).unwrap(),
-        );
-
-        let codec_config = (
-            (RangeCfg::from(0..=1 << 20), ()),
-            (RangeCfg::from(0..=1 << 20), ()),
-        );
-
-        let cfg: VariableConfig<TwoCap, ((RangeCfg<usize>, ()), (RangeCfg<usize>, ())), Sequential> =
-            VariableConfig {
-                merkle_config: mmr::full::Config {
-                    journal_partition: format!("{id}-merkle-journal"),
-                    metadata_partition: format!("{id}-merkle-meta"),
-                    items_per_blob: NonZeroU64::new(64).unwrap(),
-                    write_buffer: NonZeroUsize::new(1024).unwrap(),
-                    strategy: Sequential,
-                    page_cache: page_cache.clone(),
-                },
-                journal_config: journal::contiguous::variable::Config {
-                    partition: format!("{id}-log"),
-                    items_per_section: NonZeroU64::new(64).unwrap(),
-                    write_buffer: NonZeroUsize::new(1024).unwrap(),
-                    compression: None,
-                    codec_config,
-                    page_cache,
-                },
-                translator: TwoCap,
-            };
-
+        let cfg = doc_config(&context, &id);
         let db = DocDb::<E>::init(context, cfg)
             .await
             .expect("qmdb init failed");
-
         Self { id, db, pending: BTreeMap::new() }
     }
 
     /// read raw bytes for `key`: a STAGED (this-block) write shadows committed
     /// qmdb state, so a later op in the same block sees an earlier staged write.
+    /// committed reads go through the hashed key.
     async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         if let Some(v) = self.pending.get(key) {
             return Some(v.clone());
         }
-        self.db.get(&key.to_vec()).await.expect("get failed")
+        self.db.get(&hash_key(key)).await.expect("get failed")
     }
 
     /// load a document's ordered blocks (`None` == doc absent), through the
@@ -227,6 +287,73 @@ where
             }
         }
     }
+
+    // ---- state-sync ---------------------------------------------------------
+    // reconstruct a byte-identical-rooted store from a peer WITHOUT replaying the
+    // op history in application order — commonware's qmdb sync ships the live op
+    // range and merkle-verifies every batch against the target root.
+
+    /// the sync [`DocTarget`] for this store: its qmdb merkle root plus the LIVE
+    /// operation range `[sync_boundary, end)`. hand it to [`Document::sync_from`]
+    /// to rebuild a store with an identical root. async only because `bounds()`
+    /// reads the committed log tail.
+    ///
+    /// the range starts at `sync_boundary()`, not `0`: qmdb compacts overwritten
+    /// history below its inactivity floor, so only the active tail ships (pinned
+    /// merkle nodes cover the pruned prefix). that IS checkpoint semantics — the
+    /// snapshot half of snapshot-plus-replay-tail.
+    pub async fn sync_target(&self) -> DocTarget {
+        let end = self.db.bounds().await.end;
+        let start = self.db.sync_boundary();
+        Target {
+            root: self.db.root(),
+            range: NonEmptyRange::new(start..end)
+                .expect("a committed store has a non-empty op range"),
+        }
+    }
+
+    /// consume this store into an `Arc`-wrapped raw qmdb that serves as a sync
+    /// resolver: it answers a joiner's op-range requests with proof-carrying
+    /// batches. a LIVE source still taking writes would instead wrap
+    /// `Arc<AsyncRwLock<..>>`; this consuming form is the handoff / test source.
+    pub fn into_resolver(self) -> Arc<DocDb<E>> {
+        Arc::new(self.db)
+    }
+
+    /// reconstruct a `Document` at `id` on `context` whose qmdb root EQUALS
+    /// `target.root`, by pulling `target`'s op range from `resolver`.
+    /// commonware's sync engine merkle-verifies every fetched batch against
+    /// `target.root`, so a byzantine source cannot produce a store with a
+    /// matching root but forged contents — the root is the trust anchor. reuses
+    /// [`doc_config`] so the synced store's storage layout matches a
+    /// freshly-opened one.
+    pub async fn sync_from<R>(
+        context: E,
+        id: impl Into<ModuleId>,
+        target: DocTarget,
+        resolver: R,
+    ) -> Self
+    where
+        R: DbResolver<DocDb<E>>,
+    {
+        let id = id.into();
+        let db_config = doc_config(&context, &id);
+        let config = SyncConfig {
+            context,
+            resolver,
+            target,
+            max_outstanding_requests: 1,
+            fetch_batch_size: NonZeroU64::new(64).unwrap(),
+            apply_batch_size: 1024,
+            db_config,
+            update_rx: None,
+            finish_rx: None,
+            reached_target_tx: None,
+            max_retained_roots: 8,
+        };
+        let db = sync::sync(config).await.expect("qmdb sync failed");
+        Self { id, db, pending: BTreeMap::new() }
+    }
 }
 
 /// bridge the only sdk error `load` can raise — a stored-doc json decode failure
@@ -277,15 +404,15 @@ where
     }
 
     /// publish the block's staged docs in ONE qmdb batch: write every pending
-    /// doc, merkleize, apply, commit. no-op (and no root movement) if nothing was
-    /// staged. byte-identical to the kv commit path.
+    /// doc (under its hashed key), merkleize, apply, commit. no-op (and no root
+    /// movement) if nothing was staged. byte-identical to the kv commit path.
     async fn commit_block(&mut self) -> Result<(), Error> {
         if self.pending.is_empty() {
             return Ok(());
         }
         let mut batch = self.db.new_batch();
         for (key, value) in &self.pending {
-            batch = batch.write(key.clone(), Some(value.clone()));
+            batch = batch.write(hash_key(key), Some(value.clone()));
         }
         let batch = batch
             .merkleize(&self.db, None::<Vec<u8>>)
