@@ -1,3 +1,51 @@
+//! ============================================================================
+//! STORAGE SUBSTRATE — DECIDED DIRECTION (2026-07-01)
+//!   git2-rs (vendored libgit2) + sha1;  root() = sha256(<sha1 HEAD oid>)
+//! ============================================================================
+//!
+//! the code below is the CURRENT placeholder: a `git` SUBPROCESS in sha256-mode.
+//! it is being replaced by libgit2 (via `git2-rs`, VENDORED) in git's DEFAULT
+//! sha1 object format, with `root() = sha256(<20-byte sha1 head oid>)`. the
+//! reasoning, because it is a non-obvious stack of trade-offs:
+//!
+//! WHY libgit2 (git2-rs, vendored) instead of shelling out to `git`:
+//!   DEPLOYABILITY. shelling out makes every validator depend on a compatible
+//!   `git` binary on the host (and sha256-mode needs git >= ~2.42). vendoring
+//!   libgit2 INTO the node binary makes it SELF-CONTAINED — no `git` install.
+//!
+//! WHY sha1 (git's default), NOT sha256, even though sha256 is "stronger":
+//!   ECOSYSTEM COMPATIBILITY. forge is a *git* feature — users expect to clone it
+//!   with a stock `git`, push/pull, import existing repos, and mirror to hosting.
+//!   but a sha256 repo can do NONE of that with the outside git world:
+//!     - git's sha1<->sha256 interop layer was designed years ago and NEVER
+//!       shipped, so a sha256 repo cannot exchange objects with ANY sha1 repo
+//!       (no importing an existing repo, no pushing to a sha1 remote);
+//!     - hosting (GitHub/GitLab/...) largely REJECTS sha256 repos (no mirroring);
+//!     - libgit2's sha256 is still behind an EXPERIMENTAL build flag, API in flux,
+//!       not battle-tested in any forge.
+//!   sha1 keeps forge a normal, interoperable git repo. the hash weakness is
+//!   bounded: modern git/libgit2 use collision-DETECTING sha1 (SHA-1DC), and git
+//!   itself ran on sha1 for ~18 years.
+//!
+//! WHY root() = sha256(oid) (rehash), not the oid verbatim:
+//!   a [`StateRoot`] is 32 bytes; a sha1 oid is only 20. so the 20-byte HEAD oid
+//!   is the sha256 PREIMAGE -> 32 bytes. the payoff: forge's contribution to the
+//!   global app-hash is sha256-STRENGTH. the only residual sha1 surface is a
+//!   *forge-object* collision (two trees under one commit oid) — expensive and
+//!   SHA-1DC-guarded — while the app-hash's collision resistance at the STATE
+//!   layer stays sha256. we trade "root IS a git oid verbatim" for real-world git
+//!   interop, a good trade for a git PRODUCT. (empty repo -> StateRoot::ZERO.)
+//!
+//! WHAT DOES NOT CHANGE:
+//!   - DETERMINISM: git2's typed `Signature` sets the FIXED `ducktape` identity +
+//!     a date from `ctx.env().consensus_time` (never wall clock), so the sha1 oid
+//!     — and thus sha256(oid) — is byte-identical across nodes on the same inputs.
+//!   - the object format is a NETWORK-WIDE GENESIS CONSTANT: every validator MUST
+//!     use the identical format. a sha1 node and a sha256 node compute different
+//!     roots for the same state and FORK. it is NOT a per-node choice.
+//!
+//! ============================================================================
+//!
 //! forge — a GIT-backed feature module.
 //!
 //! where the directory module keeps a `BTreeMap` and kv keeps a qmdb, forge's

@@ -1,18 +1,20 @@
-# super-app workspace — a consensus-based platform whose features (documents,
-# forge, chat, tasks, …) are isolated MODULES. a module is a crate that depends
-# ONLY on `sdk` + the types-only `*-interface` crates of modules it talks to —
-# never another module's impl. the host dispatches modules over consensus and
-# composes each authenticated root into the global app-hash. cosmwasm's isolation
-# *pattern*, native rust (no wasm sandbox).
+# super-app workspace — a consensus platform of isolated modules. a module crate
+# depends ONLY on `sdk` + the types-only `*-interface` crates of modules it talks
+# to — never another module's impl. layout:
+#   system/  — consensus infrastructure modules (kv state primitive, valset)
+#   apps/    — product features / "apps" (forge; future document, chat, tasks)
+#   demo-modules/ — demo + test scaffolding (directory, greeter), NOT products
+# the host dispatches modules over BFT consensus and composes each authenticated
+# root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
 
 [workspace]
 resolver = "2"
 members = [
     "sdk", "state", "host",
     "system/kv", "system/kv-interface",
-    "modules/directory", "modules/directory-interface", "modules/greeter",
-    "modules/forge", "modules/forge-interface",
-    "modules/valset", "modules/valset-interface",
+    "system/valset", "system/valset-interface",
+    "apps/forge", "apps/forge-interface",
+    "demo-modules/directory", "demo-modules/directory-interface", "demo-modules/greeter",
     "node",
     "consensus",
     "demo",
@@ -48,14 +50,14 @@ sdk = { path = "sdk" }
 state = { path = "state" }
 host = { path = "host" }
 kv = { path = "system/kv" }
-directory = { path = "modules/directory" }
-greeter = { path = "modules/greeter" }
-forge = { path = "modules/forge" }
-valset = { path = "modules/valset" }
+directory = { path = "demo-modules/directory" }
+greeter = { path = "demo-modules/greeter" }
+forge = { path = "apps/forge" }
+valset = { path = "system/valset" }
 node = { path = "node" }
 consensus = { path = "consensus" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "system/kv-interface" }
-directory-interface = { path = "modules/directory-interface" }
-forge-interface = { path = "modules/forge-interface" }
-valset-interface = { path = "modules/valset-interface" }
+directory-interface = { path = "demo-modules/directory-interface" }
+forge-interface = { path = "apps/forge-interface" }
+valset-interface = { path = "system/valset-interface" }
