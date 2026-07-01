@@ -1146,6 +1146,8 @@ dependencies = [
  "host",
  "kv",
  "kv-interface",
+ "messaging",
+ "messaging-interface",
  "saga",
  "saga-interface",
  "sdk",
@@ -2045,6 +2047,26 @@ name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
+
+[[package]]
+name = "messaging"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "host",
+ "messaging-interface",
+ "sdk",
+ "sha2",
+]
+
+[[package]]
+name = "messaging-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "mime"
