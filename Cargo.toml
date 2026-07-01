@@ -1,24 +1,30 @@
 # super-app workspace — a consensus platform of isolated modules. a module crate
 # depends ONLY on `sdk` + the types-only `*-interface` crates of modules it talks
 # to — never another module's impl. layout:
-#   system/  — consensus infrastructure modules (kv state primitive, valset)
-#   apps/    — product features / "apps" (forge; future document, chat, tasks)
-#   demo-modules/ — demo + test scaffolding (directory, greeter), NOT products
+#   crates/kernel/   — the platform: sdk (interface), state (app-hash), host
+#                      (dispatch), node (transport seam), consensus (BFT orderer)
+#   crates/system/   — consensus infrastructure modules (kv, valset)
+#   crates/apps/     — product feature modules (forge; future document, chat, tasks)
+#   crates/examples/ — demo + test scaffolding modules (directory, greeter)
+#   bin/             — runnable binaries (in-process demo, real-socket node)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
 
 [workspace]
 resolver = "2"
 members = [
-    "sdk", "state", "host",
-    "system/kv", "system/kv-interface",
-    "system/valset", "system/valset-interface",
-    "apps/forge", "apps/forge-interface",
-    "demo-modules/directory", "demo-modules/directory-interface", "demo-modules/greeter",
-    "node",
-    "consensus",
-    "demo",
-    "node-bin",
+    # kernel — the platform (contract + dispatch + transport + BFT ordering)
+    "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
+    "crates/kernel/node", "crates/kernel/consensus",
+    # system — consensus infrastructure modules
+    "crates/system/kv", "crates/system/kv-interface",
+    "crates/system/valset", "crates/system/valset-interface",
+    # apps — product feature modules
+    "crates/apps/forge", "crates/apps/forge-interface",
+    # examples — demo / test scaffolding modules
+    "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
+    # bin — runnable binaries
+    "bin/demo", "bin/node",
 ]
 
 [workspace.package]
@@ -45,19 +51,20 @@ commonware-parallel = "2026.5.0"
 commonware-utils = "2026.5.0"
 commonware-actor = "2026.5.0"
 
-# internal — impl crates
-sdk = { path = "sdk" }
-state = { path = "state" }
-host = { path = "host" }
-kv = { path = "system/kv" }
-directory = { path = "demo-modules/directory" }
-greeter = { path = "demo-modules/greeter" }
-forge = { path = "apps/forge" }
-valset = { path = "system/valset" }
-node = { path = "node" }
-consensus = { path = "consensus" }
+# internal — kernel crates (the platform)
+sdk = { path = "crates/kernel/sdk" }
+state = { path = "crates/kernel/state" }
+host = { path = "crates/kernel/host" }
+node = { path = "crates/kernel/node" }
+consensus = { path = "crates/kernel/consensus" }
+# internal — module impl crates
+kv = { path = "crates/system/kv" }
+valset = { path = "crates/system/valset" }
+forge = { path = "crates/apps/forge" }
+directory = { path = "crates/examples/directory" }
+greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
-kv-interface = { path = "system/kv-interface" }
-directory-interface = { path = "demo-modules/directory-interface" }
-forge-interface = { path = "apps/forge-interface" }
-valset-interface = { path = "system/valset-interface" }
+kv-interface = { path = "crates/system/kv-interface" }
+valset-interface = { path = "crates/system/valset-interface" }
+forge-interface = { path = "crates/apps/forge-interface" }
+directory-interface = { path = "crates/examples/directory-interface" }
