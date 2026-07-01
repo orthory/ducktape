@@ -1,8 +1,9 @@
 //! the forge module's public wire surface — types only.
 //!
 //! forge is a git-backed module: its state is a real git repo, its `root()` is
-//! the repo's HEAD commit oid. writes go via [`ForgeMsg`] (a file put + commit);
-//! reads via [`ForgeQuery`] -> [`ForgeReply`], returning the HEAD oid as hex.
+//! `sha256` of the repo's HEAD commit oid. writes go via [`ForgeMsg`] (a file
+//! put + commit); reads via [`ForgeQuery`] -> [`ForgeReply`], returning the HEAD
+//! oid as hex.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,9 +20,10 @@ pub enum ForgeQuery {
     Head,
 }
 
-/// the git oid hex of HEAD, or `None` on an unborn repo (no commits yet). in
-/// sha256-mode git this hex equals `root()`'s bytes rendered hex, so a consumer
-/// can git-address the exact commit forge committed to the app-hash.
+/// the git oid hex of HEAD (a 40-char sha1 oid), or `None` on an unborn repo (no
+/// commits yet). forge's `root()` is `sha256` of the oid's 20 raw bytes, so this
+/// hex is the state root's PREIMAGE: a consumer can git-address the exact commit
+/// forge committed while the app-hash keeps sha256-strength.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ForgeReply {
     Head(Option<String>),

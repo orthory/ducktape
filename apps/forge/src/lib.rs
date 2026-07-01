@@ -3,10 +3,10 @@
 //!   git2-rs (vendored libgit2) + sha1;  root() = sha256(<sha1 HEAD oid>)
 //! ============================================================================
 //!
-//! the code below is the CURRENT placeholder: a `git` SUBPROCESS in sha256-mode.
-//! it is being replaced by libgit2 (via `git2-rs`, VENDORED) in git's DEFAULT
-//! sha1 object format, with `root() = sha256(<20-byte sha1 head oid>)`. the
-//! reasoning, because it is a non-obvious stack of trade-offs:
+//! forge stores its state in a real git repo via libgit2 (the `git2-rs` crate,
+//! VENDORED — so the node binary is SELF-CONTAINED, no `git` install needed), in
+//! git's DEFAULT sha1 object format, with `root() = sha256(<20-byte sha1 head
+//! oid>)`. the reasoning, because it is a non-obvious stack of trade-offs:
 //!
 //! WHY libgit2 (git2-rs, vendored) instead of shelling out to `git`:
 //!   DEPLOYABILITY. shelling out makes every validator depend on a compatible
@@ -49,10 +49,12 @@
 //! forge — a GIT-backed feature module.
 //!
 //! where the directory module keeps a `BTreeMap` and kv keeps a qmdb, forge's
-//! private substrate is a real on-disk git repository. its authenticated
-//! [`StateRoot`] is the repo's HEAD commit oid: in sha256-mode git that oid is
-//! exactly 32 bytes, so `root()` IS the HEAD oid verbatim, and it composes into
-//! the global app-hash next to a qmdb merkle root with zero special-casing.
+//! private substrate is a real on-disk git repository, driven through VENDORED
+//! libgit2 (`git2-rs`) — no `git` subprocess, so the node binary is self-
+//! contained. the repo is git's DEFAULT sha1 object format, so a HEAD oid is 20
+//! bytes; forge's authenticated [`StateRoot`] is `sha256(<HEAD oid bytes>)`, a
+//! 32-byte commitment that composes into the global app-hash next to a qmdb
+//! merkle root with zero special-casing. (unborn repo -> [`StateRoot::ZERO`].)
 //!
 //! ## the determinism landmine (single-node slice)
 //!
@@ -60,52 +62,55 @@
 //! committing the same content would normally get DIFFERENT commit oids — and
 //! the app-hash would fork. this slice keeps the commit reproducible anyway:
 //!
-//! - `root()` is the repo's current HEAD commit oid as a 32-byte [`StateRoot`];
-//! - the commit object uses a FIXED author/committer identity (`ducktape`) and a
-//!   date derived from `ctx.env().consensus_time` (NOT wall clock), so the oid is
-//!   byte-identical across independent repos given the same inputs (verified);
-//! - the tree is built in an isolated index (`GIT_INDEX_FILE`), so it's a pure
-//!   function of (parent, change) with no worktree cruft.
+//! - `root()` is `sha256` of the repo's current HEAD sha1 oid, a 32-byte
+//!   [`StateRoot`];
+//! - the commit object uses a FIXED author/committer identity (`ducktape`, via a
+//!   typed `git2::Signature`) and a date derived from `ctx.env().consensus_time`
+//!   (NOT wall clock, offset +0000), set for BOTH author and committer — so the
+//!   sha1 oid is byte-identical across independent repos given the same inputs;
+//! - the tree is built in-memory with a `git2::TreeBuilder` seeded from the
+//!   parent tree, so it's a pure function of (parent, change) — no on-disk index,
+//!   no worktree, nothing for host cruft to leak through.
 //!
-//! deliberately git PLUMBING, not porcelain `git add` + `git commit`: porcelain
-//! would inherit host config (`commit.gpgsign` -> a nondeterministic signature,
-//! `core.autocrlf` -> mangled blob bytes) and the checked-out worktree, either of
-//! which reintroduces the fork. the path is `hash-object` -> isolated-index
-//! `write-tree` -> `commit-tree` -> `update-ref`. a CONSEQUENCE: the worktree is
-//! never materialized — HEAD's tree is authoritative but `git status` in the repo
-//! shows the committed files as "deleted" (the working dir is empty). that's
-//! intentional for this substrate (nothing reads the worktree), not a bug.
+//! git2 is used precisely because it BYPASSES the host-config traps porcelain
+//! would inherit: `commit.gpgsign` never fires (libgit2's `commit` doesn't sign;
+//! signing is a separate call), `core.autocrlf` never mangles blob bytes
+//! (`repo.blob` writes the buffer verbatim — filters run only on worktree
+//! checkout, which forge never does), and the fixed `Signature` overrides
+//! `user.name`/`user.email`. no worktree is ever materialized (nothing reads
+//! it); the HEAD tree is authoritative.
+//!
+//! ### the host-lent staging seam
+//!
+//! forge follows the host-lent STAGING pattern. `execute` builds the commit
+//! object with `repo.commit(None, ...)` — the `None` update_ref means the object
+//! lands in the odb but NO ref moves, so `root()` (which reads the committed
+//! ref) is unchanged. `commit_block` publishes it by moving the ref
+//! (`repo.reference(force)`) and refreshing the committed mirror; `abort_block`
+//! drops the staged oid and the built commit objects linger unreferenced in the
+//! odb (node-local, never in `root()`/the app-hash). loose objects flush to disk
+//! immediately, so a per-call `Repository` opened in `commit_block` reads back
+//! the object a different `Repository` staged in `execute`.
 //!
 //! ### deferred to the p2p port (faithful multi-node)
 //!
 //! true cross-node convergence is "results on the wire, not commands": the wire
-//! fact is a `RefUpdate { name, target_oid, prev }` applied by `git update-ref`
-//! on receivers, which NEVER run `git commit`. only the origin commits locally
+//! fact is a `RefUpdate { name, target_oid, prev }` applied via `repo.reference`
+//! on receivers, which NEVER build a commit. only the origin commits locally
 //! (the `execute` below). the pinned identity/date keeps the origin's oid
 //! reproducible as a backstop, but RefUpdate stays canonical because bit-
 //! identical commit encoding across git builds isn't guaranteed. that split
 //! (origin commits + emits RefUpdate; receivers fetch closure + update-ref) is
 //! out of scope for this single-node demo.
-//!
-//! ### the sha1 fallback
-//!
-//! if the host git lacks sha256 support, `init` falls back to sha1 (20-byte
-//! oids) and `root()` becomes `sha256(oid_bytes)` — a stable 32-byte commitment
-//! one indirection removed. NB: object-format is a genesis-uniform consensus
-//! parameter, not per-node graceful degradation — a sha256 node's root (oid `X`)
-//! and a sha1 node's root (`sha256(Y)`) never agree, so a mixed validator set
-//! would fork. sha256 is the happy path; the fallback exists so the demo/tests
-//! still run on a host without sha256 git.
 
 mod git;
 
 use std::path::PathBuf;
 
 use forge_interface::{decode_msg, decode_query, encode_reply, ForgeMsg, ForgeQuery, ForgeReply};
+use git2::Oid;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use sha2::{Digest, Sha256};
-
-use git::ObjectFormat;
 
 /// the canonical branch this module commits to and reads HEAD from.
 const MAIN_REF: &str = "refs/heads/main";
@@ -113,21 +118,20 @@ const MAIN_REF: &str = "refs/heads/main";
 pub struct Forge {
     id: ModuleId,
     /// node-local repo dir — NOT consensus state (the path may differ per node);
-    /// only the HEAD oid it produces is.
+    /// only the HEAD oid it produces is. repos are opened per-call off this path
+    /// rather than held open, so no `git2` borrow outlives a method.
     repo: PathBuf,
-    /// the object format the repo was initialized in (drives oid -> root mapping).
-    fmt: ObjectFormat,
     /// write-through mirror of the COMMITTED `MAIN_REF`: refreshed at genesis and
     /// by `commit_block`, read by `root()`. the repo/ref is the source of truth
     /// for the committed parent; this cache never feeds a commit's parent. `None`
     /// == unborn repo.
-    head: Option<String>,
+    head: Option<Oid>,
     /// the head STAGED by commits made this block: `execute` builds the commit
     /// object and points this at it WITHOUT moving the ref. later commits in the
     /// same block chain on it (read-your-writes via `query`); `commit_block`
     /// publishes it (moves the ref), `abort_block` drops it. `None` == nothing
     /// staged this block. NOT reflected in `root()` until committed.
-    staged: Option<String>,
+    staged: Option<Oid>,
 }
 
 impl Forge {
@@ -135,39 +139,22 @@ impl Forge {
     /// cached head from its current `MAIN_REF` (`None` on a fresh empty repo, so
     /// `root()` starts at [`StateRoot::ZERO`]). deterministic given the dir state.
     pub fn init(id: impl Into<ModuleId>, repo_dir: impl Into<PathBuf>) -> Result<Self, Error> {
-        let repo = repo_dir.into();
-        let dot_git = repo.join(".git");
-        let fmt = if dot_git.exists() {
-            git::object_format(&repo).map_err(|e| Error::Module(e.to_string()))?
+        let repo_dir = repo_dir.into();
+        let repo = if repo_dir.join(".git").exists() {
+            git::open(&repo_dir).map_err(|e| Error::Module(e.to_string()))?
         } else {
-            git::init(&repo).map_err(|e| Error::Module(e.to_string()))?
+            git::init(&repo_dir).map_err(|e| Error::Module(e.to_string()))?
         };
         let head = git::resolve_ref(&repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?;
-        Ok(Self { id: id.into(), repo, fmt, head, staged: None })
+        Ok(Self { id: id.into(), repo: repo_dir, head, staged: None })
     }
 
-    /// map a HEAD oid hex into the fixed-width state root per the repo's format.
-    /// sha256: the 32 oid bytes ARE the root. sha1: `sha256(oid_bytes)`.
-    fn oid_to_root(&self, hex: &str) -> Result<StateRoot, Error> {
-        match self.fmt {
-            ObjectFormat::Sha256 => {
-                Ok(StateRoot(git::oid_bytes32(hex).map_err(|e| Error::Module(e.to_string()))?))
-            }
-            ObjectFormat::Sha1 => {
-                // 40-char sha1 hex -> 20 bytes -> sha256 -> 32-byte commitment.
-                if hex.len() != 40 {
-                    return Err(Error::Module(format!("expected 40 hex chars, got {}", hex.len())));
-                }
-                let mut raw = [0u8; 20];
-                for i in 0..20 {
-                    raw[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                        .map_err(|_| Error::Module(format!("bad sha1 oid: {hex}")))?;
-                }
-                let mut h = Sha256::new();
-                h.update(raw);
-                Ok(StateRoot(h.finalize().into()))
-            }
-        }
+    /// map a HEAD sha1 oid into the fixed-width state root: the 20 raw oid bytes
+    /// are the sha256 PREIMAGE, so `root() = sha256(oid_bytes)`. infallible.
+    fn oid_to_root(oid: Oid) -> StateRoot {
+        let mut h = Sha256::new();
+        h.update(oid.as_bytes()); // 20 raw sha1 bytes
+        StateRoot(h.finalize().into())
     }
 }
 
@@ -177,56 +164,51 @@ impl Module for Forge {
         self.id.clone()
     }
 
-    /// the repo's HEAD commit oid as a [`StateRoot`] — pure, no IO (that's the
-    /// whole reason `head` is a write-through cache). `None` -> `ZERO`.
+    /// the repo's HEAD commit oid as a [`StateRoot`] (`sha256` of its 20 sha1
+    /// bytes) — pure, no IO (that's the whole reason `head` is a write-through
+    /// cache). `None` -> `ZERO`.
     fn root(&self) -> StateRoot {
-        match &self.head {
-            None => StateRoot::ZERO,
-            Some(hex) => self.oid_to_root(hex).unwrap_or(StateRoot::ZERO),
-        }
+        self.head.map_or(StateRoot::ZERO, Self::oid_to_root)
     }
 
-    /// commit one file change to the repo. deterministic: fixed identity + a
-    /// `consensus_time`-derived date + an isolated-index tree build, so the
-    /// resulting commit oid is reproducible. all git IO is blocking with no
-    /// `.await`, so the "await only deterministic resources" rule holds vacuously
-    /// — the git shell-out is forge's private state substrate, not an effect.
+    /// commit one file change to the repo. deterministic: a fixed `Signature`
+    /// identity + a `consensus_time`-derived date + an in-memory tree build, so
+    /// the resulting sha1 commit oid is reproducible. all git2 IO is blocking
+    /// with no `.await`, so the "await only deterministic resources" rule holds
+    /// vacuously — the git2 call is forge's private state substrate, not an effect.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let ForgeMsg::Commit { path, content, message } =
             decode_msg(&msg.payload).map_err(Error::Module)?;
 
+        let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
+
         // 1. parent := the STAGED head if this block already committed here,
         //    else the REPO's current (committed) head. chaining on the staged
         //    head gives multi-commit-in-one-block the correct parent.
-        let parent = match &self.staged {
-            Some(s) => Some(s.clone()),
-            None => {
-                git::resolve_ref(&self.repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?
-            }
+        let parent_oid = match self.staged {
+            Some(oid) => Some(oid),
+            None => git::resolve_ref(&repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?,
         };
-        let parent_tree = match &parent {
-            Some(p) => Some(
-                git::commit_tree_oid(&self.repo, p).map_err(|e| Error::Module(e.to_string()))?,
-            ),
-            None => None,
-        };
-
-        // 2. stage the blob into an isolated index and write the tree.
-        let blob = git::hash_blob(&self.repo, content.as_bytes())
+        let parent_commit = parent_oid
+            .map(|oid| repo.find_commit(oid))
+            .transpose()
             .map_err(|e| Error::Module(e.to_string()))?;
-        let index = git::index_path(&self.repo);
-        let tree = git::write_tree_with(
-            &self.repo,
-            &index,
-            parent_tree.as_deref(),
-            &path,
-            &blob,
-        )
-        .map_err(|e| Error::Module(e.to_string()))?;
+
+        // 2. write the blob to the odb and build the tree in-memory (seeded from
+        //    the parent's tree = incremental). no on-disk index, no worktree.
+        let blob = repo.blob(content.as_bytes()).map_err(|e| Error::Module(e.to_string()))?;
+        let base_tree = parent_commit
+            .as_ref()
+            .map(|c| c.tree())
+            .transpose()
+            .map_err(|e| Error::Module(e.to_string()))?;
+        let tree_oid = git::build_tree(&repo, base_tree.as_ref(), &path, blob)
+            .map_err(|e| Error::Module(e.to_string()))?;
+        let tree = repo.find_tree(tree_oid).map_err(|e| Error::Module(e.to_string()))?;
 
         // 3. deterministic commit object: date from consensus_time, fixed identity.
         let ts = ctx.env().consensus_time;
-        let commit = git::commit_tree(&self.repo, &tree, parent.as_deref(), &message, ts)
+        let commit = git::commit(&repo, &tree, parent_commit.as_ref(), &message, ts)
             .map_err(|e| Error::Module(e.to_string()))?;
 
         // 4. STAGE the new head — do NOT move the ref. the host publishes it at
@@ -238,15 +220,15 @@ impl Module for Forge {
     }
 
     /// read projection: the current HEAD as hex (or `None` on an unborn repo).
-    /// served straight from the cached mirror — no IO, no `.await`. in sha256
-    /// mode this hex equals `root()`'s bytes; the sha1 fallback breaks that
-    /// identity (root is `sha256(oid)`) but the raw oid hex is still returned here.
+    /// served straight from the cached mirror — no IO, no `.await`. this is the
+    /// raw 40-char sha1 oid hex; `root()` is `sha256` of its 20 bytes, so the hex
+    /// is the state root's PREIMAGE, not its rendering.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             // read-your-writes: a staged (this-block) head shadows the committed
             // one; `root()` still reflects only the committed head.
             ForgeQuery::Head => Ok(encode_reply(&ForgeReply::Head(
-                self.staged.clone().or_else(|| self.head.clone()),
+                self.staged.or(self.head).map(|oid| oid.to_string()),
             ))),
         }
     }
@@ -255,8 +237,8 @@ impl Module for Forge {
     /// so `root()` now reflects it. no-op if nothing was staged this block.
     async fn commit_block(&mut self) -> Result<(), Error> {
         if let Some(oid) = self.staged.take() {
-            git::update_ref(&self.repo, MAIN_REF, &oid)
-                .map_err(|e| Error::Module(e.to_string()))?;
+            let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
+            git::update_ref(&repo, MAIN_REF, oid).map_err(|e| Error::Module(e.to_string()))?;
             self.head = Some(oid);
         }
         Ok(())
@@ -325,10 +307,12 @@ mod tests {
         }
     }
 
-    // read HEAD hex via the git cli directly — the independent oracle that
-    // root() really is the repo's HEAD, not just "some 32 bytes that moved".
-    fn git_head_hex(repo: &PathBuf) -> String {
-        git::resolve_ref(repo, MAIN_REF).unwrap().unwrap()
+    // read HEAD oid via git2 directly (opening the on-disk repo) — the
+    // independent oracle that root() really tracks the repo's HEAD ref, not just
+    // "some 32 bytes that moved". independent of forge's `head` cache. no `git`
+    // binary involved (that's the whole point of vendoring libgit2).
+    fn git_head_oid(repo: &PathBuf) -> Oid {
+        git2::Repository::open(repo).unwrap().refname_to_id(MAIN_REF).unwrap()
     }
 
     #[test]
@@ -345,18 +329,21 @@ mod tests {
 
         assert_ne!(forge.root(), StateRoot::ZERO, "a commit must move the root off ZERO");
 
-        // root IS the git HEAD oid (the load-bearing identity in sha256 mode).
-        let head_hex = git_head_hex(&dir);
+        // root() == sha256(HEAD oid) — tracks the real ref (not the cache).
+        let head_oid = git_head_oid(&dir);
         assert_eq!(
             forge.root(),
-            forge.oid_to_root(&head_hex).unwrap(),
-            "root() must equal the real git HEAD oid"
+            Forge::oid_to_root(head_oid),
+            "root() must equal sha256 of the real git HEAD oid"
         );
 
-        // and query(Head) surfaces that same hex.
+        // and query(Head) surfaces that same oid hex (the root's preimage).
         let reply =
             futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::Head))).unwrap();
-        assert_eq!(decode_reply(&reply).unwrap(), ForgeReply::Head(Some(head_hex)));
+        assert_eq!(
+            decode_reply(&reply).unwrap(),
+            ForgeReply::Head(Some(head_oid.to_string()))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -378,7 +365,7 @@ mod tests {
         futures::executor::block_on(forge.commit_block()).unwrap();
         let r2 = forge.root();
         assert_ne!(r1, r2, "a second commit must advance the root");
-        assert_eq!(r2, forge.oid_to_root(&git_head_hex(&dir)).unwrap());
+        assert_eq!(r2, Forge::oid_to_root(git_head_oid(&dir)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -397,7 +384,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // determinism: two independent repos, same inputs -> identical HEAD oid.
+    // determinism: two independent repos, same inputs -> identical HEAD oid ->
+    // identical sha256(oid) root. the pinned Signature (fixed ducktape identity +
+    // Time::new(555, 0)) is what makes the commit bytes — and thus the sha1 oid —
+    // byte-identical; the per-repo odb path never enters the commit bytes.
     #[test]
     fn commit_oid_is_reproducible_across_repos() {
         let da = tmp_repo("det-a");

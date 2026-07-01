@@ -3,13 +3,18 @@ name = "forge"
 edition.workspace = true
 version.workspace = true
 
-# a git-backed module: state is a real git repo, root() is its HEAD oid.
-# depends only on sdk + its own interface (+ sha2 for the sha1-fallback mapping).
+# a git-backed module: state is a real git repo, root() is sha256 of its HEAD
+# sha1 oid. libgit2 is VENDORED (built from source) so the node binary is
+# self-contained — no host `git` install needed.
 [dependencies]
 sdk = { workspace = true }
 forge-interface = { workspace = true }
+# sha2 rehashes the 20-byte sha1 HEAD oid into a 32-byte StateRoot (always used).
 sha2 = { workspace = true }
 async-trait = { workspace = true }
+# vendored libgit2 (built via cmake + cc). default-features=false drops the
+# ssh/https transport (openssl/libssh2) — forge only touches local repos.
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
 [dev-dependencies]
 # dev-only: prove forge's root composes into the global app-hash. not a

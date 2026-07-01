@@ -87,15 +87,15 @@ fn main() {
         println!("  app-hash       : {:?}", out.app_hash);
         println!("  forge root     : {:?}", host.module_root("forge").unwrap());
 
-        // read forge's HEAD back out (typed query) — the git oid hex. in sha256
-        // mode this hex IS the forge root bytes: a git commit addressing the app-hash.
+        // read forge's HEAD back out (typed query) — the sha1 git oid hex. this hex is
+        // the sha256 PREIMAGE of the forge root: a git commit addressing the app-hash.
         let reply = host
             .query("forge", &forge_encode_query(&ForgeQuery::Head))
             .await
             .expect("query forge");
         if let ForgeReply::Head(Some(oid)) = forge_decode_reply(&reply).unwrap() {
             println!("  forge git HEAD : {oid}");
-            println!("  (^ equals the forge root bytes above — a git HEAD as a module root)");
+            println!("  (^ the 40-char sha1 oid is the sha256 preimage of the forge root above)");
         }
 
         // read the derived greeting back out of the directory (sync typed query).
