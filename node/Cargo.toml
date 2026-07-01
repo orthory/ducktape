@@ -3,13 +3,18 @@ name = "node"
 edition.workspace = true
 version.workspace = true
 
-# the replication layer: wraps a `host::Host` with a byte-oriented transport
-# seam so a locally-originated msg is applied locally AND propagated to peers,
-# while a msg arriving from a peer is applied locally but NEVER re-propagated
-# (the wire-level local-only rule that stops a 2-node loop from ping-ponging).
+# the replication layer: wraps a `host::Host` with an ordering seam so N
+# validators apply a totally-ordered op stream identically. two seams live here:
+#  - `Transport` + `LoopbackHub` (gossip): a locally-originated msg is applied
+#    locally AND propagated; an inbound msg is applied but NEVER re-propagated
+#    (the wire-level local-only rule). converges only for order-INdependent roots.
+#  - `Orderer` + `SequencedHub`/`RoundOrderer` (agreed total order): a msg is NOT
+#    applied on submit; it is proposed into an agreed order and applied via
+#    host.submit ONLY when the order delivers it, identically on every validator.
+#    this is what makes an order-DEPENDENT qmdb root converge.
 # depends on sdk (Msg) + host (the state machine); the wire codec lives here so
-# sdk stays dep-clean. the real commonware p2p transport is a later slice; this
-# crate ships the in-process LoopbackHub that the same convergence test targets.
+# sdk stays dep-clean. the real commonware simplex orderer is a later slice; it
+# is the drop-in behind the same `Orderer` trait.
 [dependencies]
 sdk = { workspace = true }
 host = { workspace = true }
@@ -18,9 +23,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# the convergence test stands two nodes on one LoopbackHub over a pair of
+# the gossip convergence test stands two nodes on one LoopbackHub over a pair of
 # in-memory directory modules (state-based root -> converges without a total
 # order) and drives them on a plain futures executor -- no runtime/commonware.
 directory = { workspace = true }
 directory-interface = { workspace = true }
 futures = "0.3"
+# the agreed-order convergence test stands N validators, each a host with a
+# qmdb-backed kv module (order-DEPENDENT root), on the deterministic runtime.
+kv = { workspace = true }
+kv-interface = { workspace = true }
+state = { workspace = true }
+commonware-runtime = { workspace = true }

@@ -263,3 +263,208 @@ mod tests {
         assert!(decoded[1].payload.is_empty());
     }
 }
+
+// ============================================================================
+// the ordering seam — an AGREED TOTAL ORDER over opaque op frames.
+// ============================================================================
+//
+// ## the semantic shift (why this is NOT the gossip path above)
+//
+// the [`Transport`]/[`LoopbackHub`] path is GOSSIP: [`Node::apply_local`] applies
+// a msg to the local host IMMEDIATELY (the echo) then fans it out. that converges
+// only for order-INdependent module roots (a state-based `directory` root). a
+// qmdb root is op-log/MMR-order-DEPENDENT: the same SET of ops in different
+// orders yields a different root, so the instant two validators apply in
+// different orders their app-hash FORKS.
+//
+// the fix is an AGREED TOTAL ORDER. a locally-originated msg is **NOT** applied
+// on submission — that optimistic echo is exactly what forks the chain the
+// moment another validator's op orders first. instead the msg is proposed into
+// the order via [`Orderer::submit`], and it is applied via `host.submit` ONLY
+// when [`Orderer::poll_delivered`] delivers it — in the identical sequence on
+// every validator, including its originator. so even an order-dependent qmdb
+// root converges.
+//
+// ## precondition (the honest gap vs real BFT)
+//
+// [`RoundOrderer`] converges because every validator accumulates the IDENTICAL
+// SET of frames before draining a round, then applies a deterministic,
+// node-independent total order over that set. the harness guarantees the
+// identical-set precondition by handing every node the same op-set (in different
+// arrival orders); a real simplex finalization stream guarantees it for free
+// (every honest node observes the same finalized-view sequence). the simplex
+// `Orderer` is the drop-in behind this same trait — its `submit` is store.put +
+// enqueue-digest, its `poll_delivered` non-blocking-drains the finalization
+// stream. that is why `submit` is async here even though the deterministic body
+// never suspends.
+
+use sdk::Origin;
+
+/// a wire frame: the ordered unit. carries the agreed submitter identity
+/// (`origin`) and a per-origin monotonic `seq` so that two intentionally
+/// identical msgs are still DISTINCT frames — the order key must be tie-free, and
+/// `seq` doubles as replay protection for the replicated state machine. the
+/// agreed order is the byte-lexicographic sort of these frames: correctness needs
+/// ONLY that the sort be a deterministic, node-independent total order over
+/// distinct frames (it is) — NOT that it be `(origin, seq)`-monotonic (it is not:
+/// `seq` serializes as a json number, so seq=10 sorts before seq=2). a future
+/// replay/streaming slice that needs monotonic ordering must key explicitly.
+#[derive(Serialize, Deserialize)]
+struct Frame {
+    origin: Vec<u8>,
+    seq: u64,
+    target: String,
+    payload: Vec<u8>,
+}
+
+/// frame a locally-originated msg for the ordered lane.
+pub fn encode_frame(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
+    let frame = Frame {
+        origin: origin.to_vec(),
+        seq,
+        target: msg.target.clone(),
+        payload: msg.payload.clone(),
+    };
+    serde_json::to_vec(&frame).expect("frame serializes")
+}
+
+/// decode a delivered frame back to a `(Origin, Msg)` the host can submit. the
+/// `seq` is ordering/replay metadata and is not (yet) surfaced to the host.
+pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
+    let frame: Frame = serde_json::from_slice(bytes)?;
+    let origin = Origin::External(frame.origin);
+    let msg = Msg { target: frame.target, payload: frame.payload };
+    Ok((origin, msg))
+}
+
+/// total-order broadcast over opaque op frames. `submit` proposes a frame into
+/// the agreed sequence (it does NOT apply anything locally); `poll_delivered`
+/// yields the SAME sequence, in the SAME order, on EVERY validator. domain-
+/// agnostic — it orders `Vec<u8>`, never `Msg` (the simplex port slots in behind
+/// this exact shape; that is why `submit` is async).
+pub trait Orderer {
+    /// propose an opaque frame into the agreed order. no local apply.
+    fn submit(&mut self, frame: Vec<u8>) -> impl std::future::Future<Output = Result<(), Error>>;
+    /// the newly-ordered frames since the last call, in agreed order (may be
+    /// empty). non-blocking.
+    fn poll_delivered(&mut self) -> Vec<Vec<u8>>;
+}
+
+/// the deterministic agreed-order impl: accumulate a round's proposed frames,
+/// then on `poll_delivered` yield them SORTED by a deterministic, node-
+/// independent key (the frame bytes themselves, which lead with origin+seq).
+/// every validator that accumulated the identical SET yields the byte-identical
+/// SEQUENCE — so order-dependent roots converge. (this is the "sort a round's
+/// accumulated ops by a deterministic key" total order; real simplex is the
+/// drop-in.)
+#[derive(Default)]
+pub struct RoundOrderer {
+    pending: Vec<Vec<u8>>,
+}
+
+impl RoundOrderer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Orderer for RoundOrderer {
+    fn submit(&mut self, frame: Vec<u8>) -> impl std::future::Future<Output = Result<(), Error>> {
+        async move {
+            self.pending.push(frame);
+            Ok(())
+        }
+    }
+
+    fn poll_delivered(&mut self) -> Vec<Vec<u8>> {
+        let mut out = std::mem::take(&mut self.pending);
+        // the agreed order: a deterministic, node-independent total order over
+        // the round's distinct frames. NOT arrival order.
+        out.sort();
+        out
+    }
+}
+
+/// the NEGATIVE-CONTROL orderer, behind the SAME [`Orderer`] trait: it delivers
+/// each validator its frames in raw ARRIVAL order — no agreed order at all. swap
+/// [`RoundOrderer`] for this in the harness and nothing else changes; two nodes
+/// with opposite arrival orders then apply opposite sequences and an order-
+/// dependent qmdb root FORKS. that swap-only divergence is what proves the agreed
+/// order is load-bearing, not decoration.
+#[derive(Default)]
+pub struct ArrivalOrderer {
+    pending: Vec<Vec<u8>>,
+}
+
+impl ArrivalOrderer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Orderer for ArrivalOrderer {
+    fn submit(&mut self, frame: Vec<u8>) -> impl std::future::Future<Output = Result<(), Error>> {
+        async move {
+            self.pending.push(frame);
+            Ok(())
+        }
+    }
+
+    fn poll_delivered(&mut self) -> Vec<Vec<u8>> {
+        // NO sort: raw arrival order is exactly the no-agreed-order fork the
+        // total order prevents.
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// a replicated host on the ORDERED lane. owns its [`Host`] and an [`Orderer`].
+/// unlike [`Node`], `submit` does NOT apply to the local host — it only proposes
+/// into the agreed order; application happens exclusively in [`OrderedNode::
+/// drain_delivered`], in the order the [`Orderer`] delivers, identically on every
+/// validator. generic over the concrete orderer `O` (no `dyn`), so the same type
+/// serves the deterministic orderer today and the simplex orderer later.
+pub struct OrderedNode<O: Orderer> {
+    host: Host,
+    orderer: O,
+}
+
+impl<O: Orderer> OrderedNode<O> {
+    pub fn new(host: Host, orderer: O) -> Self {
+        Self { host, orderer }
+    }
+
+    /// SUBMIT — propose a locally-originated msg into the agreed order. framed
+    /// with `(origin, seq)` for a tie-free order key + replay identity. does NOT
+    /// touch the local host: `app_hash()` is unchanged until the order delivers
+    /// this frame back through [`OrderedNode::drain_delivered`] (the semantic
+    /// shift — no optimistic echo).
+    pub async fn submit(&mut self, origin: &[u8], seq: u64, msg: Msg) -> Result<(), Error> {
+        self.orderer.submit(encode_frame(origin, seq, &msg)).await
+    }
+
+    /// DRAIN — apply every frame the order delivered, STRICTLY in agreed order,
+    /// via `host.submit`. returns the count applied (0 when idle) so a test can
+    /// drive to a fixpoint deterministically.
+    pub async fn drain_delivered(&mut self) -> Result<usize, Error> {
+        let delivered = self.orderer.poll_delivered();
+        let mut applied = 0usize;
+        for frame in delivered {
+            let (_origin, msg) = decode_frame(&frame)?;
+            // origin plumbing into Env is a later slice (host still hardcodes
+            // height/time/origin); the ORDER is the sole variable under test.
+            self.host.submit(msg).await?;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
+    /// the current app-hash of the wrapped host.
+    pub fn app_hash(&self) -> StateRoot {
+        self.host.app_hash()
+    }
+
+    /// borrow the wrapped host (queries, module_root inspection, ...).
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+}
