@@ -156,6 +156,108 @@ impl Forge {
         h.update(oid.as_bytes()); // 20 raw sha1 bytes
         StateRoot(h.finalize().into())
     }
+
+    // ---- state-sync ---------------------------------------------------------
+    // a snapshot is SELF-CONTAINED BYTES — the 20-byte committed head oid, then
+    // a packfile carrying the head's FULL object closure — so it can ride a
+    // bulk data channel between nodes that share nothing (no common filesystem,
+    // no remote, no `git` binary). the oid prefix binds the pack to a state
+    // root (root() = sha256(oid)), which is what lets install verify against
+    // an expected root before a single byte touches the odb.
+
+    /// serialize the COMMITTED state into self-contained snapshot bytes: the
+    /// 20-byte head sha1 oid, then a packfile of every object reachable from
+    /// it. a staged (this-block) head is deliberately excluded — a snapshot
+    /// must reproduce `root()`, and `root()` covers only the committed ref.
+    /// an unborn repo serializes as 20 zero bytes and NO pack: the marker for
+    /// the [`StateRoot::ZERO`] state (a zero oid names no git object, so the
+    /// encoding is unambiguous).
+    pub fn snapshot(&self) -> Result<Vec<u8>, Error> {
+        let Some(head) = self.head else {
+            return Ok(vec![0u8; git::OID_RAW_LEN]);
+        };
+        let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
+        let pack = git::pack_closure(&repo, head).map_err(|e| Error::Module(e.to_string()))?;
+        let mut bytes = Vec::with_capacity(git::OID_RAW_LEN + pack.len());
+        bytes.extend_from_slice(head.as_bytes());
+        bytes.extend_from_slice(&pack);
+        Ok(bytes)
+    }
+
+    /// replace this module's state with snapshot bytes, gated on `expected`.
+    /// the bytes are UNTRUSTED (a byzantine peer produced them), so the order
+    /// is verify-then-mutate: length-check, parse the oid, require it to
+    /// rehash to `expected` through the same mapping `root()` uses — all
+    /// BEFORE any write; then index the pack (libgit2 re-hashes every object
+    /// and the pack trailer), require the head commit and its root tree to
+    /// actually parse out of the odb, and only then move the ref. on any Err
+    /// the committed ref — and so `root()` — is byte-identical to before the
+    /// call (a failed pack can at most strand unreferenced objects in the
+    /// odb: node-local, never authenticated). no worktree is ever
+    /// materialized, so there is nothing to reset. on Ok any staged head is
+    /// dropped — install is a full state replacement, not a merge.
+    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
+        // untrusted input: bound the read before parsing anything.
+        if bytes.len() < git::OID_RAW_LEN {
+            return Err(Error::Module(format!(
+                "snapshot truncated: {} bytes, oid header needs {}",
+                bytes.len(),
+                git::OID_RAW_LEN
+            )));
+        }
+        let (oid_bytes, pack) = bytes.split_at(git::OID_RAW_LEN);
+        let oid = Oid::from_bytes(oid_bytes).map_err(|e| Error::Module(e.to_string()))?;
+
+        // the empty marker: a zero oid names no object, so it encodes the
+        // unborn state and must carry nothing after the header. NB it binds
+        // to StateRoot::ZERO — the same None -> ZERO mapping root() uses —
+        // NOT to sha256(<zero oid>).
+        if oid.is_zero() {
+            if !pack.is_empty() {
+                return Err(Error::Module(
+                    "empty-state snapshot carries trailing bytes".into(),
+                ));
+            }
+            if expected != StateRoot::ZERO {
+                return Err(Error::Module(
+                    "snapshot root mismatch: empty state, non-ZERO expected".into(),
+                ));
+            }
+            let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
+            git::delete_ref(&repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?;
+            self.head = None;
+            self.staged = None;
+            return Ok(());
+        }
+
+        // the root binding, verified BEFORE any byte reaches the odb.
+        if Self::oid_to_root(oid) != expected {
+            return Err(Error::Module(
+                "snapshot root mismatch: head oid does not rehash to expected root".into(),
+            ));
+        }
+
+        // index the pack: every object is hash-verified as it lands, so a
+        // tampered pack dies here with the ref unmoved. the pack is the
+        // terminal field — its own trailer checksum delimits it.
+        let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
+        git::install_pack(&repo, pack).map_err(|e| Error::Module(e.to_string()))?;
+
+        // the pack verified per-object, but nothing yet says it CONTAINS the
+        // head — or the head's FULL closure: libgit2 indexes a partial pack
+        // fine (per-object hashes, no connectivity), so a byzantine snapshot
+        // could carry the genuine head commit and omit the blobs/trees/parents
+        // it references. walk the closure and require every reachable object
+        // before publishing.
+        git::verify_closure(&repo, oid).map_err(|e| Error::Module(e.to_string()))?;
+
+        // fully verified — publish with the same ref move commit_block uses,
+        // then refresh the committed mirror so root() reflects it.
+        git::update_ref(&repo, MAIN_REF, oid).map_err(|e| Error::Module(e.to_string()))?;
+        self.head = Some(oid);
+        self.staged = None;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait(?Send)]

@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use git2::{Commit, ErrorCode, Oid, Repository, RepositoryInitOptions, Signature, Time, Tree};
+use git2::{Buf, Commit, ErrorCode, Oid, Repository, RepositoryInitOptions, Signature, Time, Tree};
 
 /// the fixed author/committer identity — pinning it makes the commit oid
 /// reproducible across nodes (no host `user.name`/`user.email` leak).
@@ -90,5 +90,92 @@ pub fn commit(
 /// see the module docstring in `lib.rs`.)
 pub fn update_ref(repo: &Repository, name: &str, target: Oid) -> Result<(), git2::Error> {
     repo.reference(name, target, true, "forge: commit_block")?;
+    Ok(())
+}
+
+/// the raw width of a sha1 oid — the snapshot's head-oid header size.
+pub const OID_RAW_LEN: usize = 20;
+
+/// pack the FULL object closure reachable from `head` into a self-contained
+/// packfile: a revwalk over every reachable commit, each inserted with its
+/// completed tree and blobs (`insert_commit` pulls the whole closure; the
+/// builder dedups objects shared between commits). single-threaded, because
+/// multi-threaded delta selection is schedule-dependent and the pack bytes
+/// should be a pure function of the closure.
+pub fn pack_closure(repo: &Repository, head: Oid) -> Result<Vec<u8>, git2::Error> {
+    let mut pb = repo.packbuilder()?;
+    pb.set_threads(1);
+    let mut walk = repo.revwalk()?;
+    walk.push(head)?;
+    for oid in walk {
+        pb.insert_commit(oid?)?;
+    }
+    let mut buf = Buf::new();
+    pb.write_buf(&mut buf)?;
+    Ok(buf.to_vec())
+}
+
+/// stream a packfile into the odb and commit it. libgit2's indexer re-hashes
+/// every object and checks the pack trailer as it indexes, so tampered or
+/// malformed bytes fail HERE — before anything could be referenced, with no
+/// ref moved. (a failed pack may strand temp/loose junk in the odb: node-
+/// local, never part of any root.)
+pub fn install_pack(repo: &Repository, pack: &[u8]) -> Result<(), git2::Error> {
+    let odb = repo.odb()?;
+    let mut pw = odb.packwriter()?;
+    std::io::Write::write_all(&mut pw, pack)
+        .map_err(|e| git2::Error::from_str(&format!("write pack: {e}")))?;
+    pw.commit()?;
+    Ok(())
+}
+
+/// delete a ref if it exists (idempotent) — installing the empty state onto a
+/// repo whose ref was already born must unbind it, or the module's root could
+/// never return to ZERO.
+pub fn delete_ref(repo: &Repository, name: &str) -> Result<(), git2::Error> {
+    match repo.find_reference(name) {
+        Ok(mut r) => r.delete(),
+        Err(e) if e.code() == ErrorCode::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// verify the FULL object closure reachable from `head` is present in the odb.
+/// pack indexing hash-verifies each object it CARRIES but says nothing about
+/// connectivity — a byzantine pack can ship a genuine head commit and omit the
+/// blobs/trees/parents it references. walk every commit from `head` and every
+/// tree entry beneath each, requiring each object to exist (a missing parent
+/// commit surfaces as a revwalk read error; a missing tree fails `find_tree`;
+/// a missing blob fails the odb existence check). submodule gitlinks are
+/// skipped: they name commits in ANOTHER repo's odb by design.
+pub fn verify_closure(repo: &Repository, head: Oid) -> Result<(), git2::Error> {
+    let odb = repo.odb()?;
+    let mut walk = repo.revwalk()?;
+    walk.push(head)?;
+    let mut seen_trees = std::collections::BTreeSet::new();
+    for oid in walk {
+        let commit = repo.find_commit(oid?)?;
+        let mut stack = vec![commit.tree_id()];
+        while let Some(tree_id) = stack.pop() {
+            if !seen_trees.insert(tree_id) {
+                continue;
+            }
+            let tree = repo.find_tree(tree_id)?;
+            for entry in tree.iter() {
+                match entry.kind() {
+                    Some(git2::ObjectType::Tree) => stack.push(entry.id()),
+                    Some(git2::ObjectType::Commit) => {}
+                    _ => {
+                        if !odb.exists(entry.id()) {
+                            return Err(git2::Error::from_str(&format!(
+                                "closure incomplete: missing object {}",
+                                entry.id()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
