@@ -69,6 +69,40 @@ pub type Digest = sha256::Digest;
 /// through — keyed by [`Digest`], over ed25519 peers, no subscribers.
 type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::PublicKey, ()>;
 
+/// the versioned consensus signature / certificate scheme — a GENESIS-WIDE constant
+/// every validator must agree on (it domain-separates the simplex scheme + certificates;
+/// a mismatch means engines never agree and the mesh hangs).
+///
+/// # variants
+/// - [`V1Ed25519`](ConsensusScheme::V1Ed25519) — TODAY. each validator signs with its own
+///   ed25519 key; a certificate is a COLLECTION of ed25519 signatures, so cert size (and
+///   verification cost) grows linearly with the validator set.
+/// - `V2Bls` (future, NOT a variant yet) — aggregated / threshold BLS: one aggregated
+///   signature per certificate -> CONSTANT-size certs, cheap to verify at any set size.
+///   the reason to migrate at scale.
+///
+/// # the rekey / respawn contract (read before adding V2 or dynamic validators)
+/// the scheme AND the validator set are fixed at simplex `Engine` construction — neither
+/// can be hot-swapped in a running engine. changing EITHER (a scheme migration, or a
+/// validator join/leave) requires an **epoch transition**: at a height the OLD engine
+/// finalizes, every validator tears down the current engine and RE-SPAWNS a new one with
+/// the new `(scheme, participants)`. finalizing the switch through the old engine FIRST is
+/// what makes every node cut over at the SAME point (else they fork). this one
+/// teardown-and-respawn mechanism backs both BLS migration and dynamic valset.
+///
+/// # V1 implementation note
+/// [`SimplexOrderer`]'s engine is currently CONCRETE over ed25519 (its `Scheme` type + ~15
+/// `ed25519::PublicKey` bounds). so V2Bls is not merely a new enum arm — it also requires
+/// making the engine SCHEME-GENERIC (parameterizing those bounds). deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsensusScheme {
+    /// per-validator ed25519 signatures; certificates are collections of them. (today)
+    #[default]
+    V1Ed25519,
+    // V2Bls — deliberately NOT a variant yet: adding it makes every `match ConsensusScheme`
+    // non-exhaustive, which is the compiler-enforced TODO (a BLS engine + a genesis rekey).
+}
+
 /// hash a frame's bytes into the [`Digest`] simplex will order — the
 /// content-address (identical bytes always map to the same digest).
 pub fn digest_of(bytes: &[u8]) -> Digest {

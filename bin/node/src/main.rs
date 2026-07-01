@@ -42,7 +42,11 @@ use commonware_p2p::Manager;
 use commonware_runtime::{Clock, Quota, Runner, Supervisor};
 use commonware_utils::{ordered::Set, NZU32};
 
-use consensus::{digest_of, ContentStore, Digest, SimplexOrderer};
+use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer};
+
+/// the consensus signature scheme this build runs — a genesis-wide constant. today only
+/// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
+const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 use directory::Directory;
 use host::Host;
 use kv::Kv;
@@ -220,9 +224,15 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         // scheme built the production way: `signer` finds our key's index in the
         // sorted participant set, so we sign as exactly the participant our
         // discovery identity represents. (NOT the mocks-gated `fixture`.)
-        let scheme =
-            simplex_ed25519::Scheme::signer(&namespace, participants.clone(), signer.clone())
-                .expect("our key is in the authorized participant set");
+        // the consensus signature scheme is a GENESIS-WIDE constant (ConsensusScheme).
+        // today only V1 (ed25519). adding V2Bls makes this match non-exhaustive — the
+        // compiler-enforced point to wire a BLS engine + an epoch-transition rekey.
+        let scheme = match CONSENSUS_SCHEME {
+            ConsensusScheme::V1Ed25519 => {
+                simplex_ed25519::Scheme::signer(&namespace, participants.clone(), signer.clone())
+                    .expect("our key is in the authorized participant set")
+            }
+        };
 
         // genesis floor: domain-separated by namespace so every node in THIS app
         // computes the identical digest (else engines never agree -> hang). NOT
