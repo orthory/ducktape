@@ -1,0 +1,7 @@
+# node 0 — the bootstrapper. binds :52200. id 0 => it bootstraps nobody
+# (everyone else dials it). namespace + peer_seeds MUST match every other node.
+id = 0
+listen = "127.0.0.1:52200"
+namespace = "ducktape-demo"
+peer_seeds = [0, 1]
+storage_dir = "/tmp/ducktape-node-0"

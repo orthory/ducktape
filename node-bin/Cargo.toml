@@ -1,0 +1,32 @@
+[package]
+name = "node-bin"
+edition.workspace = true
+version.workspace = true
+
+# a runnable multi-process node: derives an ed25519 identity from a config seed,
+# stands up a real `authenticated::discovery` encrypted TCP mesh to its peers,
+# runs a live simplex Engine (via consensus::SimplexOrderer, over the REAL tokio
+# runtime + discovery channels — NOT p2p::simulated) driving an OrderedNode over
+# host::Host, and prints its evolving app-hash so a demo script can assert two
+# OS processes converge over real sockets.
+[[bin]]
+name = "ducktape-node"
+path = "src/main.rs"
+
+[dependencies]
+host = { workspace = true }
+node = { workspace = true }
+consensus = { workspace = true }
+sdk = { workspace = true }
+kv = { workspace = true }
+kv-interface = { workspace = true }
+directory = { workspace = true }
+
+commonware-runtime = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-p2p = { workspace = true }
+commonware-consensus = { workspace = true }
+commonware-utils = { workspace = true }
+
+serde = { workspace = true }
+toml = "0.8"

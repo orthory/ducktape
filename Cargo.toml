@@ -16,6 +16,7 @@ members = [
     "node",
     "consensus",
     "demo",
+    "node-bin",
 ]
 
 [workspace.package]
