@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset_interface::{decode_msg, decode_query, encode_reply, ValsetMsg, ValsetQuery, ValsetReply};
 
@@ -219,6 +219,10 @@ impl Module for Valset {
     /// sdk `StateRoot::ZERO` doc and forge's unborn-repo root).
     fn root(&self) -> StateRoot {
         Self::root_of(&self.validators)
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

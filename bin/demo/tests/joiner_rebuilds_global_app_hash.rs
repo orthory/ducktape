@@ -22,6 +22,11 @@ use agent_interface::{
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use demo::state_sync::{
+    LoopbackStateSyncResolver, MeshParticipant, MeshRole, StateSyncKind, StateSyncPayload,
+    StateSyncPeerId, StateSyncRequest, decode_qmdb_target, decode_response, encode_qmdb_target,
+    encode_request,
+};
 use directory::Directory;
 use directory_interface::{DirMsg, encode_msg as dir_encode_msg};
 use document::Document;
@@ -446,14 +451,82 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // the per-module surfaces the joiner pulls: snapshot bytes for the
         // in-memory + git modules, sync targets + resolvers for the qmdb stores
         // (into_resolver consumes the source store — capture everything first).
-        let directory_bytes = src_directory.snapshot();
+        // directory snapshot bytes and the kv qmdb target cross an explicit
+        // request/response boundary keyed by a validator-set mesh participant;
+        // the remaining sources stay on the older in-process handoff in this
+        // slice.
         let valset_bytes = src_valset.snapshot();
         let saga_bytes = src_saga.snapshot();
         let forge_bytes = src_forge.snapshot().expect("forge snapshot");
         let src_validators = validators(&src_valset).await;
         let src_agent_entries = agent_entries(&src_agent, "general").await;
 
-        let kv_target = src_kv.sync_target().await;
+        let source_peer = StateSyncPeerId::ed25519_public_key(src_validators[0].clone())
+            .expect("source validator key is a peer id");
+        let joiner_peer = StateSyncPeerId::ed25519_public_key(validator_key(11))
+            .expect("joiner key is a peer id");
+        let mut state_sync = LoopbackStateSyncResolver::default();
+        state_sync.insert_participant(MeshParticipant::validator_set_participant(
+            source_peer.clone(),
+        ));
+        state_sync
+            .serve_module(
+                &source_peer,
+                "directory",
+                src_directory_root,
+                StateSyncPayload::Snapshot(src_directory.snapshot()),
+            )
+            .expect("serve directory snapshot");
+
+        let raw_kv_target = src_kv.sync_target().await;
+        state_sync
+            .serve_module(
+                &source_peer,
+                "kv",
+                src_kv_root,
+                StateSyncPayload::QmdbTarget(encode_qmdb_target(&raw_kv_target)),
+            )
+            .expect("serve kv target");
+        let directory_request = StateSyncRequest::new(
+            joiner_peer.clone(),
+            source_peer.clone(),
+            "directory",
+            src_directory_root,
+            StateSyncKind::Snapshot,
+        );
+        let directory_response = decode_response(
+            &state_sync
+                .resolve_bytes(&encode_request(&directory_request))
+                .expect("directory state-sync response"),
+        )
+        .expect("decode directory state-sync response");
+        assert!(directory_response.source.has_role(MeshRole::Bootnode));
+        assert!(directory_response.source.has_role(MeshRole::Relayer));
+        let directory_bytes = directory_response
+            .payload
+            .into_snapshot_bytes()
+            .expect("directory snapshot payload");
+
+        let kv_request = StateSyncRequest::new(
+            joiner_peer,
+            source_peer,
+            "kv",
+            src_kv_root,
+            StateSyncKind::QmdbTarget,
+        );
+        let kv_response = decode_response(
+            &state_sync
+                .resolve_bytes(&encode_request(&kv_request))
+                .expect("kv state-sync response"),
+        )
+        .expect("decode kv state-sync response");
+        let kv_target = decode_qmdb_target(
+            &kv_response
+                .payload
+                .into_qmdb_target_bytes()
+                .expect("kv target payload"),
+        )
+        .expect("decode kv target");
         let kv_resolver = src_kv.into_resolver();
         let document_target = src_document.sync_target().await;
         let document_resolver = src_document.into_resolver();

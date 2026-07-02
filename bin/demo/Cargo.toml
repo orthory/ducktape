@@ -22,6 +22,8 @@ sdk = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 saga = { workspace = true }

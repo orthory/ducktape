@@ -30,7 +30,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use sdk::{Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk::{
+    Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
+};
 
 /// hard cap on dispatches per `submit` (the root op plus all follow-ups). a
 /// consensus/genesis constant — identical on every node — so the local re-entry
@@ -54,7 +56,11 @@ impl Default for BlockContext {
     /// the pre-consensus default: height/time 0 and an empty external origin, so
     /// [`Host::submit`] is byte-for-byte the old hardcoded behavior.
     fn default() -> Self {
-        Self { height: 0, consensus_time: 0, origin: Origin::External(Vec::new()) }
+        Self {
+            height: 0,
+            consensus_time: 0,
+            origin: Origin::External(Vec::new()),
+        }
     }
 }
 
@@ -69,6 +75,83 @@ pub struct BlockOutcome {
     pub effects: Vec<Effect>,
 }
 
+/// a finalized consensus boundary the host is allowed to serve from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinalizedBlock {
+    /// finalized block height.
+    pub height: u64,
+    /// app-hash consensus committed at `height`.
+    pub app_hash: StateRoot,
+}
+
+/// one module's committed root plus the sync surface it can currently serve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleSnapshot {
+    pub id: ModuleId,
+    pub root: StateRoot,
+    pub state_sync: StateSyncHandle,
+}
+
+/// a consistent registry view captured at a finalized app-hash boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizedSnapshot {
+    pub height: u64,
+    pub app_hash: StateRoot,
+    pub modules: Vec<ModuleSnapshot>,
+}
+
+impl FinalizedSnapshot {
+    /// find a module entry by id.
+    pub fn module(&self, id: &str) -> Option<&ModuleSnapshot> {
+        self.modules.iter().find(|m| m.id == id)
+    }
+
+    /// true only when every module supplied self-contained snapshot bytes.
+    pub fn has_all_snapshot_bytes(&self) -> bool {
+        self.modules
+            .iter()
+            .all(|m| m.state_sync.has_snapshot_bytes())
+    }
+
+    /// true when every module can be rebuilt without an external resolver.
+    pub fn is_self_contained(&self) -> bool {
+        self.modules
+            .iter()
+            .all(|m| m.state_sync.is_self_contained())
+    }
+}
+
+/// failures while capturing a finalized snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// the caller asked for a boundary that no longer matches the host state.
+    AppHashMismatch {
+        expected: StateRoot,
+        actual: StateRoot,
+    },
+    /// a module failed while preparing its state-sync handle.
+    Module { id: ModuleId, source: Error },
+}
+
+impl core::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AppHashMismatch { expected, actual } => write!(
+                f,
+                "finalized app-hash mismatch: expected {expected:?}, actual {actual:?}",
+            ),
+            Self::Module { id, source } => {
+                write!(
+                    f,
+                    "module {id} failed to prepare state-sync handle: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
 /// the deterministic state machine: a module registry + dispatch + drain.
 #[derive(Default)]
 pub struct Host {
@@ -78,7 +161,9 @@ pub struct Host {
 
 impl Host {
     pub fn new() -> Self {
-        Self { registry: BTreeMap::new() }
+        Self {
+            registry: BTreeMap::new(),
+        }
     }
 
     /// register a module under its own [`Module::id`]. genesis-time wiring.
@@ -139,6 +224,52 @@ impl Host {
         self.registry.get(id).map(|m| m.root())
     }
 
+    /// capture the committed registry view for a finalized block.
+    ///
+    /// The caller supplies the finalized app-hash from consensus. The host
+    /// recomputes its current app-hash first and refuses to serve if it has
+    /// already advanced, preventing a node from labeling current module state as
+    /// an older height. Because this borrows `&self`, it can only run outside the
+    /// mutable `submit_at` block lifecycle; module roots and state-sync handles
+    /// therefore come from committed state, not an in-flight staged overlay.
+    pub fn capture_finalized_snapshot(
+        &self,
+        finalized: FinalizedBlock,
+    ) -> Result<FinalizedSnapshot, SnapshotError> {
+        let actual = self.app_hash();
+        if actual != finalized.app_hash {
+            return Err(SnapshotError::AppHashMismatch {
+                expected: finalized.app_hash,
+                actual,
+            });
+        }
+
+        let modules = self
+            .registry
+            .iter()
+            .map(|(id, module)| {
+                let state_sync =
+                    module
+                        .state_sync_handle()
+                        .map_err(|source| SnapshotError::Module {
+                            id: id.clone(),
+                            source,
+                        })?;
+                Ok(ModuleSnapshot {
+                    id: id.clone(),
+                    root: module.root(),
+                    state_sync,
+                })
+            })
+            .collect::<Result<Vec<_>, SnapshotError>>()?;
+
+        Ok(FinalizedSnapshot {
+            height: finalized.height,
+            app_hash: finalized.app_hash,
+            modules,
+        })
+    }
+
     /// apply one inbound message as a block: route, execute, drain follow-ups,
     /// then COMMIT the block at its boundary. `height`/`consensus_time` are
     /// block-constant; the root op's origin is `External`, follow-ups carry
@@ -163,11 +294,7 @@ impl Host {
     /// the agreed `height` / `consensus_time` and the root op's `origin`, sourced
     /// from the finalized view by the ordered lane. otherwise identical to
     /// [`Host::submit`] (which is just `submit_at(BlockContext::default(), msg)`).
-    pub async fn submit_at(
-        &mut self,
-        ctx: BlockContext,
-        msg: Msg,
-    ) -> Result<BlockOutcome, Error> {
+    pub async fn submit_at(&mut self, ctx: BlockContext, msg: Msg) -> Result<BlockOutcome, Error> {
         // every module dispatched this block, in deterministic order — the set
         // the host commits or aborts at the boundary.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
@@ -182,7 +309,11 @@ impl Host {
                         m.commit_block().await?;
                     }
                 }
-                Ok(BlockOutcome { app_hash: self.app_hash(), events, effects })
+                Ok(BlockOutcome {
+                    app_hash: self.app_hash(),
+                    events,
+                    effects,
+                })
             }
             Err(e) => {
                 // failure anywhere in the drain: discard every touched module's
@@ -236,8 +367,11 @@ impl Host {
             touched.insert(msg.target.clone());
 
             // dispatch-start snapshot: the rest of the registry, plus self.
-            let mut snapshot: BTreeMap<ModuleId, StateRoot> =
-                self.registry.iter().map(|(k, m)| (k.clone(), m.root())).collect();
+            let mut snapshot: BTreeMap<ModuleId, StateRoot> = self
+                .registry
+                .iter()
+                .map(|(k, m)| (k.clone(), m.root()))
+                .collect();
             snapshot.insert(msg.target.clone(), me.root());
 
             let mut ctx = HostCtx {
@@ -259,7 +393,12 @@ impl Host {
             let res = me.execute(&mut ctx, &msg).await;
 
             // destructure releases the &registry borrow → map is mutable again.
-            let HostCtx { out_msgs, out_events, out_effects, .. } = ctx;
+            let HostCtx {
+                out_msgs,
+                out_events,
+                out_effects,
+                ..
+            } = ctx;
 
             // reinsert BEFORE propagating any error — a module never vanishes.
             self.registry.insert(msg.target.clone(), me);

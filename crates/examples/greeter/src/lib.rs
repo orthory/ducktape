@@ -7,7 +7,7 @@
 
 use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
 use kv_interface::{encode as kv_encode, KvMsg};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
 pub struct Greeter {
     id: ModuleId,
@@ -30,6 +30,10 @@ impl Module for Greeter {
     /// stateless — contributes a constant root to the app-hash.
     fn root(&self) -> StateRoot {
         StateRoot::ZERO
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::Stateless)
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
