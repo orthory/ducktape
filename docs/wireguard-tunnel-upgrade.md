@@ -3,8 +3,8 @@
 Status: implemented protocol boundary for the validator-mesh epic. The
 `wireguard-upgrade` crate verifies endpoint advertisements, mesh versions,
 port policy, signed upgrade request/response/ack messages, replay nonces,
-allowed IPs, relay candidates, and ACK freshness. A successful validation emits
-a tunnel install plan that is converted into `defguard_wireguard_rs`
+allowed IPs, relay candidates, signed direct-dial failure evidence, and ACK
+freshness. A successful validation emits a tunnel install plan that is converted into `defguard_wireguard_rs`
 `Peer`/`InterfaceConfiguration` values for the effectful node layer to apply
 through `WGApi`.
 
@@ -223,8 +223,27 @@ TunnelUpgradeResponseV1 {
   responder_wireguard_endpoint
   accepted_allowed_ips
   relay_candidates
+  direct_dial_failure
   keepalive_seconds
   expires_at_view
+  nonce
+  signature_ed25519
+}
+```
+
+```text
+DirectDialFailureEvidenceV1 {
+  domain = "ducktape:wireguard-direct-dial-failure:v1"
+  namespace
+  epoch
+  valset_root
+  mesh_version
+  observer_identity_ed25519
+  target_identity_ed25519
+  target_wireguard_endpoint
+  failed_at_view
+  expires_at_view
+  error_hash
   nonce
   signature_ed25519
 }
@@ -262,9 +281,11 @@ A node installs WireGuard peer config only after all checks pass:
 8. Both endpoints satisfy local port policy.
 9. No request, response, or ack message has expired.
 10. `(sender_identity, epoch, nonce)` has not been seen before for every signed
-    message.
+    message, including duplicate nonces inside the same validation call.
 11. Both requested and accepted allowed IPs are within the deterministic overlay
     assignment for those validator identities.
+12. Relay candidates are empty unless the response includes signed direct-dial
+    failure evidence from the initiator for the responder's WireGuard endpoint.
 
 ## Overlay Addressing
 
@@ -294,8 +315,9 @@ Relay selection rules:
 - Candidate must be in the same admitted active consensus epoch and mesh
   version.
 - Candidate must satisfy the same endpoint and port policy checks.
-- Candidate must not be the only path unless direct dialing failed with a
-  recorded dial error.
+- Candidate must not be used unless direct dialing failed with a signed,
+  unexpired `DirectDialFailureEvidenceV1` bound to the same namespace, epoch,
+  valset root, mesh version, observer, target, and target WireGuard endpoint.
 - External permanent relays are rejected by protocol. A deployment can add a
   relay only by admitting it to the active consensus validator set for that
   epoch.

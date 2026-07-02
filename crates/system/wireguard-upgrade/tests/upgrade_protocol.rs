@@ -80,14 +80,45 @@ fn mesh() -> (
     (a, b, set, view, policy)
 }
 
+fn direct_dial_failure(
+    observer: &PrivateKey,
+    set: &ActiveValidatorSet,
+    view: &MeshView,
+    target_identity: ValidatorIdentity,
+    target_endpoint: Endpoint,
+    nonce: u64,
+) -> DirectDialFailureEvidence {
+    DirectDialFailureEvidence::sign(
+        DirectDialFailureFields {
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            mesh_version: view.mesh_version,
+            observer_identity: id(observer),
+            target_identity,
+            target_wireguard_endpoint: target_endpoint,
+            failed_at_view: 11,
+            expires_at_view: 40,
+            error_hash: [7; 32],
+            nonce,
+        },
+        observer,
+    )
+}
+
 #[test]
 fn endpoint_policy_rejects_dns_wildcards_bad_ports_and_wrong_transport() {
     let policy = prod_policy();
 
     assert!(Endpoint::parse("example.com:51820", Transport::Udp, &policy).is_err());
     assert!(Endpoint::parse("0.0.0.0:51820", Transport::Udp, &policy).is_err());
+    assert!(Endpoint::parse("0.1.2.3:51820", Transport::Udp, &policy).is_err());
     assert!(Endpoint::parse("127.0.0.1:51820", Transport::Udp, &policy).is_err());
     assert!(Endpoint::parse("10.0.0.1:51820", Transport::Udp, &policy).is_err());
+    assert!(Endpoint::parse("100.64.0.1:51820", Transport::Udp, &policy).is_err());
+    assert!(Endpoint::parse("192.0.0.1:51820", Transport::Udp, &policy).is_err());
+    assert!(Endpoint::parse("198.18.0.1:51820", Transport::Udp, &policy).is_err());
+    assert!(Endpoint::parse("240.0.0.1:51820", Transport::Udp, &policy).is_err());
     assert!(Endpoint::parse("8.8.8.10:53", Transport::Udp, &policy).is_err());
     assert!(Endpoint::parse("8.8.8.10:51820", Transport::Tcp, &policy).is_err());
 }
@@ -155,6 +186,14 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
             responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
             accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
             relay_candidates: view.relay_candidates(),
+            direct_dial_failure: Some(direct_dial_failure(
+                &a,
+                &set,
+                &view,
+                id(&b),
+                view.record(id(&b)).unwrap().wireguard_endpoint,
+                4,
+            )),
             keepalive_seconds: Some(25),
             expires_at_view: 40,
             nonce: 2,
@@ -190,6 +229,55 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
         plan.allowed_ips,
         overlay.allowed_ips_for(&view, id(&b)).unwrap()
     );
+
+    let response_without_failure = TunnelUpgradeResponse::sign(
+        TunnelUpgradeResponseFields {
+            direct_dial_failure: None,
+            ..response.fields.clone()
+        },
+        &b,
+    );
+    let ack_without_failure = TunnelUpgradeAck::sign(
+        TunnelUpgradeAckFields {
+            response_hash: response_without_failure.hash(),
+            ..ack.fields.clone()
+        },
+        &a,
+    );
+    let mut fresh_cache = ReplayCache::default();
+    let err = validate_upgrade(
+        &view,
+        &policy,
+        &overlay,
+        12,
+        &request,
+        &response_without_failure,
+        &ack_without_failure,
+        &mut fresh_cache,
+    )
+    .unwrap_err();
+    assert_eq!(err, UpgradeError::InvalidRelay);
+
+    let duplicate_nonce_ack = TunnelUpgradeAck::sign(
+        TunnelUpgradeAckFields {
+            nonce: request.fields.nonce,
+            ..ack.fields.clone()
+        },
+        &a,
+    );
+    let mut fresh_cache = ReplayCache::default();
+    let err = validate_upgrade(
+        &view,
+        &policy,
+        &overlay,
+        12,
+        &request,
+        &response,
+        &duplicate_nonce_ack,
+        &mut fresh_cache,
+    )
+    .unwrap_err();
+    assert_eq!(err, UpgradeError::Replay);
 
     assert!(
         validate_upgrade(
@@ -289,6 +377,14 @@ fn valid_plan_builds_defguard_peer_config() {
             responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
             accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
             relay_candidates: view.relay_candidates(),
+            direct_dial_failure: Some(direct_dial_failure(
+                &a,
+                &set,
+                &view,
+                id(&b),
+                view.record(id(&b)).unwrap().wireguard_endpoint,
+                4,
+            )),
             keepalive_seconds: Some(25),
             expires_at_view: 40,
             nonce: 2,

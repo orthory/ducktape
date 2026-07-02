@@ -24,7 +24,9 @@ const ENDPOINT_NS: &[u8] = b"ducktape:wireguard-endpoint:v1";
 const UPGRADE_REQUEST_NS: &[u8] = b"ducktape:wireguard-upgrade-request:v1";
 const UPGRADE_RESPONSE_NS: &[u8] = b"ducktape:wireguard-upgrade-response:v1";
 const UPGRADE_ACK_NS: &[u8] = b"ducktape:wireguard-upgrade-ack:v1";
+const DIRECT_DIAL_FAILURE_NS: &[u8] = b"ducktape:wireguard-direct-dial-failure:v1";
 const MAX_ACK_INSTALL_LAG: u64 = 8;
+const MAX_DIAL_FAILURE_LAG: u64 = 8;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UpgradeError {
@@ -62,6 +64,8 @@ pub enum UpgradeError {
     InvalidAllowedIp,
     #[error("invalid relay candidate")]
     InvalidRelay,
+    #[error("invalid direct dial failure evidence")]
+    InvalidDialFailure,
     #[error("invalid WireGuard key")]
     InvalidWireGuardKey,
 }
@@ -528,6 +532,50 @@ impl TunnelUpgradeRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectDialFailureFields {
+    pub namespace: String,
+    pub epoch: u64,
+    pub valset_root: Root,
+    pub mesh_version: MeshVersion,
+    pub observer_identity: ValidatorIdentity,
+    pub target_identity: ValidatorIdentity,
+    pub target_wireguard_endpoint: Endpoint,
+    pub failed_at_view: u64,
+    pub expires_at_view: u64,
+    pub error_hash: [u8; 32],
+    pub nonce: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectDialFailureEvidence {
+    pub fields: DirectDialFailureFields,
+    pub signature: SignatureBytes,
+}
+
+impl DirectDialFailureEvidence {
+    pub fn sign(fields: DirectDialFailureFields, signer: &ed25519::PrivateKey) -> Self {
+        let mut msg = Vec::new();
+        put_direct_dial_failure_fields(&mut msg, &fields);
+        let signature = signer.sign(DIRECT_DIAL_FAILURE_NS, &msg);
+        Self {
+            fields,
+            signature: signature_bytes(&signature),
+        }
+    }
+
+    fn verify_signature(&self) -> Result<(), UpgradeError> {
+        let mut msg = Vec::new();
+        put_direct_dial_failure_fields(&mut msg, &self.fields);
+        verify_ed25519(
+            self.fields.observer_identity,
+            DIRECT_DIAL_FAILURE_NS,
+            &msg,
+            &self.signature,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelUpgradeResponseFields {
     pub request_hash: [u8; 32],
     pub namespace: String,
@@ -540,6 +588,7 @@ pub struct TunnelUpgradeResponseFields {
     pub responder_wireguard_endpoint: Endpoint,
     pub accepted_allowed_ips: Vec<AllowedIp>,
     pub relay_candidates: Vec<ValidatorIdentity>,
+    pub direct_dial_failure: Option<DirectDialFailureEvidence>,
     pub keepalive_seconds: Option<u16>,
     pub expires_at_view: u64,
     pub nonce: u64,
@@ -647,6 +696,20 @@ impl ReplayCache {
     fn insert(&mut self, identity: ValidatorIdentity, epoch: u64, nonce: u64) {
         self.seen.insert((identity, epoch, nonce));
     }
+
+    fn check_batch(
+        &self,
+        keys: &[(ValidatorIdentity, u64, u64)],
+    ) -> Result<BTreeSet<(ValidatorIdentity, u64, u64)>, UpgradeError> {
+        let mut pending = BTreeSet::new();
+        for (identity, epoch, nonce) in keys {
+            if !pending.insert((*identity, *epoch, *nonce)) {
+                return Err(UpgradeError::Replay);
+            }
+            self.check(*identity, *epoch, *nonce)?;
+        }
+        Ok(pending)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -746,19 +809,39 @@ pub fn validate_upgrade(
     }
     overlay.validate_for(view, rq.responder_identity, &rq.requested_allowed_ips)?;
     overlay.validate_for(view, rq.initiator_identity, &rs.accepted_allowed_ips)?;
+    if !rs.relay_candidates.is_empty() && rs.direct_dial_failure.is_none() {
+        return Err(UpgradeError::InvalidRelay);
+    }
+    if let Some(failure) = &rs.direct_dial_failure {
+        validate_direct_dial_failure(
+            failure,
+            view,
+            current_view,
+            rq.initiator_identity,
+            rq.responder_identity,
+            responder_record.wireguard_endpoint,
+        )?;
+    }
     for relay in &rs.relay_candidates {
         let record = view.record(*relay).ok_or(UpgradeError::InvalidRelay)?;
         if !record.capabilities.contains(&MeshCapability::Relay) {
             return Err(UpgradeError::InvalidRelay);
         }
     }
-    replay.check(rq.initiator_identity, rq.epoch, rq.nonce)?;
-    replay.check(rs.responder_identity, rs.epoch, rs.nonce)?;
-    replay.check(ak.initiator_identity, ak.epoch, ak.nonce)?;
+    let mut replay_keys = vec![
+        (rq.initiator_identity, rq.epoch, rq.nonce),
+        (rs.responder_identity, rs.epoch, rs.nonce),
+        (ak.initiator_identity, ak.epoch, ak.nonce),
+    ];
+    if let Some(failure) = &rs.direct_dial_failure {
+        let f = &failure.fields;
+        replay_keys.push((f.observer_identity, f.epoch, f.nonce));
+    }
+    let replay_keys = replay.check_batch(&replay_keys)?;
 
-    replay.insert(rq.initiator_identity, rq.epoch, rq.nonce);
-    replay.insert(rs.responder_identity, rs.epoch, rs.nonce);
-    replay.insert(ak.initiator_identity, ak.epoch, ak.nonce);
+    for (identity, epoch, nonce) in replay_keys {
+        replay.insert(identity, epoch, nonce);
+    }
 
     Ok(TunnelInstallPlan {
         local_identity: rq.initiator_identity,
@@ -771,6 +854,38 @@ pub fn validate_upgrade(
         relay_candidates: rs.relay_candidates.clone(),
         keepalive_seconds: rs.keepalive_seconds,
     })
+}
+
+fn validate_direct_dial_failure(
+    failure: &DirectDialFailureEvidence,
+    view: &MeshView,
+    current_view: u64,
+    observer_identity: ValidatorIdentity,
+    target_identity: ValidatorIdentity,
+    target_endpoint: Endpoint,
+) -> Result<(), UpgradeError> {
+    failure.verify_signature()?;
+    let f = &failure.fields;
+    if f.request_tuple()
+        != (
+            view.active_set.namespace.as_str(),
+            view.active_set.epoch,
+            view.active_set.valset_root,
+            view.mesh_version,
+        )
+        || f.observer_identity != observer_identity
+        || f.target_identity != target_identity
+        || f.target_wireguard_endpoint != target_endpoint
+    {
+        return Err(UpgradeError::InvalidDialFailure);
+    }
+    if current_view > f.expires_at_view
+        || f.failed_at_view > current_view
+        || current_view.saturating_sub(f.failed_at_view) > MAX_DIAL_FAILURE_LAG
+    {
+        return Err(UpgradeError::InvalidDialFailure);
+    }
+    Ok(())
 }
 
 trait CommonRequestFields {
@@ -800,6 +915,17 @@ impl CommonRequestFields for TunnelUpgradeResponseFields {
 }
 
 impl CommonRequestFields for TunnelUpgradeAckFields {
+    fn request_tuple(&self) -> (&str, u64, Root, MeshVersion) {
+        (
+            &self.namespace,
+            self.epoch,
+            self.valset_root,
+            self.mesh_version,
+        )
+    }
+}
+
+impl CommonRequestFields for DirectDialFailureFields {
     fn request_tuple(&self) -> (&str, u64, Root, MeshVersion) {
         (
             &self.namespace,
@@ -924,6 +1050,10 @@ fn check_ip_policy(addr: IpAddr, policy: &PortPolicy) -> Result<(), UpgradeError
                 || ip.is_broadcast()
                 || is_v4_documentation(ip)
                 || ip.is_multicast()
+                || is_v4_this_network(ip)
+                || is_v4_protocol_assignment(ip)
+                || is_v4_benchmarking(ip)
+                || is_v4_reserved(ip)
             {
                 return Err(UpgradeError::InvalidEndpoint(
                     "non-global IPv4 address".into(),
@@ -934,7 +1064,9 @@ fn check_ip_policy(addr: IpAddr, policy: &PortPolicy) -> Result<(), UpgradeError
                     "loopback endpoint is forbidden".into(),
                 ));
             }
-            if (ip.is_private() || ip.is_link_local()) && !policy.allow_private_ip {
+            if (ip.is_private() || ip.is_link_local() || is_v4_shared_address_space(ip))
+                && !policy.allow_private_ip
+            {
                 return Err(UpgradeError::InvalidEndpoint(
                     "private IPv4 endpoint is forbidden".into(),
                 ));
@@ -967,6 +1099,29 @@ fn is_v4_documentation(ip: Ipv4Addr) -> bool {
     o[0] == 192 && o[1] == 0 && o[2] == 2
         || o[0] == 198 && o[1] == 51 && o[2] == 100
         || o[0] == 203 && o[1] == 0 && o[2] == 113
+}
+
+fn is_v4_this_network(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 0
+}
+
+fn is_v4_shared_address_space(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0b1100_0000) == 64
+}
+
+fn is_v4_protocol_assignment(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 192 && o[1] == 0 && o[2] == 0
+}
+
+fn is_v4_benchmarking(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 198 && (o[1] == 18 || o[1] == 19)
+}
+
+fn is_v4_reserved(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
 }
 
 fn is_v6_documentation(ip: Ipv6Addr) -> bool {
@@ -1029,6 +1184,20 @@ fn put_request_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeRequestFields) {
     put_u64(out, fields.nonce);
 }
 
+fn put_direct_dial_failure_fields(out: &mut Vec<u8>, fields: &DirectDialFailureFields) {
+    put_str(out, &fields.namespace);
+    put_u64(out, fields.epoch);
+    put_root(out, fields.valset_root);
+    put_mesh_version(out, fields.mesh_version);
+    put_identity(out, fields.observer_identity);
+    put_identity(out, fields.target_identity);
+    put_endpoint(out, fields.target_wireguard_endpoint);
+    put_u64(out, fields.failed_at_view);
+    put_u64(out, fields.expires_at_view);
+    put_fixed(out, &fields.error_hash);
+    put_u64(out, fields.nonce);
+}
+
 fn put_response_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeResponseFields) {
     put_fixed(out, &fields.request_hash);
     put_str(out, &fields.namespace);
@@ -1041,6 +1210,14 @@ fn put_response_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeResponseFields) 
     put_endpoint(out, fields.responder_wireguard_endpoint);
     put_allowed_ips(out, &fields.accepted_allowed_ips);
     put_identities(out, &fields.relay_candidates);
+    match &fields.direct_dial_failure {
+        Some(evidence) => {
+            out.push(1);
+            put_direct_dial_failure_fields(out, &evidence.fields);
+            put_signature(out, &evidence.signature);
+        }
+        None => out.push(0),
+    }
     match fields.keepalive_seconds {
         Some(v) => {
             out.push(1);
