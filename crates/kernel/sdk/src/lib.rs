@@ -157,6 +157,9 @@ pub enum Error {
     SelfQuery,
     /// a module has no sync read projection (the default `Module::query`).
     QueryUnsupported,
+    /// a module has no byte-level state-sync serve surface (the default
+    /// [`Module::serve_sync`]).
+    SyncUnsupported,
     /// the local follow-up drain exceeded its dispatch budget (non-termination
     /// guard).
     BudgetExceeded,
@@ -170,6 +173,7 @@ impl core::fmt::Debug for Error {
             Error::UnknownModule(id) => write!(f, "UnknownModule({id})"),
             Error::SelfQuery => write!(f, "SelfQuery"),
             Error::QueryUnsupported => write!(f, "QueryUnsupported"),
+            Error::SyncUnsupported => write!(f, "SyncUnsupported"),
             Error::BudgetExceeded => write!(f, "BudgetExceeded"),
             Error::Module(m) => write!(f, "Module({m})"),
         }
@@ -239,6 +243,26 @@ pub trait Module {
         Ok(StateSyncHandle::Unsupported {
             reason: "module did not declare a state-sync handle".into(),
         })
+    }
+
+    /// serve one byte-level state-sync request against COMMITTED state.
+    ///
+    /// this is the routable serve surface behind [`StateSyncHandle::
+    /// ResolverBacked`]: a running node holds its modules as `dyn Module` in the
+    /// host registry, so a network state-sync service can only reach a module's
+    /// sync backend through the trait. request/response bytes are module-defined
+    /// (a qmdb-backed module answers sync-target and proof-carrying op-range
+    /// requests; the shared wire shapes live in the kernel `statesync` crate) —
+    /// the host and transport treat them opaquely, exactly like query bytes.
+    ///
+    /// read-only by contract: serving MUST NOT mutate module state, and MUST be
+    /// answered from committed state only (never a staged overlay) — the host
+    /// routes it outside any block, and responses are verified by the CALLER
+    /// against a consensus-committed root, so a dishonest response can never
+    /// install. the default is explicit non-coverage for modules whose whole
+    /// sync surface is [`StateSyncHandle::SnapshotBytes`].
+    async fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::SyncUnsupported)
     }
 
     /// the dispatch entry point. async, but every `.await` MUST be on a

@@ -1361,6 +1361,7 @@ dependencies = [
  "document-interface",
  "forge",
  "forge-interface",
+ "futures",
  "git2",
  "greeter",
  "host",
@@ -1372,6 +1373,7 @@ dependencies = [
  "serde",
  "serde_json",
  "state",
+ "statesync",
  "valset",
  "valset-interface",
 ]
@@ -1443,6 +1445,7 @@ dependencies = [
  "sdk",
  "serde_json",
  "state",
+ "statesync",
 ]
 
 [[package]]
@@ -2237,6 +2240,7 @@ dependencies = [
  "sdk",
  "serde_json",
  "state",
+ "statesync",
 ]
 
 [[package]]
@@ -2363,6 +2367,7 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "statesync",
 ]
 
 [[package]]
@@ -2506,13 +2511,17 @@ dependencies = [
  "consensus",
  "directory",
  "directory-interface",
+ "futures",
  "host",
  "kv",
  "kv-interface",
  "node",
  "sdk",
  "serde",
+ "state",
+ "statesync",
  "toml 0.8.23",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -3552,6 +3561,26 @@ dependencies = [
  "async-trait",
  "sdk",
  "sha2",
+]
+
+[[package]]
+name = "statesync"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-p2p",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-storage",
+ "commonware-utils",
+ "futures",
+ "host",
+ "kv",
+ "kv-interface",
+ "sdk",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

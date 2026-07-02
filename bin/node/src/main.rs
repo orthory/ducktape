@@ -24,11 +24,23 @@
 //! receipt). this is what lets DISTINCT ops converge across processes with
 //! per-process stores — quorum votes still cross the real TCP mesh to finalize.
 //!
-//! each process prints its GENESIS app-hash at startup and its CONVERGED app-hash
-//! once it has applied ALL N ops (its own AND every peer's). the demo script
-//! asserts every process's genesis line agrees (no pre-op fork) and every
-//! process's converged line agrees (both distinct ops applied everywhere — real
-//! cross-process BFT convergence over relayed payloads).
+//! ## state-sync service and the sync-only joiner
+//!
+//! every validator also serves the statesync wire protocol on
+//! `CHANNEL_STATE_SYNC`, answered between drains from its latest finalized
+//! boundary — so responses are always block-consistent without locks. run with
+//! `--sync-only` and the process joins the mesh WITHOUT a consensus engine,
+//! pulls a manifest + every module from the bootstrapper over that channel,
+//! rebuilds them against their consensus-committed roots, prints its composed
+//! `synced app_hash=`, and exits 0 — the network-backed joiner path over real
+//! sockets. membership note: `peer_seeds` is the AUTHORIZED MESH (everyone,
+//! including sync-only joiners); `validator_seeds` (default: peer_seeds) is the
+//! CONSENSUS participant set — the split that lets a non-validator sync.
+//!
+//! each validator prints its GENESIS app-hash at startup and its CONVERGED
+//! app-hash once it has applied ALL validator ops. the demo script asserts every
+//! process's genesis line agrees, every converged line agrees, and the sync-only
+//! joiner's synced line equals the converged line.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -38,9 +50,10 @@ use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{ed25519, Signer};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::Manager;
-use commonware_runtime::{Clock, Quota, Runner, Supervisor};
+use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _};
+use commonware_runtime::{Clock, IoBuf, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{ordered::Set, NZU32};
+use futures::{FutureExt as _, StreamExt as _};
 
 use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer};
 
@@ -48,17 +61,21 @@ use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 use directory::Directory;
+use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
 use host::Host;
 use kv::Kv;
-use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
 use node::OrderedNode;
-use sdk::{Msg, StateRoot};
+use sdk::{Module as _, Msg, StateRoot};
+use statesync::p2p::P2pSyncClient;
+use statesync::qmdb::RemoteQmdbResolver;
+use statesync::{fetch_manifest, fetch_snapshot, PayloadKind, SyncServer};
 
 /// the peer-set index. every node must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
 const PEER_SET: u64 = 0;
 /// max wire message size we accept on a channel (1 MiB) — generous for the small
-/// json frames + BFT metadata.
+/// json frames + BFT metadata, and the statesync chunk size (256 KiB) plus
+/// framing stays far below it.
 const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
@@ -68,6 +85,9 @@ const MAX_BACKLOG: usize = 128;
 /// store-only drain caches the bytes so its reporter resolves the finalized
 /// digest for an op it did NOT originate).
 const CHANNEL_PAYLOAD: u64 = 3;
+/// the statesync rpc channel: joiners request manifests / snapshot chunks /
+/// qmdb op-ranges here; validators answer between drains.
+const CHANNEL_STATE_SYNC: u64 = 4;
 
 /// the plain-data node config, parsed from toml. mirrors legacy examples/node*.toml
 /// (seed identity, listen/advertised addrs, shared namespace + authorized peer
@@ -83,9 +103,14 @@ struct NodeConfig {
     /// application namespace — MUST match across the mesh (domain-separates the
     /// discovery handshake, the simplex scheme, and the genesis floor).
     namespace: String,
-    /// the authorized participant set as identity seeds; every node lists the
-    /// SAME set (including its own), sorted into the ed25519 participant `Set`.
+    /// the authorized MESH participant set as identity seeds; every node lists
+    /// the SAME set (including its own and any sync-only joiners), sorted into
+    /// the ed25519 `Set` discovery tracks.
     peer_seeds: Vec<u64>,
+    /// the CONSENSUS participant subset (identity seeds). defaults to
+    /// `peer_seeds`. a seed in `peer_seeds` but not here is mesh-only — e.g. a
+    /// sync-only joiner that may fetch state but casts no votes.
+    validator_seeds: Option<Vec<u64>>,
     /// node 0's dialable address. required for `id != 0` (they bootstrap off it).
     bootstrapper_addr: Option<String>,
     /// per-process FS storage root. REQUIRED to be distinct per process: the qmdb
@@ -104,28 +129,42 @@ fn hex(root: &StateRoot) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse `--config <path>`.
+    // parse `--config <path> [--sync-only]`.
     let mut args = std::env::args().skip(1);
     let mut cfg_path: Option<PathBuf> = None;
+    let mut sync_only = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => cfg_path = args.next().map(PathBuf::from),
-            other => return Err(format!("unexpected arg {other:?} (want --config <path>)").into()),
+            "--sync-only" => sync_only = true,
+            other => {
+                return Err(
+                    format!("unexpected arg {other:?} (want --config <path> [--sync-only])")
+                        .into(),
+                )
+            }
         }
     }
     let cfg_path = cfg_path.ok_or("missing --config <path>")?;
     let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(&cfg_path)?)?;
 
-    run_node(cfg)
+    // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
+    run_node(cfg, sync_only)
 }
 
-/// stand up the real-socket node from `cfg` and run it until killed.
+/// stand up the real-socket node from `cfg` and run it until killed (validator)
+/// or until state sync completes (`--sync-only`).
 ///
 /// deliberately NOT `#[tokio::main]`: `tokio::Runner` owns its OWN tokio runtime,
 /// and you cannot start a runtime from inside one. so `main` is sync and hands
 /// off to `Runner::start`, which drives everything (including the engine's spawned
 /// tasks) on the runtime it owns.
-fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::Error>> {
     let id = cfg.id;
     let listen: SocketAddr = cfg.listen.parse()?;
     let advertised: SocketAddr = match cfg.advertised.as_deref() {
@@ -134,9 +173,18 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     };
     let namespace = cfg.namespace.clone().into_bytes();
 
-    // each seed -> an ed25519 identity; together the authorized participant set.
+    // each seed -> an ed25519 identity; together the authorized MESH set.
     let peers: Vec<ed25519::PublicKey> = cfg
         .peer_seeds
+        .iter()
+        .map(|s| ed25519::PrivateKey::from_seed(*s).public_key())
+        .collect();
+    // the consensus participant subset (defaults to the whole mesh).
+    let validator_seeds = cfg
+        .validator_seeds
+        .clone()
+        .unwrap_or_else(|| cfg.peer_seeds.clone());
+    let validators: Vec<ed25519::PublicKey> = validator_seeds
         .iter()
         .map(|s| ed25519::PrivateKey::from_seed(*s).public_key())
         .collect();
@@ -166,8 +214,10 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
 
     println!(
-        "[node #{id}] starting on {listen} ({} peers), storage {}",
+        "[node #{id}] starting on {listen} ({} mesh peers, {} validators{}), storage {}",
         cfg.peer_seeds.len(),
+        validator_seeds.len(),
+        if sync_only { ", sync-only" } else { "" },
         storage.display()
     );
 
@@ -178,10 +228,12 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     executor.start(|context| async move {
         let signer = ed25519::PrivateKey::from_seed(id);
 
-        // the authorized participant set, SORTED — shared by discovery (the
-        // tracked peer set) AND the simplex scheme (participant indices line up).
-        let participants: Set<ed25519::PublicKey> =
-            Set::try_from(peers).expect("authorized peer set has no duplicates");
+        // the authorized MESH set, SORTED — what discovery tracks. the
+        // consensus scheme uses the (possibly smaller) validator set below.
+        let mesh_participants: Set<ed25519::PublicKey> =
+            Set::try_from(peers.clone()).expect("authorized peer set has no duplicates");
+        let validator_participants: Set<ed25519::PublicKey> =
+            Set::try_from(validators.clone()).expect("validator set has no duplicates");
 
         // the real encrypted TCP mesh. `local` is the dev preset (allows private
         // ips). MUST be the real tokio runtime — discovery live-locks under the
@@ -195,14 +247,107 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
             MAX_MESSAGE_SIZE,
         );
         let (mut network, mut oracle) = Network::new(context.child("network"), p2p_cfg);
-        oracle.track(PEER_SET, participants.clone());
+        oracle.track(PEER_SET, mesh_participants.clone());
+
+        let quota = Quota::per_second(NZU32!(128));
+
+        if sync_only {
+            // ---- the SYNC-ONLY joiner: no engine, no votes — just the wire ----
+            //
+            // validators broadcast consensus traffic (votes, certificates,
+            // payload gossip) to EVERY tracked mesh peer, not only to fellow
+            // participants — and a message on an UNREGISTERED channel is a
+            // protocol violation that makes the peer actor kill the connection
+            // (a permanent connect/kill loop that drops every rpc). so a
+            // mesh-member-but-not-validator must register every channel and
+            // black-hole the consensus lanes it does not consume.
+            for (ch, label) in [
+                (0u64, "blackhole_vote"),
+                (1, "blackhole_certificate"),
+                (2, "blackhole_resolver"),
+                (CHANNEL_PAYLOAD, "blackhole_payload"),
+            ] {
+                let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
+                context.child(label).spawn(move |_ctx| async move {
+                    while rx.recv().await.is_ok() {}
+                });
+            }
+            let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            network.start();
+
+            let server_peer = peers.first().expect("peer_seeds is non-empty").clone();
+            let client = P2pSyncClient::new(
+                context.child("sync_client"),
+                sync_tx,
+                sync_rx,
+                server_peer,
+            );
+
+            // the mesh takes a moment to connect, and the server only serves
+            // once it has a finalized boundary — retry until the manifest lands.
+            let manifest = loop {
+                match fetch_manifest(&client).await {
+                    Ok(m) => break m,
+                    Err(e) => {
+                        println!("[node #{id}] manifest not ready ({e}); retrying");
+                        context.sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            };
+            println!(
+                "[node #{id}] manifest height={} app_hash={}",
+                manifest.height,
+                hex(&manifest.app_hash)
+            );
+
+            // kv — the resolver lane: live target, then merkle-verified op
+            // batches through the remote resolver. the target must sit at the
+            // manifest boundary; if the source advanced, refetching the
+            // manifest would converge — the demo network is parked, so assert.
+            let kv_entry = manifest.entry("kv").expect("kv in manifest");
+            assert_eq!(kv_entry.kind, PayloadKind::Resolver);
+            let resolver = RemoteQmdbResolver::new(client.clone(), "kv");
+            let target = resolver.fetch_target().await.expect("kv target");
+            assert_eq!(
+                StateRoot(target.root.0),
+                kv_entry.root,
+                "parked source: live kv target equals the manifest root"
+            );
+            // a REAL joiner owns its disk, so the store opens under the
+            // canonical module id — no rebuilt-id adapter needed.
+            let kv = Kv::sync_from(context.child("kv"), "kv", target, resolver).await;
+            assert_eq!(kv.root(), kv_entry.root, "kv synced root == manifest root");
+
+            // directory — the snapshot lane, chunked, install gated on root.
+            let dir_entry = manifest.entry("directory").expect("directory in manifest");
+            assert_eq!(dir_entry.kind, PayloadKind::Snapshot);
+            let bytes = fetch_snapshot(&client, manifest.height, "directory")
+                .await
+                .expect("directory snapshot");
+            let mut dir = Directory::new("directory");
+            dir.install(&bytes, dir_entry.root).expect("directory install");
+
+            // compose and check THE property: the joiner's app-hash IS the
+            // manifest's. print the greppable line the demo script asserts on.
+            let mods: [&dyn sdk::Module; 2] = [&kv, &dir];
+            let synced = state::global_root(&mods);
+            if synced != manifest.app_hash {
+                eprintln!(
+                    "[node #{id}] SYNC FAILED: composed {} != manifest {}",
+                    hex(&synced),
+                    hex(&manifest.app_hash)
+                );
+                std::process::exit(1);
+            }
+            println!("[node #{id}] synced app_hash={}", hex(&synced));
+            return;
+        }
+
+        // ---- a VALIDATOR: consensus engine + state-sync service -------------
 
         // the simplex engine's three sub-channels, consumed positionally by
-        // `engine.start(vote, certificate, resolver)`, PLUS a fourth for eager
-        // payload dissemination (CHANNEL_PAYLOAD): with per-process stores and
-        // DISTINCT ops, a peer finalizes a digest whose bytes it never staged, so
-        // the leader must gossip the payload for the reporter to resolve it.
-        let quota = Quota::per_second(NZU32!(128));
+        // `engine.start(vote, certificate, resolver)`, PLUS the payload channel
+        // and the statesync rpc channel.
         let vote = network.register(0, quota, MAX_BACKLOG);
         let certificate = network.register(1, quota, MAX_BACKLOG);
         let resolver = network.register(2, quota, MAX_BACKLOG);
@@ -210,10 +355,37 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         // receiver buffers from the start; the drain is spawned inside
         // `spawn_with_relay`.
         let payload = network.register(CHANNEL_PAYLOAD, quota, MAX_BACKLOG);
+        let (mut sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
 
         // start the network actors (dialer/listener/router/tracker). registered
         // receivers buffer regardless, so starting before the engine is fine.
         network.start();
+
+        // the statesync INGRESS task: owns the channel receiver and loops a
+        // clean `recv().await`, forwarding frames into a local bounded queue.
+        // the pump then selects on THAT queue — dropping an mpsc `next()`
+        // future between ticks is lossless, whereas dropping the p2p receiver's
+        // actor-backed `recv()` future mid-flight could eat a delivered
+        // message. bounded + drop-on-full: clients time out and retry, so a
+        // flood degrades to retries instead of unbounded memory.
+        let (bridge_tx, mut sync_ingress) =
+            futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
+        context.child("sync_ingress").spawn(move |_ctx| {
+            let mut receiver = sync_rx;
+            let mut bridge_tx = bridge_tx;
+            async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok((peer, msg)) => {
+                            let bytes: Vec<u8> = msg.into();
+                            // full bridge = flood pressure: drop; clients retry.
+                            let _ = bridge_tx.try_send((peer, bytes));
+                        }
+                        Err(_) => return, // network shutdown — nothing to serve.
+                    }
+                }
+            }
+        });
 
         // genesis host: the SAME module set on every node -> identical genesis
         // app-hash. qmdb `kv` (order-dependent root) + in-memory `directory`.
@@ -222,16 +394,18 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
             .expect("genesis host");
 
         // scheme built the production way: `signer` finds our key's index in the
-        // sorted participant set, so we sign as exactly the participant our
+        // sorted VALIDATOR set, so we sign as exactly the participant our
         // discovery identity represents. (NOT the mocks-gated `fixture`.)
         // the consensus signature scheme is a GENESIS-WIDE constant (ConsensusScheme).
         // today only V1 (ed25519). adding V2Bls makes this match non-exhaustive — the
         // compiler-enforced point to wire a BLS engine + an epoch-transition rekey.
         let scheme = match CONSENSUS_SCHEME {
-            ConsensusScheme::V1Ed25519 => {
-                simplex_ed25519::Scheme::signer(&namespace, participants.clone(), signer.clone())
-                    .expect("our key is in the authorized participant set")
-            }
+            ConsensusScheme::V1Ed25519 => simplex_ed25519::Scheme::signer(
+                &namespace,
+                validator_participants.clone(),
+                signer.clone(),
+            )
+            .expect("our key is in the validator participant set"),
         };
 
         // genesis floor: domain-separated by namespace so every node in THIS app
@@ -286,48 +460,69 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         };
         node.submit(format!("node{id}").as_bytes(), 0, op).await.expect("submit op");
 
-        // pump: drain finalized frames on an interval and apply them in agreed
-        // (ascending-view) order. print `converged` ONCE this node has applied ALL
-        // N ops — CRUCIALLY including the peer's op it never originated, whose bytes
-        // reached this process ONLY via the relay -> store-only drain. a node that
-        // only ever got its own op stalls at applied < N and never prints — that is
-        // the relay-broken / broadcast-lost signature. because the per-process
-        // store fills from exactly two sources (own submit + payload drain),
-        // applied == N is unforgeable evidence the peer's bytes crossed the wire.
-        // this infinite loop IS the "run forever" park (keeps the mesh alive).
-        let expected = cfg.peer_seeds.len();
+        // pump: drain finalized frames on an interval, apply them in agreed
+        // (ascending-view) order, AND serve statesync rpcs between drains (the
+        // select is biased toward serving; every response therefore reflects a
+        // block boundary — never a torn mid-drain view). print `converged` ONCE
+        // this node has applied every VALIDATOR's op — including the peer's op
+        // it never originated, whose bytes reached this process ONLY via the
+        // relay -> store-only drain. this infinite loop IS the "run forever"
+        // park (keeps the mesh + sync service alive for joiners).
+        let expected = validator_seeds.len();
         let mut applied = 0usize;
         let mut converged = false;
+        let mut sync_server = SyncServer::new();
         loop {
-            context.sleep(Duration::from_millis(100)).await;
-            // FAIL-STOP: a drain error is a node-local block-boundary fault
-            // (host::FatalError through node::Error::Fatal) — this node's state
-            // is indeterminate relative to its peers, so applying even one more
-            // finalized op could silently fork it. exit loudly; an operator (or
-            // supervisor) restarts the node, which then re-joins via state sync.
-            applied += match node.drain_delivered().await {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("[node #{id}] FATAL: {e} — halting");
-                    std::process::exit(1);
+            futures::select_biased! {
+                msg = sync_ingress.next() => {
+                    let Some((peer, bytes)) = msg else {
+                        // the ingress task ended (network shutdown) — nothing
+                        // left to serve; keep draining consensus regardless.
+                        continue;
+                    };
+                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                        continue; // malformed rpc envelope: drop, never crash.
+                    };
+                    let resp = sync_server
+                        .handle_frame(node.host(), node.finalized(), body)
+                        .await;
+                    let _ = sync_tx.send(
+                        Recipients::One(peer),
+                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
+                        false,
+                    );
                 }
-            };
-            if !converged && applied >= expected {
-                let h = node.app_hash();
-                println!("[node #{id}] converged app_hash={}", hex(&h));
-                // dump every directory key so the demo can eyeball BOTH ops applied
-                // (each node ends holding the op it originated AND the peer's).
-                for k in 0..expected {
-                    let reply = node
-                        .host()
-                        .query("directory", &encode_query(&DirQuery::Get { key: format!("k{k}") }))
-                        .await
-                        .expect("directory query");
-                    if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
-                        println!("[node #{id}]   directory k{k}={v:?}");
+                _ = context.sleep(Duration::from_millis(100)).fuse() => {
+                    // FAIL-STOP: a drain error is a node-local block-boundary
+                    // fault — this node's state is indeterminate relative to its
+                    // peers, so applying even one more finalized op could
+                    // silently fork it. exit loudly; an operator (or supervisor)
+                    // restarts the node, which then re-joins via state sync.
+                    applied += match node.drain_delivered().await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("[node #{id}] FATAL: {e} — halting");
+                            std::process::exit(1);
+                        }
+                    };
+                    if !converged && applied >= expected {
+                        let h = node.app_hash();
+                        println!("[node #{id}] converged app_hash={}", hex(&h));
+                        // dump every directory key so the demo can eyeball the ops
+                        // (each node ends holding the op it originated AND the peer's).
+                        for k in 0..expected {
+                            let reply = node
+                                .host()
+                                .query("directory", &encode_query(&DirQuery::Get { key: format!("k{k}") }))
+                                .await
+                                .expect("directory query");
+                            if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
+                                println!("[node #{id}]   directory k{k}={v:?}");
+                            }
+                        }
+                        converged = true;
                     }
                 }
-                converged = true;
             }
         }
     });

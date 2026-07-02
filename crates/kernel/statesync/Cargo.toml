@@ -1,0 +1,35 @@
+[package]
+name = "statesync"
+edition.workspace = true
+version.workspace = true
+
+# the network state-sync layer: a compact binary wire protocol (manifest /
+# chunked snapshot fetch / live qmdb op-range serving), the server-side capture
+# cache a running node answers from, and the joiner-side client helpers —
+# including a remote qmdb resolver that plugs straight into commonware's sync
+# engine. transport-neutral: anything that can move request/response bytes
+# between peers (a p2p channel, a socket, an in-process loopback) can carry it.
+#
+# module crates (kv, document, messaging, ...) may depend on this crate for the
+# shared qmdb serve/wire helpers: it is PLATFORM surface like `sdk`, not another
+# module — the module-isolation rule (impl crates never link impl crates) is
+# about product modules, and this crate contains no module state or product
+# logic.
+[dependencies]
+sdk = { workspace = true }
+host = { workspace = true }
+thiserror = { workspace = true }
+commonware-storage = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+commonware-parallel = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-utils = { workspace = true }
+commonware-p2p = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+kv = { workspace = true }
+kv-interface = { workspace = true }
+futures = "0.3"
+async-trait = { workspace = true }

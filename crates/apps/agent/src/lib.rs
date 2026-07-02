@@ -128,8 +128,16 @@ where
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "call Agent::sync_target() at this root and serve it with a DbResolver".into(),
+            detail: "serve_sync answers qmdb target + op-range requests (statesync wire)".into(),
         })
+    }
+
+    /// serve the EMBEDDED substrate's qmdb sync lane (target + op ranges).
+    /// in facade mode the registered backing module serves its own state under
+    /// its own module id — this wrapper's embedded store is then empty, exactly
+    /// what its root() commits to.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.messaging.serve_sync(req).await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

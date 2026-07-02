@@ -305,6 +305,17 @@ impl Host {
         }
     }
 
+    /// route a byte-level state-sync serve request to a registered module (see
+    /// [`Module::serve_sync`]). read-only against committed state; a network
+    /// state-sync service calls this between blocks so responses are always
+    /// boundary-consistent.
+    pub async fn serve_sync(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match self.registry.get(target) {
+            Some(m) => m.serve_sync(req).await,
+            None => Err(Error::UnknownModule(target.to_string())),
+        }
+    }
+
     /// the current app-hash: [`state::global_root`] over the registered modules.
     pub fn app_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();
