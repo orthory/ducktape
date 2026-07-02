@@ -62,6 +62,15 @@ where
         &mut self.messaging
     }
 
+    fn registered_backing(&self, ctx: &dyn Ctx) -> Option<ModuleId> {
+        let backing_id = self.messaging.id();
+        if backing_id != self.id && ctx.module_root(&backing_id).is_some() {
+            Some(backing_id)
+        } else {
+            None
+        }
+    }
+
     pub fn into_messaging(self) -> Messaging<E> {
         self.messaging
     }
@@ -118,12 +127,17 @@ where
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         for backing in backing_msgs(decode_msg(&msg.payload).map_err(Error::Module)?) {
+            let payload = encode_messaging_msg(&backing);
+            if let Some(target) = self.registered_backing(ctx) {
+                ctx.emit_msg(Msg { target, payload });
+                continue;
+            }
             self.messaging
                 .execute(
                     ctx,
                     &Msg {
                         target: self.messaging.id(),
-                        payload: encode_messaging_msg(&backing),
+                        payload,
                     },
                 )
                 .await?;
@@ -137,6 +151,20 @@ where
             .messaging
             .query(&encode_messaging_query(&backing))
             .await?;
+        let reply = decode_messaging_reply(&reply).map_err(Error::Module)?;
+        Ok(encode_reply(&reply_from_backing(reply)))
+    }
+
+    async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let backing = backing_query(decode_query(req).map_err(Error::Module)?);
+        let reply = if let Some(target) = self.registered_backing(ctx) {
+            ctx.query(&target, &encode_messaging_query(&backing))
+                .await?
+        } else {
+            self.messaging
+                .query(&encode_messaging_query(&backing))
+                .await?
+        };
         let reply = decode_messaging_reply(&reply).map_err(Error::Module)?;
         Ok(encode_reply(&reply_from_backing(reply)))
     }

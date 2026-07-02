@@ -430,6 +430,71 @@ fn missing_session_rolls_back_the_agent_backing_store() {
 }
 
 #[test]
+fn agent_uses_registered_messaging_backing_when_present() {
+    deterministic::Runner::default().start(|context| async move {
+        let messaging = Messaging::init(context.child("messaging"), DEFAULT_MESSAGING_TARGET).await;
+        let agent = Agent::init_with_messaging_id(
+            context.child("agent"),
+            DEFAULT_AGENT_TARGET,
+            DEFAULT_MESSAGING_TARGET,
+        )
+        .await;
+        let mut host = Host::genesis(vec![Box::new(messaging), Box::new(agent)]).unwrap();
+        let agent_root = host.module_root(DEFAULT_AGENT_TARGET).unwrap();
+        let messaging_root = host.module_root(DEFAULT_MESSAGING_TARGET).unwrap();
+
+        host.submit(agent_msg(AgentMsg::OpenSession {
+            session_id: "s1".into(),
+            title: "Planning".into(),
+        }))
+        .await
+        .unwrap();
+        host.submit(agent_msg(AgentMsg::AppendMessage {
+            session_id: "s1".into(),
+            message_id: "m1".into(),
+            author: "planner".into(),
+            body: "registered backing".into(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(host.module_root(DEFAULT_AGENT_TARGET).unwrap(), agent_root);
+        assert_ne!(
+            host.module_root(DEFAULT_MESSAGING_TARGET).unwrap(),
+            messaging_root
+        );
+        assert_eq!(
+            agent_query(&host, AgentQuery::Sessions).await,
+            AgentReply::Sessions(vec![AgentSession {
+                id: "s1".into(),
+                title: "Planning".into(),
+                created_at: 0,
+            }])
+        );
+        assert_eq!(
+            messaging_query(
+                &host,
+                MessagingQuery::Messages {
+                    channel_id: "s1".into()
+                },
+            )
+            .await,
+            MessagingReply::Messages(vec![ChatMessage {
+                id: "m1".into(),
+                channel_id: "s1".into(),
+                author: "planner".into(),
+                body: "registered backing".into(),
+                sequence: 1,
+                sent_at: 0,
+                thread_id: None,
+                reply_count: 0,
+                last_reply_at: None,
+            }])
+        );
+    });
+}
+
+#[test]
 fn new_agent_genesis_does_not_implicitly_migrate_standalone_messaging_state() {
     deterministic::Runner::default().start(|context| async move {
         let messaging = Messaging::init(context.child("old"), DEFAULT_MESSAGING_TARGET).await;
