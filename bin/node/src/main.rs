@@ -300,7 +300,18 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         let mut converged = false;
         loop {
             context.sleep(Duration::from_millis(100)).await;
-            applied += node.drain_delivered().await.expect("drain delivered");
+            // FAIL-STOP: a drain error is a node-local block-boundary fault
+            // (host::FatalError through node::Error::Fatal) — this node's state
+            // is indeterminate relative to its peers, so applying even one more
+            // finalized op could silently fork it. exit loudly; an operator (or
+            // supervisor) restarts the node, which then re-joins via state sync.
+            applied += match node.drain_delivered().await {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("[node #{id}] FATAL: {e} — halting");
+                    std::process::exit(1);
+                }
+            };
             if !converged && applied >= expected {
                 let h = node.app_hash();
                 println!("[node #{id}] converged app_hash={}", hex(&h));

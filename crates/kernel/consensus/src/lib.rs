@@ -124,13 +124,67 @@ pub fn digest_of(bytes: &[u8]) -> Digest {
 // the shared content store — digest -> frame bytes.
 // ============================================================================
 
+/// cap on CACHED (non-pinned) entries. everything that arrives from a peer —
+/// eager relay gossip, resolver fetches — is best-effort cache, and a byzantine
+/// peer can flood that lane with garbage blobs forever, so it must be bounded:
+/// past the cap the OLDEST cached entry is evicted FIFO. own submissions are
+/// PINNED instead (never evicted) until finalization demotes them, so this
+/// node's proposals always resolve locally and always remain servable to a
+/// fetching peer while in flight. sizing: worst case cap × max payload
+/// (1 MiB on the node's mesh) bounds cache memory; ops are typically small
+/// json frames, so in practice this holds thousands of blocks of history for
+/// peers catching up. a peer that has fallen further behind than the cache
+/// window must rebuild through module state sync, not per-op fetch.
+pub const PAYLOAD_CACHE_CAP: usize = 16_384;
+
 /// digest->bytes map: resolves the opaque digests simplex finalizes back into
 /// the frame bytes the host applies. cloning shares the backing store (`Arc`),
 /// so the automaton, reporter, and submit handle all hold the SAME content — the
 /// blessed in-process-sim shortcut (one store cloned into every validator).
+///
+/// two retention classes:
+/// - PINNED — this node's own submissions ([`ContentStore::pin`]): must survive
+///   until finalized (the automaton re-proposes them across nullified views, and
+///   peers resolve them via fetch), so they are exempt from eviction. the
+///   reporter demotes a digest to cached on finalization.
+/// - CACHED — peer-relayed / fetched bytes ([`ContentStore::put`]): best-effort,
+///   FIFO-bounded at [`PAYLOAD_CACHE_CAP`]. content-addressing keeps a flood
+///   inert for CORRECTNESS (garbage can never match a finalized digest); the cap
+///   keeps it inert for MEMORY.
 #[derive(Clone, Default)]
 pub struct ContentStore {
-    inner: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+    inner: Arc<Mutex<StoreInner>>,
+}
+
+#[derive(Default)]
+struct StoreInner {
+    /// own in-flight submissions — never evicted; demoted on finalization.
+    pinned: HashMap<Digest, Vec<u8>>,
+    /// best-effort cache, FIFO-bounded by `order` at [`PAYLOAD_CACHE_CAP`].
+    cached: HashMap<Digest, Vec<u8>>,
+    /// insertion order of `cached` keys — the FIFO eviction queue.
+    order: VecDeque<Digest>,
+}
+
+impl StoreInner {
+    fn insert_cached(&mut self, digest: Digest, bytes: Vec<u8>) {
+        // an entry we already hold (either class) keeps its place — re-inserting
+        // would double it into the eviction queue and skew the FIFO window.
+        if self.pinned.contains_key(&digest) || self.cached.contains_key(&digest) {
+            return;
+        }
+        self.cached.insert(digest, bytes);
+        self.order.push_back(digest);
+        while self.cached.len() > PAYLOAD_CACHE_CAP {
+            // pop until an entry still live in `cached` is found: `order` may
+            // carry keys a demote raced in (harmless — each pop shrinks it).
+            if let Some(old) = self.order.pop_front() {
+                self.cached.remove(&old);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl ContentStore {
@@ -138,18 +192,64 @@ impl ContentStore {
         Self::default()
     }
 
-    /// cache `bytes` under their content-address and return that digest. called
-    /// on the `submit` path before the digest is ever proposed.
-    pub fn put(&self, bytes: Vec<u8>) -> Digest {
+    /// PIN `bytes` under their content-address: this node's own submission,
+    /// exempt from cache eviction until [`ContentStore::demote`] on
+    /// finalization. called on the `submit` path before the digest is proposed.
+    pub fn pin(&self, bytes: Vec<u8>) -> Digest {
         let digest = digest_of(&bytes);
-        self.inner.lock().expect("content store poisoned").insert(digest, bytes);
+        let mut inner = self.inner.lock().expect("content store poisoned");
+        // already cached (e.g. a peer relayed our identical frame first): lift
+        // it into the pinned class so eviction can no longer drop it.
+        inner.cached.remove(&digest);
+        inner.pinned.insert(digest, bytes);
         digest
     }
 
-    /// look up the bytes for a finalized digest. `None` means we never saw the
-    /// payload (impossible with the shared in-sim store; a real node fetches).
+    /// CACHE `bytes` under their content-address (best-effort, FIFO-bounded).
+    /// the peer-facing intake: the eager payload drain and the resolver's fetch
+    /// consumer land here. re-hashing the bytes as the key IS the verification —
+    /// byzantine garbage stores under its own hash and can never match a
+    /// finalized digest.
+    pub fn put(&self, bytes: Vec<u8>) -> Digest {
+        let digest = digest_of(&bytes);
+        let mut inner = self.inner.lock().expect("content store poisoned");
+        inner.insert_cached(digest, bytes);
+        digest
+    }
+
+    /// demote a PINNED digest into the bounded cache — called by the reporter
+    /// once the digest FINALIZES: the automaton will never re-propose it (the
+    /// pending FIFO dropped it) and local apply holds its bytes in the ordered
+    /// gate, so the only remaining reader is a peer fetching recent history,
+    /// which the cache window serves. a digest that was never pinned is a no-op.
+    pub fn demote(&self, digest: &Digest) {
+        let mut inner = self.inner.lock().expect("content store poisoned");
+        if let Some(bytes) = inner.pinned.remove(digest) {
+            inner.insert_cached(*digest, bytes);
+        }
+    }
+
+    /// look up the bytes for a digest — pinned first, then cache. `None` means
+    /// this node never saw the payload (or the cache window evicted it); a real
+    /// node fetches through the resolver, a deep joiner uses module state sync.
     pub fn get(&self, digest: &Digest) -> Option<Vec<u8>> {
-        self.inner.lock().expect("content store poisoned").get(digest).cloned()
+        let inner = self.inner.lock().expect("content store poisoned");
+        inner
+            .pinned
+            .get(digest)
+            .or_else(|| inner.cached.get(digest))
+            .cloned()
+    }
+
+    /// count of PINNED entries (own in-flight submissions) — an ops/metrics
+    /// surface: sustained growth means this node's proposals are not finalizing.
+    pub fn pinned_len(&self) -> usize {
+        self.inner.lock().expect("content store poisoned").pinned.len()
+    }
+
+    /// count of CACHED entries — bounded by [`PAYLOAD_CACHE_CAP`].
+    pub fn cached_len(&self) -> usize {
+        self.inner.lock().expect("content store poisoned").cached.len()
     }
 }
 
@@ -170,10 +270,12 @@ pub struct ConsensusHandle {
 }
 
 impl ConsensusHandle {
-    /// stage `bytes` for consensus: content-address them into the store and
-    /// queue that digest for proposal. the entire `submit` body — NO local apply.
+    /// stage `bytes` for consensus: content-address them into the store (PINNED
+    /// — an own submission must survive any number of nullified views and stay
+    /// servable to fetching peers until it finalizes) and queue that digest for
+    /// proposal. the entire `submit` body — NO local apply.
     pub fn submit(&self, bytes: Vec<u8>) {
-        let digest = self.store.put(bytes);
+        let digest = self.store.pin(bytes);
         self.pending.lock().expect("pending queue poisoned").push_back(digest);
     }
 }
@@ -496,25 +598,40 @@ pub struct FinalizedInbox {
 /// finalization in ascending-view order onto `log`; a store HIT resolves its
 /// bytes into `ready` at once (the eager path), a MISS leaves the slot AWAITING an
 /// async resolver fetch that later calls [`FinalizedInbox::fill_fetched`]. `drain`
-/// releases the LONGEST all-ready PREFIX from `released`, so a slot still waiting
-/// on a fetch HALTS the prefix — everything behind it waits, never dropped, never
-/// reordered. `submit_at` applies in call order and the qmdb root is
-/// order-dependent, so this is what makes a fetched (late) op converge.
+/// releases the LONGEST all-ready PREFIX from the queue's front, so a slot still
+/// waiting on a fetch HALTS the prefix — everything behind it waits, never
+/// dropped, never reordered. `submit_at` applies in call order and the qmdb root
+/// is order-dependent, so this is what makes a fetched (late) op converge.
 ///
 /// on an all-HIT (eager) node every slot is ready the instant it lands, so the
 /// prefix is always the whole log: behavior is byte-identical to a take-all drain
 /// and every existing eager-path suite stays green. `seen` makes `record`
 /// exactly-once; `fill_fetched` is deliberately NOT seen-gated — it completes a
-/// slot `record` already logged. the `released` cursor makes release exactly-once.
+/// slot `record` already logged. release pops the slot off the queue, so release
+/// is exactly-once and the log never grows past the unreleased window.
+///
+/// ## why `seen` is deliberately UNBOUNDED
+///
+/// `seen` is currently the replicated state machine's ONLY replay guard: the
+/// frame codec carries `(origin, seq)` but nothing enforces seq monotonicity in
+/// state, and simplex happily finalizes the same digest again if a peer
+/// re-proposes byte-identical frame bytes years later. pruning `seen` would
+/// reopen exactly that replay. the cost is one 32-byte digest per finalized op
+/// for the process lifetime (~76 MB per 1M ops with set overhead) — acceptable
+/// until replay protection moves where it belongs: a deterministic per-origin
+/// nonce check in replicated state, at which point `seen` can shrink to a
+/// re-finalization-race window.
 #[derive(Default)]
 struct FinalizedInner {
-    /// committed digests in finalization (ascending-view) order — the release order.
-    log: Vec<(u64, Digest)>,
+    /// UNRELEASED committed digests in finalization (ascending-view) order — the
+    /// release order. released slots are popped off the front, so this only ever
+    /// holds the awaiting window, not all history.
+    log: VecDeque<(u64, Digest)>,
     /// resolved bytes per digest (store hit at `record`, or fetched later).
+    /// entries leave on release, so this is bounded by the unreleased window.
     ready: HashMap<Digest, Vec<u8>>,
-    /// index into `log` of the next slot to release.
-    released: usize,
-    /// exactly-once guard on `record` (NOT on `fill_fetched`).
+    /// exactly-once guard on `record` (NOT on `fill_fetched`) — and the replay
+    /// guard for the whole ordered lane (see the type doc). unbounded on purpose.
     seen: HashSet<Digest>,
 }
 
@@ -540,12 +657,12 @@ impl FinalizedInbox {
             return false;
         }
         if let Some(bytes) = store.get(&digest) {
-            inner.log.push((view, digest));
+            inner.log.push_back((view, digest));
             inner.ready.insert(digest, bytes);
             false
         } else if resolver_enabled {
             // miss: log the slot so it holds its place; the async fetch fills it.
-            inner.log.push((view, digest));
+            inner.log.push_back((view, digest));
             true
         } else {
             // no resolver: nothing can ever resolve this digest — drop (old path).
@@ -562,19 +679,25 @@ impl FinalizedInbox {
         inner.ready.insert(digest, bytes);
     }
 
-    /// release the longest all-ready PREFIX of the log from the cursor, in
-    /// finalization (ascending-view) order. a slot whose bytes have not resolved
-    /// yet halts the prefix; the cursor advances past each released slot so every
-    /// frame emits exactly once. non-blocking.
+    /// count of UNRELEASED slots (the awaiting window) — an ops/metrics surface:
+    /// sustained growth means a missing payload is halting the release prefix.
+    pub fn unreleased_len(&self) -> usize {
+        self.inner.lock().expect("finalized inbox poisoned").log.len()
+    }
+
+    /// release the longest all-ready PREFIX of the log, in finalization
+    /// (ascending-view) order. a slot whose bytes have not resolved yet halts
+    /// the prefix; each released slot is POPPED off the queue so every frame
+    /// emits exactly once and the log stays bounded by the awaiting window.
+    /// non-blocking.
     fn drain(&self) -> Vec<(u64, Vec<u8>)> {
         let mut inner = self.inner.lock().expect("finalized inbox poisoned");
         let mut out = Vec::new();
-        while inner.released < inner.log.len() {
-            let (view, digest) = inner.log[inner.released];
+        while let Some(&(view, digest)) = inner.log.front() {
             match inner.ready.remove(&digest) {
                 Some(bytes) => {
                     out.push((view, bytes));
-                    inner.released += 1;
+                    inner.log.pop_front();
                 }
                 None => break,
             }
@@ -605,6 +728,11 @@ pub struct SimplexReporter<S> {
     /// (see [`SimplexOrderer::spawn_with_resolver`]). on a finalization MISS the
     /// reporter fetches through this instead of dropping the frame.
     mailbox: Option<PayloadMailbox>,
+    /// fetches the mailbox did NOT accept (endpoint closed / rejected): the
+    /// awaiting gate slot would stall forever if the request were silently
+    /// dropped, so they are retried at the next `report` call. bounded by the
+    /// number of outstanding missing payloads.
+    deferred_fetches: VecDeque<Digest>,
     _marker: std::marker::PhantomData<fn() -> S>,
 }
 
@@ -619,7 +747,27 @@ impl<S> SimplexReporter<S> {
         inbox: FinalizedInbox,
         mailbox: Option<PayloadMailbox>,
     ) -> Self {
-        Self { store, pending, inbox, mailbox, _marker: std::marker::PhantomData }
+        Self {
+            store,
+            pending,
+            inbox,
+            mailbox,
+            deferred_fetches: VecDeque::new(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// issue (or re-issue) a payload fetch. an unaccepted submission
+    /// ([`Feedback::accepted`] false — the resolver endpoint is closed or
+    /// rejected the work) parks the digest for retry on the next `report` call
+    /// instead of silently dropping it and stalling its gate slot forever.
+    fn fetch_or_defer(&mut self, digest: Digest) {
+        let Some(mailbox) = self.mailbox.as_mut() else {
+            return;
+        };
+        if !mailbox.fetch(digest).accepted() {
+            self.deferred_fetches.push_back(digest);
+        }
     }
 }
 
@@ -630,6 +778,15 @@ where
     type Activity = Activity<S, Digest>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
+        // retry fetches a previous report failed to enqueue — a dropped fetch
+        // would stall its awaiting gate slot (and the whole release prefix
+        // behind it) forever.
+        for _ in 0..self.deferred_fetches.len() {
+            let Some(digest) = self.deferred_fetches.pop_front() else {
+                break;
+            };
+            self.fetch_or_defer(digest);
+        }
         // the ONLY activity we deliver on is a recovered finalization certificate
         // — the BFT-agreed "this frame is committed".
         if let Activity::Finalization(finalization) = activity {
@@ -653,10 +810,15 @@ where
             let need_fetch =
                 self.inbox.record(view, digest, &self.store, self.mailbox.is_some());
             if need_fetch {
-                if let Some(mailbox) = self.mailbox.as_mut() {
-                    let _ = mailbox.fetch(digest);
-                }
+                self.fetch_or_defer(digest);
             }
+            // finalized: this digest can never be re-proposed, so its pin (if it
+            // was OUR submission) is released into the bounded cache — recent
+            // history stays servable to fetching peers without growing forever.
+            // ordered AFTER record: the gate captured its own copy from the pin,
+            // so a flood-pressured cache eviction can no longer lose our own
+            // finalized frame between demote and record.
+            self.store.demote(&digest);
         }
         Feedback::Ok
     }
@@ -1096,6 +1258,79 @@ mod tests {
         assert_eq!(digest, digest_of(&bytes));
         assert_eq!(store.get(&digest), Some(bytes));
         assert_eq!(store.get(&digest_of(b"unseen")), None);
+    }
+
+    #[test]
+    fn cached_entries_evict_fifo_at_the_cap() {
+        // the flood-memory bound: cached (peer-facing) inserts past the cap
+        // evict the OLDEST cached entry; the newest CAP entries survive.
+        let store = ContentStore::new();
+        let first = store.put(b"blob-first".to_vec());
+        for i in 0..PAYLOAD_CACHE_CAP {
+            store.put(format!("blob-{i:08}").into_bytes());
+        }
+        assert_eq!(store.cached_len(), PAYLOAD_CACHE_CAP, "cache holds exactly the cap");
+        assert_eq!(store.get(&first), None, "the oldest cached entry was evicted");
+        let last = digest_of(format!("blob-{:08}", PAYLOAD_CACHE_CAP - 1).as_bytes());
+        assert!(store.get(&last).is_some(), "the newest entry survives");
+    }
+
+    #[test]
+    fn pinned_entries_survive_flood_pressure_and_demote_into_the_cache() {
+        // an own submission must survive ANY amount of cached churn (it is the
+        // only copy of an unfinalized proposal), and demote must move it into
+        // the bounded cache once finalization retires it.
+        let store = ContentStore::new();
+        let own = store.pin(b"our proposed frame".to_vec());
+        for i in 0..(PAYLOAD_CACHE_CAP + 64) {
+            store.put(format!("flood-{i:08}").into_bytes());
+        }
+        assert_eq!(
+            store.get(&own),
+            Some(b"our proposed frame".to_vec()),
+            "a pinned entry is exempt from cache eviction"
+        );
+        assert_eq!(store.pinned_len(), 1);
+
+        store.demote(&own);
+        assert_eq!(store.pinned_len(), 0, "demote releases the pin");
+        assert_eq!(
+            store.get(&own),
+            Some(b"our proposed frame".to_vec()),
+            "a freshly demoted entry is still servable from the cache"
+        );
+        // demoting an unknown digest is a no-op.
+        store.demote(&digest_of(b"never pinned"));
+    }
+
+    #[test]
+    fn duplicate_cache_puts_do_not_skew_the_fifo_window() {
+        // re-relaying the same bytes (routine gossip duplication) must not
+        // re-enter the eviction queue: the entry keeps its original place and
+        // the cache length stays exact.
+        let store = ContentStore::new();
+        let d = store.put(b"dup".to_vec());
+        for _ in 0..8 {
+            store.put(b"dup".to_vec());
+        }
+        assert_eq!(store.cached_len(), 1);
+        assert_eq!(store.get(&d), Some(b"dup".to_vec()));
+    }
+
+    #[test]
+    fn released_slots_are_popped_so_the_gate_stays_bounded() {
+        // the unreleased window is the ONLY thing the gate retains: after a
+        // clean record+drain cycle the log is empty again, cycle after cycle.
+        let store = ContentStore::new();
+        let inbox = FinalizedInbox::new();
+        for view in 0..1024u64 {
+            let d = store.put(format!("op-{view}").into_bytes());
+            inbox.record(view, d, &store, false);
+            assert_eq!(inbox.unreleased_len(), 1, "one awaiting slot before drain");
+            let released = inbox.drain();
+            assert_eq!(released.len(), 1);
+            assert_eq!(inbox.unreleased_len(), 0, "released slots are popped, not retained");
+        }
     }
 
     #[test]
