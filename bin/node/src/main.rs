@@ -75,6 +75,7 @@ use forge::Forge;
 use governance::Governance;
 use host::Host;
 use inbox::Inbox;
+use jobs::Jobs;
 use kv::Kv;
 use memory::Memory;
 use node::OrderedNode;
@@ -113,9 +114,9 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 14] = [
+const MODULE_IDS: [&str; 15] = [
     "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults", "inbox",
-    "directory", "automations", "files", "memory",
+    "directory", "automations", "files", "memory", "jobs",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
@@ -268,6 +269,7 @@ async fn genesis_host(
         // the shared agent workspace: a filesystem-shaped namespace with
         // write-once publish, immutable generations, snapshots, and watches.
         Box::new(Memory::new("memory")),
+        Box::new(Jobs::new("jobs")),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
@@ -671,6 +673,9 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let (bytes, root) = snapshot_of("memory").await;
             let mut memory = Memory::new("memory");
             memory.install(&bytes, root).expect("memory install");
+            let (bytes, root) = snapshot_of("jobs").await;
+            let mut jobs = Jobs::new("jobs");
+            jobs.install(&bytes, root).expect("jobs install");
 
             let (bytes, root) = snapshot_of("forge").await;
             let forge_repo = storage_for_sync.join("forge-repo");
@@ -679,9 +684,9 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 14] = [
+            let mods: [&dyn sdk::Module; 15] = [
                 &kv, &document, &chat, &directory, &valset, &governance,
-                &saga, &tasks, &vaults, &inbox, &forge, &automations, &files, &memory,
+                &saga, &tasks, &vaults, &inbox, &forge, &automations, &files, &memory, &jobs,
             ];
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {
