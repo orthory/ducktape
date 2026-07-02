@@ -11,31 +11,49 @@ import type { ConsoleActions } from "./DucktapeProvider";
 
 // ── Fake node ───────────────────────────────────────────
 
+const GENERAL_MESSAGE = {
+  id: "m1",
+  channel_id: "general",
+  author: "jess",
+  body: "hello",
+  sequence: 1,
+  sent_at: 10,
+  thread_id: null,
+  reply_count: 0,
+  last_reply_at: null,
+};
+
 const makeFakeNode = () => {
   const blockListeners = new Set<(block: BlockEvent) => void>();
+  // channel-aware mini-node: CreateChannel grows the list, Messages answers
+  // per channel — a stale-pane regression needs the distinction
+  const channels = [{ id: "general", name: "General", created_at: 1 }];
+  const messagesByChannel: Record<string, (typeof GENERAL_MESSAGE)[]> = {
+    general: [GENERAL_MESSAGE],
+  };
   const transport: NodeTransport = {
-    submit: vi.fn().mockResolvedValue({ height: 2, appHash: "bb".repeat(32) }),
+    submit: vi.fn((target: string, payload: unknown) => {
+      const create = (payload as { CreateChannel?: { channel_id: string; name: string } })
+        .CreateChannel;
+      if (target === "chat" && create) {
+        channels.push({ id: create.channel_id, name: create.name, created_at: 2 });
+        messagesByChannel[create.channel_id] = [];
+      }
+      return Promise.resolve({ height: 2, appHash: "bb".repeat(32) });
+    }),
     query: vi.fn((target: string, query: unknown) => {
       if (target === "chat" && query === "Channels") {
+        return Promise.resolve({ Channels: [...channels] });
+      }
+      const messagesFor = (query as { Messages?: { channel_id: string } }).Messages;
+      if (target === "chat" && messagesFor) {
         return Promise.resolve({
-          Channels: [{ id: "general", name: "General", created_at: 1 }],
+          Messages: messagesByChannel[messagesFor.channel_id] ?? [],
         });
       }
       if (target === "chat") {
         return Promise.resolve({
-          Messages: [
-            {
-              id: "m1",
-              channel_id: "general",
-              author: "jess",
-              body: "hello",
-              sequence: 1,
-              sent_at: 10,
-              thread_id: null,
-              reply_count: 0,
-              last_reply_at: null,
-            },
-          ],
+          Thread: { root: GENERAL_MESSAGE, replies: [] },
         });
       }
       return Promise.resolve({ Tasks: [] });
@@ -65,6 +83,7 @@ function Probe() {
       <span data-testid="height">{state.status?.height ?? -1}</span>
       <span data-testid="channel">{state.activeChannel ?? "none"}</span>
       <span data-testid="messages">{state.messages.length}</span>
+      <span data-testid="thread">{state.activeThread ? "open" : "closed"}</span>
     </div>
   );
 }
@@ -128,5 +147,32 @@ describe("DucktapeProvider", () => {
         statusCalls,
       ),
     );
+  });
+
+  it("createChannel enters the new channel: its messages load, the thread closes", async () => {
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+
+    // open a thread first — creating a channel must close it
+    await act(async () => {
+      capturedActions!.openThread("m1");
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("thread").textContent).toBe("open"),
+    );
+
+    await act(async () => {
+      capturedActions!.createChannel("Release Party");
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("channel").textContent).toBe("release-party");
+      // the stale-pane bug left #general's message list (1) showing here
+      expect(screen.getByTestId("messages").textContent).toBe("0");
+      expect(screen.getByTestId("thread").textContent).toBe("closed");
+    });
   });
 });

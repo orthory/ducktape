@@ -175,33 +175,35 @@ export function DucktapeProvider({
         .catch(fail);
     };
 
+    // switching channels means: new active channel, thread panel closed, and
+    // THAT channel's messages loaded — every path into a channel goes here
+    const enterChannel = (channelId: string) => {
+      const live = nodeRef.current;
+      if (!live) return;
+      setState((prev) => ({
+        ...prev,
+        activeChannel: channelId,
+        activeThread: null,
+      }));
+      Promise.resolve()
+        .then(() => chatClient.messages(live, channelId))
+        .then((messages) => setState((prev) => ({ ...prev, messages })))
+        .catch(fail);
+    };
+
     return {
       setScreen: (screen) => setState((prev) => ({ ...prev, screen })),
       setAccent: (accent) => setState((prev) => ({ ...prev, accent })),
       setAuthor: (author) => setState((prev) => ({ ...prev, author })),
 
-      selectChannel: (channelId) => {
-        const live = nodeRef.current;
-        if (!live) return;
-        setState((prev) => ({
-          ...prev,
-          activeChannel: channelId,
-          activeThread: null,
-        }));
-        Promise.resolve()
-          .then(() => chatClient.messages(live, channelId))
-          .then((messages) => setState((prev) => ({ ...prev, messages })))
-          .catch(fail);
-      },
+      selectChannel: enterChannel,
 
       createChannel: (name) => {
         const channelId = channelIdOf(name);
         if (!channelId) return;
         submitThenRefresh((live) =>
           chatClient.createChannel(live, { channelId, name }),
-        ).then(() =>
-          setState((prev) => ({ ...prev, activeChannel: channelId })),
-        );
+        ).then(() => enterChannel(channelId));
       },
 
       sendMessage: (body) => {
