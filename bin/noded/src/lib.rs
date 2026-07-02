@@ -1,4 +1,4 @@
-//! the gateway's client-facing surface: json wire types, the node-actor command
+//! the daemon's client-facing surface: json wire types, the node-actor command
 //! channel, and the axum router.
 //!
 //! the split matters: `host::Host` is deliberately non-Send (single-threaded by
@@ -8,7 +8,12 @@
 //! a fake actor on plain tokio. payloads stay opaque json: a submit/query body
 //! carries the module's own `*Msg`/`*Query` enum as a json value, encoded to the
 //! exact bytes the `*-interface` crates' `encode_*` helpers would produce
-//! (`serde_json::to_vec`), so the gateway needs no per-module knowledge.
+//! (`serde_json::to_vec`), so the daemon needs no per-module knowledge.
+//!
+//! lifecycle is part of the surface: `/v1/status` carries the daemon's build
+//! version (so a newer app can spot a stale orphan), and POST `/v1/shutdown`
+//! asks the process to exit gracefully — the managing app has no pid, only
+//! this port.
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -36,10 +41,12 @@ pub struct BlockSummary {
     pub app_hash: String,
 }
 
-/// the status projection: global app-hash plus each registered module's root.
+/// the status projection: daemon build version, global app-hash, and each
+/// registered module's root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeStatus {
+    pub version: String,
     pub app_hash: String,
     pub height: u64,
     pub modules: Vec<ModuleStatus>,
@@ -94,12 +101,13 @@ pub enum NodeCommand {
     },
 }
 
-/// the router's shared state: a command lane into the node actor plus the
-/// block-event fan-out for websocket subscribers.
+/// the router's shared state: a command lane into the node actor, the
+/// block-event fan-out for websocket subscribers, and the shutdown signal.
 #[derive(Clone)]
 pub struct NodeHandle {
     cmds: mpsc::Sender<NodeCommand>,
     events: broadcast::Sender<BlockSummary>,
+    shutdown: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl NodeHandle {
@@ -111,8 +119,16 @@ impl NodeHandle {
         let handle = Self {
             cmds: cmd_tx,
             events: event_tx.clone(),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
         (handle, cmd_rx, event_tx)
+    }
+
+    /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
+    /// `Notify` stores the permit, so a request that lands before anyone awaits
+    /// is not lost.
+    pub async fn shutdown_requested(&self) {
+        self.shutdown.notified().await;
     }
 
     async fn send(&self, cmd: NodeCommand) -> Result<(), Response> {
@@ -142,6 +158,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/submit", post(submit))
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
+        .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
         // the web app is served from a different origin than the node.
         .layer(CorsLayer::permissive())
@@ -204,6 +221,12 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
         Ok(status) => Json(status).into_response(),
         Err(_) => actor_gone(),
     }
+}
+
+async fn shutdown(State(handle): State<NodeHandle>) -> Response {
+    // reply first, then signal — the connection closes before the process does.
+    handle.shutdown.notify_one();
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {

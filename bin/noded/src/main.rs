@@ -1,14 +1,16 @@
-//! a runnable http/ws gateway over ONE embedded host.
+//! the ducktape node daemon: ONE embedded host behind http/ws.
 //!
 //! two runtimes, one thread each way: the node actor owns the (non-Send)
 //! `host::Host` inside a commonware `tokio::Runner` — the qmdb-backed modules
 //! need its storage context — and drains [`NodeCommand`]s in arrival order, one
 //! msg per block. the axum server runs on a plain tokio runtime on the main
-//! thread and only ever talks to the actor over the command channel. this is
-//! the same ownership shape the tauri desktop build embeds in-process; here it
-//! serves remote web clients instead.
+//! thread and only ever talks to the actor over the command channel. every app
+//! build is a client: the web build dials this directly; the desktop shell
+//! spawns it detached (an orphan — it outlives the window) and connects the
+//! same way. POST /v1/shutdown is how a client retires it: no pid handshake,
+//! the port IS the daemon's identity.
 //!
-//! run: `cargo run -p gateway -- [--listen 127.0.0.1:8844] [--storage <dir>]`
+//! run: `cargo run -p noded -- [--listen 127.0.0.1:8844] [--storage <dir>]`
 //!
 //! without `--storage` state lives in a fresh temp dir (clean run each boot).
 //! with it, qmdb modules and the forge repo persist; the height counter still
@@ -25,7 +27,7 @@ use document::Document;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gateway::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
+use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
 use host::{BlockContext, Host};
 use sdk::{Msg, Origin};
 use tasks::Tasks;
@@ -51,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let storage = storage.unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("ducktape-gateway-{}", std::process::id()))
+        std::env::temp_dir().join(format!("ducktape-noded-{}", std::process::id()))
     });
 
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
@@ -63,13 +65,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("node-actor".into())
         .spawn(move || run_node(actor_storage, cmd_rx, event_tx))?;
 
-    println!("[gateway] listening on {listen}, storage {}", storage.display());
+    println!("[noded] listening on {listen}, storage {}", storage.display());
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(async {
             let listener = tokio::net::TcpListener::bind(listen).await?;
-            axum::serve(listener, gateway::router(handle)).await?;
+            let shutdown = handle.clone();
+            axum::serve(listener, noded::router(handle))
+                .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
+                .await?;
+            // in-flight requests drained; blocks commit at the block boundary,
+            // so exiting here loses nothing.
+            println!("[noded] shutdown requested, exiting");
             Ok(())
         })
 }
@@ -105,7 +113,7 @@ fn run_node(
         ])
         .expect("genesis");
 
-        println!("[gateway] genesis app_hash={}", hex_root(&host.app_hash()));
+        println!("[noded] genesis app_hash={}", hex_root(&host.app_hash()));
 
         let mut height = 0u64;
         while let Some(cmd) = cmds.next().await {
@@ -118,7 +126,7 @@ fn run_node(
                     let ctx = BlockContext {
                         height: height + 1,
                         consensus_time: unix_millis(),
-                        origin: Origin::External(b"gateway".to_vec()),
+                        origin: Origin::External(b"noded".to_vec()),
                     };
                     let outcome = host.submit_at(ctx, Msg { target, payload }).await;
                     let result = match outcome {
@@ -155,6 +163,7 @@ fn run_node(
                         })
                         .collect();
                     let _ = reply.send(NodeStatus {
+                        version: env!("CARGO_PKG_VERSION").into(),
                         app_hash: hex_root(&host.app_hash()),
                         height,
                         modules,
