@@ -1,6 +1,8 @@
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use sdk::{Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk::{
+    Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
+};
 use tasks::Tasks;
 use tasks_interface::{
     TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_reply, encode_msg, encode_query,
@@ -202,7 +204,11 @@ fn failed_write_rolls_back_task_state() {
             .await
             .expect_err("missing task update must fail the block");
         assert!(
-            matches!(err, Error::Module(ref message) if message.contains("task not found")),
+            matches!(
+                err,
+                host::SubmitError::Rejected(Error::Module(ref message))
+                    if message.contains("task not found")
+            ),
             "unexpected error: {err:?}"
         );
 
@@ -265,6 +271,72 @@ fn app_hash_changes_when_task_state_changes() {
         let tasks = host_tasks(&host).await;
         assert_eq!(tasks[0].status, TaskStatus::Done);
         assert_eq!(tasks[0].updated_at, 4);
+    });
+}
+
+#[test]
+fn state_sync_handle_returns_installable_snapshot_bytes() {
+    block_on(async {
+        let mut source = Tasks::new(TASKS);
+        source
+            .execute(&mut TestCtx::at(5), &create("task-1", "sync me"))
+            .await
+            .expect("create");
+        source
+            .execute(&mut TestCtx::at(5), &create("task-2", "me too"))
+            .await
+            .expect("create");
+        source.commit_block().await.expect("commit");
+
+        // the module advertises self-contained snapshot bytes...
+        let handle = source.state_sync_handle().expect("state-sync handle");
+        let bytes = match handle {
+            StateSyncHandle::SnapshotBytes(bytes) => bytes,
+            other => panic!("expected SnapshotBytes, got {other:?}"),
+        };
+
+        // ...that install verbatim on a joiner against the source root.
+        let mut target = Tasks::new(TASKS);
+        target
+            .install(&bytes, source.root())
+            .expect("install handle bytes");
+        assert_eq!(target.root(), source.root());
+        assert_eq!(module_tasks(&target).await, module_tasks(&source).await);
+    });
+}
+
+#[test]
+fn snapshot_with_updated_at_before_created_at_round_trips() {
+    block_on(async {
+        // consensus_time has NO cross-block monotonicity guarantee, so a status
+        // update in a later block can legitimately stamp updated_at BELOW
+        // created_at. install must accept this execute-reachable state instead
+        // of refusing a snapshot an honest validator committed.
+        let mut source = Tasks::new(TASKS);
+        source
+            .execute(&mut TestCtx::at(10), &create("task-1", "time travels"))
+            .await
+            .expect("create at t=10");
+        source.commit_block().await.expect("commit create");
+        source
+            .execute(&mut TestCtx::at(5), &update("task-1", TaskStatus::Done))
+            .await
+            .expect("update at t=5");
+        source.commit_block().await.expect("commit update");
+
+        let listed = module_tasks(&source).await;
+        assert_eq!(listed[0].created_at, 10);
+        assert_eq!(
+            listed[0].updated_at, 5,
+            "the premise: updated_at < created_at is execute-reachable"
+        );
+
+        let mut target = Tasks::new(TASKS);
+        target
+            .install(&source.snapshot(), source.root())
+            .expect("install must accept execute-reachable timestamps");
+        assert_eq!(target.root(), source.root());
+        assert_eq!(module_tasks(&target).await, module_tasks(&source).await);
     });
 }
 

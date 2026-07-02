@@ -58,13 +58,13 @@ fn dir_set(k: &str, v: &str) -> Msg {
 /// distinct kv keys (so the FINAL kv content is identical under any permutation —
 /// divergence can only come from LOG ORDER, not content), plus two directory
 /// writes for the order-independence contrast. one op per validator.
-fn op_set() -> Vec<(Vec<u8>, u64, Msg)> {
+fn op_set() -> Vec<(commonware_cryptography::ed25519::PrivateKey, u64, Msg)> {
     vec![
-        (b"A".to_vec(), 0, kv_set(b"aaa", b"1")),
-        (b"B".to_vec(), 0, kv_set(b"bbb", b"2")),
-        (b"C".to_vec(), 0, kv_set(b"ccc", b"3")),
-        (b"D".to_vec(), 0, dir_set("x", "10")),
-        (b"E".to_vec(), 0, dir_set("y", "20")),
+        (op_signer(101), 0, kv_set(b"aaa", b"1")),
+        (op_signer(102), 0, kv_set(b"bbb", b"2")),
+        (op_signer(103), 0, kv_set(b"ccc", b"3")),
+        (op_signer(104), 0, dir_set("x", "10")),
+        (op_signer(105), 0, dir_set("y", "20")),
     ]
 }
 
@@ -221,4 +221,10 @@ fn convergence_is_robust_across_schedules() {
             .with_timeout(Some(Duration::from_secs(300)));
         deterministic::Runner::new(cfg).start(|context| converge(context));
     }
+}
+
+/// a deterministic dev signer for test frames (any u64 seed).
+fn op_signer(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
+    use commonware_cryptography::Signer as _;
+    commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
 }

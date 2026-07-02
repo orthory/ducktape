@@ -174,10 +174,20 @@ where
         self.pending.as_ref()
     }
 
+    /// the app-level height for `view` in the CURRENT epoch: `epoch_base + view`.
+    ///
+    /// overflow policy (applies to every `checked_add().expect()` in this type):
+    /// `epoch_base`, views, and epochs only ever grow by finalized consensus
+    /// progress — reaching u64::MAX takes ~1.8e19 finalized views, unreachable
+    /// by construction. the checked-add panic is deliberate FAIL-STOP hardening
+    /// against a corrupted input (a bad genesis base, a bit-flipped view), not a
+    /// reachable consensus path; saturating or wrapping instead would silently
+    /// desynchronize heights across validators, which is strictly worse than
+    /// halting the one node holding corrupt state.
     pub fn app_height(&self, view: u64) -> u64 {
         self.epoch_base
             .checked_add(view)
-            .expect("app height overflow")
+            .expect("app height overflow: corrupt epoch_base/view — fail-stop")
     }
 
     pub fn observe_finalized_valset(

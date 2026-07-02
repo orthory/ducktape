@@ -121,7 +121,7 @@ fn snapshot_capture_uses_the_finalized_app_hash_boundary() {
             )
             .await
             .expect_err("unknown follow-up aborts the block");
-        assert_eq!(err, Error::UnknownModule("missing".into()));
+        assert_eq!(err, host::SubmitError::Rejected(Error::UnknownModule("missing".into())));
 
         let after_abort = host
             .capture_finalized_snapshot(block(6, start_hash))

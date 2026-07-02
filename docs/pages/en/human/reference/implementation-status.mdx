@@ -4,34 +4,59 @@ This status page is grounded in checked-in code, tests, and binaries.
 
 ## Platform Spine
 
-- `sdk` defines the module contract and deterministic system API.
-- `host` owns registry dispatch, FIFO follow-up drain, and block commit/abort.
+- `sdk` defines the module contract and deterministic system API, including the
+  `serve_sync` state-sync serve surface.
+- `host` owns registry dispatch, FIFO follow-up drain, and block commit/abort,
+  with a fail-stop boundary contract: a `commit_block`/`abort_block` fault is a
+  node-local `SubmitError::Fatal`, distinct from a deterministic rejection.
 - `state` composes module roots into an order-independent app-hash.
-- `node` bridges host application to transport and ordered delivery.
-- `consensus` contains the commonware Simplex-backed orderer.
+- `node` bridges host application to transport and ordered delivery. Op frames
+  are ed25519-signed and verified on decode, so an applied op's origin is
+  authenticated authorship. `OrderedNode` supports epoch cutover (engine
+  respawn with a deterministic discard ceiling and rebased app heights).
+- `consensus` contains the commonware Simplex-backed orderer with bounded
+  payload memory (pinned own submissions, FIFO-capped peer cache) and the
+  `ValsetOrchestrator` for epoch scheduling.
+- `statesync` defines the network state-sync wire protocol (manifest, chunked
+  snapshots, remote qmdb resolver) and the p2p transport binding.
 - `reactor` closes the non-deterministic worker boundary by submitting worker
   results as ordinary messages.
 
 ## Module State
 
-- QMDB-backed modules expose real authenticated roots and state-sync targets.
+- QMDB-backed modules (kv, document, messaging) expose real authenticated roots
+  and answer network state-sync over `serve_sync`; messaging stores one record
+  per message (no whole-history value, no 1 MiB commit bomb) with keyset
+  pagination.
 - Forge derives a 32-byte state root from git state and verifies object closure
   before install.
-- Snapshot-style modules use canonical bytes where that fits the module.
-- Messaging, chat, and agent modules are wired into the current workspace.
+- Snapshot-style modules use canonical bytes where that fits the module: valset,
+  saga, tasks, directory, governance, vaults.
+- System governance gates the validator set (member-only proposals, deterministic
+  tally, follow-up membership ops); valset rejects external membership writes.
+- Vaults replicate opaque secret ciphertext with owner-gated write integrity.
+- Chat and agent are wrapper modules over the messaging substrate.
 
 ## Verification Surface
 
 - `cargo test --workspace` exercises the Rust workspace.
 - `cargo run -p demo` runs the in-process multi-module walkthrough.
 - `cargo test -p demo --test joiner_rebuilds_global_app_hash` proves a joiner can
-  rebuild every module and match the source app-hash.
-- `bin/node/examples/demo-2node.sh` drives two OS processes through the real
-  commonware-backed node path.
+  rebuild every module and match the source app-hash in-process.
+- `cargo test -p demo --test network_joiner_full` proves a joiner rebuilds every
+  module purely over the state-sync wire protocol.
+- `bin/node/examples/demo-2node.sh` drives multiple OS processes through the real
+  commonware-backed node path: three-validator convergence, an RPC-submitted
+  message crossing consensus, a cross-node governance vote, a live epoch cutover,
+  and a sync-only joiner rebuilding the post-cutover state over real sockets.
 
 ## Still Open
 
-- Network-backed module sync from a live node.
-- Dynamic valset orchestration around epoch cutover.
-- Snapshot-at-height serving from a running node.
-- Product depth for chat, agent, and tasks.
+- Restart/recovery from persisted state (engine journal replay design).
+- A demoted validator degrading to a sync-server rather than halting, and a
+  synced joiner auto-promoting to a live validator at an epoch boundary.
+- Per-origin replay nonces in state (cross-epoch frame replay currently gated by
+  the per-engine finalization dedup).
+- Origin-bound message authorship, the agent reactor-worker seam, and the
+  agent/tasks pipeline.
+- Unifying the two parallel mesh type systems and wiring the WireGuard overlay.

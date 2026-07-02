@@ -4,15 +4,19 @@
 
 ## Live Network State Sync
 
-in-process module sync proof는 존재한다. running node에는 live validator path에서
-module sync data를 serve하고 fetch하는 network resolver가 아직 필요하다.
+in-process module sync proof는 존재하고, `bin/demo/src/state_sync.rs`는
+membership validation을 갖춘 transport-neutral mesh frame을 test와 함께
+정의한다. running node에는 live validator path에서 이 frame을 serve하고
+fetch하는 network resolver가 아직 필요하다.
 
 ## Dynamic Valset Orchestration
 
-test는 epoch boundary 주변 respawn behavior를 cover한다. live loop는 finalized
-valset state를 watch하고, deterministic cutover point를 publish하고, old orderer를
-stop하고, new epoch instance를 start하고, transport/state-sync readiness를 맞추는
-작업이 아직 필요하다.
+test는 epoch boundary 주변 respawn behavior를 cover하고, deterministic core는
+존재한다. test된 `ValsetOrchestrator` state machine
+(`crates/kernel/consensus/src/valset_orchestrator.rs`)이 finalized valset
+state를 watch하고 deterministic cutover point를 publish한다. live loop는 old
+orderer를 stop하고, new epoch instance를 start하고, transport/state-sync
+readiness를 맞추는 작업이 아직 필요하다.
 
 ## Snapshot Serving
 
@@ -22,4 +26,6 @@ consistent all-module snapshot을 위한 pause/serve seam이 아직 필요하다
 ## Product Depth
 
 chat과 agent module은 존재한다. agent path는 아직 reactor-backed LLM work가 필요하다.
-model output은 ordered data로 commit되어야 한다. checked-in tasks module은 아직 없다.
+model output은 ordered data로 commit되어야 한다. 첫 tasks module은 이미 checked-in
+상태다(`crates/apps/tasks`와 `tasks-interface`, test 포함). qmdb backing, 더 풍부한
+task schema, binary로의 product wiring이 남아 있다.

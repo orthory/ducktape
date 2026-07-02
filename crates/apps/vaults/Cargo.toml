@@ -1,0 +1,22 @@
+[package]
+name = "vaults"
+edition.workspace = true
+version.workspace = true
+
+# replicated team vaults: opaque secret ciphertext with owner/reader
+# bookkeeping, write-gated by AUTHENTICATED op authorship (the ordered lane
+# verifies frame signatures before the host dispatches). a canonical-bytes
+# snapshot module like governance/tasks: root == sha256 of encoded committed
+# state, verify-then-adopt install. depends only on `sdk` + its own types-only
+# interface crate, per the module-isolation rule.
+[dependencies]
+sdk = { workspace = true }
+vaults-interface = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+host = { workspace = true }
+futures = "0.3"
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }

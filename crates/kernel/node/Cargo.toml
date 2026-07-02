@@ -21,6 +21,10 @@ host = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# op frames are ed25519-SIGNED: encode signs, decode verifies, so the host's
+# Origin::External is authenticated authorship.
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
 
 [dev-dependencies]
 # the gossip convergence test stands two nodes on one LoopbackHub over a pair of
