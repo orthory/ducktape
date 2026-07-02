@@ -21,6 +21,7 @@ members = [
     # kernel — the platform (contract + dispatch + transport + BFT ordering)
     "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
+    "crates/kernel/statesync",
     # system — consensus infrastructure modules
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
@@ -75,6 +76,7 @@ host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
 reactor = { path = "crates/kernel/reactor" }
+statesync = { path = "crates/kernel/statesync" }
 # internal — module impl crates
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }

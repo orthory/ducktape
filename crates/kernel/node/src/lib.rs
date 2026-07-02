@@ -472,11 +472,16 @@ pub struct OrderedNode<O: Orderer> {
     /// where the reactor's worker driver reads finalized `WorkerRequest`s from
     /// (via `take_effects`). accumulates in agreed-delivery order.
     effects: Vec<Effect>,
+    /// the latest APPLIED consensus boundary: the last drained view plus the
+    /// app-hash after that drain settled. this is what a state-sync service
+    /// serves from (`host::Host::capture_finalized_snapshot` demands exactly
+    /// this pair) — `None` until the first frame applies.
+    finalized: Option<host::FinalizedBlock>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
     pub fn new(host: Host, orderer: O) -> Self {
-        Self { host, orderer, effects: Vec::new() }
+        Self { host, orderer, effects: Vec::new(), finalized: None }
     }
 
     /// SUBMIT — propose a locally-originated msg into the agreed order. framed
@@ -503,6 +508,7 @@ impl<O: Orderer> OrderedNode<O> {
     pub async fn drain_delivered(&mut self) -> Result<usize, Error> {
         let delivered = self.orderer.poll_delivered();
         let mut applied = 0usize;
+        let mut last_view: Option<u64> = None;
         for (view, frame) in delivered {
             // a FINALIZED op counts as processed whether or not it applies cleanly.
             // one that fails to decode, or that a module rejects, is a DETERMINISTIC
@@ -512,6 +518,10 @@ impl<O: Orderer> OrderedNode<O> {
             // by getting a malformed op finalized. (the `?`-propagate that used to be
             // here stalled the whole drain on one bad op — the liveness gap.)
             applied += 1;
+            // even a rejected/malformed op advances the finalized boundary —
+            // the view was agreed, and every honest validator's app-hash at
+            // this view is identical (unchanged by the no-op).
+            last_view = Some(view);
             let Ok((origin, msg)) = decode_frame(&frame) else { continue };
             // the agreed view is the block coordinate: height + consensus_time
             // (a logical, agreed, monotonic clock — identical on every validator).
@@ -526,7 +536,19 @@ impl<O: Orderer> OrderedNode<O> {
                 Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
             }
         }
+        if let Some(view) = last_view {
+            self.finalized = Some(host::FinalizedBlock {
+                height: view,
+                app_hash: self.host.app_hash(),
+            });
+        }
         Ok(applied)
+    }
+
+    /// the latest APPLIED consensus boundary — what a state-sync service serves
+    /// from. `None` until the first delivered frame applies.
+    pub fn finalized(&self) -> Option<host::FinalizedBlock> {
+        self.finalized
     }
 
     /// the current app-hash of the wrapped host.

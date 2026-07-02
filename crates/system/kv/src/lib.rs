@@ -263,8 +263,15 @@ where
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "call Kv::sync_target() at this root and serve it with a DbResolver".into(),
+            detail: "serve_sync answers qmdb target + op-range requests (statesync wire)".into(),
         })
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (current target, historical proof-carrying op ranges) from committed
+    /// state. read-only; the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        statesync::qmdb::serve_bytes(&self.db, req).await
     }
 
     /// interpret the payload as a json-encoded `(key, value)` write and apply it
