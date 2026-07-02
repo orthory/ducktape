@@ -42,7 +42,6 @@
 //! process's genesis line agrees, every converged line agrees, and the sync-only
 //! joiner's synced line equals the converged line.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -372,20 +371,6 @@ fn parse_flags(
     Ok((positional, flags))
 }
 
-/// the addr peers should dial, if one is real: prefer --advertised, else the
-/// listen addr when it has a concrete port (an ephemeral port 0 is not an
-/// address anyone can dial later).
-fn dialable(
-    advertised: Option<&str>,
-    listen: &str,
-) -> Result<Option<SocketAddr>, Box<dyn std::error::Error>> {
-    if let Some(a) = advertised {
-        return Ok(Some(a.parse()?));
-    }
-    let l: SocketAddr = listen.parse()?;
-    Ok((l.port() != 0).then_some(l))
-}
-
 /// `keygen [--out <path>]` — generate (or reuse) a persisted ed25519 identity.
 /// pubkey on stdout (scriptable); provenance on stderr.
 fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -422,6 +407,18 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("init needs --name <human-readable network name>")?;
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
+    // re-running init would mint a FRESH chain-id and reset the validator set
+    // to just this identity — silently un-founding the network under every
+    // holder of an existing invite. founding is once per directory.
+    let descriptor_path = dir.join("network.toml");
+    if descriptor_path.exists() {
+        return Err(format!(
+            "{} already exists — this directory is already a network. use `invite`/`admit` \
+             for membership, or delete the file to re-found from scratch",
+            descriptor_path.display()
+        )
+        .into());
+    }
     let listen = flags
         .get("listen")
         .map(String::as_str)
@@ -436,10 +433,10 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
     };
-    if let Some(addr) = dialable(flags.get("advertised").map(String::as_str), listen)? {
+    if let Some(addr) = config::dialable(flags.get("advertised").map(String::as_str), listen)? {
         descriptor.add_bootstrap(&me, &addr);
     }
-    descriptor.save(&dir.join("network.toml"))?;
+    descriptor.save(&descriptor_path)?;
     config::write_node_toml(
         &dir,
         listen,
@@ -484,7 +481,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor_path = base.join(network_rel);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
     let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
-    match dialable(raw.advertised.as_deref(), &raw.listen)? {
+    match config::dialable(raw.advertised.as_deref(), &raw.listen)? {
         Some(addr) => descriptor.add_bootstrap(&key.public_key(), &addr),
         // an invite must carry SOME dialable member.
         None if descriptor.bootstrap.is_empty() => {
@@ -554,20 +551,30 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = config::decode_invite(blob)?;
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
-    let listen = flags
-        .get("listen")
-        .map(String::as_str)
-        .unwrap_or("127.0.0.1:0");
     descriptor.save(&dir.join("network.toml"))?;
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
-    config::write_node_toml(
-        &dir,
-        listen,
-        flags.get("advertised").map(String::as_str),
-        flags.get("http").map(String::as_str),
-        flags.get("rpc").map(String::as_str),
-    )?;
+    // the documented re-join (after a pre-genesis admit) refreshes the
+    // DESCRIPTOR; the first join's plumbing (listen/rpc/http) must survive
+    // unless this invocation explicitly re-specifies it.
+    let has_plumbing_flags = ["listen", "advertised", "http", "rpc"]
+        .iter()
+        .any(|k| flags.contains_key(*k));
+    if !dir.join("node.toml").exists() || has_plumbing_flags {
+        let listen = flags
+            .get("listen")
+            .map(String::as_str)
+            .unwrap_or("127.0.0.1:0");
+        config::write_node_toml(
+            &dir,
+            listen,
+            flags.get("advertised").map(String::as_str),
+            flags.get("http").map(String::as_str),
+            flags.get("rpc").map(String::as_str),
+        )?;
+    } else {
+        eprintln!("kept existing node.toml (pass --listen/--rpc/--http to rewrite)");
+    }
     eprintln!(
         "{} identity {me_hex}",
         if generated { "generated" } else { "reusing" }
@@ -613,6 +620,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         http_listen,
         dev_demo,
     } = resolved;
+    if !sync_only && !validators.contains(&signer.public_key()) {
+        return Err(format!(
+            "identity {} is in the mesh but not in the validator set — run with --sync-only \
+             (observer) or get admitted first",
+            hex_bytes(signer.public_key().as_ref())
+        )
+        .into());
+    }
+
     // discovery's bootstrapper list wants its own ingress address type.
     let bootstrappers: Vec<(ed25519::PublicKey, _)> = bootstrappers
         .into_iter()
@@ -626,10 +642,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         );
     }
     println!(
-        "[node {label}] starting on {listen} ({} mesh peers, {} validators{}), storage {}",
+        "[node {label}] starting on {listen} ({} mesh peers, {} validators{}), namespace {}, storage {}",
         peers.len(),
         validators.len(),
         if sync_only { ", sync-only" } else { "" },
+        String::from_utf8_lossy(&namespace),
         storage.display()
     );
 
@@ -697,11 +714,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
         // the statesync source a --sync-only joiner pulls from: a configured
         // bootstrapper if any (the network shape), else the first mesh
-        // identity (the dev shape's node 0).
+        // identity that is NOT this node — discovery never connects a node to
+        // itself, so addressing our own key would retry forever.
+        let me = signer.public_key();
         let sync_source = bootstrappers
             .first()
             .map(|(k, _)| k.clone())
-            .unwrap_or_else(|| peers.first().expect("mesh is non-empty").clone());
+            .or_else(|| peers.iter().find(|p| **p != me).cloned());
 
         // the real encrypted TCP mesh. `local` is the dev preset (allows private
         // ips). MUST be the real tokio runtime — discovery live-locks under the
@@ -743,7 +762,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
             network.start();
 
-            let server_peer = sync_source;
+            let Some(server_peer) = sync_source else {
+                eprintln!(
+                    "[node {label}] no statesync source: every bootstrap hint and mesh peer \
+                     is this node itself — a solo network has nothing to sync from"
+                );
+                std::process::exit(1);
+            };
             let client = P2pSyncClient::new(
                 context.child("sync_client"),
                 sync_tx,

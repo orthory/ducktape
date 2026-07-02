@@ -43,6 +43,11 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    // ascii first: byte-offset slicing below panics mid-codepoint on multibyte
+    // utf-8, and this parses PASTED input (invite blobs, rpc hex).
+    if !s.is_ascii() {
+        return Err("hex string contains non-ascii characters".into());
+    }
     if s.len() % 2 != 0 {
         return Err("hex string has odd length".into());
     }
@@ -72,12 +77,23 @@ pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bo
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
     }
-    std::fs::write(path, format!("{encoded}\n")).map_err(|e| format!("write {path:?}: {e}"))?;
-    #[cfg(unix)]
+    // the file is BORN 0600 (no write-then-chmod window a co-tenant could
+    // read the secret through), and create_new makes exists-then-create
+    // race-free: a concurrent keygen loses cleanly instead of clobbering.
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod {path:?}: {e}"))?;
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(path)
+            .map_err(|e| format!("create {path:?}: {e}"))?;
+        f.write_all(format!("{encoded}\n").as_bytes())
+            .map_err(|e| format!("write {path:?}: {e}"))?;
     }
     Ok((key, true))
 }
@@ -146,7 +162,39 @@ impl NetworkDescriptor {
     }
 
     pub fn validator_keys(&self) -> Result<Vec<ed25519::PublicKey>, String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for h in &self.validators {
+            if !seen.insert(h.trim()) {
+                return Err(format!(
+                    "duplicate validator {h:?} in network {}",
+                    self.chain_id
+                ));
+            }
+        }
         self.validators.iter().map(|h| decode_key(h)).collect()
+    }
+
+    /// the namespace this network's nodes actually run under: the chain-id
+    /// plus a GENESIS FINGERPRINT (sha256 over scheme + the sorted validator
+    /// set; bootstrap hints excluded — they are advisory and legitimately
+    /// differ between members). because the namespace domain-separates the
+    /// discovery handshake, the simplex scheme, and the epoch genesis floor,
+    /// a member holding a STALE descriptor (e.g. it missed a pre-genesis
+    /// `admit` and kept the old validator list) cannot even connect — genesis
+    /// divergence is a loud connectivity failure, never a silent state fork.
+    pub fn genesis_namespace(&self) -> String {
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let mut sorted = self.validators.clone();
+        sorted.sort();
+        let mut hasher = Sha256::default();
+        hasher.update(b"ducktape:genesis:v1:");
+        hasher.update(self.scheme.as_bytes());
+        for v in &sorted {
+            hasher.update(b"\n");
+            hasher.update(v.trim().as_bytes());
+        }
+        let digest = hasher.finalize();
+        format!("{}@{}", self.chain_id, hex_bytes(&digest.as_ref()[..4]))
     }
 
     /// parsed bootstrap entries; a malformed entry is a config error, not a
@@ -192,6 +240,26 @@ pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
     let raw = unhex(hex.trim())?;
     ed25519::PublicKey::decode(raw.as_slice())
         .map_err(|e| format!("{hex:?} is not an ed25519 public key: {e}"))
+}
+
+/// the addr peers should dial, if one is real: prefer `advertised`, else the
+/// listen addr when it is concrete. an UNSPECIFIED ip (0.0.0.0/[::]) or port 0
+/// is never dialable — writing one into a descriptor would hand every joiner a
+/// bootstrap hint that resolves to their own loopback. an explicitly-passed
+/// advertised addr that is not dialable is an ERROR (the caller asked for it);
+/// a non-dialable listen just means "no hint" (Ok(None)).
+pub fn dialable(advertised: Option<&str>, listen: &str) -> Result<Option<SocketAddr>, String> {
+    if let Some(a) = advertised {
+        let addr: SocketAddr = a.parse().map_err(|e| format!("advertised: {e}"))?;
+        if addr.ip().is_unspecified() || addr.port() == 0 {
+            return Err(format!(
+                "advertised addr {addr} is not dialable (unspecified ip or port 0)"
+            ));
+        }
+        return Ok(Some(addr));
+    }
+    let l: SocketAddr = listen.parse().map_err(|e| format!("listen: {e}"))?;
+    Ok((!l.ip().is_unspecified() && l.port() != 0).then_some(l))
 }
 
 // ============================================================================
@@ -370,7 +438,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
-        namespace: descriptor.chain_id.clone().into_bytes(),
+        namespace: descriptor.genesis_namespace().into_bytes(),
         signer,
         mesh,
         validators,
@@ -530,7 +598,9 @@ mod tests {
         .expect("write node.toml");
 
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.namespace, b"net#11223344".to_vec());
+        // the running namespace is the chain-id plus the genesis fingerprint.
+        assert_eq!(r.namespace, d.genesis_namespace().into_bytes());
+        assert!(String::from_utf8_lossy(&r.namespace).starts_with("net#11223344@"));
         assert_eq!(r.validators.len(), 2);
         assert_eq!(r.mesh.len(), 2);
         // self never appears in bootstrappers; the other member does.
@@ -562,6 +632,90 @@ mod tests {
         assert!(
             err.contains("admit"),
             "error carries the admit guidance: {err}"
+        );
+    }
+
+    #[test]
+    fn unhex_rejects_non_ascii_without_panicking() {
+        // fixed-offset slicing panics mid-codepoint unless ascii is enforced —
+        // this parses PASTED invite blobs and rpc hex, so Err, never panic.
+        assert!(unhex("a\u{2026}").is_err());
+        assert!(unhex("caf\u{e9}").is_err());
+        assert!(unhex("zz").is_err());
+        assert_eq!(unhex("00ff").unwrap(), vec![0x00, 0xff]);
+    }
+
+    #[test]
+    fn duplicate_validators_are_a_config_error() {
+        let a = ed25519::PrivateKey::from_seed(4).public_key();
+        let d = NetworkDescriptor {
+            chain_id: "dup#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref()), hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+        };
+        assert!(
+            d.validator_keys().is_err(),
+            "dups must not reach Set::try_from"
+        );
+    }
+
+    #[test]
+    fn genesis_namespace_fingerprints_the_validator_set_not_the_hints() {
+        let a = ed25519::PrivateKey::from_seed(5).public_key();
+        let b = ed25519::PrivateKey::from_seed(6).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "net#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+        };
+        let founder_only = d.genesis_namespace();
+        assert!(founder_only.starts_with("net#00000000@"));
+
+        // bootstrap hints are advisory and legitimately differ per member —
+        // they must NOT move the namespace.
+        d.add_bootstrap(&a, &"127.0.0.1:52200".parse().unwrap());
+        assert_eq!(d.genesis_namespace(), founder_only);
+
+        // admitting a member DOES move it: a stale descriptor can no longer
+        // handshake, so genesis divergence is loud, not a silent fork.
+        d.admit(&b);
+        assert_ne!(d.genesis_namespace(), founder_only);
+
+        // and it is order-independent (canonical over the sorted set).
+        let mut reversed = d.clone();
+        reversed.validators.reverse();
+        assert_eq!(reversed.genesis_namespace(), d.genesis_namespace());
+    }
+
+    #[test]
+    fn dialable_rejects_unspecified_ips_and_port_zero() {
+        // listen fallback: concrete -> hint, unspecified/port-0 -> no hint.
+        assert!(dialable(None, "127.0.0.1:52200").unwrap().is_some());
+        assert!(dialable(None, "0.0.0.0:52200").unwrap().is_none());
+        assert!(dialable(None, "[::]:52200").unwrap().is_none());
+        assert!(dialable(None, "127.0.0.1:0").unwrap().is_none());
+        // an EXPLICIT advertised addr that is not dialable is an error.
+        assert!(dialable(Some("0.0.0.0:52200"), "127.0.0.1:52200").is_err());
+        assert!(dialable(Some("1.2.3.4:0"), "127.0.0.1:52200").is_err());
+        assert_eq!(
+            dialable(Some("1.2.3.4:5"), "127.0.0.1:0").unwrap(),
+            Some("1.2.3.4:5".parse().unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_file_is_born_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmp("perms");
+        let path = dir.join("identity.key");
+        load_or_generate_identity(&path).expect("generate");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "secret must never be world-readable, even transiently"
         );
     }
 
