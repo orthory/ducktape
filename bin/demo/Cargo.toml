@@ -14,8 +14,8 @@ forge = { workspace = true }
 forge-interface = { workspace = true }
 document = { workspace = true }
 document-interface = { workspace = true }
-agent = { workspace = true }
-agent-interface = { workspace = true }
+chat = { workspace = true }
+chat-interface = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }

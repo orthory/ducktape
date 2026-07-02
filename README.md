@@ -17,10 +17,7 @@ Modules never link each other's implementation crates. A module depends only on:
 - the types-only `*-interface` crates of modules it needs to address.
 
 Cross-module reads go through host-routed queries. Cross-module writes are
-emitted as messages that the host drains as follow-up ops. Wrapper modules
-(chat, agent) may reuse a shared storage implementation either as a private
-embedded substrate or as a facade over an explicitly registered backing module —
-but product interaction still crosses only interface crates.
+emitted as messages that the host drains as follow-up ops.
 
 ## Repository Layout
 
@@ -28,7 +25,7 @@ but product interaction still crosses only interface crates.
 | --- | --- |
 | `crates/kernel/` | The platform: `sdk` (module contract), `state` (app-hash composition), `host` (registry + dispatch + block lifecycle), `node` (transport seam), `consensus` (commonware Simplex BFT orderer), `reactor` (worker loop for non-deterministic effects) |
 | `crates/system/` | Consensus-infrastructure modules: `kv` (QMDB byte-KV), `valset` (ed25519 validator membership), `saga` (deterministic async continuations), `wireguard-upgrade` |
-| `crates/apps/` | Product modules: `forge` (git-backed project state), `document`, `messaging`, `chat`, `agent`, `tasks` |
+| `crates/apps/` | Product modules: `forge` (git-backed project state), `document`, `chat`, `tasks` |
 | `crates/examples/` | Demo and test scaffolding modules: `directory`, `greeter` |
 | `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (real-socket validator process) |
 | `docs/` | Vocs documentation site (human/agent tracks, English/Korean) |

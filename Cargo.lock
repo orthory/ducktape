@@ -13,29 +13,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent"
-version = "0.1.0"
-dependencies = [
- "agent-interface",
- "async-trait",
- "commonware-runtime",
- "commonware-storage",
- "host",
- "messaging",
- "messaging-interface",
- "sdk",
-]
-
-[[package]]
-name = "agent-interface"
-version = "0.1.0"
-dependencies = [
- "messaging-interface",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -590,23 +567,24 @@ dependencies = [
 name = "chat"
 version = "0.1.0"
 dependencies = [
- "agent",
- "agent-interface",
  "async-trait",
  "chat-interface",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-parallel",
  "commonware-runtime",
  "commonware-storage",
+ "commonware-utils",
  "host",
- "messaging",
- "messaging-interface",
  "sdk",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "chat-interface"
 version = "0.1.0"
 dependencies = [
- "messaging-interface",
  "serde",
  "serde_json",
 ]
@@ -1348,9 +1326,9 @@ dependencies = [
 name = "demo"
 version = "0.1.0"
 dependencies = [
- "agent",
- "agent-interface",
  "async-trait",
+ "chat",
+ "chat-interface",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
@@ -2345,32 +2323,6 @@ name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
-
-[[package]]
-name = "messaging"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-parallel",
- "commonware-runtime",
- "commonware-storage",
- "commonware-utils",
- "host",
- "messaging-interface",
- "sdk",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "messaging-interface"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "mime"

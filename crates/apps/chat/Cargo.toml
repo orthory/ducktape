@@ -3,17 +3,20 @@ name = "chat"
 edition.workspace = true
 version.workspace = true
 
-# Slack-like facade over the storage-backed messaging module.
+# the chat module: block-based channels, threads, edits, reactions, membership,
+# and hook notifications on one qmdb store.
 [dependencies]
 sdk = { workspace = true }
 chat-interface = { workspace = true }
-messaging = { workspace = true }
-messaging-interface = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 commonware-storage = { workspace = true }
 commonware-runtime = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-parallel = { workspace = true }
+commonware-codec = { workspace = true }
+commonware-utils = { workspace = true }
 
 [dev-dependencies]
-agent = { workspace = true }
-agent-interface = { workspace = true }
 host = { workspace = true }
