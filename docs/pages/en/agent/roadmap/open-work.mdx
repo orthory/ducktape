@@ -5,15 +5,19 @@ as finished.
 
 ## Live Network State Sync
 
-In-process module sync proofs exist. A running node still needs network resolvers
-that serve and fetch module sync data from the live validator path.
+In-process module sync proofs exist, and `bin/demo/src/state_sync.rs` defines
+tested transport-neutral mesh frames with membership validation. A running node
+still needs network resolvers that serve and fetch those frames from the live
+validator path.
 
 ## Dynamic Valset Orchestration
 
-Tests cover respawn behavior around an epoch boundary. The live loop still needs
-to watch finalized valset state, publish a deterministic cutover point, stop old
-orderers, start new epoch instances, and keep transport/state-sync readiness
-aligned.
+Tests cover respawn behavior around an epoch boundary, and the deterministic
+core exists: the tested `ValsetOrchestrator` state machine
+(`crates/kernel/consensus/src/valset_orchestrator.rs`) watches finalized valset
+state and publishes a deterministic cutover point. The live loop still needs to
+stop old orderers, start new epoch instances, and keep transport/state-sync
+readiness aligned.
 
 ## Snapshot Serving
 
@@ -23,5 +27,6 @@ pause/serve seam for a consistent all-module snapshot at a finalized height.
 ## Product Depth
 
 Chat and agent modules exist. The agent path still needs real reactor-backed LLM
-work so model output is committed as ordered data. There is no checked-in tasks
-module yet.
+work so model output is committed as ordered data. A first tasks module is
+checked in (`crates/apps/tasks` plus `tasks-interface` and tests); qmdb backing,
+a richer task schema, and product wiring into the binaries remain.

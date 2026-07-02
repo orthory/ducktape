@@ -5,18 +5,20 @@ repo는 core architecture threshold를 넘었다. 남은 일은 live control pla
 
 ## Network State Sync
 
-module sync path는 in-process로 증명되어 있다. 빠진 live path는 test-only
-in-process resolver가 아니라 running network 위에서 module sync data를 serve하고
-fetch하는 resolver다.
+module sync path는 in-process로 증명되어 있고, `bin/demo/src/state_sync.rs`는
+membership validation을 갖춘 transport-neutral mesh request/response frame을
+이미 정의하며 test로 검증된다. 아직 빠진 것은 live network path다. in-process
+wiring이 아니라 running validator mesh 위에서 이 frame을 serve하고 fetch하는
+resolver가 필요하다.
 
 ## Dynamic Valset Orchestration
 
 consensus respawn behavior는 epoch boundary에서 joiner를 편입하는 test coverage를
-가진다. 남은 일은 이 behavior를 live module state 및 node orchestration에 연결하는
-것이다.
+가지며, deterministic core는 완료 상태다. test된 `ValsetOrchestrator` state
+machine(`crates/kernel/consensus/src/valset_orchestrator.rs`)이 finalized valset
+state를 watch하고 deterministic cutover point를 결정해 publish한다. 남은 일은 그
+core 주변의 live wiring이다.
 
-- finalized valset state를 watch한다.
-- deterministic cutover point를 결정하고 publish한다.
 - old orderer instance를 stop하고 new epoch를 일관되게 start한다.
 - transport와 state-sync readiness를 membership change와 맞춘다.
 
@@ -33,7 +35,10 @@ pause/serve seam이 아직 필요하다.
 
 chat과 agent에는 실제 product pressure가 더 필요하다. agent module은 reactor
 worker seam에 연결되어야 한다. LLM output은 hidden non-determinism이 아니라
-ordered data로 commit되어야 한다. checked-in tasks module은 아직 없다.
+ordered data로 commit되어야 한다. 첫 tasks module은 이미 checked-in 상태다
+(`crates/apps/tasks`와 `tasks-interface`, test 포함). staged in-memory state와
+검증된 snapshot/install을 갖추고 있고, 남은 일은 qmdb backing, 더 풍부한 task
+schema, binary로의 product wiring이다.
 
 ## Deferred Deliberately
 

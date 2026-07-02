@@ -29,6 +29,8 @@ transport happened to deliver.
 messages and queries through `valset-interface`, and the demo applies a join
 message carrying an ed25519 public key.
 
-The remaining membership work is orchestration around consensus epochs: the repo
-has tests for respawn behavior, but the live loop that watches finalized valset
-state and coordinates cutover is still future work.
+The remaining membership work is live orchestration around consensus epochs: the
+repo has tests for respawn behavior and a tested deterministic cutover state
+machine (`ValsetOrchestrator`) that watches finalized valset state and decides
+the cutover point, but the live loop that acts on it — stopping old orderers,
+starting the new epoch, aligning transport readiness — is still future work.

@@ -203,7 +203,9 @@ pub trait Ctx {
     fn module_root(&self, target: &str) -> Option<StateRoot>;
 
     /// live, read-only, host-routed read of another module. `target == env.me`
-    /// is rejected with [`Error::SelfQuery`]. backed by [`Module::query`].
+    /// is rejected with [`Error::SelfQuery`]. the host routes this to
+    /// [`Module::query_with`] (whose default delegates to [`Module::query`]) —
+    /// filtered facade modules depend on receiving the `query_with` ctx.
     async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error>;
 
     /// emit a write intent — collected, re-dispatched as a follow-up op; never
