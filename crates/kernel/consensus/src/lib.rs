@@ -40,9 +40,10 @@ use std::collections::{HashSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use commonware_actor::Feedback;
+use commonware_codec::{Decode as _, Encode as _};
 use commonware_consensus::{
     simplex::{
-        types::{Activity, Context},
+        types::{Activity, Context, Finalization},
         Plan,
     },
     Automaton, CertifiableAutomaton, Relay, Reporter,
@@ -811,11 +812,22 @@ impl FinalizedInbox {
 /// generic over the certificate scheme `S` so we never name a concrete scheme;
 /// the only `Activity` fields touched are `Finalization::proposal::{payload,
 /// round}`, both scheme-independent.
+/// the newest finalization certificate the reporter has observed, shared with
+/// the orderer: `(engine view, scheme-encoded Finalization bytes)`. a recovery
+/// layer persists this once the app has drained everything at or below its
+/// view; a restart then respawns the engine on it (`Floor::Finalized`), which
+/// suppresses journal-replay re-reports below the floor — without it, a
+/// reopened journal re-reports history into a fresh (empty) content store and
+/// the ordered gate wedges awaiting bytes no peer may hold.
+pub type LatestFinalization = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
+
 #[derive(Clone)]
 pub struct SimplexReporter<S> {
     store: ContentStore,
     pending: Arc<Mutex<VecDeque<Digest>>>,
     inbox: FinalizedInbox,
+    /// the shared latest-finalization slot (see [`LatestFinalization`]).
+    latest_final: LatestFinalization,
     /// the catch-up fetch mailbox, `Some` only when a resolver engine is wired
     /// (see [`SimplexOrderer::spawn_with_resolver`]). on a finalization MISS the
     /// reporter fetches through this instead of dropping the frame.
@@ -838,11 +850,13 @@ impl<S> SimplexReporter<S> {
         pending: Arc<Mutex<VecDeque<Digest>>>,
         inbox: FinalizedInbox,
         mailbox: Option<PayloadMailbox>,
+        latest_final: LatestFinalization,
     ) -> Self {
         Self {
             store,
             pending,
             inbox,
+            latest_final,
             mailbox,
             deferred_fetches: VecDeque::new(),
             _marker: std::marker::PhantomData,
@@ -911,6 +925,14 @@ where
             // so a flood-pressured cache eviction can no longer lose our own
             // finalized frame between demote and record.
             self.store.demote(&digest);
+            // surface the certificate for the recovery layer (the respawn
+            // floor). encoded here because only the reporter holds the typed
+            // Finalization<S, _>.
+            *self
+                .latest_final
+                .lock()
+                .expect("latest finalization poisoned") =
+                Some((view, finalization.encode().to_vec()));
         }
         Feedback::Ok
     }
@@ -929,11 +951,34 @@ where
 pub struct SimplexOrderer {
     handle: ConsensusHandle,
     inbox: FinalizedInbox,
+    /// the shared latest-finalization slot (see [`LatestFinalization`]).
+    latest_final: LatestFinalization,
     /// the engine task keepalive: dropping the orderer aborts its engine.
     _engine: commonware_runtime::Handle<()>,
     /// the payload-fetch resolver engine keepalive — `Some` only when built via
     /// [`SimplexOrderer::spawn_with_resolver`]. dropping it stops catch-up fetch.
     _resolver: Option<commonware_runtime::Handle<()>>,
+}
+
+impl SimplexOrderer {
+    /// the newest finalization certificate the engine reported: `(engine
+    /// view, scheme-encoded bytes)`. see [`LatestFinalization`] for why a
+    /// recovery layer persists this.
+    pub fn latest_finalization(&self) -> Option<(u64, Vec<u8>)> {
+        self.latest_final
+            .lock()
+            .expect("latest finalization poisoned")
+            .clone()
+    }
+
+    /// count of finalized slots not yet released by `poll_delivered`. a
+    /// recovery layer persists a finalization floor only when this is 0 —
+    /// read the certificate FIRST, then this: releases happen only on the
+    /// caller's own drain thread, so a zero here proves everything reported
+    /// before the certificate read has been released (and applied).
+    pub fn unreleased_len(&self) -> usize {
+        self.inbox.unreleased_len()
+    }
 }
 
 impl node::Orderer for SimplexOrderer {
@@ -984,6 +1029,7 @@ impl SimplexOrderer {
         partition: String,
         epoch: commonware_consensus::types::Epoch,
         genesis: Digest,
+        floor: Option<Finalization<S, Digest>>,
         store: ContentStore,
         relay: R,
         vote: (VS, VR),
@@ -1035,8 +1081,14 @@ impl SimplexOrderer {
         let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
         let handle = automaton.handle(store.clone());
         let inbox = FinalizedInbox::new();
-        let reporter =
-            SimplexReporter::<S>::new(store.clone(), automaton.pending(), inbox.clone(), None);
+        let latest_final = LatestFinalization::default();
+        let reporter = SimplexReporter::<S>::new(
+            store.clone(),
+            automaton.pending(),
+            inbox.clone(),
+            None,
+            latest_final.clone(),
+        );
 
         // page cache borrows the pooler context BEFORE we hand a child to Engine.
         let page_cache = CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10));
@@ -1052,7 +1104,13 @@ impl SimplexOrderer {
             partition,
             mailbox_size: NZUsize!(1024),
             epoch,
-            floor: Floor::Genesis(genesis),
+            // a RESTART respawn passes the persisted finalization floor: the
+            // engine then skips journal-replay re-reports at or below it. a
+            // fresh epoch starts from its genesis floor.
+            floor: match floor {
+                Some(finalization) => Floor::Finalized(finalization),
+                None => Floor::Genesis(genesis),
+            },
             leader_timeout: Duration::from_secs(1),
             certification_timeout: Duration::from_secs(2),
             timeout_retry: Duration::from_secs(10),
@@ -1070,7 +1128,7 @@ impl SimplexOrderer {
         // KEEP the handle alive inside the orderer — dropping it aborts the engine.
         let engine_handle = engine.start(vote, certificate, resolver);
 
-        SimplexOrderer { handle, inbox, _engine: engine_handle, _resolver: None }
+        SimplexOrderer { handle, inbox, latest_final, _engine: engine_handle, _resolver: None }
     }
 
     /// stand up a live simplex engine with a [`NoopRelay`] — the in-process-sim
@@ -1114,7 +1172,7 @@ impl SimplexOrderer {
     {
         let relay = NoopRelay::<commonware_cryptography::ed25519::PublicKey>::new();
         Self::build(
-            context, scheme, blocker, partition, epoch, genesis, store, relay, vote,
+            context, scheme, blocker, partition, epoch, genesis, None, store, relay, vote,
             certificate, resolver,
         )
     }
@@ -1179,7 +1237,7 @@ impl SimplexOrderer {
             store.clone(),
         );
         Self::build(
-            context, scheme, blocker, partition, epoch, genesis, store, relay, vote,
+            context, scheme, blocker, partition, epoch, genesis, None, store, relay, vote,
             certificate, resolver,
         )
     }
@@ -1217,6 +1275,7 @@ impl SimplexOrderer {
         partition: String,
         epoch: commonware_consensus::types::Epoch,
         genesis: Digest,
+        floor: Option<Finalization<S, Digest>>,
         store: ContentStore,
         vote: (VS, VR),
         certificate: (CS, CR),
@@ -1313,11 +1372,13 @@ impl SimplexOrderer {
         // KEEP the fetch handle alive inside the orderer — dropping it stops catch-up.
         let fetch_handle = fetch_engine.start((fetch_sender, fetch_receiver));
 
+        let latest_final = LatestFinalization::default();
         let reporter = SimplexReporter::<S>::new(
             store.clone(),
             automaton.pending(),
             inbox.clone(),
             Some(mailbox),
+            latest_final.clone(),
         );
 
         let page_cache = CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10));
@@ -1332,7 +1393,12 @@ impl SimplexOrderer {
             partition,
             mailbox_size: NZUsize!(1024),
             epoch,
-            floor: Floor::Genesis(genesis),
+            // restart respawn: the persisted floor suppresses journal-replay
+            // re-reports at or below the already-applied boundary.
+            floor: match floor {
+                Some(finalization) => Floor::Finalized(finalization),
+                None => Floor::Genesis(genesis),
+            },
             leader_timeout: Duration::from_secs(1),
             certification_timeout: Duration::from_secs(2),
             timeout_retry: Duration::from_secs(10),
@@ -1351,10 +1417,25 @@ impl SimplexOrderer {
         SimplexOrderer {
             handle,
             inbox,
+            latest_final,
             _engine: engine_handle,
             _resolver: Some(fetch_handle),
         }
     }
+}
+
+/// decode a persisted finalization certificate back to the typed
+/// [`Finalization`] a respawn floor needs, under `scheme`'s certificate codec
+/// bounds. the counterpart of [`SimplexOrderer::latest_finalization`]'s
+/// encoding; a decode failure means the persisted floor is damaged — callers
+/// FAIL rather than silently fall back to a genesis floor, which would
+/// resurrect the journal-replay wedge the floor exists to prevent.
+pub fn decode_finalization<S>(scheme: &S, bytes: &[u8]) -> Result<Finalization<S, Digest>, String>
+where
+    S: Scheme,
+{
+    Finalization::<S, Digest>::decode_cfg(bytes, &scheme.certificate_codec_config())
+        .map_err(|e| format!("persisted finalization floor does not decode: {e}"))
 }
 
 #[cfg(test)]

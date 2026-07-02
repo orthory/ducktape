@@ -49,10 +49,13 @@ This status page is grounded in checked-in code, tests, and binaries.
   commonware-backed node path: three-validator convergence, an RPC-submitted
   message crossing consensus, a cross-node governance vote, a live epoch cutover,
   and a sync-only joiner rebuilding the post-cutover state over real sockets.
+- `cargo test -p node-bin --test restart_e2e` crashes a solo validator process
+  with SIGKILL and shuts it down gracefully; each respawn over the same storage
+  dir recovers the byte-identical app-hash without re-running genesis and keeps
+  finalizing over its reopened consensus journal.
 
 ## Still Open
 
-- Restart/recovery from persisted state (engine journal replay design).
 - A demoted validator degrading to a sync-server rather than halting, and a
   synced joiner auto-promoting to a live validator at an epoch boundary.
 - Per-origin replay nonces in state (cross-epoch frame replay currently gated by

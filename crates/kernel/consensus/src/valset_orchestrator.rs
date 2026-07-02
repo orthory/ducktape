@@ -149,10 +149,24 @@ where
     Member: Ord + Clone,
 {
     pub fn new(cutover_delay: u64, initial: ObservedValset<Member>) -> Self {
+        Self::resume(cutover_delay, initial, 0, 0)
+    }
+
+    /// resume at a recovered `(epoch, epoch_base)` instead of genesis — a
+    /// restarted node re-enters the epoch its recovery journal recorded, with
+    /// `initial` observed from the RECOVERED valset module state (so the next
+    /// membership change diffs against what consensus actually committed, not
+    /// the genesis seed).
+    pub fn resume(
+        cutover_delay: u64,
+        initial: ObservedValset<Member>,
+        epoch: u64,
+        epoch_base: u64,
+    ) -> Self {
         Self {
             cutover_delay,
-            epoch: 0,
-            epoch_base: 0,
+            epoch,
+            epoch_base,
             current: initial,
             pending: None,
         }
