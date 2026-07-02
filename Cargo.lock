@@ -1809,6 +1809,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "governance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
+ "futures",
+ "governance-interface",
+ "host",
+ "sdk",
+ "serde_json",
+ "sha2",
+ "valset",
+ "valset-interface",
+]
+
+[[package]]
+name = "governance-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "governor"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2483,6 +2508,8 @@ name = "node"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
  "commonware-runtime",
  "directory",
  "directory-interface",
@@ -2516,6 +2543,7 @@ dependencies = [
  "document",
  "forge",
  "futures",
+ "governance",
  "host",
  "kv",
  "kv-interface",

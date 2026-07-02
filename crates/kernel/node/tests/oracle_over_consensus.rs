@@ -56,9 +56,14 @@ async fn drain_fixpoint<O: Orderer>(n: &mut OrderedNode<O>) {
 }
 
 /// submit the identical (agreed) op into every validator's order.
-async fn broadcast<O: Orderer>(nodes: &mut [OrderedNode<O>], origin: &[u8], seq: u64, msg: &Msg) {
+async fn broadcast<O: Orderer>(
+    nodes: &mut [OrderedNode<O>],
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    seq: u64,
+    msg: &Msg,
+) {
     for n in nodes.iter_mut() {
-        n.submit(origin, seq, msg.clone()).await.expect("submit");
+        n.submit(signer, seq, msg.clone()).await.expect("submit");
     }
 }
 
@@ -91,7 +96,7 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
         }
 
         // (1) the Trigger op is agreed -> submit to every validator's order, drain.
-        broadcast(&mut nodes, b"trigger", 0, &trigger("s1", b"hello")).await;
+        broadcast(&mut nodes, &sk(1), 0, &trigger("s1", b"hello")).await;
         for n in &mut nodes {
             drain_fixpoint(n).await;
         }
@@ -113,7 +118,7 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
         let oracle_op = mock_worker(&effects_per_node[assignee][0]).expect("worker claims the effect");
 
         // (3) the OracleResult op is agreed -> submit to every validator's order, drain.
-        broadcast(&mut nodes, b"oracle:s1", 0, &oracle_op).await;
+        broadcast(&mut nodes, &sk(2), 0, &oracle_op).await;
         for n in &mut nodes {
             drain_fixpoint(n).await;
         }
@@ -129,4 +134,10 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
             assert_eq!(v.result, Some(b"olleh".to_vec()), "on the identical agreed oracle result");
         }
     });
+}
+
+/// a deterministic dev signer for test frames (any u64 seed).
+fn sk(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
+    use commonware_cryptography::Signer as _;
+    commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
 }

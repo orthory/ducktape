@@ -150,7 +150,19 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
         ];
         let mut height = 0u64;
         for op in ops {
-            host.submit(op).await.expect("source op");
+            // membership ops are governance-gated: drive every source op on the
+            // SYSTEM origin lane (trusted test orchestration), which valset and
+            // every product module accept alike.
+            host.submit_at(
+                host::BlockContext {
+                    height: height + 1,
+                    consensus_time: height + 1,
+                    origin: sdk::Origin::System,
+                },
+                op,
+            )
+            .await
+            .expect("source op");
             height += 1;
         }
         let finalized = FinalizedBlock { height, app_hash: host.app_hash() };

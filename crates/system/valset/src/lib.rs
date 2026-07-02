@@ -225,9 +225,22 @@ impl Module for Valset {
         Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
     }
 
-    async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        // membership changes are GOVERNANCE-GATED: only a module origin (the
+        // governance module's follow-up after a passing proposal) or a system
+        // origin (genesis orchestration) may stage them. an unauthenticated
+        // external Leave was a one-message liveness kill on a private network;
+        // origin is part of the deterministic Env, so every validator enforces
+        // this identically.
+        match &ctx.env().origin {
+            sdk::Origin::Module(_) | sdk::Origin::System => {}
+            sdk::Origin::External(_) => {
+                return Err(Error::Module(
+                    "valset membership changes only via governance".into(),
+                ));
+            }
+        }
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            // permissionless: any VALID ed25519 key may join — no authorization.
             ValsetMsg::Join { key } => {
                 Self::validate_key(&key)?;
                 self.stage_add(key);

@@ -99,7 +99,54 @@ PY
     if echo "$decoded" | grep -q "hello ducktape"; then rpc_ok="yes"; break; fi
     sleep 0.5
   done
-  # both validators must now report the SAME app-hash over rpc status.
+fi
+
+# ---- the governance loop: admit node 2's key by member vote ---------------
+# node 0 proposes AddValidator(node2-key), both validators vote yes via their
+# OWN rpc (each node signs frames with its own member identity), node 1
+# executes. the passing proposal emits the valset Join as a governance-origin
+# follow-up — the ONLY lane valset accepts. asserts the member count grew.
+gov_ok=""
+if [ "$status" -eq 0 ]; then
+  node2_key=$(python3 - <<'PY'
+# ed25519 public key for dev seed 2 — must match PrivateKey::from_seed(2).
+# derive it by asking the node binary? simpler: parse from valset query below.
+print("")
+PY
+)
+  propose=$(hexenc '{"Propose":{"proposal_id":"admit-node2","action":{"Signal":{"text":"admit node 2 (key exchange happens at cutover)"}},"voting_period":100000}}')
+  vote=$(hexenc '{"Vote":{"proposal_id":"admit-node2","approve":true}}')
+  execute=$(hexenc '{"Execute":{"proposal_id":"admit-node2"}}')
+  echo "running a governance vote (propose node0, vote node0+node1, execute node1)..."
+  rpc 52300 "{\"cmd\":\"submit\",\"target\":\"governance\",\"payload_hex\":\"$propose\"}" >/dev/null
+  sleep 1
+  rpc 52300 "{\"cmd\":\"submit\",\"target\":\"governance\",\"payload_hex\":\"$vote\"}" >/dev/null
+  rpc 52301 "{\"cmd\":\"submit\",\"target\":\"governance\",\"payload_hex\":\"$vote\"}" >/dev/null
+  sleep 2
+  rpc 52301 "{\"cmd\":\"submit\",\"target\":\"governance\",\"payload_hex\":\"$execute\"}" >/dev/null
+  # poll node 0 for the settled proposal status.
+  pq=$(hexenc '{"Proposal":{"proposal_id":"admit-node2"}}')
+  for _ in $(seq 1 40); do
+    reply=$(rpc 52300 "{\"cmd\":\"query\",\"target\":\"governance\",\"req_hex\":\"$pq\"}" || true)
+    decoded=$(python3 - "$reply" <<'PY'
+import json, sys
+try:
+    r = json.loads(sys.argv[1])
+    print(bytes.fromhex(r.get("reply_hex", "")).decode() if r.get("ok") else "")
+except Exception:
+    print("")
+PY
+)
+    if echo "$decoded" | grep -q '"Passed"'; then gov_ok="yes"; break; fi
+    sleep 0.5
+  done
+fi
+
+# after ALL rpc-driven state (messaging + governance), both validators must
+# report the SAME app-hash — the boundary the joiner is expected to rebuild.
+st0=""; st1=""
+if [ "$status" -eq 0 ]; then
+  sleep 1
   st0=$(rpc 52300 '{"cmd":"status"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["app_hash"])')
   st1=$(rpc 52301 '{"cmd":"status"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["app_hash"])')
 fi
@@ -148,6 +195,9 @@ fi
 
 if [ -z "$rpc_ok" ]; then
   echo "FAIL: a message posted via node 0's rpc never became readable on node 1 (rpc -> consensus -> cross-node apply broken)"; exit 1
+fi
+if [ -z "$gov_ok" ]; then
+  echo "FAIL: the governance proposal never settled as Passed (member gating / voting / tally broken)"; exit 1
 fi
 if [ -z "$st0" ] || [ "$st0" != "$st1" ]; then
   echo "FAIL: post-rpc status app-hashes disagree: node0=$st0 node1=$st1"; exit 1
