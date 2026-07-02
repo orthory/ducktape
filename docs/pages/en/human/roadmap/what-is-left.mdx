@@ -1,0 +1,41 @@
+# What Is Left
+
+The repo has crossed the core architecture threshold. The remaining work is the
+live control plane and product depth around it.
+
+## Network State Sync
+
+The module sync paths are proven in-process. The missing live path is a resolver
+that serves and fetches module sync data over the running network rather than
+through test-only in-process resolvers.
+
+## Dynamic Valset Orchestration
+
+The consensus respawn behavior has test coverage for incorporating a joiner at
+an epoch boundary. The remaining work is connecting that behavior to live module
+state and node orchestration:
+
+- watch finalized valset state;
+- decide and publish a deterministic cutover point;
+- stop old orderer instances and start the new epoch consistently;
+- keep transport and state-sync readiness aligned with membership changes.
+
+State sync is no longer the conceptual blocker for joiner catch-up, but live
+orchestration still needs to be wired.
+
+## Live Snapshot Serving
+
+The capstone test proves a joiner can rebuild from module targets and snapshots.
+A running node still needs the pause/serve seam to provide a consistent
+all-module snapshot at a finalized height.
+
+## Product Modules
+
+Chat and agent need real product pressure. The agent module should plug into the
+reactor worker seam so LLM output is committed as ordered data, not hidden
+non-determinism. There is no checked-in tasks module yet.
+
+## Deferred Deliberately
+
+- Commit-phase crash safety and full two-phase commit remain deferred because the
+  current host-lent atomicity covers execute-phase behavior.

@@ -1,0 +1,34 @@
+# State Sync
+
+A joining node must rebuild authenticated module state without trusting the peer
+that serves the bytes. Ducktape treats the module root as the trust anchor.
+
+## QMDB Modules
+
+The `kv` and `document` modules sync through commonware's QMDB sync engine. A
+source exposes a target root and operation range. The joiner pulls batches and
+merkle-verifies them against the target root. Replaying logical keys in a tidy
+order is not equivalent, because QMDB roots commit to the operation log.
+
+QMDB modules hash logical keys to fixed-width keys at the storage seam because
+the streaming resolvers require fixed-width key types.
+
+## Forge
+
+Forge syncs around git data. The root is derived from the head object id, but
+pack indexing alone is not enough: libgit2 can index partial packs. The install
+path therefore runs a full-closure connectivity walk before moving the ref.
+
+## Snapshot Modules
+
+Valset, directory, saga, messaging-backed wrappers, and similar modules use
+canonical-byte snapshot/install paths where appropriate. The installer must
+verify before mutating local state, so a malformed or incomplete snapshot cannot
+partially advance the root.
+
+## Capstone
+
+The demo test `joiner_rebuilds_global_app_hash` rebuilds every module and checks
+that the joiner lands on the exact source app-hash. That proves the math of
+module-level sync and global composition. It does not yet prove live network
+serving from a running node.

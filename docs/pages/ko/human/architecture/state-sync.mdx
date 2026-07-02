@@ -1,0 +1,34 @@
+# State Sync
+
+joining node는 byte를 제공하는 peer를 신뢰하지 않고 authenticated module state를
+재구축해야 한다. Ducktape는 module root를 trust anchor로 취급한다.
+
+## QMDB Modules
+
+`kv`와 `document` module은 commonware의 QMDB sync engine으로 sync한다. source는
+target root와 operation range를 노출한다. joiner는 batch를 pull하고 target root에
+대해 merkle-verify한다. logical key를 tidy order로 replay하는 것은 동등하지 않다.
+QMDB root는 operation log에 commit하기 때문이다.
+
+QMDB module은 streaming resolver가 fixed-width key type을 요구하기 때문에 storage
+seam에서 logical key를 fixed-width key로 hash한다.
+
+## Forge
+
+Forge sync는 git data를 중심으로 동작한다. root는 head object id에서 나오지만,
+pack indexing만으로 충분하지 않다. libgit2는 partial pack도 index할 수 있다.
+install path는 ref를 이동하기 전에 full-closure connectivity walk를 실행한다.
+
+## Snapshot Modules
+
+Valset, directory, saga, messaging-backed wrapper 같은 module은 필요한 곳에서
+canonical-byte snapshot/install path를 사용한다. installer는 local state를 mutate
+하기 전에 verify해야 하므로 malformed 또는 incomplete snapshot이 root를 부분적으로
+advance할 수 없다.
+
+## Capstone
+
+demo test `joiner_rebuilds_global_app_hash`는 모든 module을 재구축하고 joiner가
+정확한 source app-hash에 도달하는지 확인한다. 이것은 module-level sync와 global
+composition의 수학을 증명한다. running node가 live network로 serve하는 것은 아직
+증명하지 않는다.

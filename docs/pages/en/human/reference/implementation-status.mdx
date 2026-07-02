@@ -1,0 +1,37 @@
+# Implementation Status
+
+This status page is grounded in checked-in code, tests, and binaries.
+
+## Platform Spine
+
+- `sdk` defines the module contract and deterministic system API.
+- `host` owns registry dispatch, FIFO follow-up drain, and block commit/abort.
+- `state` composes module roots into an order-independent app-hash.
+- `node` bridges host application to transport and ordered delivery.
+- `consensus` contains the commonware Simplex-backed orderer.
+- `reactor` closes the non-deterministic worker boundary by submitting worker
+  results as ordinary messages.
+
+## Module State
+
+- QMDB-backed modules expose real authenticated roots and state-sync targets.
+- Forge derives a 32-byte state root from git state and verifies object closure
+  before install.
+- Snapshot-style modules use canonical bytes where that fits the module.
+- Messaging, chat, and agent modules are wired into the current workspace.
+
+## Verification Surface
+
+- `cargo test --workspace` exercises the Rust workspace.
+- `cargo run -p demo` runs the in-process multi-module walkthrough.
+- `cargo test -p demo --test joiner_rebuilds_global_app_hash` proves a joiner can
+  rebuild every module and match the source app-hash.
+- `bin/node/examples/demo-2node.sh` drives two OS processes through the real
+  commonware-backed node path.
+
+## Still Open
+
+- Network-backed module sync from a live node.
+- Dynamic valset orchestration around epoch cutover.
+- Snapshot-at-height serving from a running node.
+- Product depth for chat, agent, and tasks.

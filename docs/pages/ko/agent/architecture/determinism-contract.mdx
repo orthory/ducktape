@@ -1,0 +1,29 @@
+# Determinism Contract
+
+Ducktape는 모든 validator가 같은 agreed operation order에서 같은 module root를
+도출할 때만 안전하다. agent edit는 이 contract를 보존해야 한다.
+
+## Inside Execution
+
+허용되는 input은 agreed data다. operation byte, agreed height/time, module id,
+origin, deterministic state read가 해당한다. wall clock, randomness, network IO,
+LLM call, filesystem discovery, external fetch는 금지된다.
+
+feature가 non-deterministic answer를 필요로 하면 `Effect`로 모델링하고, 답을 나중에
+ordered data로 반환한다.
+
+## Cross-Module Work
+
+read는 `Ctx::query` 또는 `Ctx::module_root`를 사용한다. write는 `Msg` intent를
+emit한다. product module 사이에 직접 implementation dependency를 추가하지 않는다.
+
+interface crate가 typed payload와 query의 합법적인 vocabulary다. host는 여전히
+target module id로 opaque byte를 route한다.
+
+## Block Boundary
+
+module은 `execute` 동안 write를 stage하고, block boundary는 host가 소유한다. clean
+follow-up drain은 touched module을 commit한다. error 또는 dispatch-budget breach는
+touched module을 abort하고 root를 그대로 둔다.
+
+host dispatch를 바꿀 때는 success path와 rollback path를 모두 확인한다.

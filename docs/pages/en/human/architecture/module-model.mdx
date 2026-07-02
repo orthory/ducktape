@@ -1,0 +1,49 @@
+# Module Model
+
+A module is an isolated state machine behind a small native Rust contract. The
+pattern borrows the isolation shape of CosmWasm, but the current implementation
+is native Rust rather than Wasm.
+
+## Contract
+
+`sdk` defines the shared surface:
+
+- `ModuleId` names a module in genesis state.
+- `StateRoot` is the 32-byte authenticated commitment exposed to the host.
+- `Msg` is a write intent targeted at a module.
+- `Event` leaves the state machine for observability.
+- `Effect` asks the host-owned reactor to perform non-deterministic work.
+- `Env` carries agreed height, agreed time, origin, and the active module id.
+- `Ctx` exposes host-routed reads and intent emission.
+- `Module` provides `id`, `root`, `execute`, read projections, `commit_block`,
+  and `abort_block`.
+
+## State Ownership
+
+Each module chooses the state substrate that fits it:
+
+- QMDB-backed modules store authenticated key-value state.
+- Forge stores git objects and exposes a root derived from the git head.
+- Snapshot-style modules can commit canonical bytes.
+
+The host does not inspect those internal schemas. It asks for a root and folds
+that root into the global app-hash.
+
+## Cross-Module Interaction
+
+Interface crates are the legal cross-module vocabulary. A module can emit a
+typed payload for another module, but the host treats the bytes opaquely and
+routes only by target module id.
+
+Read paths are synchronous from the state-machine point of view: a module can
+ask the host for another module's read projection, but it cannot mutate the
+target directly. This keeps module boundaries reviewable and makes follow-up
+messages the only write crossing.
+
+## Native Rust Boundary
+
+The current module boundary is native Rust. That keeps the platform tractable
+while the host, consensus, state-sync, and product seams are still moving. A
+future sandbox boundary would need to preserve the same contract: typed
+interfaces, no implementation references across modules, and deterministic
+execution under the host.

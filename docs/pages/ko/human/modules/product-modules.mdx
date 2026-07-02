@@ -1,0 +1,29 @@
+# Product Modules
+
+product module은 platform이 호스팅하는 업무용 surface다. 같은 module contract를
+공유하지만, 각 module은 자기 작업에 맞는 storage substrate와 interface를 고른다.
+
+## Built or Started
+
+- `document`는 QMDB 위에 block-based document를 저장하고 QMDB state sync를
+  노출한다.
+- `forge`는 git-backed project state를 저장하고, git head에서 root를 계산하며
+  connectivity verification으로 pack install을 보호한다.
+- `messaging`은 root-backed shared message storage를 제공한다.
+- `chat`은 messaging storage 위의 view다.
+- `agent`는 messaging-backed thread model을 통해 agent session을 저장한다.
+- `kv`, `valset`, `saga`, `directory`, `greeter`는 infrastructure, example,
+  test를 지원한다.
+
+## Interface Shape
+
+interface crate는 module-specific payload를 encode/decode하고, host는 opaque byte만
+route한다. product module은 implementation API가 아니라 typed message와 query를
+공유한다.
+
+## Product Pressure
+
+checked-in module에서 유용한 pressure point가 보인다. chat은 shared messaging
+storage 위의 live product read를 검증하고, forge는 authenticated project state를
+검증하며, agent session은 future worker-backed agent가 필요로 할 storage 및 query
+boundary를 검증한다.

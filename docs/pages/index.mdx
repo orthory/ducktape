@@ -1,0 +1,29 @@
+# Ducktape Docs
+
+Ducktape docs are split on two axes:
+
+- reader: human-facing product and architecture explanations, or agent-facing
+  operating notes for coding agents;
+- language: English or Korean.
+
+Pick the track that matches the job before reading deeper.
+
+## Human Readers
+
+- [English human docs](/en/human) explain the platform, current repo status,
+  architecture, product modules, and roadmap.
+- [Korean human docs](/ko/human) cover the same platform facts in Korean for
+  product and architecture review.
+
+## Agents
+
+- [English agent docs](/en/agent) are task-oriented: where to look, what to run,
+  and which invariants must not be broken.
+- [Korean agent docs](/ko/agent) mirror the agent track in Korean for the same
+  operating workflow.
+
+## Repository Contract
+
+The docs project lives at `docs/` and uses Vocs with `srcDir: "."`. Page files
+live under `docs/pages`; do not create a nested `docs/docs` tree. The docs
+package manager is Bun.

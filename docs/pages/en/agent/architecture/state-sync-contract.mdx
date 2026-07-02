@@ -1,0 +1,31 @@
+# State Sync Contract
+
+State sync must rebuild module state from authenticated commitments rather than
+trusting peer bytes.
+
+## Trust Anchor
+
+The module root is the trust anchor. A joiner may accept data served by a peer
+only after verifying it against the target root or a root-derived commitment.
+
+## QMDB Modules
+
+QMDB roots commit to the operation log. Do not replace sync with a sorted logical
+key replay unless the root semantics change. New QMDB modules should hash logical
+keys to fixed-width storage keys at the sync seam.
+
+## Forge
+
+Forge install must verify full object closure before moving refs. Pack indexing
+alone is insufficient because libgit2 can index partial packs.
+
+## Snapshot Modules
+
+Snapshot installers must verify before mutating local state. A malformed snapshot
+must not partially advance the local root.
+
+## Proof Surface
+
+`cargo test -p demo --test joiner_rebuilds_global_app_hash` proves in-process
+module rebuild and global app-hash composition. It does not prove live network
+serving from a running node.

@@ -1,0 +1,47 @@
+# Module Model
+
+module은 작은 native Rust contract 뒤에 있는 격리 상태 머신이다. isolation
+shape는 CosmWasm과 비슷하지만, 현재 구현은 Wasm이 아니라 native Rust다.
+
+## Contract
+
+`sdk`는 공유 surface를 정의한다.
+
+- `ModuleId`는 genesis state 안의 module name이다.
+- `StateRoot`는 호스트에 노출되는 32바이트 인증 commitment다.
+- `Msg`는 target module로 향하는 write intent다.
+- `Event`는 observability를 위해 state machine 밖으로 나간다.
+- `Effect`는 host-owned reactor에 non-deterministic work를 요청한다.
+- `Env`는 agreed height, agreed time, origin, active module id를 담는다.
+- `Ctx`는 host-routed read와 intent emission을 노출한다.
+- `Module`은 `id`, `root`, `execute`, read projection, `commit_block`,
+  `abort_block`을 제공한다.
+
+## State Ownership
+
+각 module은 자기 작업에 맞는 state substrate를 고른다.
+
+- QMDB-backed module은 authenticated key-value state를 저장한다.
+- Forge는 git object를 저장하고 git head에서 root를 계산한다.
+- Snapshot-style module은 canonical byte를 commit할 수 있다.
+
+호스트는 내부 schema를 해석하지 않는다. root를 요청하고 그 root를 global
+app-hash에 fold한다.
+
+## Cross-Module Interaction
+
+interface crate는 합법적인 cross-module vocabulary다. module은 다른 module로
+typed payload를 emit할 수 있지만, 호스트는 byte를 opaque하게 다루고 target
+module id로만 route한다.
+
+read path는 state-machine 관점에서 synchronous하다. module은 다른 module의
+read projection을 호스트에 요청할 수 있지만 target을 직접 mutate할 수 없다.
+따라서 module boundary는 review 가능하게 유지되고, follow-up message만 write
+crossing이 된다.
+
+## Native Rust Boundary
+
+현재 module boundary는 native Rust다. host, consensus, state-sync, product
+seam이 아직 움직이는 동안 platform을 다루기 쉽게 유지하기 위한 선택이다.
+미래의 sandbox boundary도 typed interface, module 간 구현 참조 금지, host 아래
+결정적 execution이라는 같은 contract를 보존해야 한다.

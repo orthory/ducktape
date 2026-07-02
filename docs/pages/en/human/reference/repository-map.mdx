@@ -1,0 +1,44 @@
+# Repository Map
+
+The workspace is organized by platform layer.
+
+## Kernel
+
+- `crates/kernel/sdk`: module contract, context, messages, events, effects,
+  origins, deterministic environment, and `StateRoot`.
+- `crates/kernel/state`: global app-hash composition over sorted module roots.
+- `crates/kernel/host`: registry, dispatch, follow-up drain, and block
+  commit/abort lifecycle.
+- `crates/kernel/node`: loopback and ordered node seams between host and orderer.
+- `crates/kernel/consensus`: commonware Simplex orderer, content store, relay,
+  finalized inbox, resolver fetch, and scheme boundaries.
+- `crates/kernel/reactor`: host-owned worker loop for non-deterministic effects.
+
+## System
+
+- `crates/system/kv`: QMDB byte-key value module.
+- `crates/system/valset`: ed25519 validator membership module.
+- `crates/system/saga`: deterministic continuation state for async workflows.
+- `*-interface` crates: types-only payload and query surfaces.
+
+## Apps
+
+- `crates/apps/forge`: git-backed project state.
+- `crates/apps/document`: block document state on QMDB.
+- `crates/apps/messaging`: root-backed shared message storage.
+- `crates/apps/chat`: chat view over messaging.
+- `crates/apps/agent`: agent sessions over the messaging-backed thread model.
+- app `*-interface` crates: legal cross-module payload surfaces.
+
+## Examples and Binaries
+
+- `crates/examples/directory`: state-based directory module used in tests and
+  demos.
+- `crates/examples/greeter`: demo module that emits follow-up writes.
+- `bin/demo`: in-process walkthrough of the registered module set.
+- `bin/node`: real-socket validator process and two-process demo.
+
+## Docs
+
+- `docs/`: this Vocs project.
+- `docs/pages`: the reader-facing page tree.

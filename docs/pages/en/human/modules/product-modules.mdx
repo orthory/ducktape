@@ -1,0 +1,29 @@
+# Product Modules
+
+Product modules are the workplace surface hosted by the platform. They share the
+same module contract, but each module chooses the storage substrate and interface
+that fits its job.
+
+## Built or Started
+
+- `document` stores block-based documents on QMDB and exposes QMDB state sync.
+- `forge` stores git-backed project state, with a root derived from the git head
+  and pack install guarded by connectivity verification.
+- `messaging` provides root-backed shared message storage.
+- `chat` is a view over messaging storage.
+- `agent` stores agent sessions through the messaging-backed thread model.
+- `kv`, `valset`, `saga`, `directory`, and `greeter` support infrastructure,
+  examples, and tests.
+
+## Interface Shape
+
+Interface crates encode and decode module-specific payloads while the host
+routes only opaque bytes. That keeps module dependencies narrow: product modules
+share typed messages and queries, not implementation APIs.
+
+## Product Pressure
+
+The currently useful pressure points are clear from the checked-in modules:
+chat exercises live product reads over shared messaging storage, forge exercises
+authenticated project state, and agent sessions exercise the same storage and
+query boundaries that future worker-backed agents will need.

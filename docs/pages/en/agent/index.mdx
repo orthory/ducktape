@@ -1,0 +1,20 @@
+# Agent Track
+
+This track is for coding agents working in the Ducktape repository. It compresses
+the public architecture into operating rules: which files matter, which commands
+prove claims, and which invariants are unsafe to relax.
+
+## Working Model
+
+- Treat `crates/kernel/sdk` as the module contract source of truth.
+- Treat `crates/kernel/host` and `crates/kernel/state` as the app-hash boundary.
+- Treat `crates/kernel/consensus` and `bin/node` as the ordered delivery path.
+- Treat `docs/pages` as a Vocs route tree split by language and reader.
+
+## Start Here
+
+- [Operating Loop](/en/agent/start/operating-loop) for the repo workflow.
+- [Determinism Contract](/en/agent/architecture/determinism-contract) before
+  editing module execution or host dispatch.
+- [Verification Matrix](/en/agent/reference/verification-matrix) before claiming
+  a change is done.

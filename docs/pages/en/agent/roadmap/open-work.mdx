@@ -1,0 +1,27 @@
+# Open Work
+
+This page tracks implementation gaps that agents should not accidentally present
+as finished.
+
+## Live Network State Sync
+
+In-process module sync proofs exist. A running node still needs network resolvers
+that serve and fetch module sync data from the live validator path.
+
+## Dynamic Valset Orchestration
+
+Tests cover respawn behavior around an epoch boundary. The live loop still needs
+to watch finalized valset state, publish a deterministic cutover point, stop old
+orderers, start new epoch instances, and keep transport/state-sync readiness
+aligned.
+
+## Snapshot Serving
+
+The capstone joiner test proves rebuild math. A running node still needs a
+pause/serve seam for a consistent all-module snapshot at a finalized height.
+
+## Product Depth
+
+Chat and agent modules exist. The agent path still needs real reactor-backed LLM
+work so model output is committed as ordered data. There is no checked-in tasks
+module yet.

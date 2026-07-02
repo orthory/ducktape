@@ -1,0 +1,29 @@
+# Async Engine
+
+Ducktape는 asynchronous work를 결정적 continuation state와 host-owned
+non-deterministic worker loop로 나눈다.
+
+## Saga
+
+saga module은 app-hash 아래 continuation state를 저장한다. trigger는 pending
+work를 기록하고 worker request를 effect로 emit한다. pending state는 결정적이며
+다른 module state처럼 commit된다.
+
+## Reactor
+
+reactor는 module execution 밖의 worker를 소유한다. worker는 effect를 claim하고,
+non-deterministic work를 수행한 뒤 `Msg`를 반환할 수 있다. 그 message는 나중
+block에서 일반 op로 host에 다시 들어온다.
+
+중요한 규칙은 worker가 module handle을 받지 않는다는 점이다. worker는 state를
+직접 mutate할 수 없다. consensus state로 돌아오는 유일한 경로는 반환한 message다.
+
+## Oracle as Transaction
+
+LLM output, external fetch, transport action, 기타 non-deterministic edge는
+oracle result로 모델링된다. result는 ordered op 안의 data가 되며, `execute`
+안으로 숨어 들어간 side effect가 아니다.
+
+이 규칙 때문에 agent module도 같은 platform shape를 사용할 수 있다. LLM call은
+worker seam 뒤에 있어야 하고, transcript나 decision은 module root를 통해
+commit되어야 한다.
