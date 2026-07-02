@@ -390,6 +390,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "automations"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "automations-interface",
+ "chat",
+ "chat-interface",
+ "commonware-runtime",
+ "futures",
+ "host",
+ "sdk",
+ "sha2",
+ "tasks",
+ "tasks-interface",
+]
+
+[[package]]
+name = "automations-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1739,6 +1764,7 @@ dependencies = [
  "agent",
  "agent-interface",
  "async-trait",
+ "automations",
  "chat",
  "chat-interface",
  "commonware-codec",
@@ -1749,14 +1775,19 @@ dependencies = [
  "directory-interface",
  "document",
  "document-interface",
+ "files",
  "forge",
  "forge-interface",
  "futures",
  "git2",
  "greeter",
  "host",
+ "inbox",
+ "inbox-interface",
+ "jobs",
  "kv",
  "kv-interface",
+ "memory",
  "saga",
  "saga-interface",
  "sdk",
@@ -2164,6 +2195,27 @@ checksum = "38e2275cc4e4fc009b0669731a1e5ab7ebf11f469eaede2bab9309a5b4d6057f"
 dependencies = [
  "memoffset",
  "rustc_version",
+]
+
+[[package]]
+name = "files"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "files-interface",
+ "futures",
+ "host",
+ "sdk",
+ "sha2",
+]
+
+[[package]]
+name = "files-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -3097,6 +3149,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "inbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "host",
+ "inbox-interface",
+ "sdk",
+ "sha2",
+]
+
+[[package]]
+name = "inbox-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3254,6 +3326,26 @@ checksum = "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
 dependencies = [
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "jobs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "host",
+ "jobs-interface",
+ "sdk",
+ "sha2",
+]
+
+[[package]]
+name = "jobs-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3509,6 +3601,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "host",
+ "memory-interface",
+ "sdk",
+ "sha2",
+]
+
+[[package]]
+name = "memory-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3696,6 +3808,7 @@ dependencies = [
 name = "node-bin"
 version = "0.1.0"
 dependencies = [
+ "automations",
  "chat",
  "chat-interface",
  "commonware-codec",
@@ -3708,13 +3821,17 @@ dependencies = [
  "directory",
  "directory-interface",
  "document",
+ "files",
  "forge",
  "futures",
  "governance",
  "governance-interface",
  "host",
+ "inbox",
+ "jobs",
  "kv",
  "kv-interface",
+ "memory",
  "node",
  "noded",
  "rand 0.8.6",
@@ -3748,6 +3865,7 @@ dependencies = [
  "futures",
  "host",
  "http-body-util",
+ "inbox",
  "sdk",
  "serde",
  "serde_json",

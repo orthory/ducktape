@@ -67,14 +67,19 @@ use config::{Resolved, hex_bytes, unhex};
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
+use automations::Automations;
 use chat::Chat;
 use directory::Directory;
 use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use document::Document;
+use files::Files;
 use forge::Forge;
 use governance::Governance;
 use host::Host;
+use inbox::Inbox;
+use jobs::Jobs;
 use kv::Kv;
+use memory::Memory;
 use node::OrderedNode;
 use recovery::{Manifest, Recovery};
 use saga::SagaModule;
@@ -112,17 +117,9 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 10] = [
-    "kv",
-    "document",
-    "chat",
-    "forge",
-    "valset",
-    "governance",
-    "saga",
-    "tasks",
-    "vaults",
-    "directory",
+const MODULE_IDS: [&str; 15] = [
+    "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults", "inbox",
+    "directory", "automations", "files", "memory", "jobs",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
@@ -208,7 +205,18 @@ async fn genesis_host(
         Box::new(SagaModule::new("saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
+        // per-member notification queues; other modules deliver via follow-up
+        // ops so a notification commits atomically with the causing event (P2).
+        Box::new(Inbox::new("inbox")),
+        Box::new(Files::new("files")),
+        // the shared agent workspace: a filesystem-shaped namespace with
+        // write-once publish, immutable generations, snapshots, and watches.
+        Box::new(Memory::new("memory")),
+        Box::new(Jobs::new("jobs")),
         Box::new(Directory::new("directory")),
+        // user-defined rules over chat posts: trusts the "chat" origin for hook
+        // events and emits chat/tasks follow-ups.
+        Box::new(Automations::new("automations", "chat", "tasks")),
     ])
     .expect("genesis host")
 }
@@ -257,9 +265,29 @@ async fn restore_host(
     let (bytes, root) = snapshot_of("vaults")?;
     vaults.install(bytes, root).map_err(|e| format!("vaults install: {e}"))?;
 
+    let mut inbox = Inbox::new("inbox");
+    let (bytes, root) = snapshot_of("inbox")?;
+    inbox.install(bytes, root).map_err(|e| format!("inbox install: {e}"))?;
+
+    let mut files = Files::new("files");
+    let (bytes, root) = snapshot_of("files")?;
+    files.install(bytes, root).map_err(|e| format!("files install: {e}"))?;
+
+    let mut memory = Memory::new("memory");
+    let (bytes, root) = snapshot_of("memory")?;
+    memory.install(bytes, root).map_err(|e| format!("memory install: {e}"))?;
+
+    let mut jobs = Jobs::new("jobs");
+    let (bytes, root) = snapshot_of("jobs")?;
+    jobs.install(bytes, root).map_err(|e| format!("jobs install: {e}"))?;
+
     let mut directory = Directory::new("directory");
     let (bytes, root) = snapshot_of("directory")?;
     directory.install(bytes, root).map_err(|e| format!("directory install: {e}"))?;
+
+    let mut automations = Automations::new("automations", "chat", "tasks");
+    let (bytes, root) = snapshot_of("automations")?;
+    automations.install(bytes, root).map_err(|e| format!("automations install: {e}"))?;
 
     Host::genesis(vec![
         Box::new(kv),
@@ -271,7 +299,12 @@ async fn restore_host(
         Box::new(saga),
         Box::new(tasks),
         Box::new(vaults),
+        Box::new(inbox),
+        Box::new(files),
+        Box::new(memory),
+        Box::new(jobs),
         Box::new(directory),
+        Box::new(automations),
     ])
     .map_err(|e| format!("restore host: {e}"))
 }
@@ -920,6 +953,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut vaults = Vaults::new("vaults");
             vaults.install(&bytes, root).expect("vaults install");
 
+            let (bytes, root) = snapshot_of("automations").await;
+            let mut automations = Automations::new("automations", "chat", "tasks");
+            automations.install(&bytes, root).expect("automations install");
+
+            let (bytes, root) = snapshot_of("inbox").await;
+            let mut inbox = Inbox::new("inbox");
+            inbox.install(&bytes, root).expect("inbox install");
+
+            let (bytes, root) = snapshot_of("files").await;
+            let mut files = Files::new("files");
+            files.install(&bytes, root).expect("files install");
+            let (bytes, root) = snapshot_of("memory").await;
+            let mut memory = Memory::new("memory");
+            memory.install(&bytes, root).expect("memory install");
+            let (bytes, root) = snapshot_of("jobs").await;
+            let mut jobs = Jobs::new("jobs");
+            jobs.install(&bytes, root).expect("jobs install");
+
             let (bytes, root) = snapshot_of("forge").await;
             let forge_repo = storage_for_sync.join("forge-repo");
             let mut forge = Forge::init("forge", forge_repo).expect("joiner forge init");
@@ -927,9 +978,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 10] = [
+            let mods: [&dyn sdk::Module; 15] = [
                 &kv, &document, &chat, &directory, &valset, &governance,
-                &saga, &tasks, &vaults, &forge,
+                &saga, &tasks, &vaults, &inbox, &forge, &automations, &files, &memory, &jobs,
             ];
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {
