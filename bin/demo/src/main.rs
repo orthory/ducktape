@@ -1,10 +1,13 @@
-//! a runnable super-app demo: eleven registered modules — a qmdb-backed kv, a
+//! a runnable super-app demo: fifteen registered modules — a qmdb-backed kv, a
 //! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
 //! qmdb-backed block DOCUMENT module, a qmdb-backed block-based CHAT module, an
 //! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
-//! orchestrator, a TASKS ledger, and a JOBS work board — dispatched over ONE
-//! host, showing the app-hash evolve
-//! as typed cross-module ops flow, ending on the agent-collaboration beat: a
+//! orchestrator, a TASKS ledger, the AUTOMATIONS rule engine, the INBOX
+//! notification queues, a content-addressed FILES module, the MEMORY shared
+//! agent workspace, and the JOBS work board — dispatched over ONE host, showing
+//! the app-hash evolve as typed cross-module ops flow, ending on the
+//! agent-collaboration beat: a mention becomes a run and a pending saga in one
+//! block.
 //! mention becomes a run and a pending saga in one block.
 //!
 //! run: `cargo run -p demo`
@@ -15,6 +18,7 @@ use agent_interface::{
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
     encode_query as agent_encode_query,
 };
+use automations::Automations;
 use chat::Chat;
 use chat_interface::{
     Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, PostPolicy,
@@ -31,6 +35,7 @@ use document_interface::{
     Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
     encode_msg as doc_encode_msg, encode_query as doc_encode_query,
 };
+use files::Files;
 use forge::Forge;
 use forge_interface::{
     ForgeMsg, ForgeQuery, ForgeReply, decode_reply as forge_decode_reply,
@@ -38,6 +43,12 @@ use forge_interface::{
 };
 use greeter::Greeter;
 use host::{BlockContext, Host};
+use inbox::Inbox;
+use inbox_interface::{
+    InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
+    encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
+};
+use memory::Memory;
 use jobs::Jobs;
 use saga::SagaModule;
 use saga_interface::{
@@ -68,8 +79,12 @@ fn main() {
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");
         let tasks = Tasks::new("tasks");
+        let inbox = Inbox::new("inbox");
+        let files = Files::new("files");
+        let memory = Memory::new("memory");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        let automations = Automations::new("automations", "chat", "tasks");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
@@ -80,12 +95,16 @@ fn main() {
             Box::new(valset),
             Box::new(saga),
             Box::new(tasks),
+            Box::new(inbox),
+            Box::new(files),
+            Box::new(memory),
             Box::new(jobs),
             Box::new(agent),
+            Box::new(automations),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 11 registered modules over one host ===");
+        println!("=== super-app demo — 15 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -526,14 +545,63 @@ fn main() {
         println!("  (post + hook + run + trigger: ONE block — the P2 atomic cascade)");
         println!("  app-hash       : {:?}", out.app_hash);
 
+        // block 9: the INBOX notification queue. modules deliver to a member as
+        // a follow-up so the notification commits atomically with its cause; here
+        // an external submitter self-delivers a note to show the air-gap-native
+        // path (no external push service). the queue holds it as consensus state.
+        let out = host
+            .submit_at(
+                BlockContext {
+                    height: 0,
+                    consensus_time: 9,
+                    // the submitter's id — the inbox derives `source` from this
+                    // origin ("ext:" + hex of the external bytes), never from
+                    // the payload.
+                    origin: Origin::External(b"cli".to_vec()),
+                },
+                Msg {
+                    target: "inbox".into(),
+                    payload: inbox_encode_msg(&InboxMsg::Deliver {
+                        member: "quackbot".into(),
+                        kind: "mention".into(),
+                        body: "you were mentioned in #general".into(),
+                    }),
+                },
+            )
+            .await
+            .expect("submit block 9");
+        println!("\n[block 9] inbox <- Deliver(quackbot) — a notification as consensus state");
+        let reply = host
+            .query(
+                "inbox",
+                &inbox_encode_query(&InboxQuery::List {
+                    member: "quackbot".into(),
+                    from_seq: 0,
+                    limit: 16,
+                }),
+            )
+            .await
+            .expect("query inbox");
+        if let InboxReply::Items(items) = inbox_decode_reply(&reply).unwrap() {
+            for note in &items {
+                println!(
+                    "  note           : seq {} [{}] from {:?} — {}",
+                    note.seq, note.kind, note.source, note.body
+                );
+            }
+        }
+        println!("  app-hash       : {:?}", out.app_hash);
+
         println!("\nmodule roots:");
         for id in [
             "agent",
             "chat",
             "directory",
             "document",
+            "files",
             "forge",
             "greeter",
+            "inbox",
             "jobs",
             "kv",
             "saga",
