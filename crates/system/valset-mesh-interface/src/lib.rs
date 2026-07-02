@@ -1,9 +1,11 @@
-//! deterministic mesh control-plane types derived from valset membership.
+//! deterministic mesh control-plane types derived from admitted validator membership.
 //!
 //! The mesh model is validator-owned: every control participant, bootnode, and
-//! relay candidate is a validator in the current valset projection. This crate
-//! does not configure WireGuard devices or perform key exchange; it only defines
-//! the stable contract future adapters can consume.
+//! relay candidate is a validator in the current invitation/admission projection.
+//! Raw permissionless valset membership is only candidate state and must not be
+//! used directly as transport authority. This crate does not configure WireGuard
+//! devices or perform key exchange; it only defines the stable contract future
+//! adapters can consume.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,6 +21,10 @@ pub type MeshEpoch = u64;
 /// A deterministic content version for a [`MeshView`].
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MeshVersion(pub [u8; 32]);
+
+/// Finalized commitment produced by the invitation/admission system for an epoch.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdmissionRoot(pub [u8; 32]);
 
 /// A validator identity as stored by the valset module.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -51,7 +57,7 @@ impl MeshEndpoints {
     }
 }
 
-/// One valset member plus its mesh endpoint advertisement.
+/// One admitted validator plus its mesh endpoint advertisement.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorMeshAdvertisement {
     pub identity: Vec<u8>,
@@ -96,10 +102,11 @@ pub struct MeshValidator {
     pub capabilities: MeshCapabilities,
 }
 
-/// The complete mesh projection for one valset epoch.
+/// The complete mesh projection for one admitted validator epoch.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeshView {
     pub epoch: MeshEpoch,
+    pub admission_root: AdmissionRoot,
     pub version: MeshVersion,
     pub validators: Vec<MeshValidator>,
 }
@@ -121,6 +128,7 @@ impl MeshView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshDeriveError {
     EmptyValidatorSet,
+    MissingAdmissionRoot,
     InvalidIdentityLength {
         len: usize,
     },
@@ -140,6 +148,7 @@ impl fmt::Display for MeshDeriveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyValidatorSet => write!(f, "validator mesh requires at least one validator"),
+            Self::MissingAdmissionRoot => write!(f, "validator mesh requires an admission root"),
             Self::InvalidIdentityLength { len } => write!(
                 f,
                 "validator identity must be {VALIDATOR_IDENTITY_LEN} bytes, got {len}"
@@ -162,13 +171,15 @@ impl fmt::Display for MeshDeriveError {
 
 impl std::error::Error for MeshDeriveError {}
 
-/// Derive a deterministic mesh view from valset membership and endpoint
-/// advertisements. Input order is deliberately ignored; validator identity
-/// byte-order defines the stable order.
+/// Derive a deterministic mesh view from admitted validator membership and
+/// endpoint advertisements. Input order is deliberately ignored; validator
+/// identity byte-order defines the stable order.
 pub fn derive_mesh(
     epoch: MeshEpoch,
+    admission_root: AdmissionRoot,
     advertisements: impl IntoIterator<Item = ValidatorMeshAdvertisement>,
 ) -> Result<MeshView, MeshDeriveError> {
+    validate_admission_root(admission_root)?;
     let mut by_identity: BTreeMap<ValidatorIdentity, MeshEndpoints> = BTreeMap::new();
     for advertisement in advertisements {
         validate_identity(&advertisement.identity)?;
@@ -198,24 +209,27 @@ pub fn derive_mesh(
             capabilities: MeshCapabilities::validator_owned(),
         })
         .collect();
-    let version = version_for(epoch, &validators);
+    let version = version_for(epoch, admission_root, &validators);
     Ok(MeshView {
         epoch,
+        admission_root,
         version,
         validators,
     })
 }
 
-/// Derive a mesh view from the valset module's sorted membership reply plus a
-/// deterministic endpoint lookup owned by the caller.
-pub fn derive_mesh_from_valset<F>(
+/// Derive a mesh view from the invitation/admission system's finalized validator
+/// set plus a deterministic endpoint lookup owned by the caller.
+pub fn derive_mesh_from_admitted_set<F>(
     epoch: MeshEpoch,
+    admission_root: AdmissionRoot,
     validators: impl IntoIterator<Item = Vec<u8>>,
     mut endpoint_for: F,
 ) -> Result<MeshView, MeshDeriveError>
 where
     F: FnMut(&[u8]) -> Option<MeshEndpoints>,
 {
+    validate_admission_root(admission_root)?;
     let mut advertisements = Vec::new();
     for identity in validators {
         validate_identity(&identity)?;
@@ -225,7 +239,7 @@ where
             })?;
         advertisements.push(ValidatorMeshAdvertisement::new(identity, endpoints));
     }
-    derive_mesh(epoch, advertisements)
+    derive_mesh(epoch, admission_root, advertisements)
 }
 
 pub fn encode_view(view: &MeshView) -> Vec<u8> {
@@ -241,6 +255,13 @@ fn validate_identity(identity: &[u8]) -> Result<(), MeshDeriveError> {
         return Err(MeshDeriveError::InvalidIdentityLength {
             len: identity.len(),
         });
+    }
+    Ok(())
+}
+
+fn validate_admission_root(admission_root: AdmissionRoot) -> Result<(), MeshDeriveError> {
+    if admission_root.0 == [0u8; 32] {
+        return Err(MeshDeriveError::MissingAdmissionRoot);
     }
     Ok(())
 }
@@ -261,10 +282,15 @@ fn validate_endpoints(identity: &[u8], endpoints: &MeshEndpoints) -> Result<(), 
     Ok(())
 }
 
-fn version_for(epoch: MeshEpoch, validators: &[MeshValidator]) -> MeshVersion {
+fn version_for(
+    epoch: MeshEpoch,
+    admission_root: AdmissionRoot,
+    validators: &[MeshValidator],
+) -> MeshVersion {
     let mut h = Sha256::new();
     h.update(b"ducktape:valset-mesh-interface:v1");
     h.update(epoch.to_le_bytes());
+    h.update(admission_root.0);
     h.update((validators.len() as u64).to_le_bytes());
     for validator in validators {
         h.update(validator.stable_index.to_le_bytes());
@@ -298,6 +324,10 @@ mod tests {
         vec![byte; VALIDATOR_IDENTITY_LEN]
     }
 
+    fn admission(byte: u8) -> AdmissionRoot {
+        AdmissionRoot([byte; 32])
+    }
+
     fn endpoints(byte: u8) -> MeshEndpoints {
         MeshEndpoints::new(
             format!("tcp://10.0.0.{byte}:7000"),
@@ -322,10 +352,13 @@ mod tests {
     fn validators_become_control_bootnode_and_relay_participants() {
         let keys = vec![key(3), key(1), key(2)];
         let endpoints = endpoint_map(&keys);
-        let view = derive_mesh_from_valset(7, keys.clone(), |id| endpoints.get(id).cloned())
-            .expect("mesh view");
+        let view = derive_mesh_from_admitted_set(7, admission(8), keys.clone(), |id| {
+            endpoints.get(id).cloned()
+        })
+        .expect("mesh view");
 
         assert_eq!(view.epoch, 7);
+        assert_eq!(view.admission_root, admission(8));
         assert_eq!(view.validators.len(), 3);
         for validator in &view.validators {
             assert!(keys.contains(&validator.identity.0));
@@ -349,10 +382,14 @@ mod tests {
         let descending = vec![key(3), key(2), key(1)];
         let endpoints = endpoint_map(&ascending);
 
-        let a = derive_mesh_from_valset(11, ascending.clone(), |id| endpoints.get(id).cloned())
-            .expect("ascending mesh");
-        let b = derive_mesh_from_valset(11, descending, |id| endpoints.get(id).cloned())
-            .expect("descending mesh");
+        let a = derive_mesh_from_admitted_set(11, admission(8), ascending.clone(), |id| {
+            endpoints.get(id).cloned()
+        })
+        .expect("ascending mesh");
+        let b = derive_mesh_from_admitted_set(11, admission(8), descending, |id| {
+            endpoints.get(id).cloned()
+        })
+        .expect("descending mesh");
 
         assert_eq!(identities(&a), ascending);
         assert_eq!(a, b);
@@ -371,20 +408,49 @@ mod tests {
         let changed = vec![key(1), key(2), key(3)];
         let endpoints = endpoint_map(&changed);
 
-        let before = derive_mesh_from_valset(22, base, |id| endpoints.get(id).cloned())
-            .expect("before mesh");
-        let after = derive_mesh_from_valset(22, changed, |id| endpoints.get(id).cloned())
-            .expect("after mesh");
+        let before =
+            derive_mesh_from_admitted_set(22, admission(8), base, |id| endpoints.get(id).cloned())
+                .expect("before mesh");
+        let after = derive_mesh_from_admitted_set(22, admission(8), changed, |id| {
+            endpoints.get(id).cloned()
+        })
+        .expect("after mesh");
 
         assert_ne!(before.version, after.version);
+    }
+
+    #[test]
+    fn admission_root_changes_move_the_mesh_version_and_zero_is_rejected() {
+        let keys = vec![key(1), key(2)];
+        let endpoints = endpoint_map(&keys);
+
+        let a = derive_mesh_from_admitted_set(22, admission(8), keys.clone(), |id| {
+            endpoints.get(id).cloned()
+        })
+        .expect("admission A");
+        let b = derive_mesh_from_admitted_set(22, admission(9), keys.clone(), |id| {
+            endpoints.get(id).cloned()
+        })
+        .expect("admission B");
+
+        assert_ne!(a.version, b.version);
+        assert_eq!(
+            derive_mesh_from_admitted_set(22, AdmissionRoot([0; 32]), keys, |id| {
+                endpoints.get(id).cloned()
+            })
+            .unwrap_err(),
+            MeshDeriveError::MissingAdmissionRoot
+        );
     }
 
     #[test]
     fn relay_candidates_are_members_not_external_relays() {
         let keys = vec![key(4), key(5), key(6)];
         let endpoints = endpoint_map(&keys);
-        let view = derive_mesh_from_valset(30, keys.clone(), |id| endpoints.get(id).cloned())
-            .expect("mesh view");
+        let view = derive_mesh_from_admitted_set(30, admission(8), keys.clone(), |id| {
+            endpoints.get(id).cloned()
+        })
+        .expect("mesh view");
 
         let relays: Vec<Vec<u8>> = view
             .relay_candidates()
