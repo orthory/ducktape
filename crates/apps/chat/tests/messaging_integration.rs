@@ -136,7 +136,97 @@ fn chat_is_a_filtered_view_over_messaging_storage() {
                 body: "hello".into(),
                 sequence: 1,
                 sent_at: 0,
+                thread_id: None,
+                reply_count: 0,
+                last_reply_at: None,
             }])
+        );
+    });
+}
+
+#[test]
+fn chat_exposes_threaded_conversations_from_shared_messaging_storage() {
+    deterministic::Runner::default().start(|context| async move {
+        let chat = Chat::init_with_messaging_id(context, DEFAULT_CHAT_TARGET, "messaging").await;
+        let mut host = Host::genesis(vec![Box::new(chat)]).unwrap();
+
+        host.submit(chat_msg(ChatMsg::CreateChannel {
+            channel_id: "general".into(),
+            name: "General".into(),
+        }))
+        .await
+        .unwrap();
+        host.submit(chat_msg(ChatMsg::SendMessage {
+            channel_id: "general".into(),
+            message_id: "m1".into(),
+            author: "alice".into(),
+            body: "ship richer chat".into(),
+        }))
+        .await
+        .unwrap();
+        host.submit(chat_msg(ChatMsg::ReplyInThread {
+            channel_id: "general".into(),
+            thread_id: "m1".into(),
+            message_id: "r1".into(),
+            author: "bob".into(),
+            body: "threaded reply".into(),
+        }))
+        .await
+        .unwrap();
+
+        let parent = ChatMessage {
+            id: "m1".into(),
+            channel_id: "general".into(),
+            author: "alice".into(),
+            body: "ship richer chat".into(),
+            sequence: 1,
+            sent_at: 0,
+            thread_id: None,
+            reply_count: 1,
+            last_reply_at: Some(0),
+        };
+        let reply = ChatMessage {
+            id: "r1".into(),
+            channel_id: "general".into(),
+            author: "bob".into(),
+            body: "threaded reply".into(),
+            sequence: 1,
+            sent_at: 0,
+            thread_id: Some("m1".into()),
+            reply_count: 0,
+            last_reply_at: None,
+        };
+
+        let history = host
+            .query(
+                DEFAULT_CHAT_TARGET,
+                &encode_query(&ChatQuery::Messages {
+                    channel_id: "general".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_reply(&history).unwrap(),
+            ChatReply::Messages(vec![parent.clone()])
+        );
+
+        let thread = host
+            .query(
+                DEFAULT_CHAT_TARGET,
+                &encode_query(&ChatQuery::Thread {
+                    channel_id: "general".into(),
+                    thread_id: "m1".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_reply(&thread).unwrap(),
+            ChatReply::Thread(Some(chat_interface::ChatThread {
+                root: parent,
+                replies: vec![reply],
+            }))
         );
     });
 }
@@ -200,10 +290,29 @@ fn synced_chat_reconstructs_the_same_messaging_storage_view() {
             },
         )
         .await;
+        apply_commit(
+            &mut src,
+            22,
+            ChatMsg::ReplyInThread {
+                channel_id: "general".into(),
+                thread_id: "m1".into(),
+                message_id: "r1".into(),
+                author: "carol".into(),
+                body: "thread survives sync".into(),
+            },
+        )
+        .await;
         let src_root = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
 
         let expected_messages = messages(&src, "general").await;
+        let expected_thread = src
+            .query(&encode_query(&ChatQuery::Thread {
+                channel_id: "general".into(),
+                thread_id: "m1".into(),
+            }))
+            .await
+            .unwrap();
         let target = src.sync_target().await;
         let resolver = src.into_resolver();
 
@@ -222,5 +331,15 @@ fn synced_chat_reconstructs_the_same_messaging_storage_view() {
             "synced chat root must equal source messaging root"
         );
         assert_eq!(messages(&synced, "general").await, expected_messages);
+        assert_eq!(
+            synced
+                .query(&encode_query(&ChatQuery::Thread {
+                    channel_id: "general".into(),
+                    thread_id: "m1".into(),
+                }))
+                .await
+                .unwrap(),
+            expected_thread
+        );
     });
 }

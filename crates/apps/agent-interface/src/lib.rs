@@ -25,6 +25,13 @@ pub enum AgentMsg {
         author: String,
         body: String,
     },
+    AppendThreadReply {
+        session_id: String,
+        thread_id: String,
+        message_id: String,
+        author: String,
+        body: String,
+    },
 }
 
 pub fn encode_msg(m: &AgentMsg) -> Vec<u8> {

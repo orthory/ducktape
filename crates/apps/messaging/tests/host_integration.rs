@@ -60,6 +60,9 @@ fn host_commits_channel_messages_and_serves_history_queries() {
                 body: "hello".into(),
                 sequence: 1,
                 sent_at: 0,
+                thread_id: None,
+                reply_count: 0,
+                last_reply_at: None,
             }])
         );
     });
