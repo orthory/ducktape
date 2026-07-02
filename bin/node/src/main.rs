@@ -551,6 +551,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = config::decode_invite(blob)?;
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
+    config::guard_join_descriptor(&dir, &descriptor)?;
     descriptor.save(&dir.join("network.toml"))?;
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
@@ -622,8 +623,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     } = resolved;
     if !sync_only && !validators.contains(&signer.public_key()) {
         return Err(format!(
-            "identity {} is in the mesh but not in the validator set — run with --sync-only \
-             (observer) or get admitted first",
+            "identity {} is not in the validator set — run with --sync-only (observer) or \
+             get admitted first",
             hex_bytes(signer.public_key().as_ref())
         )
         .into());

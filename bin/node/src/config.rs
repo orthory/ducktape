@@ -242,6 +242,30 @@ pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
         .map_err(|e| format!("{hex:?} is not an ed25519 public key: {e}"))
 }
 
+/// guard a join against clobbering a DIFFERENT network's descriptor: a
+/// workspace dir only ever holds one chain-id. a refreshed invite for the
+/// SAME chain-id (the documented re-join after a pre-genesis admit) may
+/// replace it; anything else is almost certainly a paste into the wrong dir —
+/// and for a founder, an unrecoverable one (the time-salted chain-id cannot
+/// be re-minted).
+pub fn guard_join_descriptor(dir: &Path, incoming: &NetworkDescriptor) -> Result<(), String> {
+    let path = dir.join("network.toml");
+    if !path.exists() {
+        return Ok(());
+    }
+    let existing = NetworkDescriptor::load(&path)?;
+    if existing.chain_id != incoming.chain_id {
+        return Err(format!(
+            "{} already belongs to network {} — refusing to replace its descriptor with an \
+             invite for {}; join a different network with a fresh --dir",
+            dir.display(),
+            existing.chain_id,
+            incoming.chain_id
+        ));
+    }
+    Ok(())
+}
+
 /// the addr peers should dial, if one is real: prefer `advertised`, else the
 /// listen addr when it is concrete. an UNSPECIFIED ip (0.0.0.0/[::]) or port 0
 /// is never dialable — writing one into a descriptor would hand every joiner a
@@ -468,6 +492,18 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         .validator_seeds
         .clone()
         .unwrap_or_else(|| peer_seeds.clone());
+    // duplicates would otherwise panic much later at run_node's Set::try_from.
+    for (kind, seeds) in [
+        ("peer_seeds", &peer_seeds),
+        ("validator_seeds", &validator_seeds),
+    ] {
+        let mut seen = std::collections::BTreeSet::new();
+        for s in seeds {
+            if !seen.insert(*s) {
+                return Err(format!("duplicate seed {s} in {kind}"));
+            }
+        }
+    }
 
     let key_of = |s: u64| ed25519::PrivateKey::from_seed(s).public_key();
     let mesh: Vec<_> = peer_seeds.iter().map(|s| key_of(*s)).collect();
@@ -717,6 +753,49 @@ mod tests {
             mode, 0o600,
             "secret must never be world-readable, even transiently"
         );
+    }
+
+    #[test]
+    fn join_guard_refuses_a_foreign_descriptor_but_allows_the_refresh() {
+        let a = ed25519::PrivateKey::from_seed(11).public_key();
+        let dir = tmp("joinguard");
+        let mut ours = NetworkDescriptor {
+            chain_id: "home#11111111".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+        };
+        // empty dir: anything goes.
+        assert!(guard_join_descriptor(&dir, &ours).is_ok());
+        ours.save(&dir.join("network.toml")).expect("save");
+
+        // the refreshed invite (same chain-id, more members) is the re-join.
+        let mut refreshed = ours.clone();
+        refreshed.admit(&ed25519::PrivateKey::from_seed(12).public_key());
+        assert!(guard_join_descriptor(&dir, &refreshed).is_ok());
+
+        // a different network's invite must never clobber this workspace.
+        let foreign = NetworkDescriptor {
+            chain_id: "other#22222222".into(),
+            ..ours.clone()
+        };
+        let err = guard_join_descriptor(&dir, &foreign).expect_err("foreign refused");
+        assert!(
+            err.contains("home#11111111"),
+            "error names the resident network: {err}"
+        );
+    }
+
+    #[test]
+    fn dev_shape_duplicate_seeds_are_a_config_error() {
+        let dir = tmp("devdups");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\npeer_seeds = [0, 1, 1]\n",
+        )
+        .expect("write");
+        let err = resolve(&dir.join("node.toml")).expect_err("dup seeds refused");
+        assert!(err.contains("duplicate seed"), "{err}");
     }
 
     #[test]
