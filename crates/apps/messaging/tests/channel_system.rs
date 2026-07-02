@@ -122,7 +122,9 @@ fn creates_channels_and_posts_ordered_messages() {
             query(
                 &module,
                 MessagingQuery::Messages {
-                    channel_id: "general".into()
+                    channel_id: "general".into(),
+                    before: None,
+                    limit: None,
                 }
             )
             .await,
@@ -260,7 +262,9 @@ fn posts_thread_replies_and_updates_parent_summary() {
             query(
                 &module,
                 MessagingQuery::Messages {
-                    channel_id: "general".into()
+                    channel_id: "general".into(),
+                    before: None,
+                    limit: None,
                 }
             )
             .await,
@@ -490,7 +494,9 @@ fn rejects_posts_to_missing_channels_and_aborts_cleanly() {
             query(
                 &module,
                 MessagingQuery::Messages {
-                    channel_id: "ghost".into()
+                    channel_id: "ghost".into(),
+                    before: None,
+                    limit: None,
                 }
             )
             .await,

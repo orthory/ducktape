@@ -217,6 +217,8 @@ fn chat_writes_land_in_registered_messaging_backing() {
                 agent_interface::DEFAULT_MESSAGING_TARGET,
                 &messaging_interface::encode_query(&MessagingQuery::Messages {
                     channel_id: "general".into(),
+                    before: None,
+                    limit: None,
                 }),
             )
             .await

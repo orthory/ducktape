@@ -197,6 +197,8 @@ pub fn backing_query(query: AgentQuery) -> MessagingQuery {
         },
         AgentQuery::Messages { session_id } => MessagingQuery::Messages {
             channel_id: session_id,
+            before: None,
+            limit: None,
         },
         AgentQuery::Thread {
             session_id,

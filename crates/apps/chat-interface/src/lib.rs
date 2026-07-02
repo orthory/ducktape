@@ -156,7 +156,11 @@ pub fn backing_query(query: ChatQuery) -> MessagingQuery {
     match query {
         ChatQuery::Channels => MessagingQuery::Channels,
         ChatQuery::Channel { channel_id } => MessagingQuery::Channel { channel_id },
-        ChatQuery::Messages { channel_id } => MessagingQuery::Messages { channel_id },
+        ChatQuery::Messages { channel_id } => MessagingQuery::Messages {
+            channel_id,
+            before: None,
+            limit: None,
+        },
         ChatQuery::Thread {
             channel_id,
             thread_id,
