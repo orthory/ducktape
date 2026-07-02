@@ -29,8 +29,11 @@ pub const MAX_WORKER_ROUNDS: u32 = 256;
 /// errors from driving the reactor.
 #[derive(Debug)]
 pub enum Error {
-    /// the host rejected a submitted op.
+    /// the host rejected a submitted op (deterministic, block rolled back).
     Host(sdk::Error),
+    /// a node-local block-boundary fault — the host registry is indeterminate
+    /// and the caller must fail-stop (see [`host::FatalError`]).
+    Fatal(host::FatalError),
     /// a worker failed to produce its result.
     Worker(String),
     /// the outer worker loop exceeded [`MAX_WORKER_ROUNDS`].
@@ -43,10 +46,20 @@ impl From<sdk::Error> for Error {
     }
 }
 
+impl From<host::SubmitError> for Error {
+    fn from(e: host::SubmitError) -> Self {
+        match e {
+            host::SubmitError::Rejected(e) => Error::Host(e),
+            host::SubmitError::Fatal(f) => Error::Fatal(f),
+        }
+    }
+}
+
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Host(e) => write!(f, "host error: {e}"),
+            Error::Fatal(e) => write!(f, "{e}"),
             Error::Worker(m) => write!(f, "worker error: {m}"),
             Error::BudgetExceeded => write!(f, "worker-round budget exceeded"),
         }
@@ -153,7 +166,8 @@ mod tests {
     /// try-decodes a `WorkerRequest`; on anything else it returns `Ok(None)` ("not
     /// my effect"). on a match it computes a stand-in result — reversing the spec
     /// bytes, a pure transform here but MODELING an opaque external computation —
-    /// and returns the `OracleResult` op that carries it back through submit.
+    /// and returns the `OracleResult` op that carries it back through submit,
+    /// echoing the request's `(saga_id, attempt)` idempotency key.
     struct MockOracle;
 
     #[async_trait::async_trait(?Send)]
@@ -166,13 +180,59 @@ mod tests {
             let result: Vec<u8> = wr.spec.iter().rev().copied().collect();
             Ok(Some(Msg {
                 target: "saga".into(),
-                payload: encode_msg(&SagaMsg::OracleResult { saga_id: wr.saga_id, result }),
+                payload: encode_msg(&SagaMsg::OracleResult {
+                    saga_id: wr.saga_id,
+                    attempt: wr.attempt,
+                    outcome: Ok(result),
+                }),
             }))
         }
     }
 
+    /// a worker whose FIRST attempt fails: attempt 0 comes back `Err`, every
+    /// later attempt succeeds — the retry-through-the-loop fixture.
+    struct FlakyOracle;
+
+    #[async_trait::async_trait(?Send)]
+    impl Worker for FlakyOracle {
+        async fn run(&self, effect: &Effect) -> Result<Option<Msg>, Error> {
+            let wr = match decode_worker_request(&effect.0) {
+                Ok(wr) => wr,
+                Err(_) => return Ok(None),
+            };
+            let outcome = if wr.attempt == 0 {
+                Err("first attempt always fails".to_string())
+            } else {
+                Ok(wr.spec.iter().rev().copied().collect())
+            };
+            Ok(Some(Msg {
+                target: "saga".into(),
+                payload: encode_msg(&SagaMsg::OracleResult {
+                    saga_id: wr.saga_id,
+                    attempt: wr.attempt,
+                    outcome,
+                }),
+            }))
+        }
+    }
+
+    fn trigger_with_attempts(id: &str, spec: &[u8], max_attempts: u32) -> Msg {
+        Msg {
+            target: "saga".into(),
+            payload: encode_msg(&SagaMsg::Trigger {
+                saga_id: id.into(),
+                spec: spec.to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts,
+                lease_views: None,
+            }),
+        }
+    }
+
     fn trigger(id: &str, spec: &[u8]) -> Msg {
-        Msg { target: "saga".into(), payload: encode_msg(&SagaMsg::Trigger { saga_id: id.into(), spec: spec.to_vec() }) }
+        trigger_with_attempts(id, spec, 1)
     }
 
     async fn get_saga(host: &Host, id: &str) -> Option<SagaView> {
@@ -232,6 +292,33 @@ mod tests {
             let settled = reactor.submit_and_settle(follow).await.expect("settle");
             assert_eq!(get_saga(reactor.host(), "s1").await.unwrap().status, SagaStatus::Done, "the oracle op advanced it to Done");
             assert_eq!(settled.app_hash, done_hash, "and it converges on the same settled done-hash");
+        });
+    }
+
+    /// a failed attempt re-enters the loop as a retry: the `Err` outcome op
+    /// makes the saga re-emit a `WorkerRequest` for attempt 1 (a fresh
+    /// idempotency key), the worker answers THAT, and the saga settles at
+    /// Done on the second attempt — all through ordinary submitted ops.
+    #[test]
+    fn a_flaky_worker_retries_through_the_loop_and_settles_done() {
+        block_on(async {
+            let host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
+            let mut reactor = Reactor::new(host, vec![Box::new(FlakyOracle)]);
+
+            let settled = reactor
+                .submit_and_settle(trigger_with_attempts("s1", b"hello", 2))
+                .await
+                .expect("settle");
+
+            let v = get_saga(reactor.host(), "s1").await.expect("saga exists");
+            assert_eq!(v.status, SagaStatus::Done, "the retry landed");
+            assert_eq!(v.attempt, 1, "attempt 0 was consumed by the Err outcome");
+            assert_eq!(
+                v.result,
+                Some(b"olleh".to_vec()),
+                "the retried result is committed"
+            );
+            assert_eq!(settled.app_hash, reactor.app_hash());
         });
     }
 }

@@ -8,16 +8,23 @@
 //! demo binary does), including OVERWRITES in kv and document: a qmdb root is
 //! op-log ordered, so a naive "export current pairs and re-apply" could never
 //! reproduce it — only the real sync path can. the joiner rebuilds kv, document,
-//! and agent through the qmdb sync engine (target + resolver), forge / valset /
-//! directory / saga through snapshot + install gated on the source root, and
-//! greeter fresh (stateless). every reconstructed module is then read back —
-//! content, not just digests — and one tampered snapshot must be refused without
-//! disturbing the already-installed state.
+//! and chat through the qmdb sync engine (target + resolver), forge / valset /
+//! directory / saga / agent through snapshot + install gated on the source
+//! root, and greeter fresh (stateless). every reconstructed module is then
+//! read back — content, not just digests — and one tampered snapshot must be
+//! refused without disturbing the already-installed state.
 
-use agent::Agent;
+use agent::AgentModule;
 use agent_interface::{
-    AgentEntry, AgentMsg, AgentQuery, AgentReply, decode_reply as agent_decode_reply,
-    encode_msg as agent_encode_msg, encode_query as agent_encode_query,
+    ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentStatus, TurnPolicy,
+    decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
+    encode_query as agent_encode_query,
+};
+use chat::Chat;
+use chat_interface::{
+    Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, MessageView, PostPolicy,
+    decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
+    encode_query as chat_encode_query,
 };
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
@@ -102,6 +109,20 @@ async fn commit_op(module: &mut dyn Module, at: u64, payload: Vec<u8>) {
     module.commit_block().await.unwrap();
 }
 
+/// like [`commit_op`] but with an explicit dispatch origin — the agent
+/// module's admin ops are owner-gated and reject the system origin.
+async fn commit_op_as(module: &mut dyn Module, at: u64, origin: sdk::Origin, payload: Vec<u8>) {
+    let target = module.id();
+    let msg = Msg {
+        target: target.clone(),
+        payload,
+    };
+    let mut ctx = TestCtx::at(at, &target);
+    ctx.env.origin = origin;
+    module.execute(&mut ctx, &msg).await.unwrap();
+    module.commit_block().await.unwrap();
+}
+
 /// the (id, root) pair a node's registry reports for a module — the exact input
 /// `state::global_root` consumes. needed because ONE deterministic runner
 /// shares ONE storage-partition namespace: the joiner's qmdb stores must
@@ -143,24 +164,27 @@ impl Module for RegistryEntry {
 fn joiner_app_hash(
     kv: &dyn Module,
     document: &dyn Module,
-    agent: &dyn Module,
+    chat: &dyn Module,
     directory: &dyn Module,
     greeter: &dyn Module,
     forge: &dyn Module,
     valset: &dyn Module,
     saga: &dyn Module,
+    agent: &dyn Module,
 ) -> StateRoot {
     let kv_entry = RegistryEntry::of("kv", kv);
     let document_entry = RegistryEntry::of("document", document);
-    let mods: [&dyn Module; 8] = [
+    let chat_entry = RegistryEntry::of("chat", chat);
+    let mods: [&dyn Module; 9] = [
         &kv_entry,
         directory,
         greeter,
         forge,
         &document_entry,
-        agent,
+        &chat_entry,
         valset,
         saga,
+        agent,
     ];
     global_root(&mods)
 }
@@ -186,19 +210,20 @@ async fn validators(v: &Valset) -> Vec<Vec<u8>> {
     }
 }
 
-async fn agent_entries<E>(agent: &Agent<E>, session_id: &str) -> Vec<AgentEntry>
+async fn chat_messages<E>(chat: &Chat<E>, channel_id: &str) -> Vec<MessageView>
 where
     E: commonware_storage::Context + commonware_runtime::BufferPooler,
 {
-    let reply = agent
-        .query(&agent_encode_query(&AgentQuery::Messages {
-            session_id: session_id.into(),
+    let reply = chat
+        .query(&chat_encode_query(&ChatQuery::MessagesLatest {
+            channel_id: channel_id.into(),
+            limit: 16,
         }))
         .await
         .unwrap();
-    match agent_decode_reply(&reply).unwrap() {
-        AgentReply::Messages(entries) => entries,
-        other => panic!("unexpected agent reply: {other:?}"),
+    match chat_decode_reply(&reply).unwrap() {
+        ChatReply::Messages(messages) => messages,
+        other => panic!("unexpected chat reply: {other:?}"),
     }
 }
 
@@ -307,32 +332,64 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         )
         .await;
 
-        let mut src_agent = Agent::init_with_messaging_id(
-            context.child("source_agent"),
-            "agent",
-            "agent-messaging",
-        )
-        .await;
+        // chat content exercises every record family the sync must carry:
+        // channel + index, message heads, a thread reply index, an edit's
+        // immutable revision record, and a reaction set. commit_op's TestCtx
+        // dispatches with Origin::System, so the stored author is System and
+        // the same origin may edit.
+        let mut src_chat = Chat::init(context.child("source_chat"), "chat").await;
         commit_op(
-            &mut src_agent,
+            &mut src_chat,
             10,
-            agent_encode_msg(&AgentMsg::OpenSession {
-                session_id: "general".into(),
-                title: "General".into(),
+            chat_encode_msg(&ChatMsg::CreateChannel {
+                channel_id: "general".into(),
+                name: "General".into(),
+                post_policy: PostPolicy::Open,
             }),
         )
         .await;
         commit_op(
-            &mut src_agent,
+            &mut src_chat,
             20,
-            agent_encode_msg(&AgentMsg::AppendTurn {
-                session_id: "general".into(),
-                user_message_id: "u1".into(),
-                assistant_message_id: "a1".into(),
-                user: "alice".into(),
-                assistant: "codex".into(),
-                user_body: "hello".into(),
-                assistant_body: "storage-backed".into(),
+            chat_encode_msg(&ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: "m1".into(),
+                blocks: vec![ChatBlock::paragraph("hello")],
+                thread: None,
+                as_agent: None,
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_chat,
+            21,
+            chat_encode_msg(&ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: "r1".into(),
+                blocks: vec![ChatBlock::paragraph("threaded")],
+                thread: Some(1),
+                as_agent: None,
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_chat,
+            22,
+            chat_encode_msg(&ChatMsg::EditMessage {
+                channel_id: "general".into(),
+                seq: 1,
+                blocks: vec![ChatBlock::paragraph("hello, edited")],
+                base_rev: Some(0),
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_chat,
+            23,
+            chat_encode_msg(&ChatMsg::AddReaction {
+                channel_id: "general".into(),
+                seq: 2,
+                emoji: "thumbsup".into(),
             }),
         )
         .await;
@@ -385,6 +442,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             saga_encode_msg(&SagaMsg::Trigger {
                 saga_id: "greet".into(),
                 spec: b"reverse hello".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
             }),
         )
         .await;
@@ -393,7 +455,8 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             0,
             saga_encode_msg(&SagaMsg::OracleResult {
                 saga_id: "greet".into(),
-                result: b"olleh".to_vec(),
+                attempt: 0,
+                outcome: Ok(b"olleh".to_vec()),
             }),
         )
         .await;
@@ -404,6 +467,63 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             saga_encode_msg(&SagaMsg::Trigger {
                 saga_id: "translate".into(),
                 spec: b"hola".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
+            }),
+        )
+        .await;
+
+        // the agent orchestrator: a registry entry per owner shape (one
+        // paused) plus a channel watch — the run machinery is exercised by
+        // the agent crate's own snapshot suite; this leg pins the joiner
+        // path. admin ops are owner-gated, so they carry an external origin.
+        let owner = sdk::Origin::External(b"agent-owner".to_vec());
+        let mut src_agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        commit_op_as(
+            &mut src_agent,
+            30,
+            owner.clone(),
+            agent_encode_msg(&AgentMsg::RegisterAgent {
+                agent_id: "quackbot".into(),
+                display_name: "Quackbot".into(),
+                model_ref: "mock-llm-1".into(),
+                prompt_hash: vec![7u8; 32],
+                allowed_actions: vec![ACTION_CHAT_POST.into()],
+            }),
+        )
+        .await;
+        commit_op_as(
+            &mut src_agent,
+            31,
+            owner.clone(),
+            agent_encode_msg(&AgentMsg::RegisterAgent {
+                agent_id: "sleepy".into(),
+                display_name: "Sleepy".into(),
+                model_ref: "mock-llm-1".into(),
+                prompt_hash: vec![8u8; 32],
+                allowed_actions: Vec::new(),
+            }),
+        )
+        .await;
+        commit_op_as(
+            &mut src_agent,
+            32,
+            owner.clone(),
+            agent_encode_msg(&AgentMsg::PauseAgent {
+                agent_id: "sleepy".into(),
+            }),
+        )
+        .await;
+        commit_op_as(
+            &mut src_agent,
+            33,
+            owner.clone(),
+            agent_encode_msg(&AgentMsg::WatchChannel {
+                channel_id: "general".into(),
+                policy: TurnPolicy::Mention,
             }),
         )
         .await;
@@ -415,17 +535,19 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let src_document_root = src_document.root();
         let src_directory_root = src_directory.root();
         let src_forge_root = src_forge.root();
-        let src_agent_root = src_agent.root();
+        let src_chat_root = src_chat.root();
         let src_valset_root = src_valset.root();
         let src_saga_root = src_saga.root();
+        let src_agent_root = src_agent.root();
         for (id, root) in [
             ("kv", src_kv_root),
             ("document", src_document_root),
             ("directory", src_directory_root),
             ("forge", src_forge_root),
-            ("agent", src_agent_root),
+            ("chat", src_chat_root),
             ("valset", src_valset_root),
             ("saga", src_saga_root),
+            ("agent", src_agent_root),
         ] {
             assert_ne!(
                 root,
@@ -435,15 +557,16 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         }
 
         let src_global = {
-            let mods: [&dyn Module; 8] = [
+            let mods: [&dyn Module; 9] = [
                 &src_kv,
                 &src_directory,
                 &src_greeter,
                 &src_forge,
                 &src_document,
-                &src_agent,
+                &src_chat,
                 &src_valset,
                 &src_saga,
+                &src_agent,
             ];
             global_root(&mods)
         };
@@ -457,9 +580,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // slice.
         let valset_bytes = src_valset.snapshot();
         let saga_bytes = src_saga.snapshot();
+        let agent_bytes = src_agent.snapshot();
         let forge_bytes = src_forge.snapshot().expect("forge snapshot");
         let src_validators = validators(&src_valset).await;
-        let src_agent_entries = agent_entries(&src_agent, "general").await;
+        let src_chat_messages = chat_messages(&src_chat, "general").await;
 
         let source_peer = StateSyncPeerId::ed25519_public_key(src_validators[0].clone())
             .expect("source validator key is a peer id");
@@ -530,8 +654,8 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let kv_resolver = src_kv.into_resolver();
         let document_target = src_document.sync_target().await;
         let document_resolver = src_document.into_resolver();
-        let agent_target = src_agent.sync_target().await;
-        let agent_resolver = src_agent.into_resolver();
+        let chat_target = src_chat.sync_target().await;
+        let chat_resolver = src_chat.into_resolver();
 
         // ---- JOINER: reconstruct every stateful module -----------------------
         let join_kv = Kv::sync_from(
@@ -548,12 +672,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             document_resolver,
         )
         .await;
-        let join_agent = Agent::sync_from_messaging_id(
-            context.child("joiner_agent"),
-            "agent",
-            "agent-messaging-rebuilt",
-            agent_target,
-            agent_resolver,
+        let join_chat = Chat::sync_from(
+            context.child("joiner_chat"),
+            "chat-rebuilt",
+            chat_target,
+            chat_resolver,
         )
         .await;
 
@@ -569,6 +692,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         join_saga
             .install(&saga_bytes, src_saga_root)
             .expect("saga install");
+        let mut join_agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        join_agent
+            .install(&agent_bytes, src_agent_root)
+            .expect("agent install");
         let mut join_forge = Forge::init("forge", joiner_dir.clone()).expect("joiner forge init");
         join_forge
             .install(&forge_bytes, src_forge_root)
@@ -587,9 +714,9 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "document: synced root != source root"
         );
         assert_eq!(
-            join_agent.root(),
-            src_agent_root,
-            "agent: synced root != source root"
+            join_chat.root(),
+            src_chat_root,
+            "chat: synced root != source root"
         );
         assert_eq!(
             join_directory.root(),
@@ -611,6 +738,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             src_forge_root,
             "forge: installed root != source root"
         );
+        assert_eq!(
+            join_agent.root(),
+            src_agent_root,
+            "agent: installed root != source root"
+        );
 
         // ...and the composed app-hash over the same canonical ids is the exact
         // digest consensus committed on the source — THE joiner property.
@@ -618,12 +750,13 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             joiner_app_hash(
                 &join_kv,
                 &join_document,
-                &join_agent,
+                &join_chat,
                 &join_directory,
                 &join_greeter,
                 &join_forge,
                 &join_valset,
                 &join_saga,
+                &join_agent,
             ),
             src_global,
             "the joiner must land on the exact source app-hash"
@@ -653,8 +786,8 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         assert_eq!(blocks[1].text, "a block document, rebuilt by a joiner");
 
         assert_eq!(
-            agent_entries(&join_agent, "general").await,
-            src_agent_entries
+            chat_messages(&join_chat, "general").await,
+            src_chat_messages
         );
 
         assert_eq!(join_directory.get("name"), Some(&"world".to_string()));
@@ -684,6 +817,35 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         };
         assert_eq!(translate.status, SagaStatus::Pending);
         assert_eq!(translate.result, None);
+
+        // agent: the registry (statuses included) and the watch survived.
+        let reply = join_agent
+            .query(&agent_encode_query(&AgentQuery::Agents))
+            .await
+            .unwrap();
+        let AgentReply::Agents(agents) = agent_decode_reply(&reply).unwrap() else {
+            panic!("agents reply expected");
+        };
+        assert_eq!(
+            agents
+                .iter()
+                .map(|a| (a.agent_id.as_str(), a.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("quackbot", AgentStatus::Active),
+                ("sleepy", AgentStatus::Paused),
+            ]
+        );
+        let reply = join_agent
+            .query(&agent_encode_query(&AgentQuery::Watches))
+            .await
+            .unwrap();
+        let AgentReply::Watches(watches) = agent_decode_reply(&reply).unwrap() else {
+            panic!("watches reply expected");
+        };
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].channel_id, "general");
+        assert_eq!(watches[0].policy, TurnPolicy::Mention);
 
         // forge: read the committed FILE back out of the joiner's OWN repo —
         // proof the pack landed real objects (commit, tree, blob), not just a
@@ -737,12 +899,13 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             joiner_app_hash(
                 &join_kv,
                 &join_document,
-                &join_agent,
+                &join_chat,
                 &join_directory,
                 &join_greeter,
                 &join_forge,
                 &join_valset,
                 &join_saga,
+                &join_agent,
             ),
             src_global
         );

@@ -48,22 +48,28 @@ fn a_rejected_finalized_op_is_a_noop_not_a_halt() {
         let mut node = OrderedNode::new(host, RoundOrderer::new());
 
         // a good op applies.
-        node.submit(b"n", 0, op(b"good1")).await.expect("submit");
+        node.submit(&sk(1), 0, op(b"good1")).await.expect("submit");
         assert!(node.drain_delivered().await.is_ok(), "good op drains ok");
 
         // a POISON op the module rejects: drain MUST still be Ok (no halt) — it is
         // processed as an inert no-op. before the fix this returned Err and stalled.
-        node.submit(b"byz", 0, op(b"poison")).await.expect("submit");
+        node.submit(&sk(2), 0, op(b"poison")).await.expect("submit");
         assert!(
             node.drain_delivered().await.is_ok(),
             "a rejected finalized op must NOT halt the node"
         );
 
         // the node keeps going — a later good op still lands.
-        node.submit(b"n", 0, op(b"good2")).await.expect("submit");
+        node.submit(&sk(1), 1, op(b"good2")).await.expect("submit");
         assert!(node.drain_delivered().await.is_ok(), "node continues past the rejected op");
 
         // exactly the two good ops landed; poison was inert.
         assert_eq!(*seen.lock().unwrap(), vec![b"good1".to_vec(), b"good2".to_vec()]);
     });
+}
+
+/// a deterministic dev signer for test frames (any u64 seed).
+fn sk(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
+    use commonware_cryptography::Signer as _;
+    commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
 }

@@ -1,0 +1,37 @@
+[package]
+name = "noded"
+edition.workspace = true
+version.workspace = true
+
+# the ducktape node daemon: owns ONE embedded `host::Host` on a dedicated
+# actor thread (the host is deliberately non-Send) and exposes it to clients
+# over http + websocket — POST /v1/submit (one msg = one block), POST /v1/query
+# (read committed state), GET /v1/status (version + app-hash + module roots),
+# POST /v1/shutdown (graceful exit), GET /v1/ws (a block-finalized event
+# stream). every ducktape app build is a client of this process: the web build
+# dials it directly; the tauri build spawns it as a DETACHED subprocess (an
+# orphan that outlives the window) and talks to it the same way.
+[[bin]]
+name = "ducktape-noded"
+path = "src/main.rs"
+
+[dependencies]
+host = { workspace = true }
+sdk = { workspace = true }
+chat = { workspace = true }
+tasks = { workspace = true }
+document = { workspace = true }
+forge = { workspace = true }
+
+commonware-runtime = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

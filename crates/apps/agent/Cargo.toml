@@ -3,15 +3,23 @@ name = "agent"
 edition.workspace = true
 version.workspace = true
 
-# Queryable agent-session facade over the storage-backed messaging module.
+# the agent orchestrator: registry, channel watches, run lifecycle, context
+# pinning, and deterministic LLM-output validation over chat + saga + tasks.
 [dependencies]
 sdk = { workspace = true }
 agent-interface = { workspace = true }
-messaging = { workspace = true }
-messaging-interface = { workspace = true }
+chat-interface = { workspace = true }
+saga-interface = { workspace = true }
+tasks-interface = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
 async-trait = { workspace = true }
-commonware-runtime = { workspace = true }
-commonware-storage = { workspace = true }
 
 [dev-dependencies]
+futures = "0.3"
 host = { workspace = true }
+reactor = { workspace = true }
+chat = { workspace = true }
+saga = { workspace = true }
+tasks = { workspace = true }
+commonware-runtime = { workspace = true }

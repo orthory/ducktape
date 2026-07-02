@@ -89,7 +89,7 @@ fn failed_block_rolls_back_every_module() {
             .submit(Msg { target: "fanout".into(), payload: Vec::new() })
             .await
             .expect_err("the boom follow-up must fail the block");
-        assert_eq!(err, Error::Module("boom".into()));
+        assert_eq!(err, host::SubmitError::Rejected(Error::Module("boom".into())));
 
         // no trace: every root and the app-hash are byte-identical to pre-block.
         assert_eq!(host.module_root(DIR).unwrap(), dir0, "directory must roll back");
@@ -143,7 +143,7 @@ fn budget_exceeded_also_rolls_back() {
             .submit(Msg { target: "looper".into(), payload: Vec::new() })
             .await
             .expect_err("must hit the dispatch budget");
-        assert_eq!(err, Error::BudgetExceeded);
+        assert_eq!(err, host::SubmitError::Rejected(Error::BudgetExceeded));
 
         assert_eq!(host.module_root(DIR).unwrap(), dir0, "directory must roll back on budget exhaustion");
         assert_eq!(host.app_hash(), app0, "app-hash unchanged after a budget-exceeded block");

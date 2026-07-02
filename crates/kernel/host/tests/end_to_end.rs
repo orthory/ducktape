@@ -110,7 +110,7 @@ fn unknown_target_is_rejected_without_corrupting_the_registry() {
             .submit(Msg { target: "ghost".to_string(), payload: Vec::new() })
             .await
             .expect_err("unknown target must error");
-        assert_eq!(err, Error::UnknownModule("ghost".to_string()));
+        assert_eq!(err, host::SubmitError::Rejected(Error::UnknownModule("ghost".to_string())));
 
         // registry intact: kv is still routable.
         assert!(host.module_root(KV_ID).is_some());

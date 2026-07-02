@@ -6,8 +6,11 @@ version.workspace = true
 [dependencies]
 sdk = { workspace = true }
 saga-interface = { workspace = true }
+valset-interface = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"
+host = { workspace = true }
+valset = { workspace = true }

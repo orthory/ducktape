@@ -59,6 +59,16 @@ use document_interface::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
+/// write-time cap on a SERIALIZED document. [`doc_config`]'s codec [`RangeCfg`]
+/// bounds a stored value at 1 MiB AT DECODE TIME only — an oversized doc would
+/// stage fine, sail through the expect()-panicking commit path, and then panic
+/// every later read of that doc (and any log replay / sync batch decode) on
+/// every validator: a poison pill. rejecting at write time keeps it out of the
+/// log entirely. 768 KiB leaves a 256 KiB margin under the codec bound so the
+/// whole serialized operation (hashed key, varint length prefix, framing) — and
+/// the NEXT small edit to an at-cap doc — stays comfortably under 1 MiB.
+pub const MAX_DOC_LEN: usize = 768 * 1024;
+
 /// the qmdb key: a fixed 32-byte sha256 digest of the `doc_id`. fixed width is
 /// what lets a store be state-synced (commonware's resolvers require `K: Array`).
 type DocKey = <Sha256 as Hasher>::Digest;
@@ -144,6 +154,13 @@ enum DocError {
     BlockNotFound,
     /// an `after` anchor id that isn't in the doc.
     AnchorNotFound,
+    /// the op would grow the serialized doc past [`MAX_DOC_LEN`] — rejected at
+    /// write time so the oversized bytes never reach the panicking commit/read
+    /// paths (the codec bound is decode-only).
+    DocTooLarge,
+    /// a stored doc failed to decode. distinct from [`DocError::DocNotFound`]:
+    /// corruption must surface loudly, never masquerade as an absent doc.
+    DocCorrupt,
 }
 
 impl core::fmt::Display for DocError {
@@ -153,6 +170,8 @@ impl core::fmt::Display for DocError {
             DocError::DuplicateBlock => "duplicate block id",
             DocError::BlockNotFound => "block not found",
             DocError::AnchorNotFound => "after-anchor not found",
+            DocError::DocTooLarge => "doc too large",
+            DocError::DocCorrupt => "stored doc is corrupt",
         };
         f.write_str(s)
     }
@@ -225,12 +244,15 @@ where
 
     /// stage a document's serialized blocks for this block WITHOUT committing.
     /// visible to `get`/`load` at once; folded into qmdb (and `root()`) only when
-    /// the host calls `commit_block`.
-    fn store(&mut self, doc_id: &str, blocks: &[Block]) {
-        self.pending.insert(
-            doc_id.as_bytes().to_vec(),
-            serde_json::to_vec(blocks).expect("Vec<Block> is always serializable"),
-        );
+    /// the host calls `commit_block`. rejects a doc whose serialized form exceeds
+    /// [`MAX_DOC_LEN`] BEFORE staging, so a failed op leaves no overlay entry.
+    fn store(&mut self, doc_id: &str, blocks: &[Block]) -> Result<(), DocError> {
+        let bytes = serde_json::to_vec(blocks).expect("Vec<Block> is always serializable");
+        if bytes.len() > MAX_DOC_LEN {
+            return Err(DocError::DocTooLarge);
+        }
+        self.pending.insert(doc_id.as_bytes().to_vec(), bytes);
+        Ok(())
     }
 
     /// apply one decoded [`DocMsg`] to the staged overlay. pure list surgery over
@@ -242,7 +264,7 @@ where
                 // stored `[]`; ABSENT is `None` — that distinction is why CreateDoc
                 // is its own op and why block ops require it first.
                 if self.load(&doc_id).await.map_err(to_doc_err)?.is_none() {
-                    self.store(&doc_id, &[]);
+                    self.store(&doc_id, &[])?;
                 }
                 Ok(())
             }
@@ -253,21 +275,21 @@ where
                 }
                 let i = idx_after(&d, &after)?;
                 d.insert(i, block);
-                self.store(&doc_id, &d);
+                self.store(&doc_id, &d)?;
                 Ok(())
             }
             DocMsg::UpdateBlock { doc_id, block_id, text } => {
                 let mut d = self.load(&doc_id).await.map_err(to_doc_err)?.ok_or(DocError::DocNotFound)?;
                 let b = d.iter_mut().find(|b| b.id == block_id).ok_or(DocError::BlockNotFound)?;
                 b.text = text;
-                self.store(&doc_id, &d);
+                self.store(&doc_id, &d)?;
                 Ok(())
             }
             DocMsg::RemoveBlock { doc_id, block_id } => {
                 let mut d = self.load(&doc_id).await.map_err(to_doc_err)?.ok_or(DocError::DocNotFound)?;
                 let pos = d.iter().position(|b| b.id == block_id).ok_or(DocError::BlockNotFound)?;
                 d.remove(pos);
-                self.store(&doc_id, &d);
+                self.store(&doc_id, &d)?;
                 Ok(())
             }
             DocMsg::MoveBlock { doc_id, block_id, after } => {
@@ -282,7 +304,7 @@ where
                 // anchor index is computed in the now-shortened list.
                 let i = idx_after(&d, &after)?;
                 d.insert(i, blk);
-                self.store(&doc_id, &d);
+                self.store(&doc_id, &d)?;
                 Ok(())
             }
         }
@@ -358,10 +380,12 @@ where
 
 /// bridge the only sdk error `load` can raise — a stored-doc json decode failure
 /// — back into `DocError` so `apply` stays single-error-typed. unreachable for
-/// our own writes (we only ever store valid `Vec<Block>` json); a corrupt stored
-/// doc is treated as absent.
+/// our own writes (we only ever store valid `Vec<Block>` json), but if it ever
+/// fires it MUST surface as corruption, not [`DocError::DocNotFound`]: mapping a
+/// decode failure to "absent" would let `CreateDoc` silently re-seed an empty
+/// doc over the corrupt bytes, destroying the evidence AND the data.
 fn to_doc_err(_e: Error) -> DocError {
-    DocError::DocNotFound
+    DocError::DocCorrupt
 }
 
 #[async_trait::async_trait(?Send)]
@@ -382,9 +406,15 @@ where
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "call Document::sync_target() at this root and serve it with a DbResolver"
-                .into(),
+            detail: "serve_sync answers qmdb target + op-range requests (statesync wire)".into(),
         })
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (current target, historical proof-carrying op ranges) from committed
+    /// state. read-only; the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        statesync::qmdb::serve_bytes(&self.db, req).await
     }
 
     /// decode a [`DocMsg`] and apply it to the staged overlay. the only `.await`
@@ -678,6 +708,111 @@ mod tests {
             let doc = get_doc(&d, "doc1").await.unwrap();
             let ids: Vec<&str> = doc.iter().map(|b| b.id.as_str()).collect();
             assert_eq!(ids, ["b1", "b2"], "op2 must have seen op1's staged write");
+        });
+    }
+
+    // the poison-pill guard: an op that would grow the serialized doc past
+    // MAX_DOC_LEN is rejected at WRITE time — never staged, never committed —
+    // instead of committing fine and panicking every later decode of that doc.
+    #[test]
+    fn oversized_doc_is_rejected_before_staging() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            let r_before = d.root();
+
+            // one block whose text alone exceeds the cap -> the serialized doc
+            // must exceed it too, whatever the json framing adds.
+            let huge = "x".repeat(MAX_DOC_LEN + 1);
+            let err = d
+                .execute(
+                    &mut TestCtx::new(),
+                    &msg(&DocMsg::InsertBlock {
+                        doc_id: "doc1".into(),
+                        after: None,
+                        block: blk("big", &huge),
+                    }),
+                )
+                .await
+                .expect_err("over-cap doc must be rejected");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("doc too large")),
+                "unexpected error: {err:?}"
+            );
+
+            // rejected BEFORE staging: no overlay entry, commit is a no-op, and
+            // the committed doc is untouched.
+            assert!(d.pending.is_empty(), "a rejected write must not be staged");
+            d.commit_block().await.unwrap();
+            assert_eq!(
+                d.root(),
+                r_before,
+                "a rejected write must not move the root"
+            );
+            assert!(get_doc(&d, "doc1").await.unwrap().is_empty());
+        });
+    }
+
+    // corruption must surface as a DISTINCT error, never DocNotFound: mapping it
+    // to "absent" would let CreateDoc re-seed an empty doc over the corrupt
+    // bytes, silently destroying the data.
+    #[test]
+    fn corrupt_stored_doc_errors_as_corruption_not_absence() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            // commit bytes that are NOT valid Vec<Block> json under doc1's key
+            // (simulating on-disk corruption; unreachable through DocMsg ops).
+            d.pending.insert(b"doc1".to_vec(), b"not json".to_vec());
+            d.commit_block().await.unwrap();
+
+            // a block op must report corruption, not DocNotFound.
+            let err = d
+                .execute(
+                    &mut TestCtx::new(),
+                    &msg(&DocMsg::InsertBlock {
+                        doc_id: "doc1".into(),
+                        after: None,
+                        block: blk("b1", "x"),
+                    }),
+                )
+                .await
+                .expect_err("op on a corrupt doc must fail");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("corrupt")),
+                "unexpected error: {err:?}"
+            );
+            d.abort_block().await.unwrap();
+
+            // CreateDoc must NOT treat the corrupt doc as absent and re-seed it.
+            let err = d
+                .execute(
+                    &mut TestCtx::new(),
+                    &msg(&DocMsg::CreateDoc {
+                        doc_id: "doc1".into(),
+                    }),
+                )
+                .await
+                .expect_err("create over a corrupt doc must fail");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("corrupt")),
+                "unexpected error: {err:?}"
+            );
+            d.abort_block().await.unwrap();
+
+            // the read path surfaces the decode failure too (as an error, not None).
+            assert!(
+                d.query(&encode_query(&DocQuery::GetDoc {
+                    doc_id: "doc1".into()
+                }))
+                .await
+                .is_err()
+            );
         });
     }
 

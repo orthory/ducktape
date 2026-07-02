@@ -1,30 +1,13 @@
 # Ducktape
 
-Ducktape is a Rust-native sovereign collaboration runtime: a BFT-replicated host
-that runs isolated product modules — forge, chat, documents, tasks, and agent
-workflows — under one verifiable global app-hash.
+A consensus-based workplace super-app: one BFT-replicated state machine that
+hosts isolated product modules — documents, forge, chat, agent workflows — the
+way CosmWasm isolates contracts, but in native Rust.
 
-It is one deterministic collaboration state, not a bundle of services glued
-together by APIs. Each module owns its authenticated state substrate and exposes
-exactly one 32-byte root to the host. The host dispatches module operations over
-BFT consensus and composes the sorted module roots into the app-hash that
-consensus commits. If two nodes agree on the app-hash, they agree on the whole
-collaboration state.
-
-## What Runs Under The Hash
-
-The checked-in product surface is intentionally modular:
-
-- `forge` anchors project state in git-backed authenticated roots.
-- `chat` provides conversational collaboration over the messaging substrate.
-- `document` stores block-based documents with a QMDB-backed state-sync path.
-- `tasks` tracks deterministic task state through committed module roots.
-- `agent` records agent sessions and turns through the same host-routed module
-  boundary.
-
-System modules such as `kv`, `valset`, `saga`, and `wireguard-upgrade` use the
-same runtime contract, so infrastructure state and product state can converge
-under one app-hash without sharing implementation crates.
+Each module owns its authenticated state substrate and exposes exactly one
+32-byte root to the host. The host dispatches modules over BFT consensus and
+composes the sorted module roots into a global app-hash that consensus commits.
+If two nodes agree on the app-hash, they agree on every module's state.
 
 ## The Module Rule
 
@@ -34,18 +17,15 @@ Modules never link each other's implementation crates. A module depends only on:
 - the types-only `*-interface` crates of modules it needs to address.
 
 Cross-module reads go through host-routed queries. Cross-module writes are
-emitted as messages that the host drains as follow-up ops. Wrapper modules
-(chat, agent) may reuse a shared storage implementation either as a private
-embedded substrate or as a facade over an explicitly registered backing module —
-but product interaction still crosses only interface crates.
+emitted as messages that the host drains as follow-up ops.
 
 ## Repository Layout
 
 | Path | Contents |
 | --- | --- |
-| `crates/kernel/` | The runtime host: `sdk` (module contract), `state` (app-hash composition), `host` (registry + dispatch + block lifecycle), `node` (transport seam), `consensus` (commonware Simplex BFT orderer), `reactor` (worker loop for non-deterministic effects) |
+| `crates/kernel/` | The platform: `sdk` (module contract), `state` (app-hash composition), `host` (registry + dispatch + block lifecycle), `node` (transport seam), `consensus` (commonware Simplex BFT orderer), `reactor` (worker loop for non-deterministic effects) |
 | `crates/system/` | Consensus-infrastructure modules: `kv` (QMDB byte-KV), `valset` (ed25519 validator membership), `saga` (deterministic async continuations), `wireguard-upgrade` |
-| `crates/apps/` | Product modules: `forge` (git-backed project state), `messaging`, `chat`, `document`, `tasks`, `agent` |
+| `crates/apps/` | Product modules: `forge` (git-backed project state), `document`, `chat`, `agent` (LLM-run orchestrator: registry, watches, runs), `tasks` |
 | `crates/examples/` | Demo and test scaffolding modules: `directory`, `greeter` |
 | `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (real-socket validator process) |
 | `docs/` | Vocs documentation site (human/agent tracks, English/Korean) |
@@ -61,8 +41,8 @@ Run the workspace tests:
 cargo test --workspace
 ```
 
-Run the in-process runtime demo — registers system and product modules together
-and shows their roots moving under one composed app-hash:
+Run the in-process super-app demo — registers the platform and product modules
+together and shows their roots moving under one composed app-hash:
 
 ```sh
 cargo run -p demo
@@ -100,11 +80,10 @@ Korean) under `docs/pages`.
 
 ## Status
 
-The runtime spine is checked in and verified: the module contract, host registry,
-global app-hash, ordered node path, commonware Simplex orderer, saga/reactor async
-seam, and root-backed product modules for forge, chat, documents, tasks, and
-agent workflows. State sync exists for QMDB-backed, forge, and snapshot-style
-modules.
+The platform spine is checked in and verified: the module contract, host
+registry, global app-hash, ordered node path, commonware Simplex orderer,
+saga/reactor async seam, and several root-backed product modules, plus state
+sync for QMDB-backed, forge, and snapshot-style modules.
 
 Still open — mostly live orchestration: network-backed module sync from a
 running node, dynamic valset wiring around epoch cutover, snapshot-at-height

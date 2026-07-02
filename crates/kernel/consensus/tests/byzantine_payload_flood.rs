@@ -67,13 +67,13 @@ fn dir_set(k: &str, v: &str) -> Msg {
 /// same op-set as the shared-store proof: distinct origins/keys so the FINAL kv
 /// CONTENT is permutation-invariant (divergence can only come from LOG ORDER),
 /// plus two order-INDEPENDENT directory writes. one op per validator.
-fn op_set() -> Vec<(Vec<u8>, u64, Msg)> {
+fn op_set() -> Vec<(commonware_cryptography::ed25519::PrivateKey, u64, Msg)> {
     vec![
-        (b"A".to_vec(), 0, kv_set(b"aaa", b"1")),
-        (b"B".to_vec(), 0, kv_set(b"bbb", b"2")),
-        (b"C".to_vec(), 0, kv_set(b"ccc", b"3")),
-        (b"D".to_vec(), 0, dir_set("x", "10")),
-        (b"E".to_vec(), 0, dir_set("y", "20")),
+        (op_signer(101), 0, kv_set(b"aaa", b"1")),
+        (op_signer(102), 0, kv_set(b"bbb", b"2")),
+        (op_signer(103), 0, kv_set(b"ccc", b"3")),
+        (op_signer(104), 0, dir_set("x", "10")),
+        (op_signer(105), 0, dir_set("y", "20")),
     ]
 }
 
@@ -95,7 +95,7 @@ fn sentinel_garbage() -> Vec<u8> {
 /// stores it under `digest_of(frame)`, which is never finalized (never proposed),
 /// so it is never delivered — isolating the defense from mere frame-validity.
 fn unproposed_valid_frame() -> Vec<u8> {
-    encode_frame(b"Z", 0, &kv_set(b"zzz", b"999"))
+    encode_frame(&op_signer(200), 0, &kv_set(b"zzz", b"999"))
 }
 
 /// the N=5 relay convergence scenario. `flood`: when true, validator `BYZ` spawns
@@ -323,4 +323,10 @@ fn byzantine_flood_tolerance_is_robust_across_schedules() {
             .with_timeout(Some(Duration::from_secs(300)));
         deterministic::Runner::new(cfg).start(|context| run_relay(context, true));
     }
+}
+
+/// a deterministic dev signer for test frames (any u64 seed).
+fn op_signer(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
+    use commonware_cryptography::Signer as _;
+    commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
 }

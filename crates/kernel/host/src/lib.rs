@@ -121,6 +121,98 @@ impl FinalizedSnapshot {
     }
 }
 
+/// which block-boundary phase a module failed in. the two phases have opposite
+/// damage profiles: a COMMIT failure may leave the block half-published (earlier
+/// modules in registry order committed, this one did not), an ABORT failure may
+/// leave staged writes that leak into a later block. either way this node's
+/// registry no longer matches what every other honest validator computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryPhase {
+    Commit,
+    Abort,
+}
+
+/// a NON-DETERMINISTIC, node-local fault at the block boundary. this is NOT a
+/// rejected op: a rejected op errors identically on every honest validator and
+/// is safely treated as a deterministic no-op, while a boundary fault (a disk
+/// error inside `commit_block`, a module that could not discard its stage) hit
+/// only THIS node — its registry state is now indeterminate relative to its
+/// peers. the only sound response is fail-stop: surface the fault and stop
+/// applying blocks; continuing would silently fork this node's app-hash.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FatalError {
+    /// the module whose boundary hook failed.
+    pub module: ModuleId,
+    /// the boundary phase that failed.
+    pub phase: BoundaryPhase,
+    /// the module's own error.
+    pub source: Error,
+}
+
+impl core::fmt::Display for FatalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let phase = match self.phase {
+            BoundaryPhase::Commit => "commit_block",
+            BoundaryPhase::Abort => "abort_block",
+        };
+        write!(
+            f,
+            "fatal block-boundary fault: module {} failed {phase}: {} — registry state is \
+             indeterminate, this node must stop applying blocks",
+            self.module, self.source
+        )
+    }
+}
+
+impl std::error::Error for FatalError {}
+
+/// the two ways a `submit` can fail, with OPPOSITE handling contracts:
+///
+/// - [`SubmitError::Rejected`] is DETERMINISTIC: every honest validator computes
+///   the identical rejection for this op (a module error, an unknown target, a
+///   blown dispatch budget) and the abort path verifiably rolled every touched
+///   module back. an ordered lane treats it as a no-op and keeps draining.
+/// - [`SubmitError::Fatal`] is NODE-LOCAL: a block-boundary hook failed on this
+///   node only, and the registry may be half-committed or carrying a leaked
+///   stage. the caller MUST stop applying blocks (fail-stop) — continuing forks
+///   this node against its peers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubmitError {
+    /// the op was rejected deterministically; the block rolled back cleanly.
+    Rejected(Error),
+    /// a block-boundary hook failed on this node; state is indeterminate.
+    Fatal(FatalError),
+}
+
+impl SubmitError {
+    /// the deterministic rejection, if that is what this is. `None` for a fatal
+    /// boundary fault — callers that only expect rejections should not silently
+    /// discard fatality.
+    pub fn rejected(&self) -> Option<&Error> {
+        match self {
+            Self::Rejected(e) => Some(e),
+            Self::Fatal(_) => None,
+        }
+    }
+}
+
+impl core::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Rejected(e) => write!(f, "op rejected: {e}"),
+            Self::Fatal(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
+
+impl From<Error> for SubmitError {
+    fn from(e: Error) -> Self {
+        Self::Rejected(e)
+    }
+}
+
 /// failures while capturing a finalized snapshot.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SnapshotError {
@@ -213,6 +305,17 @@ impl Host {
         }
     }
 
+    /// route a byte-level state-sync serve request to a registered module (see
+    /// [`Module::serve_sync`]). read-only against committed state; a network
+    /// state-sync service calls this between blocks so responses are always
+    /// boundary-consistent.
+    pub async fn serve_sync(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match self.registry.get(target) {
+            Some(m) => m.serve_sync(req).await,
+            None => Err(Error::UnknownModule(target.to_string())),
+        }
+    }
+
     /// the current app-hash: [`state::global_root`] over the registered modules.
     pub fn app_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();
@@ -286,7 +389,19 @@ impl Host {
     /// leaves NO trace — every module root is byte-identical to its pre-block
     /// value. the app-hash is recomposed AFTER the commit, so it reflects exactly
     /// the committed state.
-    pub async fn submit(&mut self, msg: Msg) -> Result<BlockOutcome, Error> {
+    ///
+    /// ## the two failure modes
+    ///
+    /// a [`SubmitError::Rejected`] means the drain failed DETERMINISTICALLY and
+    /// the abort path rolled every touched module back — same on every honest
+    /// validator, safe to treat as a no-op. a [`SubmitError::Fatal`] means a
+    /// boundary hook itself failed on THIS node: a commit fault leaves the block
+    /// half-published (modules earlier in registry order already committed), an
+    /// abort fault leaves a stage that may leak into a later block. no cleanup
+    /// is attempted for either — any further boundary calls would run against a
+    /// registry already known to be inconsistent, manufacturing a THIRD state no
+    /// validator agreed on. the caller must fail-stop.
+    pub async fn submit(&mut self, msg: Msg) -> Result<BlockOutcome, SubmitError> {
         self.submit_at(BlockContext::default(), msg).await
     }
 
@@ -294,7 +409,11 @@ impl Host {
     /// the agreed `height` / `consensus_time` and the root op's `origin`, sourced
     /// from the finalized view by the ordered lane. otherwise identical to
     /// [`Host::submit`] (which is just `submit_at(BlockContext::default(), msg)`).
-    pub async fn submit_at(&mut self, ctx: BlockContext, msg: Msg) -> Result<BlockOutcome, Error> {
+    pub async fn submit_at(
+        &mut self,
+        ctx: BlockContext,
+        msg: Msg,
+    ) -> Result<BlockOutcome, SubmitError> {
         // every module dispatched this block, in deterministic order — the set
         // the host commits or aborts at the boundary.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
@@ -303,10 +422,18 @@ impl Host {
             Ok((events, effects)) => {
                 // clean drain: publish every touched module's staged writes. this
                 // is the ONLY place a module's state advances, so recompose the
-                // app-hash AFTER.
+                // app-hash AFTER. a commit failure is FATAL, not a rejection: the
+                // modules before this one in registry order already published,
+                // so the block is half-committed on this node alone.
                 for id in &touched {
                     if let Some(m) = self.registry.get_mut(id) {
-                        m.commit_block().await?;
+                        m.commit_block().await.map_err(|source| {
+                            SubmitError::Fatal(FatalError {
+                                module: id.clone(),
+                                phase: BoundaryPhase::Commit,
+                                source,
+                            })
+                        })?;
                     }
                 }
                 Ok(BlockOutcome {
@@ -317,13 +444,27 @@ impl Host {
             }
             Err(e) => {
                 // failure anywhere in the drain: discard every touched module's
-                // staged writes. no root moves — the block leaves no trace.
+                // staged writes. no root moves — the block leaves no trace. an
+                // abort failure is FATAL, not a rejection: that module's stage
+                // may leak into a later block's commit. keep aborting the rest
+                // (each un-aborted stage is one more leak) but report the FIRST
+                // fault — the node is stopping either way.
+                let mut fatal: Option<FatalError> = None;
                 for id in &touched {
                     if let Some(m) = self.registry.get_mut(id) {
-                        let _ = m.abort_block().await;
+                        if let Err(source) = m.abort_block().await {
+                            fatal.get_or_insert(FatalError {
+                                module: id.clone(),
+                                phase: BoundaryPhase::Abort,
+                                source,
+                            });
+                        }
                     }
                 }
-                Err(e)
+                match fatal {
+                    Some(f) => Err(SubmitError::Fatal(f)),
+                    None => Err(SubmitError::Rejected(e)),
+                }
             }
         }
     }

@@ -3,8 +3,11 @@ name = "agent-interface"
 edition.workspace = true
 version.workspace = true
 
-# Shared agent-session wire surface built on top of messaging-interface.
+# types-only: the wire surface of the agent orchestrator module. depends on
+# chat-interface (reply blocks / author refs) and saga-interface (the canonical
+# origin mirror) — interface-on-interface is the legal cross-module surface.
 [dependencies]
-messaging-interface = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chat-interface = { workspace = true }
+saga-interface = { workspace = true }

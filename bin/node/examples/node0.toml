@@ -3,8 +3,8 @@
 id = 0
 listen = "127.0.0.1:52200"
 namespace = "ducktape-demo"
-peer_seeds = [0, 1]
+# mesh = validators + the sync-only joiner (seed 2); consensus stays [0, 1].
+peer_seeds = [0, 1, 2, 3]
+validator_seeds = [0, 1, 2]
 storage_dir = "/tmp/ducktape-node-0"
-# consensus signature scheme — GENESIS-WIDE, every node must match. "ed25519"
-# (default) or "bls-multisig" (dev bls secrets derived from the same peer_seeds).
-# consensus_scheme = "ed25519"
+rpc_listen = "127.0.0.1:52300"

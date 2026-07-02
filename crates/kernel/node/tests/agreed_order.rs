@@ -46,15 +46,21 @@ fn dir_set(k: &str, v: &str) -> Msg {
 /// order key is tie-free), distinct kv keys (so the FINAL kv content is identical
 /// under any permutation — divergence can only come from LOG ORDER, not content),
 /// plus two directory writes for the order-independence contrast.
-fn op_set() -> Vec<(Vec<u8>, u64, Msg)> {
+fn op_set() -> Vec<(commonware_cryptography::ed25519::PrivateKey, u64, Msg)> {
     vec![
-        (b"A".to_vec(), 0, kv_set(b"aaa", b"1")),
-        (b"B".to_vec(), 0, kv_set(b"bbb", b"2")),
-        (b"C".to_vec(), 0, kv_set(b"ccc", b"3")),
-        (b"D".to_vec(), 0, dir_set("x", "10")),
-        (b"E".to_vec(), 0, dir_set("y", "20")),
+        (sk(1), 0, kv_set(b"aaa", b"1")),
+        (sk(2), 0, kv_set(b"bbb", b"2")),
+        (sk(3), 0, kv_set(b"ccc", b"3")),
+        (sk(4), 0, dir_set("x", "10")),
+        (sk(5), 0, dir_set("y", "20")),
     ]
 }
+/// a deterministic dev signer for test frames (any u64 seed).
+fn sk(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
+    use commonware_cryptography::Signer as _;
+    commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
+}
+
 
 /// permute a vec by a rotation offset — a cheap way to give each validator a
 /// genuinely different arrival order of the identical set.
@@ -67,7 +73,7 @@ fn rotated<T: Clone>(v: &[T], by: usize) -> Vec<T> {
 /// total number of ops applied.
 async fn feed_and_drain<O: Orderer>(
     node: &mut OrderedNode<O>,
-    arrival: &[(Vec<u8>, u64, Msg)],
+    arrival: &[(commonware_cryptography::ed25519::PrivateKey, u64, Msg)],
 ) -> usize {
     for (origin, seq, msg) in arrival {
         node.submit(origin, *seq, msg.clone()).await.expect("submit");

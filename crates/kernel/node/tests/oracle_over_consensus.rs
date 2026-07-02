@@ -35,16 +35,35 @@ use saga_interface::{
 use sdk::{Effect, Msg};
 
 fn trigger(id: &str, spec: &[u8]) -> Msg {
-    Msg { target: "saga".into(), payload: encode_msg(&SagaMsg::Trigger { saga_id: id.into(), spec: spec.to_vec() }) }
+    Msg {
+        target: "saga".into(),
+        payload: encode_msg(&SagaMsg::Trigger {
+            saga_id: id.into(),
+            spec: spec.to_vec(),
+            reply_to: None,
+            reply_payload: Vec::new(),
+            deadline: None,
+            max_attempts: 1,
+            lease_views: None,
+        }),
+    }
 }
 
 /// the MOCK oracle: try-decode a `WorkerRequest`, compute a stand-in result
 /// (reversing the spec — a pure transform here, MODELING opaque external work),
-/// and return the `OracleResult` op that carries it back through the normal path.
+/// and return the `OracleResult` op that carries it back through the normal
+/// path, echoing the request's `(saga_id, attempt)` idempotency key.
 fn mock_worker(eff: &Effect) -> Option<Msg> {
     let wr = decode_worker_request(&eff.0).ok()?;
     let result: Vec<u8> = wr.spec.iter().rev().copied().collect();
-    Some(Msg { target: "saga".into(), payload: encode_msg(&SagaMsg::OracleResult { saga_id: wr.saga_id, result }) })
+    Some(Msg {
+        target: "saga".into(),
+        payload: encode_msg(&SagaMsg::OracleResult {
+            saga_id: wr.saga_id,
+            attempt: wr.attempt,
+            outcome: Ok(result),
+        }),
+    })
 }
 
 async fn drain_fixpoint<O: Orderer>(n: &mut OrderedNode<O>) {
@@ -56,9 +75,14 @@ async fn drain_fixpoint<O: Orderer>(n: &mut OrderedNode<O>) {
 }
 
 /// submit the identical (agreed) op into every validator's order.
-async fn broadcast<O: Orderer>(nodes: &mut [OrderedNode<O>], origin: &[u8], seq: u64, msg: &Msg) {
+async fn broadcast<O: Orderer>(
+    nodes: &mut [OrderedNode<O>],
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    seq: u64,
+    msg: &Msg,
+) {
     for n in nodes.iter_mut() {
-        n.submit(origin, seq, msg.clone()).await.expect("submit");
+        n.submit(signer, seq, msg.clone()).await.expect("submit");
     }
 }
 
@@ -91,7 +115,7 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
         }
 
         // (1) the Trigger op is agreed -> submit to every validator's order, drain.
-        broadcast(&mut nodes, b"trigger", 0, &trigger("s1", b"hello")).await;
+        broadcast(&mut nodes, &sk(1), 0, &trigger("s1", b"hello")).await;
         for n in &mut nodes {
             drain_fixpoint(n).await;
         }
@@ -113,7 +137,7 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
         let oracle_op = mock_worker(&effects_per_node[assignee][0]).expect("worker claims the effect");
 
         // (3) the OracleResult op is agreed -> submit to every validator's order, drain.
-        broadcast(&mut nodes, b"oracle:s1", 0, &oracle_op).await;
+        broadcast(&mut nodes, &sk(2), 0, &oracle_op).await;
         for n in &mut nodes {
             drain_fixpoint(n).await;
         }
@@ -129,4 +153,10 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
             assert_eq!(v.result, Some(b"olleh".to_vec()), "on the identical agreed oracle result");
         }
     });
+}
+
+/// a deterministic dev signer for test frames (any u64 seed).
+fn sk(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
+    use commonware_cryptography::Signer as _;
+    commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
 }

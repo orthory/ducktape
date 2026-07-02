@@ -50,6 +50,23 @@ pub enum Error {
     Decode(#[from] serde_json::Error),
     #[error("host error: {0}")]
     Host(#[from] sdk::Error),
+    /// a node-local block-boundary fault (see [`host::FatalError`]): this node's
+    /// registry is indeterminate relative to its peers. the process must stop
+    /// applying blocks — every lane surfaces this instead of continuing.
+    #[error("{0}")]
+    Fatal(host::FatalError),
+}
+
+impl From<host::SubmitError> for Error {
+    fn from(e: host::SubmitError) -> Self {
+        match e {
+            // a deterministic rejection keeps its module-error shape.
+            host::SubmitError::Rejected(e) => Error::Host(e),
+            // a boundary fault keeps its fatality — callers match on this to
+            // fail-stop rather than treating it as one bad op.
+            host::SubmitError::Fatal(f) => Error::Fatal(f),
+        }
+    }
 }
 
 // ============================================================================
@@ -298,44 +315,88 @@ mod tests {
 // stream. that is why `submit` is async here even though the deterministic body
 // never suspends.
 
+use commonware_codec::DecodeExt as _;
+use commonware_cryptography::{
+    ed25519::{PrivateKey, PublicKey, Signature},
+    Signer as _, Verifier as _,
+};
 use sdk::Origin;
 
-/// a wire frame: the ordered unit. carries the agreed submitter identity
-/// (`origin`) and a per-origin monotonic `seq` so that two intentionally
-/// identical msgs are still DISTINCT frames — the order key must be tie-free, and
-/// `seq` doubles as replay protection for the replicated state machine. the
-/// agreed order is the byte-lexicographic sort of these frames: correctness needs
-/// ONLY that the sort be a deterministic, node-independent total order over
-/// distinct frames (it is) — NOT that it be `(origin, seq)`-monotonic (it is not:
-/// `seq` serializes as a json number, so seq=10 sorts before seq=2). a future
-/// replay/streaming slice that needs monotonic ordering must key explicitly.
+/// the signing domain for op frames. domain-separated so an op signature can
+/// never double as a consensus vote, an endpoint advertisement, or any other
+/// signed artifact in the system.
+const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
+
+/// a wire frame: the ordered unit. carries the submitter's ed25519 public key
+/// (`origin`), a per-origin monotonic `seq` (so two intentionally identical
+/// msgs are still DISTINCT frames — the order key must be tie-free), and a
+/// SIGNATURE binding (origin, seq, target, payload) to the origin key: after
+/// [`decode_frame`] verifies it, `Origin::External(pubkey)` is AUTHENTICATED
+/// AUTHORSHIP a module (e.g. governance voting) may rely on — no validator can
+/// forge another identity's op. the agreed order is the byte-lexicographic
+/// sort of these frames: correctness needs ONLY that the sort be a
+/// deterministic, node-independent total order over distinct frames (it is) —
+/// NOT that it be `(origin, seq)`-monotonic. replay of a byte-identical frame
+/// is deduplicated by the consensus lane's exactly-once digest gate; per-origin
+/// nonce enforcement IN STATE is the planned successor.
 #[derive(Serialize, Deserialize)]
 struct Frame {
     origin: Vec<u8>,
     seq: u64,
     target: String,
     payload: Vec<u8>,
+    sig: Vec<u8>,
 }
 
-/// frame a locally-originated msg for the ordered lane.
-pub fn encode_frame(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
+/// the signed preimage: length-prefixed fields so no two (seq, target,
+/// payload) triples can collide across a moving boundary.
+fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
+    let target = msg.target.as_bytes();
+    let mut out = Vec::with_capacity(8 * 3 + origin.len() + target.len() + msg.payload.len());
+    out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
+    out.extend_from_slice(origin);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&(target.len() as u64).to_le_bytes());
+    out.extend_from_slice(target);
+    out.extend_from_slice(&msg.payload);
+    out
+}
+
+/// frame and SIGN a locally-originated msg for the ordered lane. the signer's
+/// public key becomes the frame's origin.
+pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
+    let origin = signer.public_key().as_ref().to_vec();
+    let sig = signer.sign(FRAME_NS, &frame_preimage(&origin, seq, msg));
     let frame = Frame {
-        origin: origin.to_vec(),
+        origin,
         seq,
         target: msg.target.clone(),
         payload: msg.payload.clone(),
+        sig: sig.as_ref().to_vec(),
     };
     serde_json::to_vec(&frame).expect("frame serializes")
 }
 
-/// decode a delivered frame back to a `(Origin, Msg)` the host can submit. the
-/// `origin` becomes the block's root `Origin::External(..)`; the `seq` is
-/// ordering/replay metadata and is not surfaced to the host.
+/// decode a delivered frame back to a `(Origin, Msg)` the host can submit —
+/// VERIFYING the signature first. a frame whose origin is not a valid ed25519
+/// key or whose signature does not bind (origin, seq, target, payload) errors,
+/// and the ordered drain treats that as a deterministic no-op: every honest
+/// validator rejects the identical forged frame identically. the verified
+/// `origin` becomes the block's root `Origin::External(pubkey)` — authorship a
+/// module can trust; the `seq` is ordering/replay metadata, not surfaced.
 pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
     let frame: Frame = serde_json::from_slice(bytes)?;
-    let origin = Origin::External(frame.origin);
+    let pubkey = PublicKey::decode(frame.origin.as_slice())
+        .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
+    let sig = Signature::decode(frame.sig.as_slice())
+        .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
     let msg = Msg { target: frame.target, payload: frame.payload };
-    Ok((origin, msg))
+    if !pubkey.verify(FRAME_NS, &frame_preimage(&frame.origin, frame.seq, &msg), &sig) {
+        return Err(Error::Host(sdk::Error::Module(
+            "frame signature does not bind this op to its origin".into(),
+        )));
+    }
+    Ok((Origin::External(frame.origin), msg))
 }
 
 /// total-order broadcast over opaque op frames. `submit` proposes a frame into
@@ -455,11 +516,69 @@ pub struct OrderedNode<O: Orderer> {
     /// where the reactor's worker driver reads finalized `WorkerRequest`s from
     /// (via `take_effects`). accumulates in agreed-delivery order.
     effects: Vec<Effect>,
+    /// the latest APPLIED consensus boundary: the last drained APP HEIGHT
+    /// (`view_base + engine view`) plus the app-hash after that drain settled.
+    /// this is what a state-sync service serves from
+    /// (`host::Host::capture_finalized_snapshot` demands exactly this pair) —
+    /// `None` until the first frame applies.
+    finalized: Option<host::FinalizedBlock>,
+    /// the app-height offset of the CURRENT engine's view 0. epoch cutover
+    /// respawns the engine with views restarting at 0; the base keeps `Env`
+    /// heights and the finalized boundary monotone across epochs
+    /// (`app_height = view_base + view` — the orchestrator's epoch_base).
+    view_base: u64,
+    /// the last ENGINE-relative view drained (what the valset orchestrator
+    /// observes and compares cutover views against). reset on epoch respawn.
+    last_engine_view: Option<u64>,
+    /// the deterministic CUTOVER CEILING: frames finalized at or past this
+    /// ENGINE view are DISCARDED, not applied. every honest node discards by
+    /// the same agreed rule, so a straggler op that finalizes on only some
+    /// nodes while engines are being torn down can never fork app state —
+    /// submitters resubmit in the new epoch.
+    view_ceiling: Option<u64>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
     pub fn new(host: Host, orderer: O) -> Self {
-        Self { host, orderer, effects: Vec::new() }
+        Self {
+            host,
+            orderer,
+            effects: Vec::new(),
+            finalized: None,
+            view_base: 0,
+            last_engine_view: None,
+            view_ceiling: None,
+        }
+    }
+
+    /// EPOCH CUTOVER: replace the orderer (dropping the old one aborts its
+    /// engine) and rebase app heights at `view_base` (the cutover app height —
+    /// the orchestrator's epoch_base). clears the ceiling and the
+    /// engine-relative view; the finalized boundary carries over.
+    ///
+    /// call this only after a final [`OrderedNode::drain_delivered`] under the
+    /// ceiling — anything the old engine finalized past the ceiling was
+    /// deterministically discarded on every honest node.
+    pub fn cutover(&mut self, orderer: O, view_base: u64) {
+        self.orderer = orderer;
+        self.view_base = view_base;
+        self.last_engine_view = None;
+        self.view_ceiling = None;
+        // effects of pre-cutover blocks remain takeable; frames buffered in
+        // the OLD orderer die with it (they were past the ceiling or already
+        // drained).
+    }
+
+    /// set the deterministic discard boundary for the CURRENT engine (see the
+    /// field doc). idempotent; cleared by [`OrderedNode::cutover`].
+    pub fn set_view_ceiling(&mut self, ceiling: u64) {
+        self.view_ceiling = Some(ceiling);
+    }
+
+    /// the last ENGINE-relative finalized view this node drained — the number
+    /// the valset orchestrator observes. `None` since the last cutover.
+    pub fn last_engine_view(&self) -> Option<u64> {
+        self.last_engine_view
     }
 
     /// SUBMIT — propose a locally-originated msg into the agreed order. framed
@@ -467,38 +586,79 @@ impl<O: Orderer> OrderedNode<O> {
     /// touch the local host: `app_hash()` is unchanged until the order delivers
     /// this frame back through [`OrderedNode::drain_delivered`] (the semantic
     /// shift — no optimistic echo).
-    pub async fn submit(&mut self, origin: &[u8], seq: u64, msg: Msg) -> Result<(), Error> {
-        self.orderer.submit(encode_frame(origin, seq, &msg)).await
+    pub async fn submit(&mut self, signer: &PrivateKey, seq: u64, msg: Msg) -> Result<(), Error> {
+        self.orderer.submit(encode_frame(signer, seq, &msg)).await
     }
 
     /// DRAIN — apply every frame the order delivered, STRICTLY in agreed order,
     /// via `host.submit`. returns the count applied (0 when idle) so a test can
     /// drive to a fixpoint deterministically.
+    ///
+    /// ## rejected vs fatal
+    ///
+    /// a DETERMINISTIC rejection (decode failure, module error, blown budget) is
+    /// a no-op: every honest validator finalized the identical op and rejects it
+    /// identically — the drain keeps going. a FATAL boundary fault
+    /// ([`host::SubmitError::Fatal`]) is node-local: this registry is now
+    /// indeterminate, so the drain STOPS and surfaces [`Error::Fatal`] — applying
+    /// even one more finalized op would compound a state no validator agreed on.
     pub async fn drain_delivered(&mut self) -> Result<usize, Error> {
         let delivered = self.orderer.poll_delivered();
         let mut applied = 0usize;
+        let mut last_view: Option<u64> = None;
         for (view, frame) in delivered {
-            // a FINALIZED op counts as processed whether or not it applies cleanly.
+            // a FINALIZED op counts as processed whether or not it applies
+            // cleanly — and its VIEW advances the engine clock either way (the
+            // view was agreed; discarding or rejecting its op is the same
+            // deterministic no-op on every honest node). without this, a node
+            // could never OBSERVE the views that carry it past its own cutover.
+            applied += 1;
+            last_view = Some(view);
+            // the CUTOVER CEILING: frames finalized at or past the agreed
+            // cutover view are DISCARDED — the same view-based rule on every
+            // honest node, so a straggler finalizing during teardown on only
+            // some nodes cannot fork app state.
+            if let Some(ceiling) = self.view_ceiling {
+                if view >= ceiling {
+                    continue;
+                }
+            }
             // one that fails to decode, or that a module rejects, is a DETERMINISTIC
             // no-op: every honest validator finalized the identical op and handles it
             // identically (host-lent rolls back a rejected block, root unchanged), so
             // the chain cannot fork — AND a byzantine proposer cannot HALT honest nodes
             // by getting a malformed op finalized. (the `?`-propagate that used to be
             // here stalled the whole drain on one bad op — the liveness gap.)
-            applied += 1;
             let Ok((origin, msg)) = decode_frame(&frame) else { continue };
-            // the agreed view is the block coordinate: height + consensus_time
-            // (a logical, agreed, monotonic clock — identical on every validator).
-            // the frame carries the op's real submitter as the root origin.
-            let ctx = BlockContext { height: view, consensus_time: view, origin };
+            // the agreed view is the block coordinate: the APP HEIGHT is the
+            // engine view offset by the epoch base, so heights and the logical
+            // clock stay monotone across epoch cutovers — identical on every
+            // validator. the frame carries the op's real submitter.
+            let height = self.view_base + view;
+            let ctx = BlockContext { height, consensus_time: height, origin };
             // surface each finalized block's effects for the reactor's worker
             // driver. a rejected op yields no outcome (deterministic no-op) and so
             // contributes no effects — same on every validator.
-            if let Ok(outcome) = self.host.submit_at(ctx, msg).await {
-                self.effects.extend(outcome.effects);
+            match self.host.submit_at(ctx, msg).await {
+                Ok(outcome) => self.effects.extend(outcome.effects),
+                Err(host::SubmitError::Rejected(_)) => {}
+                Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
             }
         }
+        if let Some(view) = last_view {
+            self.last_engine_view = Some(view);
+            self.finalized = Some(host::FinalizedBlock {
+                height: self.view_base + view,
+                app_hash: self.host.app_hash(),
+            });
+        }
         Ok(applied)
+    }
+
+    /// the latest APPLIED consensus boundary — what a state-sync service serves
+    /// from. `None` until the first delivered frame applies.
+    pub fn finalized(&self) -> Option<host::FinalizedBlock> {
+        self.finalized
     }
 
     /// the current app-hash of the wrapped host.

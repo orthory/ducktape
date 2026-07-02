@@ -1,0 +1,63 @@
+import type { CSSProperties, ReactNode } from "react";
+
+// Line-style icon set (stroke = currentColor) carried over from the design
+// source, trimmed to the icons this console uses.
+const PATHS: Record<string, ReactNode> = {
+  chat: <path d="M5 7a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-6l-4 3.5V14H7a2 2 0 0 1-2-2z" />,
+  tasks: (
+    <>
+      <path d="M12 3.4l6.6 2.3v5c0 4.2-2.8 7-6.6 8.5-3.8-1.5-6.6-4.3-6.6-8.5v-5z" />
+      <path d="M9.2 11.7l2 2 3.6-3.8" />
+    </>
+  ),
+  node: (
+    <>
+      <path d="M12 3.4l7.4 4.27v8.66L12 20.6l-7.4-4.27V7.67z" />
+      <circle cx="12" cy="12" r="2.3" />
+    </>
+  ),
+  settings: (
+    <>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 4v2M12 18v2M4 12h2M18 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M17.7 6.3l-1.4 1.4M7.7 16.3l-1.4 1.4" />
+    </>
+  ),
+  close: <path d="M6 6l12 12M18 6L6 18" />,
+  plus: <path d="M12 5v14M5 12h14" />,
+  check: <path d="M5 12.5l4 4 10-10" />,
+  chevronRight: <path d="M9 6l6 6-6 6" />,
+  hash: <path d="M9 4L7 20M17 4l-2 16M5 9h15M4 15h15" />,
+};
+
+export type IconName = keyof typeof PATHS;
+
+export function Icon({
+  name,
+  size = 18,
+  color = "currentColor",
+  strokeWidth = 1.6,
+  style,
+}: {
+  name: IconName;
+  size?: number;
+  color?: string;
+  strokeWidth?: number;
+  style?: CSSProperties;
+}) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ color, flexShrink: 0, ...style }}
+      aria-hidden="true"
+    >
+      {PATHS[name]}
+    </svg>
+  );
+}

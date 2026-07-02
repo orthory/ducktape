@@ -1,0 +1,17 @@
+[package]
+name = "ducktape-desktop"
+edition.workspace = true
+version.workspace = true
+
+# the desktop shell of the ducktape app: the SAME react console the web build
+# serves, in a native window. the node does NOT live here — the shell spawns
+# `ducktape-noded` as a detached orphan (see src/daemon.rs) and the webview
+# talks to it over the daemon's http/ws surface exactly like the web build
+# does. keeping this crate free of host/module deps is the point: one node
+# process, every ui a client.
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
