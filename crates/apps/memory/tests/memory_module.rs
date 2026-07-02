@@ -315,8 +315,8 @@ fn author_derives_from_origin_and_cannot_be_spoofed() {
         module.abort_block().await.unwrap();
         assert_eq!(module.root(), root0);
 
-        // authorship is never in the payload: external = hex, module = id,
-        // system = "system".
+        // authorship is never in the payload: external = domain-separated
+        // "ext:" + hex, module = id verbatim, system = "system".
         module
             .execute(
                 &mut TestCtx::with_origin(1, Origin::External(vec![0xab, 0x01, 0xff])),
@@ -338,7 +338,7 @@ fn author_derives_from_origin_and_cannot_be_spoofed() {
         module.commit_block().await.unwrap();
 
         for (path, author) in [
-            ("/user", "ab01ff"),
+            ("/user", "ext:ab01ff"),
             ("/module", "agent"),
             ("/system", "system"),
         ] {
@@ -568,6 +568,21 @@ fn caps_bound_snapshots_and_watches() {
     });
 }
 
+async fn ls(module: &Memory, path: &str, limit: u64) -> Vec<LsEntry> {
+    match query(
+        module,
+        MemoryQuery::Ls {
+            path: path.into(),
+            limit,
+        },
+    )
+    .await
+    {
+        MemoryReply::Ls(entries) => entries,
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
 #[test]
 fn ls_lists_implicit_dirs_and_files_sorted() {
     block_on(async {
@@ -582,11 +597,8 @@ fn ls_lists_implicit_dirs_and_files_sorted() {
 
         // "/a" is BOTH a file and an implied dir: the file entry wins in the
         // listing, and the dir remains listable directly.
-        let MemoryReply::Ls(entries) = query(&module, MemoryQuery::Ls { path: "/".into() }).await
-        else {
-            panic!("ls reply expected")
-        };
-        let rendered: Vec<(String, bool)> = entries
+        let rendered: Vec<(String, bool)> = ls(&module, "/", 256)
+            .await
             .iter()
             .map(|e| match e {
                 LsEntry::Dir { path } => (path.clone(), true),
@@ -599,12 +611,8 @@ fn ls_lists_implicit_dirs_and_files_sorted() {
             "root lists its direct children sorted, file shadowing the dir"
         );
 
-        let MemoryReply::Ls(entries) = query(&module, MemoryQuery::Ls { path: "/a".into() }).await
-        else {
-            panic!("ls reply expected")
-        };
         assert_eq!(
-            entries,
+            ls(&module, "/a", 256).await,
             vec![
                 LsEntry::Dir {
                     path: "/a/b".into()
@@ -613,16 +621,7 @@ fn ls_lists_implicit_dirs_and_files_sorted() {
             ]
         );
 
-        let MemoryReply::Ls(entries) = query(
-            &module,
-            MemoryQuery::Ls {
-                path: "/a/b".into(),
-            },
-        )
-        .await
-        else {
-            panic!("ls reply expected")
-        };
+        let entries = ls(&module, "/a/b", 256).await;
         let files: Vec<&str> = entries
             .iter()
             .map(|e| match e {
@@ -634,13 +633,47 @@ fn ls_lists_implicit_dirs_and_files_sorted() {
 
         // a leaf file and a missing dir both list as empty.
         for path in ["/a/b/c", "/ghost"] {
-            let MemoryReply::Ls(entries) =
-                query(&module, MemoryQuery::Ls { path: path.into() }).await
-            else {
-                panic!("ls reply expected")
-            };
-            assert!(entries.is_empty(), "{path} must list empty");
+            assert!(
+                ls(&module, path, 256).await.is_empty(),
+                "{path} must list empty"
+            );
         }
+    });
+}
+
+#[test]
+fn ls_clamps_the_limit_and_pages_in_sorted_order() {
+    block_on(async {
+        let mut module = Memory::new(MEMORY);
+        // 257 children under one dir: one more than the clamp.
+        for i in 0..257 {
+            module
+                .execute(
+                    &mut TestCtx::at(1),
+                    &module_msg(publish(&format!("/d/f{i:03}"), "")),
+                )
+                .await
+                .unwrap();
+        }
+        module.commit_block().await.unwrap();
+
+        let all = ls(&module, "/d", 1_000).await;
+        assert_eq!(all.len(), 256, "an oversized limit clamps to 256");
+
+        let page = ls(&module, "/d", 5).await;
+        let paths: Vec<&str> = page
+            .iter()
+            .map(|e| match e {
+                LsEntry::File(stat) => stat.path.as_str(),
+                LsEntry::Dir { path } => panic!("unexpected dir {path}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            ["/d/f000", "/d/f001", "/d/f002", "/d/f003", "/d/f004"],
+            "a small limit takes the sorted-first entries"
+        );
+        assert!(ls(&module, "/d", 0).await.is_empty());
     });
 }
 
@@ -998,23 +1031,26 @@ fn watches_fan_out_one_event_per_module_and_unregister_stops_them() {
             .unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         module.abort_block().await.unwrap();
-        // a relative prefix is rejected too.
-        let err = module
-            .execute(
-                &mut TestCtx::at(1).knowing("agent"),
-                &module_msg(MemoryMsg::RegisterWatch {
-                    prefix: "skills/".into(),
-                    module_id: "agent".into(),
-                }),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
-        module.abort_block().await.unwrap();
+        // a watch prefix must be a CANONICAL path: relative, trailing-slash,
+        // and dot-segment spellings are all rejected at registration time.
+        for prefix in ["skills/", "/skills/", "/skills/./x", ""] {
+            let err = module
+                .execute(
+                    &mut TestCtx::at(1).knowing("agent"),
+                    &module_msg(MemoryMsg::RegisterWatch {
+                        prefix: prefix.into(),
+                        module_id: "agent".into(),
+                    }),
+                )
+                .await
+                .expect_err(&format!("{prefix:?} must be rejected"));
+            assert!(matches!(err, Error::Module(_)));
+            module.abort_block().await.unwrap();
+        }
 
-        // agent watches /skills/ twice over (overlapping prefixes) and bot
+        // agent watches /skills twice over (overlapping prefixes) and bot
         // watches everything: a publish must reach each module exactly ONCE.
-        for (prefix, module_id) in [("/skills/", "agent"), ("/", "agent"), ("/", "bot")] {
+        for (prefix, module_id) in [("/skills", "agent"), ("/", "agent"), ("/", "bot")] {
             module
                 .execute(
                     &mut TestCtx::at(2).knowing(module_id),
@@ -1070,7 +1106,7 @@ fn watches_fan_out_one_event_per_module_and_unregister_stops_them() {
             "agent's / watch still matches"
         );
 
-        // unregistering is exact per (prefix, module): agent keeps /skills/.
+        // unregistering is exact per (prefix, module): agent keeps /skills.
         for msg in [
             MemoryMsg::UnregisterWatch {
                 prefix: "/".into(),
@@ -1103,7 +1139,7 @@ fn watches_fan_out_one_event_per_module_and_unregister_stops_them() {
                 .map(|m| m.target.as_str())
                 .collect::<Vec<_>>(),
             ["agent"],
-            "only the surviving /skills/ watch fires"
+            "only the surviving /skills watch fires"
         );
         let mut ctx = TestCtx::at(6);
         module
@@ -1112,6 +1148,73 @@ fn watches_fan_out_one_event_per_module_and_unregister_stops_them() {
             .unwrap();
         module.commit_block().await.unwrap();
         assert!(ctx.emitted.is_empty());
+    });
+}
+
+#[test]
+fn watch_matching_is_segment_aware_not_a_string_prefix() {
+    block_on(async {
+        let mut module = Memory::new(MEMORY);
+        module
+            .execute(
+                &mut TestCtx::at(1).knowing("agent"),
+                &module_msg(MemoryMsg::RegisterWatch {
+                    prefix: "/a".into(),
+                    module_id: "agent".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // "/ab" shares the string prefix but NOT the path segment: no event.
+        let mut ctx = TestCtx::at(2);
+        module
+            .execute(&mut ctx, &module_msg(publish("/ab", "x")))
+            .await
+            .unwrap();
+        assert!(ctx.emitted.is_empty(), "/a must not match /ab");
+
+        // the exact path and true descendants both match.
+        let mut ctx = TestCtx::at(2);
+        module
+            .execute(&mut ctx, &module_msg(publish("/a", "x")))
+            .await
+            .unwrap();
+        assert_eq!(ctx.emitted.len(), 1, "/a matches itself");
+        let mut ctx = TestCtx::at(2);
+        module
+            .execute(&mut ctx, &module_msg(publish("/a/b", "x")))
+            .await
+            .unwrap();
+        assert_eq!(ctx.emitted.len(), 1, "/a matches /a/b");
+        module.commit_block().await.unwrap();
+
+        // the root watch matches everything, "/ab" included.
+        module
+            .execute(
+                &mut TestCtx::at(3).knowing("bot"),
+                &module_msg(MemoryMsg::RegisterWatch {
+                    prefix: "/".into(),
+                    module_id: "bot".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let mut ctx = TestCtx::at(3);
+        module
+            .execute(&mut ctx, &module_msg(publish("/ab", "y")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        assert_eq!(
+            ctx.emitted
+                .iter()
+                .map(|m| m.target.as_str())
+                .collect::<Vec<_>>(),
+            ["bot"],
+            "the root watch fires; the /a watch still does not"
+        );
     });
 }
 
@@ -1202,7 +1305,7 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
             .execute(
                 &mut TestCtx::at(2).knowing("agent"),
                 &module_msg(MemoryMsg::RegisterWatch {
-                    prefix: "/skills/".into(),
+                    prefix: "/skills".into(),
                     module_id: "agent".into(),
                 }),
             )
@@ -1252,6 +1355,116 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
         // the identical root (canonical encoding, no incidental state).
         assert_ne!(source.root(), StateRoot::ZERO);
     });
+}
+
+// ---- hand-encoding helpers mirroring the module's canonical byte layout ----
+
+fn push_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_str(out: &mut Vec<u8>, s: &str) {
+    push_u64(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// one generation record: empty meta, "system" author, height 1.
+fn push_gen(out: &mut Vec<u8>, path: &str, generation: u64, body: &str) {
+    push_str(out, path);
+    push_u64(out, generation);
+    push_str(out, body);
+    push_u64(out, 0); // meta entries
+    push_str(out, "system");
+    push_u64(out, 1); // published_at_height
+}
+
+fn sha256_root(bytes: &[u8]) -> StateRoot {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    StateRoot(h.finalize().into())
+}
+
+#[test]
+fn install_rejects_non_canonical_bytes_even_with_a_colluding_root() {
+    // each evil image is presented WITH the root of its own bytes (the
+    // colluding-root case): the byte hash passes by construction, so the
+    // strict decode has to be the wall that keeps the state out.
+
+    // duplicate (path, generation) keys — a lenient decode would silently
+    // collapse them via insert-overwrite.
+    let mut dup = Vec::new();
+    push_u64(&mut dup, 1); // live count
+    push_str(&mut dup, "/a");
+    push_u64(&mut dup, 1); // first
+    push_u64(&mut dup, 1); // latest
+    push_u64(&mut dup, 2); // gens count
+    push_gen(&mut dup, "/a", 1, "x");
+    push_gen(&mut dup, "/a", 1, "y");
+    push_u64(&mut dup, 0); // snapshots
+    push_u64(&mut dup, 0); // watches
+
+    // a reordered (descending) live section — same set, non-canonical order.
+    let mut desc = Vec::new();
+    push_u64(&mut desc, 2);
+    push_str(&mut desc, "/b");
+    push_u64(&mut desc, 1);
+    push_u64(&mut desc, 1);
+    push_str(&mut desc, "/a");
+    push_u64(&mut desc, 1);
+    push_u64(&mut desc, 1);
+    push_u64(&mut desc, 2);
+    push_gen(&mut desc, "/a", 1, "x");
+    push_gen(&mut desc, "/b", 1, "y");
+    push_u64(&mut desc, 0);
+    push_u64(&mut desc, 0);
+
+    // a live head whose generation records are absent.
+    let mut ghost = Vec::new();
+    push_u64(&mut ghost, 1);
+    push_str(&mut ghost, "/a");
+    push_u64(&mut ghost, 1);
+    push_u64(&mut ghost, 1);
+    push_u64(&mut ghost, 0); // gens
+    push_u64(&mut ghost, 0); // snapshots
+    push_u64(&mut ghost, 0); // watches
+
+    // a snapshot pin referencing a missing generation record.
+    let mut pin = Vec::new();
+    push_u64(&mut pin, 0); // live
+    push_u64(&mut pin, 0); // gens
+    push_u64(&mut pin, 1); // snapshots
+    push_str(&mut pin, "s");
+    push_u64(&mut pin, 1); // pin count
+    push_str(&mut pin, "/a");
+    push_u64(&mut pin, 1);
+    push_u64(&mut pin, 0); // watches
+
+    // a non-canonical (trailing-slash) watch prefix.
+    let mut watch = Vec::new();
+    push_u64(&mut watch, 0);
+    push_u64(&mut watch, 0);
+    push_u64(&mut watch, 0);
+    push_u64(&mut watch, 1);
+    push_str(&mut watch, "/skills/");
+    push_str(&mut watch, "agent");
+
+    for (bytes, what) in [
+        (dup, "duplicate generation keys"),
+        (desc, "descending live paths"),
+        (ghost, "live head without records"),
+        (pin, "dangling snapshot pin"),
+        (watch, "non-canonical watch prefix"),
+    ] {
+        let colluding_root = sha256_root(&bytes);
+        let empty_root = Memory::new(MEMORY).root();
+        let mut target = Memory::new(MEMORY);
+        let err = target
+            .install(&bytes, colluding_root)
+            .expect_err(&format!("{what} must be rejected"));
+        assert!(matches!(err, Error::Module(_)), "{what}");
+        assert_eq!(target.root(), empty_root, "{what} must not adopt anything");
+    }
 }
 
 // a watcher whose execute always fails — proves publish + fan-out are atomic.

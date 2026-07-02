@@ -158,7 +158,7 @@ impl Memory {
             // overlapping prefixes), in sorted order.
             let mut targets: BTreeSet<String> = BTreeSet::new();
             for (prefix, module_id) in &store.watches {
-                if path.starts_with(prefix.as_str()) {
+                if watch_matches(prefix, &path) {
                     targets.insert(module_id.clone());
                 }
             }
@@ -293,14 +293,23 @@ impl Memory {
         self.committed.encode()
     }
 
-    /// adopt a peer image only after verifying it re-derives `expected` (the
-    /// consensus-committed root). the root comparison is the integrity check.
+    /// adopt a peer image only after verifying it against `expected` (the
+    /// consensus-committed root).
+    ///
+    /// the hash authenticates the BYTES, not the decoded state: `snapshot()` is
+    /// the exact root preimage, so honest bytes hash to the committed root
+    /// directly, and any non-canonical re-encoding (e.g. duplicate-key sections
+    /// a lenient decode would collapse via insert-overwrite) is rejected before
+    /// it is ever parsed. the strict [`Store::decode`] behind it rejects
+    /// execute-unreachable states outright, so even a colluding root recomputed
+    /// from evil bytes cannot smuggle one in.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let store = Store::decode(bytes)?;
-        if Self::root_of(&store) != expected {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        if StateRoot(h.finalize().into()) != expected {
             return Err(Error::Module("snapshot root mismatch".into()));
         }
-        self.committed = store;
+        self.committed = Store::decode(bytes)?;
         self.pending = None;
         Ok(())
     }
@@ -337,12 +346,13 @@ impl Store {
             .any(|pins| pins.get(path) == Some(&g))
     }
 
-    fn stat_of(&self, path: &str, head: &LiveHead) -> FileStat {
-        let latest = self
-            .gens
-            .get(&(path.to_string(), head.latest))
-            .expect("live head generation is always present");
-        FileStat {
+    /// the [`FileStat`] of a live head, or `None` if its latest record is
+    /// missing. strict decode makes that state unreachable, but a query path
+    /// must NEVER panic (a panic here is a validator crash), so the miss
+    /// degrades to "not visible" instead.
+    fn stat_of(&self, path: &str, head: &LiveHead) -> Option<FileStat> {
+        let latest = self.gens.get(&(path.to_string(), head.latest))?;
+        Some(FileStat {
             path: path.to_string(),
             latest_generation: head.latest,
             generations: head.latest - head.first + 1,
@@ -350,14 +360,15 @@ impl Store {
             latest_author: latest.author.clone(),
             latest_published_at_height: latest.published_at_height,
             body_len: latest.body.len() as u64,
-        }
+        })
     }
 
     // ---- read verbs (all against this committed store) ---------------------
 
-    fn ls(&self, path: &str) -> Result<Vec<LsEntry>, Error> {
+    fn ls(&self, path: &str, limit: u64) -> Result<Vec<LsEntry>, Error> {
         let dir = validate_query_path(path)?;
         let depth = dir.len();
+        let limit = limit.min(MAX_QUERY_LIMIT) as usize;
         // File wins over Dir on a colliding child path (a concrete file shadows
         // the implied directory in the listing; the dir is still Ls-able directly).
         let mut entries: BTreeMap<String, LsEntry> = BTreeMap::new();
@@ -368,7 +379,10 @@ impl Store {
                 continue;
             }
             if fseg.len() == depth + 1 {
-                entries.insert(fpath.clone(), LsEntry::File(self.stat_of(fpath, head)));
+                let Some(stat) = self.stat_of(fpath, head) else {
+                    continue;
+                };
+                entries.insert(fpath.clone(), LsEntry::File(stat));
             } else {
                 dirs.push(canonical_path(&fseg[..depth + 1]));
             }
@@ -378,12 +392,15 @@ impl Store {
                 .entry(dir_path.clone())
                 .or_insert(LsEntry::Dir { path: dir_path });
         }
-        Ok(entries.into_values().collect())
+        Ok(entries.into_values().take(limit).collect())
     }
 
     fn stat(&self, path: &str) -> Result<Option<FileStat>, Error> {
         let path = validate_file_path(path)?;
-        Ok(self.live.get(&path).map(|head| self.stat_of(&path, head)))
+        Ok(self
+            .live
+            .get(&path)
+            .and_then(|head| self.stat_of(&path, head)))
     }
 
     fn read(
@@ -430,7 +447,9 @@ impl Store {
             if !path.starts_with(prefix) {
                 continue;
             }
-            let stat = self.stat_of(path, head);
+            let Some(stat) = self.stat_of(path, head) else {
+                continue;
+            };
             if meta_filter
                 .iter()
                 .all(|(k, v)| stat.latest_meta.get(k) == Some(v))
@@ -449,10 +468,11 @@ impl Store {
                 continue;
             }
             let generation = head.latest;
-            let record = self
-                .gens
-                .get(&(path.clone(), generation))
-                .expect("live head generation is always present");
+            // like stat_of: a missing record is unreachable past strict decode,
+            // but a query must degrade gracefully rather than panic.
+            let Some(record) = self.gens.get(&(path.clone(), generation)) else {
+                continue;
+            };
             for (idx, line) in record.body.split('\n').enumerate() {
                 if hits.len() >= limit {
                     return hits;
@@ -508,25 +528,66 @@ impl Store {
         out
     }
 
+    /// strict decode: only canonical encodings of execute-reachable states are
+    /// accepted. every section demands strictly-ascending unique keys (the only
+    /// order [`Store::encode`] emits), canonical paths, execute-time caps, live
+    /// heads whose FULL generation range is present (publish inserts each
+    /// record; delete only removes records when the head goes), and snapshot
+    /// pins that resolve to a present record. anything else is rejected — an
+    /// honest validator can never have committed it.
     fn decode(bytes: &[u8]) -> Result<Store, Error> {
         let mut off = 0usize;
         let mut store = Store::default();
 
         for _ in 0..read_count(bytes, &mut off)? {
             let path = read_string(bytes, &mut off)?;
+            validate_file_path(&path)?;
             let first = read_u64(bytes, &mut off)?;
             let latest = read_u64(bytes, &mut off)?;
+            // generation numbering starts at 1, and one incarnation never holds
+            // more than the generation cap (also bounds the range walk below).
+            if first == 0 || first > latest || latest - first >= MAX_GENERATIONS_PER_PATH {
+                return Err(Error::Module("snapshot live head range is invalid".into()));
+            }
+            if store
+                .live
+                .last_key_value()
+                .is_some_and(|(last, _)| last.as_str() >= path.as_str())
+            {
+                return Err(Error::Module(
+                    "snapshot live paths not strictly ascending".into(),
+                ));
+            }
             store.live.insert(path, LiveHead { first, latest });
         }
+
         for _ in 0..read_count(bytes, &mut off)? {
             let path = read_string(bytes, &mut off)?;
+            validate_file_path(&path)?;
             let generation = read_u64(bytes, &mut off)?;
+            if generation == 0 {
+                return Err(Error::Module("snapshot generation must be >= 1".into()));
+            }
             let body = read_string(bytes, &mut off)?;
+            if body.len() > MAX_BODY_BYTES {
+                return Err(Error::Module("snapshot body exceeds cap".into()));
+            }
             let meta = read_meta(bytes, &mut off)?;
+            validate_meta(&meta)?;
             let author = read_string(bytes, &mut off)?;
             let published_at_height = read_u64(bytes, &mut off)?;
+            let key = (path, generation);
+            if store
+                .gens
+                .last_key_value()
+                .is_some_and(|(last, _)| *last >= key)
+            {
+                return Err(Error::Module(
+                    "snapshot generation keys not strictly ascending".into(),
+                ));
+            }
             store.gens.insert(
-                (path, generation),
+                key,
                 Generation {
                     generation,
                     body,
@@ -536,21 +597,71 @@ impl Store {
                 },
             );
         }
+
+        // every live head's full [first..=latest] range must be present.
+        for (path, head) in &store.live {
+            for g in head.first..=head.latest {
+                if !store.gens.contains_key(&(path.clone(), g)) {
+                    return Err(Error::Module(
+                        "snapshot live head missing a generation record".into(),
+                    ));
+                }
+            }
+        }
+
         for _ in 0..read_count(bytes, &mut off)? {
             let name = read_string(bytes, &mut off)?;
-            let mut pins = BTreeMap::new();
+            if name.is_empty() || name.len() > MAX_SNAPSHOT_NAME_BYTES {
+                return Err(Error::Module("snapshot name is invalid".into()));
+            }
+            if store
+                .snapshots
+                .last_key_value()
+                .is_some_and(|(last, _)| last.as_str() >= name.as_str())
+            {
+                return Err(Error::Module(
+                    "snapshot names not strictly ascending".into(),
+                ));
+            }
+            let mut pins: BTreeMap<String, u64> = BTreeMap::new();
             for _ in 0..read_count(bytes, &mut off)? {
                 let path = read_string(bytes, &mut off)?;
+                validate_file_path(&path)?;
                 let g = read_u64(bytes, &mut off)?;
+                if pins
+                    .last_key_value()
+                    .is_some_and(|(last, _)| last.as_str() >= path.as_str())
+                {
+                    return Err(Error::Module(
+                        "snapshot pin paths not strictly ascending".into(),
+                    ));
+                }
+                if !store.gens.contains_key(&(path.clone(), g)) {
+                    return Err(Error::Module(
+                        "snapshot pin references a missing generation".into(),
+                    ));
+                }
                 pins.insert(path, g);
             }
             store.snapshots.insert(name, pins);
         }
+
         for _ in 0..read_count(bytes, &mut off)? {
             let prefix = read_string(bytes, &mut off)?;
+            validate_prefix(&prefix)?;
             let module_id = read_string(bytes, &mut off)?;
-            store.watches.insert((prefix, module_id));
+            if module_id.is_empty() || module_id.len() > MAX_MODULE_ID_BYTES {
+                return Err(Error::Module("snapshot watch module id is invalid".into()));
+            }
+            let key = (prefix, module_id);
+            if store.watches.last().is_some_and(|last| *last >= key) {
+                return Err(Error::Module(
+                    "snapshot watches not strictly ascending".into(),
+                ));
+            }
+            store.watches.insert(key);
         }
+
         if off != bytes.len() {
             return Err(Error::Module("snapshot has trailing bytes".into()));
         }
@@ -597,7 +708,7 @@ impl Module for Memory {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         let reply = match decode_query(req).map_err(Error::Module)? {
-            MemoryQuery::Ls { path } => MemoryReply::Ls(self.committed.ls(&path)?),
+            MemoryQuery::Ls { path, limit } => MemoryReply::Ls(self.committed.ls(&path, limit)?),
             MemoryQuery::Stat { path } => MemoryReply::Stat(self.committed.stat(&path)?),
             MemoryQuery::Read {
                 path,
@@ -633,12 +744,16 @@ impl Module for Memory {
 
 // ---- validation & helpers --------------------------------------------------
 
+/// derive the stored author from the dispatch origin — never from a payload.
+/// external identities are domain-separated as `"ext:"` + lowercase hex (the
+/// cross-module convention shared with jobs/inbox/files), so a hex-shaped
+/// module id can never collide with an external identity.
 fn author_from_origin(origin: &Origin) -> Result<String, Error> {
     match origin {
         Origin::External(bytes) if bytes.is_empty() => {
             Err(Error::Module("unauthenticated external origin".into()))
         }
-        Origin::External(bytes) => Ok(hex(bytes)),
+        Origin::External(bytes) => Ok(format!("ext:{}", hex(bytes))),
         Origin::Module(id) => Ok(id.clone()),
         Origin::System => Ok("system".into()),
     }
@@ -736,17 +851,21 @@ fn validate_meta(meta: &Meta) -> Result<(), Error> {
     Ok(())
 }
 
+/// a watch prefix is a CANONICAL absolute path — the same segment validation as
+/// file paths, with the root `"/"` additionally allowed (watch everything).
 fn validate_prefix(prefix: &str) -> Result<(), Error> {
-    if prefix.is_empty() {
-        return Err(Error::Module("watch prefix must not be empty".into()));
-    }
-    if !prefix.starts_with('/') {
-        return Err(Error::Module("watch prefix must be absolute".into()));
-    }
-    if prefix.len() > MAX_PATH_BYTES {
-        return Err(Error::Module("watch prefix exceeds byte cap".into()));
-    }
-    Ok(())
+    normalize_segments(prefix).map(|_| ())
+}
+
+/// segment-aware subtree match: the root watches everything; otherwise the
+/// published path must BE the prefix or live strictly below it — a `/a` watch
+/// matches `/a` and `/a/b` but never `/ab`.
+fn watch_matches(prefix: &str, path: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// truncate to at most `max_bytes`, backing off to the previous char boundary so
@@ -816,4 +935,29 @@ fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, Error> {
         .map_err(|_| Error::Module("snapshot string is not utf-8".into()))?;
     *off += len;
     Ok(value.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// strict decode makes a live head without its generation record
+    /// unreachable, but if such a state ever existed in memory the read verbs
+    /// must degrade gracefully (skip / None) — a panic in a query path is a
+    /// validator crash.
+    #[test]
+    fn read_verbs_degrade_gracefully_on_a_missing_head_record() {
+        let mut store = Store::default();
+        let head = LiveHead {
+            first: 1,
+            latest: 1,
+        };
+        store.live.insert("/ghost".into(), head);
+
+        assert_eq!(store.stat_of("/ghost", &head), None);
+        assert_eq!(store.stat("/ghost").unwrap(), None);
+        assert!(store.ls("/", 256).unwrap().is_empty());
+        assert!(store.find("/", &BTreeMap::new(), 256).is_empty());
+        assert!(store.grep("/", "", 256).is_empty());
+    }
 }

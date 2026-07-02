@@ -76,8 +76,10 @@ pub struct Generation {
     pub generation: u64,
     pub body: String,
     pub meta: Meta,
-    /// derived from `Env.origin` — a module id, hex of the external submitter's
-    /// bytes, or `"system"`; never caller-supplied.
+    /// derived from `Env.origin` — a module id verbatim, `"ext:"` + lowercase
+    /// hex of the external submitter's bytes (domain-separated so a module id
+    /// can never collide with a hex identity), or `"system"`; never
+    /// caller-supplied.
     pub author: String,
     pub published_at_height: u64,
 }
@@ -133,9 +135,11 @@ pub enum MemoryMsg {
     DropSnapshot {
         name: String,
     },
-    /// subscribe `module_id` to publishes whose path starts with `prefix`. on
-    /// every successful publish, one follow-up [`MemoryEvent::Published`] is
-    /// emitted to each matching watcher module (the chat-hook fan-out pattern).
+    /// subscribe `module_id` to publishes at or below `prefix`, which must be a
+    /// CANONICAL absolute path (`"/"` watches the whole namespace). matching is
+    /// segment-aware: `/a` matches `/a` and `/a/b` but never `/ab`. on every
+    /// successful publish, one follow-up [`MemoryEvent::Published`] is emitted
+    /// to each matching watcher module (the chat-hook fan-out pattern).
     RegisterWatch {
         prefix: String,
         module_id: String,
@@ -148,8 +152,9 @@ pub enum MemoryMsg {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum MemoryQuery {
-    /// entries directly under `path` (child dirs + files), sorted by path.
-    Ls { path: String },
+    /// entries directly under `path` (child dirs + files), sorted by path, up
+    /// to `limit` (clamped to [`MAX_QUERY_LIMIT`]).
+    Ls { path: String, limit: u64 },
     /// the [`FileStat`] of one file, or `None`.
     Stat { path: String },
     /// one generation of a file. `generation` and `snapshot` are mutually
