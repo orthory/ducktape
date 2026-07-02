@@ -1,0 +1,34 @@
+# Network and Membership
+
+repo에는 현재 세 가지 network 및 membership concern이 분리되어 있다. message
+propagation, ordered consensus delivery, validator membership state다.
+
+## Propagation Seam
+
+`crates/kernel/node`는 byte-oriented transport seam과 in-process loopback 구현을
+정의한다. loopback path는 deterministic local convergence test를 위한 것이다.
+outbound message는 local apply 후 encode되어 peer에게 전달되고, inbound message는
+apply되지만 re-broadcast되지 않는다.
+
+이 path는 node/host boundary test에 유용하지만, order-dependent root를 위한 live
+consensus path는 아니다.
+
+## Ordered Consensus Path
+
+`OrderedNode`는 `Orderer`에서 finalized operation을 apply한다. commonware
+Simplex-backed orderer는 `crates/kernel/consensus`에 있고, `bin/node`가 이를
+real-socket validator process에 연결한다.
+
+ordered path는 load-bearing이다. QMDB root가 operation order에 의존하기 때문이다.
+validator는 transport가 우연히 전달한 순서가 아니라 shared finalized sequence를
+apply해야 한다.
+
+## Valset State
+
+`crates/system/valset`은 validator membership을 module state로 저장한다.
+`valset-interface`를 통해 typed message와 query를 노출하며, demo는 ed25519 public
+key가 담긴 join message를 apply한다.
+
+남은 membership work는 consensus epoch 주변 orchestration이다. repo에는 respawn
+behavior test가 있지만, finalized valset state를 watch하고 cutover를 조율하는
+live loop는 아직 미래 작업이다.

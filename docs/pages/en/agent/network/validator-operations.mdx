@@ -1,0 +1,26 @@
+# Validator Operations
+
+Ducktape has separate seams for propagation, ordered consensus delivery, and
+validator membership. Do not collapse those concepts in docs or code.
+
+## Propagation
+
+`crates/kernel/node` includes the loopback transport seam used for deterministic
+local convergence tests. It is not the load-bearing path for QMDB root order.
+
+## Ordered Path
+
+`OrderedNode<O>` applies finalized operations from an `Orderer`. The commonware
+Simplex orderer lives under `crates/kernel/consensus`, and `bin/node` wires it
+into a real-socket validator process.
+
+The ordered path is required because QMDB roots depend on write order.
+
+## Membership
+
+`crates/system/valset` stores validator membership as module state. Dynamic
+valset work must connect finalized valset state to consensus epoch cutover,
+transport readiness, and state-sync readiness.
+
+When editing membership behavior, look for tests around respawn, joiner
+incorporation, and finalized epoch boundaries.

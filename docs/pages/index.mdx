@@ -1,35 +1,29 @@
-# Ducktape
+# Ducktape Docs
 
-Ducktape is a consensus-based workplace super-app: a single BFT-replicated state
-machine that hosts isolated product modules such as documents, forge, chat, and
-agent workflows. Each module owns its authenticated state substrate and exposes
-only a 32-byte root to the host. The host composes those module roots into the
-global app-hash that consensus commits.
+Ducktape docs are split on two axes:
 
-The core rule is simple: modules do not link to each other's implementation
-crates. They depend on `sdk` and on types-only interface crates for the modules
-they need to address. Cross-module reads go through host-routed queries;
-cross-module writes are emitted as messages that the host drains as follow-up
-ops.
+- reader: human-facing product and architecture explanations, or agent-facing
+  operating notes for coding agents;
+- language: English or Korean.
 
-## Current Status
+Pick the track that matches the job before reading deeper.
 
-- The module contract, host registry, global app-hash, ordered node path,
-  commonware Simplex orderer, saga/reactor async seam, and several root-backed
-  product modules exist in the repository.
-- The demo registers the platform modules and product modules together, then
-  shows their roots moving under one composed app-hash.
-- State sync exists for QMDB-backed modules, forge, and snapshot-style modules;
-  the capstone test proves a joiner can rebuild every module and land on the
-  source app-hash.
-- The remaining work is mostly live orchestration: network-backed sync paths,
-  dynamic valset wiring, serving snapshots from a running node, and fuller
-  product modules.
+## Human Readers
 
-## Read Next
+- [English human docs](/en/human) explain the platform, current repo status,
+  architecture, product modules, and roadmap.
+- [Korean human docs](/ko/human) cover the same platform facts in Korean for
+  product and architecture review.
 
-- [Quick Start](/start/quick-start) for the commands that prove the current
-  platform.
-- [Platform Invariants](/architecture/platform-invariants) for the rules that
-  keep the state machine deterministic.
-- [What Is Left](/roadmap/what-is-left) for the implementation frontier.
+## Agents
+
+- [English agent docs](/en/agent) are task-oriented: where to look, what to run,
+  and which invariants must not be broken.
+- [Korean agent docs](/ko/agent) mirror the agent track in Korean for the same
+  operating workflow.
+
+## Repository Contract
+
+The docs project lives at `docs/` and uses Vocs with `srcDir: "."`. Page files
+live under `docs/pages`; do not create a nested `docs/docs` tree. The docs
+package manager is Bun.

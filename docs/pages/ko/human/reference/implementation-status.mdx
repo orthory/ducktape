@@ -1,0 +1,37 @@
+# Implementation Status
+
+이 status page는 checked-in code, test, binary에 근거한다.
+
+## Platform Spine
+
+- `sdk`는 module contract와 deterministic system API를 정의한다.
+- `host`는 registry dispatch, FIFO follow-up drain, block commit/abort를 소유한다.
+- `state`는 module root를 order-independent app-hash로 합성한다.
+- `node`는 host application과 transport 또는 ordered delivery를 연결한다.
+- `consensus`에는 commonware Simplex-backed orderer가 있다.
+- `reactor`는 worker result를 일반 message로 submit하여 non-deterministic worker
+  boundary를 닫는다.
+
+## Module State
+
+- QMDB-backed module은 실제 authenticated root와 state-sync target을 노출한다.
+- Forge는 git state에서 32바이트 state root를 계산하고 install 전에 object closure를
+  verify한다.
+- Snapshot-style module은 module에 맞는 canonical byte를 사용한다.
+- Messaging, chat, agent module은 현재 workspace에 연결되어 있다.
+
+## Verification Surface
+
+- `cargo test --workspace`는 Rust workspace를 검증한다.
+- `cargo run -p demo`는 in-process multi-module walkthrough를 실행한다.
+- `cargo test -p demo --test joiner_rebuilds_global_app_hash`는 joiner가 모든 module을
+  rebuild하고 source app-hash와 match할 수 있음을 증명한다.
+- `bin/node/examples/demo-2node.sh`는 commonware-backed node path에서 두 OS process를
+  구동한다.
+
+## Still Open
+
+- live node에서 network-backed module sync.
+- epoch cutover 주변 dynamic valset orchestration.
+- running node에서 snapshot-at-height serving.
+- chat, agent, tasks의 product depth.

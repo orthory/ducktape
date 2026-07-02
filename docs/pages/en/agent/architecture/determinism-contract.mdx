@@ -1,0 +1,29 @@
+# Determinism Contract
+
+Ducktape is safe only when every validator derives the same module roots from the
+same agreed operation order. Agent edits must preserve that contract.
+
+## Inside Execution
+
+Allowed inputs are agreed data: operation bytes, agreed height/time, module id,
+origin, and deterministic state reads. Disallowed inputs include wall clock,
+randomness, network IO, LLM calls, filesystem discovery, and external fetches.
+
+If a feature needs a non-deterministic answer, model it as an `Effect` and return
+the answer later as ordered data.
+
+## Cross-Module Work
+
+Read through `Ctx::query` or `Ctx::module_root`. Write by emitting `Msg` intents.
+Do not add direct implementation dependencies between product modules.
+
+Interface crates are the legal vocabulary for typed payloads and queries. The
+host still routes opaque bytes by target module id.
+
+## Block Boundary
+
+Modules stage writes during `execute`; the host owns the block boundary. A clean
+follow-up drain commits touched modules. Any error or dispatch-budget breach
+aborts touched modules and leaves roots unchanged.
+
+When changing host dispatch, check both the success path and the rollback path.

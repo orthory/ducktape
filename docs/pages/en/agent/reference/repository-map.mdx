@@ -1,0 +1,35 @@
+# Repository Map
+
+Use this map to find the authoritative surface before editing.
+
+## Kernel
+
+- `crates/kernel/sdk`: module contract and deterministic system API.
+- `crates/kernel/state`: global app-hash composition.
+- `crates/kernel/host`: registry, dispatch, follow-up drain, commit/abort.
+- `crates/kernel/node`: loopback and ordered node seams.
+- `crates/kernel/consensus`: Simplex orderer, content store, relay, inbox,
+  resolver fetch, scheme boundaries.
+- `crates/kernel/reactor`: host-owned worker loop for effects.
+
+## System
+
+- `crates/system/kv`: QMDB byte-key module.
+- `crates/system/valset`: validator membership state.
+- `crates/system/saga`: deterministic continuation state.
+- `*-interface`: typed payload and query surfaces.
+
+## Apps
+
+- `crates/apps/document`: QMDB document state.
+- `crates/apps/forge`: git-backed project state.
+- `crates/apps/messaging`: shared message storage.
+- `crates/apps/chat`: chat view.
+- `crates/apps/agent`: agent sessions over messaging-backed threads.
+
+## Docs
+
+- `docs/pages/en/human`: English human-facing docs.
+- `docs/pages/ko/human`: Korean human-facing docs.
+- `docs/pages/en/agent`: English agent-facing docs.
+- `docs/pages/ko/agent`: Korean agent-facing docs.

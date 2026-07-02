@@ -1,0 +1,41 @@
+# What Is Left
+
+repo는 core architecture threshold를 넘었다. 남은 일은 live control plane과 그
+주변의 product depth다.
+
+## Network State Sync
+
+module sync path는 in-process로 증명되어 있다. 빠진 live path는 test-only
+in-process resolver가 아니라 running network 위에서 module sync data를 serve하고
+fetch하는 resolver다.
+
+## Dynamic Valset Orchestration
+
+consensus respawn behavior는 epoch boundary에서 joiner를 편입하는 test coverage를
+가진다. 남은 일은 이 behavior를 live module state 및 node orchestration에 연결하는
+것이다.
+
+- finalized valset state를 watch한다.
+- deterministic cutover point를 결정하고 publish한다.
+- old orderer instance를 stop하고 new epoch를 일관되게 start한다.
+- transport와 state-sync readiness를 membership change와 맞춘다.
+
+state sync는 joiner catch-up의 개념적 blocker가 아니지만, live orchestration은
+아직 wiring이 필요하다.
+
+## Live Snapshot Serving
+
+capstone test는 joiner가 module target과 snapshot에서 rebuild할 수 있음을 증명한다.
+running node는 finalized height에서 consistent all-module snapshot을 제공하는
+pause/serve seam이 아직 필요하다.
+
+## Product Modules
+
+chat과 agent에는 실제 product pressure가 더 필요하다. agent module은 reactor
+worker seam에 연결되어야 한다. LLM output은 hidden non-determinism이 아니라
+ordered data로 commit되어야 한다. checked-in tasks module은 아직 없다.
+
+## Deferred Deliberately
+
+- commit-phase crash safety와 full two-phase commit은 deferred 상태다. 현재
+  host-lent atomicity가 execute-phase behavior를 커버하기 때문이다.

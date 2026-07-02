@@ -2,12 +2,12 @@
   "name": "@ducktape/docs",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.33.0",
+  "packageManager": "bun@1.3.14",
   "scripts": {
     "dev": "vocs dev",
     "build": "vocs build",
     "preview": "vocs preview",
-    "docs:check": "node scripts/check-docs-structure.mjs && vocs build"
+    "docs:check": "bun scripts/check-docs-structure.mjs && vocs build"
   },
   "dependencies": {
     "react": "19.2.7",

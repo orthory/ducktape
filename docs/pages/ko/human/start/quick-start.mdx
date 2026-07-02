@@ -1,0 +1,52 @@
+# Quick Start
+
+이 저장소는 Rust workspace다. 문서는 `docs/` 아래의 별도 Vocs project이며,
+Rust 검증과 docs 검증은 분리되어 있다.
+
+## Platform Checks
+
+workspace test를 실행한다.
+
+```sh
+cargo test --workspace
+```
+
+in-process super-app demo를 실행한다.
+
+```sh
+cargo run -p demo
+```
+
+two-process node demo를 실행한다.
+
+```sh
+cd bin/node
+./examples/demo-2node.sh
+```
+
+joiner state-sync proof를 직접 실행한다.
+
+```sh
+cargo test -p demo --test joiner_rebuilds_global_app_hash
+```
+
+## Docs Checks
+
+docs dependency를 설치하고 docs gate를 실행한다.
+
+```sh
+cd docs
+bun install
+bun run docs:check
+```
+
+Vocs dev server를 시작한다.
+
+```sh
+cd docs
+bun run dev
+```
+
+docs project는 의도적으로 `docs/`를 root로 쓰고 `srcDir: "."`를 유지한다.
+page file은 `docs/pages` 아래에 있어야 하며, nested `docs/docs` directory를
+만들지 않는다.

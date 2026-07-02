@@ -1,0 +1,35 @@
+# Repository Map
+
+수정 전 authoritative surface를 찾기 위한 map이다.
+
+## Kernel
+
+- `crates/kernel/sdk`: module contract와 deterministic system API.
+- `crates/kernel/state`: global app-hash composition.
+- `crates/kernel/host`: registry, dispatch, follow-up drain, commit/abort.
+- `crates/kernel/node`: loopback 및 ordered node seam.
+- `crates/kernel/consensus`: Simplex orderer, content store, relay, inbox,
+  resolver fetch, scheme boundary.
+- `crates/kernel/reactor`: effect를 위한 host-owned worker loop.
+
+## System
+
+- `crates/system/kv`: QMDB byte-key module.
+- `crates/system/valset`: validator membership state.
+- `crates/system/saga`: deterministic continuation state.
+- `*-interface`: typed payload와 query surface.
+
+## Apps
+
+- `crates/apps/document`: QMDB document state.
+- `crates/apps/forge`: git-backed project state.
+- `crates/apps/messaging`: shared message storage.
+- `crates/apps/chat`: chat view.
+- `crates/apps/agent`: messaging-backed thread 위 agent session.
+
+## Docs
+
+- `docs/pages/en/human`: English human-facing docs.
+- `docs/pages/ko/human`: Korean human-facing docs.
+- `docs/pages/en/agent`: English agent-facing docs.
+- `docs/pages/ko/agent`: Korean agent-facing docs.

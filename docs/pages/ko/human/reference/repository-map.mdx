@@ -1,0 +1,43 @@
+# Repository Map
+
+workspace는 platform layer별로 구성되어 있다.
+
+## Kernel
+
+- `crates/kernel/sdk`: module contract, context, message, event, effect, origin,
+  deterministic environment, `StateRoot`.
+- `crates/kernel/state`: 정렬된 module root 위의 global app-hash composition.
+- `crates/kernel/host`: registry, dispatch, follow-up drain, block commit/abort
+  lifecycle.
+- `crates/kernel/node`: host와 orderer 사이의 loopback 및 ordered node seam.
+- `crates/kernel/consensus`: commonware Simplex orderer, content store, relay,
+  finalized inbox, resolver fetch, scheme boundary.
+- `crates/kernel/reactor`: non-deterministic effect를 위한 host-owned worker loop.
+
+## System
+
+- `crates/system/kv`: QMDB byte-key value module.
+- `crates/system/valset`: ed25519 validator membership module.
+- `crates/system/saga`: async workflow의 deterministic continuation state.
+- `*-interface` crate: types-only payload와 query surface.
+
+## Apps
+
+- `crates/apps/forge`: git-backed project state.
+- `crates/apps/document`: QMDB 위 block document state.
+- `crates/apps/messaging`: root-backed shared message storage.
+- `crates/apps/chat`: messaging 위 chat view.
+- `crates/apps/agent`: messaging-backed thread model 위 agent session.
+- app `*-interface` crate: 합법적인 cross-module payload surface.
+
+## Examples and Binaries
+
+- `crates/examples/directory`: test와 demo에서 쓰는 state-based directory module.
+- `crates/examples/greeter`: follow-up write를 emit하는 demo module.
+- `bin/demo`: registered module set의 in-process walkthrough.
+- `bin/node`: real-socket validator process와 two-process demo.
+
+## Docs
+
+- `docs/`: Vocs project.
+- `docs/pages`: language/reader 축으로 나뉜 page tree.

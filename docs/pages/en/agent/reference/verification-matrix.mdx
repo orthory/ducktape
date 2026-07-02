@@ -1,0 +1,41 @@
+# Verification Matrix
+
+Use the narrowest command set that proves the touched surface.
+
+## Docs Only
+
+```sh
+cd docs
+bun run docs:check
+```
+
+Also run:
+
+```sh
+git diff --check origin/main...HEAD
+```
+
+Check that `docs/docs` does not exist and that authored docs do not contain
+draft markers.
+
+## Platform Code
+
+```sh
+cargo test --workspace
+cargo fmt --all -- --check
+```
+
+Run focused tests when changing a specific module, but do not replace the
+workspace gate with a narrow test unless the user explicitly requested a narrow
+run.
+
+## Demos and State Sync
+
+```sh
+cargo run -p demo
+cargo test -p demo --test joiner_rebuilds_global_app_hash
+cd bin/node && ./examples/demo-2node.sh
+```
+
+Use these when docs or code claim multi-module convergence, joiner rebuild, or
+real-socket ordered node behavior.

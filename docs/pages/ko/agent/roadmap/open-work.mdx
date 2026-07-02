@@ -1,0 +1,25 @@
+# Open Work
+
+이 page는 agent가 실수로 완료된 것처럼 말하면 안 되는 implementation gap을 기록한다.
+
+## Live Network State Sync
+
+in-process module sync proof는 존재한다. running node에는 live validator path에서
+module sync data를 serve하고 fetch하는 network resolver가 아직 필요하다.
+
+## Dynamic Valset Orchestration
+
+test는 epoch boundary 주변 respawn behavior를 cover한다. live loop는 finalized
+valset state를 watch하고, deterministic cutover point를 publish하고, old orderer를
+stop하고, new epoch instance를 start하고, transport/state-sync readiness를 맞추는
+작업이 아직 필요하다.
+
+## Snapshot Serving
+
+capstone joiner test는 rebuild math를 증명한다. running node에는 finalized height에서
+consistent all-module snapshot을 위한 pause/serve seam이 아직 필요하다.
+
+## Product Depth
+
+chat과 agent module은 존재한다. agent path는 아직 reactor-backed LLM work가 필요하다.
+model output은 ordered data로 commit되어야 한다. checked-in tasks module은 아직 없다.
