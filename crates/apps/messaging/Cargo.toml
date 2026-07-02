@@ -5,6 +5,8 @@ version.workspace = true
 
 [dependencies]
 sdk = { workspace = true }
+# kernel state-sync platform surface: the shared qmdb serve/wire helpers.
+statesync = { workspace = true }
 messaging-interface = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

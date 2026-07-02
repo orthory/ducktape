@@ -242,6 +242,14 @@ impl Module for Tasks {
         Self::root_of(&self.tasks)
     }
 
+    /// advertise the snapshot lane: [`Tasks::snapshot`] is the exact preimage
+    /// of `root()`, and [`Tasks::install`] verifies before adopting — without
+    /// this override, sync orchestration saw `Unsupported` and a joiner could
+    /// not rebuild the module at all.
+    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, Error> {
+        Ok(sdk::StateSyncHandle::SnapshotBytes(self.snapshot()))
+    }
+
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             TaskMsg::CreateTask { task_id, title } => {
