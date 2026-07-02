@@ -17,3 +17,5 @@ async-trait = { workspace = true }
 futures = "0.3"
 host = { workspace = true }
 tasks = { workspace = true }
+chat = { workspace = true }
+commonware-runtime = { workspace = true }

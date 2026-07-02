@@ -198,14 +198,11 @@ fn module_authored_post_does_not_fire() {
 }
 
 #[test]
-fn emitted_followup_failure_aborts_the_whole_block() {
+fn squatted_task_id_is_caught_by_probe_and_block_commits() {
     block_on(async {
         let mut host = genesis();
-        // target a task_id_prefix such that a second identical fire collides at
-        // the tasks module (duplicate task id) — that follow-up failure must
-        // abort the entire posting block (P2), leaving no trace.
         let (ctx, msg) = from_user(create_rule_msg(
-            "dupe",
+            "capture",
             Trigger::MessagePosted {
                 channel_id: None,
                 mention: None,
@@ -218,41 +215,94 @@ fn emitted_followup_failure_aborts_the_whole_block() {
         ));
         host.submit_at(ctx, msg).await.expect("create rule");
 
-        // first fire creates auto-general-5.
+        // squat the deterministic id the next fire will compose: without the
+        // probe, tasks would reject the duplicate and abort the posting block.
         host.submit_at(
             BlockContext {
                 height: 2,
                 consensus_time: 200,
-                origin: Origin::External(b"p".to_vec()),
+                origin: Origin::External(b"squatter".to_vec()),
+            },
+            Msg {
+                target: TASKS.into(),
+                payload: tasks_interface::encode_msg(&tasks_interface::TaskMsg::CreateTask {
+                    task_id: "auto-general-5".into(),
+                    title: "squatted".into(),
+                }),
+            },
+        )
+        .await
+        .expect("squat the id");
+
+        // the fire is downgraded to a run record; the user's post commits.
+        host.submit_at(
+            BlockContext {
+                height: 3,
+                consensus_time: 300,
+                origin: Origin::External(b"poster".to_vec()),
             },
             chat_event_msg("general", 5, AuthorRef::User(vec![1; 4])),
         )
         .await
-        .expect("first fire");
-        let app_after_first = host.app_hash();
+        .expect("the squatted fire must not abort the block");
+        assert_eq!(tasks_of(&host).await.len(), 1, "only the squatter's task");
+        let recs = run_history(&host, "capture").await;
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].action_ok);
+        assert!(recs[0].detail.contains("already exists"));
+    });
+}
 
-        // a second post at the same seq re-derives the same task id -> tasks
-        // rejects the duplicate -> the block aborts.
+#[test]
+fn post_probe_collision_still_aborts_the_block() {
+    block_on(async {
+        let mut host = genesis();
+        // two rules composing the SAME task id fire on one event: both probes
+        // run before either follow-up applies, so both pass and both emit —
+        // the second follow-up then fails at tasks and the whole block aborts
+        // (P2). the probe layer is best-effort by design; atomicity is the
+        // backstop.
+        for rule_id in ["r1", "r2"] {
+            let (ctx, msg) = from_user(create_rule_msg(
+                rule_id,
+                Trigger::MessagePosted {
+                    channel_id: None,
+                    mention: None,
+                    text_contains: None,
+                },
+                Action::CreateTask {
+                    task_id_prefix: "auto".into(),
+                    title_template: "T".into(),
+                },
+            ));
+            host.submit_at(ctx, msg).await.expect("create rule");
+        }
+        let app_before = host.app_hash();
+
         let err = host
             .submit_at(
                 BlockContext {
-                    height: 3,
-                    consensus_time: 300,
-                    origin: Origin::External(b"p".to_vec()),
+                    height: 2,
+                    consensus_time: 200,
+                    origin: Origin::External(b"poster".to_vec()),
                 },
-                chat_event_msg("general", 5, AuthorRef::User(vec![2; 4])),
+                chat_event_msg("general", 5, AuthorRef::User(vec![1; 4])),
             )
             .await
-            .expect_err("duplicate task id aborts the block");
+            .expect_err("the same-event id collision aborts the block");
         assert!(
             matches!(err, host::SubmitError::Rejected(Error::Module(ref m)) if m.contains("already exists")),
             "unexpected error: {err:?}"
         );
         assert_eq!(
             host.app_hash(),
-            app_after_first,
+            app_before,
             "the aborted block left the app-hash untouched"
         );
-        assert_eq!(tasks_of(&host).await.len(), 1, "no second task landed");
+        assert!(tasks_of(&host).await.is_empty(), "no task landed");
+        assert!(
+            run_history(&host, "r1").await.is_empty(),
+            "aborted records leave no trace"
+        );
     });
 }

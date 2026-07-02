@@ -395,7 +395,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "automations-interface",
+ "chat",
  "chat-interface",
+ "commonware-runtime",
  "futures",
  "host",
  "sdk",

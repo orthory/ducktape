@@ -23,18 +23,29 @@
 //! never trigger rules, so an automation posting into a hooked channel cannot
 //! cascade. this mirrors the agent module's user-author-only decision.
 //!
-//! ## No-fail hook arm and atomicity (P2)
+//! ## No-fail hook arm, probes, and atomicity (P2)
 //!
 //! the hook arm runs in the user's posting block. an `Err` here would abort the
 //! post itself (and every other hook subscriber's delivery), so an undecodable
-//! event, a failed message fetch, or an action that is structurally impossible to
-//! build (e.g. a template that substitutes to an empty message/title) is a staged
-//! no-op recorded as a [`RunRecord`] with `action_ok = false` — never a block
-//! failure. HOWEVER, once an action IS emitted, its follow-up runs against the
-//! real chat/tasks module: if that follow-up fails there (e.g. the target channel
-//! does not exist), the whole block aborts and leaves no trace. that is correct
+//! event, a failed message-text fetch, or an action that is structurally
+//! impossible to build (e.g. a template that substitutes to an empty
+//! message/title, or a composed id over the cap) is a staged no-op recorded as a
+//! [`RunRecord`] with `action_ok = false` — never a block failure.
+//!
+//! on top of that, every action is PROBED before it is emitted (agent v2's
+//! no-fail-arm pattern applied to follow-ups): host-routed queries against the
+//! target module's staged-or-committed state — deterministic on every
+//! validator — verify that a `PostMessage` target channel exists and its
+//! deterministic message id is unused (a user could pre-post the composed id to
+//! wedge the rule — id squatting), and that a `CreateTask` id is unused. a probe
+//! rejection downgrades to a `RunRecord`, protecting the posting user's block
+//! from every structurally-KNOWABLE follow-up failure.
+//!
+//! probes cannot catch everything: two rules composing the same id within one
+//! event emit past each other's probes, and any other post-probe follow-up
+//! failure still aborts the whole block, leaving no trace. that is correct
 //! platform behavior — the rule's effect and the triggering post commit or abort
-//! as one atomic unit.
+//! as one atomic unit (P2).
 //!
 //! ## Hook registration is a separate operator op
 //!
@@ -66,7 +77,10 @@ use chat_interface::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
-use tasks_interface::{TaskMsg, encode_msg as tasks_encode_msg};
+use tasks_interface::{
+    TaskMsg, TaskQuery, TaskReply, decode_reply as tasks_decode_reply,
+    encode_msg as tasks_encode_msg, encode_query as tasks_encode_query,
+};
 
 /// max rules retained. registering beyond this is rejected at execute.
 pub const MAX_RULES: usize = 1024;
@@ -289,16 +303,19 @@ impl Automations {
 
         // fetch the post's text ONCE, and only if some rule that already matches
         // on channel + mention needs it (a `text_contains` filter, or a `{text}`
-        // placeholder). the fetch is best-effort: a failure yields empty text.
+        // placeholder). `None` = the fetch FAILED (query error / message absent),
+        // which is distinct from a legitimately empty body (`Some("")`): rules
+        // that need text record a failure on `None` instead of silently
+        // matching against emptiness.
         let needs_text = effective.values().any(|rule| {
             rule.enabled
                 && Self::matches_channel_and_mention(rule, &channel_id, &mentions)
                 && Self::rule_wants_text(rule)
         });
-        let text = if needs_text {
+        let text: Option<String> = if needs_text {
             self.fetch_text(&*ctx, &channel_id, seq).await
         } else {
-            String::new()
+            Some(String::new())
         };
         let author_display = display_author(&author);
 
@@ -307,46 +324,53 @@ impl Automations {
         let mut fired: Vec<(String, Rule)> = Vec::new();
         let mut records: Vec<RunRecord> = Vec::new();
         for (rule_id, rule) in &effective {
-            if !rule.enabled || !Self::rule_matches(rule, &channel_id, &mentions, &text) {
+            if !rule.enabled || !Self::matches_channel_and_mention(rule, &channel_id, &mentions) {
                 continue;
+            }
+            let record = |action_ok: bool, detail: String| RunRecord {
+                rule_id: rule_id.clone(),
+                channel_id: channel_id.clone(),
+                seq,
+                height,
+                action_ok,
+                detail,
+            };
+            // a rule that needs text cannot be evaluated (or substituted) when
+            // the fetch failed: a recorded failure, never empty-text guessing.
+            let text = match (&text, Self::rule_wants_text(rule)) {
+                (Some(text), _) => text.as_str(),
+                (None, false) => "",
+                (None, true) => {
+                    records.push(record(false, "text fetch failed".into()));
+                    continue;
+                }
+            };
+            let Trigger::MessagePosted { text_contains, .. } = &rule.trigger;
+            if let Some(want) = text_contains {
+                if !text.contains(want.as_str()) {
+                    continue;
+                }
             }
             if budget >= MAX_ACTIONS_PER_EVENT {
-                records.push(RunRecord {
-                    rule_id: rule_id.clone(),
-                    channel_id: channel_id.clone(),
-                    seq,
-                    height,
-                    action_ok: false,
-                    detail: "action budget exceeded".into(),
-                });
+                records.push(record(false, "action budget exceeded".into()));
                 continue;
             }
-            match self.build_and_emit(ctx, rule, &channel_id, seq, &author_display, &text) {
+            match self
+                .build_and_emit(ctx, rule, &channel_id, seq, &author_display, text)
+                .await
+            {
                 Ok(detail) => {
                     budget += 1;
                     let mut updated = rule.clone();
-                    updated.fire_count += 1;
+                    updated.fire_count = updated.fire_count.saturating_add(1);
                     fired.push((rule_id.clone(), updated));
-                    records.push(RunRecord {
-                        rule_id: rule_id.clone(),
-                        channel_id: channel_id.clone(),
-                        seq,
-                        height,
-                        action_ok: true,
-                        detail,
-                    });
+                    records.push(record(true, detail));
                 }
                 Err(detail) => {
-                    // a structurally impossible action is recorded, not emitted,
-                    // and never bumps fire_count or consumes the action budget.
-                    records.push(RunRecord {
-                        rule_id: rule_id.clone(),
-                        channel_id: channel_id.clone(),
-                        seq,
-                        height,
-                        action_ok: false,
-                        detail,
-                    });
+                    // a structurally impossible or probe-rejected action is
+                    // recorded, not emitted, and never bumps fire_count or
+                    // consumes the action budget.
+                    records.push(record(false, detail));
                 }
             }
         }
@@ -357,10 +381,21 @@ impl Automations {
         Ok(())
     }
 
-    /// build the action for a firing rule and emit it as a follow-up. returns
-    /// the success `detail` on emit, or an error `detail` when the action is
-    /// structurally impossible to build (recorded, not a block failure).
-    fn build_and_emit(
+    /// build the action for a firing rule, PROBE its target, and emit it as a
+    /// follow-up. returns the success `detail` on emit, or an error `detail`
+    /// when the action is structurally impossible or a probe rejects it
+    /// (recorded, not a block failure).
+    ///
+    /// the probe layer (agent v2's no-fail-arm pattern applied to follow-ups):
+    /// every structurally-KNOWABLE follow-up failure is checked here via
+    /// host-routed queries against the target's staged-or-committed state —
+    /// deterministic on every validator — so a missing channel, a squatted
+    /// deterministic id, or a task-id collision downgrades to a RunRecord
+    /// instead of aborting the posting user's block. probes cannot catch
+    /// everything (e.g. two rules composing the same id in one event emit past
+    /// each other's probes); a post-probe follow-up failure still aborts the
+    /// block by P2 design.
+    async fn build_and_emit(
         &self,
         ctx: &mut dyn Ctx,
         rule: &Rule,
@@ -380,6 +415,42 @@ impl Automations {
                 }
                 // deterministic, collision-free per (rule, message).
                 let message_id = format!("auto-{}-{}-{}", rule.rule_id, event_channel, seq);
+                // composed-id guard BEFORE the probes: event channel ids are
+                // unbounded, so the composition can exceed this module's id cap.
+                if message_id.len() > MAX_ID_BYTES {
+                    return Err("composed id exceeds cap".into());
+                }
+                // probe 1: the target channel must exist — chat would reject
+                // the post and abort the block otherwise.
+                let req = chat_encode_query(&ChatQuery::Channel {
+                    channel_id: channel_id.clone(),
+                });
+                match ctx.query(&self.chat, &req).await {
+                    Err(e) => return Err(format!("chat probe failed: {e}")),
+                    Ok(bytes) => match chat_decode_reply(&bytes) {
+                        Ok(ChatReply::Channel(Some(_))) => {}
+                        Ok(ChatReply::Channel(None)) => {
+                            return Err(format!("target channel does not exist: {channel_id}"));
+                        }
+                        _ => return Err("chat probe returned an unexpected reply".into()),
+                    },
+                }
+                // probe 2: the deterministic message id must be unused — ids
+                // are caller-supplied at chat, so a user could pre-post the
+                // composed id to wedge this rule's next fire (id squatting).
+                let req = chat_encode_query(&ChatQuery::Message {
+                    message_id: message_id.clone(),
+                });
+                match ctx.query(&self.chat, &req).await {
+                    Err(e) => return Err(format!("chat probe failed: {e}")),
+                    Ok(bytes) => match chat_decode_reply(&bytes) {
+                        Ok(ChatReply::Message(None)) => {}
+                        Ok(ChatReply::Message(Some(_))) => {
+                            return Err(format!("message id already taken: {message_id}"));
+                        }
+                        _ => return Err("chat probe returned an unexpected reply".into()),
+                    },
+                }
                 ctx.emit_msg(Msg {
                     target: self.chat.clone(),
                     payload: chat_encode_msg(&ChatMsg::PostMessage {
@@ -402,6 +473,26 @@ impl Automations {
                 }
                 // deterministic, collision-free per (prefix, message).
                 let task_id = format!("{task_id_prefix}-{event_channel}-{seq}");
+                // composed-id guard BEFORE the probe (see PostMessage).
+                if task_id.len() > MAX_ID_BYTES {
+                    return Err("composed id exceeds cap".into());
+                }
+                // probe: the composed task id must be unused — tasks rejects
+                // duplicates, which would abort the block. tasks-interface only
+                // exposes List today, so this is an O(n) scan; switch to a Get
+                // query when the interface grows one.
+                let req = tasks_encode_query(&TaskQuery::List);
+                match ctx.query(&self.tasks, &req).await {
+                    Err(e) => return Err(format!("tasks probe failed: {e}")),
+                    Ok(bytes) => match tasks_decode_reply(&bytes) {
+                        Ok(TaskReply::Tasks(tasks)) => {
+                            if tasks.iter().any(|task| task.id == task_id) {
+                                return Err(format!("task id already exists: {task_id}"));
+                            }
+                        }
+                        Err(_) => return Err("tasks probe returned an unexpected reply".into()),
+                    },
+                }
                 ctx.emit_msg(Msg {
                     target: self.tasks.clone(),
                     payload: tasks_encode_msg(&TaskMsg::CreateTask {
@@ -414,24 +505,24 @@ impl Automations {
         }
     }
 
-    /// best-effort single-message fetch by sequence. a query error or an absent
-    /// message yields empty text — the no-fail contract of the hook arm.
-    async fn fetch_text(&self, ctx: &dyn Ctx, channel_id: &str, seq: u64) -> String {
+    /// single-message fetch by sequence. `Some(text)` is the message's
+    /// concatenated text blocks (possibly legitimately empty); `None` means the
+    /// FETCH failed — a query error, an undecodable reply, or an absent
+    /// message — which callers record instead of treating as empty text.
+    async fn fetch_text(&self, ctx: &dyn Ctx, channel_id: &str, seq: u64) -> Option<String> {
         let req = chat_encode_query(&ChatQuery::MessagesRange {
             channel_id: channel_id.to_string(),
             from_seq: seq,
             limit: 1,
         });
-        let Ok(bytes) = ctx.query(&self.chat, &req).await else {
-            return String::new();
-        };
+        let bytes = ctx.query(&self.chat, &req).await.ok()?;
         let Ok(ChatReply::Messages(views)) = chat_decode_reply(&bytes) else {
-            return String::new();
+            return None;
         };
-        match views.into_iter().find(|view| view.seq == seq) {
-            Some(view) => blocks_text(&view.head.blocks),
-            None => String::new(),
-        }
+        views
+            .into_iter()
+            .find(|view| view.seq == seq)
+            .map(|view| blocks_text(&view.head.blocks))
     }
 
     fn matches_channel_and_mention(rule: &Rule, channel_id: &str, mentions: &[AuthorRef]) -> bool {
@@ -450,19 +541,6 @@ impl Automations {
                 .iter()
                 .any(|author| display_author(author).contains(want.as_str()))
             {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn rule_matches(rule: &Rule, channel_id: &str, mentions: &[AuthorRef], text: &str) -> bool {
-        if !Self::matches_channel_and_mention(rule, channel_id, mentions) {
-            return false;
-        }
-        let Trigger::MessagePosted { text_contains, .. } = &rule.trigger;
-        if let Some(want) = text_contains {
-            if !text.contains(want.as_str()) {
                 return false;
             }
         }
@@ -938,28 +1016,38 @@ impl Module for Automations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use automations_interface::{AutomationsReply, decode_reply, encode_msg, encode_query};
     use chat_interface::{
-        Block, Mark, MessageHead, MessageView, Span, decode_msg as chat_decode_msg,
-        decode_query as chat_decode_query, encode_event as chat_encode_event,
-        encode_reply as chat_encode_reply,
+        Block, Channel, Mark, MessageHead, MessageView, PostPolicy, Span,
+        decode_msg as chat_decode_msg, decode_query as chat_decode_query,
+        encode_event as chat_encode_event, encode_reply as chat_encode_reply,
     };
     use futures::executor::block_on;
     use sdk::{Effect, Env, Event};
-    use tasks_interface::decode_msg as tasks_decode_msg;
+    use tasks_interface::{
+        Task, TaskStatus, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
+    };
 
     const CHAT: &str = "chat";
     const TASKS: &str = "tasks";
     const ME: &str = "automations";
 
     /// a minimal `Ctx` capturing emitted msgs and serving canned chat
-    /// transcripts, enough to unit-test `execute` in isolation.
+    /// transcripts / channels and a task list — enough to unit-test `execute`
+    /// (including the pre-emit probes) in isolation.
     struct CaptureCtx {
         env: Env,
-        /// channel -> messages with contiguous seqs starting at 1.
+        /// channel -> messages with contiguous seqs starting at 1. transcript
+        /// channels also count as existing for the channel probe.
         transcripts: BTreeMap<String, Vec<MessageView>>,
+        /// channels the chat probe reports as existing.
+        channels: BTreeSet<String>,
+        /// the task list served to the tasks probe.
+        tasks: Vec<Task>,
         msgs: Vec<Msg>,
-        /// when set, chat queries return this error instead of a transcript.
+        /// when set, every query returns an error.
         fail_query: bool,
     }
 
@@ -973,6 +1061,8 @@ mod tests {
                     me: ME.into(),
                 },
                 transcripts: BTreeMap::new(),
+                channels: BTreeSet::new(),
+                tasks: Vec::new(),
                 msgs: Vec::new(),
                 fail_query: false,
             }
@@ -985,7 +1075,22 @@ mod tests {
             self.from_origin(Origin::Module(CHAT.into()))
         }
         fn with_transcript(mut self, channel: &str, messages: Vec<MessageView>) -> Self {
+            self.channels.insert(channel.into());
             self.transcripts.insert(channel.into(), messages);
+            self
+        }
+        fn with_channel(mut self, channel: &str) -> Self {
+            self.channels.insert(channel.into());
+            self
+        }
+        fn with_task(mut self, task_id: &str) -> Self {
+            self.tasks.push(Task {
+                id: task_id.into(),
+                title: task_id.into(),
+                status: TaskStatus::Open,
+                created_at: 0,
+                updated_at: 0,
+            });
             self
         }
         fn failing_query(mut self) -> Self {
@@ -1039,8 +1144,30 @@ mod tests {
                         }
                         Ok(chat_encode_reply(&ChatReply::Messages(window)))
                     }
+                    ChatQuery::Channel { channel_id } => {
+                        let channel = self.channels.contains(&channel_id).then(|| Channel {
+                            id: channel_id.clone(),
+                            name: channel_id,
+                            created_at: 0,
+                            head_seq: 0,
+                            post_policy: PostPolicy::Open,
+                            hooks: Vec::new(),
+                            pinned: Vec::new(),
+                        });
+                        Ok(chat_encode_reply(&ChatReply::Channel(channel)))
+                    }
+                    ChatQuery::Message { message_id } => {
+                        Ok(chat_encode_reply(&ChatReply::Message(
+                            self.transcripts
+                                .values()
+                                .flatten()
+                                .find(|view| view.head.message_id == message_id)
+                                .cloned(),
+                        )))
+                    }
                     _ => Err(Error::QueryUnsupported),
                 },
+                TASKS => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
                 other => Err(Error::UnknownModule(other.into())),
             }
         }
@@ -1448,7 +1575,7 @@ mod tests {
         .expect("create");
         block_on(m.commit_block()).expect("commit");
 
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().from_chat().with_channel("announce");
         exec(
             &mut m,
             &mut chat_ctx,
@@ -1600,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_text_fetch_is_no_fail_and_treats_text_empty() {
+    fn failed_text_fetch_is_recorded_not_guessed_empty() {
         let mut m = module();
         let mut ctx = CaptureCtx::new();
         exec(
@@ -1615,12 +1742,55 @@ mod tests {
         .expect("create");
         block_on(m.commit_block()).expect("commit");
 
-        // query fails -> empty text -> text_contains("deploy") does not match ->
-        // no fire, and crucially the block is NOT aborted.
+        // the fetch fails -> the text-needing rule cannot be evaluated: a
+        // recorded failure (never empty-text guessing), no emit, and crucially
+        // the block is NOT aborted.
         let mut ctx = CaptureCtx::new().failing_query().from_chat();
         exec(&mut m, &mut ctx, &posted("general", 1, user(1), Vec::new()))
             .expect("no-fail arm survives a failed fetch");
         assert!(ctx.msgs.is_empty());
+        block_on(m.commit_block()).expect("commit");
+        assert_eq!(get_rule(&m, "r").expect("r").fire_count, 0);
+        let recs = history(&m, "r", 4);
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].action_ok);
+        assert_eq!(recs[0].detail, "text fetch failed");
+    }
+
+    #[test]
+    fn legitimately_empty_body_is_valid_text() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new();
+        // an empty text_contains filter matches an empty body; {text}
+        // substitutes as empty. only a FAILED fetch is a failure.
+        exec(
+            &mut m,
+            &mut ctx,
+            &create(
+                "r",
+                post_trigger(Some("general"), Some("")),
+                task_action("t", "seen [{text}]"),
+            ),
+        )
+        .expect("create");
+        block_on(m.commit_block()).expect("commit");
+
+        let empty_body = message("general", 1, user(1), vec![Block::paragraph("")]);
+        let mut chat_ctx = CaptureCtx::new()
+            .from_chat()
+            .with_transcript("general", vec![empty_body]);
+        exec(
+            &mut m,
+            &mut chat_ctx,
+            &posted("general", 1, user(1), Vec::new()),
+        )
+        .expect("fire");
+        let tasks = chat_ctx.task_msgs();
+        assert_eq!(tasks.len(), 1, "an empty body is valid content");
+        let TaskMsg::CreateTask { title, .. } = &tasks[0] else {
+            panic!("expected CreateTask");
+        };
+        assert_eq!(title, "seen []");
     }
 
     // ---- malformed action + budget -----------------------------------------
@@ -1736,6 +1906,174 @@ mod tests {
         assert!(chat_ctx.msgs.is_empty());
     }
 
+    // ---- pre-emit probes + guards -------------------------------------------
+
+    #[test]
+    fn missing_target_channel_is_recorded_not_emitted() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new();
+        exec(
+            &mut m,
+            &mut ctx,
+            &create("r", post_trigger(None, None), post_action("ghost", "hi")),
+        )
+        .expect("create");
+        block_on(m.commit_block()).expect("commit");
+
+        // "ghost" is not a known channel: the probe records, never emits.
+        let mut chat_ctx = CaptureCtx::new().from_chat();
+        exec(
+            &mut m,
+            &mut chat_ctx,
+            &posted("general", 1, user(1), Vec::new()),
+        )
+        .expect("no-fail arm");
+        assert!(chat_ctx.msgs.is_empty(), "no post to a missing channel");
+        block_on(m.commit_block()).expect("commit");
+        let recs = history(&m, "r", 4);
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].action_ok);
+        assert!(recs[0].detail.contains("does not exist"));
+        assert_eq!(get_rule(&m, "r").expect("r").fire_count, 0);
+    }
+
+    #[test]
+    fn squatted_message_id_is_caught_by_probe() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new();
+        exec(
+            &mut m,
+            &mut ctx,
+            &create("r", post_trigger(None, None), post_action("general", "hi")),
+        )
+        .expect("create");
+        block_on(m.commit_block()).expect("commit");
+
+        // the deterministic id for the seq-1 fire is already taken: a user
+        // pre-posted it (id squatting). the probe records, never emits — the
+        // emit would abort the posting block at chat's duplicate-id check.
+        let mut squatted = message("general", 1, user(9), vec![Block::paragraph("squat")]);
+        squatted.head.message_id = "auto-r-general-1".into();
+        let mut chat_ctx = CaptureCtx::new()
+            .from_chat()
+            .with_transcript("general", vec![squatted]);
+        exec(
+            &mut m,
+            &mut chat_ctx,
+            &posted("general", 1, user(1), Vec::new()),
+        )
+        .expect("no-fail arm");
+        assert!(chat_ctx.msgs.is_empty(), "no emit against a squatted id");
+        block_on(m.commit_block()).expect("commit");
+        let recs = history(&m, "r", 4);
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].action_ok);
+        assert!(recs[0].detail.contains("already taken"));
+    }
+
+    #[test]
+    fn task_id_collision_is_caught_by_probe() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new();
+        exec(
+            &mut m,
+            &mut ctx,
+            &create("r", post_trigger(None, None), task_action("auto", "T")),
+        )
+        .expect("create");
+        block_on(m.commit_block()).expect("commit");
+
+        let mut chat_ctx = CaptureCtx::new().from_chat().with_task("auto-general-5");
+        exec(
+            &mut m,
+            &mut chat_ctx,
+            &posted("general", 5, user(1), Vec::new()),
+        )
+        .expect("no-fail arm");
+        assert!(chat_ctx.msgs.is_empty(), "no emit against a taken task id");
+        block_on(m.commit_block()).expect("commit");
+        let recs = history(&m, "r", 4);
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].action_ok);
+        assert!(recs[0].detail.contains("already exists"));
+    }
+
+    #[test]
+    fn oversized_composed_id_is_recorded_not_emitted() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new();
+        exec(
+            &mut m,
+            &mut ctx,
+            &create("r", post_trigger(None, None), task_action("auto", "T")),
+        )
+        .expect("create");
+        block_on(m.commit_block()).expect("commit");
+
+        // an event channel long enough to push the composed id over the cap.
+        let long_channel = "c".repeat(MAX_ID_BYTES);
+        let mut chat_ctx = CaptureCtx::new().from_chat();
+        exec(
+            &mut m,
+            &mut chat_ctx,
+            &posted(&long_channel, 1, user(1), Vec::new()),
+        )
+        .expect("no-fail arm");
+        assert!(chat_ctx.msgs.is_empty(), "no emit with an oversized id");
+        block_on(m.commit_block()).expect("commit");
+        let recs = history(&m, "r", 4);
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].action_ok);
+        assert_eq!(recs[0].detail, "composed id exceeds cap");
+    }
+
+    #[test]
+    fn fire_count_saturates_at_u64_max() {
+        // craft a committed state whose rule already sits at u64::MAX via the
+        // canonical codec (install verifies it against its own root), then
+        // fire: the count must saturate, not wrap.
+        let mut rules: BTreeMap<String, Rule> = BTreeMap::new();
+        rules.insert(
+            "r".into(),
+            Rule {
+                rule_id: "r".into(),
+                enabled: true,
+                trigger: Trigger::MessagePosted {
+                    channel_id: None,
+                    mention: None,
+                    text_contains: None,
+                },
+                action: Action::CreateTask {
+                    task_id_prefix: "auto".into(),
+                    title_template: "T".into(),
+                },
+                created_at: 0,
+                fire_count: u64::MAX,
+            },
+        );
+        let history_ring: VecDeque<RunRecord> = VecDeque::new();
+        let bytes = encode_state(&rules, &history_ring);
+        let root = Automations::root_of(&rules, &history_ring);
+
+        let mut m = module();
+        m.install(&bytes, root).expect("install crafted state");
+
+        let mut chat_ctx = CaptureCtx::new().from_chat();
+        exec(
+            &mut m,
+            &mut chat_ctx,
+            &posted("general", 1, user(1), Vec::new()),
+        )
+        .expect("fire");
+        assert_eq!(chat_ctx.task_msgs().len(), 1, "the action still emits");
+        block_on(m.commit_block()).expect("commit");
+        assert_eq!(
+            get_rule(&m, "r").expect("r").fire_count,
+            u64::MAX,
+            "fire_count saturates instead of wrapping"
+        );
+    }
+
     // ---- substitution -------------------------------------------------------
 
     #[test]
@@ -1845,8 +2183,17 @@ mod tests {
         .expect("create r2");
         block_on(source.commit_block()).expect("commit rules");
 
-        // fire r1 to populate the run-history ring.
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        // fire r1 to populate the run-history ring (the transcript provides the
+        // channel for the probe and text for r2's filter, which does not match).
+        let mut chat_ctx = CaptureCtx::new().from_chat().with_transcript(
+            "general",
+            vec![message(
+                "general",
+                1,
+                user(1),
+                vec![Block::paragraph("hello")],
+            )],
+        );
         exec(
             &mut source,
             &mut chat_ctx,
@@ -1901,9 +2248,9 @@ mod tests {
 
     #[test]
     fn install_accepts_run_records_with_oversized_event_fields() {
-        // chat does not bound channel-id length, so a fired rule can commit a
-        // run record whose channel_id (and detail, which embeds it) exceeds
-        // this module's own id caps. install must accept every
+        // chat does not bound channel-id length, so a matching rule can commit
+        // a run record whose channel_id exceeds this module's own id caps
+        // (here via the composed-id guard record). install must accept every
         // execute-reachable state — the root comparison is the integrity check.
         let mut source = module();
         let mut ctx = CaptureCtx::new();
@@ -1924,7 +2271,7 @@ mod tests {
         )
         .expect("fire");
         block_on(source.commit_block()).expect("commit fire");
-        assert_eq!(history(&source, "r", 4).len(), 1, "the fire was recorded");
+        assert_eq!(history(&source, "r", 4).len(), 1, "the match was recorded");
 
         let mut target = module();
         target
