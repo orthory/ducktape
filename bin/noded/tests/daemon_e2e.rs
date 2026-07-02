@@ -241,7 +241,7 @@ fn full_surface_blocks_authorship_and_ws() {
         .iter()
         .map(|m| m["id"].as_str().expect("module id"))
         .collect();
-    assert_eq!(modules, ["chat", "tasks", "document", "forge"]);
+    assert_eq!(modules, ["chat", "tasks", "inbox", "document", "forge"]);
     let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();
 
     // subscribe BEFORE submitting: every committed block must fan out.
