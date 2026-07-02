@@ -65,6 +65,14 @@ pub struct SubmitRequest {
     pub target: String,
     /// the module's `*Msg` enum as a json value — encoded verbatim into `Msg.payload`.
     pub payload: serde_json::Value,
+    /// the submitter identity stamped into `Origin::External` — modules that
+    /// derive authorship from origin (chat's `AuthorRef::User`) see these
+    /// bytes. optional; the daemon's own name is the fallback. this is a
+    /// TRUSTED-CLIENT convention, not authentication: anything that can reach
+    /// the port can claim any origin. fine for a local daemon; a public
+    /// deployment needs real submitter auth here.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +97,8 @@ pub enum NodeCommand {
     Submit {
         target: String,
         payload: Vec<u8>,
+        /// `Origin::External` bytes for this block (see [`SubmitRequest::origin`]).
+        origin: Vec<u8>,
         reply: oneshot::Sender<Result<BlockSummary, String>>,
     },
     Query {
@@ -165,14 +175,24 @@ pub fn router(handle: NodeHandle) -> Router {
         .with_state(handle)
 }
 
+/// the fallback submitter identity when a client sends no `origin`.
+pub const DEFAULT_ORIGIN: &str = "noded";
+
 async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>) -> Response {
     let payload =
         serde_json::to_vec(&req.payload).expect("a decoded json value re-serializes");
+    // empty string falls back too — chat rejects empty external authors
+    let origin = req
+        .origin
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_ORIGIN.to_string())
+        .into_bytes();
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
         .send(NodeCommand::Submit {
             target: req.target,
             payload,
+            origin,
             reply,
         })
         .await

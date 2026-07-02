@@ -16,7 +16,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
     tokio::spawn(async move {
         while let Some(cmd) = cmds.next().await {
             match cmd {
-                NodeCommand::Submit { target, payload, reply } => {
+                NodeCommand::Submit { target, payload, origin, reply } => {
                     let result = match submit_err {
                         Some(err) => Err(err.to_string()),
                         None => {
@@ -27,9 +27,12 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             let value: serde_json::Value =
                                 serde_json::from_slice(&payload).expect("payload is json");
                             assert_eq!(value["CreateChannel"]["channel_id"], "general");
+                            // the block reply doubles as the origin probe: echo
+                            // the stamped origin so tests assert per-request
+                            // identity without a second channel.
                             Ok(BlockSummary {
                                 height: 7,
-                                app_hash: "ab".repeat(32),
+                                app_hash: String::from_utf8_lossy(&origin).into_owned(),
                             })
                         }
                     };
@@ -93,7 +96,31 @@ async fn submit_forwards_the_payload_and_returns_the_block() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["height"], 7);
-    assert_eq!(body["appHash"], "ab".repeat(32));
+    // the fake actor echoes the stamped origin here — no origin sent, so the
+    // daemon default applies
+    assert_eq!(body["appHash"], "noded");
+}
+
+#[tokio::test]
+async fn submit_stamps_the_client_origin() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/submit",
+            serde_json::json!({
+                "target": "chat",
+                "payload": { "CreateChannel": { "channel_id": "general", "name": "General" } },
+                "origin": "jess",
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["appHash"], "jess");
 }
 
 #[tokio::test]

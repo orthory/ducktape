@@ -1,11 +1,13 @@
 // The chat surface over the node's `chat` module: a channel rail, the message
-// list, a composer, and a thread side panel. Exactly what the module serves —
-// channels, messages, thread replies — no reactions/pins/presence cosplay.
+// list, a composer, and a thread side panel. Messages are sequence-addressed
+// MessageViews with block bodies; authorship comes back as AuthorRef (derived
+// from the submit origin), decoded to a display name here.
 
 import { useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 
-import type { ChatMessage } from "../../../domain/chat-client";
+import { authorName, blocksText } from "../../../domain/chat-client";
+import type { MessageView } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
@@ -89,9 +91,11 @@ function MessageRow({
   message,
   onOpenThread,
 }: {
-  message: ChatMessage;
-  onOpenThread?: (rootId: string) => void;
+  message: MessageView;
+  onOpenThread?: (rootSeq: number) => void;
 }) {
+  const author = authorName(message.head.author);
+  const replyCount = message.head.reply_count;
   return (
     <div
       style={{
@@ -101,39 +105,45 @@ function MessageRow({
         animation: "msgIn .16s ease-out",
       }}
     >
-      <span style={avatarStyle}>{message.author.slice(0, 2).toUpperCase()}</span>
+      <span style={avatarStyle}>{author.slice(0, 2).toUpperCase()}</span>
       <div style={{ minWidth: 0, flex: 1 }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
           <span style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>
-            {message.author}
+            {author}
           </span>
           <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
-            {timeOf(message.sent_at)}
+            {timeOf(message.head.created_at)}
           </span>
+          {message.head.edited_at !== null && (
+            <span style={{ font: `400 10px ${font.sans}`, color: color.muted2 }}>
+              (edited)
+            </span>
+          )}
         </div>
         <div
           style={{
             font: `400 13px ${font.sans}`,
-            color: color.inkSofter,
+            color: message.head.deleted ? color.muted2 : color.inkSofter,
+            fontStyle: message.head.deleted ? "italic" : "normal",
             whiteSpace: "pre-wrap",
             wordBreak: "break-word",
           }}
         >
-          {message.body}
+          {message.head.deleted ? "message deleted" : blocksText(message.head.blocks)}
         </div>
-        {onOpenThread && (
+        {onOpenThread && !message.head.deleted && (
           <button
-            onClick={() => onOpenThread(message.id)}
+            onClick={() => onOpenThread(message.seq)}
             style={{
               all: "unset",
               cursor: "pointer",
               marginTop: 3,
               font: `500 11px ${font.sans}`,
-              color: message.reply_count > 0 ? accentVar : color.muted2,
+              color: replyCount > 0 ? accentVar : color.muted2,
             }}
           >
-            {message.reply_count > 0
-              ? `${message.reply_count} ${message.reply_count === 1 ? "reply" : "replies"}`
+            {replyCount > 0
+              ? `${replyCount} ${replyCount === 1 ? "reply" : "replies"}`
               : "reply in thread"}
           </button>
         )}
@@ -294,7 +304,7 @@ function ThreadPanel() {
           />
         )}
         {thread.replies.map((reply) => (
-          <MessageRow key={reply.id} message={reply} />
+          <MessageRow key={reply.seq} message={reply} />
         ))}
       </div>
       <Composer placeholder="Reply in thread" onSubmit={actions.replyInThread} />
@@ -308,7 +318,7 @@ export function ChatView() {
   const { state, actions } = useDucktape();
   const channel = state.channels.find((c) => c.id === state.activeChannel);
   // thread replies render in the panel; the main lane shows roots only
-  const roots = state.messages.filter((message) => message.thread_id === null);
+  const roots = state.messages.filter((message) => message.head.thread === null);
 
   return (
     <div style={{ display: "flex", flex: 1, minWidth: 0 }}>
@@ -331,7 +341,7 @@ export function ChatView() {
 
         <div style={{ flex: 1, overflowY: "auto", padding: "9px 0" }}>
           {roots.map((message) => (
-            <MessageRow key={message.id} message={message} onOpenThread={actions.openThread} />
+            <MessageRow key={message.seq} message={message} onOpenThread={actions.openThread} />
           ))}
           {channel && roots.length === 0 && (
             <div style={{ padding: "13px 17px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>

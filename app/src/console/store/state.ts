@@ -2,7 +2,7 @@
 // (channels/messages/tasks/status re-queried per block) plus local ui state
 // (screen, accent, author identity, thread panel).
 
-import type { ChatChannel, ChatMessage, ChatThread } from "../../domain/chat-client";
+import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { NodeStatus } from "../../domain/transport";
 
@@ -19,10 +19,10 @@ export interface ConsoleState {
   /** True when this app owns the daemon lifecycle (desktop build). */
   managed: boolean;
   status: NodeStatus | null;
-  channels: ChatChannel[];
+  channels: Channel[];
   activeChannel: string | null;
-  /** Messages of the active channel only. */
-  messages: ChatMessage[];
+  /** Messages of the active channel only (all sequences; views filter). */
+  messages: MessageView[];
   activeThread: ChatThread | null;
   tasks: Task[];
   error: string | null;
