@@ -1078,6 +1078,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "commonware-actor",
+ "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
@@ -1091,6 +1092,7 @@ dependencies = [
  "kv",
  "kv-interface",
  "node",
+ "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "sdk",
 ]

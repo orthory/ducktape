@@ -12,6 +12,10 @@
 #   ducktape-node --config examples/node0.toml   # bootstrapper
 #   ducktape-node --config examples/node1.toml   # dials node 0
 #
+# DUCKTAPE_CONSENSUS_SCHEME=bls-multisig runs the identical demo under the V2
+# bls-multisig consensus scheme (default: ed25519). GENESIS-WIDE — both nodes
+# always get the same value.
+#
 # the assertion is four-part (each part diagnoses a distinct failure mode):
 #   1. both GENESIS app-hashes agree      -> no pre-op fork (genesis determinism)
 #   2. both CONVERGED app-hashes present  -> both nodes applied BOTH ops; a node
@@ -31,14 +35,23 @@ BIN_PATH="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import jso
 # so a stale run would start from divergent (non-empty) bases.
 rm -rf /tmp/ducktape-node-0 /tmp/ducktape-node-1
 
+# consensus scheme switch: DUCKTAPE_CONSENSUS_SCHEME=bls-multisig reruns the SAME
+# demo under the V2 bls scheme. GENESIS-WIDE — both nodes get the identical value,
+# appended to a temp copy of each config so the checked-in examples stay pristine.
+SCHEME="${DUCKTAPE_CONSENSUS_SCHEME:-ed25519}"
+cfg0=$(mktemp)
+cfg1=$(mktemp)
+cat examples/node0.toml >"$cfg0"; echo "consensus_scheme = \"$SCHEME\"" >>"$cfg0"
+cat examples/node1.toml >"$cfg1"; echo "consensus_scheme = \"$SCHEME\"" >>"$cfg1"
+
 log0=$(mktemp)
 log1=$(mktemp)
 
-echo "launching node 0 (bootstrapper) + node 1 (dialer)..."
-"$BIN_PATH" --config examples/node0.toml >"$log0" 2>&1 &
+echo "launching node 0 (bootstrapper) + node 1 (dialer) under scheme $SCHEME..."
+"$BIN_PATH" --config "$cfg0" >"$log0" 2>&1 &
 pid0=$!
 sleep 1
-"$BIN_PATH" --config examples/node1.toml >"$log1" 2>&1 &
+"$BIN_PATH" --config "$cfg1" >"$log1" 2>&1 &
 pid1=$!
 
 # wait up to ~60s for BOTH nodes to log a converged app-hash.
@@ -63,7 +76,7 @@ gen1=$(grep -m1 -oE 'genesis app_hash=[0-9a-f]+' "$log1" | cut -d= -f2 || true)
 conv0=$(grep -m1 -oE 'converged app_hash=[0-9a-f]+' "$log0" | cut -d= -f2 || true)
 conv1=$(grep -m1 -oE 'converged app_hash=[0-9a-f]+' "$log1" | cut -d= -f2 || true)
 
-rm -f "$log0" "$log1"
+rm -f "$log0" "$log1" "$cfg0" "$cfg1"
 
 echo
 echo "genesis:   node0=$gen0  node1=$gen1"
@@ -82,4 +95,4 @@ if [ "$conv0" = "$gen0" ]; then
   echo "FAIL: converged hash == genesis (nothing was actually applied)"; exit 1
 fi
 
-echo "PASS: both processes converged on byte-identical app-hash $conv0 over real TCP (off genesis $gen0)"
+echo "PASS: both processes converged on byte-identical app-hash $conv0 over real TCP (off genesis $gen0, scheme $SCHEME)"

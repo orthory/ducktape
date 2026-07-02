@@ -22,6 +22,9 @@ commonware-runtime = { workspace = true }
 commonware-resolver = { workspace = true }
 bytes = "1"
 rand_core = "0.6.4"
+# deterministic DEV bls key derivation (bls_dev_secret) — mirrors the seeded-chacha
+# pattern commonware's own `Signer::from_seed` uses. dev/test keys only.
+rand_chacha = "0.3"
 
 [dev-dependencies]
 # the N-validator convergence harness: real simplex Engines over one simulated
@@ -34,3 +37,5 @@ directory = { workspace = true }
 directory-interface = { workspace = true }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
+# the V2 certificate-shape test encodes certificates to assert flat-size aggregation.
+commonware-codec = { workspace = true }

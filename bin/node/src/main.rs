@@ -43,10 +43,6 @@ use commonware_runtime::{Clock, Quota, Runner, Supervisor};
 use commonware_utils::{ordered::Set, NZU32};
 
 use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer};
-
-/// the consensus signature scheme this build runs — a genesis-wide constant. today only
-/// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
-const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 use directory::Directory;
 use host::Host;
 use kv::Kv;
@@ -92,6 +88,23 @@ struct NodeConfig {
     /// `kv` module uses a fixed "kv" partition, so two processes sharing a root
     /// would corrupt each other's state. defaults to a per-id temp dir.
     storage_dir: Option<String>,
+    /// the consensus signature scheme — a GENESIS-WIDE constant, every node in the
+    /// mesh must agree (see [`ConsensusScheme`]'s rekey/respawn contract). `"ed25519"`
+    /// (the default) runs V1; `"bls-multisig"` runs V2, deriving each validator's bls
+    /// signing secret from the SAME dev seeds as its ed25519 identity (ed25519 stays
+    /// the transport identity — only vote/certificate signatures change).
+    consensus_scheme: Option<String>,
+}
+
+/// parse the config's scheme selector into the genesis-wide [`ConsensusScheme`].
+fn parse_scheme(s: Option<&str>) -> Result<ConsensusScheme, String> {
+    match s {
+        None | Some("ed25519") => Ok(ConsensusScheme::V1Ed25519),
+        Some("bls-multisig") => Ok(ConsensusScheme::V2Bls),
+        Some(other) => Err(format!(
+            "unknown consensus_scheme {other:?} (want \"ed25519\" or \"bls-multisig\")"
+        )),
+    }
 }
 
 /// hex-encode a state root for a stable, greppable log line.
@@ -133,6 +146,7 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         None => listen,
     };
     let namespace = cfg.namespace.clone().into_bytes();
+    let consensus_scheme = parse_scheme(cfg.consensus_scheme.as_deref())?;
 
     // each seed -> an ed25519 identity; together the authorized participant set.
     let peers: Vec<ed25519::PublicKey> = cfg
@@ -166,7 +180,7 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
 
     println!(
-        "[node #{id}] starting on {listen} ({} peers), storage {}",
+        "[node #{id}] starting on {listen} ({} peers, {consensus_scheme:?}), storage {}",
         cfg.peer_seeds.len(),
         storage.display()
     );
@@ -221,19 +235,6 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         let host = Host::genesis(vec![Box::new(kv), Box::new(Directory::new("directory"))])
             .expect("genesis host");
 
-        // scheme built the production way: `signer` finds our key's index in the
-        // sorted participant set, so we sign as exactly the participant our
-        // discovery identity represents. (NOT the mocks-gated `fixture`.)
-        // the consensus signature scheme is a GENESIS-WIDE constant (ConsensusScheme).
-        // today only V1 (ed25519). adding V2Bls makes this match non-exhaustive — the
-        // compiler-enforced point to wire a BLS engine + an epoch-transition rekey.
-        let scheme = match CONSENSUS_SCHEME {
-            ConsensusScheme::V1Ed25519 => {
-                simplex_ed25519::Scheme::signer(&namespace, participants.clone(), signer.clone())
-                    .expect("our key is in the authorized participant set")
-            }
-        };
-
         // genesis floor: domain-separated by namespace so every node in THIS app
         // computes the identical digest (else engines never agree -> hang). NOT
         // the mocks-gated `mocks::application::genesis`.
@@ -250,19 +251,55 @@ fn run_node(cfg: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         // is an FS-safe per-node partition. the engine keepalive handle lives
         // inside the returned orderer (held by the OrderedNode below, which the
         // loop never drops — so the engine never aborts).
-        let orderer = SimplexOrderer::spawn_with_relay(
-            context.child("consensus"),
-            scheme,
-            oracle.clone(),
-            signer.public_key().to_string(),
-            Epoch::new(0),
-            genesis_floor,
-            store,
-            vote,
-            certificate,
-            resolver,
-            payload,
-        );
+        //
+        // the spawn is SCHEME-GENERIC and the orderer scheme-erased, so the
+        // GENESIS-WIDE ConsensusScheme is purely a construction-time choice: each
+        // arm builds its scheme value the production way and hands it to the SAME
+        // wiring. V1 signs with our ed25519 identity over the sorted participant
+        // set. V2 signs with a bls secret derived from the SAME dev seeds; the
+        // (identity key -> bls key) map is TRUSTED config input in this slice —
+        // see ConsensusScheme's rogue-key note (PoP lands with valset membership
+        // authentication). ed25519 stays the transport identity either way.
+        let orderer = match consensus_scheme {
+            ConsensusScheme::V1Ed25519 => {
+                let scheme = simplex_ed25519::Scheme::signer(
+                    &namespace,
+                    participants.clone(),
+                    signer.clone(),
+                )
+                .expect("our key is in the authorized participant set");
+                SimplexOrderer::spawn_with_relay(
+                    context.child("consensus"),
+                    scheme,
+                    oracle.clone(),
+                    signer.public_key().to_string(),
+                    Epoch::new(0),
+                    genesis_floor,
+                    store,
+                    vote,
+                    certificate,
+                    resolver,
+                    payload,
+                )
+            }
+            ConsensusScheme::V2Bls => {
+                let scheme = consensus::bls_dev_scheme(&namespace, &cfg.peer_seeds, id)
+                    .expect("our dev bls key is in the derived participant map");
+                SimplexOrderer::spawn_with_relay(
+                    context.child("consensus"),
+                    scheme,
+                    oracle.clone(),
+                    signer.public_key().to_string(),
+                    Epoch::new(0),
+                    genesis_floor,
+                    store,
+                    vote,
+                    certificate,
+                    resolver,
+                    payload,
+                )
+            }
+        };
         let mut node = OrderedNode::new(host, orderer);
 
         // the genesis app-hash BEFORE any op — the demo asserts this agrees across
