@@ -170,9 +170,11 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, Task>, Error> {
 
         Tasks::validate_non_empty("task_id", &id)?;
         Tasks::validate_non_empty("title", &title)?;
-        if updated_at < created_at {
-            return Err(Error::Module("snapshot task timestamps are invalid".into()));
-        }
+        // no updated_at >= created_at check: `stage_status` stamps updated_at
+        // with the block's consensus_time unconditionally and NOTHING guarantees
+        // cross-block monotonicity, so a legitimately committed state can hold
+        // updated_at < created_at. install must accept every execute-reachable
+        // state — the root comparison is the integrity check.
         if tasks
             .last_key_value()
             .is_some_and(|(last, _)| last.as_str() >= id.as_str())
