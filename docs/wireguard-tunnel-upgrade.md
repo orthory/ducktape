@@ -25,18 +25,27 @@ WireGuard devices or perform this handshake.
 
 ## Trust Anchors
 
-The trust anchor is the finalized valset state, not a node-local config file.
+The trust anchor is the finalized active consensus validator set, not a
+node-local config file and not the permissionless valset module by itself. The
+current `ValsetMsg::Join` surface accepts any well-formed Ed25519 key as
+application state; that is candidate membership only. A key from that module
+does not become a WireGuard peer, bootnode, or relay until the consensus/admission
+layer includes it in the finalized active validator set for the epoch.
+
 For epoch `E`, a node accepts a mesh view only when:
 
-1. The validator identity is present in the finalized valset for `E`.
-2. The mesh view version is derived from the sorted valset identities plus their
-   signed endpoint advertisements.
-3. The advertisement signature verifies under the validator identity.
+1. The validator identity is admitted in the finalized active consensus set for
+   `E`.
+2. The mesh view version is derived from the canonical mesh-version preimage for
+   that admitted set and its endpoint records.
+3. The advertisement signature verifies under the admitted validator identity.
 4. The advertisement is still within its expiry view.
 5. Its endpoints satisfy the local port policy.
 
 Node-local config may restrict the policy further, but it must not add
-validators or relays outside the finalized valset.
+validators or relays outside the finalized active consensus set. Until the
+admission layer exists in code, a WireGuard implementation must fail closed and
+must not treat permissionless `ValsetMsg::Join` membership as tunnel authority.
 
 ## Endpoint Model
 
@@ -59,7 +68,10 @@ EndpointAdvertisementV1 {
 }
 ```
 
-Endpoint fields are typed before verification:
+Endpoint fields are typed before verification. Protocol v1 endpoints use
+canonical IP literals only; DNS names are rejected. IPv4-mapped IPv6 literals
+must be normalized before policy checks. The `host` field must not contain a
+port or zone identifier.
 
 ```text
 ControlEndpoint {
@@ -80,11 +92,51 @@ The parser rejects:
 - empty host;
 - unspecified hosts such as `0.0.0.0` or `::` as advertised endpoints;
 - loopback hosts outside an explicit local-dev policy;
+- private, link-local, multicast, broadcast, documentation, or otherwise
+  non-global addresses unless the active policy explicitly allows that address
+  class;
+- DNS names, non-canonical IP literals, IPv6 zone identifiers, and endpoint
+  strings with embedded ports;
 - port `0`;
 - ports outside the active allowlist;
 - mismatched transport, for example WireGuard over TCP;
 - duplicate endpoint advertisements for one validator and epoch unless the
   replacement has a higher monotonic nonce and is signed by the same validator.
+
+Future protocol versions may allow DNS only if resolution is authenticated,
+pinned for the dial attempt, and rechecked immediately before use. DNS rebinding
+between verification and dial is a hard failure.
+
+## Mesh Version
+
+`mesh_version` is not self-referential. It is computed before advertisement
+signing from a preimage that excludes `mesh_version` and `signature_ed25519`:
+
+```text
+EndpointRecordV1 {
+  namespace
+  epoch
+  valset_root
+  validator_identity_ed25519
+  control_endpoint
+  wireguard_endpoint
+  capabilities
+  expires_at_view
+  nonce
+}
+
+mesh_version =
+  HASH("ducktape:validator-mesh-version:v1" ||
+       namespace ||
+       epoch ||
+       valset_root ||
+       SORT_ASC(endpoint_record_hashes))
+```
+
+The endpoint advertisement signs the full `EndpointAdvertisementV1`, including
+the computed `mesh_version`, but the signature is not part of the mesh-version
+preimage. Implementations must ship fixed test vectors for this preimage so that
+independent nodes produce the same mesh version from the same admitted set.
 
 ## Port Policy
 
@@ -172,10 +224,12 @@ TunnelUpgradeAckV1 {
   response_hash
   namespace
   epoch
+  valset_root
   mesh_version
   initiator_identity_ed25519
   responder_identity_ed25519
   installed_at_view
+  expires_at_view
   nonce
   signature_ed25519
 }
@@ -183,22 +237,33 @@ TunnelUpgradeAckV1 {
 
 A node installs WireGuard peer config only after all checks pass:
 
-1. Both identities are validators in the same finalized valset epoch.
+1. Both identities are admitted validators in the same finalized active
+   consensus epoch.
 2. Both endpoint advertisements are valid for the same mesh version.
-3. Request and response signatures verify.
+3. Request, response, and ack signatures verify.
 4. The responder echoes the request hash.
-5. Both WireGuard public keys are well-formed X25519 public keys.
-6. Both endpoints satisfy local port policy.
-7. The message has not expired.
-8. `(sender_identity, epoch, nonce)` has not been seen before.
-9. The requested allowed IPs are within the deterministic overlay assignment for
-   those validator identities.
+5. The ack echoes both request and response hashes.
+6. All three messages carry the same namespace, epoch, valset root, and mesh
+   version.
+7. Both WireGuard public keys are well-formed X25519 public keys.
+8. Both endpoints satisfy local port policy.
+9. No request, response, or ack message has expired.
+10. `(sender_identity, epoch, nonce)` has not been seen before for every signed
+    message.
+11. Both requested and accepted allowed IPs are within the deterministic overlay
+    assignment for those validator identities.
 
 ## Overlay Addressing
 
 Overlay IPs are derived from `(namespace, epoch, validator_identity)` and the
-validator's stable mesh index. A peer cannot request arbitrary routes. The
-implementation must reject:
+validator's stable mesh index. A peer cannot request arbitrary routes.
+
+`requested_allowed_ips` is the initiator's proposed route set for the responder
+identity. `accepted_allowed_ips` is the responder's route set for the initiator
+identity. Each field must equal the canonical route set for that remote identity
+or a strict subset explicitly allowed by the mesh policy; supernets and routes
+for any other validator are forbidden. The implementation must reject either
+field when it contains:
 
 - default routes such as `0.0.0.0/0` and `::/0`;
 - host routes for another validator's overlay address;
@@ -207,18 +272,20 @@ implementation must reject:
 
 ## Relay Fallback
 
-Relay candidates are the validators whose mesh view capability includes
+Relay candidates are admitted validators whose mesh view capability includes
 `relay`. A relay forwards encrypted tunnel traffic or control messages only; it
 must not terminate the WireGuard session or decrypt state-sync payloads.
 
 Relay selection rules:
 
-- Candidate must be in the same epoch and mesh version.
+- Candidate must be in the same admitted active consensus epoch and mesh
+  version.
 - Candidate must satisfy the same endpoint and port policy checks.
 - Candidate must not be the only path unless direct dialing failed with a
   recorded dial error.
 - External permanent relays are rejected by protocol. A deployment can add a
-  relay only by adding it to the validator set for that epoch.
+  relay only by admitting it to the active consensus validator set for that
+  epoch.
 
 ## Replay, Downgrade, and Cutover
 
@@ -249,14 +316,19 @@ Possession of a tunnel never bypasses module/root/kind checks.
 ## Minimum Tests Before Implementation Is Mergeable
 
 - Endpoint parser rejects wildcard, loopback in production, port zero, wrong
-  transport, and disallowed ports.
+  transport, disallowed ports, DNS names, IPv4-mapped loopback/private forms,
+  link-local, multicast, embedded-port hosts, and DNS rebinding if a future
+  protocol version enables DNS.
 - Signed endpoint advertisement fails for wrong epoch, wrong mesh version,
-  unknown validator, duplicate nonce, and expired view.
-- Upgrade request/response fail when request hash, policy hash, valset root, or
-  identities do not match.
+  unknown admitted validator, candidate-only permissionless valset membership,
+  duplicate nonce, and expired view.
+- Mesh-version fixed vectors cover identical inputs, endpoint changes, valset
+  changes, and signatures excluded from the preimage.
+- Upgrade request/response/ack fail when request hash, response hash, policy
+  hash, valset root, expiry, or identities do not match.
 - Overlay route validation rejects default routes, stolen peer routes, and
-  routes outside the mesh CIDR.
-- Relay fallback uses only validator-set relay candidates and keeps payloads
-  encrypted end-to-end.
+  routes outside the mesh CIDR for both requested and accepted allowed IPs.
+- Relay fallback uses only admitted validator-set relay candidates and keeps
+  payloads encrypted end-to-end.
 - Epoch cutover removes departed validators and rotates or revalidates retained
   validator sessions.
