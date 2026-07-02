@@ -393,6 +393,8 @@ pub struct Plumbing {
     pub advertised: Option<String>,
     pub http_listen: Option<String>,
     pub rpc_listen: Option<String>,
+    /// merged like the rest — a hand-edited storage_dir survives rewrites.
+    pub storage_dir: String,
 }
 
 pub fn merged_plumbing(
@@ -423,6 +425,9 @@ pub fn merged_plumbing(
         rpc_listen: rpc_listen
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.rpc_listen.clone())),
+        storage_dir: e
+            .and_then(|r| r.storage_dir.clone())
+            .unwrap_or_else(|| "storage".into()),
     })
 }
 
@@ -439,7 +444,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     if let Some(a) = &p.advertised {
         s += &format!("advertised = \"{a}\"\n");
     }
-    s += "storage_dir = 'storage'\n";
+    s += &format!("storage_dir = '{}'\n", p.storage_dir);
     if let Some(h) = &p.http_listen {
         s += &format!("http_listen = \"{h}\"\n");
     }
@@ -1019,13 +1024,15 @@ mod tests {
         // an existing DEV-shape file (the desktop app's solo config).
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:0\"\nnamespace = \"ducktape-local\"\npeer_seeds = [0]\nhttp_listen = \"127.0.0.1:8844\"\n",
+            "id = 0\nlisten = \"127.0.0.1:0\"\nnamespace = \"ducktape-local\"\npeer_seeds = [0]\nhttp_listen = \"127.0.0.1:8844\"\nstorage_dir = '/data/ducktape'\n",
         )
         .expect("write");
-        // one flag overrides ONLY its field; the http port survives.
+        // one flag overrides ONLY its field; the http port AND a hand-edited
+        // storage_dir survive.
         let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None).expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
+        assert_eq!(p.storage_dir, "/data/ducktape");
         assert!(p.rpc_listen.is_none());
         // and the merged write is network-shape.
         write_node_toml(&dir, &p).expect("write");
@@ -1033,6 +1040,7 @@ mod tests {
         assert_eq!(raw.network.as_deref(), Some("network.toml"));
         assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(raw.listen, "127.0.0.1:53000");
+        assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
     }
 
     #[test]

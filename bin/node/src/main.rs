@@ -549,13 +549,12 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
     config::guard_join_descriptor(&dir, &descriptor)?;
-    descriptor.save(&dir.join("network.toml"))?;
-    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
-    let me_hex = hex_bytes(key.public_key().as_ref());
     // plumbing merges: explicit flags win, an existing node.toml's values
-    // (network- or dev-shape) survive, defaults fill the rest. the file is
-    // ALWAYS rewritten in the network shape — a join must take effect even in
-    // a dir holding the app's dev-shape solo config.
+    // (network- or dev-shape) survive, defaults fill the rest. computed
+    // BEFORE anything lands on disk so a corrupt existing node.toml aborts
+    // the join without leaving a half-migrated dir. the file is ALWAYS
+    // rewritten in the network shape — a join must take effect even in a dir
+    // holding the app's dev-shape solo config.
     let plumbing = config::merged_plumbing(
         &dir,
         flags.get("listen").map(String::as_str),
@@ -563,6 +562,9 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("http").map(String::as_str),
         flags.get("rpc").map(String::as_str),
     )?;
+    descriptor.save(&dir.join("network.toml"))?;
+    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
+    let me_hex = hex_bytes(key.public_key().as_ref());
     config::write_node_toml(&dir, &plumbing)?;
     eprintln!(
         "{} identity {me_hex}",
@@ -752,8 +754,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
             let Some(server_peer) = sync_source else {
                 eprintln!(
-                    "[node {label}] no statesync source: every bootstrap hint and mesh peer \
-                     is this node itself — a solo network has nothing to sync from"
+                    "[node {label}] no statesync source: no validator other than this node \
+                     is available to serve (only validators answer the statesync channel)"
                 );
                 std::process::exit(1);
             };
