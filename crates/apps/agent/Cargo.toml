@@ -3,14 +3,15 @@ name = "agent"
 edition.workspace = true
 version.workspace = true
 
-# Stateless shared-session command facade over the storage-backed messaging module.
+# Queryable agent-session facade over the storage-backed messaging module.
 [dependencies]
 sdk = { workspace = true }
 agent-interface = { workspace = true }
+messaging = { workspace = true }
 messaging-interface = { workspace = true }
 async-trait = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-storage = { workspace = true }
 
 [dev-dependencies]
 host = { workspace = true }
-messaging = { workspace = true }
-commonware-runtime = { workspace = true }

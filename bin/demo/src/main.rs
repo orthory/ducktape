@@ -1,13 +1,16 @@
-//! a runnable super-app demo: eight isolated modules — a qmdb-backed kv, a sync
+//! a runnable super-app demo: seven registered modules — a qmdb-backed kv, a sync
 //! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
-//! block DOCUMENT module, a stateless agent-session facade over a qmdb-backed
-//! messaging app, and an ed25519 permissionless VALSET — dispatched over ONE
-//! host, showing the app-hash evolve as typed cross-module ops flow.
+//! block DOCUMENT module, a queryable agent-session module backed by messaging
+//! storage, and an ed25519 permissionless VALSET — dispatched over ONE host,
+//! showing the app-hash evolve as typed cross-module ops flow.
 //!
 //! run: `cargo run -p demo`
 
 use agent::Agent;
-use agent_interface::{AgentMsg, encode_msg as agent_encode_msg};
+use agent_interface::{
+    AgentMsg, AgentQuery, AgentReply, decode_reply as agent_decode_reply,
+    encode_msg as agent_encode_msg, encode_query as agent_encode_query,
+};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -25,11 +28,6 @@ use forge_interface::{
 };
 use greeter::Greeter;
 use host::Host;
-use messaging::Messaging;
-use messaging_interface::{
-    MessagingQuery, MessagingReply, decode_reply as messaging_decode_reply,
-    encode_query as messaging_encode_query,
-};
 use sdk::Msg;
 use valset::Valset;
 use valset_interface::{
@@ -50,8 +48,8 @@ fn main() {
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
         let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
-        let messaging = Messaging::init(context.child("messaging"), "messaging").await;
-        let agent = Agent::new("agent");
+        let agent =
+            Agent::init_with_messaging_id(context.child("agent"), "agent", "agent-messaging").await;
         let valset = Valset::new("valset");
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -59,13 +57,12 @@ fn main() {
             Box::new(greeter),
             Box::new(forge),
             Box::new(document),
-            Box::new(messaging),
             Box::new(agent),
             Box::new(valset),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 8 isolated modules over one host ===");
+        println!("=== super-app demo — 7 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -81,8 +78,8 @@ fn main() {
             host.module_root("document").unwrap()
         );
         println!(
-            "genesis messaging root (no channels): {:?}",
-            host.module_root("messaging").unwrap()
+            "genesis agent root (no sessions)    : {:?}",
+            host.module_root("agent").unwrap()
         );
 
         // block 1: a typed Set to the in-memory directory module.
@@ -177,8 +174,8 @@ fn main() {
             );
         }
 
-        // block 4: open an agent session through the stateless facade, then
-        // block 5 appends a message. messaging owns the storage root.
+        // block 4: open an agent session. agent is a queryable module with a
+        // real messaging-backed storage root.
         let out = host
             .submit(Msg {
                 target: "agent".into(),
@@ -191,10 +188,6 @@ fn main() {
             .expect("submit block 4");
         println!("\n[block 4] agent <- OpenSession(general)");
         println!(
-            "  messaging root : {:?}",
-            host.module_root("messaging").unwrap()
-        );
-        println!(
             "  agent root     : {:?}",
             host.module_root("agent").unwrap()
         );
@@ -203,31 +196,30 @@ fn main() {
         let out = host
             .submit(Msg {
                 target: "agent".into(),
-                payload: agent_encode_msg(&AgentMsg::AppendMessage {
+                payload: agent_encode_msg(&AgentMsg::AppendTurn {
                     session_id: "general".into(),
-                    message_id: "m1".into(),
-                    author: "demo".into(),
-                    body: "hello channel".into(),
+                    user_message_id: "u1".into(),
+                    assistant_message_id: "a1".into(),
+                    user: "demo-user".into(),
+                    assistant: "demo-agent".into(),
+                    user_body: "what changed?".into(),
+                    assistant_body: "agent is now queryable and root-backed".into(),
                 }),
             })
             .await
             .expect("submit block 5");
         let reply = host
             .query(
-                "messaging",
-                &messaging_encode_query(&MessagingQuery::Messages {
-                    channel_id: "general".into(),
+                "agent",
+                &agent_encode_query(&AgentQuery::Messages {
+                    session_id: "general".into(),
                 }),
             )
             .await
-            .expect("query messaging");
-        if let MessagingReply::Messages(messages) = messaging_decode_reply(&reply).unwrap() {
-            println!("\n[block 5] agent <- AppendMessage(general, m1)");
-            println!("  message count  : {}", messages.len());
-            println!(
-                "  messaging root : {:?}",
-                host.module_root("messaging").unwrap()
-            );
+            .expect("query agent");
+        if let AgentReply::Messages(entries) = agent_decode_reply(&reply).unwrap() {
+            println!("\n[block 5] agent <- AppendTurn(general, u1, a1)");
+            println!("  entry count    : {}", entries.len());
             println!(
                 "  agent root     : {:?}",
                 host.module_root("agent").unwrap()
@@ -350,7 +342,6 @@ fn main() {
             "greeter",
             "agent",
             "kv",
-            "messaging",
             "valset",
         ] {
             println!("  {id:>10} : {:?}", host.module_root(id).unwrap());

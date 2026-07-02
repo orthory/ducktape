@@ -7,14 +7,18 @@
 //! commit_block path (payloads built via the *-interface crates, exactly as the
 //! demo binary does), including OVERWRITES in kv and document: a qmdb root is
 //! op-log ordered, so a naive "export current pairs and re-apply" could never
-//! reproduce it — only the real sync path can. the joiner rebuilds kv and
-//! document / messaging through the qmdb sync engine (target + resolver), forge /
-//! valset / directory / saga through snapshot + install gated on the source root,
-//! and greeter / agent fresh (stateless). every reconstructed module is then read
-//! back — content, not just digests — and one tampered snapshot must be refused
-//! without disturbing the already-installed state.
+//! reproduce it — only the real sync path can. the joiner rebuilds kv, document,
+//! and agent through the qmdb sync engine (target + resolver), forge / valset /
+//! directory / saga through snapshot + install gated on the source root, and
+//! greeter fresh (stateless). every reconstructed module is then read back —
+//! content, not just digests — and one tampered snapshot must be refused without
+//! disturbing the already-installed state.
 
 use agent::Agent;
+use agent_interface::{
+    AgentEntry, AgentMsg, AgentQuery, AgentReply, decode_reply as agent_decode_reply,
+    encode_msg as agent_encode_msg, encode_query as agent_encode_query,
+};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -30,12 +34,6 @@ use forge_interface::{ForgeMsg, encode_msg as forge_encode_msg};
 use greeter::Greeter;
 use kv::Kv;
 use kv_interface::{KvMsg, encode as kv_encode};
-use messaging::Messaging;
-use messaging_interface::{
-    ChatMessage, MessagingMsg, MessagingQuery, MessagingReply,
-    decode_reply as messaging_decode_reply, encode_msg as messaging_encode_msg,
-    encode_query as messaging_encode_query,
-};
 use saga::SagaModule;
 use saga_interface::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
@@ -131,15 +129,15 @@ impl Module for RegistryEntry {
     }
 }
 
-/// compose the joiner's app-hash: the two rebuilt qmdb stores enter under their
-/// canonical ids via [`RegistryEntry`]; the rest carry their canonical ids
-/// natively. a free function (not a borrowing closure) so the caller can still
-/// mutate a module between compositions.
+/// compose the joiner's app-hash: rebuilt qmdb stores that use non-canonical
+/// storage ids enter under their canonical module ids via [`RegistryEntry`];
+/// the rest carry their canonical ids natively. a free function (not a
+/// borrowing closure) so the caller can still mutate a module between
+/// compositions.
 #[allow(clippy::too_many_arguments)]
 fn joiner_app_hash(
     kv: &dyn Module,
     document: &dyn Module,
-    messaging: &dyn Module,
     agent: &dyn Module,
     directory: &dyn Module,
     greeter: &dyn Module,
@@ -149,14 +147,12 @@ fn joiner_app_hash(
 ) -> StateRoot {
     let kv_entry = RegistryEntry::of("kv", kv);
     let document_entry = RegistryEntry::of("document", document);
-    let messaging_entry = RegistryEntry::of("messaging", messaging);
-    let mods: [&dyn Module; 9] = [
+    let mods: [&dyn Module; 8] = [
         &kv_entry,
         directory,
         greeter,
         forge,
         &document_entry,
-        &messaging_entry,
         agent,
         valset,
         saga,
@@ -185,19 +181,19 @@ async fn validators(v: &Valset) -> Vec<Vec<u8>> {
     }
 }
 
-async fn messaging_messages<E>(m: &Messaging<E>, channel_id: &str) -> Vec<ChatMessage>
+async fn agent_entries<E>(agent: &Agent<E>, session_id: &str) -> Vec<AgentEntry>
 where
     E: commonware_storage::Context + commonware_runtime::BufferPooler,
 {
-    let reply = m
-        .query(&messaging_encode_query(&MessagingQuery::Messages {
-            channel_id: channel_id.into(),
+    let reply = agent
+        .query(&agent_encode_query(&AgentQuery::Messages {
+            session_id: session_id.into(),
         }))
         .await
         .unwrap();
-    match messaging_decode_reply(&reply).unwrap() {
-        MessagingReply::Messages(messages) => messages,
-        other => panic!("unexpected messaging reply: {other:?}"),
+    match agent_decode_reply(&reply).unwrap() {
+        AgentReply::Messages(entries) => entries,
+        other => panic!("unexpected agent reply: {other:?}"),
     }
 }
 
@@ -306,36 +302,32 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         )
         .await;
 
-        let mut src_messaging =
-            Messaging::init(context.child("source_messaging"), "messaging").await;
+        let mut src_agent = Agent::init_with_messaging_id(
+            context.child("source_agent"),
+            "agent",
+            "agent-messaging",
+        )
+        .await;
         commit_op(
-            &mut src_messaging,
+            &mut src_agent,
             10,
-            messaging_encode_msg(&MessagingMsg::CreateChannel {
-                channel_id: "general".into(),
-                name: "General".into(),
+            agent_encode_msg(&AgentMsg::OpenSession {
+                session_id: "general".into(),
+                title: "General".into(),
             }),
         )
         .await;
         commit_op(
-            &mut src_messaging,
+            &mut src_agent,
             20,
-            messaging_encode_msg(&MessagingMsg::PostMessage {
-                channel_id: "general".into(),
-                message_id: "m1".into(),
-                author: "alice".into(),
-                body: "hello".into(),
-            }),
-        )
-        .await;
-        commit_op(
-            &mut src_messaging,
-            21,
-            messaging_encode_msg(&MessagingMsg::PostMessage {
-                channel_id: "general".into(),
-                message_id: "m2".into(),
-                author: "bob".into(),
-                body: "storage-backed".into(),
+            agent_encode_msg(&AgentMsg::AppendTurn {
+                session_id: "general".into(),
+                user_message_id: "u1".into(),
+                assistant_message_id: "a1".into(),
+                user: "alice".into(),
+                assistant: "codex".into(),
+                user_body: "hello".into(),
+                assistant_body: "storage-backed".into(),
             }),
         )
         .await;
@@ -412,14 +404,13 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         .await;
 
         let src_greeter = Greeter::new("greeter");
-        let src_agent = Agent::new("agent");
 
         // ---- the source app-hash: what consensus commits to ------------------
         let src_kv_root = src_kv.root();
         let src_document_root = src_document.root();
         let src_directory_root = src_directory.root();
         let src_forge_root = src_forge.root();
-        let src_messaging_root = src_messaging.root();
+        let src_agent_root = src_agent.root();
         let src_valset_root = src_valset.root();
         let src_saga_root = src_saga.root();
         for (id, root) in [
@@ -427,7 +418,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             ("document", src_document_root),
             ("directory", src_directory_root),
             ("forge", src_forge_root),
-            ("messaging", src_messaging_root),
+            ("agent", src_agent_root),
             ("valset", src_valset_root),
             ("saga", src_saga_root),
         ] {
@@ -439,13 +430,12 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         }
 
         let src_global = {
-            let mods: [&dyn Module; 9] = [
+            let mods: [&dyn Module; 8] = [
                 &src_kv,
                 &src_directory,
                 &src_greeter,
                 &src_forge,
                 &src_document,
-                &src_messaging,
                 &src_agent,
                 &src_valset,
                 &src_saga,
@@ -461,14 +451,14 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let saga_bytes = src_saga.snapshot();
         let forge_bytes = src_forge.snapshot().expect("forge snapshot");
         let src_validators = validators(&src_valset).await;
-        let src_messaging_messages = messaging_messages(&src_messaging, "general").await;
+        let src_agent_entries = agent_entries(&src_agent, "general").await;
 
         let kv_target = src_kv.sync_target().await;
         let kv_resolver = src_kv.into_resolver();
         let document_target = src_document.sync_target().await;
         let document_resolver = src_document.into_resolver();
-        let messaging_target = src_messaging.sync_target().await;
-        let messaging_resolver = src_messaging.into_resolver();
+        let agent_target = src_agent.sync_target().await;
+        let agent_resolver = src_agent.into_resolver();
 
         // ---- JOINER: reconstruct every stateful module -----------------------
         let join_kv = Kv::sync_from(
@@ -485,11 +475,12 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             document_resolver,
         )
         .await;
-        let join_messaging = Messaging::sync_from(
-            context.child("joiner_messaging"),
-            "messaging-rebuilt",
-            messaging_target,
-            messaging_resolver,
+        let join_agent = Agent::sync_from_messaging_id(
+            context.child("joiner_agent"),
+            "agent",
+            "agent-messaging-rebuilt",
+            agent_target,
+            agent_resolver,
         )
         .await;
 
@@ -510,7 +501,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             .install(&forge_bytes, src_forge_root)
             .expect("forge install");
         let join_greeter = Greeter::new("greeter");
-        let join_agent = Agent::new("agent");
 
         // every reconstructed root equals its source root...
         assert_eq!(
@@ -524,9 +514,9 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "document: synced root != source root"
         );
         assert_eq!(
-            join_messaging.root(),
-            src_messaging_root,
-            "messaging: synced root != source root"
+            join_agent.root(),
+            src_agent_root,
+            "agent: synced root != source root"
         );
         assert_eq!(
             join_directory.root(),
@@ -555,7 +545,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             joiner_app_hash(
                 &join_kv,
                 &join_document,
-                &join_messaging,
                 &join_agent,
                 &join_directory,
                 &join_greeter,
@@ -591,8 +580,8 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         assert_eq!(blocks[1].text, "a block document, rebuilt by a joiner");
 
         assert_eq!(
-            messaging_messages(&join_messaging, "general").await,
-            src_messaging_messages
+            agent_entries(&join_agent, "general").await,
+            src_agent_entries
         );
 
         assert_eq!(join_directory.get("name"), Some(&"world".to_string()));
@@ -675,7 +664,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             joiner_app_hash(
                 &join_kv,
                 &join_document,
-                &join_messaging,
                 &join_agent,
                 &join_directory,
                 &join_greeter,
