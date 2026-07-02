@@ -30,8 +30,13 @@ export interface NodeStatus {
 }
 
 export interface NodeTransport {
-  /** Submit one module msg — one block. Resolves once the block is committed. */
-  submit(target: string, payload: unknown): Promise<BlockEvent>;
+  /**
+   * Submit one module msg — one block. Resolves once the block is committed.
+   * `origin` is the submitter identity stamped into the block's
+   * `Origin::External`; modules that derive authorship from origin (chat)
+   * attribute the write to it. Omitted → the daemon's default identity.
+   */
+  submit(target: string, payload: unknown, origin?: string): Promise<BlockEvent>;
   /** Read committed state. The reply is the module's `*Reply` enum as json. */
   query(target: string, query: unknown): Promise<unknown>;
   status(): Promise<NodeStatus>;
@@ -99,8 +104,10 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
   };
 
   return {
-    submit: (target, payload) =>
-      postJson<BlockEvent>(`${base}/v1/submit`, { target, payload }),
+    // JSON.stringify drops an undefined origin, so the field only crosses the
+    // wire when a caller set one
+    submit: (target, payload, origin) =>
+      postJson<BlockEvent>(`${base}/v1/submit`, { target, payload, origin }),
     query: (target, query) =>
       postJson<unknown>(`${base}/v1/query`, { target, query }),
     status: () =>

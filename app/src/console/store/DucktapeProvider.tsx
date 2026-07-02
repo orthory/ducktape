@@ -42,7 +42,7 @@ export interface ConsoleActions {
   selectChannel(channelId: string): void;
   createChannel(name: string): void;
   sendMessage(body: string): void;
-  openThread(rootId: string): void;
+  openThread(rootSeq: number): void;
   closeThread(): void;
   replyInThread(body: string): void;
   addTask(title: string): void;
@@ -130,7 +130,7 @@ export function DucktapeProvider({
               ? current
               : (channels[0]?.id ?? null);
           return Promise.resolve()
-            .then(() => (active ? chatClient.messages(live, active) : []))
+            .then(() => (active ? chatClient.latestMessages(live, active) : []))
             .then((messages) =>
               setState((prev) => ({
                 ...prev,
@@ -186,7 +186,7 @@ export function DucktapeProvider({
         activeThread: null,
       }));
       Promise.resolve()
-        .then(() => chatClient.messages(live, channelId))
+        .then(() => chatClient.latestMessages(live, channelId))
         .then((messages) => setState((prev) => ({ ...prev, messages })))
         .catch(fail);
     };
@@ -202,7 +202,11 @@ export function DucktapeProvider({
         const channelId = channelIdOf(name);
         if (!channelId) return;
         submitThenRefresh((live) =>
-          chatClient.createChannel(live, { channelId, name }),
+          chatClient.createChannel(live, {
+            channelId,
+            name,
+            origin: stateRef.current.author,
+          }),
         ).then(() => enterChannel(channelId));
       },
 
@@ -210,21 +214,21 @@ export function DucktapeProvider({
         const channelId = stateRef.current.activeChannel;
         if (!channelId || !body.trim()) return;
         submitThenRefresh((live) =>
-          chatClient.sendMessage(live, {
+          chatClient.postMessage(live, {
             channelId,
             messageId: crypto.randomUUID(),
-            author: stateRef.current.author,
-            body: body.trim(),
+            text: body.trim(),
+            origin: stateRef.current.author,
           }),
         );
       },
 
-      openThread: (rootId) => {
+      openThread: (rootSeq) => {
         const live = nodeRef.current;
         const channelId = stateRef.current.activeChannel;
         if (!live || !channelId) return;
         Promise.resolve()
-          .then(() => chatClient.thread(live, { channelId, threadId: rootId }))
+          .then(() => chatClient.thread(live, { channelId, rootSeq }))
           .then((activeThread) =>
             setState((prev) => ({ ...prev, activeThread })),
           )
@@ -240,15 +244,17 @@ export function DucktapeProvider({
         if (!live || !channelId || !root || !body.trim()) return;
         Promise.resolve()
           .then(() =>
-            chatClient.replyInThread(live, {
+            chatClient.postMessage(live, {
               channelId,
-              threadId: root.id,
               messageId: crypto.randomUUID(),
-              author: stateRef.current.author,
-              body: body.trim(),
+              text: body.trim(),
+              origin: stateRef.current.author,
+              thread: root.seq,
             }),
           )
-          .then(() => chatClient.thread(live, { channelId, threadId: root.id }))
+          .then(() =>
+            chatClient.thread(live, { channelId, rootSeq: root.seq }),
+          )
           .then((activeThread) => {
             setState((prev) => ({ ...prev, activeThread }));
             return refresh();

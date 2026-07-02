@@ -12,22 +12,40 @@ import type { ConsoleActions } from "./DucktapeProvider";
 // ── Fake node ───────────────────────────────────────────
 
 const GENERAL_MESSAGE = {
-  id: "m1",
   channel_id: "general",
-  author: "jess",
-  body: "hello",
-  sequence: 1,
-  sent_at: 10,
-  thread_id: null,
-  reply_count: 0,
-  last_reply_at: null,
+  seq: 1,
+  head: {
+    message_id: "m1",
+    author: { User: Array.from(new TextEncoder().encode("jess")) },
+    blocks: [{ Paragraph: [{ text: "hello", marks: [] }] }],
+    created_at: 10,
+    rev: 0,
+    edited_at: null,
+    base_rev: null,
+    deleted: false,
+    thread: null,
+    reply_count: 0,
+    last_reply_seq: null,
+  },
+  reactions: [],
+  channel_head_seq: 1,
 };
+
+const wireChannel = (id: string, name: string, created_at: number) => ({
+  id,
+  name,
+  created_at,
+  head_seq: 0,
+  post_policy: "Open",
+  hooks: [],
+  pinned: [],
+});
 
 const makeFakeNode = () => {
   const blockListeners = new Set<(block: BlockEvent) => void>();
-  // channel-aware mini-node: CreateChannel grows the list, Messages answers
-  // per channel — a stale-pane regression needs the distinction
-  const channels = [{ id: "general", name: "General", created_at: 1 }];
+  // channel-aware mini-node: CreateChannel grows the list, MessagesLatest
+  // answers per channel — a stale-pane regression needs the distinction
+  const channels = [wireChannel("general", "General", 1)];
   const messagesByChannel: Record<string, (typeof GENERAL_MESSAGE)[]> = {
     general: [GENERAL_MESSAGE],
   };
@@ -36,7 +54,7 @@ const makeFakeNode = () => {
       const create = (payload as { CreateChannel?: { channel_id: string; name: string } })
         .CreateChannel;
       if (target === "chat" && create) {
-        channels.push({ id: create.channel_id, name: create.name, created_at: 2 });
+        channels.push(wireChannel(create.channel_id, create.name, 2));
         messagesByChannel[create.channel_id] = [];
       }
       return Promise.resolve({ height: 2, appHash: "bb".repeat(32) });
@@ -45,10 +63,11 @@ const makeFakeNode = () => {
       if (target === "chat" && query === "Channels") {
         return Promise.resolve({ Channels: [...channels] });
       }
-      const messagesFor = (query as { Messages?: { channel_id: string } }).Messages;
-      if (target === "chat" && messagesFor) {
+      const latest = (query as { MessagesLatest?: { channel_id: string } })
+        .MessagesLatest;
+      if (target === "chat" && latest) {
         return Promise.resolve({
-          Messages: messagesByChannel[messagesFor.channel_id] ?? [],
+          Messages: messagesByChannel[latest.channel_id] ?? [],
         });
       }
       if (target === "chat") {
@@ -59,6 +78,7 @@ const makeFakeNode = () => {
       return Promise.resolve({ Tasks: [] });
     }),
     status: vi.fn().mockResolvedValue({
+      version: "0.1.0",
       appHash: "aa".repeat(32),
       height: 1,
       modules: [{ id: "chat", root: "cc".repeat(32) }],
@@ -109,7 +129,7 @@ describe("DucktapeProvider", () => {
     });
   });
 
-  it("sendMessage submits the wire msg with the local author", async () => {
+  it("sendMessage posts a paragraph block with the author as submit origin", async () => {
     const { transport } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
@@ -121,13 +141,23 @@ describe("DucktapeProvider", () => {
     });
 
     await waitFor(() => expect(transport.submit).toHaveBeenCalled());
-    const [target, payload] = vi.mocked(transport.submit).mock.calls[0];
+    const [target, payload, origin] = vi.mocked(transport.submit).mock.calls[0];
     expect(target).toBe("chat");
-    const msg = payload as { SendMessage: Record<string, string> };
-    expect(msg.SendMessage.channel_id).toBe("general");
-    expect(msg.SendMessage.author).toBe("operator");
-    expect(msg.SendMessage.body).toBe("hi node");
-    expect(msg.SendMessage.message_id).toBeTruthy();
+    expect(origin).toBe("operator"); // authorship travels as origin, not payload
+    const msg = payload as {
+      PostMessage: {
+        channel_id: string;
+        message_id: string;
+        blocks: unknown[];
+        thread: number | null;
+      };
+    };
+    expect(msg.PostMessage.channel_id).toBe("general");
+    expect(msg.PostMessage.blocks).toEqual([
+      { Paragraph: [{ text: "hi node", marks: [] }] },
+    ]);
+    expect(msg.PostMessage.thread).toBeNull();
+    expect(msg.PostMessage.message_id).toBeTruthy();
   });
 
   it("re-queries committed state when a block finalizes", async () => {
@@ -158,7 +188,7 @@ describe("DucktapeProvider", () => {
 
     // open a thread first — creating a channel must close it
     await act(async () => {
-      capturedActions!.openThread("m1");
+      capturedActions!.openThread(1);
     });
     await waitFor(() =>
       expect(screen.getByTestId("thread").textContent).toBe("open"),

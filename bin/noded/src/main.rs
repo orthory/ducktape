@@ -116,12 +116,13 @@ fn run_node(
                 NodeCommand::Submit {
                     target,
                     payload,
+                    origin,
                     reply,
                 } => {
                     let ctx = BlockContext {
                         height: height + 1,
                         consensus_time: unix_millis(),
-                        origin: Origin::External(b"noded".to_vec()),
+                        origin: Origin::External(origin),
                     };
                     let outcome = host.submit_at(ctx, Msg { target, payload }).await;
                     let result = match outcome {
