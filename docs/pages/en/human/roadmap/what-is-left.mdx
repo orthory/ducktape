@@ -20,9 +20,12 @@ remains is durability, promotion flows, and product depth.
 
 ## Durability And Promotion
 
-- Restart/recovery from persisted state: the qmdb stores and the simplex journal
-  persist, but the node re-runs genesis on start. A resume path must avoid
-  double-applying replayed journal ops (the epoch/replay design).
+- ~~Restart/recovery from persisted state~~ — shipped: a write-ahead op journal
+  plus periodic checkpoints of the in-memory modules recover the composed
+  app-hash on boot, and the engine respawns at its persisted epoch over its
+  existing journal partition behind a persisted finalization floor (no
+  double-apply, no double-vote). Remaining edge: a pre-recovery storage dir
+  (state without a checkpoint) fails loudly instead of migrating.
 - A validator demoted at cutover currently halts; it should degrade to a
   sync-server. A synced joiner should be able to auto-promote to a live validator
   at an epoch boundary rather than requiring a manual restart.
