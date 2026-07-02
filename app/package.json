@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "tauri": "tauri",
     "test": "vitest run"
   },
   "dependencies": {
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.0",
+    "@tauri-apps/cli": "^2.11.2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/react": "^19.2.17",

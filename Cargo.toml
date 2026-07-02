@@ -38,6 +38,8 @@ members = [
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/gateway",
+    # app — the desktop shell of the react client (web twin ships from app/)
+    "app/src-tauri",
 ]
 
 [workspace.package]
