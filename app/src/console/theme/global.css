@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+/* Ducktape Console global styles — resets, keyframes, scrollbar.
+   Fonts (Geist / Geist Mono / IBM Plex Sans KR) are loaded in main.tsx. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font-family: "Geist Sans", "IBM Plex Sans KR", system-ui, -apple-system, sans-serif;
+  color: #2c2b27;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+input,
+textarea {
+  font-family: inherit;
+  border: none;
+  outline: none;
+  background: none;
+}
+
+button {
+  font-family: inherit;
+}
+
+/* Visible, on-brand keyboard focus ring. `:focus-visible` shows it only on
+   keyboard navigation (never on mouse click). */
+button:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--accent, #a05a3c);
+  outline-offset: 2px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #d7d7d7;
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #c3c3c3;
+  background-clip: content-box;
+}
+
+@keyframes msgIn {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes ik-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+@keyframes ik-fade {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
