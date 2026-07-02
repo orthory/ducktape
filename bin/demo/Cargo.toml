@@ -24,6 +24,7 @@ tasks = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 inbox-interface = { workspace = true }
+files = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }

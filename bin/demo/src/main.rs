@@ -1,9 +1,12 @@
-//! a runnable super-app demo: twelve registered modules — a qmdb-backed kv, a
-//! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
+//! a runnable super-app demo: thirteen registered modules — a qmdb-backed kv,
+//! a sync in-memory directory, a stateless greeter, a GIT-backed forge, a
 //! qmdb-backed block DOCUMENT module, a qmdb-backed block-based CHAT module, an
 //! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
-//! orchestrator, a TASKS ledger, the AUTOMATIONS rule engine, and the INBOX
-//! notification queues — dispatched over ONE host, showing the app-hash evolve
+//! orchestrator, a TASKS ledger, the AUTOMATIONS rule engine, the INBOX
+//! notification queues, and a content-addressed FILES module — dispatched over
+//! ONE host, showing the app-hash evolve as typed cross-module ops flow, ending
+//! on the agent-collaboration beat: a mention becomes a run and a pending saga
+//! in one block.
 //! as typed cross-module ops flow, ending on the agent-collaboration beat: a
 //! mention becomes a run and a pending saga in one block.
 //!
@@ -32,6 +35,7 @@ use document_interface::{
     Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
     encode_msg as doc_encode_msg, encode_query as doc_encode_query,
 };
+use files::Files;
 use forge::Forge;
 use forge_interface::{
     ForgeMsg, ForgeQuery, ForgeReply, decode_reply as forge_decode_reply,
@@ -74,6 +78,7 @@ fn main() {
         let saga = SagaModule::new("saga");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
+        let files = Files::new("files");
         let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
         let automations = Automations::new("automations", "chat", "tasks");
         let mut host = Host::genesis(vec![
@@ -87,12 +92,13 @@ fn main() {
             Box::new(saga),
             Box::new(tasks),
             Box::new(inbox),
+            Box::new(files),
             Box::new(agent),
             Box::new(automations),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 12 registered modules over one host ===");
+        println!("=== super-app demo — 13 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -586,6 +592,7 @@ fn main() {
             "chat",
             "directory",
             "document",
+            "files",
             "forge",
             "greeter",
             "inbox",
