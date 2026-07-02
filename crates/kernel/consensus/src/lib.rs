@@ -55,11 +55,17 @@ use commonware_p2p::{Recipients, Sender};
 use commonware_runtime::IoBuf;
 
 use bytes::Bytes;
+use commonware_cryptography::Signer as _;
+use commonware_cryptography::bls12381::primitives::variant::MinPk;
+use commonware_cryptography::bls12381::primitives::{ops as bls_ops, variant as bls_variant};
 use commonware_resolver::p2p::{
     Config as ResolverConfig, Engine as ResolverEngine, Mailbox as ResolverMailbox,
     Producer as ResolverProducer,
 };
 use commonware_resolver::{Consumer as ResolverConsumer, Delivery, Resolver as _};
+use commonware_utils::TryCollect as _;
+use commonware_utils::ordered::BiMap;
+use rand_core::SeedableRng as _;
 
 mod valset_orchestrator;
 pub use valset_orchestrator::{
@@ -80,14 +86,28 @@ type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::
 /// a mismatch means engines never agree and the mesh hangs).
 ///
 /// # variants
-/// - [`V1Ed25519`](ConsensusScheme::V1Ed25519) — TODAY. each validator signs with its own
-///   ed25519 key; a certificate is a COLLECTION of ed25519 signatures, so cert size (and
-///   verification cost) grows linearly with the validator set.
-/// - `V2Bls` (future, NOT a variant yet) — aggregated / threshold BLS: one aggregated
-///   signature per certificate -> CONSTANT-size certs, cheap to verify at any set size.
-///   the reason to migrate at scale.
+/// - [`V1Ed25519`](ConsensusScheme::V1Ed25519) — the DEFAULT. each validator signs with
+///   its own ed25519 key; a certificate is a COLLECTION of ed25519 signatures, so cert
+///   size (and verification cost) grows linearly with the validator set.
+/// - [`V2Bls`](ConsensusScheme::V2Bls) — bls12381 MULTISIG over the MinPk variant
+///   (48-byte bls public keys). quorum votes aggregate into ONE bls signature per
+///   certificate (plus a signer-index bitmap), so cert size stays essentially FLAT as
+///   the set grows — the reason to migrate at scale. still attributable: the signer
+///   indices ride along, so per-validator liveness/fault evidence keeps working. the
+///   scheme is DUAL-KEY: ed25519 remains the transport/p2p IDENTITY everywhere (peer
+///   ordering, discovery, blocking); the bls key ONLY signs votes/certificates.
+///   deliberately NOT the bls threshold schemes — those need DKG/resharing, which
+///   fights the epoch teardown-respawn contract below.
 ///
-/// # the rekey / respawn contract (read before adding V2 or dynamic validators)
+/// # rogue-key / proof-of-possession (V2)
+/// naive bls aggregation is rogue-key-attackable: a registrant that can choose its
+/// public key as a function of the others' can forge aggregate signatures. in this
+/// slice the (identity key -> bls key) map fed to the scheme is TRUSTED input from
+/// config/genesis, so no proof-of-possession check is performed here. PoP verification
+/// lands with valset membership authentication — a join must prove knowledge of its bls
+/// secret before its key ever enters the map.
+///
+/// # the rekey / respawn contract (read before wiring V2 or dynamic validators)
 /// the scheme AND the validator set are fixed at simplex `Engine` construction — neither
 /// can be hot-swapped in a running engine. changing EITHER (a scheme migration, or a
 /// validator join/leave) requires an **epoch transition**: at a height the OLD engine
@@ -99,17 +119,89 @@ type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::
 /// relayers, and control participants must be derived from that epoch's validator set,
 /// not from a static external relay.
 ///
-/// # V1 implementation note
-/// [`SimplexOrderer`]'s engine is currently CONCRETE over ed25519 (its `Scheme` type + ~15
-/// `ed25519::PublicKey` bounds). so V2Bls is not merely a new enum arm — it also requires
-/// making the engine SCHEME-GENERIC (parameterizing those bounds). deferred.
+/// # implementation note
+/// [`SimplexOrderer`]'s spawn fns are GENERIC over the simplex scheme `S` (with
+/// `S::PublicKey` pinned to ed25519 — the transport identity), and the orderer itself is
+/// scheme-erased. so selecting a variant is purely a construction-time choice: build the
+/// matching scheme value (`simplex::scheme::ed25519::Scheme::signer` for V1,
+/// [`BlsScheme::signer`] / [`bls_dev_scheme`] for V2) and hand it to the same spawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConsensusScheme {
-    /// per-validator ed25519 signatures; certificates are collections of them. (today)
+    /// per-validator ed25519 signatures; certificates are collections of them.
     #[default]
     V1Ed25519,
-    // V2Bls — deliberately NOT a variant yet: adding it makes every `match ConsensusScheme`
-    // non-exhaustive, which is the compiler-enforced TODO (a BLS engine + a genesis rekey).
+    /// dual-key bls12381 multisig (MinPk): ed25519 identity, bls votes, ONE aggregated
+    /// signature (+ signer indices) per certificate.
+    V2Bls,
+}
+
+// ============================================================================
+// the V2Bls scheme surface — dual-key (ed25519 identity, bls12381 signing).
+// ============================================================================
+
+/// the V2 simplex scheme: bls12381 multisig over the MinPk variant, keyed by ed25519
+/// IDENTITY keys — the dual-key shape. participant ORDER (and so signer indices, leader
+/// rotation, and the certificate bitmap) comes from the sorted ed25519 identity keys,
+/// exactly like V1; only the vote/certificate signatures are bls. constructed via
+/// `BlsScheme::signer(namespace, participants, secret)` /
+/// `BlsScheme::verifier(namespace, participants)` where `participants` is the
+/// (identity key -> bls key) [`BiMap`](commonware_utils::ordered::BiMap) — TRUSTED
+/// config/genesis input in this slice (see the rogue-key section on
+/// [`ConsensusScheme`]).
+pub type BlsScheme = commonware_consensus::simplex::scheme::bls12381_multisig::Scheme<
+    commonware_cryptography::ed25519::PublicKey,
+    MinPk,
+>;
+
+/// a V2 bls signing (private) key — the scalar behind a validator's vote signatures.
+pub type BlsPrivateKey = commonware_cryptography::bls12381::primitives::group::Private;
+
+/// a V2 bls public key (MinPk: 48 bytes) — the `values` side of the participant BiMap.
+pub type BlsPublicKey = <MinPk as bls_variant::Variant>::Public;
+
+/// a V2 certificate: ONE aggregated bls signature + the signer-index bitmap.
+pub type BlsCertificate =
+    commonware_cryptography::bls12381::certificate::multisig::Certificate<MinPk>;
+
+/// derive a validator's V2 bls signing secret from its DEV seed — the bls analog of
+/// `ed25519::PrivateKey::from_seed` (INSECURE; examples/tests/dev config only). the
+/// chacha seed is sha256-domain-separated from the ed25519 derivation so the two dev
+/// keys never share key material even for the same seed value.
+pub fn bls_dev_secret(seed: u64) -> BlsPrivateKey {
+    let mut hasher = Sha256::default();
+    hasher.update(b"ducktape:consensus:bls12381:dev-seed:v1:");
+    hasher.update(&seed.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut chacha_seed = [0u8; 32];
+    chacha_seed.copy_from_slice(digest.as_ref());
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed(chacha_seed);
+    bls_ops::keypair::<_, MinPk>(&mut rng).0
+}
+
+/// the bls public key for a DEV seed — the counterpart of [`bls_dev_secret`], used to
+/// build the participant BiMap from peer seed lists.
+pub fn bls_dev_public(seed: u64) -> BlsPublicKey {
+    bls_ops::compute_public::<MinPk>(&bls_dev_secret(seed))
+}
+
+/// build a V2 signer over the DEV validator set `seeds` for `my_seed` — the bls analog
+/// of the V1 dev path `simplex_ed25519::Scheme::signer(ns, participants, from_seed(id))`
+/// (bin/node, tests). pairs every seed's ed25519 IDENTITY key with its derived bls
+/// signing key into the participant BiMap; `None` when `my_seed`'s bls key is not in
+/// the set (or `seeds` contains duplicates). the pairs are TRUSTED input here — see the
+/// rogue-key / proof-of-possession section on [`ConsensusScheme`].
+pub fn bls_dev_scheme(namespace: &[u8], seeds: &[u64], my_seed: u64) -> Option<BlsScheme> {
+    let participants: BiMap<commonware_cryptography::ed25519::PublicKey, BlsPublicKey> = seeds
+        .iter()
+        .map(|s| {
+            (
+                commonware_cryptography::ed25519::PrivateKey::from_seed(*s).public_key(),
+                bls_dev_public(*s),
+            )
+        })
+        .try_collect()
+        .ok()?;
+    BlsScheme::signer(namespace, participants, bls_dev_secret(my_seed))
 }
 
 /// hash a frame's bytes into the [`Digest`] simplex will order — the
@@ -877,16 +969,17 @@ impl SimplexOrderer {
     /// enqueues onto the very FIFO the automaton peeks — all over the shared
     /// `store`.
     ///
-    /// concrete over the simplex ed25519 [`Scheme`](commonware_consensus::simplex::
-    /// scheme::ed25519::Scheme) (NOT the mocks-gated `fixture`, so this compiles
-    /// without the `mocks` feature); generic over the runtime `context` E, the
-    /// `blocker` B, and the three engine channel pairs (forwarded to
-    /// `engine.start`). config is the tuned legacy default. the engine's keepalive
-    /// handle lives inside the returned orderer — dropping it aborts the engine.
+    /// GENERIC over the simplex scheme `S` (the [`ConsensusScheme`] seam) with
+    /// `S::PublicKey` pinned to ed25519 — the transport identity every p2p bound in
+    /// this crate keys on; only the vote/certificate signatures vary by scheme. also
+    /// generic over the runtime `context` E, the `blocker` B, and the three engine
+    /// channel pairs (forwarded to `engine.start`). config is the tuned legacy
+    /// default. the engine's keepalive handle lives inside the returned orderer —
+    /// dropping it aborts the engine.
     #[allow(clippy::too_many_arguments)]
-    fn build<E, B, R, VS, VR, CS, CR, RS, RR>(
+    fn build<E, S, B, R, VS, VR, CS, CR, RS, RR>(
         context: E,
-        scheme: commonware_consensus::simplex::scheme::ed25519::Scheme,
+        scheme: S,
         blocker: B,
         partition: String,
         epoch: commonware_consensus::types::Epoch,
@@ -907,6 +1000,10 @@ impl SimplexOrderer {
             + Send
             + Sync
             + 'static,
+        S: commonware_consensus::simplex::scheme::Scheme<
+                Digest,
+                PublicKey = commonware_cryptography::ed25519::PublicKey,
+            >,
         B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         R: Relay<
                 Digest = Digest,
@@ -938,9 +1035,8 @@ impl SimplexOrderer {
         let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
         let handle = automaton.handle(store.clone());
         let inbox = FinalizedInbox::new();
-        let reporter = SimplexReporter::<
-            commonware_consensus::simplex::scheme::ed25519::Scheme,
-        >::new(store.clone(), automaton.pending(), inbox.clone(), None);
+        let reporter =
+            SimplexReporter::<S>::new(store.clone(), automaton.pending(), inbox.clone(), None);
 
         // page cache borrows the pooler context BEFORE we hand a child to Engine.
         let page_cache = CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10));
@@ -982,9 +1078,9 @@ impl SimplexOrderer {
     /// nothing to disseminate. signature UNCHANGED from before the relay split, so
     /// the in-sim proof calls this untouched.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn<E, B, VS, VR, CS, CR, RS, RR>(
+    pub fn spawn<E, S, B, VS, VR, CS, CR, RS, RR>(
         context: E,
-        scheme: commonware_consensus::simplex::scheme::ed25519::Scheme,
+        scheme: S,
         blocker: B,
         partition: String,
         epoch: commonware_consensus::types::Epoch,
@@ -1004,6 +1100,10 @@ impl SimplexOrderer {
             + Send
             + Sync
             + 'static,
+        S: commonware_consensus::simplex::scheme::Scheme<
+                Digest,
+                PublicKey = commonware_cryptography::ed25519::PublicKey,
+            >,
         B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         VS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         VR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
@@ -1028,9 +1128,9 @@ impl SimplexOrderer {
     /// originated, so when that digest finalizes its reporter resolves and delivers
     /// it — in BFT order, via the SAME finalization arm the proposer uses.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_relay<E, B, PS, PR, VS, VR, CS, CR, RS, RR>(
+    pub fn spawn_with_relay<E, S, B, PS, PR, VS, VR, CS, CR, RS, RR>(
         context: E,
-        scheme: commonware_consensus::simplex::scheme::ed25519::Scheme,
+        scheme: S,
         blocker: B,
         partition: String,
         epoch: commonware_consensus::types::Epoch,
@@ -1051,6 +1151,10 @@ impl SimplexOrderer {
             + Send
             + Sync
             + 'static,
+        S: commonware_consensus::simplex::scheme::Scheme<
+                Digest,
+                PublicKey = commonware_cryptography::ed25519::PublicKey,
+            >,
         B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         PS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>
             + Clone
@@ -1104,9 +1208,9 @@ impl SimplexOrderer {
     /// finalization it did not originate misses and routes through the fetch path.
     /// it exists to exercise the miss/fetch/ordered-release path deterministically.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_resolver<E, B, D, PS, PR, FS, FR, VS, VR, CS, CR, RS, RR>(
+    pub fn spawn_with_resolver<E, S, B, D, PS, PR, FS, FR, VS, VR, CS, CR, RS, RR>(
         context: E,
-        scheme: commonware_consensus::simplex::scheme::ed25519::Scheme,
+        scheme: S,
         blocker: B,
         provider: D,
         me: commonware_cryptography::ed25519::PublicKey,
@@ -1131,6 +1235,10 @@ impl SimplexOrderer {
             + Send
             + Sync
             + 'static,
+        S: commonware_consensus::simplex::scheme::Scheme<
+                Digest,
+                PublicKey = commonware_cryptography::ed25519::PublicKey,
+            >,
         B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>
             + Clone,
         D: commonware_p2p::Provider<PublicKey = commonware_cryptography::ed25519::PublicKey>,
@@ -1205,9 +1313,12 @@ impl SimplexOrderer {
         // KEEP the fetch handle alive inside the orderer — dropping it stops catch-up.
         let fetch_handle = fetch_engine.start((fetch_sender, fetch_receiver));
 
-        let reporter = SimplexReporter::<
-            commonware_consensus::simplex::scheme::ed25519::Scheme,
-        >::new(store.clone(), automaton.pending(), inbox.clone(), Some(mailbox));
+        let reporter = SimplexReporter::<S>::new(
+            store.clone(),
+            automaton.pending(),
+            inbox.clone(),
+            Some(mailbox),
+        );
 
         let page_cache = CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10));
         let cfg = SimplexConfig {
@@ -1411,6 +1522,61 @@ mod tests {
         assert!(!inbox.record(1, d, &store, false));
         inbox.record(1, d, &store, false); // same digest again -> ignored by `seen`.
         assert_eq!(inbox.drain(), vec![(1, b"once".to_vec())]);
+    }
+
+    #[test]
+    fn bls_dev_keys_are_deterministic_and_domain_separated_per_seed() {
+        // dev key derivation must be a PURE function of the seed — every process
+        // in a mesh derives the same participant map from the same peer seeds.
+        assert_eq!(
+            bls_dev_public(7),
+            bls_dev_public(7),
+            "same seed -> same bls key"
+        );
+        assert_ne!(
+            bls_dev_public(7),
+            bls_dev_public(8),
+            "distinct seeds -> distinct keys"
+        );
+    }
+
+    #[test]
+    fn bls_dev_scheme_orders_participants_by_identity_key() {
+        // the dual-key contract: participant ORDER (signer indices, leader
+        // rotation, the certificate bitmap) comes from the sorted ed25519 IDENTITY
+        // keys — byte-identical to V1's participant Set — regardless of the order
+        // seeds appear in config.
+        use commonware_cryptography::ed25519;
+        use commonware_utils::ordered::Set;
+
+        let seeds = [3u64, 0, 2];
+        let scheme = bls_dev_scheme(b"ns", &seeds, 2).expect("seed 2 is a member");
+        let expected: Set<ed25519::PublicKey> = Set::try_from(
+            seeds
+                .iter()
+                .map(|s| ed25519::PrivateKey::from_seed(*s).public_key())
+                .collect::<Vec<_>>(),
+        )
+        .expect("distinct dev keys");
+        assert_eq!(
+            scheme.participants(),
+            &expected,
+            "identity keys order the set"
+        );
+
+        // and this validator signs as EXACTLY its identity's slot in that order.
+        let me = ed25519::PrivateKey::from_seed(2).public_key();
+        assert_eq!(
+            scheme.me().map(usize::from),
+            expected.position(&me),
+            "signer index == identity position"
+        );
+
+        // a seed outside the set cannot construct a signer.
+        assert!(
+            bls_dev_scheme(b"ns", &seeds, 9).is_none(),
+            "non-member seed -> None"
+        );
     }
 
     #[test]

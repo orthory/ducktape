@@ -24,7 +24,11 @@
 //!            set. that is incorporation; app-hash-free, unforgeable.
 //!
 //! schemes are built the PRODUCTION way (`Scheme::signer`, as bin/node does), not
-//! the mocks fixture, so the 4-subset and 5-superset share identical keys.
+//! the mocks fixture, so the 4-subset and 5-superset share identical keys. the
+//! scenario is SCHEME-PARAMETRIC: `scenario` takes a `(namespace, subset, member)
+//! -> scheme` factory, so the same join-by-respawn proof runs under BOTH V1
+//! ed25519 and V2 bls multisig (only scheme construction differs — the respawn
+//! contract itself is scheme-independent, which is exactly the point).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -39,8 +43,48 @@ use commonware_utils::{ordered::Set, NZUsize, NZU32};
 use consensus::{ContentStore, SimplexOrderer};
 use node::Orderer as _;
 
-/// drive the whole join-by-respawn scenario under one deterministic schedule.
-async fn scenario(context: deterministic::Context) {
+/// recover the dev seed behind a deterministic identity (all five live in 0..5).
+fn seed_of(v: &ed25519::PublicKey) -> u64 {
+    (0..5u64)
+        .find(|s| ed25519::PrivateKey::from_seed(*s).public_key() == *v)
+        .expect("known dev key")
+}
+
+/// V1 factory: the production ed25519 signer over the epoch's subset — identical
+/// keys across the 4-set and the 5-superset.
+fn ed25519_scheme_for(
+    namespace: &[u8],
+    participants: &Set<ed25519::PublicKey>,
+    v: &ed25519::PublicKey,
+) -> simplex_ed25519::Scheme {
+    let sk = ed25519::PrivateKey::from_seed(seed_of(v));
+    simplex_ed25519::Scheme::signer(namespace, participants.clone(), sk)
+        .expect("member is in the set")
+}
+
+/// V2 factory: the dual-key bls signer over the epoch's subset — the (identity ->
+/// bls) map is derived from the SAME dev seeds, so the 4-set and 5-superset stay
+/// key-identical exactly like V1 (the respawn only swaps the participant map).
+fn bls_scheme_for(
+    namespace: &[u8],
+    participants: &Set<ed25519::PublicKey>,
+    v: &ed25519::PublicKey,
+) -> consensus::BlsScheme {
+    let seeds: Vec<u64> = participants.iter().map(seed_of).collect();
+    consensus::bls_dev_scheme(namespace, &seeds, seed_of(v)).expect("member is in the set")
+}
+
+/// drive the whole join-by-respawn scenario under one deterministic schedule,
+/// parametric over the consensus scheme (`scheme_for` builds each member's signer
+/// over an epoch's participant subset).
+async fn scenario<S, F>(context: deterministic::Context, scheme_for: F)
+where
+    S: commonware_consensus::simplex::scheme::Scheme<
+            consensus::Digest,
+            PublicKey = ed25519::PublicKey,
+        >,
+    F: Fn(&[u8], &Set<ed25519::PublicKey>, &ed25519::PublicKey) -> S,
+{
     let namespace = b"valset-reconfig".to_vec();
     let epoch0 = Epoch::new(0);
     let epoch1 = Epoch::new(1);
@@ -51,9 +95,6 @@ async fn scenario(context: deterministic::Context) {
     let keys: Vec<ed25519::PrivateKey> =
         (0..5u64).map(ed25519::PrivateKey::from_seed).collect();
     let pubs: Vec<ed25519::PublicKey> = keys.iter().map(|k| k.public_key()).collect();
-    let sk_of = |v: &ed25519::PublicKey| -> ed25519::PrivateKey {
-        keys.iter().find(|k| k.public_key() == *v).expect("known key").clone()
-    };
 
     let participants4: Set<ed25519::PublicKey> =
         Set::try_from(pubs[0..4].to_vec()).expect("no dup 4-set");
@@ -117,8 +158,7 @@ async fn scenario(context: deterministic::Context) {
     let genesis0 = mocks::application::genesis::<Sha256>(epoch0);
     let mut e0: HashMap<ed25519::PublicKey, SimplexOrderer> = HashMap::new();
     for v in participants4.iter() {
-        let scheme = simplex_ed25519::Scheme::signer(&namespace, participants4.clone(), sk_of(v))
-            .expect("incumbent is in the 4-set");
+        let scheme = scheme_for(&namespace, &participants4, v);
         let (vote, cert, res) = reg0.remove(v).expect("registered e0");
         let orderer = SimplexOrderer::spawn(
             context.child("e0"),
@@ -161,8 +201,7 @@ async fn scenario(context: deterministic::Context) {
     let genesis1 = mocks::application::genesis::<Sha256>(epoch1);
     let mut e1: HashMap<ed25519::PublicKey, SimplexOrderer> = HashMap::new();
     for v in participants5.iter() {
-        let scheme = simplex_ed25519::Scheme::signer(&namespace, participants5.clone(), sk_of(v))
-            .expect("member is in the 5-set");
+        let scheme = scheme_for(&namespace, &participants5, v);
         let (vote, cert, res) = reg1.remove(v).expect("registered e1");
         let orderer = SimplexOrderer::spawn(
             context.child("e1"),
@@ -210,5 +249,15 @@ fn a_joined_validator_is_incorporated_after_epoch_respawn() {
     // timed runner is the liveness backstop: if the respawned five-set never
     // finalizes the joiner's op, the drain loop never completes and the deadline
     // panics (rather than hanging) — the simplex analog of a non-incorporation.
-    deterministic::Runner::timed(Duration::from_secs(300)).start(|context| scenario(context));
+    deterministic::Runner::timed(Duration::from_secs(300))
+        .start(|context| scenario(context, ed25519_scheme_for));
+}
+
+#[test]
+fn a_joined_validator_is_incorporated_after_epoch_respawn_under_bls_multisig() {
+    // the V2 twin: the same teardown-and-respawn join, but every engine runs the
+    // dual-key bls multisig scheme — proving the epoch-transition rekey mechanism
+    // the ConsensusScheme contract leans on works for the scheme V2 actually uses.
+    deterministic::Runner::timed(Duration::from_secs(300))
+        .start(|context| scenario(context, bls_scheme_for));
 }

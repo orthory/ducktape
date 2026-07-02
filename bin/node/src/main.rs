@@ -689,6 +689,16 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                     signer.clone(),
                 )
                 .expect("our key is in the validator participant set"),
+                // the engine and tests are V2-capable (see consensus::BlsScheme);
+                // wiring V2 into the epoch respawn machinery needs the bls
+                // participant BiMap derived per epoch (valset-registered bls
+                // keys + proof-of-possession) — fail-stop until that lands.
+                ConsensusScheme::V2Bls => {
+                    unimplemented!(
+                        "V2Bls node wiring lands with valset bls key registration; \
+                         the consensus engine itself is V2-capable"
+                    )
+                }
             };
             let label: &'static str =
                 Box::leak(format!("consensus_e{epoch}").into_boxed_str());
