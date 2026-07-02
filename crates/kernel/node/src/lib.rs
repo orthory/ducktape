@@ -614,11 +614,16 @@ pub trait BlockSink {
     ) -> impl std::future::Future<Output = Result<(), Error>>;
     /// durably record a settled block's outcome.
     fn seal(&mut self, seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>>;
-    /// durably record an epoch cutover: the new epoch and its app-height base.
+    /// durably record an epoch cutover: the new epoch, its app-height base,
+    /// and the ENGINE PARTICIPANT SET it was spawned over (raw public-key
+    /// bytes). the set rides the record because a restart must respawn the
+    /// engine with the EPOCH'S set — the instantaneous valset projection may
+    /// already include a change awaiting the next cutover.
     fn cutover(
         &mut self,
         epoch: u64,
         view_base: u64,
+        participants: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>>;
 }
 
@@ -646,6 +651,7 @@ impl BlockSink for NullSink {
         &mut self,
         _epoch: u64,
         _view_base: u64,
+        _participants: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>> {
         async { Ok(()) }
     }
@@ -786,8 +792,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// call this only after a final [`OrderedNode::drain_delivered`] under the
     /// ceiling — anything the old engine finalized past the ceiling was
     /// deterministically discarded on every honest node.
-    pub async fn cutover(&mut self, orderer: O, epoch: u64, view_base: u64) -> Result<(), Error> {
-        self.sink.cutover(epoch, view_base).await?;
+    pub async fn cutover(
+        &mut self,
+        orderer: O,
+        epoch: u64,
+        view_base: u64,
+        participants: &[Vec<u8>],
+    ) -> Result<(), Error> {
+        self.sink.cutover(epoch, view_base, participants).await?;
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;

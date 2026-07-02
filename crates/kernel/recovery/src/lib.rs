@@ -174,6 +174,25 @@ fn get_roots(c: &mut Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
     Ok(roots)
 }
 
+fn put_keys(out: &mut Vec<u8>, keys: &[Vec<u8>]) {
+    put_u64(out, keys.len() as u64);
+    for k in keys {
+        put_bytes(out, k);
+    }
+}
+
+fn get_keys(c: &mut Cursor) -> Result<Vec<Vec<u8>>, Error> {
+    let n = c.u64()? as usize;
+    if n > 4096 {
+        return Err(Error::Corrupt(format!("{n} participant keys exceeds sanity cap")));
+    }
+    let mut keys = Vec::with_capacity(n);
+    for _ in 0..n {
+        keys.push(c.bytes()?);
+    }
+    Ok(keys)
+}
+
 // ============================================================================
 // records — the op journal's entries.
 // ============================================================================
@@ -201,8 +220,16 @@ pub enum Record {
         roots: Vec<(ModuleId, StateRoot)>,
         app_hash: StateRoot,
     },
-    /// an epoch cutover: the new epoch and its app-height base.
-    Cutover { epoch: u64, view_base: u64 },
+    /// an epoch cutover: the new epoch, its app-height base, and the engine
+    /// participant set it was spawned over. the set rides the record so a
+    /// restart in the window between the cutover and the next checkpoint
+    /// respawns the engine with the EPOCH'S set, never the instantaneous
+    /// valset projection (which may already stage the next change).
+    Cutover {
+        epoch: u64,
+        view_base: u64,
+        participants: Vec<Vec<u8>>,
+    },
 }
 
 impl Record {
@@ -230,10 +257,11 @@ impl Record {
                 put_roots(&mut out, roots);
                 put_root(&mut out, app_hash);
             }
-            Record::Cutover { epoch, view_base } => {
+            Record::Cutover { epoch, view_base, participants } => {
                 out.push(TAG_CUTOVER);
                 put_u64(&mut out, *epoch);
                 put_u64(&mut out, *view_base);
+                put_keys(&mut out, participants);
             }
         }
         out
@@ -256,7 +284,11 @@ impl Record {
                 let app_hash = c.root()?;
                 Record::Seal { height, disposition, roots, app_hash }
             }
-            TAG_CUTOVER => Record::Cutover { epoch: c.u64()?, view_base: c.u64()? },
+            TAG_CUTOVER => Record::Cutover {
+                epoch: c.u64()?,
+                view_base: c.u64()?,
+                participants: get_keys(&mut c)?,
+            },
             t => return Err(Error::Corrupt(format!("unknown record tag {t}"))),
         };
         c.done()?;
@@ -281,6 +313,15 @@ pub struct Manifest {
     pub epoch: u64,
     /// that epoch's app-height base (`app_height = view_base + engine view`).
     pub view_base: u64,
+    /// the epoch's ENGINE PARTICIPANT SET (raw public-key bytes) — what the
+    /// live engine was spawned over. a restart respawns with exactly this
+    /// set: the checkpointed valset snapshot may already hold a membership
+    /// change whose cutover had not happened yet.
+    pub participants: Vec<Vec<u8>>,
+    /// an epoch cutover armed but not yet crossed at checkpoint time (the
+    /// ordered lane's discard-ceiling view). a restart re-arms the same
+    /// deterministic boundary its peers are converging on.
+    pub pending_cutover_view: Option<u64>,
     /// the composed app-hash at `height`.
     pub app_hash: StateRoot,
     /// every module's root at `height` — the replay baseline.
@@ -312,6 +353,14 @@ impl Manifest {
         }
         put_u64(&mut out, self.epoch);
         put_u64(&mut out, self.view_base);
+        put_keys(&mut out, &self.participants);
+        match self.pending_cutover_view {
+            Some(v) => {
+                out.push(1);
+                put_u64(&mut out, v);
+            }
+            None => out.push(0),
+        }
         put_root(&mut out, &self.app_hash);
         put_roots(&mut out, &self.roots);
         put_u64(&mut out, self.snapshots.len() as u64);
@@ -333,6 +382,12 @@ impl Manifest {
         };
         let epoch = c.u64()?;
         let view_base = c.u64()?;
+        let participants = get_keys(&mut c)?;
+        let pending_cutover_view = match c.take(1)?[0] {
+            0 => None,
+            1 => Some(c.u64()?),
+            t => return Err(Error::Corrupt(format!("bad pending-cutover tag {t}"))),
+        };
         let app_hash = c.root()?;
         let roots = get_roots(&mut c)?;
         let n = c.u64()? as usize;
@@ -348,7 +403,18 @@ impl Manifest {
         let oplog_pos = c.u64()?;
         let next_seq = c.u64()?;
         c.done()?;
-        Ok(Self { height, epoch, view_base, app_hash, roots, snapshots, oplog_pos, next_seq })
+        Ok(Self {
+            height,
+            epoch,
+            view_base,
+            participants,
+            pending_cutover_view,
+            app_hash,
+            roots,
+            snapshots,
+            oplog_pos,
+            next_seq,
+        })
     }
 
     /// look up a stored snapshot by module id.
@@ -375,6 +441,8 @@ impl Manifest {
         height: Option<u64>,
         epoch: u64,
         view_base: u64,
+        participants: Vec<Vec<u8>>,
+        pending_cutover_view: Option<u64>,
         oplog_pos: u64,
         next_seq: u64,
     ) -> Result<Self, Error> {
@@ -403,6 +471,8 @@ impl Manifest {
             height,
             epoch,
             view_base,
+            participants,
+            pending_cutover_view,
             app_hash: host.app_hash(),
             roots,
             snapshots,
@@ -631,8 +701,14 @@ where
         &mut self,
         epoch: u64,
         view_base: u64,
+        participants: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        let record = Record::Cutover { epoch, view_base }.encode();
+        let record = Record::Cutover {
+            epoch,
+            view_base,
+            participants: participants.to_vec(),
+        }
+        .encode();
         async move {
             self.journal.append(&record).await.map_err(storage_err)?;
             self.journal.sync().await.map_err(storage_err)?;
@@ -655,10 +731,18 @@ pub struct Recovered {
     /// the consensus epoch to respawn and its app-height base.
     pub epoch: u64,
     pub view_base: u64,
+    /// the epoch's engine participant set: the manifest's, superseded by any
+    /// newer [`Record::Cutover`] the journal retained.
+    pub participants: Vec<Vec<u8>>,
     /// every retained frame's bytes (pins and blocks) — the boot path seeds
     /// the consensus content store with these so re-reported finalizations
     /// resolve locally instead of wedging the ordered gate.
     pub frames: Vec<Vec<u8>>,
+    /// every post-checkpoint sealed block's `(height, post-block roots)`, in
+    /// order — the boot path scans these to re-derive a cutover that was
+    /// armed by a block ABOVE the checkpoint (the checkpoint itself records
+    /// one armed at or below it via `pending_cutover_view`).
+    pub blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)>,
     /// replay accounting, for the boot log line.
     pub applied: usize,
     pub skipped: usize,
@@ -683,7 +767,9 @@ where
         let mut tip_hash = manifest.app_hash;
         let mut epoch = manifest.epoch;
         let mut view_base = manifest.view_base;
+        let mut participants = manifest.participants.clone();
         let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)> = Vec::new();
         let mut pending: Option<(u64, Vec<u8>)> = None;
         let mut applied = 0usize;
         let mut skipped = 0usize;
@@ -708,12 +794,13 @@ where
         for record in records {
             match record {
                 Record::Pinned { frame } => frames.push(frame),
-                Record::Cutover { epoch: e, view_base: b } => {
+                Record::Cutover { epoch: e, view_base: b, participants: p } => {
                     // monotone: a stale record retained from below the
                     // checkpoint must not regress the manifest's values.
                     if e > epoch {
                         epoch = e;
                         view_base = b;
+                        participants = p;
                     }
                 }
                 Record::Block { height, frame } => {
@@ -783,6 +870,7 @@ where
                             )));
                         }
                     }
+                    blocks.push((height, roots.clone()));
                     for (id, root) in roots {
                         expected.insert(id, root);
                     }
@@ -817,6 +905,7 @@ where
             };
             BlockSink::seal(self, &seal).await.map_err(|e| Error::Storage(e.to_string()))?;
             self.journal.sync().await.map_err(storage_err)?;
+            blocks.push((height, seal.roots.clone()));
             tip_height = Some(height);
             tip_hash = host.app_hash();
             rolled_forward = true;
@@ -837,7 +926,9 @@ where
             app_hash: tip_hash,
             epoch,
             view_base,
+            participants,
             frames,
+            blocks,
             applied,
             skipped,
             rolled_forward,
@@ -906,7 +997,11 @@ mod tests {
                 roots: vec![],
                 app_hash: StateRoot([6; 32]),
             },
-            Record::Cutover { epoch: 2, view_base: 40 },
+            Record::Cutover {
+                epoch: 2,
+                view_base: 40,
+                participants: vec![vec![7u8; 32], vec![8u8; 32]],
+            },
         ];
         for r in records {
             let decoded = Record::decode(&r.encode()).expect("roundtrip");
@@ -935,6 +1030,8 @@ mod tests {
             height: Some(42),
             epoch: 1,
             view_base: 30,
+            participants: vec![vec![7u8; 32], vec![8u8; 32]],
+            pending_cutover_view: Some(15),
             app_hash: StateRoot([1; 32]),
             roots: roots(&[("directory", 2), ("valset", 3)]),
             snapshots: vec![

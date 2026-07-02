@@ -62,7 +62,7 @@ fn ceiling_discards_and_cutover_rebases_heights() {
         // CUTOVER: fresh orderer (engine views restart at 0), app heights
         // rebased at the cutover height. the discarded op stays discarded; a
         // resubmission in the new epoch applies at a monotone height.
-        node.cutover(RoundOrderer::new(), 1, 2).await.expect("cutover");
+        node.cutover(RoundOrderer::new(), 1, 2, &[]).await.expect("cutover");
         assert_eq!(node.last_engine_view(), None, "engine view resets");
         node.submit(&sk(1), 3, set("k2", "v2-epoch1")).await.expect("resubmit");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
