@@ -1200,6 +1200,8 @@ dependencies = [
  "saga",
  "saga-interface",
  "sdk",
+ "serde",
+ "serde_json",
  "state",
  "valset",
  "valset-interface",
