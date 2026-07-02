@@ -91,9 +91,21 @@ use tasks::Tasks;
 use valset::Valset;
 use vaults::Vaults;
 
-/// the peer-set index. every node must `track` the same authorized set at the
-/// same index for discovery's bit-vector gossip to line up.
+/// the peer-set index a node WITHOUT consensus coordinates tracks (a parked
+/// joiner, a sync-only observer): the genesis mesh at index 0. a VALIDATOR
+/// tracks its epoch's mesh at index = epoch instead — discovery requires
+/// strictly increasing indexes per `track`, ignores indexes a peer does not
+/// know, but KILLS a peer whose set at a SHARED index has a different
+/// length, so the set tracked at a given index must be identical on every
+/// node that tracks it (epoch participant sets are; instantaneous valset
+/// projections are not).
 const PEER_SET: u64 = 0;
+/// a deliberately-unregistered module target. while an epoch cutover is
+/// pending, validators submit empty frames against it: finalized views only
+/// advance with ops, so an idle network would otherwise park AT the armed
+/// boundary forever. the frame finalizes, rejects deterministically on every
+/// node (unknown module), advances the engine clock, and leaves no state.
+const NOP_TARGET: &str = "consensus.nop";
 /// max wire message size we accept on a channel (1 MiB) — generous for the small
 /// json frames + BFT metadata, and the statesync chunk size (256 KiB) plus
 /// framing stays far below it.
@@ -149,6 +161,18 @@ fn epoch_floor(namespace: &[u8], epoch: u64) -> Digest {
         ]
         .concat(),
     )
+}
+
+/// the orchestrator's current epoch participant set as raw key bytes — what
+/// checkpoints, cutover records, and the statesync manifest carry.
+fn participant_bytes(
+    orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
+) -> Vec<Vec<u8>> {
+    orchestrator
+        .current_members()
+        .iter()
+        .map(|k| k.as_ref().to_vec())
+        .collect()
 }
 
 /// read the valset module's current membership projection (committed state —
@@ -828,11 +852,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             MAX_MESSAGE_SIZE,
         );
         let (mut network, mut oracle) = Network::new(context.child("network"), p2p_cfg);
-        oracle.track(PEER_SET, mesh_participants.clone());
 
         let quota = Quota::per_second(NZU32!(128));
 
         if sync_only {
+            // no consensus coordinates yet: track the genesis mesh at the
+            // base index. validators ignore this index if they have rotated
+            // past keeping it; connection authorization is the UNION of every
+            // tracked set on each side, so the descriptor's members stay
+            // reachable.
+            oracle.track(PEER_SET, mesh_participants.clone());
             // ---- the SYNC-ONLY joiner: no engine, no votes — just the wire ----
             //
             // validators broadcast consensus traffic (votes, certificates,
@@ -1016,12 +1045,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         };
         let forge_repo = storage_for_sync.join("forge-repo");
         // (host, recovered-state, next local submit seq, last checkpoint
-        // (height, oplog position) for the pump's prune bookkeeping).
-        let (host, resumed, mut next_seq, mut prev_ckpt): (
+        // (height, oplog position) for the pump's prune bookkeeping, and a
+        // cutover the pre-crash process had armed but not crossed).
+        let (host, resumed, mut next_seq, mut prev_ckpt, pending_boot): (
             Host,
             Option<recovery::Recovered>,
             u64,
             (Option<u64>, u64),
+            Option<u64>,
         ) = match manifest {
             None => {
                 // a journal without a checkpoint is damage, not a fresh dir —
@@ -1036,19 +1067,23 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
                 let host = genesis_host(&context, &forge_repo, &validators).await;
                 let pos = recovery.oplog_pos().await;
+                let genesis_participants: Vec<Vec<u8>> =
+                    validators.iter().map(|k| k.as_ref().to_vec()).collect();
                 // seq 0 is the dev demo op's; real submits start at 1.
-                let genesis_manifest = match Manifest::capture(&host, None, 0, 0, pos, 1) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("[node {label}] FATAL: genesis checkpoint capture: {e}");
-                        std::process::exit(1);
-                    }
-                };
+                let genesis_manifest =
+                    match Manifest::capture(&host, None, 0, 0, genesis_participants, None, pos, 1)
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("[node {label}] FATAL: genesis checkpoint capture: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                 if let Err(e) = recovery.write_manifest(&genesis_manifest).await {
                     eprintln!("[node {label}] FATAL: genesis checkpoint write: {e}");
                     std::process::exit(1);
                 }
-                (host, None, 1, (None, pos))
+                (host, None, 1, (None, pos), None)
             }
             Some(manifest) => {
                 let mut host = match restore_host(&context, &forge_repo, &manifest).await {
@@ -1093,22 +1128,59 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     rec.skipped,
                     if rec.rolled_forward { ", rolled 1 forward" } else { "" },
                 );
+                // a cutover armed but not crossed before the crash: recorded
+                // in the checkpoint (valid only while no cutover happened
+                // since — a newer epoch means that boundary was crossed), or
+                // derived from the replayed seals: the first CURRENT-epoch
+                // block that moved the valset root armed the boundary at its
+                // view + the delay. deterministic — the same block arms the
+                // same boundary on every node.
+                let pending_boot = if rec.epoch == manifest.epoch {
+                    manifest.pending_cutover_view
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    let mut prev_root =
+                        manifest.root("valset").expect("valset is a genesis module");
+                    let mut armed = None;
+                    for (height, roots) in &rec.blocks {
+                        let root = roots
+                            .iter()
+                            .find(|(id, _)| id == "valset")
+                            .map(|(_, r)| *r)
+                            .expect("every seal carries the full root vector");
+                        if root != prev_root && *height > rec.view_base && armed.is_none() {
+                            armed = Some(*height - rec.view_base + CUTOVER_DELAY);
+                        }
+                        prev_root = root;
+                    }
+                    armed
+                });
                 let prev = (manifest.height, manifest.oplog_pos);
-                (host, Some(rec), next_seq, prev)
+                (host, Some(rec), next_seq, prev, pending_boot)
             }
         };
 
-        // consensus membership comes from RECOVERED state (at genesis this is
-        // exactly the config seed — valset was just seeded from it). a key no
-        // longer in the set must not spawn an engine for the epoch.
+        // consensus membership comes from the RECOVERY RECORD: the epoch's
+        // ENGINE PARTICIPANT SET (at genesis: exactly the config seed). the
+        // recovered valset projection is NOT it — a restart inside a cutover
+        // window would read a membership change whose boundary has not been
+        // crossed and spawn a different scheme than its peers are running.
         let member_keys: Vec<ed25519::PublicKey> = {
-            let raw = read_valset_members(&host).await;
+            let raw: Vec<Vec<u8>> = match &resumed {
+                Some(rec) => rec.participants.clone(),
+                None => validators.iter().map(|k| k.as_ref().to_vec()).collect(),
+            };
             let mut keys = Vec::with_capacity(raw.len());
             for k in &raw {
                 match ed25519::PublicKey::decode(k.as_slice()) {
                     Ok(pk) => keys.push(pk),
                     Err(e) => {
-                        eprintln!("[node {label}] FATAL: recovered valset holds a non-ed25519 key: {e}");
+                        eprintln!(
+                            "[node {label}] FATAL: recovered participant set holds a \
+                             non-ed25519 key: {e}"
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -1125,6 +1197,29 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let participants: Set<ed25519::PublicKey> =
             Set::try_from(member_keys.clone()).expect("valset membership has no duplicates");
         let resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
+
+        // the validator-owned transport mesh, tracked at index = epoch: the
+        // epoch's participants ∪ the descriptor mesh (genesis members + [dev]
+        // extras — kept authorized so demoted members and pre-genesis peers
+        // can still reach the statesync service). the SAME set on every node
+        // at this index: discovery kills peers whose bit-vector length
+        // disagrees at a shared index, and epoch participant sets are the
+        // only membership every node agrees on epoch-for-epoch.
+        let mesh_at = {
+            let descriptor_mesh = peers.clone();
+            move |epoch_members: &std::collections::BTreeSet<ed25519::PublicKey>| {
+                let mut union: std::collections::BTreeSet<ed25519::PublicKey> =
+                    descriptor_mesh.iter().cloned().collect();
+                union.extend(epoch_members.iter().cloned());
+                Set::try_from(union.into_iter().collect::<Vec<_>>())
+                    .expect("a btree-set union has no duplicates")
+            }
+        };
+        let mut mesh_oracle = oracle.clone();
+        mesh_oracle.track(
+            resume_epoch,
+            mesh_at(&member_keys.iter().cloned().collect()),
+        );
 
         // lanes for epochs BELOW the resume epoch are registered and
         // black-holed (the sync-only arm's exact trick): a lagging peer still
@@ -1300,6 +1395,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
         };
         let mut last_cert_height = boot_floor.as_ref().map(|c| c.height);
+        // the newest persisted finalization floor, kept in memory so the
+        // statesync service can serve it to joiners at a matching boundary.
+        let mut latest_floor: Option<recovery::FloorCert> = boot_floor.clone();
         let orderer = spawn_epoch(
             &mut channel_bank,
             resume_epoch,
@@ -1319,24 +1417,32 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             ),
             None => OrderedNode::with_sink(host, orderer, recovery),
         };
+        // the observation barrier: every drain batch ends AT a block that
+        // moves the valset root, so the orchestration step below observes a
+        // membership change at exactly its block's view — the same view on
+        // every validator, whatever the local batch shape. without it the
+        // armed cutover view (and with it the next epoch's height base)
+        // would depend on drain timing: a cross-node fork.
+        node.watch_module("valset");
 
         // the valset ORCHESTRATOR: watches finalized valset module state and
-        // schedules deterministic epoch cutovers. the initial observation is
-        // the CURRENT committed membership (genesis-seeded on a fresh boot,
-        // recovered on a restart), at the recovered epoch coordinates.
-        let valset_root = node
-            .host()
-            .module_root("valset")
-            .expect("valset is registered");
+        // schedules deterministic epoch cutovers. it resumes at the recovered
+        // epoch coordinates over the epoch's ENGINE PARTICIPANT SET, and
+        // re-arms a cutover the pre-crash process had scheduled.
         let mut orchestrator = consensus::ValsetOrchestrator::resume(
             CUTOVER_DELAY,
-            consensus::ObservedValset::from_validator_set(
-                consensus::ValsetRoot(valset_root.0),
-                member_keys.clone(),
-            ),
+            member_keys.clone(),
             resume_epoch,
             view_base,
+            pending_boot,
         );
+        if let Some(ceiling) = pending_boot {
+            node.set_view_ceiling(ceiling);
+            println!(
+                "[node {label}] re-armed pending cutover at view {ceiling} (epoch {})",
+                resume_epoch + 1
+            );
+        }
 
         // the genesis app-hash BEFORE any op — the demo asserts this agrees across
         // processes (a fork here would be a genesis-determinism bug, not consensus).
@@ -1414,6 +1520,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut sync_server = SyncServer::new();
         // recovery cadence: sealed blocks since the last checkpoint manifest.
         let mut blocks_since_checkpoint: u64 = 0;
+        // throttle for the pending-cutover nop pusher below.
+        let mut last_nop = std::time::Instant::now();
         // the host-owned worker set (reactor seam). EMPTY for now: effects of
         // finalized blocks are drained and logged so the lane is visibly live;
         // the agent LLM worker plugs in here.
@@ -1476,6 +1584,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     Some(f.height),
                                     orchestrator.epoch(),
                                     orchestrator.epoch_base(),
+                                    participant_bytes(&orchestrator),
+                                    orchestrator.pending_cutover().map(|c| c.cutover_view()),
                                     pos,
                                     next_seq,
                                 ) {
@@ -1556,8 +1666,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
                         continue; // malformed rpc envelope: drop, never crash.
                     };
+                    // the boundary's consensus coordinates ride the manifest.
+                    // the floor certificate is served only when it certifies
+                    // exactly the current boundary — a cert behind the
+                    // boundary would make a joiner skip history it needs.
+                    let coords = statesync::BoundaryCoords {
+                        epoch: orchestrator.epoch(),
+                        view_base: orchestrator.epoch_base(),
+                        participants: participant_bytes(&orchestrator),
+                        floor_cert: latest_floor
+                            .as_ref()
+                            .filter(|fc| fc.epoch == orchestrator.epoch())
+                            .filter(|fc| {
+                                node.finalized().is_some_and(|f| f.height == fc.height)
+                            })
+                            .map(|fc| fc.cert.clone()),
+                    };
                     let resp = sync_server
-                        .handle_frame(node.host(), node.finalized(), body)
+                        .handle_frame(node.host(), node.finalized(), &coords, body)
                         .await;
                     let _ = sync_tx.send(
                         Recipients::One(peer),
@@ -1650,7 +1776,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     cert,
                                 };
                                 match node.sink_mut().write_floor_cert(&fc).await {
-                                    Ok(()) => last_cert_height = Some(height),
+                                    Ok(()) => {
+                                        last_cert_height = Some(height);
+                                        latest_floor = Some(fc);
+                                    }
                                     Err(e) => eprintln!(
                                         "[node {label}] floor cert write failed (will retry): {e}"
                                     ),
@@ -1671,6 +1800,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 Some(f.height),
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
+                                participant_bytes(&orchestrator),
+                                orchestrator.pending_cutover().map(|c| c.cutover_view()),
                                 pos,
                                 next_seq,
                             );
@@ -1709,25 +1840,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // membership projection; a change schedules a deterministic
                     // cutover (arming the discard ceiling), and crossing the
                     // cutover view tears the engine down and respawns it over
-                    // the new participant set at the next epoch.
+                    // the set read AT the boundary. the observation barrier
+                    // guarantees this tick's last view IS the changing block's
+                    // view when membership moved.
                     if let Some(engine_view) = node.last_engine_view() {
                         let members_raw = read_valset_members(node.host()).await;
-                        let valset_root = node
-                            .host()
-                            .module_root("valset")
-                            .expect("valset is registered");
-                        let mut member_keys: Vec<ed25519::PublicKey> = Vec::new();
+                        let mut observed: Vec<ed25519::PublicKey> = Vec::new();
                         for key in &members_raw {
                             if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
-                                member_keys.push(pk);
+                                observed.push(pk);
                             }
                         }
-                        let observed = consensus::ObservedValset::from_validator_set(
-                            consensus::ValsetRoot(valset_root.0),
-                            member_keys,
-                        );
                         if let consensus::ObservationOutcome::Scheduled(cutover) =
-                            orchestrator.observe_finalized_valset(engine_view, observed)
+                            orchestrator.observe_members(engine_view, observed.iter().cloned())
                         {
                             println!(
                                 "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
@@ -1737,8 +1862,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             );
                             node.set_view_ceiling(cutover.cutover_view());
                         }
-                        if let Some(plan) = orchestrator.respawn_if_due(engine_view) {
-                            let members = plan.valset().membership().consensus_members();
+                        if let Some(plan) = orchestrator.respawn_if_due(engine_view, observed) {
+                            let members = plan.valset().consensus_members();
+                            let member_bytes: Vec<Vec<u8>> =
+                                members.iter().map(|k| k.as_ref().to_vec()).collect();
+                            // transport FIRST: the new epoch's mesh must admit
+                            // its members (a fresh joiner above all) before
+                            // anything is expected of them. index = epoch,
+                            // strictly increasing across cutovers.
+                            mesh_oracle.track(plan.epoch(), mesh_at(members));
                             if !members.contains(&signer.public_key()) {
                                 println!(
                                     "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
@@ -1760,11 +1892,47 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 None,
                             );
                             if let Err(e) = node
-                                .cutover(orderer, plan.epoch(), plan.cutover_app_height())
+                                .cutover(
+                                    orderer,
+                                    plan.epoch(),
+                                    plan.cutover_app_height(),
+                                    &member_bytes,
+                                )
                                 .await
                             {
                                 eprintln!("[node {label}] FATAL: {e} — halting");
                                 std::process::exit(1);
+                            }
+                            // checkpoint IMMEDIATELY: the manifest must record
+                            // the new epoch's participant set (the journal's
+                            // cutover record alone covers only the crash
+                            // window until this write lands).
+                            let pos = node.sink_mut().oplog_pos().await;
+                            let captured = Manifest::capture(
+                                node.host(),
+                                node.finalized().map(|f| f.height),
+                                orchestrator.epoch(),
+                                orchestrator.epoch_base(),
+                                participant_bytes(&orchestrator),
+                                None,
+                                pos,
+                                next_seq,
+                            );
+                            match captured {
+                                Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                                    Ok(()) => {
+                                        blocks_since_checkpoint = 0;
+                                        prev_ckpt = (m.height, pos);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[node {label}] post-cutover checkpoint write failed \
+                                         (the journal's cutover record covers a restart): {e}"
+                                    ),
+                                },
+                                Err(e) => eprintln!(
+                                    "[node {label}] post-cutover checkpoint capture failed \
+                                     (the journal's cutover record covers a restart): {e}"
+                                ),
                             }
                             println!(
                                 "[node {label}] cutover complete: epoch {} with {} validators (app height base {})",
@@ -1772,6 +1940,30 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 members.len(),
                                 plan.cutover_app_height()
                             );
+                        }
+                    }
+
+                    // a pending cutover only crosses when finalized views
+                    // REACH it, and views only advance with ops — an idle
+                    // network would park at the armed boundary forever. push
+                    // a deterministically-rejected nop (unknown module
+                    // target: rejects identically on every node, leaves no
+                    // state) until the boundary is crossed.
+                    if orchestrator.pending_cutover().is_some()
+                        && last_nop.elapsed() >= Duration::from_secs(1)
+                    {
+                        last_nop = std::time::Instant::now();
+                        let seq = next_seq;
+                        next_seq += 1;
+                        if let Err(e) = node
+                            .submit(
+                                &signer,
+                                seq,
+                                Msg { target: NOP_TARGET.into(), payload: Vec::new() },
+                            )
+                            .await
+                        {
+                            eprintln!("[node {label}] cutover nop submit failed: {e}");
                         }
                     }
 
