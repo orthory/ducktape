@@ -24,6 +24,7 @@ members = [
     # system — consensus infrastructure modules
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
+    "crates/system/valset-mesh-interface",
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
@@ -85,6 +86,7 @@ greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "crates/system/kv-interface" }
 valset-interface = { path = "crates/system/valset-interface" }
+valset-mesh-interface = { path = "crates/system/valset-mesh-interface" }
 saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
