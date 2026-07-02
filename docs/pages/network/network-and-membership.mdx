@@ -1,0 +1,34 @@
+# Network and Membership
+
+The repository currently has three separate network and membership concerns:
+message propagation, ordered consensus delivery, and validator membership state.
+
+## Propagation Seam
+
+`crates/kernel/node` defines a byte-oriented transport seam and an in-process
+loopback implementation. The loopback path exists for deterministic local
+convergence tests: outbound messages are applied locally, encoded, and delivered
+to peers; inbound messages are applied but not re-broadcast.
+
+This path is useful for testing the node/host boundary, but it is not the live
+consensus path for order-dependent roots.
+
+## Ordered Consensus Path
+
+`OrderedNode` applies finalized operations from an `Orderer`. The commonware
+Simplex-backed orderer lives in `crates/kernel/consensus`, and `bin/node` wires
+it into a real-socket validator process.
+
+The ordered path is load-bearing because QMDB roots depend on operation order.
+Validators must apply a shared finalized sequence, not whichever order their
+transport happened to deliver.
+
+## Valset State
+
+`crates/system/valset` stores validator membership as a module. It exposes typed
+messages and queries through `valset-interface`, and the demo applies a join
+message carrying an ed25519 public key.
+
+The remaining membership work is orchestration around consensus epochs: the repo
+has tests for respawn behavior, but the live loop that watches finalized valset
+state and coordinates cutover is still future work.

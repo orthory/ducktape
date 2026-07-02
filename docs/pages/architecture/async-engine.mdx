@@ -1,0 +1,30 @@
+# Async Engine
+
+Ducktape splits asynchronous work into deterministic continuation state and a
+host-owned non-deterministic worker loop.
+
+## Saga
+
+The saga module stores continuation state under the app-hash. A trigger records
+that work is pending and emits a worker request as an effect. The pending state
+is deterministic and committed like any other module state.
+
+## Reactor
+
+The reactor owns workers outside module execution. A worker may claim an effect,
+perform the non-deterministic work, and return a `Msg`. That message re-enters
+the host as an ordinary op in a later block.
+
+The important rule is that workers never receive module handles. They cannot
+mutate state directly. Their only path back into consensus state is the message
+they return.
+
+## Oracle as Transaction
+
+LLM output, external fetches, transport actions, and other non-deterministic
+edges are modeled as oracle results. The result becomes data in an ordered op,
+not a side effect smuggled into `execute`.
+
+This is why the agent module can use the same platform shape as the rest of the
+system: an LLM call belongs behind a worker seam, while the resulting transcript
+or decision is committed through a module root.
