@@ -7,7 +7,31 @@ use directory::Directory;
 use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
 use greeter::Greeter;
 use host::Host;
-use sdk::Msg;
+use sdk::{Ctx, Error, Module, Msg, StateRoot};
+
+struct QueryCycler {
+    id: &'static str,
+    next: &'static str,
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for QueryCycler {
+    fn id(&self) -> String {
+        self.id.into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn query_with(&self, ctx: &dyn Ctx, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        ctx.query(self.next, b"cycle").await
+    }
+}
 
 #[test]
 fn greeter_reads_directory_and_writes_a_derived_greeting() {
@@ -60,5 +84,23 @@ fn genesis_rejects_duplicate_ids() {
         let b = Directory::new("dup");
         let err = Host::genesis(vec![Box::new(a), Box::new(b)]);
         assert!(err.is_err(), "duplicate module id must be rejected at genesis");
+    });
+}
+
+#[test]
+fn query_cycles_are_rejected() {
+    deterministic::Runner::default().start(|_| async move {
+        let host = Host::genesis(vec![
+            Box::new(QueryCycler { id: "a", next: "b" }),
+            Box::new(QueryCycler { id: "b", next: "a" }),
+        ])
+        .expect("genesis");
+
+        let err = host
+            .query("a", b"start")
+            .await
+            .expect_err("query cycle must fail instead of recursing");
+
+        assert!(matches!(err, Error::Module(msg) if msg == "query cycle: a"));
     });
 }

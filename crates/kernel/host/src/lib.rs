@@ -101,10 +101,29 @@ impl Host {
     }
 
     /// external read-only query of a registered module (sync, like [`Ctx::query`]
-    /// but from outside a dispatch). routes to [`Module::query`].
+    /// but from outside a dispatch). routes to [`Module::query_with`].
     pub async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
         match self.registry.get(target) {
-            Some(m) => m.query(req).await,
+            Some(m) => {
+                let snapshot: BTreeMap<ModuleId, StateRoot> = self
+                    .registry
+                    .iter()
+                    .map(|(k, m)| (k.clone(), m.root()))
+                    .collect();
+                let target = target.to_string();
+                let ctx = ReadOnlyQueryCtx {
+                    env: Env {
+                        height: 0,
+                        consensus_time: 0,
+                        origin: Origin::System,
+                        me: target.clone(),
+                    },
+                    snapshot: &snapshot,
+                    registry: &self.registry,
+                    active: BTreeSet::from([target]),
+                };
+                m.query_with(&ctx, req).await
+            }
             None => Err(Error::UnknownModule(target.to_string())),
         }
     }
@@ -286,7 +305,21 @@ impl Ctx for HostCtx<'_> {
             return Err(Error::SelfQuery);
         }
         match self.registry.get(target) {
-            Some(m) => m.query(req).await,
+            Some(m) => {
+                let target = target.to_string();
+                let ctx = ReadOnlyQueryCtx {
+                    env: Env {
+                        height: self.env.height,
+                        consensus_time: self.env.consensus_time,
+                        origin: self.env.origin.clone(),
+                        me: target.clone(),
+                    },
+                    snapshot: &self.snapshot,
+                    registry: self.registry,
+                    active: BTreeSet::from([self.env.me.clone(), target]),
+                };
+                m.query_with(&ctx, req).await
+            }
             None => Err(Error::UnknownModule(target.to_string())),
         }
     }
@@ -302,4 +335,59 @@ impl Ctx for HostCtx<'_> {
     fn request_effect(&mut self, eff: Effect) {
         self.out_effects.push(eff);
     }
+}
+
+/// Query projections can also be filtered views over other registered modules.
+/// This context carries the host snapshot and rejects nested query cycles.
+struct ReadOnlyQueryCtx<'a> {
+    env: Env,
+    snapshot: &'a BTreeMap<ModuleId, StateRoot>,
+    registry: &'a BTreeMap<ModuleId, Box<dyn Module>>,
+    active: BTreeSet<ModuleId>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl Ctx for ReadOnlyQueryCtx<'_> {
+    fn env(&self) -> &Env {
+        &self.env
+    }
+
+    fn module_root(&self, target: &str) -> Option<StateRoot> {
+        self.snapshot.get(target).copied()
+    }
+
+    async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+        if target == self.env.me {
+            return Err(Error::SelfQuery);
+        }
+        if self.active.contains(target) {
+            return Err(Error::Module(format!("query cycle: {target}")));
+        }
+        match self.registry.get(target) {
+            Some(m) => {
+                let target = target.to_string();
+                let mut active = self.active.clone();
+                active.insert(target.clone());
+                let ctx = ReadOnlyQueryCtx {
+                    env: Env {
+                        height: self.env.height,
+                        consensus_time: self.env.consensus_time,
+                        origin: self.env.origin.clone(),
+                        me: target,
+                    },
+                    snapshot: self.snapshot,
+                    registry: self.registry,
+                    active,
+                };
+                m.query_with(&ctx, req).await
+            }
+            None => Err(Error::UnknownModule(target.to_string())),
+        }
+    }
+
+    fn emit_msg(&mut self, _msg: Msg) {}
+
+    fn emit_event(&mut self, _ev: Event) {}
+
+    fn request_effect(&mut self, _eff: Effect) {}
 }

@@ -198,6 +198,14 @@ pub trait Module {
         Err(Error::QueryUnsupported)
     }
 
+    /// read-only projection with access to host-routed reads of sibling modules.
+    /// filtered facade modules can override this to present another module's
+    /// durable state without copying it. standalone modules can keep implementing
+    /// [`Module::query`]; the default delegates there.
+    async fn query_with(&self, _ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.query(req).await
+    }
+
     /// BLOCK-BOUNDARY COMMIT. a module STAGES its writes during `execute` and
     /// publishes them here, once, when the host declares the block a success.
     /// after this returns, `root()` MUST reflect the staged writes. the default

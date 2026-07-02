@@ -485,6 +485,8 @@ dependencies = [
 name = "chat"
 version = "0.1.0"
 dependencies = [
+ "agent",
+ "agent-interface",
  "async-trait",
  "chat-interface",
  "commonware-runtime",

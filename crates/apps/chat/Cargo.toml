@@ -14,4 +14,6 @@ commonware-storage = { workspace = true }
 commonware-runtime = { workspace = true }
 
 [dev-dependencies]
+agent = { workspace = true }
+agent-interface = { workspace = true }
 host = { workspace = true }

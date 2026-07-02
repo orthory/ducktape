@@ -1,3 +1,5 @@
+use agent::Agent;
+use agent_interface::AgentMsg;
 use chat::Chat;
 use chat_interface::{
     ChatChannel, ChatMessage, ChatMsg, ChatQuery, ChatReply, DEFAULT_CHAT_TARGET, decode_reply,
@@ -6,6 +8,7 @@ use chat_interface::{
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::Host;
 use messaging::Messaging;
+use messaging_interface::{MessagingQuery, MessagingReply};
 use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
 
 struct TestCtx {
@@ -51,6 +54,13 @@ fn chat_msg(payload: ChatMsg) -> Msg {
     }
 }
 
+fn agent_msg(payload: AgentMsg) -> Msg {
+    Msg {
+        target: agent_interface::DEFAULT_AGENT_TARGET.into(),
+        payload: agent_interface::encode_msg(&payload),
+    }
+}
+
 async fn apply_commit<E>(module: &mut Chat<E>, at: u64, payload: ChatMsg)
 where
     E: commonware_storage::Context + commonware_runtime::BufferPooler,
@@ -76,6 +86,151 @@ where
         ChatReply::Messages(messages) => messages,
         other => panic!("unexpected reply: {other:?}"),
     }
+}
+
+#[test]
+fn chat_channels_include_agent_opened_sessions_when_backed_by_registered_messaging() {
+    deterministic::Runner::default().start(|context| async move {
+        let messaging = Messaging::init(
+            context.child("messaging"),
+            agent_interface::DEFAULT_MESSAGING_TARGET,
+        )
+        .await;
+        let chat = Chat::init_with_messaging_id(
+            context.child("chat"),
+            DEFAULT_CHAT_TARGET,
+            agent_interface::DEFAULT_MESSAGING_TARGET,
+        )
+        .await;
+        let agent = Agent::new(agent_interface::DEFAULT_AGENT_TARGET);
+        let mut host =
+            Host::genesis(vec![Box::new(messaging), Box::new(chat), Box::new(agent)]).unwrap();
+        let chat_root = host.module_root(DEFAULT_CHAT_TARGET).unwrap();
+        let messaging_root = host
+            .module_root(agent_interface::DEFAULT_MESSAGING_TARGET)
+            .unwrap();
+
+        host.submit(agent_msg(AgentMsg::OpenSession {
+            session_id: "agent-inbox".into(),
+            title: "Agent Inbox".into(),
+        }))
+        .await
+        .unwrap();
+        host.submit(agent_msg(AgentMsg::AppendMessage {
+            session_id: "agent-inbox".into(),
+            message_id: "m1".into(),
+            author: "agent".into(),
+            body: "ready".into(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            host.module_root(DEFAULT_CHAT_TARGET).unwrap(),
+            chat_root,
+            "registered chat is a stateless filtered view"
+        );
+        assert_ne!(
+            host.module_root(agent_interface::DEFAULT_MESSAGING_TARGET)
+                .unwrap(),
+            messaging_root,
+            "registered messaging owns the storage root"
+        );
+
+        let channels = host
+            .query(DEFAULT_CHAT_TARGET, &encode_query(&ChatQuery::Channels))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_reply(&channels).unwrap(),
+            ChatReply::Channels(vec![ChatChannel {
+                id: "agent-inbox".into(),
+                name: "Agent Inbox".into(),
+                created_at: 0,
+            }])
+        );
+
+        let history = host
+            .query(
+                DEFAULT_CHAT_TARGET,
+                &encode_query(&ChatQuery::Messages {
+                    channel_id: "agent-inbox".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_reply(&history).unwrap(),
+            ChatReply::Messages(vec![ChatMessage {
+                id: "m1".into(),
+                channel_id: "agent-inbox".into(),
+                author: "agent".into(),
+                body: "ready".into(),
+                sequence: 1,
+                sent_at: 0,
+                thread_id: None,
+                reply_count: 0,
+                last_reply_at: None,
+            }])
+        );
+    });
+}
+
+#[test]
+fn chat_writes_land_in_registered_messaging_backing() {
+    deterministic::Runner::default().start(|context| async move {
+        let messaging = Messaging::init(
+            context.child("messaging"),
+            agent_interface::DEFAULT_MESSAGING_TARGET,
+        )
+        .await;
+        let chat = Chat::init_with_messaging_id(
+            context.child("chat"),
+            DEFAULT_CHAT_TARGET,
+            agent_interface::DEFAULT_MESSAGING_TARGET,
+        )
+        .await;
+        let mut host = Host::genesis(vec![Box::new(messaging), Box::new(chat)]).unwrap();
+
+        host.submit(chat_msg(ChatMsg::CreateChannel {
+            channel_id: "general".into(),
+            name: "General".into(),
+        }))
+        .await
+        .unwrap();
+        host.submit(chat_msg(ChatMsg::SendMessage {
+            channel_id: "general".into(),
+            message_id: "m1".into(),
+            author: "alice".into(),
+            body: "hello".into(),
+        }))
+        .await
+        .unwrap();
+
+        let backing_history = host
+            .query(
+                agent_interface::DEFAULT_MESSAGING_TARGET,
+                &messaging_interface::encode_query(&MessagingQuery::Messages {
+                    channel_id: "general".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            messaging_interface::decode_reply(&backing_history).unwrap(),
+            MessagingReply::Messages(vec![messaging_interface::ChatMessage {
+                id: "m1".into(),
+                channel_id: "general".into(),
+                author: "alice".into(),
+                body: "hello".into(),
+                sequence: 1,
+                sent_at: 0,
+                thread_id: None,
+                reply_count: 0,
+                last_reply_at: None,
+            }])
+        );
+    });
 }
 
 #[test]
