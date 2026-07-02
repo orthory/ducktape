@@ -22,6 +22,8 @@ saga = { workspace = true }
 saga-interface = { workspace = true }
 tasks = { workspace = true }
 automations = { workspace = true }
+inbox = { workspace = true }
+inbox-interface = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }

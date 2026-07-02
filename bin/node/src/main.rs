@@ -73,6 +73,7 @@ use document::Document;
 use forge::Forge;
 use governance::Governance;
 use host::Host;
+use inbox::Inbox;
 use kv::Kv;
 use node::OrderedNode;
 use saga::SagaModule;
@@ -110,8 +111,8 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 11] = [
-    "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults",
+const MODULE_IDS: [&str; 12] = [
+    "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults", "inbox",
     "directory", "automations",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
@@ -258,6 +259,9 @@ async fn genesis_host(
         Box::new(SagaModule::new("saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
+        // per-member notification queues; other modules deliver via follow-up
+        // ops so a notification commits atomically with the causing event (P2).
+        Box::new(Inbox::new("inbox")),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
@@ -651,6 +655,10 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let mut automations = Automations::new("automations", "chat", "tasks");
             automations.install(&bytes, root).expect("automations install");
 
+            let (bytes, root) = snapshot_of("inbox").await;
+            let mut inbox = Inbox::new("inbox");
+            inbox.install(&bytes, root).expect("inbox install");
+
             let (bytes, root) = snapshot_of("forge").await;
             let forge_repo = storage_for_sync.join("forge-repo");
             let mut forge = Forge::init("forge", forge_repo).expect("joiner forge init");
@@ -658,9 +666,9 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 11] = [
+            let mods: [&dyn sdk::Module; 12] = [
                 &kv, &document, &chat, &directory, &valset, &governance,
-                &saga, &tasks, &vaults, &forge, &automations,
+                &saga, &tasks, &vaults, &inbox, &forge, &automations,
             ];
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {

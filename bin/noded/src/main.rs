@@ -26,6 +26,7 @@ use document::Document;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
+use inbox::Inbox;
 use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Msg, Origin};
@@ -34,7 +35,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 4] = ["chat", "tasks", "document", "forge"];
+const MODULE_IDS: [&str; 5] = ["chat", "tasks", "inbox", "document", "forge"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
@@ -91,15 +92,18 @@ fn run_node(
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
-        // genesis: chat + tasks as the first product surface, document + agent +
-        // forge so the whole app-hash story is visible from the status endpoint.
+        // genesis: chat + tasks + inbox as the first product surface, document +
+        // agent + forge so the whole app-hash story is visible from the status
+        // endpoint.
         let chat = Chat::init(context.child("chat"), "chat").await;
         let tasks = Tasks::new("tasks");
+        let inbox = Inbox::new("inbox");
         let document = Document::init(context.child("document"), "document").await;
         let forge = Forge::init("forge", forge_repo).expect("forge init");
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(tasks),
+            Box::new(inbox),
             Box::new(document),
             Box::new(forge),
         ])

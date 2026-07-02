@@ -35,6 +35,7 @@ chat = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }
 automations = { workspace = true }
+inbox = { workspace = true }
 reactor = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
