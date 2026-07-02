@@ -7,3 +7,4 @@ namespace = "ducktape-demo"
 peer_seeds = [0, 1, 2]
 validator_seeds = [0, 1]
 storage_dir = "/tmp/ducktape-node-0"
+rpc_listen = "127.0.0.1:52300"

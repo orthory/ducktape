@@ -56,6 +56,54 @@ for _ in $(seq 1 120); do
   sleep 0.5
 done
 
+# ---- the rpc product loop: post a message via node 0, read it on node 1 ----
+# proves the full stack end-to-end: rpc ingress -> ordered lane -> simplex
+# finalization -> cross-node apply -> module query on the OTHER validator.
+rpc() { # rpc <port> <json>
+  python3 - "$1" "$2" <<'PY'
+import json, socket, sys
+port, req = int(sys.argv[1]), sys.argv[2]
+s = socket.create_connection(("127.0.0.1", port), timeout=10)
+s.sendall(req.encode() + b"\n")
+buf = b""
+while not buf.endswith(b"\n"):
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+print(buf.decode().strip())
+PY
+}
+hexenc() { python3 -c "import sys; print(sys.argv[1].encode().hex())" "$1"; }
+
+rpc_ok=""
+if [ "$status" -eq 0 ]; then
+  create=$(hexenc '{"CreateChannel":{"channel_id":"general","name":"General"}}')
+  post=$(hexenc '{"PostMessage":{"channel_id":"general","message_id":"m1","author":"eddy","body":"hello ducktape"}}')
+  echo "posting to messaging via node 0 rpc..."
+  rpc 52300 "{\"cmd\":\"submit\",\"target\":\"messaging\",\"payload_hex\":\"$create\"}" >/dev/null
+  rpc 52300 "{\"cmd\":\"submit\",\"target\":\"messaging\",\"payload_hex\":\"$post\"}" >/dev/null
+  # wait for finalization to land on node 1, then read the channel THERE.
+  q=$(hexenc '{"Messages":{"channel_id":"general"}}')
+  for _ in $(seq 1 40); do
+    reply=$(rpc 52301 "{\"cmd\":\"query\",\"target\":\"messaging\",\"req_hex\":\"$q\"}" || true)
+    decoded=$(python3 - "$reply" <<'PY'
+import json, sys
+try:
+    r = json.loads(sys.argv[1])
+    print(bytes.fromhex(r.get("reply_hex", "")).decode() if r.get("ok") else "")
+except Exception:
+    print("")
+PY
+)
+    if echo "$decoded" | grep -q "hello ducktape"; then rpc_ok="yes"; break; fi
+    sleep 0.5
+  done
+  # both validators must now report the SAME app-hash over rpc status.
+  st0=$(rpc 52300 '{"cmd":"status"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["app_hash"])')
+  st1=$(rpc 52301 '{"cmd":"status"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["app_hash"])')
+fi
+
 # ---- the sync-only joiner: rebuild everything over the statesync channel ----
 log2=$(mktemp)
 synced=""
@@ -98,11 +146,17 @@ if [ "$conv0" = "$gen0" ]; then
   echo "FAIL: converged hash == genesis (nothing was actually applied)"; exit 1
 fi
 
+if [ -z "$rpc_ok" ]; then
+  echo "FAIL: a message posted via node 0's rpc never became readable on node 1 (rpc -> consensus -> cross-node apply broken)"; exit 1
+fi
+if [ -z "$st0" ] || [ "$st0" != "$st1" ]; then
+  echo "FAIL: post-rpc status app-hashes disagree: node0=$st0 node1=$st1"; exit 1
+fi
 if [ -z "$synced" ]; then
   echo "FAIL: the sync-only joiner never printed a synced app-hash (statesync service or joiner flow broken)"; exit 1
 fi
-if [ "$synced" != "$conv0" ]; then
-  echo "FAIL: the joiner synced app-hash DISAGREES with the validators: $synced != $conv0"; exit 1
+if [ "$synced" != "$st0" ]; then
+  echo "FAIL: the joiner synced app-hash DISAGREES with the post-rpc validators: $synced != $st0"; exit 1
 fi
 
-echo "PASS: both validators converged on byte-identical app-hash $conv0 over real TCP (off genesis $gen0), and the sync-only joiner rebuilt it over the statesync channel"
+echo "PASS: validators converged ($conv0), an rpc-submitted message crossed consensus (node0 -> node1), and the sync-only joiner rebuilt the post-rpc state ($st0) over the statesync channel"
