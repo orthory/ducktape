@@ -32,7 +32,7 @@ use saga_interface::{
     decode_msg, decode_query, encode_reply, encode_worker_request, SagaMsg, SagaQuery, SagaReply,
     SagaStatus, SagaView, WorkerRequest,
 };
-use sdk::{Ctx, Effect, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Effect, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
 /// one tracked saga. the id is the map key, so it isn't repeated here.
@@ -228,6 +228,10 @@ impl Module for SagaModule {
     /// preimage IS the snapshot encoding (see [`SagaModule::snapshot`]).
     fn root(&self) -> StateRoot {
         committed_root(&self.sagas)
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

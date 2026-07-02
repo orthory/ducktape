@@ -51,6 +51,43 @@ impl core::fmt::Debug for StateRoot {
     }
 }
 
+/// how a module can serve its committed state at a block boundary.
+///
+/// The host uses this as an honesty surface for snapshot orchestration: raw
+/// bytes are installable by modules that already expose snapshot/install, while
+/// resolver-backed modules explicitly report that a caller must use their
+/// module-specific sync target and resolver instead of pretending the host has a
+/// byte snapshot for them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StateSyncHandle {
+    /// no durable module state needs transfer; recreate the module at genesis.
+    Stateless,
+    /// self-contained bytes that can be installed against the module root.
+    SnapshotBytes(Vec<u8>),
+    /// sync is available, but only through a module-specific resolver path.
+    ResolverBacked {
+        /// storage/sync backend name, e.g. "qmdb".
+        backend: String,
+        /// short operator-facing note describing the required handle.
+        detail: String,
+    },
+    /// this module has not declared a state-sync surface.
+    Unsupported {
+        /// why the host cannot serve or describe a sync handle for this module.
+        reason: String,
+    },
+}
+
+impl StateSyncHandle {
+    pub fn has_snapshot_bytes(&self) -> bool {
+        matches!(self, Self::SnapshotBytes(_))
+    }
+
+    pub fn is_self_contained(&self) -> bool {
+        matches!(self, Self::Stateless | Self::SnapshotBytes(_))
+    }
+}
+
 /// a module's stable identity within the app. assigned at genesis and part of
 /// consensus state — NOT per-node config — so every validator composes the same
 /// global root in the same order.
@@ -191,6 +228,18 @@ pub trait Module {
     /// the module's current authenticated root. called by the host to fold into
     /// the global app-hash after a block applies.
     fn root(&self) -> StateRoot;
+
+    /// describe the committed-state sync surface for this module.
+    ///
+    /// This is called by snapshot orchestration after the host has reached a
+    /// block boundary. The default is explicit non-coverage; modules that expose
+    /// installable snapshot bytes or a resolver-backed sync path should override
+    /// it so a live node can advertise exactly what it can serve.
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::Unsupported {
+            reason: "module did not declare a state-sync handle".into(),
+        })
+    }
 
     /// the dispatch entry point. async, but every `.await` MUST be on a
     /// deterministic resource (own qmdb state, a query) — NEVER a network/effect.

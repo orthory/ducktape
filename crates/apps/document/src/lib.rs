@@ -57,7 +57,7 @@ use commonware_utils::range::NonEmptyRange;
 use document_interface::{
     decode_msg, decode_query, encode_reply, Block, DocMsg, DocQuery, DocReply,
 };
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
 /// the qmdb key: a fixed 32-byte sha256 digest of the `doc_id`. fixed width is
 /// what lets a store be state-synced (commonware's resolvers require `K: Array`).
@@ -377,6 +377,14 @@ where
     /// sync (qmdb caches its root); never a placeholder.
     fn root(&self) -> StateRoot {
         StateRoot(self.db.root().0)
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::ResolverBacked {
+            backend: "qmdb".into(),
+            detail: "call Document::sync_target() at this root and serve it with a DbResolver"
+                .into(),
+        })
     }
 
     /// decode a [`DocMsg`] and apply it to the staged overlay. the only `.await`
