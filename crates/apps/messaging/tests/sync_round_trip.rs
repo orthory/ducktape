@@ -82,6 +82,19 @@ where
     }
 }
 
+async fn thread_reply<E>(module: &Messaging<E>, channel_id: &str, thread_id: &str) -> Vec<u8>
+where
+    E: commonware_storage::Context + commonware_runtime::BufferPooler,
+{
+    module
+        .query(&encode_query(&MessagingQuery::Thread {
+            channel_id: channel_id.into(),
+            thread_id: thread_id.into(),
+        }))
+        .await
+        .unwrap()
+}
+
 #[test]
 fn synced_store_reconstructs_source_root_and_history() {
     deterministic::Runner::default().start(|context| async move {
@@ -117,10 +130,23 @@ fn synced_store_reconstructs_source_root_and_history() {
             },
         )
         .await;
+        apply_commit(
+            &mut src,
+            22,
+            MessagingMsg::PostThreadReply {
+                channel_id: "general".into(),
+                thread_id: "m1".into(),
+                message_id: "r1".into(),
+                author: "carol".into(),
+                body: "sync the thread too".into(),
+            },
+        )
+        .await;
         let src_root = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
 
         let expected_messages = messages(&src, "general").await;
+        let expected_thread = thread_reply(&src, "general", "m1").await;
         let target = src.sync_target().await;
         let resolver = src.into_resolver();
 
@@ -132,5 +158,9 @@ fn synced_store_reconstructs_source_root_and_history() {
             "synced store root must equal source root"
         );
         assert_eq!(messages(&synced, "general").await, expected_messages);
+        assert_eq!(
+            thread_reply(&synced, "general", "m1").await,
+            expected_thread
+        );
     });
 }

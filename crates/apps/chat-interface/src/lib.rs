@@ -6,7 +6,7 @@
 
 use messaging_interface::{
     Channel as MessagingChannel, ChatMessage as MessagingChatMessage, MessagingMsg, MessagingQuery,
-    MessagingReply,
+    MessagingReply, Thread as MessagingThread,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,18 @@ pub struct ChatMessage {
     pub body: String,
     pub sequence: u64,
     pub sent_at: u64,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub reply_count: u64,
+    #[serde(default)]
+    pub last_reply_at: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ChatThread {
+    pub root: ChatMessage,
+    pub replies: Vec<ChatMessage>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -41,13 +53,28 @@ pub enum ChatMsg {
         author: String,
         body: String,
     },
+    ReplyInThread {
+        channel_id: String,
+        thread_id: String,
+        message_id: String,
+        author: String,
+        body: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ChatQuery {
     Channels,
-    Channel { channel_id: String },
-    Messages { channel_id: String },
+    Channel {
+        channel_id: String,
+    },
+    Messages {
+        channel_id: String,
+    },
+    Thread {
+        channel_id: String,
+        thread_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -55,6 +82,7 @@ pub enum ChatReply {
     Channels(Vec<ChatChannel>),
     Channel(Option<ChatChannel>),
     Messages(Vec<ChatMessage>),
+    Thread(Option<ChatThread>),
 }
 
 impl From<MessagingChannel> for ChatChannel {
@@ -76,6 +104,18 @@ impl From<MessagingChatMessage> for ChatMessage {
             body: message.body,
             sequence: message.sequence,
             sent_at: message.sent_at,
+            thread_id: message.thread_id,
+            reply_count: message.reply_count,
+            last_reply_at: message.last_reply_at,
+        }
+    }
+}
+
+impl From<MessagingThread> for ChatThread {
+    fn from(thread: MessagingThread) -> Self {
+        Self {
+            root: ChatMessage::from(thread.root),
+            replies: thread.replies.into_iter().map(ChatMessage::from).collect(),
         }
     }
 }
@@ -96,6 +136,19 @@ pub fn backing_msg(msg: ChatMsg) -> MessagingMsg {
             author,
             body,
         },
+        ChatMsg::ReplyInThread {
+            channel_id,
+            thread_id,
+            message_id,
+            author,
+            body,
+        } => MessagingMsg::PostThreadReply {
+            channel_id,
+            thread_id,
+            message_id,
+            author,
+            body,
+        },
     }
 }
 
@@ -104,6 +157,13 @@ pub fn backing_query(query: ChatQuery) -> MessagingQuery {
         ChatQuery::Channels => MessagingQuery::Channels,
         ChatQuery::Channel { channel_id } => MessagingQuery::Channel { channel_id },
         ChatQuery::Messages { channel_id } => MessagingQuery::Messages { channel_id },
+        ChatQuery::Thread {
+            channel_id,
+            thread_id,
+        } => MessagingQuery::Thread {
+            channel_id,
+            thread_id,
+        },
     }
 }
 
@@ -116,6 +176,7 @@ pub fn reply_from_backing(reply: MessagingReply) -> ChatReply {
         MessagingReply::Messages(messages) => {
             ChatReply::Messages(messages.into_iter().map(ChatMessage::from).collect())
         }
+        MessagingReply::Thread(thread) => ChatReply::Thread(thread.map(ChatThread::from)),
     }
 }
 

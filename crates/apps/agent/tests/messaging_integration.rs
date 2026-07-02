@@ -4,7 +4,7 @@ use commonware_runtime::{Runner as _, deterministic};
 use host::Host;
 use messaging::Messaging;
 use messaging_interface::{
-    Channel, ChatMessage, MessagingQuery, MessagingReply, decode_reply, encode_query,
+    Channel, ChatMessage, MessagingQuery, MessagingReply, Thread, decode_reply, encode_query,
 };
 use sdk::{Msg, StateRoot};
 
@@ -85,7 +85,91 @@ fn agent_session_commands_drive_messaging_backing_state() {
                 body: "draft the shared context".into(),
                 sequence: 1,
                 sent_at: 0,
+                thread_id: None,
+                reply_count: 0,
+                last_reply_at: None,
             }])
+        );
+    });
+}
+
+#[test]
+fn agent_session_thread_replies_use_messaging_threads() {
+    deterministic::Runner::default().start(|context| async move {
+        let messaging = Messaging::init(context, DEFAULT_MESSAGING_TARGET).await;
+        let agent = Agent::new(agent_interface::DEFAULT_AGENT_TARGET);
+        let mut host = Host::genesis(vec![Box::new(messaging), Box::new(agent)]).unwrap();
+
+        host.submit(agent_msg(AgentMsg::OpenSession {
+            session_id: "s1".into(),
+            title: "Planning".into(),
+        }))
+        .await
+        .unwrap();
+        host.submit(agent_msg(AgentMsg::AppendMessage {
+            session_id: "s1".into(),
+            message_id: "m1".into(),
+            author: "planner".into(),
+            body: "draft the shared context".into(),
+        }))
+        .await
+        .unwrap();
+        host.submit(agent_msg(AgentMsg::AppendThreadReply {
+            session_id: "s1".into(),
+            thread_id: "m1".into(),
+            message_id: "r1".into(),
+            author: "reviewer".into(),
+            body: "keep this in the thread".into(),
+        }))
+        .await
+        .unwrap();
+
+        let parent = ChatMessage {
+            id: "m1".into(),
+            channel_id: "s1".into(),
+            author: "planner".into(),
+            body: "draft the shared context".into(),
+            sequence: 1,
+            sent_at: 0,
+            thread_id: None,
+            reply_count: 1,
+            last_reply_at: Some(0),
+        };
+        let reply = ChatMessage {
+            id: "r1".into(),
+            channel_id: "s1".into(),
+            author: "reviewer".into(),
+            body: "keep this in the thread".into(),
+            sequence: 1,
+            sent_at: 0,
+            thread_id: Some("m1".into()),
+            reply_count: 0,
+            last_reply_at: None,
+        };
+
+        assert_eq!(
+            messaging_query(
+                &host,
+                MessagingQuery::Messages {
+                    channel_id: "s1".into()
+                }
+            )
+            .await,
+            MessagingReply::Messages(vec![parent.clone()])
+        );
+        assert_eq!(
+            messaging_query(
+                &host,
+                MessagingQuery::Thread {
+                    channel_id: "s1".into(),
+                    thread_id: "m1".into(),
+                }
+            )
+            .await,
+            MessagingReply::Thread(Some(Thread {
+                root: parent,
+                replies: vec![reply],
+            }))
         );
     });
 }

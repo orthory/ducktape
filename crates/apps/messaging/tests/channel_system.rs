@@ -1,8 +1,8 @@
 use commonware_runtime::{Runner as _, deterministic};
 use messaging::Messaging;
 use messaging_interface::{
-    Channel, ChatMessage, MessagingMsg, MessagingQuery, MessagingReply, decode_reply, encode_msg,
-    encode_query,
+    Channel, ChatMessage, MessagingMsg, MessagingQuery, MessagingReply, Thread, decode_reply,
+    encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
 
@@ -134,6 +134,9 @@ fn creates_channels_and_posts_ordered_messages() {
                     body: "hello".into(),
                     sequence: 1,
                     sent_at: 20,
+                    thread_id: None,
+                    reply_count: 0,
+                    last_reply_at: None,
                 },
                 ChatMessage {
                     id: "m2".into(),
@@ -142,6 +145,9 @@ fn creates_channels_and_posts_ordered_messages() {
                     body: "hi".into(),
                     sequence: 2,
                     sent_at: 21,
+                    thread_id: None,
+                    reply_count: 0,
+                    last_reply_at: None,
                 },
             ]),
             "messages must be returned in per-channel sequence order"
@@ -154,6 +160,303 @@ fn creates_channels_and_posts_ordered_messages() {
         );
         module.commit_block().await.unwrap();
         assert_ne!(module.root(), root1, "committed messages must move root");
+    });
+}
+
+#[test]
+fn posts_thread_replies_and_updates_parent_summary() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Messaging::init(context, "messaging").await;
+
+        module
+            .execute(
+                &mut TestCtx::at(10),
+                &module_msg(MessagingMsg::CreateChannel {
+                    channel_id: "general".into(),
+                    name: "General".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(20),
+                &module_msg(MessagingMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "m1".into(),
+                    author: "alice".into(),
+                    body: "ship thread model".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let root_after_parent = module.root();
+
+        module
+            .execute(
+                &mut TestCtx::at(30),
+                &module_msg(MessagingMsg::PostThreadReply {
+                    channel_id: "general".into(),
+                    thread_id: "m1".into(),
+                    message_id: "r1".into(),
+                    author: "bob".into(),
+                    body: "reply in context".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(31),
+                &module_msg(MessagingMsg::PostThreadReply {
+                    channel_id: "general".into(),
+                    thread_id: "m1".into(),
+                    message_id: "r2".into(),
+                    author: "carol".into(),
+                    body: "keep sidebar quiet".into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let parent = ChatMessage {
+            id: "m1".into(),
+            channel_id: "general".into(),
+            author: "alice".into(),
+            body: "ship thread model".into(),
+            sequence: 1,
+            sent_at: 20,
+            thread_id: None,
+            reply_count: 2,
+            last_reply_at: Some(31),
+        };
+        let replies = vec![
+            ChatMessage {
+                id: "r1".into(),
+                channel_id: "general".into(),
+                author: "bob".into(),
+                body: "reply in context".into(),
+                sequence: 1,
+                sent_at: 30,
+                thread_id: Some("m1".into()),
+                reply_count: 0,
+                last_reply_at: None,
+            },
+            ChatMessage {
+                id: "r2".into(),
+                channel_id: "general".into(),
+                author: "carol".into(),
+                body: "keep sidebar quiet".into(),
+                sequence: 2,
+                sent_at: 31,
+                thread_id: Some("m1".into()),
+                reply_count: 0,
+                last_reply_at: None,
+            },
+        ];
+
+        assert_eq!(
+            query(
+                &module,
+                MessagingQuery::Messages {
+                    channel_id: "general".into()
+                }
+            )
+            .await,
+            MessagingReply::Messages(vec![parent.clone()]),
+            "channel history should show top-level parent with thread summary only"
+        );
+        assert_eq!(
+            query(
+                &module,
+                MessagingQuery::Thread {
+                    channel_id: "general".into(),
+                    thread_id: "m1".into(),
+                }
+            )
+            .await,
+            MessagingReply::Thread(Some(Thread {
+                root: parent,
+                replies
+            }))
+        );
+
+        assert_eq!(
+            module.root(),
+            root_after_parent,
+            "thread replies are staged until commit"
+        );
+        module.commit_block().await.unwrap();
+        assert_ne!(module.root(), root_after_parent);
+    });
+}
+
+#[test]
+fn rejected_thread_reply_rolls_back_parent_summary_and_replies() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Messaging::init(context, "messaging").await;
+        module
+            .execute(
+                &mut TestCtx::at(10),
+                &module_msg(MessagingMsg::CreateChannel {
+                    channel_id: "general".into(),
+                    name: "General".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let root = module.root();
+
+        let err = module
+            .execute(
+                &mut TestCtx::at(30),
+                &module_msg(MessagingMsg::PostThreadReply {
+                    channel_id: "general".into(),
+                    thread_id: "missing".into(),
+                    message_id: "r1".into(),
+                    author: "bob".into(),
+                    body: "no parent".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Module(_)));
+        module.abort_block().await.unwrap();
+        assert_eq!(module.root(), root);
+        assert_eq!(
+            query(
+                &module,
+                MessagingQuery::Thread {
+                    channel_id: "general".into(),
+                    thread_id: "missing".into(),
+                }
+            )
+            .await,
+            MessagingReply::Thread(None)
+        );
+    });
+}
+
+#[test]
+fn thread_keys_do_not_collide_when_ids_contain_separators() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Messaging::init(context, "messaging").await;
+
+        module
+            .execute(
+                &mut TestCtx::at(10),
+                &module_msg(MessagingMsg::CreateChannel {
+                    channel_id: "a\0b".into(),
+                    name: "A/B".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(11),
+                &module_msg(MessagingMsg::CreateChannel {
+                    channel_id: "a".into(),
+                    name: "A".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(20),
+                &module_msg(MessagingMsg::PostMessage {
+                    channel_id: "a\0b".into(),
+                    message_id: "c".into(),
+                    author: "alice".into(),
+                    body: "first root".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(21),
+                &module_msg(MessagingMsg::PostMessage {
+                    channel_id: "a".into(),
+                    message_id: "b\0c".into(),
+                    author: "bob".into(),
+                    body: "second root".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        module
+            .execute(
+                &mut TestCtx::at(30),
+                &module_msg(MessagingMsg::PostThreadReply {
+                    channel_id: "a\0b".into(),
+                    thread_id: "c".into(),
+                    message_id: "r1".into(),
+                    author: "alice".into(),
+                    body: "first reply".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(31),
+                &module_msg(MessagingMsg::PostThreadReply {
+                    channel_id: "a".into(),
+                    thread_id: "b\0c".into(),
+                    message_id: "r2".into(),
+                    author: "bob".into(),
+                    body: "second reply".into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let first = query(
+            &module,
+            MessagingQuery::Thread {
+                channel_id: "a\0b".into(),
+                thread_id: "c".into(),
+            },
+        )
+        .await;
+        let second = query(
+            &module,
+            MessagingQuery::Thread {
+                channel_id: "a".into(),
+                thread_id: "b\0c".into(),
+            },
+        )
+        .await;
+
+        let MessagingReply::Thread(Some(first)) = first else {
+            panic!("missing first thread")
+        };
+        let MessagingReply::Thread(Some(second)) = second else {
+            panic!("missing second thread")
+        };
+        assert_eq!(
+            first
+                .replies
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r1"]
+        );
+        assert_eq!(
+            second
+                .replies
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r2"]
+        );
     });
 }
 

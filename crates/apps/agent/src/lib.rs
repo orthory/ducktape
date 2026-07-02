@@ -62,6 +62,22 @@ impl Module for Agent {
                     body,
                 }),
             }),
+            AgentMsg::AppendThreadReply {
+                session_id,
+                thread_id,
+                message_id,
+                author,
+                body,
+            } => ctx.emit_msg(Msg {
+                target: self.messaging.clone(),
+                payload: encode_messaging_msg(&MessagingMsg::PostThreadReply {
+                    channel_id: session_id,
+                    thread_id,
+                    message_id,
+                    author,
+                    body,
+                }),
+            }),
         }
         Ok(())
     }

@@ -25,8 +25,8 @@ use commonware_storage::{
 };
 use commonware_utils::range::NonEmptyRange;
 use messaging_interface::{
-    Channel, ChatMessage, MessagingMsg, MessagingQuery, MessagingReply, decode_msg, decode_query,
-    encode_reply,
+    Channel, ChatMessage, MessagingMsg, MessagingQuery, MessagingReply, Thread, decode_msg,
+    decode_query, encode_reply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use serde::{Serialize, de::DeserializeOwned};
@@ -66,6 +66,19 @@ fn channel_key(channel_id: &str) -> Vec<u8> {
 
 fn messages_key(channel_id: &str) -> Vec<u8> {
     keyed(b"messages", channel_id)
+}
+
+fn keyed_component(key: &mut Vec<u8>, value: &str) {
+    key.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    key.extend_from_slice(value.as_bytes());
+}
+
+fn thread_key(channel_id: &str, thread_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(b"thread".len() + 16 + channel_id.len() + thread_id.len());
+    key.extend_from_slice(b"thread");
+    keyed_component(&mut key, channel_id);
+    keyed_component(&mut key, thread_id);
+    key
 }
 
 fn message_id_key(message_id: &str) -> Vec<u8> {
@@ -193,6 +206,30 @@ where
         Ok(messages)
     }
 
+    async fn thread_replies(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+    ) -> Result<Vec<ChatMessage>, Error> {
+        let mut replies: Vec<ChatMessage> = self
+            .load(&thread_key(channel_id, thread_id))
+            .await?
+            .unwrap_or_default();
+        replies.sort_by(|a, b| a.sequence.cmp(&b.sequence).then_with(|| a.id.cmp(&b.id)));
+        Ok(replies)
+    }
+
+    async fn thread(&self, channel_id: &str, thread_id: &str) -> Result<Option<Thread>, Error> {
+        let messages = self.messages(channel_id).await?;
+        let Some(root) = messages.into_iter().find(|m| m.id == thread_id) else {
+            return Ok(None);
+        };
+        Ok(Some(Thread {
+            root,
+            replies: self.thread_replies(channel_id, thread_id).await?,
+        }))
+    }
+
     async fn message_exists(&self, message_id: &str) -> Result<bool, Error> {
         Ok(self.get_raw(&message_id_key(message_id)).await?.is_some())
     }
@@ -252,8 +289,65 @@ where
             body,
             sequence,
             sent_at,
+            thread_id: None,
+            reply_count: 0,
+            last_reply_at: None,
         });
         self.store(messages_key(&channel_id), &messages);
+        self.store(message_id_key(&message_id), &channel_id);
+        Ok(())
+    }
+
+    async fn stage_thread_reply(
+        &mut self,
+        channel_id: String,
+        thread_id: String,
+        message_id: String,
+        author: String,
+        body: String,
+        sent_at: u64,
+    ) -> Result<(), Error> {
+        Self::validate_non_empty("channel_id", &channel_id)?;
+        Self::validate_non_empty("thread_id", &thread_id)?;
+        Self::validate_non_empty("message_id", &message_id)?;
+        Self::validate_non_empty("author", &author)?;
+        if self.channel(&channel_id).await?.is_none() {
+            return Err(Error::Module(format!("unknown channel: {channel_id}")));
+        }
+        if self.message_exists(&message_id).await? {
+            return Err(Error::Module(format!(
+                "message already exists: {message_id}"
+            )));
+        }
+
+        let mut messages = self.messages(&channel_id).await?;
+        let Some(root) = messages.iter_mut().find(|m| m.id == thread_id) else {
+            return Err(Error::Module(format!("unknown thread: {thread_id}")));
+        };
+        if root.thread_id.is_some() {
+            return Err(Error::Module(format!(
+                "thread replies cannot start subthreads: {thread_id}"
+            )));
+        }
+
+        let mut replies = self.thread_replies(&channel_id, &thread_id).await?;
+        let sequence = replies.last().map_or(1, |m| m.sequence + 1);
+        replies.push(ChatMessage {
+            id: message_id.clone(),
+            channel_id: channel_id.clone(),
+            author,
+            body,
+            sequence,
+            sent_at,
+            thread_id: Some(thread_id.clone()),
+            reply_count: 0,
+            last_reply_at: None,
+        });
+
+        root.reply_count += 1;
+        root.last_reply_at = Some(sent_at);
+        self.store(messages_key(&channel_id), &messages);
+        self.store(thread_key(&channel_id, &thread_id), &replies);
         self.store(message_id_key(&message_id), &channel_id);
         Ok(())
     }
@@ -343,6 +437,23 @@ where
                 )
                 .await
             }
+            MessagingMsg::PostThreadReply {
+                channel_id,
+                thread_id,
+                message_id,
+                author,
+                body,
+            } => {
+                self.stage_thread_reply(
+                    channel_id,
+                    thread_id,
+                    message_id,
+                    author,
+                    body,
+                    ctx.env().consensus_time,
+                )
+                .await
+            }
         }
     }
 
@@ -356,6 +467,12 @@ where
             ))),
             MessagingQuery::Messages { channel_id } => Ok(encode_reply(&MessagingReply::Messages(
                 self.messages(&channel_id).await?,
+            ))),
+            MessagingQuery::Thread {
+                channel_id,
+                thread_id,
+            } => Ok(encode_reply(&MessagingReply::Thread(
+                self.thread(&channel_id, &thread_id).await?,
             ))),
         }
     }
