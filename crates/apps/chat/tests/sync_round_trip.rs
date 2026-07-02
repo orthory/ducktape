@@ -94,6 +94,7 @@ fn synced_store_reconstructs_source_root_and_history() {
                 message_id: "m1".into(),
                 blocks: vec![Block::paragraph("draft")],
                 thread: None,
+                as_agent: None,
             },
         )
         .await;
@@ -105,6 +106,7 @@ fn synced_store_reconstructs_source_root_and_history() {
                 message_id: "m2".into(),
                 blocks: vec![Block::paragraph("final")],
                 thread: None,
+                as_agent: None,
             },
         )
         .await;
@@ -116,6 +118,7 @@ fn synced_store_reconstructs_source_root_and_history() {
                 message_id: "r1".into(),
                 blocks: vec![Block::paragraph("sync the thread too")],
                 thread: Some(1),
+                as_agent: None,
             },
         )
         .await;

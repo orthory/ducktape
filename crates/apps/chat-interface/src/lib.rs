@@ -37,6 +37,13 @@ pub const MAX_QUERY_LIMIT: u64 = 256;
 pub enum AuthorRef {
     /// an external submitter's (non-empty) public key bytes.
     User(Vec<u8>),
+    /// an individual agent hosted by a module. `module` always derives from
+    /// the dispatch origin (`Origin::Module`); `agent_id` comes from the
+    /// post's `as_agent` field, which ONLY a module origin may set — so an
+    /// agent author is exactly as trustworthy as the genesis-fixed module
+    /// code that claimed it, and each agent is individually addressable in
+    /// mentions.
+    Agent { module: String, agent_id: String },
     /// a module that emitted the write as a follow-up.
     Module(String),
     /// genesis / system-internal.
@@ -168,11 +175,16 @@ pub enum ChatMsg {
     },
     /// post a message; `thread` = `Some(root_seq)` posts a thread reply, which
     /// is a normal message record consuming its own channel sequence.
+    /// `as_agent` refines a MODULE origin into an [`AuthorRef::Agent`] author
+    /// (`{module: origin module, agent_id}`) — modules are genesis-trusted
+    /// code, so a hosting module may attribute a post to one of its agents.
+    /// an external or system submitter setting `as_agent` is REJECTED.
     PostMessage {
         channel_id: String,
         message_id: String,
         blocks: Vec<Block>,
         thread: Option<u64>,
+        as_agent: Option<String>,
     },
     /// replace the head blocks; the prior head is appended to the immutable
     /// revision history. only the stored author may edit.

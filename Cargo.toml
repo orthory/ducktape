@@ -27,6 +27,7 @@ members = [
     "crates/apps/forge", "crates/apps/forge-interface",
     "crates/apps/document", "crates/apps/document-interface",
     "crates/apps/chat", "crates/apps/chat-interface",
+    "crates/apps/agent", "crates/apps/agent-interface",
     "crates/apps/tasks", "crates/apps/tasks-interface",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
@@ -74,6 +75,7 @@ saga = { path = "crates/system/saga" }
 forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
 chat = { path = "crates/apps/chat" }
+agent = { path = "crates/apps/agent" }
 tasks = { path = "crates/apps/tasks" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
@@ -86,5 +88,6 @@ saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
 chat-interface = { path = "crates/apps/chat-interface" }
+agent-interface = { path = "crates/apps/agent-interface" }
 tasks-interface = { path = "crates/apps/tasks-interface" }
 directory-interface = { path = "crates/examples/directory-interface" }

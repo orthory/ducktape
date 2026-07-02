@@ -1,11 +1,19 @@
-//! a runnable super-app demo: seven registered modules — a qmdb-backed kv, a sync
+//! a runnable super-app demo: ten registered modules — a qmdb-backed kv, a sync
 //! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
-//! block DOCUMENT module, a qmdb-backed block-based CHAT module, and an ed25519
-//! permissionless VALSET — dispatched over ONE host, showing the app-hash evolve
-//! as typed cross-module ops flow.
+//! block DOCUMENT module, a qmdb-backed block-based CHAT module, an ed25519
+//! permissionless VALSET, the SAGA async-RPC ledger, the AGENT orchestrator,
+//! and a TASKS ledger — dispatched over ONE host, showing the app-hash evolve
+//! as typed cross-module ops flow, ending on the agent-collaboration beat: a
+//! mention becomes a run and a pending saga in one block.
 //!
 //! run: `cargo run -p demo`
 
+use agent::AgentModule;
+use agent_interface::{
+    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, TurnPolicy,
+    decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
+    encode_query as agent_encode_query,
+};
 use chat::Chat;
 use chat_interface::{
     Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, PostPolicy,
@@ -29,7 +37,12 @@ use forge_interface::{
 };
 use greeter::Greeter;
 use host::{BlockContext, Host};
+use saga::SagaModule;
+use saga_interface::{
+    SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
+};
 use sdk::{Msg, Origin};
+use tasks::Tasks;
 use valset::Valset;
 use valset_interface::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -51,6 +64,9 @@ fn main() {
         let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
         let chat = Chat::init(context.child("chat"), "chat").await;
         let valset = Valset::new("valset");
+        let saga = SagaModule::new("saga");
+        let tasks = Tasks::new("tasks");
+        let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
@@ -59,10 +75,13 @@ fn main() {
             Box::new(document),
             Box::new(chat),
             Box::new(valset),
+            Box::new(saga),
+            Box::new(tasks),
+            Box::new(agent),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 7 registered modules over one host ===");
+        println!("=== super-app demo — 10 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -218,6 +237,7 @@ fn main() {
                     message_id: "m1".into(),
                     blocks: vec![ChatBlock::paragraph("what changed?")],
                     thread: None,
+                    as_agent: None,
                 }),
             },
         )
@@ -234,6 +254,7 @@ fn main() {
                         "chat is block-based and origin-authored now",
                     )],
                     thread: Some(1),
+                    as_agent: None,
                 }),
             },
         )
@@ -389,14 +410,119 @@ fn main() {
             }
         }
 
+        // block 8: the agent-collaboration loop (design §3). register an agent
+        // (which model+prompt it runs is committed into the app-hash), watch
+        // the chat channel under a Mention policy — the watch and chat's hook
+        // registration commit atomically — then post a message MENTIONING the
+        // agent: the very same block carries the post, the hook delivery, the
+        // run record, and the saga trigger. the emitted WorkerRequest effect
+        // is the off-consensus LLM seam a reactor driver answers as an
+        // ordinary oracle op in some later block.
+        host.submit_at(
+            as_demo_user(),
+            Msg {
+                target: "agent".into(),
+                payload: agent_encode_msg(&AgentMsg::RegisterAgent {
+                    agent_id: "quackbot".into(),
+                    display_name: "Quackbot".into(),
+                    model_ref: "mock-llm-1".into(),
+                    prompt_hash: vec![7u8; 32],
+                    allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
+                }),
+            },
+        )
+        .await
+        .expect("submit block 8 register");
+        host.submit_at(
+            as_demo_user(),
+            Msg {
+                target: "agent".into(),
+                payload: agent_encode_msg(&AgentMsg::WatchChannel {
+                    channel_id: "general".into(),
+                    policy: TurnPolicy::Mention,
+                }),
+            },
+        )
+        .await
+        .expect("submit block 8 watch");
+        let out = host
+            .submit_at(
+                as_demo_user(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id: "general".into(),
+                        message_id: "m3".into(),
+                        blocks: vec![ChatBlock::Paragraph(vec![
+                            chat_interface::Span::plain("hey "),
+                            chat_interface::Span {
+                                text: "@quackbot".into(),
+                                marks: vec![chat_interface::Mark::Mention(
+                                    chat_interface::AuthorRef::Agent {
+                                        module: "agent".into(),
+                                        agent_id: "quackbot".into(),
+                                    },
+                                )],
+                            },
+                            chat_interface::Span::plain(" can you follow up?"),
+                        ])],
+                        thread: None,
+                        as_agent: None,
+                    }),
+                },
+            )
+            .await
+            .expect("submit block 8 mention");
+        println!("\n[block 8] agent <- Register + Watch(Mention); chat <- PostMessage(@quackbot)");
+        println!(
+            "  effects        : {} WorkerRequest (the off-consensus LLM seam)",
+            out.effects.len()
+        );
+        let reply = host
+            .query(
+                "agent",
+                &agent_encode_query(&AgentQuery::Run {
+                    run_id: "general/3/quackbot".into(),
+                }),
+            )
+            .await
+            .expect("query agent run");
+        if let AgentReply::Run(Some(run)) = agent_decode_reply(&reply).unwrap() {
+            println!(
+                "  run            : {} {:?} (context pinned to seq {})",
+                run.run_id, run.status, run.anchor_seq
+            );
+        }
+        let reply = host
+            .query(
+                "saga",
+                &saga_encode_query(&SagaQuery::Get {
+                    saga_id: "agent/general/3/quackbot".into(),
+                }),
+            )
+            .await
+            .expect("query saga");
+        let SagaReply::Saga(Some(saga_view)) = saga_decode_reply(&reply).unwrap() else {
+            panic!("the run's saga must exist");
+        };
+        println!(
+            "  saga           : agent/general/3/quackbot {:?} (deadline view {:?})",
+            saga_view.status, saga_view.deadline
+        );
+        println!("  (post + hook + run + trigger: ONE block — the P2 atomic cascade)");
+        println!("  app-hash       : {:?}", out.app_hash);
+
         println!("\nmodule roots:");
         for id in [
+            "agent",
             "chat",
             "directory",
             "document",
             "forge",
             "greeter",
             "kv",
+            "saga",
+            "tasks",
             "valset",
         ] {
             println!("  {id:>10} : {:?}", host.module_root(id).unwrap());

@@ -347,9 +347,10 @@ where
         Ok(self.get_raw(&member_key(channel_id, user)).await?.is_some())
     }
 
-    /// gate a post/reaction on the channel policy. module and system authors
-    /// always pass — modules are genesis-fixed trusted code (the agent module
-    /// must be able to answer in members-only channels); external users need
+    /// gate a post/reaction on the channel policy. module, agent, and system
+    /// authors always pass — modules are genesis-fixed trusted code (the agent
+    /// module must be able to answer in members-only channels, and an agent
+    /// author is a module origin refined by `as_agent`); external users need
     /// membership under `MembersOnly`.
     async fn check_post_policy(&self, channel: &Channel, author: &AuthorRef) -> Result<(), Error> {
         match (&channel.post_policy, author) {
@@ -1015,7 +1016,27 @@ where
                 message_id,
                 blocks,
                 thread,
+                as_agent,
             } => {
+                // `as_agent` refines a MODULE origin into an individual agent
+                // author. modules are genesis-trusted code, so the module id
+                // half of the author is still origin-derived and spoof-proof;
+                // an external or system submitter claiming an agent identity
+                // is rejected outright.
+                let author = match as_agent {
+                    None => author,
+                    Some(agent_id) => {
+                        Self::validate_non_empty("as_agent", &agent_id)?;
+                        match author {
+                            AuthorRef::Module(module) => AuthorRef::Agent { module, agent_id },
+                            _ => {
+                                return Err(Error::Module(
+                                    "as_agent requires a module origin".into(),
+                                ));
+                            }
+                        }
+                    }
+                };
                 let mentions = collect_mentions(&blocks);
                 let posted = self
                     .stage_message(author.clone(), &channel_id, message_id, blocks, thread, now)

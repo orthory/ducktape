@@ -16,6 +16,11 @@ document = { workspace = true }
 document-interface = { workspace = true }
 chat = { workspace = true }
 chat-interface = { workspace = true }
+agent = { workspace = true }
+agent-interface = { workspace = true }
+saga = { workspace = true }
+saga-interface = { workspace = true }
+tasks = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }
@@ -26,8 +31,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-saga = { workspace = true }
-saga-interface = { workspace = true }
 state = { workspace = true }
 async-trait = { workspace = true }
 commonware-storage = { workspace = true }
