@@ -1,0 +1,16 @@
+[package]
+name = "inbox"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+inbox-interface = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+host = { workspace = true }
+# crafted-snapshot tests hash the canonical encoding to the expected root.
+sha2 = { workspace = true }
