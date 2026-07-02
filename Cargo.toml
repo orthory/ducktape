@@ -37,7 +37,7 @@ members = [
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
     # bin — runnable binaries
-    "bin/demo", "bin/node",
+    "bin/demo", "bin/node", "bin/gateway",
 ]
 
 [workspace.package]
