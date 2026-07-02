@@ -419,10 +419,13 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let listen = flags
-        .get("listen")
-        .map(String::as_str)
-        .unwrap_or("127.0.0.1:0");
+    let plumbing = config::merged_plumbing(
+        &dir,
+        flags.get("listen").map(String::as_str),
+        flags.get("advertised").map(String::as_str),
+        flags.get("http").map(String::as_str),
+        flags.get("rpc").map(String::as_str),
+    )?;
 
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me = key.public_key();
@@ -433,17 +436,11 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
     };
-    if let Some(addr) = config::dialable(flags.get("advertised").map(String::as_str), listen)? {
+    if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
     }
     descriptor.save(&descriptor_path)?;
-    config::write_node_toml(
-        &dir,
-        listen,
-        flags.get("advertised").map(String::as_str),
-        flags.get("http").map(String::as_str),
-        flags.get("rpc").map(String::as_str),
-    )?;
+    config::write_node_toml(&dir, &plumbing)?;
     eprintln!(
         "{} identity {}",
         if generated { "generated" } else { "reusing" },
@@ -555,27 +552,18 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     descriptor.save(&dir.join("network.toml"))?;
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
-    // the documented re-join (after a pre-genesis admit) refreshes the
-    // DESCRIPTOR; the first join's plumbing (listen/rpc/http) must survive
-    // unless this invocation explicitly re-specifies it.
-    let has_plumbing_flags = ["listen", "advertised", "http", "rpc"]
-        .iter()
-        .any(|k| flags.contains_key(*k));
-    if !dir.join("node.toml").exists() || has_plumbing_flags {
-        let listen = flags
-            .get("listen")
-            .map(String::as_str)
-            .unwrap_or("127.0.0.1:0");
-        config::write_node_toml(
-            &dir,
-            listen,
-            flags.get("advertised").map(String::as_str),
-            flags.get("http").map(String::as_str),
-            flags.get("rpc").map(String::as_str),
-        )?;
-    } else {
-        eprintln!("kept existing node.toml (pass --listen/--rpc/--http to rewrite)");
-    }
+    // plumbing merges: explicit flags win, an existing node.toml's values
+    // (network- or dev-shape) survive, defaults fill the rest. the file is
+    // ALWAYS rewritten in the network shape — a join must take effect even in
+    // a dir holding the app's dev-shape solo config.
+    let plumbing = config::merged_plumbing(
+        &dir,
+        flags.get("listen").map(String::as_str),
+        flags.get("advertised").map(String::as_str),
+        flags.get("http").map(String::as_str),
+        flags.get("rpc").map(String::as_str),
+    )?;
+    config::write_node_toml(&dir, &plumbing)?;
     eprintln!(
         "{} identity {me_hex}",
         if generated { "generated" } else { "reusing" }
@@ -630,7 +618,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         .into());
     }
 
-    // discovery's bootstrapper list wants its own ingress address type.
+    // keep the raw (key, addr) pairs for statesync source selection before
+    // discovery's bootstrapper list converts to its own ingress address type.
+    let sync_candidates = bootstrappers.clone();
     let bootstrappers: Vec<(ed25519::PublicKey, _)> = bootstrappers
         .into_iter()
         .map(|(k, a)| (k, a.into()))
@@ -713,15 +703,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let validator_participants: Set<ed25519::PublicKey> =
             Set::try_from(validators.clone()).expect("validator set has no duplicates");
 
-        // the statesync source a --sync-only joiner pulls from: a configured
-        // bootstrapper if any (the network shape), else the first mesh
-        // identity that is NOT this node — discovery never connects a node to
-        // itself, so addressing our own key would retry forever.
-        let me = signer.public_key();
-        let sync_source = bootstrappers
-            .first()
-            .map(|(k, _)| k.clone())
-            .or_else(|| peers.iter().find(|p| **p != me).cloned());
+        // the statesync source a --sync-only joiner pulls from: only
+        // validators serve the channel, so the candidate must be a validator
+        // that is not us (a non-validator hint or our own key would be
+        // retried forever — discovery never connects a node to itself).
+        let sync_source =
+            config::choose_sync_source(&sync_candidates, &validators, &signer.public_key());
 
         // the real encrypted TCP mesh. `local` is the dev preset (allows private
         // ips). MUST be the real tokio runtime — discovery live-locks under the

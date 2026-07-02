@@ -43,10 +43,11 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
-    // ascii first: byte-offset slicing below panics mid-codepoint on multibyte
-    // utf-8, and this parses PASTED input (invite blobs, rpc hex).
-    if !s.is_ascii() {
-        return Err("hex string contains non-ascii characters".into());
+    // strict hex digits only: from_str_radix would tolerate '+' signs, and
+    // byte-offset slicing below panics mid-codepoint on multibyte utf-8 —
+    // this parses PASTED input (invite blobs, rpc hex).
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("hex string contains non-hex characters".into());
     }
     if s.len() % 2 != 0 {
         return Err("hex string has odd length".into());
@@ -92,8 +93,12 @@ pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bo
         let mut f = opts
             .open(path)
             .map_err(|e| format!("create {path:?}: {e}"))?;
-        f.write_all(format!("{encoded}\n").as_bytes())
-            .map_err(|e| format!("write {path:?}: {e}"))?;
+        if let Err(e) = f.write_all(format!("{encoded}\n").as_bytes()) {
+            // a partial file would shadow every future load with a decode
+            // error; remove it so the next run regenerates cleanly.
+            let _ = std::fs::remove_file(path);
+            return Err(format!("write {path:?}: {e}"));
+        }
     }
     Ok((key, true))
 }
@@ -145,7 +150,17 @@ pub struct NetworkDescriptor {
 
 impl NetworkDescriptor {
     pub fn from_toml(text: &str) -> Result<Self, String> {
-        toml::from_str(text).map_err(|e| format!("network descriptor: {e}"))
+        let mut d: Self = toml::from_str(text).map_err(|e| format!("network descriptor: {e}"))?;
+        // canonicalize at the boundary: hex is many-to-one under decode
+        // (case, whitespace), so every descriptor INSIDE the program carries
+        // trimmed, lowercase, sorted validator entries — string comparisons
+        // (admit, membership hints) and the genesis fingerprint then agree
+        // with what decode_key actually accepts.
+        for v in &mut d.validators {
+            *v = v.trim().to_ascii_lowercase();
+        }
+        d.validators.sort();
+        Ok(d)
     }
 
     pub fn to_toml(&self) -> String {
@@ -162,16 +177,25 @@ impl NetworkDescriptor {
     }
 
     pub fn validator_keys(&self) -> Result<Vec<ed25519::PublicKey>, String> {
+        // dedup on the DECODED key: hex spelling is many-to-one (case), and a
+        // duplicate that slipped through here would panic much later at
+        // run_node's Set::try_from.
+        let keys: Vec<ed25519::PublicKey> = self
+            .validators
+            .iter()
+            .map(|h| decode_key(h))
+            .collect::<Result<_, _>>()?;
         let mut seen = std::collections::BTreeSet::new();
-        for h in &self.validators {
-            if !seen.insert(h.trim()) {
+        for k in &keys {
+            if !seen.insert(k.as_ref().to_vec()) {
                 return Err(format!(
-                    "duplicate validator {h:?} in network {}",
+                    "duplicate validator {} in network {}",
+                    hex_bytes(k.as_ref()),
                     self.chain_id
                 ));
             }
         }
-        self.validators.iter().map(|h| decode_key(h)).collect()
+        Ok(keys)
     }
 
     /// the namespace this network's nodes actually run under: the chain-id
@@ -184,35 +208,46 @@ impl NetworkDescriptor {
     /// divergence is a loud connectivity failure, never a silent state fork.
     pub fn genesis_namespace(&self) -> String {
         use commonware_cryptography::{Hasher as _, Sha256};
-        let mut sorted = self.validators.clone();
+        // canonical form regardless of how the struct was built (from_toml
+        // normalizes, but a hand-constructed descriptor must fingerprint
+        // identically): trimmed, lowercased, sorted.
+        let mut sorted: Vec<String> = self
+            .validators
+            .iter()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .collect();
         sorted.sort();
         let mut hasher = Sha256::default();
         hasher.update(b"ducktape:genesis:v1:");
         hasher.update(self.scheme.as_bytes());
         for v in &sorted {
             hasher.update(b"\n");
-            hasher.update(v.trim().as_bytes());
+            hasher.update(v.as_bytes());
         }
         let digest = hasher.finalize();
-        format!("{}@{}", self.chain_id, hex_bytes(&digest.as_ref()[..4]))
+        // 128 bits: a 32-bit suffix is grindable (~2^32 hashes finds an
+        // admitted key that leaves the fingerprint unchanged, resurrecting
+        // the silent stale-descriptor fork this exists to prevent).
+        format!("{}@{}", self.chain_id, hex_bytes(&digest.as_ref()[..16]))
     }
 
-    /// parsed bootstrap entries; a malformed entry is a config error, not a
-    /// silent skip.
+    /// parsed bootstrap entries; a MALFORMED entry is a config error, but a
+    /// well-formed hint that is not dialable (unspecified ip, port 0 — e.g.
+    /// minted by an older binary) is skipped: hints are advisory, and dialing
+    /// 0.0.0.0 resolves to the joiner's own loopback.
     pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, SocketAddr)>, String> {
-        self.bootstrap
-            .iter()
-            .map(|entry| {
-                let (key, addr) = entry
-                    .split_once('@')
-                    .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
-                Ok((
-                    decode_key(key)?,
-                    addr.parse::<SocketAddr>()
-                        .map_err(|e| format!("{entry:?}: {e}"))?,
-                ))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for entry in &self.bootstrap {
+            let (key, addr) = entry
+                .split_once('@')
+                .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
+            let addr: SocketAddr = addr.parse().map_err(|e| format!("{entry:?}: {e}"))?;
+            if addr.ip().is_unspecified() || addr.port() == 0 {
+                continue;
+            }
+            out.push((decode_key(key)?, addr));
+        }
+        Ok(out)
     }
 
     /// add a validator identity (pre-genesis membership — see `admit`).
@@ -346,33 +381,93 @@ pub fn load_node_toml(cfg_path: &Path) -> Result<(NodeToml, PathBuf), String> {
     Ok((raw, base))
 }
 
-/// write a network-shape node.toml into a workspace dir (init/join). the file
-/// references its siblings relatively, so the whole dir is relocatable.
-pub fn write_node_toml(
+/// a workspace's plumbing (everything in node.toml that is not the network
+/// reference), merged from three layers: explicit flags win, else values an
+/// EXISTING node.toml already carries — network- or dev-shape alike, so
+/// joining inside the desktop app's solo dir inherits its http port instead
+/// of resetting it — else defaults. always writing the merged result makes
+/// init/join idempotent AND partial-flag-safe (one flag never resets the
+/// others).
+pub struct Plumbing {
+    pub listen: String,
+    pub advertised: Option<String>,
+    pub http_listen: Option<String>,
+    pub rpc_listen: Option<String>,
+}
+
+pub fn merged_plumbing(
     dir: &Path,
-    listen: &str,
+    listen: Option<&str>,
     advertised: Option<&str>,
     http_listen: Option<&str>,
     rpc_listen: Option<&str>,
-) -> Result<PathBuf, String> {
+) -> Result<Plumbing, String> {
+    let path = dir.join("node.toml");
+    let existing: Option<NodeToml> = if path.exists() {
+        Some(load_node_toml(&path)?.0)
+    } else {
+        None
+    };
+    let e = existing.as_ref();
+    Ok(Plumbing {
+        listen: listen
+            .map(str::to_string)
+            .or_else(|| e.map(|r| r.listen.clone()))
+            .unwrap_or_else(|| "127.0.0.1:0".into()),
+        advertised: advertised
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.advertised.clone())),
+        http_listen: http_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.http_listen.clone())),
+        rpc_listen: rpc_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.rpc_listen.clone())),
+    })
+}
+
+/// write a network-shape node.toml into a workspace dir (init/join). the file
+/// references its siblings relatively, so the whole dir is relocatable.
+/// replaces a dev-shape file wholesale (its plumbing survives via
+/// [`merged_plumbing`]) — a join must actually take effect.
+pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     let mut s = String::from(
         "# ducktape node config (network shape) — see network.toml for the network.\n\
          network = \"network.toml\"\nkey_file = \"identity.key\"\n",
     );
-    s += &format!("listen = \"{listen}\"\n");
-    if let Some(a) = advertised {
+    s += &format!("listen = \"{}\"\n", p.listen);
+    if let Some(a) = &p.advertised {
         s += &format!("advertised = \"{a}\"\n");
     }
     s += "storage_dir = 'storage'\n";
-    if let Some(h) = http_listen {
+    if let Some(h) = &p.http_listen {
         s += &format!("http_listen = \"{h}\"\n");
     }
-    if let Some(r) = rpc_listen {
+    if let Some(r) = &p.rpc_listen {
         s += &format!("rpc_listen = \"{r}\"\n");
     }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(path)
+}
+
+/// the statesync source a joiner pulls from. only VALIDATORS serve the
+/// statesync channel (a --sync-only process syncs and exits; a non-validator
+/// never runs SyncServer), so a bootstrap hint is only a candidate when its
+/// key is in the validator set — otherwise a joiner pins a peer that can
+/// never answer and retries forever. preference: first validator bootstrap
+/// hint, else any validator that is not us. None = nobody can serve (solo).
+pub fn choose_sync_source(
+    bootstrappers: &[(ed25519::PublicKey, SocketAddr)],
+    validators: &[ed25519::PublicKey],
+    me: &ed25519::PublicKey,
+) -> Option<ed25519::PublicKey> {
+    bootstrappers
+        .iter()
+        .map(|(k, _)| k)
+        .find(|k| *k != me && validators.contains(k))
+        .or_else(|| validators.iter().find(|k| *k != me))
+        .cloned()
 }
 
 /// everything `run_node` needs, shape-independent.
@@ -521,7 +616,12 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
             .ok_or("a non-zero node needs bootstrapper_addr set")?
             .parse()
             .map_err(|e| format!("bootstrapper_addr: {e}"))?;
+        // self-filter matches the Resolved.bootstrappers contract: a config
+        // with peer_seeds[0] == id would otherwise dial (and statesync) itself.
         vec![(key_of(boot_seed), boot_addr)]
+            .into_iter()
+            .filter(|(k, _)| *k != ed25519::PrivateKey::from_seed(id).public_key())
+            .collect()
     };
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
@@ -796,6 +896,158 @@ mod tests {
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err("dup seeds refused");
         assert!(err.contains("duplicate seed"), "{err}");
+    }
+
+    #[test]
+    fn mixed_case_duplicate_validators_are_caught_at_the_decoded_key() {
+        let a = ed25519::PrivateKey::from_seed(21).public_key();
+        let lower = hex_bytes(a.as_ref());
+        let upper = lower.to_ascii_uppercase();
+        // constructed directly (bypassing from_toml's normalization) — the
+        // dedup must hold on the DECODED key, not the spelling.
+        let d = NetworkDescriptor {
+            chain_id: "case#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![lower, upper],
+            bootstrap: vec![],
+        };
+        assert!(
+            d.validator_keys().is_err(),
+            "case variants decode to one key"
+        );
+    }
+
+    #[test]
+    fn descriptors_canonicalize_on_load_and_fingerprint_canonically() {
+        let a = ed25519::PrivateKey::from_seed(22).public_key();
+        let b = ed25519::PrivateKey::from_seed(23).public_key();
+        let canonical = NetworkDescriptor {
+            chain_id: "canon#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref()), hex_bytes(b.as_ref())],
+            bootstrap: vec![],
+        };
+        // a hand-edited twin: uppercase, whitespace, different order.
+        let messy = NetworkDescriptor {
+            chain_id: "canon#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![
+                format!("  {}  ", hex_bytes(b.as_ref()).to_ascii_uppercase()),
+                hex_bytes(a.as_ref()),
+            ],
+            bootstrap: vec![],
+        };
+        // identical decoded sets MUST run under the identical namespace.
+        assert_eq!(messy.genesis_namespace(), canonical.genesis_namespace());
+        // the fingerprint is 128-bit (32 hex chars) — wide enough that
+        // grinding an admit that keeps it unchanged is infeasible.
+        let ns = canonical.genesis_namespace();
+        assert_eq!(ns.split('@').nth(1).unwrap().len(), 32);
+        // and loading the messy spelling from toml normalizes it away.
+        let reloaded = NetworkDescriptor::from_toml(&messy.to_toml()).unwrap();
+        assert_eq!(reloaded.validators, {
+            let mut v = vec![hex_bytes(a.as_ref()), hex_bytes(b.as_ref())];
+            v.sort();
+            v
+        });
+    }
+
+    #[test]
+    fn undialable_bootstrap_hints_are_skipped_not_dialed() {
+        let a = ed25519::PrivateKey::from_seed(24).public_key();
+        let b = ed25519::PrivateKey::from_seed(25).public_key();
+        let d = NetworkDescriptor {
+            chain_id: "hints#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![
+                format!("{}@0.0.0.0:52200", hex_bytes(a.as_ref())),
+                format!("{}@127.0.0.1:0", hex_bytes(a.as_ref())),
+                format!("{}@127.0.0.1:52200", hex_bytes(b.as_ref())),
+            ],
+        };
+        let entries = d.bootstrap_entries().expect("well-formed hints parse");
+        assert_eq!(
+            entries.len(),
+            1,
+            "0.0.0.0 and port-0 hints are advisory noise"
+        );
+        assert_eq!(entries[0].0, b);
+        // malformed is still an error, never a skip.
+        let bad = NetworkDescriptor {
+            bootstrap: vec!["nope".into()],
+            ..d
+        };
+        assert!(bad.bootstrap_entries().is_err());
+    }
+
+    #[test]
+    fn unhex_rejects_sign_characters() {
+        // from_str_radix would tolerate a leading '+' per pair.
+        assert!(unhex("+1ab").is_err());
+        assert!(unhex("-1ab").is_err());
+    }
+
+    #[test]
+    fn sync_source_prefers_validator_hints_and_never_self() {
+        let me = ed25519::PrivateKey::from_seed(31).public_key();
+        let observer = ed25519::PrivateKey::from_seed(32).public_key();
+        let validator = ed25519::PrivateKey::from_seed(33).public_key();
+        let addr: SocketAddr = "127.0.0.1:52200".parse().unwrap();
+        let validators = vec![me.clone(), validator.clone()];
+
+        // a non-validator hint sorts first but can never serve — skipped.
+        let hints = vec![(observer.clone(), addr), (validator.clone(), addr)];
+        assert_eq!(
+            choose_sync_source(&hints, &validators, &me),
+            Some(validator.clone())
+        );
+
+        // no usable hint: any validator that is not us.
+        assert_eq!(
+            choose_sync_source(&[], &validators, &me),
+            Some(validator.clone())
+        );
+
+        // solo network: nobody can serve.
+        assert_eq!(choose_sync_source(&[], &[me.clone()], &me), None);
+    }
+
+    #[test]
+    fn plumbing_merges_flags_over_existing_file_over_defaults() {
+        let dir = tmp("plumbing");
+        // an existing DEV-shape file (the desktop app's solo config).
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:0\"\nnamespace = \"ducktape-local\"\npeer_seeds = [0]\nhttp_listen = \"127.0.0.1:8844\"\n",
+        )
+        .expect("write");
+        // one flag overrides ONLY its field; the http port survives.
+        let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None).expect("merge");
+        assert_eq!(p.listen, "127.0.0.1:53000");
+        assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
+        assert!(p.rpc_listen.is_none());
+        // and the merged write is network-shape.
+        write_node_toml(&dir, &p).expect("write");
+        let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
+        assert_eq!(raw.network.as_deref(), Some("network.toml"));
+        assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
+        assert_eq!(raw.listen, "127.0.0.1:53000");
+    }
+
+    #[test]
+    fn dev_shape_never_bootstraps_itself() {
+        let dir = tmp("devself");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 1\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [1, 0]\nbootstrapper_addr = \"127.0.0.1:52231\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve");
+        assert!(
+            r.bootstrappers.is_empty(),
+            "peer_seeds[0] == id must not dial itself"
+        );
     }
 
     #[test]
