@@ -69,6 +69,16 @@ for (const route of ['/en/human', '/ko/human', '/en/agent', '/ko/agent']) {
     failures.push(`vocs.config.ts must include ${route}`)
   }
 }
+for (const label of ['For Human', 'For Agent', 'English', 'Korean']) {
+  if (!config.includes(`text: '${label}'`)) {
+    failures.push(`vocs.config.ts must include top nav label ${label}`)
+  }
+}
+for (const label of ['Human EN', 'Human KO', 'Agent EN', 'Agent KO']) {
+  if (config.includes(`text: '${label}'`)) {
+    failures.push(`vocs.config.ts must not keep retired top nav label ${label}`)
+  }
+}
 
 const readme = readFileSync(join(root, 'README.md'), 'utf8')
 if (/\bpnpm\b/.test(readme)) {
