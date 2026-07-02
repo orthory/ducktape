@@ -34,6 +34,8 @@ pub enum UpgradeError {
     InvalidKeyLength { expected: usize, actual: usize },
     #[error("empty active validator set")]
     EmptyValidatorSet,
+    #[error("missing admission root")]
+    MissingAdmissionRoot,
     #[error("duplicate active validator")]
     DuplicateValidator,
     #[error("unknown validator")]
@@ -72,6 +74,9 @@ pub enum UpgradeError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Root(pub [u8; 32]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AdmissionRoot(pub [u8; 32]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MeshVersion(pub [u8; 32]);
@@ -213,6 +218,7 @@ pub struct ActiveValidatorSet {
     pub namespace: String,
     pub epoch: u64,
     pub valset_root: Root,
+    pub admission_root: AdmissionRoot,
     validators: Vec<ValidatorIdentity>,
 }
 
@@ -221,10 +227,14 @@ impl ActiveValidatorSet {
         namespace: impl Into<String>,
         epoch: u64,
         valset_root: Root,
+        admission_root: AdmissionRoot,
         validators: Vec<ValidatorIdentity>,
     ) -> Result<Self, UpgradeError> {
         if validators.is_empty() {
             return Err(UpgradeError::EmptyValidatorSet);
+        }
+        if admission_root.0 == [0u8; 32] {
+            return Err(UpgradeError::MissingAdmissionRoot);
         }
         let mut sorted = validators;
         sorted.sort();
@@ -235,6 +245,7 @@ impl ActiveValidatorSet {
             namespace: namespace.into(),
             epoch,
             valset_root,
+            admission_root,
             validators: sorted,
         })
     }
@@ -257,6 +268,7 @@ pub struct EndpointRecord {
     pub namespace: String,
     pub epoch: u64,
     pub valset_root: Root,
+    pub admission_root: AdmissionRoot,
     pub validator_identity: ValidatorIdentity,
     pub control_endpoint: Endpoint,
     pub wireguard_endpoint: Endpoint,
@@ -320,6 +332,7 @@ impl MeshView {
             if record.namespace != active_set.namespace
                 || record.epoch != active_set.epoch
                 || record.valset_root != active_set.valset_root
+                || record.admission_root != active_set.admission_root
                 || !active_set.contains(record.validator_identity)
             {
                 return Err(UpgradeError::UnknownValidator);
@@ -484,6 +497,7 @@ pub struct TunnelUpgradeRequestFields {
     pub namespace: String,
     pub epoch: u64,
     pub valset_root: Root,
+    pub admission_root: AdmissionRoot,
     pub mesh_version: MeshVersion,
     pub initiator_identity: ValidatorIdentity,
     pub responder_identity: ValidatorIdentity,
@@ -536,6 +550,7 @@ pub struct DirectDialFailureFields {
     pub namespace: String,
     pub epoch: u64,
     pub valset_root: Root,
+    pub admission_root: AdmissionRoot,
     pub mesh_version: MeshVersion,
     pub observer_identity: ValidatorIdentity,
     pub target_identity: ValidatorIdentity,
@@ -581,6 +596,7 @@ pub struct TunnelUpgradeResponseFields {
     pub namespace: String,
     pub epoch: u64,
     pub valset_root: Root,
+    pub admission_root: AdmissionRoot,
     pub mesh_version: MeshVersion,
     pub responder_identity: ValidatorIdentity,
     pub initiator_identity: ValidatorIdentity,
@@ -637,6 +653,7 @@ pub struct TunnelUpgradeAckFields {
     pub namespace: String,
     pub epoch: u64,
     pub valset_root: Root,
+    pub admission_root: AdmissionRoot,
     pub mesh_version: MeshVersion,
     pub initiator_identity: ValidatorIdentity,
     pub responder_identity: ValidatorIdentity,
@@ -744,11 +761,13 @@ pub fn validate_upgrade(
     let rs = &response.fields;
     let ak = &ack.fields;
     let root = view.active_set.valset_root;
+    let admission_root = view.active_set.admission_root;
     if rq.request_tuple()
         != (
             view.active_set.namespace.as_str(),
             view.active_set.epoch,
             root,
+            admission_root,
             view.mesh_version,
         )
         || rs.request_hash != request.hash()
@@ -757,6 +776,7 @@ pub fn validate_upgrade(
                 view.active_set.namespace.as_str(),
                 view.active_set.epoch,
                 root,
+                admission_root,
                 view.mesh_version,
             )
         || ak.request_hash != request.hash()
@@ -766,6 +786,7 @@ pub fn validate_upgrade(
                 view.active_set.namespace.as_str(),
                 view.active_set.epoch,
                 root,
+                admission_root,
                 view.mesh_version,
             )
     {
@@ -871,6 +892,7 @@ fn validate_direct_dial_failure(
             view.active_set.namespace.as_str(),
             view.active_set.epoch,
             view.active_set.valset_root,
+            view.active_set.admission_root,
             view.mesh_version,
         )
         || f.observer_identity != observer_identity
@@ -889,48 +911,52 @@ fn validate_direct_dial_failure(
 }
 
 trait CommonRequestFields {
-    fn request_tuple(&self) -> (&str, u64, Root, MeshVersion);
+    fn request_tuple(&self) -> (&str, u64, Root, AdmissionRoot, MeshVersion);
 }
 
 impl CommonRequestFields for TunnelUpgradeRequestFields {
-    fn request_tuple(&self) -> (&str, u64, Root, MeshVersion) {
+    fn request_tuple(&self) -> (&str, u64, Root, AdmissionRoot, MeshVersion) {
         (
             &self.namespace,
             self.epoch,
             self.valset_root,
+            self.admission_root,
             self.mesh_version,
         )
     }
 }
 
 impl CommonRequestFields for TunnelUpgradeResponseFields {
-    fn request_tuple(&self) -> (&str, u64, Root, MeshVersion) {
+    fn request_tuple(&self) -> (&str, u64, Root, AdmissionRoot, MeshVersion) {
         (
             &self.namespace,
             self.epoch,
             self.valset_root,
+            self.admission_root,
             self.mesh_version,
         )
     }
 }
 
 impl CommonRequestFields for TunnelUpgradeAckFields {
-    fn request_tuple(&self) -> (&str, u64, Root, MeshVersion) {
+    fn request_tuple(&self) -> (&str, u64, Root, AdmissionRoot, MeshVersion) {
         (
             &self.namespace,
             self.epoch,
             self.valset_root,
+            self.admission_root,
             self.mesh_version,
         )
     }
 }
 
 impl CommonRequestFields for DirectDialFailureFields {
-    fn request_tuple(&self) -> (&str, u64, Root, MeshVersion) {
+    fn request_tuple(&self) -> (&str, u64, Root, AdmissionRoot, MeshVersion) {
         (
             &self.namespace,
             self.epoch,
             self.valset_root,
+            self.admission_root,
             self.mesh_version,
         )
     }
@@ -1152,6 +1178,7 @@ fn put_endpoint_record(out: &mut Vec<u8>, record: &EndpointRecord) {
     put_str(out, &record.namespace);
     put_u64(out, record.epoch);
     put_root(out, record.valset_root);
+    put_admission_root(out, record.admission_root);
     put_identity(out, record.validator_identity);
     put_endpoint(out, record.control_endpoint);
     put_endpoint(out, record.wireguard_endpoint);
@@ -1173,6 +1200,7 @@ fn put_request_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeRequestFields) {
     put_str(out, &fields.namespace);
     put_u64(out, fields.epoch);
     put_root(out, fields.valset_root);
+    put_admission_root(out, fields.admission_root);
     put_mesh_version(out, fields.mesh_version);
     put_identity(out, fields.initiator_identity);
     put_identity(out, fields.responder_identity);
@@ -1188,6 +1216,7 @@ fn put_direct_dial_failure_fields(out: &mut Vec<u8>, fields: &DirectDialFailureF
     put_str(out, &fields.namespace);
     put_u64(out, fields.epoch);
     put_root(out, fields.valset_root);
+    put_admission_root(out, fields.admission_root);
     put_mesh_version(out, fields.mesh_version);
     put_identity(out, fields.observer_identity);
     put_identity(out, fields.target_identity);
@@ -1203,6 +1232,7 @@ fn put_response_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeResponseFields) 
     put_str(out, &fields.namespace);
     put_u64(out, fields.epoch);
     put_root(out, fields.valset_root);
+    put_admission_root(out, fields.admission_root);
     put_mesh_version(out, fields.mesh_version);
     put_identity(out, fields.responder_identity);
     put_identity(out, fields.initiator_identity);
@@ -1235,6 +1265,7 @@ fn put_ack_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeAckFields) {
     put_str(out, &fields.namespace);
     put_u64(out, fields.epoch);
     put_root(out, fields.valset_root);
+    put_admission_root(out, fields.admission_root);
     put_mesh_version(out, fields.mesh_version);
     put_identity(out, fields.initiator_identity);
     put_identity(out, fields.responder_identity);
@@ -1275,6 +1306,10 @@ fn put_u16_vec(out: &mut Vec<u8>, values: &[u16]) {
 }
 
 fn put_root(out: &mut Vec<u8>, value: Root) {
+    out.extend_from_slice(&value.0);
+}
+
+fn put_admission_root(out: &mut Vec<u8>, value: AdmissionRoot) {
     out.extend_from_slice(&value.0);
 }
 

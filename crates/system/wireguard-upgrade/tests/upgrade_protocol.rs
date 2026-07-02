@@ -12,6 +12,10 @@ fn root(byte: u8) -> Root {
     Root([byte; 32])
 }
 
+fn admission(byte: u8) -> AdmissionRoot {
+    AdmissionRoot([byte; 32])
+}
+
 fn xkey(byte: u8) -> X25519PublicKey {
     X25519PublicKey([byte; 32])
 }
@@ -25,7 +29,7 @@ fn endpoint(addr: [u8; 4], port: u16, transport: Transport, policy: &PortPolicy)
 }
 
 fn active_set(a: ValidatorIdentity, b: ValidatorIdentity) -> ActiveValidatorSet {
-    ActiveValidatorSet::new("demo", 7, root(9), vec![a, b]).unwrap()
+    ActiveValidatorSet::new("demo", 7, root(9), admission(8), vec![a, b]).unwrap()
 }
 
 fn record_for(
@@ -39,6 +43,7 @@ fn record_for(
         namespace: set.namespace.clone(),
         epoch: set.epoch,
         valset_root: set.valset_root,
+        admission_root: set.admission_root,
         validator_identity: id(signer),
         control_endpoint: endpoint([1, 1, 1, wg_addr[3]], 443, Transport::Tcp, &policy),
         wireguard_endpoint: endpoint(wg_addr, 51820, Transport::Udp, &policy),
@@ -93,6 +98,7 @@ fn direct_dial_failure(
             namespace: set.namespace.clone(),
             epoch: set.epoch,
             valset_root: set.valset_root,
+            admission_root: set.admission_root,
             mesh_version: view.mesh_version,
             observer_identity: id(observer),
             target_identity,
@@ -130,6 +136,17 @@ fn mesh_view_uses_only_admitted_validators_and_has_deterministic_version() {
     let outsider = PrivateKey::from_seed(13);
     let policy = prod_policy();
     let set = active_set(id(&a), id(&b));
+    assert_eq!(
+        ActiveValidatorSet::new(
+            "demo",
+            7,
+            root(9),
+            AdmissionRoot([0; 32]),
+            vec![id(&a), id(&b)]
+        )
+        .unwrap_err(),
+        UpgradeError::MissingAdmissionRoot
+    );
     let (ad_a, ad_b) = signed_ads(&a, &b, &set, [8, 8, 8, 11], [8, 8, 8, 12]);
     let outsider_record = record_for(&outsider, &set, [8, 8, 8, 13], 1);
     let outsider_version =
@@ -161,6 +178,7 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
             namespace: set.namespace.clone(),
             epoch: set.epoch,
             valset_root: set.valset_root,
+            admission_root: set.admission_root,
             mesh_version: view.mesh_version,
             initiator_identity: id(&a),
             responder_identity: id(&b),
@@ -179,6 +197,7 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
             namespace: set.namespace.clone(),
             epoch: set.epoch,
             valset_root: set.valset_root,
+            admission_root: set.admission_root,
             mesh_version: view.mesh_version,
             responder_identity: id(&b),
             initiator_identity: id(&a),
@@ -207,6 +226,7 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
             namespace: set.namespace.clone(),
             epoch: set.epoch,
             valset_root: set.valset_root,
+            admission_root: set.admission_root,
             mesh_version: view.mesh_version,
             initiator_identity: id(&a),
             responder_identity: id(&b),
@@ -352,6 +372,7 @@ fn valid_plan_builds_defguard_peer_config() {
             namespace: set.namespace.clone(),
             epoch: set.epoch,
             valset_root: set.valset_root,
+            admission_root: set.admission_root,
             mesh_version: view.mesh_version,
             initiator_identity: id(&a),
             responder_identity: id(&b),
@@ -370,6 +391,7 @@ fn valid_plan_builds_defguard_peer_config() {
             namespace: set.namespace.clone(),
             epoch: set.epoch,
             valset_root: set.valset_root,
+            admission_root: set.admission_root,
             mesh_version: view.mesh_version,
             responder_identity: id(&b),
             initiator_identity: id(&a),
@@ -398,6 +420,7 @@ fn valid_plan_builds_defguard_peer_config() {
             namespace: set.namespace.clone(),
             epoch: set.epoch,
             valset_root: set.valset_root,
+            admission_root: set.admission_root,
             mesh_version: view.mesh_version,
             initiator_identity: id(&a),
             responder_identity: id(&b),

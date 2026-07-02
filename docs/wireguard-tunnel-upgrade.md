@@ -14,8 +14,8 @@ through `WGApi`.
   tunnel without introducing a permanent external relay or central controller.
 - Derive every control participant, bootnode, and relay candidate from the
   consensus validator set.
-- Bind every tunnel decision to a valset epoch, mesh version, validator
-  identity, endpoint advertisement, and port policy.
+- Bind every tunnel decision to a valset epoch, invitation/admission root, mesh
+  version, validator identity, endpoint advertisement, and port policy.
 - Fail closed when endpoint, port, identity, epoch, signature, or replay checks
   cannot be verified.
 
@@ -45,10 +45,21 @@ application state; that is candidate membership only. A key from that module
 does not become a WireGuard peer, bootnode, or relay until the consensus/admission
 layer includes it in the finalized active validator set for the epoch.
 
+The protocol carries two distinct commitments:
+
+- `valset_root`: the replicated candidate-membership state root.
+- `admission_root`: the invitation/admission system's finalized commitment for
+  which candidate validators are actually admitted for the epoch.
+
+`admission_root` is mandatory and must not be zero. It is included in endpoint
+advertisement records, mesh-version preimages, request/response/ack messages,
+and direct-dial failure evidence. A node must reject a tunnel upgrade if it only
+has candidate valset membership but no matching finalized admission root.
+
 For epoch `E`, a node accepts a mesh view only when:
 
 1. The validator identity is admitted in the finalized active consensus set for
-   `E`.
+   `E` under the signed/finalized admission root.
 2. The mesh view version is derived from the canonical mesh-version preimage for
    that admitted set and its endpoint records.
 3. The advertisement signature verifies under the admitted validator identity.
@@ -70,6 +81,7 @@ EndpointAdvertisementV1 {
   namespace
   epoch
   valset_root
+  admission_root
   mesh_version
   validator_identity_ed25519
   control_endpoint
@@ -130,6 +142,7 @@ EndpointRecordV1 {
   namespace
   epoch
   valset_root
+  admission_root
   validator_identity_ed25519
   control_endpoint
   wireguard_endpoint
@@ -143,6 +156,7 @@ mesh_version =
        namespace ||
        epoch ||
        valset_root ||
+       admission_root ||
        SORT_ASC(endpoint_record_hashes))
 ```
 
@@ -195,6 +209,7 @@ TunnelUpgradeRequestV1 {
   namespace
   epoch
   valset_root
+  admission_root
   mesh_version
   initiator_identity_ed25519
   responder_identity_ed25519
@@ -216,6 +231,7 @@ TunnelUpgradeResponseV1 {
   namespace
   epoch
   valset_root
+  admission_root
   mesh_version
   responder_identity_ed25519
   initiator_identity_ed25519
@@ -237,6 +253,7 @@ DirectDialFailureEvidenceV1 {
   namespace
   epoch
   valset_root
+  admission_root
   mesh_version
   observer_identity_ed25519
   target_identity_ed25519
@@ -257,6 +274,7 @@ TunnelUpgradeAckV1 {
   namespace
   epoch
   valset_root
+  admission_root
   mesh_version
   initiator_identity_ed25519
   responder_identity_ed25519
@@ -275,8 +293,8 @@ A node installs WireGuard peer config only after all checks pass:
 3. Request, response, and ack signatures verify.
 4. The responder echoes the request hash.
 5. The ack echoes both request and response hashes.
-6. All three messages carry the same namespace, epoch, valset root, and mesh
-   version.
+6. All three messages carry the same namespace, epoch, valset root,
+   admission root, and mesh version.
 7. Both WireGuard public keys are well-formed X25519 public keys.
 8. Both endpoints satisfy local port policy.
 9. No request, response, or ack message has expired.
