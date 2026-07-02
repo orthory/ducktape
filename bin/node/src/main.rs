@@ -103,6 +103,16 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 /// the same deterministic discard ceiling. small for the demo network; a
 /// production mesh would size this in minutes of views.
 const CUTOVER_DELAY: u64 = 3;
+/// every module in the production genesis set, in status-report order. keep in
+/// sync with [`genesis_host`] — status endpoints report exactly these roots.
+const MODULE_IDS: [&str; 10] = [
+    "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults",
+    "directory",
+];
+/// how long an app-surface submit reply may be held awaiting finalization
+/// before it errors out (the op may still land later; clients re-query on
+/// block events). mirrors the rpc bridge's stuck-node budget.
+const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 
 /// the four channels epoch `e`'s engine uses: vote, certificate, resolver, and
 /// the eager payload-relay lane. starts at 8, clear of the statesync channel.
@@ -158,6 +168,14 @@ struct NodeConfig {
     /// queries, status, and shutdown. OFF when unset. bind loopback only —
     /// the rpc trusts its caller (it stamps this node's own origin on submits).
     rpc_listen: Option<String>,
+    /// http/ws app-surface listen address (the noded wire contract: /v1/submit,
+    /// /v1/query, /v1/status, /v1/shutdown, /v1/ws). OFF when unset. bind
+    /// loopback only — like the rpc, the surface trusts its caller and stamps
+    /// this node's own origin on submits. a submit reply is HELD until the op's
+    /// frame drains at a finalized boundary (the app's submit→re-query contract
+    /// needs the applied state visible when the reply lands), unlike the rpc's
+    /// accepted-not-finalized submit.
+    http_listen: Option<String>,
 }
 
 /// read the valset module's current membership projection (committed state —
@@ -435,6 +453,42 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
         _ => None,
     };
+
+    // the http/ws app surface: same bind-early rule. the server itself runs on
+    // its OWN plain-tokio OS thread (noded's exact split — the host never
+    // leaves the commonware runner thread; http handlers only send
+    // NodeCommands over the lane), so the pump below is its single consumer.
+    let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    match cfg.http_listen.as_deref() {
+        Some(addr) if !sync_only => {
+            let listener = std::net::TcpListener::bind(addr)?;
+            listener.set_nonblocking(true)?;
+            println!(
+                "[node #{id}] app surface listening on http://{}",
+                listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+            );
+            std::thread::Builder::new().name("app-surface".into()).spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("app-surface tokio runtime")
+                    .block_on(async move {
+                        let listener = tokio::net::TcpListener::from_std(listener)
+                            .expect("adopt app-surface listener");
+                        if let Err(e) = noded::serve(listener, http_handle).await {
+                            eprintln!("app surface server error: {e}");
+                        }
+                    });
+                // a client asked the surface to shut down (POST /v1/shutdown) —
+                // mirror the rpc shutdown: exit the whole process gracefully.
+                println!("[node #{id}] shutdown requested via app surface — exiting");
+                std::process::exit(0);
+            })?;
+        }
+        // surface off: dropping the handle terminates the command stream; the
+        // pump's select arm sees one None and then never polls it again.
+        _ => drop(http_handle),
+    }
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
@@ -786,6 +840,19 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         let expected = validator_seeds.len();
         let mut applied = 0usize;
         let mut converged = false;
+        // the app-surface lane: held submit replies keyed by the submitted
+        // frame's content address, resolved when the frame drains (or expired
+        // after SUBMIT_HOLD), plus the last block height published to ws
+        // subscribers.
+        let mut http_ingress = http_cmds;
+        let mut pending_submits: std::collections::HashMap<
+            node::FrameId,
+            (
+                futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
+                std::time::Instant,
+            ),
+        > = std::collections::HashMap::new();
+        let mut last_published: Option<u64> = None;
         let mut sync_server = SyncServer::new();
         // the host-owned worker set (reactor seam). EMPTY for now: effects of
         // finalized blocks are drained and logged so the lane is visibly live;
@@ -805,7 +872,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                                         .submit(&signer, seq, Msg { target, payload })
                                         .await
                                     {
-                                        Ok(()) => RpcReply::ok(),
+                                        Ok(_) => RpcReply::ok(),
                                         Err(e) => RpcReply::err(format!("submit failed: {e}")),
                                     }
                                 }
@@ -824,10 +891,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                         },
                         RpcRequest::Status => {
                             let mut modules = std::collections::BTreeMap::new();
-                            for m in [
-                                "kv", "document", "chat", "forge",
-                                "valset", "governance", "saga", "tasks", "vaults", "directory",
-                            ] {
+                            for m in MODULE_IDS {
                                 if let Some(root) = node.host().module_root(m) {
                                     modules.insert(m.to_string(), hex(&root));
                                 }
@@ -848,6 +912,63 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                         }
                     };
                     let _ = reply.send(resp);
+                }
+                cmd = http_ingress.next() => {
+                    let Some(cmd) = cmd else { continue };
+                    match cmd {
+                        // `origin` is the caller's CLAIMED submitter identity —
+                        // meaningful on the embedded daemon, but this lane signs
+                        // frames, and the signed origin IS this node's pubkey
+                        // (authenticated authorship that governance relies on).
+                        // a claimed origin cannot ride a signed frame without
+                        // making authorship forgeable, so it is ignored here;
+                        // display names resolve via the name registry instead.
+                        noded::NodeCommand::Submit { target, payload, origin: _, reply } => {
+                            let seq = next_seq;
+                            next_seq += 1;
+                            match node.submit(&signer, seq, Msg { target, payload }).await {
+                                // HOLD the reply: it lands when this frame
+                                // drains at a finalized boundary, so the app's
+                                // follow-up query reads the applied state.
+                                Ok(frame) => {
+                                    pending_submits.insert(
+                                        frame,
+                                        (reply, std::time::Instant::now() + SUBMIT_HOLD),
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                                }
+                            }
+                        }
+                        noded::NodeCommand::Query { target, req, reply } => {
+                            let result = node
+                                .host()
+                                .query(&target, &req)
+                                .await
+                                .map_err(|e| e.to_string());
+                            let _ = reply.send(result);
+                        }
+                        noded::NodeCommand::Status { reply } => {
+                            let modules = MODULE_IDS
+                                .iter()
+                                .map(|m| noded::ModuleStatus {
+                                    id: (*m).into(),
+                                    root: node
+                                        .host()
+                                        .module_root(m)
+                                        .map(|r| hex(&r))
+                                        .unwrap_or_default(),
+                                })
+                                .collect();
+                            let _ = reply.send(noded::NodeStatus {
+                                version: env!("CARGO_PKG_VERSION").into(),
+                                app_hash: hex(&node.app_hash()),
+                                height: node.finalized().map(|f| f.height).unwrap_or(0),
+                                modules,
+                            });
+                        }
+                    }
                 }
                 msg = sync_ingress.next() => {
                     let Some((peer, bytes)) = msg else {
@@ -880,6 +1001,55 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                             std::process::exit(1);
                         }
                     };
+                    // resolve held app-surface submits against what this
+                    // drain finished with; every disposition is deterministic,
+                    // so the reply faithfully reports the op's consensus fate.
+                    let boundary_hash = hex(&node.app_hash());
+                    for d in node.take_drained() {
+                        let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
+                        let _ = reply.send(match d.disposition {
+                            node::Disposition::Applied => Ok(noded::BlockSummary {
+                                height: d.height,
+                                app_hash: boundary_hash.clone(),
+                            }),
+                            node::Disposition::Rejected => {
+                                Err("op finalized but rejected (deterministic no-op)".into())
+                            }
+                            node::Disposition::Discarded => {
+                                Err("op discarded at an epoch cutover — resubmit".into())
+                            }
+                        });
+                    }
+                    // expire holds the mesh never finalized in time. the op may
+                    // still land later — clients re-query on block events.
+                    if !pending_submits.is_empty() {
+                        let now = std::time::Instant::now();
+                        let expired: Vec<node::FrameId> = pending_submits
+                            .iter()
+                            .filter(|(_, (_, deadline))| *deadline <= now)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for k in expired {
+                            if let Some((reply, _)) = pending_submits.remove(&k) {
+                                let _ = reply.send(Err(
+                                    "timed out awaiting finalization — re-query on the next block"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                    // publish each newly-applied boundary to ws subscribers
+                    // (send only errs when nobody is subscribed — fine).
+                    if let Some(f) = node.finalized() {
+                        if last_published != Some(f.height) {
+                            let _ = http_events.send(noded::BlockSummary {
+                                height: f.height,
+                                app_hash: hex(&f.app_hash),
+                            });
+                            last_published = Some(f.height);
+                        }
+                    }
+
                     // the VALSET ORCHESTRATION step: observe the finalized
                     // membership projection; a change schedules a deterministic
                     // cutover (arming the discard ceiling), and crossing the

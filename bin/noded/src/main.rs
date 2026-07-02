@@ -70,10 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?
         .block_on(async {
             let listener = tokio::net::TcpListener::bind(listen).await?;
-            let shutdown = handle.clone();
-            axum::serve(listener, noded::router(handle))
-                .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
-                .await?;
+            noded::serve(listener, handle).await?;
             // in-flight requests drained; blocks commit at the block boundary,
             // so exiting here loses nothing.
             println!("[noded] shutdown requested, exiting");

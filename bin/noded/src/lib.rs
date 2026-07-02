@@ -249,6 +249,21 @@ async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
+/// serve the client surface on `listener` until a shutdown request lands
+/// (POST /v1/shutdown). the caller owns the runtime this runs on; the host
+/// actor lives elsewhere and is reachable only through `handle`'s command
+/// lane — which is what lets ANY binary that owns a host (the embedded daemon,
+/// the p2p validator) stand up the identical surface.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    handle: NodeHandle,
+) -> std::io::Result<()> {
+    let shutdown = handle.clone();
+    axum::serve(listener, router(handle))
+        .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
+        .await
+}
+
 async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
     let events = handle.events.subscribe();
     upgrade.on_upgrade(move |socket| stream_blocks(socket, events))

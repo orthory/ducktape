@@ -94,9 +94,25 @@ export const MAX_QUERY_LIMIT = 256;
  *  identity the daemon stamped — for this app, the utf-8 display name. */
 export const authorName = (author: AuthorRef): string => {
   if (author === "System") return "system";
-  if ("User" in author) return new TextDecoder().decode(new Uint8Array(author.User));
+  if ("User" in author) return displayUserBytes(author.User);
   if ("Agent" in author) return `${author.Agent.module}/${author.Agent.agent_id}`;
   return author.Module;
+};
+
+/** User author bytes are a claimed display name on the embedded daemon but a
+ * raw ed25519 pubkey on the networked node (the signed frame origin). Render
+ * printable UTF-8 as-is and anything else as a short hex handle until the
+ * name registry resolves keys to display names. */
+const displayUserBytes = (bytes: number[]): string => {
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+    // control characters mean "not a name" even when technically valid UTF-8.
+    if (!/[\p{Cc}\p{Cn}]/u.test(text)) return text;
+  } catch {
+    // fall through to the hex handle
+  }
+  const hex = bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}…`;
 };
 
 const spanText = (spans: Span[]): string => spans.map((span) => span.text).join("");
