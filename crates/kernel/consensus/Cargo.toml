@@ -20,6 +20,7 @@ commonware-utils = { workspace = true }
 commonware-actor = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-resolver = { workspace = true }
+commonware-codec = { workspace = true }
 bytes = "1"
 rand_core = "0.6.4"
 # deterministic DEV bls key derivation (bls_dev_secret) — mirrors the seeded-chacha

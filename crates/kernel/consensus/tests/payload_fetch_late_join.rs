@@ -140,6 +140,7 @@ async fn run_late_join(mut context: deterministic::Context) {
             v.to_string(),
             epoch,
             genesis_floor,
+            None,
             store,
             vote,
             certificate,
