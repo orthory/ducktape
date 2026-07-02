@@ -102,7 +102,12 @@ fn chat_channels_include_agent_opened_sessions_when_backed_by_registered_messagi
             agent_interface::DEFAULT_MESSAGING_TARGET,
         )
         .await;
-        let agent = Agent::new(agent_interface::DEFAULT_AGENT_TARGET);
+        let agent = Agent::init_with_messaging_id(
+            context.child("agent"),
+            agent_interface::DEFAULT_AGENT_TARGET,
+            agent_interface::DEFAULT_MESSAGING_TARGET,
+        )
+        .await;
         let mut host =
             Host::genesis(vec![Box::new(messaging), Box::new(chat), Box::new(agent)]).unwrap();
         let chat_root = host.module_root(DEFAULT_CHAT_TARGET).unwrap();

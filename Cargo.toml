@@ -1,6 +1,11 @@
-# super-app workspace — a consensus platform of isolated modules. a module crate
-# depends ONLY on `sdk` + the types-only `*-interface` crates of modules it talks
-# to — never another module's impl. layout:
+# super-app workspace — a consensus platform of isolated modules. module crates
+# normally depend only on `sdk` + the types-only `*-interface` crates of modules
+# they talk to. wrapper modules such as chat/agent may reuse a shared storage
+# implementation either as a private embedded substrate or as a facade over an
+# explicitly registered backing module. embedded durable state must be committed
+# through the wrapper's root()/commit/abort/sync surface; registered backing state
+# belongs to the backing module's root. cross-module product interaction still
+# goes through interface crates, not another module's implementation API. layout:
 #   crates/kernel/   — the platform: sdk (interface), state (app-hash), host
 #                      (dispatch), node (transport seam), consensus (BFT orderer)
 #   crates/system/   — consensus infrastructure modules (kv, valset)
