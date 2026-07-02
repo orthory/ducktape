@@ -66,6 +66,7 @@ use directory::Directory;
 use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
 use document::Document;
 use forge::Forge;
+use governance::Governance;
 use host::Host;
 use kv::Kv;
 use messaging::Messaging;
@@ -186,6 +187,9 @@ async fn genesis_host(
         Box::new(agent),
         Box::new(forge),
         Box::new(valset),
+        // governance is the SOLE authorized author of valset changes: member
+        // proposals + ballots, deterministic tally, follow-up membership ops.
+        Box::new(Governance::new("governance", "valset")),
         Box::new(SagaModule::new("saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Directory::new("directory")),
@@ -539,6 +543,10 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let mut saga = SagaModule::new("saga");
             saga.install(&bytes, root).expect("saga install");
 
+            let (bytes, root) = snapshot_of("governance").await;
+            let mut governance = Governance::new("governance", "valset");
+            governance.install(&bytes, root).expect("governance install");
+
             let (bytes, root) = snapshot_of("tasks").await;
             let mut tasks = Tasks::new("tasks");
             tasks.install(&bytes, root).expect("tasks install");
@@ -550,9 +558,9 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 10] = [
-                &kv, &document, &messaging, &chat, &agent, &directory, &valset, &saga, &tasks,
-                &forge,
+            let mods: [&dyn sdk::Module; 11] = [
+                &kv, &document, &messaging, &chat, &agent, &directory, &valset, &governance,
+                &saga, &tasks, &forge,
             ];
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {
@@ -682,7 +690,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             target: "directory".into(),
             payload: encode_msg(&DirMsg::Set { key: format!("k{id}"), value: format!("node-{id}") }),
         };
-        node.submit(format!("node{id}").as_bytes(), 0, op).await.expect("submit op");
+        node.submit(&signer, 0, op).await.expect("submit op");
 
         // the local rpc bridge: blocking listener threads push parsed requests
         // into this bounded queue; the pump answers between drains.
@@ -697,9 +705,9 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             drop(rpc_tx); // rpc off: the branch below just stays pending forever.
         }
 
-        // the ordered lane stamps (origin, seq) per frame. rpc submits carry
-        // THIS node's identity as origin; seq starts after the demo op's 0.
-        let node_origin = signer.public_key().as_ref().to_vec();
+        // the ordered lane SIGNS every frame. rpc submits are signed by THIS
+        // node's identity (the node is the local caller's custodian until user
+        // keys reach the console); seq starts after the demo op's 0.
         let mut next_seq: u64 = 1;
 
         // pump: drain finalized frames on an interval, apply them in agreed
@@ -728,7 +736,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                                     let seq = next_seq;
                                     next_seq += 1;
                                     match node
-                                        .submit(&node_origin, seq, Msg { target, payload })
+                                        .submit(&signer, seq, Msg { target, payload })
                                         .await
                                     {
                                         Ok(()) => RpcReply::ok(),
@@ -752,7 +760,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                             let mut modules = std::collections::BTreeMap::new();
                             for m in [
                                 "kv", "document", "messaging", "chat", "agent", "forge",
-                                "valset", "saga", "tasks", "directory",
+                                "valset", "governance", "saga", "tasks", "directory",
                             ] {
                                 if let Some(root) = node.host().module_root(m) {
                                     modules.insert(m.to_string(), hex(&root));
@@ -819,7 +827,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                                     let seq = next_seq;
                                     next_seq += 1;
                                     if let Err(e) =
-                                        node.submit(&node_origin, seq, follow).await
+                                        node.submit(&signer, seq, follow).await
                                     {
                                         eprintln!("[node #{id}] worker follow-up submit failed: {e}");
                                     }

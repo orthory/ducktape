@@ -1,0 +1,25 @@
+[package]
+name = "governance"
+edition.workspace = true
+version.workspace = true
+
+# member-gated governance over the validator set: proposals, ballots, and
+# deterministic tally at a consensus-time deadline. depends only on `sdk` plus
+# types-only interface crates (its own, valset's — membership checks go through
+# host-routed queries, execution through emitted follow-up msgs), per the
+# module-isolation rule. state is a canonical-bytes snapshot module (like
+# tasks): low-volume, fully replicated, root == sha256 of the encoded state.
+[dependencies]
+sdk = { workspace = true }
+governance-interface = { workspace = true }
+valset-interface = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+host = { workspace = true }
+valset = { workspace = true }
+futures = "0.3"
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }

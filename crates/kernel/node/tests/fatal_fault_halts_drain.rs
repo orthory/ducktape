@@ -54,13 +54,13 @@ fn a_commit_fault_halts_the_drain_with_fatal() {
         let op = Msg { target: "bomb".into(), payload: Vec::new() };
         // op 1 commits cleanly; op 2 arms the commit fault; op 3 must never
         // apply — the drain halts AT the fault instead of continuing past it.
-        node.submit(b"a", 0, op.clone()).await.expect("submit 1");
+        node.submit(&sk(1), 0, op.clone()).await.expect("submit 1");
         let applied = node.drain_delivered().await.expect("first drain is clean");
         assert_eq!(applied, 1);
         let after_first = node.app_hash();
 
-        node.submit(b"a", 1, op.clone()).await.expect("submit 2");
-        node.submit(b"a", 2, op.clone()).await.expect("submit 3");
+        node.submit(&sk(1), 1, op.clone()).await.expect("submit 2");
+        node.submit(&sk(1), 2, op.clone()).await.expect("submit 3");
 
         let err = node
             .drain_delivered()
@@ -101,11 +101,11 @@ fn a_deterministic_rejection_does_not_halt_the_drain() {
         let host = Host::genesis(vec![Box::new(RejectAll)]).expect("genesis");
         let mut orderer = RoundOrderer::new();
         orderer
-            .submit(encode_frame(b"a", 0, &Msg { target: "reject".into(), payload: Vec::new() }))
+            .submit(encode_frame(&sk(1), 0, &Msg { target: "reject".into(), payload: Vec::new() }))
             .await
             .expect("frame 1");
         orderer
-            .submit(encode_frame(b"a", 1, &Msg { target: "reject".into(), payload: Vec::new() }))
+            .submit(encode_frame(&sk(1), 1, &Msg { target: "reject".into(), payload: Vec::new() }))
             .await
             .expect("frame 2");
         let mut node = OrderedNode::new(host, orderer);
@@ -116,4 +116,10 @@ fn a_deterministic_rejection_does_not_halt_the_drain() {
             .expect("rejections must not error the drain");
         assert_eq!(applied, 2, "both rejected frames count as processed no-ops");
     });
+}
+
+/// a deterministic dev signer for test frames (any u64 seed).
+fn sk(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
+    use commonware_cryptography::Signer as _;
+    commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
 }

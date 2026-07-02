@@ -26,6 +26,7 @@ members = [
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
     "crates/system/valset-mesh-interface",
+    "crates/system/governance", "crates/system/governance-interface",
     "crates/system/wireguard-upgrade",
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
@@ -80,6 +81,7 @@ statesync = { path = "crates/kernel/statesync" }
 # internal — module impl crates
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
+governance = { path = "crates/system/governance" }
 saga = { path = "crates/system/saga" }
 forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
@@ -92,6 +94,7 @@ greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "crates/system/kv-interface" }
 valset-interface = { path = "crates/system/valset-interface" }
+governance-interface = { path = "crates/system/governance-interface" }
 valset-mesh-interface = { path = "crates/system/valset-mesh-interface" }
 wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 saga-interface = { path = "crates/system/saga-interface" }

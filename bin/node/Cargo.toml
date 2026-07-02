@@ -26,6 +26,7 @@ directory = { workspace = true }
 directory-interface = { workspace = true }
 # the production module set: system infrastructure + every product module.
 valset = { workspace = true }
+governance = { workspace = true }
 saga = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
