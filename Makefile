@@ -45,9 +45,15 @@ install-app: app
 	cp -R target/release/bundle/macos/Ducktape.app "$(APP_DEST)/"
 	@echo "installed $(APP_DEST)/Ducktape.app"
 
+## the full LOCAL verification gate (no hosted CI by design — run this before
+## every push): the rust workspace including the process-level e2e suites
+## (bin/node spawns a real 4-node cluster over localhost TCP, bin/noded drives
+## a real spawned daemon over http/ws), then the app suites with the daemon
+## binary staged so the live-daemon wire-parity e2e RUNS instead of skipping.
 test:
 	$(CARGO) test --workspace
-	cd app && $(BUN) run test
+	$(CARGO) build -p noded
+	cd app && DUCKTAPE_NODED_BIN=$(abspath target/debug/ducktape-noded) $(BUN) run test
 
 clean:
 	$(CARGO) clean

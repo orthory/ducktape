@@ -27,7 +27,7 @@ use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
-use host::{BlockContext, Host};
+use host::{BlockContext, Host, SubmitError};
 use sdk::{Msg, Origin};
 use tasks::Tasks;
 use tokio::sync::broadcast;
@@ -133,7 +133,16 @@ fn run_node(
                             let _ = events.send(block.clone());
                             Ok(block)
                         }
-                        Err(err) => Err(err.to_string()),
+                        // FAIL-STOP per the host contract: a Fatal means a
+                        // block-boundary hook failed and the registry may be
+                        // half-committed — applying even one more msg could
+                        // silently corrupt state. exit loudly; the managing
+                        // app respawns a fresh daemon over the storage dir.
+                        Err(SubmitError::Fatal(err)) => {
+                            eprintln!("[noded] FATAL: {err} — halting");
+                            std::process::exit(1);
+                        }
+                        Err(err @ SubmitError::Rejected(_)) => Err(err.to_string()),
                     };
                     let _ = reply.send(result); // caller may have hung up
                 }
