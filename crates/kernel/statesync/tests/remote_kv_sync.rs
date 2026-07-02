@@ -60,8 +60,16 @@ async fn serve_until_closed(
     finalized: FinalizedBlock,
     mut rx: mpsc::Receiver<RpcPair>,
 ) {
+    // fixed coordinates: these tests exercise the module payload lanes; the
+    // epoch fields just have to round-trip through the manifest.
+    let coords = statesync::BoundaryCoords {
+        epoch: 0,
+        view_base: 0,
+        participants: vec![],
+        floor_cert: None,
+    };
     while let Some((frame, reply)) = rx.next().await {
-        let resp = server.handle_frame(host, Some(finalized), &frame).await;
+        let resp = server.handle_frame(host, Some(finalized), &coords, &frame).await;
         // a dropped reply receiver just means the client gave up — server-side
         // that is not an error.
         let _ = reply.send(resp);
@@ -199,6 +207,7 @@ fn stale_capture_requests_are_refused_not_mis_served() {
             .handle(
                 &host,
                 Some(finalized),
+                &statesync::BoundaryCoords::default(),
                 SyncRequest::Chunk { height: 999, module_id: "kv".into(), offset: 0 },
             )
             .await;
@@ -210,7 +219,9 @@ fn stale_capture_requests_are_refused_not_mis_served() {
         // manifest against a WRONG finalized boundary (host has advanced past
         // it) is refused by the host's app-hash gate, not served stale.
         let wrong = FinalizedBlock { height: 0, app_hash: StateRoot([1u8; 32]) };
-        let resp = server.handle(&host, Some(wrong), SyncRequest::Manifest).await;
+        let resp = server
+            .handle(&host, Some(wrong), &statesync::BoundaryCoords::default(), SyncRequest::Manifest)
+            .await;
         assert!(
             matches!(resp, SyncResponse::Error(ref e) if e.contains("capture failed")),
             "a mismatched boundary must refuse, got {resp:?}"

@@ -122,10 +122,30 @@ pub struct ManifestEntry {
 }
 
 /// the joiner's picture of one captured boundary.
+///
+/// besides the module payloads, the manifest carries the boundary's CONSENSUS
+/// COORDINATES — everything a syncing joiner needs to become a validator at
+/// this exact boundary. like the app-hash, these are unauthenticated serving
+/// hints under the same trust model: a lying epoch or base makes the joiner's
+/// heights (and thus its app-hash) diverge, which fails loudly; a fabricated
+/// world still cannot vote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub height: u64,
     pub app_hash: StateRoot,
+    /// the consensus epoch whose engine was live at `height`.
+    pub epoch: u64,
+    /// that epoch's app-height base (`app_height = view_base + engine view`).
+    pub view_base: u64,
+    /// the epoch's engine participant set (raw public-key bytes) — NOT
+    /// necessarily the valset projection at `height`, which may already
+    /// stage a change awaiting its cutover.
+    pub participants: Vec<Vec<u8>>,
+    /// the scheme-encoded finalization certificate for exactly `height`,
+    /// when the serving node holds one (`None` right after a cutover, when
+    /// the epoch has not finalized past its base — the joiner then spawns on
+    /// the epoch's genesis floor instead).
+    pub floor_cert: Option<Vec<u8>>,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -222,6 +242,19 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             out.push(0u8);
             out.extend_from_slice(&m.height.to_le_bytes());
             out.extend_from_slice(m.app_hash.as_bytes());
+            out.extend_from_slice(&m.epoch.to_le_bytes());
+            out.extend_from_slice(&m.view_base.to_le_bytes());
+            out.extend_from_slice(&(m.participants.len() as u64).to_le_bytes());
+            for p in &m.participants {
+                wire::put_bytes(&mut out, p);
+            }
+            match &m.floor_cert {
+                Some(cert) => {
+                    out.push(1);
+                    wire::put_bytes(&mut out, cert);
+                }
+                None => out.push(0),
+            }
             out.extend_from_slice(&(m.entries.len() as u64).to_le_bytes());
             for e in &m.entries {
                 wire::put_str(&mut out, &e.module_id);
@@ -253,6 +286,26 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
         0 => {
             let height = wire::take_u64(&mut buf)?;
             let app_hash = StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?);
+            let epoch = wire::take_u64(&mut buf)?;
+            let view_base = wire::take_u64(&mut buf)?;
+            let p = wire::take_u64(&mut buf)?;
+            // each participant costs at least its 8-byte length prefix, so a
+            // forged count can never drive allocation past the buffer.
+            if p > (buf.len() / 8) as u64 {
+                return Err(WireError::Codec(format!(
+                    "participant count {p} exceeds the {} remaining bytes",
+                    buf.len()
+                )));
+            }
+            let mut participants = Vec::with_capacity(p as usize);
+            for _ in 0..p {
+                participants.push(wire::take_bytes(&mut buf)?.to_vec());
+            }
+            let floor_cert = match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
+                t => return Err(WireError::BadTag("floor_cert", t)),
+            };
             let n = wire::take_u64(&mut buf)?;
             // each entry costs at least its id length prefix + root + kind, so
             // a forged count can never drive allocation past the buffer.
@@ -273,6 +326,10 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
             SyncResponse::Manifest(Manifest {
                 height,
                 app_hash,
+                epoch,
+                view_base,
+                participants,
+                floor_cert,
                 entries,
             })
         }
@@ -338,10 +395,25 @@ struct CapturedModule {
     payload: CapturedPayload,
 }
 
+/// consensus coordinates of a served boundary — captured WITH the module
+/// payloads so a later manifest request for the same height serves one
+/// consistent picture. the caller (the node's pump, which owns both the host
+/// and the consensus wiring) supplies them per request; the floor-cert
+/// contract is the caller's: pass it only when it certifies exactly the
+/// current finalized height.
+#[derive(Debug, Clone, Default)]
+pub struct BoundaryCoords {
+    pub epoch: u64,
+    pub view_base: u64,
+    pub participants: Vec<Vec<u8>>,
+    pub floor_cert: Option<Vec<u8>>,
+}
+
 /// a consistent boundary capture: every payload from ONE finalized boundary.
 #[derive(Debug, Clone)]
 struct Capture {
     app_hash: StateRoot,
+    coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
 }
 
@@ -361,14 +433,16 @@ impl SyncServer {
     }
 
     /// handle one decoded request. `finalized` is the node's latest applied
-    /// boundary (None before the first block) — required for Manifest.
+    /// boundary (None before the first block) and `coords` its consensus
+    /// coordinates — both required for Manifest.
     pub async fn handle(
         &mut self,
         host: &Host,
         finalized: Option<FinalizedBlock>,
+        coords: &BoundaryCoords,
         req: SyncRequest,
     ) -> SyncResponse {
-        match self.try_handle(host, finalized, req).await {
+        match self.try_handle(host, finalized, coords, req).await {
             Ok(resp) => resp,
             Err(msg) => SyncResponse::Error(msg),
         }
@@ -379,10 +453,11 @@ impl SyncServer {
         &mut self,
         host: &Host,
         finalized: Option<FinalizedBlock>,
+        coords: &BoundaryCoords,
         frame: &[u8],
     ) -> Vec<u8> {
         let resp = match decode_request(frame) {
-            Ok(req) => self.handle(host, finalized, req).await,
+            Ok(req) => self.handle(host, finalized, coords, req).await,
             Err(e) => SyncResponse::Error(format!("bad request frame: {e}")),
         };
         encode_response(&resp)
@@ -392,12 +467,13 @@ impl SyncServer {
         &mut self,
         host: &Host,
         finalized: Option<FinalizedBlock>,
+        coords: &BoundaryCoords,
         req: SyncRequest,
     ) -> Result<SyncResponse, String> {
         match req {
             SyncRequest::Manifest => {
                 let finalized = finalized.ok_or("no finalized boundary to serve yet")?;
-                self.ensure_capture(host, finalized).await?;
+                self.ensure_capture(host, finalized, coords).await?;
                 let capture = self
                     .captures
                     .get(&finalized.height)
@@ -405,6 +481,10 @@ impl SyncServer {
                 Ok(SyncResponse::Manifest(Manifest {
                     height: finalized.height,
                     app_hash: capture.app_hash,
+                    epoch: capture.coords.epoch,
+                    view_base: capture.coords.view_base,
+                    participants: capture.coords.participants.clone(),
+                    floor_cert: capture.coords.floor_cert.clone(),
                     entries: capture
                         .modules
                         .iter()
@@ -459,6 +539,7 @@ impl SyncServer {
         &mut self,
         host: &Host,
         finalized: FinalizedBlock,
+        coords: &BoundaryCoords,
     ) -> Result<(), String> {
         if self.captures.contains_key(&finalized.height) {
             return Ok(());
@@ -487,6 +568,7 @@ impl SyncServer {
             finalized.height,
             Capture {
                 app_hash: snapshot.app_hash,
+                coords: coords.clone(),
                 modules,
             },
         );
@@ -592,6 +674,10 @@ mod tests {
             SyncResponse::Manifest(Manifest {
                 height: 7,
                 app_hash: StateRoot([9u8; ROOT_LEN]),
+                epoch: 2,
+                view_base: 5,
+                participants: vec![vec![3u8; 32], vec![4u8; 32]],
+                floor_cert: Some(vec![0xCC; 96]),
                 entries: vec![
                     ManifestEntry {
                         module_id: "kv".into(),
@@ -604,6 +690,17 @@ mod tests {
                         kind: PayloadKind::Snapshot,
                     },
                 ],
+            }),
+            // a fresh-epoch boundary: no finalization past the base yet, so
+            // no floor certificate — the joiner spawns on the genesis floor.
+            SyncResponse::Manifest(Manifest {
+                height: 12,
+                app_hash: StateRoot([8u8; ROOT_LEN]),
+                epoch: 1,
+                view_base: 12,
+                participants: vec![vec![3u8; 32]],
+                floor_cert: None,
+                entries: vec![],
             }),
             SyncResponse::Chunk {
                 total: 10,
@@ -640,11 +737,26 @@ mod tests {
     }
 
     #[test]
-    fn forged_manifest_count_rejects_before_allocation() {
-        // header: tag 0, height, app_hash, then a count far past the buffer.
+    fn forged_manifest_counts_reject_before_allocation() {
+        // header: tag 0, height, app_hash, epoch, view_base, then a forged
+        // PARTICIPANT count far past the buffer.
         let mut bytes = vec![0u8];
         bytes.extend_from_slice(&1u64.to_le_bytes());
         bytes.extend_from_slice(&[0u8; ROOT_LEN]);
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode_response(&bytes).is_err());
+
+        // same header, zero participants + no floor cert, then a forged
+        // ENTRY count.
+        let mut bytes = vec![0u8];
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; ROOT_LEN]);
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.push(0);
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
     }
