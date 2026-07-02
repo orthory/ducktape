@@ -9,11 +9,17 @@
 //! op-log ordered, so a naive "export current pairs and re-apply" could never
 //! reproduce it — only the real sync path can. the joiner rebuilds kv, document,
 //! and chat through the qmdb sync engine (target + resolver), forge / valset /
-//! directory / saga through snapshot + install gated on the source root, and
-//! greeter fresh (stateless). every reconstructed module is then read back —
-//! content, not just digests — and one tampered snapshot must be refused without
-//! disturbing the already-installed state.
+//! directory / saga / agent through snapshot + install gated on the source
+//! root, and greeter fresh (stateless). every reconstructed module is then
+//! read back — content, not just digests — and one tampered snapshot must be
+//! refused without disturbing the already-installed state.
 
+use agent::AgentModule;
+use agent_interface::{
+    ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentStatus, TurnPolicy,
+    decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
+    encode_query as agent_encode_query,
+};
 use chat::Chat;
 use chat_interface::{
     Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, MessageView, PostPolicy,
@@ -103,6 +109,20 @@ async fn commit_op(module: &mut dyn Module, at: u64, payload: Vec<u8>) {
     module.commit_block().await.unwrap();
 }
 
+/// like [`commit_op`] but with an explicit dispatch origin — the agent
+/// module's admin ops are owner-gated and reject the system origin.
+async fn commit_op_as(module: &mut dyn Module, at: u64, origin: sdk::Origin, payload: Vec<u8>) {
+    let target = module.id();
+    let msg = Msg {
+        target: target.clone(),
+        payload,
+    };
+    let mut ctx = TestCtx::at(at, &target);
+    ctx.env.origin = origin;
+    module.execute(&mut ctx, &msg).await.unwrap();
+    module.commit_block().await.unwrap();
+}
+
 /// the (id, root) pair a node's registry reports for a module — the exact input
 /// `state::global_root` consumes. needed because ONE deterministic runner
 /// shares ONE storage-partition namespace: the joiner's qmdb stores must
@@ -150,11 +170,12 @@ fn joiner_app_hash(
     forge: &dyn Module,
     valset: &dyn Module,
     saga: &dyn Module,
+    agent: &dyn Module,
 ) -> StateRoot {
     let kv_entry = RegistryEntry::of("kv", kv);
     let document_entry = RegistryEntry::of("document", document);
     let chat_entry = RegistryEntry::of("chat", chat);
-    let mods: [&dyn Module; 8] = [
+    let mods: [&dyn Module; 9] = [
         &kv_entry,
         directory,
         greeter,
@@ -163,6 +184,7 @@ fn joiner_app_hash(
         &chat_entry,
         valset,
         saga,
+        agent,
     ];
     global_root(&mods)
 }
@@ -334,6 +356,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 message_id: "m1".into(),
                 blocks: vec![ChatBlock::paragraph("hello")],
                 thread: None,
+                as_agent: None,
             }),
         )
         .await;
@@ -345,6 +368,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 message_id: "r1".into(),
                 blocks: vec![ChatBlock::paragraph("threaded")],
                 thread: Some(1),
+                as_agent: None,
             }),
         )
         .await;
@@ -452,6 +476,58 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         )
         .await;
 
+        // the agent orchestrator: a registry entry per owner shape (one
+        // paused) plus a channel watch — the run machinery is exercised by
+        // the agent crate's own snapshot suite; this leg pins the joiner
+        // path. admin ops are owner-gated, so they carry an external origin.
+        let owner = sdk::Origin::External(b"agent-owner".to_vec());
+        let mut src_agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        commit_op_as(
+            &mut src_agent,
+            30,
+            owner.clone(),
+            agent_encode_msg(&AgentMsg::RegisterAgent {
+                agent_id: "quackbot".into(),
+                display_name: "Quackbot".into(),
+                model_ref: "mock-llm-1".into(),
+                prompt_hash: vec![7u8; 32],
+                allowed_actions: vec![ACTION_CHAT_POST.into()],
+            }),
+        )
+        .await;
+        commit_op_as(
+            &mut src_agent,
+            31,
+            owner.clone(),
+            agent_encode_msg(&AgentMsg::RegisterAgent {
+                agent_id: "sleepy".into(),
+                display_name: "Sleepy".into(),
+                model_ref: "mock-llm-1".into(),
+                prompt_hash: vec![8u8; 32],
+                allowed_actions: Vec::new(),
+            }),
+        )
+        .await;
+        commit_op_as(
+            &mut src_agent,
+            32,
+            owner.clone(),
+            agent_encode_msg(&AgentMsg::PauseAgent {
+                agent_id: "sleepy".into(),
+            }),
+        )
+        .await;
+        commit_op_as(
+            &mut src_agent,
+            33,
+            owner.clone(),
+            agent_encode_msg(&AgentMsg::WatchChannel {
+                channel_id: "general".into(),
+                policy: TurnPolicy::Mention,
+            }),
+        )
+        .await;
+
         let src_greeter = Greeter::new("greeter");
 
         // ---- the source app-hash: what consensus commits to ------------------
@@ -462,6 +538,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let src_chat_root = src_chat.root();
         let src_valset_root = src_valset.root();
         let src_saga_root = src_saga.root();
+        let src_agent_root = src_agent.root();
         for (id, root) in [
             ("kv", src_kv_root),
             ("document", src_document_root),
@@ -470,6 +547,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             ("chat", src_chat_root),
             ("valset", src_valset_root),
             ("saga", src_saga_root),
+            ("agent", src_agent_root),
         ] {
             assert_ne!(
                 root,
@@ -479,7 +557,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         }
 
         let src_global = {
-            let mods: [&dyn Module; 8] = [
+            let mods: [&dyn Module; 9] = [
                 &src_kv,
                 &src_directory,
                 &src_greeter,
@@ -488,6 +566,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &src_chat,
                 &src_valset,
                 &src_saga,
+                &src_agent,
             ];
             global_root(&mods)
         };
@@ -501,6 +580,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // slice.
         let valset_bytes = src_valset.snapshot();
         let saga_bytes = src_saga.snapshot();
+        let agent_bytes = src_agent.snapshot();
         let forge_bytes = src_forge.snapshot().expect("forge snapshot");
         let src_validators = validators(&src_valset).await;
         let src_chat_messages = chat_messages(&src_chat, "general").await;
@@ -612,6 +692,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         join_saga
             .install(&saga_bytes, src_saga_root)
             .expect("saga install");
+        let mut join_agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        join_agent
+            .install(&agent_bytes, src_agent_root)
+            .expect("agent install");
         let mut join_forge = Forge::init("forge", joiner_dir.clone()).expect("joiner forge init");
         join_forge
             .install(&forge_bytes, src_forge_root)
@@ -654,6 +738,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             src_forge_root,
             "forge: installed root != source root"
         );
+        assert_eq!(
+            join_agent.root(),
+            src_agent_root,
+            "agent: installed root != source root"
+        );
 
         // ...and the composed app-hash over the same canonical ids is the exact
         // digest consensus committed on the source — THE joiner property.
@@ -667,6 +756,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &join_forge,
                 &join_valset,
                 &join_saga,
+                &join_agent,
             ),
             src_global,
             "the joiner must land on the exact source app-hash"
@@ -728,6 +818,35 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         assert_eq!(translate.status, SagaStatus::Pending);
         assert_eq!(translate.result, None);
 
+        // agent: the registry (statuses included) and the watch survived.
+        let reply = join_agent
+            .query(&agent_encode_query(&AgentQuery::Agents))
+            .await
+            .unwrap();
+        let AgentReply::Agents(agents) = agent_decode_reply(&reply).unwrap() else {
+            panic!("agents reply expected");
+        };
+        assert_eq!(
+            agents
+                .iter()
+                .map(|a| (a.agent_id.as_str(), a.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("quackbot", AgentStatus::Active),
+                ("sleepy", AgentStatus::Paused),
+            ]
+        );
+        let reply = join_agent
+            .query(&agent_encode_query(&AgentQuery::Watches))
+            .await
+            .unwrap();
+        let AgentReply::Watches(watches) = agent_decode_reply(&reply).unwrap() else {
+            panic!("watches reply expected");
+        };
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].channel_id, "general");
+        assert_eq!(watches[0].policy, TurnPolicy::Mention);
+
         // forge: read the committed FILE back out of the joiner's OWN repo —
         // proof the pack landed real objects (commit, tree, blob), not just a
         // head oid that rehashes to the right root.
@@ -786,6 +905,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &join_forge,
                 &join_valset,
                 &join_saga,
+                &join_agent,
             ),
             src_global
         );

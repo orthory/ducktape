@@ -25,7 +25,7 @@ emitted as messages that the host drains as follow-up ops.
 | --- | --- |
 | `crates/kernel/` | The platform: `sdk` (module contract), `state` (app-hash composition), `host` (registry + dispatch + block lifecycle), `node` (transport seam), `consensus` (commonware Simplex BFT orderer), `reactor` (worker loop for non-deterministic effects) |
 | `crates/system/` | Consensus-infrastructure modules: `kv` (QMDB byte-KV), `valset` (ed25519 validator membership), `saga` (deterministic async continuations), `wireguard-upgrade` |
-| `crates/apps/` | Product modules: `forge` (git-backed project state), `document`, `chat`, `tasks` |
+| `crates/apps/` | Product modules: `forge` (git-backed project state), `document`, `chat`, `agent` (LLM-run orchestrator: registry, watches, runs), `tasks` |
 | `crates/examples/` | Demo and test scaffolding modules: `directory`, `greeter` |
 | `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (real-socket validator process) |
 | `docs/` | Vocs documentation site (human/agent tracks, English/Korean) |

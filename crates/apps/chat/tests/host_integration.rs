@@ -144,6 +144,7 @@ fn host_commits_chat_blocks_and_serves_history_queries() {
                 message_id: "m1".into(),
                 blocks: vec![Block::paragraph("hello")],
                 thread: None,
+                as_agent: None,
             }),
         )
         .await
@@ -183,6 +184,7 @@ fn host_rolls_back_failed_chat_blocks() {
                     message_id: "m1".into(),
                     blocks: vec![Block::paragraph("hello")],
                     thread: None,
+                    as_agent: None,
                 }),
             )
             .await
@@ -252,6 +254,7 @@ fn hook_notifications_commit_atomically_with_the_post() {
                 message_id: "m1".into(),
                 blocks: vec![Block::paragraph("notify me")],
                 thread: None,
+                as_agent: None,
             }),
         )
         .await
@@ -294,6 +297,7 @@ fn hook_notifications_commit_atomically_with_the_post() {
                     message_id: "m2".into(),
                     blocks: vec![Block::paragraph("this must vanish")],
                     thread: None,
+                    as_agent: None,
                 }),
             )
             .await

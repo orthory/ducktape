@@ -96,6 +96,7 @@ fn post(channel: &str, message_id: &str, text: &str, thread: Option<u64>) -> Cha
         message_id: message_id.into(),
         blocks: vec![Block::paragraph(text)],
         thread,
+        as_agent: None,
     }
 }
 
@@ -580,6 +581,104 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
 }
 
 #[test]
+fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let root_before = module.root();
+
+        let as_agent_post = |message_id: &str| ChatMsg::PostMessage {
+            channel_id: "general".into(),
+            message_id: message_id.into(),
+            blocks: vec![Block::paragraph("agent reply")],
+            thread: None,
+            as_agent: Some("quackbot".into()),
+        };
+
+        // an external user claiming an agent identity is rejected — users are
+        // not genesis-trusted code — and so is the system origin.
+        for origin in [user(1), Origin::System] {
+            let err = module
+                .execute(
+                    &mut TestCtx::with_origin(20, origin),
+                    &module_msg(as_agent_post("m1")),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Module(_)));
+            module.abort_block().await.unwrap();
+            assert_eq!(module.root(), root_before, "the rejection leaves no trace");
+        }
+
+        // an empty agent id never passes, even from a module origin.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(20, Origin::Module("agent".into())),
+                &module_msg(ChatMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "m1".into(),
+                    blocks: vec![Block::paragraph("agent reply")],
+                    thread: None,
+                    as_agent: Some(String::new()),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        module.abort_block().await.unwrap();
+
+        // a module origin is honored: the stored author is the FULL agent ref,
+        // module half from the origin, agent half from the payload.
+        module
+            .execute(
+                &mut TestCtx::with_origin(21, Origin::Module("agent".into())),
+                &module_msg(as_agent_post("m1")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Message(Some(view)) = query(
+            &module,
+            ChatQuery::Message {
+                message_id: "m1".into(),
+            },
+        )
+        .await
+        else {
+            panic!("message must exist");
+        };
+        assert_eq!(
+            view.head.author,
+            AuthorRef::Agent {
+                module: "agent".into(),
+                agent_id: "quackbot".into(),
+            }
+        );
+
+        // author checks compare the FULL AuthorRef: the bare module origin is
+        // a different author than its agent, so it cannot edit the agent post.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(22, Origin::Module("agent".into())),
+                &module_msg(ChatMsg::EditMessage {
+                    channel_id: "general".into(),
+                    seq: 1,
+                    blocks: vec![Block::paragraph("rewritten")],
+                    base_rev: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        module.abort_block().await.unwrap();
+    });
+}
+
+#[test]
 fn reactions_are_idempotent_sets_per_emoji_and_author() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = Chat::init(context, "chat").await;
@@ -980,6 +1079,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
                         },
                     ])],
                     thread: None,
+                    as_agent: None,
                 }),
             )
             .await
