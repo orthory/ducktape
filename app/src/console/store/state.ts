@@ -14,6 +14,10 @@ export interface ConsoleState {
   author: string;
   /** The node answered the last status query. */
   connected: boolean;
+  /** The daemon url this build resolved to (null until bootstrap finishes). */
+  nodeUrl: string | null;
+  /** True when this app owns the daemon lifecycle (desktop build). */
+  managed: boolean;
   status: NodeStatus | null;
   channels: ChatChannel[];
   activeChannel: string | null;
@@ -31,6 +35,8 @@ export const createInitialState = (): ConsoleState => ({
   accent: DEFAULT_ACCENT,
   author: "operator",
   connected: false,
+  nodeUrl: null,
+  managed: false,
   status: null,
   channels: [],
   activeChannel: null,

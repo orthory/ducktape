@@ -31,28 +31,53 @@ const shortHash = (hex: string): string =>
   hex.length > 16 ? `${hex.slice(0, 8)}…${hex.slice(-8)}` : hex || "—";
 
 export function StatusView() {
-  const { state } = useDucktape();
+  const { state, actions } = useDucktape();
   const status = state.status;
 
   return (
     <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
       <div
         style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
           padding: "11px 17px",
           borderBottom: `1px solid ${color.borderSoft}`,
-          font: `600 13px ${font.sans}`,
-          color: color.ink,
         }}
       >
-        Node
+        <span style={{ font: `600 13px ${font.sans}`, color: color.ink }}>Node</span>
+        {state.managed && (
+          <button
+            onClick={state.connected ? actions.stopNode : actions.startNode}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              padding: "5px 11px",
+              borderRadius: radius.sm,
+              border: `1px solid ${color.borderStrong}`,
+              background: color.paper,
+              font: `600 11px ${font.sans}`,
+              color: state.connected ? color.red : color.green,
+            }}
+          >
+            {state.connected ? "Stop node" : "Start node"}
+          </button>
+        )}
       </div>
 
       <div style={{ padding: 17, display: "flex", flexDirection: "column", gap: 17, overflowY: "auto" }}>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <Stat label="CONNECTION" value={state.connected ? "connected" : "disconnected"} />
           <Stat label="HEIGHT" value={(status?.height ?? 0).toLocaleString()} />
-          <Stat label="TARGET" value={"__TAURI_INTERNALS__" in window ? "embedded" : "remote"} />
+          <Stat label="DAEMON" value={state.managed ? "managed" : "remote"} />
+          <Stat label="VERSION" value={status?.version ?? "—"} />
         </div>
+
+        {state.nodeUrl && (
+          <div style={{ font: `400 11px ${font.mono}`, color: color.muted2, margin: "-8px 2px 0" }}>
+            {state.nodeUrl}
+          </div>
+        )}
 
         <div
           style={{

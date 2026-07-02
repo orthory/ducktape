@@ -9,5 +9,8 @@ cd "$(dirname "$0")/.."
 triple=$(rustc -vV | sed -n 's/^host: //p')
 cargo build --release -p noded --manifest-path ../Cargo.toml
 mkdir -p src-tauri/binaries
+# rm first: cp onto the existing build.rs placeholder would keep the
+# placeholder's non-executable mode
+rm -f "src-tauri/binaries/ducktape-noded-${triple}"
 cp "../target/release/ducktape-noded" "src-tauri/binaries/ducktape-noded-${triple}"
 echo "staged src-tauri/binaries/ducktape-noded-${triple}"
