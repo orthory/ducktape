@@ -1,6 +1,6 @@
 //! a runnable super-app demo: seven isolated modules — a qmdb-backed kv, a sync
 //! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
-//! block DOCUMENT module, an in-memory messaging app with channels, and an
+//! block DOCUMENT module, a qmdb-backed messaging app with channels, and an
 //! ed25519 permissionless VALSET — dispatched over ONE host, showing the app-hash
 //! evolve as typed cross-module ops flow, forge's git HEAD oid compose into that
 //! same app-hash as its root, document and messaging roots do the same, and a new
@@ -8,26 +8,34 @@
 //!
 //! run: `cargo run -p demo`
 
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_codec::DecodeExt as _;
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
-use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery};
-use forge::Forge;
-use forge_interface::{decode_reply as forge_decode_reply, encode_msg as forge_encode_msg,
-    encode_query as forge_encode_query, ForgeMsg, ForgeQuery, ForgeReply};
+use directory_interface::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
 use document::Document;
-use document_interface::{decode_reply as doc_decode_reply, encode_msg as doc_encode_msg,
-    encode_query as doc_encode_query, Block, BlockKind, DocMsg, DocQuery, DocReply};
+use document_interface::{
+    Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
+    encode_msg as doc_encode_msg, encode_query as doc_encode_query,
+};
+use forge::Forge;
+use forge_interface::{
+    ForgeMsg, ForgeQuery, ForgeReply, decode_reply as forge_decode_reply,
+    encode_msg as forge_encode_msg, encode_query as forge_encode_query,
+};
 use greeter::Greeter;
 use host::Host;
 use messaging::Messaging;
-use messaging_interface::{decode_reply as messaging_decode_reply, encode_msg as messaging_encode_msg,
-    encode_query as messaging_encode_query, MessagingMsg, MessagingQuery, MessagingReply};
+use messaging_interface::{
+    MessagingMsg, MessagingQuery, MessagingReply, decode_reply as messaging_decode_reply,
+    encode_msg as messaging_encode_msg, encode_query as messaging_encode_query,
+};
 use sdk::Msg;
 use valset::Valset;
-use valset_interface::{decode_reply as valset_decode_reply, encode_msg as valset_encode_msg,
-    encode_query as valset_encode_query, ValsetMsg, ValsetQuery, ValsetReply};
-use commonware_cryptography::{ed25519::PrivateKey, Signer as _};
-use commonware_codec::DecodeExt as _;
+use valset_interface::{
+    ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
+    encode_msg as valset_encode_msg, encode_query as valset_encode_query,
+};
 
 fn main() {
     // forge's substrate is a real git repo on disk. wipe any prior run's dir so
@@ -38,11 +46,11 @@ fn main() {
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real chain).
         let document = Document::init(context.child("document"), "document").await;
-        let kv = kv::Kv::init(context, "kv").await;
+        let kv = kv::Kv::init(context.child("kv"), "kv").await;
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
         let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
-        let messaging = Messaging::new("messaging");
+        let messaging = Messaging::init(context.child("messaging"), "messaging").await;
         let valset = Valset::new("valset");
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -58,16 +66,31 @@ fn main() {
         println!("=== super-app demo — 7 isolated modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
-        println!("genesis forge root (unborn git repo): {:?}", host.module_root("forge").unwrap());
-        println!("genesis valset root (empty set)     : {:?}", host.module_root("valset").unwrap());
-        println!("genesis document root (no docs)     : {:?}", host.module_root("document").unwrap());
-        println!("genesis messaging root (no channels): {:?}", host.module_root("messaging").unwrap());
+        println!(
+            "genesis forge root (unborn git repo): {:?}",
+            host.module_root("forge").unwrap()
+        );
+        println!(
+            "genesis valset root (empty set)     : {:?}",
+            host.module_root("valset").unwrap()
+        );
+        println!(
+            "genesis document root (no docs)     : {:?}",
+            host.module_root("document").unwrap()
+        );
+        println!(
+            "genesis messaging root (no channels): {:?}",
+            host.module_root("messaging").unwrap()
+        );
 
         // block 1: a typed Set to the in-memory directory module.
         let out = host
             .submit(Msg {
                 target: "directory".into(),
-                payload: encode_msg(&DirMsg::Set { key: "name".into(), value: "world".into() }),
+                payload: encode_msg(&DirMsg::Set {
+                    key: "name".into(),
+                    value: "world".into(),
+                }),
             })
             .await
             .expect("submit block 1");
@@ -77,7 +100,10 @@ fn main() {
         // block 2: trigger greeter. it QUERIES directory (typed, cross-module),
         // then emits typed follow-up writes to directory + kv — all in one block.
         let out = host
-            .submit(Msg { target: "greeter".into(), payload: b"name".to_vec() })
+            .submit(Msg {
+                target: "greeter".into(),
+                payload: b"name".to_vec(),
+            })
             .await
             .expect("submit block 2");
         println!("\n[block 2] greeter(name): query directory -> write greeting to directory + kv");
@@ -99,7 +125,10 @@ fn main() {
             .expect("submit block 3");
         println!("\n[block 3] forge <- Commit(README.md) — a real git commit");
         println!("  app-hash       : {:?}", out.app_hash);
-        println!("  forge root     : {:?}", host.module_root("forge").unwrap());
+        println!(
+            "  forge root     : {:?}",
+            host.module_root("forge").unwrap()
+        );
 
         // read forge's HEAD back out (typed query) — the sha1 git oid hex. this hex is
         // the sha256 PREIMAGE of the forge root: a git commit addressing the app-hash.
@@ -114,23 +143,41 @@ fn main() {
 
         // read the derived greeting back out of the directory (sync typed query).
         let reply = host
-            .query("directory", &encode_query(&DirQuery::Get { key: "greeting:name".into() }))
+            .query(
+                "directory",
+                &encode_query(&DirQuery::Get {
+                    key: "greeting:name".into(),
+                }),
+            )
             .await
             .expect("query directory");
-        println!("\ndirectory[greeting:name] = {:?}", decode_reply(&reply).unwrap());
+        println!(
+            "\ndirectory[greeting:name] = {:?}",
+            decode_reply(&reply).unwrap()
+        );
 
         // and read it back out of the QMDB kv module — a real async cross-module read.
         let kv_reply = host
-            .query("kv", &kv_interface::encode_query(&kv_interface::KvQuery::Get { key: b"greeting:name".to_vec() }))
+            .query(
+                "kv",
+                &kv_interface::encode_query(&kv_interface::KvQuery::Get {
+                    key: b"greeting:name".to_vec(),
+                }),
+            )
             .await
             .expect("query kv");
-        if let kv_interface::KvReply::Value(Some(v)) = kv_interface::decode_reply(&kv_reply).unwrap() {
-            println!("kv[greeting:name]        = {:?}", String::from_utf8_lossy(&v));
+        if let kv_interface::KvReply::Value(Some(v)) =
+            kv_interface::decode_reply(&kv_reply).unwrap()
+        {
+            println!(
+                "kv[greeting:name]        = {:?}",
+                String::from_utf8_lossy(&v)
+            );
         }
 
         // block 4: create a channel, then block 5 posts a message into that
         // channel. messaging is an isolated product app module with a typed wire
-        // surface and a state-based root.
+        // surface and a real qmdb storage root.
         let out = host
             .submit(Msg {
                 target: "messaging".into(),
@@ -142,7 +189,10 @@ fn main() {
             .await
             .expect("submit block 4");
         println!("\n[block 4] messaging <- CreateChannel(general)");
-        println!("  messaging root : {:?}", host.module_root("messaging").unwrap());
+        println!(
+            "  messaging root : {:?}",
+            host.module_root("messaging").unwrap()
+        );
         println!("  app-hash       : {:?}", out.app_hash);
 
         let out = host
@@ -158,13 +208,21 @@ fn main() {
             .await
             .expect("submit block 5");
         let reply = host
-            .query("messaging", &messaging_encode_query(&MessagingQuery::Messages { channel_id: "general".into() }))
+            .query(
+                "messaging",
+                &messaging_encode_query(&MessagingQuery::Messages {
+                    channel_id: "general".into(),
+                }),
+            )
             .await
             .expect("query messaging");
         if let MessagingReply::Messages(messages) = messaging_decode_reply(&reply).unwrap() {
             println!("\n[block 5] messaging <- PostMessage(general, m1)");
             println!("  message count  : {}", messages.len());
-            println!("  messaging root : {:?}", host.module_root("messaging").unwrap());
+            println!(
+                "  messaging root : {:?}",
+                host.module_root("messaging").unwrap()
+            );
             println!("  app-hash       : {:?}", out.app_hash);
         }
 
@@ -181,7 +239,9 @@ fn main() {
         let out = host
             .submit(Msg {
                 target: "valset".into(),
-                payload: valset_encode_msg(&ValsetMsg::Join { key: new_validator.clone() }),
+                payload: valset_encode_msg(&ValsetMsg::Join {
+                    key: new_validator.clone(),
+                }),
             })
             .await
             .expect("submit block 6");
@@ -192,7 +252,10 @@ fn main() {
             .expect("query valset");
         let ValsetReply::Validators(vs) = valset_decode_reply(&reply).unwrap();
         println!("  validator count: {} (was 0 at genesis)", vs.len());
-        println!("  valset root    : {:?}", host.module_root("valset").unwrap());
+        println!(
+            "  valset root    : {:?}",
+            host.module_root("valset").unwrap()
+        );
         println!("  app-hash       : {:?}", out.app_hash);
 
         // block 7: the DOCUMENT module (ducktape's founding product, reborn as a
@@ -202,38 +265,65 @@ fn main() {
         println!("\n[block 7] document <- CreateDoc + 2x InsertBlock + UpdateBlock");
         host.submit(Msg {
             target: "document".into(),
-            payload: doc_encode_msg(&DocMsg::CreateDoc { doc_id: "readme".into() }),
-        }).await.expect("doc create");
+            payload: doc_encode_msg(&DocMsg::CreateDoc {
+                doc_id: "readme".into(),
+            }),
+        })
+        .await
+        .expect("doc create");
         host.submit(Msg {
             target: "document".into(),
             payload: doc_encode_msg(&DocMsg::InsertBlock {
                 doc_id: "readme".into(),
                 after: None,
-                block: Block { id: "title".into(), kind: BlockKind::Heading, text: "ducktape".into() },
+                block: Block {
+                    id: "title".into(),
+                    kind: BlockKind::Heading,
+                    text: "ducktape".into(),
+                },
             }),
-        }).await.expect("doc insert 1");
+        })
+        .await
+        .expect("doc insert 1");
         host.submit(Msg {
             target: "document".into(),
             payload: doc_encode_msg(&DocMsg::InsertBlock {
                 doc_id: "readme".into(),
                 after: Some("title".into()),
-                block: Block { id: "intro".into(), kind: BlockKind::Paragraph, text: "a block document".into() },
+                block: Block {
+                    id: "intro".into(),
+                    kind: BlockKind::Paragraph,
+                    text: "a block document".into(),
+                },
             }),
-        }).await.expect("doc insert 2");
-        let out = host.submit(Msg {
-            target: "document".into(),
-            payload: doc_encode_msg(&DocMsg::UpdateBlock {
-                doc_id: "readme".into(),
-                block_id: "intro".into(),
-                text: "a simple, block-based document on qmdb".into(),
-            }),
-        }).await.expect("doc update");
+        })
+        .await
+        .expect("doc insert 2");
+        let out = host
+            .submit(Msg {
+                target: "document".into(),
+                payload: doc_encode_msg(&DocMsg::UpdateBlock {
+                    doc_id: "readme".into(),
+                    block_id: "intro".into(),
+                    text: "a simple, block-based document on qmdb".into(),
+                }),
+            })
+            .await
+            .expect("doc update");
         println!("  app-hash       : {:?}", out.app_hash);
-        println!("  document root  : {:?}", host.module_root("document").unwrap());
+        println!(
+            "  document root  : {:?}",
+            host.module_root("document").unwrap()
+        );
 
         // read the whole doc back out (typed query) — the ordered blocks.
         let reply = host
-            .query("document", &doc_encode_query(&DocQuery::GetDoc { doc_id: "readme".into() }))
+            .query(
+                "document",
+                &doc_encode_query(&DocQuery::GetDoc {
+                    doc_id: "readme".into(),
+                }),
+            )
             .await
             .expect("query document");
         if let DocReply::Doc(Some(blocks)) = doc_decode_reply(&reply).unwrap() {
@@ -244,7 +334,15 @@ fn main() {
         }
 
         println!("\nmodule roots:");
-        for id in ["directory", "document", "forge", "greeter", "kv", "messaging", "valset"] {
+        for id in [
+            "directory",
+            "document",
+            "forge",
+            "greeter",
+            "kv",
+            "messaging",
+            "valset",
+        ] {
             println!("  {id:>10} : {:?}", host.module_root(id).unwrap());
         }
         println!("\nfinal app-hash   : {:?}", host.app_hash());

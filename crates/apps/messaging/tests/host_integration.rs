@@ -1,3 +1,4 @@
+use commonware_runtime::{Runner as _, deterministic};
 use host::Host;
 use messaging::Messaging;
 use messaging_interface::{
@@ -15,8 +16,9 @@ fn msg(payload: MessagingMsg) -> Msg {
 
 #[test]
 fn host_commits_channel_messages_and_serves_history_queries() {
-    futures::executor::block_on(async {
-        let mut host = Host::genesis(vec![Box::new(Messaging::new("messaging"))]).unwrap();
+    deterministic::Runner::default().start(|context| async move {
+        let messaging = Messaging::init(context, "messaging").await;
+        let mut host = Host::genesis(vec![Box::new(messaging)]).unwrap();
         let root0 = host.module_root("messaging").unwrap();
         let app0 = host.app_hash();
 
@@ -65,8 +67,9 @@ fn host_commits_channel_messages_and_serves_history_queries() {
 
 #[test]
 fn host_rolls_back_failed_message_blocks() {
-    futures::executor::block_on(async {
-        let mut host = Host::genesis(vec![Box::new(Messaging::new("messaging"))]).unwrap();
+    deterministic::Runner::default().start(|context| async move {
+        let messaging = Messaging::init(context, "messaging").await;
+        let mut host = Host::genesis(vec![Box::new(messaging)]).unwrap();
         let root0 = host.module_root("messaging").unwrap();
         let app0 = host.app_hash();
 

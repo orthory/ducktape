@@ -1,3 +1,4 @@
+use commonware_runtime::{Runner as _, deterministic};
 use messaging::Messaging;
 use messaging_interface::{
     Channel, ChatMessage, MessagingMsg, MessagingQuery, MessagingReply, decode_reply, encode_msg,
@@ -48,132 +49,149 @@ fn module_msg(payload: MessagingMsg) -> Msg {
     }
 }
 
-fn query(module: &Messaging, req: MessagingQuery) -> MessagingReply {
-    let reply = futures::executor::block_on(module.query(&encode_query(&req))).unwrap();
+async fn query<E>(module: &Messaging<E>, req: MessagingQuery) -> MessagingReply
+where
+    E: commonware_storage::Context + commonware_runtime::BufferPooler,
+{
+    let reply = module.query(&encode_query(&req)).await.unwrap();
     decode_reply(&reply).unwrap()
 }
 
 #[test]
 fn creates_channels_and_posts_ordered_messages() {
-    let mut module = Messaging::new("messaging");
-    let root0 = module.root();
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Messaging::init(context, "messaging").await;
+        let root0 = module.root();
 
-    futures::executor::block_on(module.execute(
-        &mut TestCtx::at(10),
-        &module_msg(MessagingMsg::CreateChannel {
-            channel_id: "general".into(),
-            name: "General".into(),
-        }),
-    ))
-    .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(10),
+                &module_msg(MessagingMsg::CreateChannel {
+                    channel_id: "general".into(),
+                    name: "General".into(),
+                }),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(
-        module.root(),
-        root0,
-        "root must reflect committed state only"
-    );
-    assert_eq!(
-        query(&module, MessagingQuery::Channels),
-        MessagingReply::Channels(vec![Channel {
-            id: "general".into(),
-            name: "General".into(),
-            created_at: 10,
-        }]),
-        "queries must see this block's staged channel"
-    );
+        assert_eq!(
+            module.root(),
+            root0,
+            "root must reflect committed state only"
+        );
+        assert_eq!(
+            query(&module, MessagingQuery::Channels).await,
+            MessagingReply::Channels(vec![Channel {
+                id: "general".into(),
+                name: "General".into(),
+                created_at: 10,
+            }]),
+            "queries must see this block's staged channel"
+        );
 
-    futures::executor::block_on(module.commit_block()).unwrap();
-    let root1 = module.root();
-    assert_ne!(root1, root0, "committing the channel must move the root");
+        module.commit_block().await.unwrap();
+        let root1 = module.root();
+        assert_ne!(root1, root0, "committing the channel must move the root");
 
-    futures::executor::block_on(module.execute(
-        &mut TestCtx::at(20),
-        &module_msg(MessagingMsg::PostMessage {
-            channel_id: "general".into(),
-            message_id: "m1".into(),
-            author: "alice".into(),
-            body: "hello".into(),
-        }),
-    ))
-    .unwrap();
-    futures::executor::block_on(module.execute(
-        &mut TestCtx::at(21),
-        &module_msg(MessagingMsg::PostMessage {
-            channel_id: "general".into(),
-            message_id: "m2".into(),
-            author: "bob".into(),
-            body: "hi".into(),
-        }),
-    ))
-    .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(20),
+                &module_msg(MessagingMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "m1".into(),
+                    author: "alice".into(),
+                    body: "hello".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(21),
+                &module_msg(MessagingMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "m2".into(),
+                    author: "bob".into(),
+                    body: "hi".into(),
+                }),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(
-        query(
-            &module,
-            MessagingQuery::Messages {
-                channel_id: "general".into()
-            }
-        ),
-        MessagingReply::Messages(vec![
-            ChatMessage {
-                id: "m1".into(),
-                channel_id: "general".into(),
-                author: "alice".into(),
-                body: "hello".into(),
-                sequence: 1,
-                sent_at: 20,
-            },
-            ChatMessage {
-                id: "m2".into(),
-                channel_id: "general".into(),
-                author: "bob".into(),
-                body: "hi".into(),
-                sequence: 2,
-                sent_at: 21,
-            },
-        ]),
-        "messages must be returned in per-channel sequence order"
-    );
+        assert_eq!(
+            query(
+                &module,
+                MessagingQuery::Messages {
+                    channel_id: "general".into()
+                }
+            )
+            .await,
+            MessagingReply::Messages(vec![
+                ChatMessage {
+                    id: "m1".into(),
+                    channel_id: "general".into(),
+                    author: "alice".into(),
+                    body: "hello".into(),
+                    sequence: 1,
+                    sent_at: 20,
+                },
+                ChatMessage {
+                    id: "m2".into(),
+                    channel_id: "general".into(),
+                    author: "bob".into(),
+                    body: "hi".into(),
+                    sequence: 2,
+                    sent_at: 21,
+                },
+            ]),
+            "messages must be returned in per-channel sequence order"
+        );
 
-    assert_eq!(
-        module.root(),
-        root1,
-        "staged messages must not move root before commit"
-    );
-    futures::executor::block_on(module.commit_block()).unwrap();
-    assert_ne!(module.root(), root1, "committed messages must move root");
+        assert_eq!(
+            module.root(),
+            root1,
+            "staged messages must not move root before commit"
+        );
+        module.commit_block().await.unwrap();
+        assert_ne!(module.root(), root1, "committed messages must move root");
+    });
 }
 
 #[test]
 fn rejects_posts_to_missing_channels_and_aborts_cleanly() {
-    let mut module = Messaging::new("messaging");
-    let root0 = module.root();
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Messaging::init(context, "messaging").await;
+        let root0 = module.root();
 
-    let err = futures::executor::block_on(module.execute(
-        &mut TestCtx::at(20),
-        &module_msg(MessagingMsg::PostMessage {
-            channel_id: "ghost".into(),
-            message_id: "m1".into(),
-            author: "alice".into(),
-            body: "hello".into(),
-        }),
-    ))
-    .unwrap_err();
+        let err = module
+            .execute(
+                &mut TestCtx::at(20),
+                &module_msg(MessagingMsg::PostMessage {
+                    channel_id: "ghost".into(),
+                    message_id: "m1".into(),
+                    author: "alice".into(),
+                    body: "hello".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
 
-    assert!(matches!(err, Error::Module(_)));
-    futures::executor::block_on(module.abort_block()).unwrap();
-    assert_eq!(
-        module.root(),
-        root0,
-        "rejected post must leave committed root unchanged"
-    );
-    assert_eq!(
-        query(
-            &module,
-            MessagingQuery::Messages {
-                channel_id: "ghost".into()
-            }
-        ),
-        MessagingReply::Messages(Vec::new())
-    );
+        assert!(matches!(err, Error::Module(_)));
+        module.abort_block().await.unwrap();
+        assert_eq!(
+            module.root(),
+            root0,
+            "rejected post must leave committed root unchanged"
+        );
+        assert_eq!(
+            query(
+                &module,
+                MessagingQuery::Messages {
+                    channel_id: "ghost".into()
+                }
+            )
+            .await,
+            MessagingReply::Messages(Vec::new())
+        );
+    });
 }
