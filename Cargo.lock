@@ -3697,6 +3697,7 @@ name = "node-bin"
 version = "0.1.0"
 dependencies = [
  "chat",
+ "chat-interface",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
@@ -3710,6 +3711,7 @@ dependencies = [
  "forge",
  "futures",
  "governance",
+ "governance-interface",
  "host",
  "kv",
  "kv-interface",
@@ -3724,6 +3726,7 @@ dependencies = [
  "state",
  "statesync",
  "tasks",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing-subscriber 0.3.23",
@@ -3748,6 +3751,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tasks",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http",

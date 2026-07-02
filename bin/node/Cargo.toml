@@ -57,3 +57,11 @@ toml = "0.8"
 rand = "0.8"
 # stderr tracing for the p2p/consensus internals (RUST_LOG=commonware_p2p=debug).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# the process-level e2e suite (tests/) spawns REAL `ducktape-node` binaries and
+# drives them through the rpc with TYPED interface-crate payloads — payload
+# drift fails to compile instead of rotting silently like the old bash demo.
+[dev-dependencies]
+chat-interface = { workspace = true }
+governance-interface = { workspace = true }
+tempfile = "3"

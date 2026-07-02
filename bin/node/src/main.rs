@@ -16,13 +16,17 @@
 //!
 //! payload dissemination is REAL: each process submits a DISTINCT op (node N
 //! writes directory key `kN`), so a peer that finalizes another node's op-digest
-//! has NO local bytes for it. `SimplexOrderer::spawn_with_relay` wires a
+//! has NO local bytes for it. `SimplexOrderer::spawn_with_resolver` wires a
 //! `ConsensusRelay` that, at propose time, gossips the proposed frame's bytes to
-//! all peers on `CHANNEL_PAYLOAD`; every peer's STORE-ONLY drain caches them, so
+//! all peers on the payload channel; every peer's STORE-ONLY drain caches them, so
 //! when that digest finalizes the reporter resolves it locally and delivers it in
 //! BFT order. content-addressing IS the verification (the drain re-hashes on
-//! receipt). this is what lets DISTINCT ops converge across processes with
-//! per-process stores — quorum votes still cross the real TCP mesh to finalize.
+//! receipt). the relay gossip is one-shot, and quorum is a SUBSET — a validator
+//! can finalize a view whose gossip it missed — so a lazy payload FETCH lane
+//! backstops it: the resolver pulls missing bytes by digest from the tracked
+//! mesh and fills the finalized slot instead of wedging the apply prefix. this
+//! is what lets DISTINCT ops converge across processes with per-process stores
+//! — quorum votes still cross the real TCP mesh to finalize.
 //!
 //! ## state-sync service and the sync-only joiner
 //!
@@ -124,11 +128,14 @@ const MODULE_IDS: [&str; 10] = [
 /// block events). mirrors the rpc bridge's stuck-node budget.
 const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 
-/// the four channels epoch `e`'s engine uses: vote, certificate, resolver, and
-/// the eager payload-relay lane. starts at 8, clear of the statesync channel.
-fn engine_channels(epoch: u64) -> (u64, u64, u64, u64) {
-    let base = 8 + epoch * 4;
-    (base, base + 1, base + 2, base + 3)
+/// the five channels epoch `e`'s engine uses: vote, certificate, resolver, the
+/// eager payload-relay lane, and the payload FETCH lane (the lazy catch-up
+/// backstop — a validator that missed the one-shot relay gossip for a
+/// finalized op fetches its bytes by digest instead of wedging its apply
+/// prefix forever). starts at 8, clear of the statesync channel.
+fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
+    let base = 8 + epoch * 5;
+    (base, base + 1, base + 2, base + 3, base + 4)
 }
 
 /// the per-epoch genesis floor: domain-separated by namespace AND epoch, so a
@@ -739,8 +746,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // mesh-member-but-not-validator must register every channel and
             // black-hole the consensus lanes it does not consume.
             for epoch in 0..EPOCH_CHANNEL_BANK {
-                let (vote, cert, res, payload) = engine_channels(epoch);
-                for ch in [vote, cert, res, payload] {
+                let (vote, cert, res, payload, fetch) = engine_channels(epoch);
+                for ch in [vote, cert, res, payload, fetch] {
                     let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
                     let label: &'static str =
                         Box::leak(format!("blackhole_{ch}").into_boxed_str());
@@ -878,15 +885,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // pre-register the ENTIRE epoch channel bank (registration is only
         // possible before network.start(); every respawned engine needs fresh
         // channels). bank[e] holds epoch e's (vote, certificate, resolver,
-        // payload) pairs until that epoch's engine consumes them.
+        // payload, fetch) pairs until that epoch's engine consumes them.
         let mut channel_bank: Vec<Option<_>> = (0..EPOCH_CHANNEL_BANK)
             .map(|epoch| {
-                let (vote, cert, res, payload) = engine_channels(epoch);
+                let (vote, cert, res, payload, fetch) = engine_channels(epoch);
                 Some((
                     network.register(vote, quota, MAX_BACKLOG),
                     network.register(cert, quota, MAX_BACKLOG),
                     network.register(res, quota, MAX_BACKLOG),
                     network.register(payload, quota, MAX_BACKLOG),
+                    network.register(fetch, quota, MAX_BACKLOG),
                 ))
             })
             .collect();
@@ -948,7 +956,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 });
-            let (vote, certificate, resolver, payload) = slot;
+            let (vote, certificate, resolver, payload, fetch) = slot;
             let scheme = match CONSENSUS_SCHEME {
                 ConsensusScheme::V1Ed25519 => simplex_ed25519::Scheme::signer(
                     &namespace,
@@ -969,10 +977,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             };
             let label: &'static str =
                 Box::leak(format!("consensus_e{epoch}").into_boxed_str());
-            SimplexOrderer::spawn_with_relay(
+            // spawn WITH the lazy payload-fetch backstop: quorum is a SUBSET
+            // (n - floor((n-1)/3)), so a validator can finalize a view it never
+            // voted in — and if it also missed the one-shot relay gossip (mesh
+            // still forming, transient disconnect), relay-only wiring would
+            // silently drop that op's slot and wedge/fork the node. the
+            // resolver fetches missing bytes by digest from the tracked mesh
+            // (the oracle is provider AND blocker) and fills the ordered slot.
+            SimplexOrderer::spawn_with_resolver(
                 context.child(label),
                 scheme,
                 oracle.clone(),
+                oracle.clone(),
+                signer.public_key(),
                 format!("{}-e{epoch}", signer.public_key()),
                 Epoch::new(epoch),
                 epoch_floor(&namespace, epoch),
@@ -983,6 +1000,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 certificate,
                 resolver,
                 payload,
+                fetch,
+                false,
             )
         };
 

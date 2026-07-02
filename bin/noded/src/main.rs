@@ -26,8 +26,8 @@ use document::Document;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::{BlockContext, Host};
 use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
+use host::{BlockContext, Host, SubmitError};
 use sdk::{Msg, Origin};
 use tasks::Tasks;
 use tokio::sync::broadcast;
@@ -45,7 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--listen" => listen = args.next().ok_or("--listen needs an addr")?.parse()?,
             "--storage" => storage = args.next().map(PathBuf::from),
             other => {
-                return Err(format!("unexpected arg {other:?} (want --listen/--storage)").into());
+                return Err(
+                    format!("unexpected arg {other:?} (want --listen/--storage)").into(),
+                );
             }
         }
     }
@@ -62,10 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("node-actor".into())
         .spawn(move || run_node(actor_storage, cmd_rx, event_tx))?;
 
-    println!(
-        "[noded] listening on {listen}, storage {}",
-        storage.display()
-    );
+    println!("[noded] listening on {listen}, storage {}", storage.display());
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -87,7 +86,8 @@ fn run_node(
     events: broadcast::Sender<BlockSummary>,
 ) {
     let forge_repo = storage.join("forge-git");
-    let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
+    let rt_cfg =
+        commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
@@ -133,7 +133,16 @@ fn run_node(
                             let _ = events.send(block.clone());
                             Ok(block)
                         }
-                        Err(err) => Err(err.to_string()),
+                        // FAIL-STOP per the host contract: a Fatal means a
+                        // block-boundary hook failed and the registry may be
+                        // half-committed — applying even one more msg could
+                        // silently corrupt state. exit loudly; the managing
+                        // app respawns a fresh daemon over the storage dir.
+                        Err(SubmitError::Fatal(err)) => {
+                            eprintln!("[noded] FATAL: {err} — halting");
+                            std::process::exit(1);
+                        }
+                        Err(err @ SubmitError::Rejected(_)) => Err(err.to_string()),
                     };
                     let _ = reply.send(result); // caller may have hung up
                 }
