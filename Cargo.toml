@@ -24,6 +24,7 @@ members = [
     # system — consensus infrastructure modules
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
+    "crates/system/wireguard-upgrade",
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
@@ -61,6 +62,7 @@ commonware-p2p = "2026.5.0"
 commonware-parallel = "2026.5.0"
 commonware-utils = "2026.5.0"
 commonware-actor = "2026.5.0"
+defguard_wireguard_rs = "0.10.0"
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
@@ -83,6 +85,7 @@ greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "crates/system/kv-interface" }
 valset-interface = { path = "crates/system/valset-interface" }
+wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
