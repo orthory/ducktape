@@ -418,6 +418,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             saga_encode_msg(&SagaMsg::Trigger {
                 saga_id: "greet".into(),
                 spec: b"reverse hello".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
             }),
         )
         .await;
@@ -426,7 +431,8 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             0,
             saga_encode_msg(&SagaMsg::OracleResult {
                 saga_id: "greet".into(),
-                result: b"olleh".to_vec(),
+                attempt: 0,
+                outcome: Ok(b"olleh".to_vec()),
             }),
         )
         .await;
@@ -437,6 +443,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             saga_encode_msg(&SagaMsg::Trigger {
                 saga_id: "translate".into(),
                 spec: b"hola".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
             }),
         )
         .await;

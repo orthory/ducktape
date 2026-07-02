@@ -35,16 +35,35 @@ use saga_interface::{
 use sdk::{Effect, Msg};
 
 fn trigger(id: &str, spec: &[u8]) -> Msg {
-    Msg { target: "saga".into(), payload: encode_msg(&SagaMsg::Trigger { saga_id: id.into(), spec: spec.to_vec() }) }
+    Msg {
+        target: "saga".into(),
+        payload: encode_msg(&SagaMsg::Trigger {
+            saga_id: id.into(),
+            spec: spec.to_vec(),
+            reply_to: None,
+            reply_payload: Vec::new(),
+            deadline: None,
+            max_attempts: 1,
+            lease_views: None,
+        }),
+    }
 }
 
 /// the MOCK oracle: try-decode a `WorkerRequest`, compute a stand-in result
 /// (reversing the spec — a pure transform here, MODELING opaque external work),
-/// and return the `OracleResult` op that carries it back through the normal path.
+/// and return the `OracleResult` op that carries it back through the normal
+/// path, echoing the request's `(saga_id, attempt)` idempotency key.
 fn mock_worker(eff: &Effect) -> Option<Msg> {
     let wr = decode_worker_request(&eff.0).ok()?;
     let result: Vec<u8> = wr.spec.iter().rev().copied().collect();
-    Some(Msg { target: "saga".into(), payload: encode_msg(&SagaMsg::OracleResult { saga_id: wr.saga_id, result }) })
+    Some(Msg {
+        target: "saga".into(),
+        payload: encode_msg(&SagaMsg::OracleResult {
+            saga_id: wr.saga_id,
+            attempt: wr.attempt,
+            outcome: Ok(result),
+        }),
+    })
 }
 
 async fn drain_fixpoint<O: Orderer>(n: &mut OrderedNode<O>) {

@@ -3222,9 +3222,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "host",
  "saga-interface",
  "sdk",
  "sha2",
+ "valset",
+ "valset-interface",
 ]
 
 [[package]]
