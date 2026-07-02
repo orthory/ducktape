@@ -60,15 +60,23 @@ use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
+use agent::Agent;
+use chat::Chat;
 use directory::Directory;
 use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
+use document::Document;
+use forge::Forge;
 use host::Host;
 use kv::Kv;
+use messaging::Messaging;
 use node::OrderedNode;
-use sdk::{Module as _, Msg, StateRoot};
+use saga::SagaModule;
+use sdk::{Msg, StateRoot};
+use tasks::Tasks;
+use valset::Valset;
 use statesync::p2p::P2pSyncClient;
 use statesync::qmdb::RemoteQmdbResolver;
-use statesync::{fetch_manifest, fetch_snapshot, PayloadKind, SyncServer};
+use statesync::{fetch_manifest, fetch_snapshot, SyncServer};
 
 /// the peer-set index. every node must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
@@ -117,15 +125,167 @@ struct NodeConfig {
     /// `kv` module uses a fixed "kv" partition, so two processes sharing a root
     /// would corrupt each other's state. defaults to a per-id temp dir.
     storage_dir: Option<String>,
+    /// local rpc listen address (json-lines over tcp) for op submission,
+    /// queries, status, and shutdown. OFF when unset. bind loopback only —
+    /// the rpc trusts its caller (it stamps this node's own origin on submits).
+    rpc_listen: Option<String>,
 }
 
 /// hex-encode a state root for a stable, greppable log line.
 fn hex(root: &StateRoot) -> String {
-    let mut s = String::with_capacity(root.0.len() * 2);
-    for b in root.0.iter() {
+    hex_bytes(&root.0)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("hex string has odd length".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// the PRODUCTION module set — genesis state, identical on every node (a
+/// different set composes a different app-hash and the network forks at
+/// genesis). system infrastructure (kv, valset seeded with the genesis
+/// validators, saga) plus every product module. `forge_repo` is this node's
+/// on-disk git substrate; wrapper modules run EMBEDDED substrates for now.
+async fn genesis_host(
+    context: &commonware_runtime::tokio::Context,
+    forge_repo: &std::path::Path,
+    genesis_validators: &[ed25519::PublicKey],
+) -> Host {
+    let kv = Kv::init(context.child("kv"), "kv").await;
+    let document = Document::init(context.child("document"), "document").await;
+    let messaging = Messaging::init(context.child("messaging"), "messaging").await;
+    let chat = Chat::init(context.child("chat"), "chat").await;
+    let agent =
+        Agent::init_with_messaging_id(context.child("agent"), "agent", "agent-messaging").await;
+    let forge = Forge::init("forge", forge_repo.to_path_buf()).expect("forge init");
+    let mut valset = Valset::new("valset");
+    // genesis-seed the validator set from config — deterministic and identical
+    // on every node, so membership is IN consensus state from block zero (the
+    // substrate epoch cutover + governance will drive).
+    for v in genesis_validators {
+        valset.insert(v.as_ref().to_vec());
+    }
+    Host::genesis(vec![
+        Box::new(kv),
+        Box::new(document),
+        Box::new(messaging),
+        Box::new(chat),
+        Box::new(agent),
+        Box::new(forge),
+        Box::new(valset),
+        Box::new(SagaModule::new("saga")),
+        Box::new(Tasks::new("tasks")),
+        Box::new(Directory::new("directory")),
+    ])
+    .expect("genesis host")
+}
+
+// ============================================================================
+// the local rpc: json-lines over tcp, bridged from blocking threads.
+// ============================================================================
+
+/// one rpc request, parsed from a json line.
+#[derive(serde::Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum RpcRequest {
+    /// submit an op into the ordered lane (accepted != finalized — poll status).
+    Submit { target: String, payload_hex: String },
+    /// read-only query against a module's committed+staged projection.
+    Query { target: String, req_hex: String },
+    /// node status: latest applied boundary + every module root.
+    Status,
+    /// graceful stop: replies ok, then exits 0 after the current pump turn.
+    Shutdown,
+}
+
+#[derive(serde::Serialize)]
+struct RpcReply {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<RpcStatus>,
+}
+
+#[derive(serde::Serialize)]
+struct RpcStatus {
+    height: Option<u64>,
+    app_hash: String,
+    modules: std::collections::BTreeMap<String, String>,
+}
+
+impl RpcReply {
+    fn ok() -> Self {
+        Self { ok: true, error: None, reply_hex: None, status: None }
+    }
+    fn err(msg: impl Into<String>) -> Self {
+        Self { ok: false, error: Some(msg.into()), reply_hex: None, status: None }
+    }
+}
+
+/// a parsed request plus the blocking thread's reply slot.
+type RpcJob = (RpcRequest, std::sync::mpsc::Sender<RpcReply>);
+
+/// serve json-lines rpc on `listener`, one OS thread per connection (local,
+/// low-volume — an operator console, a script). each line becomes an [`RpcJob`]
+/// pushed into the pump's bounded queue; the pump answers between drains, so
+/// every reply reflects a block boundary. this runs on PLAIN OS THREADS: it
+/// must never touch the async runtime, only the mpsc bridge.
+fn spawn_rpc_listener(
+    listener: std::net::TcpListener,
+    bridge: futures::channel::mpsc::Sender<RpcJob>,
+) {
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            let mut bridge = bridge.clone();
+            std::thread::spawn(move || {
+                use std::io::{BufRead as _, BufReader, Write as _};
+                let reader = BufReader::new(conn.try_clone().expect("clone rpc conn"));
+                let mut conn = conn;
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let reply = match serde_json::from_str::<RpcRequest>(&line) {
+                        Ok(req) => {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            if bridge.try_send((req, tx)).is_err() {
+                                RpcReply::err("node busy (rpc queue full)")
+                            } else {
+                                // the pump answers within a tick; a stuck node
+                                // must not park the operator's console forever.
+                                rx.recv_timeout(std::time::Duration::from_secs(10))
+                                    .unwrap_or_else(|_| RpcReply::err("node unresponsive"))
+                            }
+                        }
+                        Err(e) => RpcReply::err(format!("bad request: {e}")),
+                    };
+                    let mut out = serde_json::to_string(&reply).expect("reply serializes");
+                    out.push('\n');
+                    if conn.write_all(out.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -221,7 +381,15 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         storage.display()
     );
 
+    // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
+    // so a bind failure is a clean startup error, not an async surprise.
+    let rpc_listener = match cfg.rpc_listen.as_deref() {
+        Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
+        _ => None,
+    };
+
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
+    let storage_for_sync = storage.clone();
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -300,36 +468,92 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                 hex(&manifest.app_hash)
             );
 
-            // kv — the resolver lane: live target, then merkle-verified op
-            // batches through the remote resolver. the target must sit at the
-            // manifest boundary; if the source advanced, refetching the
-            // manifest would converge — the demo network is parked, so assert.
-            let kv_entry = manifest.entry("kv").expect("kv in manifest");
-            assert_eq!(kv_entry.kind, PayloadKind::Resolver);
-            let resolver = RemoteQmdbResolver::new(client.clone(), "kv");
-            let target = resolver.fetch_target().await.expect("kv target");
-            assert_eq!(
-                StateRoot(target.root.0),
-                kv_entry.root,
-                "parked source: live kv target equals the manifest root"
-            );
-            // a REAL joiner owns its disk, so the store opens under the
-            // canonical module id — no rebuilt-id adapter needed.
-            let kv = Kv::sync_from(context.child("kv"), "kv", target, resolver).await;
-            assert_eq!(kv.root(), kv_entry.root, "kv synced root == manifest root");
+            // rebuild EVERY module in the manifest. a REAL joiner owns its
+            // disk, so every store opens under its canonical module id.
+            //
+            // resolver lane: live target through the module lane (must sit at
+            // the manifest boundary — a parked demo source guarantees it; a
+            // busy source would be retried by refetching the manifest), then
+            // merkle-verified op batches through the remote resolver.
+            // snapshot lane: chunked bytes, install gated on the manifest root.
+            let fetch_target = |module: &'static str| {
+                let resolver = RemoteQmdbResolver::new(client.clone(), module);
+                let entry_root = manifest.entry(module).expect("module in manifest").root;
+                async move {
+                    let target = resolver.fetch_target().await.expect("target");
+                    assert_eq!(
+                        StateRoot(target.root.0),
+                        entry_root,
+                        "parked source: live {module} target equals the manifest root"
+                    );
+                    (target, resolver)
+                }
+            };
 
-            // directory — the snapshot lane, chunked, install gated on root.
-            let dir_entry = manifest.entry("directory").expect("directory in manifest");
-            assert_eq!(dir_entry.kind, PayloadKind::Snapshot);
-            let bytes = fetch_snapshot(&client, manifest.height, "directory")
-                .await
-                .expect("directory snapshot");
-            let mut dir = Directory::new("directory");
-            dir.install(&bytes, dir_entry.root).expect("directory install");
+            let (target, resolver) = fetch_target("kv").await;
+            let kv = Kv::sync_from(context.child("kv"), "kv", target, resolver).await;
+
+            let (target, resolver) = fetch_target("document").await;
+            let document =
+                Document::sync_from(context.child("document"), "document", target, resolver).await;
+
+            let (target, resolver) = fetch_target("messaging").await;
+            let messaging =
+                Messaging::sync_from(context.child("messaging"), "messaging", target, resolver)
+                    .await;
+
+            // wrappers over EMBEDDED substrates: chat embeds under its own id,
+            // agent under "agent-messaging" — mirroring genesis_host exactly.
+            let (target, resolver) = fetch_target("chat").await;
+            let chat = Chat::sync_from(context.child("chat"), "chat", target, resolver).await;
+
+            let (target, resolver) = fetch_target("agent").await;
+            let agent = Agent::sync_from_messaging_id(
+                context.child("agent"),
+                "agent",
+                "agent-messaging",
+                target,
+                resolver,
+            )
+            .await;
+
+            let snapshot_of = |module: &'static str| {
+                let client = client.clone();
+                let height = manifest.height;
+                let root = manifest.entry(module).expect("module in manifest").root;
+                async move {
+                    let bytes = fetch_snapshot(&client, height, module).await.expect("snapshot");
+                    (bytes, root)
+                }
+            };
+
+            let (bytes, root) = snapshot_of("directory").await;
+            let mut directory = Directory::new("directory");
+            directory.install(&bytes, root).expect("directory install");
+
+            let (bytes, root) = snapshot_of("valset").await;
+            let mut valset = Valset::new("valset");
+            valset.install(&bytes, root).expect("valset install");
+
+            let (bytes, root) = snapshot_of("saga").await;
+            let mut saga = SagaModule::new("saga");
+            saga.install(&bytes, root).expect("saga install");
+
+            let (bytes, root) = snapshot_of("tasks").await;
+            let mut tasks = Tasks::new("tasks");
+            tasks.install(&bytes, root).expect("tasks install");
+
+            let (bytes, root) = snapshot_of("forge").await;
+            let forge_repo = storage_for_sync.join("forge-repo");
+            let mut forge = Forge::init("forge", forge_repo).expect("joiner forge init");
+            forge.install(&bytes, root).expect("forge install");
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 2] = [&kv, &dir];
+            let mods: [&dyn sdk::Module; 10] = [
+                &kv, &document, &messaging, &chat, &agent, &directory, &valset, &saga, &tasks,
+                &forge,
+            ];
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {
                 eprintln!(
@@ -388,10 +612,10 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         });
 
         // genesis host: the SAME module set on every node -> identical genesis
-        // app-hash. qmdb `kv` (order-dependent root) + in-memory `directory`.
-        let kv = Kv::init(context.child("kv"), "kv").await;
-        let host = Host::genesis(vec![Box::new(kv), Box::new(Directory::new("directory"))])
-            .expect("genesis host");
+        // app-hash. the full production set — system infrastructure plus every
+        // product module — with the genesis validators seeded into valset.
+        let forge_repo = storage_for_sync.join("forge-repo");
+        let host = genesis_host(&context, &forge_repo, &validators).await;
 
         // scheme built the production way: `signer` finds our key's index in the
         // sorted VALIDATOR set, so we sign as exactly the participant our
@@ -460,20 +684,97 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         };
         node.submit(format!("node{id}").as_bytes(), 0, op).await.expect("submit op");
 
+        // the local rpc bridge: blocking listener threads push parsed requests
+        // into this bounded queue; the pump answers between drains.
+        let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
+        if let Some(listener) = rpc_listener {
+            println!(
+                "[node #{id}] rpc listening on {}",
+                listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+            );
+            spawn_rpc_listener(listener, rpc_tx);
+        } else {
+            drop(rpc_tx); // rpc off: the branch below just stays pending forever.
+        }
+
+        // the ordered lane stamps (origin, seq) per frame. rpc submits carry
+        // THIS node's identity as origin; seq starts after the demo op's 0.
+        let node_origin = signer.public_key().as_ref().to_vec();
+        let mut next_seq: u64 = 1;
+
         // pump: drain finalized frames on an interval, apply them in agreed
-        // (ascending-view) order, AND serve statesync rpcs between drains (the
-        // select is biased toward serving; every response therefore reflects a
+        // (ascending-view) order, serve statesync rpcs, answer local rpc, and
+        // drive the reactor seam between drains (every response reflects a
         // block boundary — never a torn mid-drain view). print `converged` ONCE
-        // this node has applied every VALIDATOR's op — including the peer's op
-        // it never originated, whose bytes reached this process ONLY via the
-        // relay -> store-only drain. this infinite loop IS the "run forever"
-        // park (keeps the mesh + sync service alive for joiners).
+        // this node has applied every VALIDATOR's op. this infinite loop IS the
+        // "run forever" park (keeps the mesh + sync service alive for joiners);
+        // rpc `shutdown` is the graceful exit.
         let expected = validator_seeds.len();
         let mut applied = 0usize;
         let mut converged = false;
         let mut sync_server = SyncServer::new();
+        // the host-owned worker set (reactor seam). EMPTY for now: effects of
+        // finalized blocks are drained and logged so the lane is visibly live;
+        // the agent LLM worker plugs in here.
+        let workers: Vec<Box<dyn reactor::Worker>> = Vec::new();
         loop {
             futures::select_biased! {
+                job = rpc_ingress.next() => {
+                    let Some((req, reply)) = job else { continue };
+                    let resp = match req {
+                        RpcRequest::Submit { target, payload_hex } => {
+                            match unhex(&payload_hex) {
+                                Ok(payload) => {
+                                    let seq = next_seq;
+                                    next_seq += 1;
+                                    match node
+                                        .submit(&node_origin, seq, Msg { target, payload })
+                                        .await
+                                    {
+                                        Ok(()) => RpcReply::ok(),
+                                        Err(e) => RpcReply::err(format!("submit failed: {e}")),
+                                    }
+                                }
+                                Err(e) => RpcReply::err(format!("bad payload_hex: {e}")),
+                            }
+                        }
+                        RpcRequest::Query { target, req_hex } => match unhex(&req_hex) {
+                            Ok(req_bytes) => match node.host().query(&target, &req_bytes).await {
+                                Ok(bytes) => RpcReply {
+                                    reply_hex: Some(hex_bytes(&bytes)),
+                                    ..RpcReply::ok()
+                                },
+                                Err(e) => RpcReply::err(format!("query failed: {e}")),
+                            },
+                            Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
+                        },
+                        RpcRequest::Status => {
+                            let mut modules = std::collections::BTreeMap::new();
+                            for m in [
+                                "kv", "document", "messaging", "chat", "agent", "forge",
+                                "valset", "saga", "tasks", "directory",
+                            ] {
+                                if let Some(root) = node.host().module_root(m) {
+                                    modules.insert(m.to_string(), hex(&root));
+                                }
+                            }
+                            RpcReply {
+                                status: Some(RpcStatus {
+                                    height: node.finalized().map(|f| f.height),
+                                    app_hash: hex(&node.app_hash()),
+                                    modules,
+                                }),
+                                ..RpcReply::ok()
+                            }
+                        }
+                        RpcRequest::Shutdown => {
+                            let _ = reply.send(RpcReply::ok());
+                            println!("[node #{id}] shutdown requested via rpc — exiting");
+                            std::process::exit(0);
+                        }
+                    };
+                    let _ = reply.send(resp);
+                }
                 msg = sync_ingress.next() => {
                     let Some((peer, bytes)) = msg else {
                         // the ingress task ended (network shutdown) — nothing
@@ -505,6 +806,41 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                             std::process::exit(1);
                         }
                     };
+                    // the reactor seam: offer each finalized block's effects to
+                    // the host-owned workers; a claiming worker's follow-up op
+                    // re-enters through the ordered lane as its own block (the
+                    // oracle-as-op). unclaimed effects are logged, not silently
+                    // dropped — a saga stuck Pending should be visible.
+                    for eff in node.take_effects() {
+                        let mut claimed = false;
+                        for w in &workers {
+                            match w.run(&eff).await {
+                                Ok(Some(follow)) => {
+                                    let seq = next_seq;
+                                    next_seq += 1;
+                                    if let Err(e) =
+                                        node.submit(&node_origin, seq, follow).await
+                                    {
+                                        eprintln!("[node #{id}] worker follow-up submit failed: {e}");
+                                    }
+                                    claimed = true;
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    eprintln!("[node #{id}] worker error: {e}");
+                                    claimed = true; // errored ≠ unclaimed; don't double-log
+                                    break;
+                                }
+                            }
+                        }
+                        if !claimed {
+                            println!(
+                                "[node #{id}] effect with no worker ({} bytes) — dropped",
+                                eff.0.len()
+                            );
+                        }
+                    }
                     if !converged && applied >= expected {
                         let h = node.app_hash();
                         println!("[node #{id}] converged app_hash={}", hex(&h));

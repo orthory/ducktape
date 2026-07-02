@@ -2503,6 +2503,8 @@ dependencies = [
 name = "node-bin"
 version = "0.1.0"
 dependencies = [
+ "agent",
+ "chat",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
@@ -2511,17 +2513,25 @@ dependencies = [
  "consensus",
  "directory",
  "directory-interface",
+ "document",
+ "forge",
  "futures",
  "host",
  "kv",
  "kv-interface",
+ "messaging",
  "node",
+ "reactor",
+ "saga",
  "sdk",
  "serde",
+ "serde_json",
  "state",
  "statesync",
+ "tasks",
  "toml 0.8.23",
  "tracing-subscriber 0.3.23",
+ "valset",
 ]
 
 [[package]]
