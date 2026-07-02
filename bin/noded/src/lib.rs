@@ -123,7 +123,11 @@ pub struct NodeHandle {
 impl NodeHandle {
     /// build the handle plus the actor-side ends: the command receiver the
     /// actor drains and the event sender it publishes finalized blocks on.
-    pub fn channel() -> (Self, mpsc::Receiver<NodeCommand>, broadcast::Sender<BlockSummary>) {
+    pub fn channel() -> (
+        Self,
+        mpsc::Receiver<NodeCommand>,
+        broadcast::Sender<BlockSummary>,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
         let handle = Self {
@@ -160,7 +164,10 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 
 /// the actor dropped the reply oneshot — it panicked or shut down mid-request.
 fn actor_gone() -> Response {
-    error_response(StatusCode::SERVICE_UNAVAILABLE, "node actor dropped the reply")
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "node actor dropped the reply",
+    )
 }
 
 pub fn router(handle: NodeHandle) -> Router {
@@ -179,8 +186,7 @@ pub fn router(handle: NodeHandle) -> Router {
 pub const DEFAULT_ORIGIN: &str = "noded";
 
 async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>) -> Response {
-    let payload =
-        serde_json::to_vec(&req.payload).expect("a decoded json value re-serializes");
+    let payload = serde_json::to_vec(&req.payload).expect("a decoded json value re-serializes");
     // empty string falls back too — chat rejects empty external authors
     let origin = req
         .origin
@@ -254,10 +260,7 @@ async fn shutdown(State(handle): State<NodeHandle>) -> Response {
 /// actor lives elsewhere and is reachable only through `handle`'s command
 /// lane — which is what lets ANY binary that owns a host (the embedded daemon,
 /// the p2p validator) stand up the identical surface.
-pub async fn serve(
-    listener: tokio::net::TcpListener,
-    handle: NodeHandle,
-) -> std::io::Result<()> {
+pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std::io::Result<()> {
     let shutdown = handle.clone();
     axum::serve(listener, router(handle))
         .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
@@ -273,8 +276,8 @@ async fn stream_blocks(mut socket: WebSocket, mut events: broadcast::Receiver<Bl
     loop {
         match events.recv().await {
             Ok(block) => {
-                let frame = serde_json::to_string(&WsFrame::Block(block))
-                    .expect("ws frame serializes");
+                let frame =
+                    serde_json::to_string(&WsFrame::Block(block)).expect("ws frame serializes");
                 if socket.send(Message::Text(frame.into())).await.is_err() {
                     return; // client hung up
                 }

@@ -26,8 +26,8 @@ use document::Document;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
 use host::{BlockContext, Host};
+use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
 use sdk::{Msg, Origin};
 use tasks::Tasks;
 use tokio::sync::broadcast;
@@ -45,9 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--listen" => listen = args.next().ok_or("--listen needs an addr")?.parse()?,
             "--storage" => storage = args.next().map(PathBuf::from),
             other => {
-                return Err(
-                    format!("unexpected arg {other:?} (want --listen/--storage)").into(),
-                );
+                return Err(format!("unexpected arg {other:?} (want --listen/--storage)").into());
             }
         }
     }
@@ -64,7 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("node-actor".into())
         .spawn(move || run_node(actor_storage, cmd_rx, event_tx))?;
 
-    println!("[noded] listening on {listen}, storage {}", storage.display());
+    println!(
+        "[noded] listening on {listen}, storage {}",
+        storage.display()
+    );
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -86,8 +87,7 @@ fn run_node(
     events: broadcast::Sender<BlockSummary>,
 ) {
     let forge_repo = storage.join("forge-git");
-    let rt_cfg =
-        commonware_runtime::tokio::Config::default().with_storage_directory(storage);
+    let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {

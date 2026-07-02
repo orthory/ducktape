@@ -84,15 +84,15 @@ hexenc() { python3 -c "import sys; print(sys.argv[1].encode().hex())" "$1"; }
 
 rpc_ok=""
 if [ "$status" -eq 0 ]; then
-  create=$(hexenc '{"CreateChannel":{"channel_id":"general","name":"General"}}')
-  post=$(hexenc '{"PostMessage":{"channel_id":"general","message_id":"m1","author":"eddy","body":"hello ducktape"}}')
-  echo "posting to messaging via node 0 rpc..."
-  rpc 52300 "{\"cmd\":\"submit\",\"target\":\"messaging\",\"payload_hex\":\"$create\"}" >/dev/null
-  rpc 52300 "{\"cmd\":\"submit\",\"target\":\"messaging\",\"payload_hex\":\"$post\"}" >/dev/null
+  create=$(hexenc '{"CreateChannel":{"channel_id":"general","name":"General","post_policy":"Open"}}')
+  post=$(hexenc '{"PostMessage":{"channel_id":"general","message_id":"m1","blocks":[{"Paragraph":[{"text":"hello ducktape","marks":[]}]}],"thread":null,"as_agent":null}}')
+  echo "posting to chat via node 0 rpc..."
+  rpc 52300 "{\"cmd\":\"submit\",\"target\":\"chat\",\"payload_hex\":\"$create\"}" >/dev/null
+  rpc 52300 "{\"cmd\":\"submit\",\"target\":\"chat\",\"payload_hex\":\"$post\"}" >/dev/null
   # wait for finalization to land on node 1, then read the channel THERE.
-  q=$(hexenc '{"Messages":{"channel_id":"general"}}')
+  q=$(hexenc '{"MessagesLatest":{"channel_id":"general","limit":10}}')
   for _ in $(seq 1 40); do
-    reply=$(rpc 52301 "{\"cmd\":\"query\",\"target\":\"messaging\",\"req_hex\":\"$q\"}" || true)
+    reply=$(rpc 52301 "{\"cmd\":\"query\",\"target\":\"chat\",\"req_hex\":\"$q\"}" || true)
     decoded=$(python3 - "$reply" <<'PY'
 import json, sys
 try:
@@ -117,7 +117,7 @@ cutover_ok=""
 post_cutover_ok=""
 if [ "$status" -eq 0 ]; then
   # node 3's identity, printed by node 0 at startup (deterministic dev seed 3).
-  node3_key=$(grep -m1 -oE 'peer\[3\] seed=3 identity=[0-9a-f]+' "$log0" | cut -d= -f3)
+  node3_key=$(grep -m1 -oE 'peer\[3\] identity=[0-9a-f]+' "$log0" | cut -d= -f2)
   if [ -z "$node3_key" ]; then echo "FAIL: node 3 identity not found in node 0 log"; exit 1; fi
   propose=$(python3 - "$node3_key" <<'PY'
 import json, sys
@@ -173,11 +173,11 @@ PY
     # the epoch-1 network must still finalize ops: post a message via node 0,
     # read it via node 1 — through the RESPAWNED engines.
     if [ -n "$cutover_ok" ]; then
-      post2=$(hexenc '{"PostMessage":{"channel_id":"general","message_id":"m2","author":"eddy","body":"epoch one lives"}}')
-      rpc 52300 "{\"cmd\":\"submit\",\"target\":\"messaging\",\"payload_hex\":\"$post2\"}" >/dev/null
-      q2=$(hexenc '{"Messages":{"channel_id":"general"}}')
+      post2=$(hexenc '{"PostMessage":{"channel_id":"general","message_id":"m2","blocks":[{"Paragraph":[{"text":"epoch one lives","marks":[]}]}],"thread":null,"as_agent":null}}')
+      rpc 52300 "{\"cmd\":\"submit\",\"target\":\"chat\",\"payload_hex\":\"$post2\"}" >/dev/null
+      q2=$(hexenc '{"MessagesLatest":{"channel_id":"general","limit":10}}')
       for _ in $(seq 1 40); do
-        reply=$(rpc 52302 "{\"cmd\":\"query\",\"target\":\"messaging\",\"req_hex\":\"$q2\"}" || true)
+        reply=$(rpc 52302 "{\"cmd\":\"query\",\"target\":\"chat\",\"req_hex\":\"$q2\"}" || true)
         decoded=$(python3 - "$reply" <<'PY'
 import json, sys
 try:
@@ -194,7 +194,7 @@ PY
   fi
 fi
 
-# after ALL rpc-driven state (messaging + governance), both validators must
+# after ALL rpc-driven state (chat + governance), both validators must
 # report the SAME app-hash — the boundary the joiner is expected to rebuild.
 st0=""; st1=""
 if [ "$status" -eq 0 ]; then

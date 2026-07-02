@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use commonware_codec::{DecodeExt as _, Encode as _};
-use commonware_cryptography::{ed25519, Signer as _};
+use commonware_cryptography::{Signer as _, ed25519};
 use serde::{Deserialize, Serialize};
 
 /// the consensus scheme tag a descriptor must carry — a genesis-wide constant
@@ -160,7 +160,8 @@ impl NetworkDescriptor {
                     .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
                 Ok((
                     decode_key(key)?,
-                    addr.parse::<SocketAddr>().map_err(|e| format!("{entry:?}: {e}"))?,
+                    addr.parse::<SocketAddr>()
+                        .map_err(|e| format!("{entry:?}: {e}"))?,
                 ))
             })
             .collect()
@@ -180,7 +181,8 @@ impl NetworkDescriptor {
     /// the same key (a member's advertised addr can move).
     pub fn add_bootstrap(&mut self, key: &ed25519::PublicKey, addr: &SocketAddr) {
         let hex = hex_bytes(key.as_ref());
-        self.bootstrap.retain(|e| !e.starts_with(&format!("{hex}@")));
+        self.bootstrap
+            .retain(|e| !e.starts_with(&format!("{hex}@")));
         self.bootstrap.push(format!("{hex}@{addr}"));
         self.bootstrap.sort();
     }
@@ -197,7 +199,10 @@ pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
 // ============================================================================
 
 pub fn encode_invite(descriptor: &NetworkDescriptor) -> String {
-    format!("{INVITE_PREFIX}{}", hex_bytes(descriptor.to_toml().as_bytes()))
+    format!(
+        "{INVITE_PREFIX}{}",
+        hex_bytes(descriptor.to_toml().as_bytes())
+    )
 }
 
 pub fn decode_invite(blob: &str) -> Result<NetworkDescriptor, String> {
@@ -240,10 +245,12 @@ pub struct NodeToml {
 /// read a raw node.toml plus its base directory (which relative paths inside
 /// the file resolve against).
 pub fn load_node_toml(cfg_path: &Path) -> Result<(NodeToml, PathBuf), String> {
-    let text =
-        std::fs::read_to_string(cfg_path).map_err(|e| format!("read {cfg_path:?}: {e}"))?;
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| format!("read {cfg_path:?}: {e}"))?;
     let raw: NodeToml = toml::from_str(&text).map_err(|e| format!("{cfg_path:?}: {e}"))?;
-    let base = cfg_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let base = cfg_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     Ok((raw, base))
 }
 
@@ -306,8 +313,7 @@ pub struct Resolved {
 /// (network, key_file, storage_dir) resolve relative to the file's directory,
 /// so a workspace directory is relocatable.
 pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
-    let text =
-        std::fs::read_to_string(cfg_path).map_err(|e| format!("read {cfg_path:?}: {e}"))?;
+    let text = std::fs::read_to_string(cfg_path).map_err(|e| format!("read {cfg_path:?}: {e}"))?;
     let raw: NodeToml = toml::from_str(&text).map_err(|e| format!("{cfg_path:?}: {e}"))?;
     let base = cfg_path.parent().unwrap_or_else(|| Path::new("."));
     if raw.network.is_some() {
@@ -381,10 +387,19 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
 fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
-    let id = raw.id.ok_or("a dev-shape config needs `id` (or add `network = ...`)")?;
-    let namespace = raw.namespace.ok_or("a dev-shape config needs `namespace`")?;
-    let peer_seeds = raw.peer_seeds.ok_or("a dev-shape config needs `peer_seeds`")?;
-    let validator_seeds = raw.validator_seeds.clone().unwrap_or_else(|| peer_seeds.clone());
+    let id = raw
+        .id
+        .ok_or("a dev-shape config needs `id` (or add `network = ...`)")?;
+    let namespace = raw
+        .namespace
+        .ok_or("a dev-shape config needs `namespace`")?;
+    let peer_seeds = raw
+        .peer_seeds
+        .ok_or("a dev-shape config needs `peer_seeds`")?;
+    let validator_seeds = raw
+        .validator_seeds
+        .clone()
+        .unwrap_or_else(|| peer_seeds.clone());
 
     let key_of = |s: u64| ed25519::PrivateKey::from_seed(s).public_key();
     let mesh: Vec<_> = peer_seeds.iter().map(|s| key_of(*s)).collect();
@@ -393,8 +408,9 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     let bootstrappers = if id == 0 {
         Vec::new()
     } else {
-        let boot_seed =
-            *peer_seeds.first().ok_or("a bootstrapping node needs peer_seeds[0] = node 0")?;
+        let boot_seed = *peer_seeds
+            .first()
+            .ok_or("a bootstrapping node needs peer_seeds[0] = node 0")?;
         let boot_addr: SocketAddr = raw
             .bootstrapper_addr
             .as_deref()
@@ -434,7 +450,10 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ducktape-config-test-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ducktape-config-test-{}-{name}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test dir");
         dir
@@ -447,7 +466,10 @@ mod tests {
         let (a, generated) = load_or_generate_identity(&path).expect("generate");
         assert!(generated);
         let (b, generated) = load_or_generate_identity(&path).expect("reuse");
-        assert!(!generated, "an existing identity is reused, never clobbered");
+        assert!(
+            !generated,
+            "an existing identity is reused, never clobbered"
+        );
         assert_eq!(a.public_key(), b.public_key());
     }
 
@@ -493,7 +515,10 @@ mod tests {
         let mut d = NetworkDescriptor {
             chain_id: "net#11223344".into(),
             scheme: SCHEME_ED25519.into(),
-            validators: vec![hex_bytes(me.public_key().as_ref()), hex_bytes(other.as_ref())],
+            validators: vec![
+                hex_bytes(me.public_key().as_ref()),
+                hex_bytes(other.as_ref()),
+            ],
             bootstrap: vec![],
         };
         d.add_bootstrap(&other, &"127.0.0.1:52200".parse().unwrap());
@@ -534,7 +559,10 @@ mod tests {
         )
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err("non-member must be refused");
-        assert!(err.contains("admit"), "error carries the admit guidance: {err}");
+        assert!(
+            err.contains("admit"),
+            "error carries the admit guidance: {err}"
+        );
     }
 
     #[test]
@@ -560,6 +588,9 @@ bootstrapper_addr = "127.0.0.1:52200"
             ed25519::PrivateKey::from_seed(0).public_key(),
             "non-zero nodes dial peer_seeds[0]"
         );
-        assert_eq!(r.signer.public_key(), ed25519::PrivateKey::from_seed(1).public_key());
+        assert_eq!(
+            r.signer.public_key(),
+            ed25519::PrivateKey::from_seed(1).public_key()
+        );
     }
 }

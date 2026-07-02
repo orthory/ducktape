@@ -46,27 +46,27 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
-use commonware_cryptography::{ed25519, Signer};
+use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_codec::DecodeExt as _;
 use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _};
 use commonware_runtime::{Clock, IoBuf, Quota, Runner, Spawner, Supervisor};
-use commonware_utils::{ordered::Set, NZU32};
+use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
 
-use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer};
+use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
 mod config;
-use config::{hex_bytes, unhex, Resolved};
+use config::{Resolved, hex_bytes, unhex};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 use chat::Chat;
 use directory::Directory;
-use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
+use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use document::Document;
 use forge::Forge;
 use governance::Governance;
@@ -75,12 +75,12 @@ use kv::Kv;
 use node::OrderedNode;
 use saga::SagaModule;
 use sdk::{Msg, StateRoot};
+use statesync::p2p::P2pSyncClient;
+use statesync::qmdb::RemoteQmdbResolver;
+use statesync::{SyncServer, fetch_manifest, fetch_snapshot};
 use tasks::Tasks;
 use valset::Valset;
 use vaults::Vaults;
-use statesync::p2p::P2pSyncClient;
-use statesync::qmdb::RemoteQmdbResolver;
-use statesync::{fetch_manifest, fetch_snapshot, SyncServer};
 
 /// the peer-set index. every node must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
@@ -109,7 +109,15 @@ const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
 const MODULE_IDS: [&str; 10] = [
-    "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults",
+    "kv",
+    "document",
+    "chat",
+    "forge",
+    "valset",
+    "governance",
+    "saga",
+    "tasks",
+    "vaults",
     "directory",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
@@ -139,11 +147,10 @@ fn epoch_floor(namespace: &[u8], epoch: u64) -> Digest {
     )
 }
 
-
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
 async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
-    use valset_interface::{decode_reply, encode_query, ValsetQuery, ValsetReply};
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
         .query("valset", &encode_query(&ValsetQuery::Validators))
         .await
@@ -237,10 +244,20 @@ struct RpcStatus {
 
 impl RpcReply {
     fn ok() -> Self {
-        Self { ok: true, error: None, reply_hex: None, status: None }
+        Self {
+            ok: true,
+            error: None,
+            reply_hex: None,
+            status: None,
+        }
     }
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(msg.into()), reply_hex: None, status: None }
+        Self {
+            ok: false,
+            error: Some(msg.into()),
+            reply_hex: None,
+            status: None,
+        }
     }
 }
 
@@ -318,7 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "unexpected arg {other:?} (want a subcommand — keygen|init|invite|admit|join \
                      — or --config <path> [--sync-only])"
                 )
-                .into())
+                .into());
             }
         }
     }
@@ -376,10 +393,19 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("identity.key"));
+    let out = PathBuf::from(
+        flags
+            .get("out")
+            .map(String::as_str)
+            .unwrap_or("identity.key"),
+    );
     let (key, generated) = config::load_or_generate_identity(&out)?;
     println!("{}", hex_bytes(key.public_key().as_ref()));
-    eprintln!("{} identity at {}", if generated { "generated" } else { "reusing" }, out.display());
+    eprintln!(
+        "{} identity at {}",
+        if generated { "generated" } else { "reusing" },
+        out.display()
+    );
     Ok(())
 }
 
@@ -391,10 +417,15 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let name = flags.get("name").ok_or("init needs --name <human-readable network name>")?;
+    let name = flags
+        .get("name")
+        .ok_or("init needs --name <human-readable network name>")?;
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
-    let listen = flags.get("listen").map(String::as_str).unwrap_or("127.0.0.1:0");
+    let listen = flags
+        .get("listen")
+        .map(String::as_str)
+        .unwrap_or("127.0.0.1:0");
 
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me = key.public_key();
@@ -423,7 +454,10 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     eprintln!("network {chain_id} initialized in {}", dir.display());
     eprintln!("start:  ducktape-node --config {}/node.toml", dir.display());
-    eprintln!("invite: ducktape-node invite --config {}/node.toml", dir.display());
+    eprintln!(
+        "invite: ducktape-node invite --config {}/node.toml",
+        dir.display()
+    );
     println!("{chain_id}");
     Ok(())
 }
@@ -436,7 +470,12 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let cfg_path = PathBuf::from(flags.get("config").map(String::as_str).unwrap_or("node.toml"));
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
         .network
@@ -444,15 +483,16 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("invite needs a network-shape config (no `network` field found)")?;
     let descriptor_path = base.join(network_rel);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
-    let key =
-        config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
+    let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
     match dialable(raw.advertised.as_deref(), &raw.listen)? {
         Some(addr) => descriptor.add_bootstrap(&key.public_key(), &addr),
         // an invite must carry SOME dialable member.
         None if descriptor.bootstrap.is_empty() => {
-            return Err("no dialable address: give node.toml a concrete `listen` port or an \
+            return Err(
+                "no dialable address: give node.toml a concrete `listen` port or an \
                         `advertised` addr so a joiner can reach the network"
-                .into())
+                    .into(),
+            );
         }
         None => {}
     }
@@ -470,10 +510,17 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("admit needs exactly one <hex pubkey>".into());
     };
     let key = config::decode_key(pubkey_hex)?;
-    let cfg_path = PathBuf::from(flags.get("config").map(String::as_str).unwrap_or("node.toml"));
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
     let (raw, base) = config::load_node_toml(&cfg_path)?;
-    let network_rel =
-        raw.network.as_deref().ok_or("admit needs a network-shape config")?;
+    let network_rel = raw
+        .network
+        .as_deref()
+        .ok_or("admit needs a network-shape config")?;
     let storage = base.join(raw.storage_dir.as_deref().unwrap_or("storage"));
     if storage.exists() {
         return Err(format!(
@@ -507,7 +554,10 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = config::decode_invite(blob)?;
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
-    let listen = flags.get("listen").map(String::as_str).unwrap_or("127.0.0.1:0");
+    let listen = flags
+        .get("listen")
+        .map(String::as_str)
+        .unwrap_or("127.0.0.1:0");
     descriptor.save(&dir.join("network.toml"))?;
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
@@ -518,8 +568,15 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("http").map(String::as_str),
         flags.get("rpc").map(String::as_str),
     )?;
-    eprintln!("{} identity {me_hex}", if generated { "generated" } else { "reusing" });
-    eprintln!("workspace for {} written to {}", descriptor.chain_id, dir.display());
+    eprintln!(
+        "{} identity {me_hex}",
+        if generated { "generated" } else { "reusing" }
+    );
+    eprintln!(
+        "workspace for {} written to {}",
+        descriptor.chain_id,
+        dir.display()
+    );
     if descriptor.validators.contains(&me_hex) {
         eprintln!(
             "this identity is a member — start: ducktape-node --config {}/node.toml",
@@ -557,11 +614,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         dev_demo,
     } = resolved;
     // discovery's bootstrapper list wants its own ingress address type.
-    let bootstrappers: Vec<(ed25519::PublicKey, _)> =
-        bootstrappers.into_iter().map(|(k, a)| (k, a.into())).collect();
+    let bootstrappers: Vec<(ed25519::PublicKey, _)> = bootstrappers
+        .into_iter()
+        .map(|(k, a)| (k, a.into()))
+        .collect();
 
     for (i, pk) in peers.iter().enumerate() {
-        println!("[node {label}] peer[{i}] identity={}", hex_bytes(pk.as_ref()));
+        println!(
+            "[node {label}] peer[{i}] identity={}",
+            hex_bytes(pk.as_ref())
+        );
     }
     println!(
         "[node {label}] starting on {listen} ({} mesh peers, {} validators{}), storage {}",
@@ -589,26 +651,31 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             listener.set_nonblocking(true)?;
             println!(
                 "[node {label}] app surface listening on http://{}",
-                listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                listener
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
             );
             let thread_label = label.clone();
-            std::thread::Builder::new().name("app-surface".into()).spawn(move || {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("app-surface tokio runtime")
-                    .block_on(async move {
-                        let listener = tokio::net::TcpListener::from_std(listener)
-                            .expect("adopt app-surface listener");
-                        if let Err(e) = noded::serve(listener, http_handle).await {
-                            eprintln!("app surface server error: {e}");
-                        }
-                    });
-                // a client asked the surface to shut down (POST /v1/shutdown) —
-                // mirror the rpc shutdown: exit the whole process gracefully.
-                println!("[node {thread_label}] shutdown requested via app surface — exiting");
-                std::process::exit(0);
-            })?;
+            std::thread::Builder::new()
+                .name("app-surface".into())
+                .spawn(move || {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("app-surface tokio runtime")
+                        .block_on(async move {
+                            let listener = tokio::net::TcpListener::from_std(listener)
+                                .expect("adopt app-surface listener");
+                            if let Err(e) = noded::serve(listener, http_handle).await {
+                                eprintln!("app surface server error: {e}");
+                            }
+                        });
+                    // a client asked the surface to shut down (POST /v1/shutdown) —
+                    // mirror the rpc shutdown: exit the whole process gracefully.
+                    println!("[node {thread_label}] shutdown requested via app surface — exiting");
+                    std::process::exit(0);
+                })?;
         }
         // surface off: dropping the handle terminates the command stream; the
         // pump's select arm sees one None and then never polls it again.
