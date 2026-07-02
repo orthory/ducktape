@@ -189,7 +189,7 @@ fn host_rolls_back_failed_chat_blocks() {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
         assert_eq!(host.module_root("chat").unwrap(), root0);
         assert_eq!(host.app_hash(), app0);
     });
@@ -212,7 +212,7 @@ fn default_empty_external_origin_is_rejected() {
             }))
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
         assert_eq!(host.app_hash(), app0);
     });
 }
@@ -302,7 +302,7 @@ fn hook_notifications_commit_atomically_with_the_post() {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
         assert_eq!(host.module_root("chat").unwrap(), chat_root);
         assert_eq!(host.module_root("recorder").unwrap(), recorder_root);
         assert_eq!(host.app_hash(), app_hash);
