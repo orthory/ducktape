@@ -20,7 +20,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent::Agent;
 use chat::Chat;
 use commonware_runtime::{Runner as _, Supervisor as _};
 use document::Document;
@@ -35,7 +34,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 5] = ["chat", "tasks", "document", "agent", "forge"];
+const MODULE_IDS: [&str; 4] = ["chat", "tasks", "document", "forge"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
@@ -100,15 +99,11 @@ fn run_node(
         let chat = Chat::init(context.child("chat"), "chat").await;
         let tasks = Tasks::new("tasks");
         let document = Document::init(context.child("document"), "document").await;
-        let agent =
-            Agent::init_with_messaging_id(context.child("agent"), "agent", "agent-messaging")
-                .await;
         let forge = Forge::init("forge", forge_repo).expect("forge init");
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(tasks),
             Box::new(document),
-            Box::new(agent),
             Box::new(forge),
         ])
         .expect("genesis");

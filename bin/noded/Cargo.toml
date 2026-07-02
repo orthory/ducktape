@@ -21,7 +21,6 @@ sdk = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 document = { workspace = true }
-agent = { workspace = true }
 forge = { workspace = true }
 
 commonware-runtime = { workspace = true }

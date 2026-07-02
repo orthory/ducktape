@@ -3,8 +3,7 @@ name = "chat-interface"
 edition.workspace = true
 version.workspace = true
 
-# Slack-like chat wire surface backed by the messaging storage model.
+# types-only: the wire surface of the chat module.
 [dependencies]
-messaging-interface = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

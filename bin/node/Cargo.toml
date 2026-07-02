@@ -31,9 +31,7 @@ governance = { workspace = true }
 saga = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
-messaging = { workspace = true }
 chat = { workspace = true }
-agent = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }
 reactor = { workspace = true }

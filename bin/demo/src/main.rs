@@ -1,15 +1,16 @@
 //! a runnable super-app demo: seven registered modules — a qmdb-backed kv, a sync
 //! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
-//! block DOCUMENT module, a queryable agent-session module backed by messaging
-//! storage, and an ed25519 permissionless VALSET — dispatched over ONE host,
-//! showing the app-hash evolve as typed cross-module ops flow.
+//! block DOCUMENT module, a qmdb-backed block-based CHAT module, and an ed25519
+//! permissionless VALSET — dispatched over ONE host, showing the app-hash evolve
+//! as typed cross-module ops flow.
 //!
 //! run: `cargo run -p demo`
 
-use agent::Agent;
-use agent_interface::{
-    AgentMsg, AgentQuery, AgentReply, decode_reply as agent_decode_reply,
-    encode_msg as agent_encode_msg, encode_query as agent_encode_query,
+use chat::Chat;
+use chat_interface::{
+    Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, PostPolicy,
+    decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
+    encode_query as chat_encode_query,
 };
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
@@ -27,8 +28,8 @@ use forge_interface::{
     encode_msg as forge_encode_msg, encode_query as forge_encode_query,
 };
 use greeter::Greeter;
-use host::Host;
-use sdk::Msg;
+use host::{BlockContext, Host};
+use sdk::{Msg, Origin};
 use valset::Valset;
 use valset_interface::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -48,8 +49,7 @@ fn main() {
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
         let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
-        let agent =
-            Agent::init_with_messaging_id(context.child("agent"), "agent", "agent-messaging").await;
+        let chat = Chat::init(context.child("chat"), "chat").await;
         let valset = Valset::new("valset");
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -57,7 +57,7 @@ fn main() {
             Box::new(greeter),
             Box::new(forge),
             Box::new(document),
-            Box::new(agent),
+            Box::new(chat),
             Box::new(valset),
         ])
         .expect("genesis");
@@ -78,8 +78,8 @@ fn main() {
             host.module_root("document").unwrap()
         );
         println!(
-            "genesis agent root (no sessions)    : {:?}",
-            host.module_root("agent").unwrap()
+            "genesis chat root (no channels)     : {:?}",
+            host.module_root("chat").unwrap()
         );
 
         // block 1: a typed Set to the in-memory directory module.
@@ -174,56 +174,111 @@ fn main() {
             );
         }
 
-        // block 4: open an agent session. agent is a queryable module with a
-        // real messaging-backed storage root.
+        // block 4: create a chat channel. chat derives authorship from the
+        // dispatch origin (no author field in any payload), so the demo submits
+        // with an explicit external origin — a seed-derived ed25519 pubkey
+        // standing in for a real submitter id. the default empty external
+        // origin would be rejected.
+        let demo_user = PrivateKey::decode(&[5u8; 32][..])
+            .expect("32-byte seed is a valid ed25519 private key")
+            .public_key()
+            .as_ref()
+            .to_vec();
+        let as_demo_user = || BlockContext {
+            height: 0,
+            consensus_time: 0,
+            origin: Origin::External(demo_user.clone()),
+        };
         let out = host
-            .submit(Msg {
-                target: "agent".into(),
-                payload: agent_encode_msg(&AgentMsg::OpenSession {
-                    session_id: "general".into(),
-                    title: "General".into(),
-                }),
-            })
+            .submit_at(
+                as_demo_user(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::CreateChannel {
+                        channel_id: "general".into(),
+                        name: "General".into(),
+                        post_policy: PostPolicy::Open,
+                    }),
+                },
+            )
             .await
             .expect("submit block 4");
-        println!("\n[block 4] agent <- OpenSession(general)");
-        println!(
-            "  agent root     : {:?}",
-            host.module_root("agent").unwrap()
-        );
+        println!("\n[block 4] chat <- CreateChannel(general) — authorship from origin");
+        println!("  chat root      : {:?}", host.module_root("chat").unwrap());
         println!("  app-hash       : {:?}", out.app_hash);
 
-        let out = host
-            .submit(Msg {
-                target: "agent".into(),
-                payload: agent_encode_msg(&AgentMsg::AppendTurn {
-                    session_id: "general".into(),
-                    user_message_id: "u1".into(),
-                    assistant_message_id: "a1".into(),
-                    user: "demo-user".into(),
-                    assistant: "demo-agent".into(),
-                    user_body: "what changed?".into(),
-                    assistant_body: "agent is now queryable and root-backed".into(),
+        // block 5: a root message, a thread reply, and a reaction — three ops,
+        // three blocks; sequences come from the channel's head_seq counter.
+        host.submit_at(
+            as_demo_user(),
+            Msg {
+                target: "chat".into(),
+                payload: chat_encode_msg(&ChatMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "m1".into(),
+                    blocks: vec![ChatBlock::paragraph("what changed?")],
+                    thread: None,
                 }),
-            })
+            },
+        )
+        .await
+        .expect("submit block 5 post");
+        host.submit_at(
+            as_demo_user(),
+            Msg {
+                target: "chat".into(),
+                payload: chat_encode_msg(&ChatMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "m2".into(),
+                    blocks: vec![ChatBlock::paragraph(
+                        "chat is block-based and origin-authored now",
+                    )],
+                    thread: Some(1),
+                }),
+            },
+        )
+        .await
+        .expect("submit block 5 reply");
+        let out = host
+            .submit_at(
+                as_demo_user(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::AddReaction {
+                        channel_id: "general".into(),
+                        seq: 2,
+                        emoji: "🦆".into(),
+                    }),
+                },
+            )
             .await
-            .expect("submit block 5");
+            .expect("submit block 5 reaction");
         let reply = host
             .query(
-                "agent",
-                &agent_encode_query(&AgentQuery::Messages {
-                    session_id: "general".into(),
+                "chat",
+                &chat_encode_query(&ChatQuery::MessagesLatest {
+                    channel_id: "general".into(),
+                    limit: 16,
                 }),
             )
             .await
-            .expect("query agent");
-        if let AgentReply::Messages(entries) = agent_decode_reply(&reply).unwrap() {
-            println!("\n[block 5] agent <- AppendTurn(general, u1, a1)");
-            println!("  entry count    : {}", entries.len());
+            .expect("query chat");
+        if let ChatReply::Messages(messages) = chat_decode_reply(&reply).unwrap() {
+            println!("\n[block 5] chat <- PostMessage(m1) + thread reply(m2) + AddReaction");
+            println!("  message count  : {}", messages.len());
             println!(
-                "  agent root     : {:?}",
-                host.module_root("agent").unwrap()
+                "  m1 replies     : {} (last reply seq: {:?})",
+                messages[0].head.reply_count, messages[0].head.last_reply_seq
             );
+            println!(
+                "  m2 reactions   : {:?}",
+                messages[1]
+                    .reactions
+                    .iter()
+                    .map(|r| (r.emoji.as_str(), r.reactors.len()))
+                    .collect::<Vec<_>>()
+            );
+            println!("  chat root      : {:?}", host.module_root("chat").unwrap());
             println!("  app-hash       : {:?}", out.app_hash);
         }
 
@@ -346,11 +401,11 @@ fn main() {
 
         println!("\nmodule roots:");
         for id in [
+            "chat",
             "directory",
             "document",
             "forge",
             "greeter",
-            "agent",
             "kv",
             "valset",
         ] {

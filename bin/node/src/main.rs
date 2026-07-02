@@ -61,7 +61,6 @@ use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
-use agent::Agent;
 use chat::Chat;
 use directory::Directory;
 use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
@@ -70,7 +69,6 @@ use forge::Forge;
 use governance::Governance;
 use host::Host;
 use kv::Kv;
-use messaging::Messaging;
 use node::OrderedNode;
 use saga::SagaModule;
 use sdk::{Msg, StateRoot};
@@ -213,10 +211,7 @@ async fn genesis_host(
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
-    let messaging = Messaging::init(context.child("messaging"), "messaging").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
-    let agent =
-        Agent::init_with_messaging_id(context.child("agent"), "agent", "agent-messaging").await;
     let forge = Forge::init("forge", forge_repo.to_path_buf()).expect("forge init");
     let mut valset = Valset::new("valset");
     // genesis-seed the validator set from config — deterministic and identical
@@ -228,9 +223,7 @@ async fn genesis_host(
     Host::genesis(vec![
         Box::new(kv),
         Box::new(document),
-        Box::new(messaging),
         Box::new(chat),
-        Box::new(agent),
         Box::new(forge),
         Box::new(valset),
         // governance is the SOLE authorized author of valset changes: member
@@ -552,25 +545,8 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let document =
                 Document::sync_from(context.child("document"), "document", target, resolver).await;
 
-            let (target, resolver) = fetch_target("messaging").await;
-            let messaging =
-                Messaging::sync_from(context.child("messaging"), "messaging", target, resolver)
-                    .await;
-
-            // wrappers over EMBEDDED substrates: chat embeds under its own id,
-            // agent under "agent-messaging" — mirroring genesis_host exactly.
             let (target, resolver) = fetch_target("chat").await;
             let chat = Chat::sync_from(context.child("chat"), "chat", target, resolver).await;
-
-            let (target, resolver) = fetch_target("agent").await;
-            let agent = Agent::sync_from_messaging_id(
-                context.child("agent"),
-                "agent",
-                "agent-messaging",
-                target,
-                resolver,
-            )
-            .await;
 
             let snapshot_of = |module: &'static str| {
                 let client = client.clone();
@@ -613,8 +589,8 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 12] = [
-                &kv, &document, &messaging, &chat, &agent, &directory, &valset, &governance,
+            let mods: [&dyn sdk::Module; 10] = [
+                &kv, &document, &chat, &directory, &valset, &governance,
                 &saga, &tasks, &vaults, &forge,
             ];
             let synced = state::global_root(&mods);
@@ -839,7 +815,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                         RpcRequest::Status => {
                             let mut modules = std::collections::BTreeMap::new();
                             for m in [
-                                "kv", "document", "messaging", "chat", "agent", "forge",
+                                "kv", "document", "chat", "forge",
                                 "valset", "governance", "saga", "tasks", "vaults", "directory",
                             ] {
                                 if let Some(root) = node.host().module_root(m) {
