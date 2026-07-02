@@ -1,0 +1,4 @@
+interface:
+  display_name: "Work"
+  short_description: "Start task worktrees and maintain one PR."
+  default_prompt: "Use $work to start or resume a task worktree, finish the work, push the branch, and maintain one PR."

@@ -1,9 +1,9 @@
 ---
-name: planning-mode
-description: Use when running as the top-tier model in this repo and the task involves writing or changing code before editing files. Also triggers on "planning mode", work spanning multiple files or steps, or deciding whether to implement directly versus delegate mechanical bulk work.
+name: plan
+description: Use when running as the top-tier model in this repo and the task involves writing or changing code before editing files. Also triggers on planning work, multi-step work, or deciding whether to implement directly versus delegate mechanical bulk work.
 ---
 
-# Planning Mode (Ducktape)
+# Plan (Ducktape)
 
 You are running as the **top-tier model** of whatever provider drives this session
 (Claude Opus, Codex's top reasoning model, etc.). Act as the **architect and the
