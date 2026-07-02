@@ -1,0 +1,4 @@
+interface:
+  display_name: "Publishing PRs"
+  short_description: "Package Ducktape work into PRs targeting main."
+  default_prompt: "Use $publishing-prs when turning local Ducktape work into a pull request targeting main."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Working in Worktrees"
+  short_description: "Start Ducktape work in isolated main-based worktrees."
+  default_prompt: "Use $working-in-worktrees before starting a Ducktape feature, fix, docs, or process change in an isolated main-based worktree."
