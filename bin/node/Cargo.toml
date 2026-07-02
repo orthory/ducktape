@@ -37,6 +37,12 @@ vaults = { workspace = true }
 reactor = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
+# the http/ws app surface, shared with the embedded daemon: NodeCommand lane,
+# axum router, and serve() — this binary only owns the pump-side of the lane.
+noded = { path = "../noded" }
+# the app-surface thread runs plain tokio (axum); the node itself stays on
+# commonware's runner.
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }

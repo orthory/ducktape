@@ -1,20 +1,20 @@
 # ducktape build + install entry points.
 #
-# `make install` builds the node daemon and the desktop app, installs
-# ducktape-noded into ~/.cargo/bin, and places Ducktape.app in /Applications.
+# `make install` builds the networked node and the desktop app, installs
+# ducktape-node into ~/.cargo/bin, and places Ducktape.app in /Applications.
 # individual targets below for the pieces.
 
 CARGO ?= cargo
 BUN ?= bun
 APP_DEST ?= /Applications
 
-.PHONY: all noded web app sidecar install install-noded install-app test clean
+.PHONY: all node web app sidecar install install-node install-app test clean
 
-all: noded web
+all: node web
 
-## release build of the node daemon
-noded:
-	$(CARGO) build --release -p noded
+## release build of the networked node (serves the app surface)
+node:
+	$(CARGO) build --release -p node-bin
 
 ## stage the daemon as the desktop app's sidecar (app/src-tauri/binaries)
 sidecar: app/node_modules
@@ -32,11 +32,11 @@ app: app/node_modules
 app/node_modules:
 	cd app && $(BUN) install
 
-install: install-noded install-app
+install: install-node install-app
 
-## ducktape-noded -> ~/.cargo/bin
-install-noded:
-	$(CARGO) install --path bin/noded --locked
+## ducktape-node -> ~/.cargo/bin
+install-node:
+	$(CARGO) install --path bin/node --locked
 
 ## Ducktape.app -> $(APP_DEST)
 install-app: app
