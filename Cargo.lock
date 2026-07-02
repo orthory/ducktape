@@ -2532,6 +2532,7 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "chat",
+ "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
@@ -2560,6 +2561,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing-subscriber 0.3.23",
  "valset",
+ "valset-interface",
  "vaults",
 ]
 
