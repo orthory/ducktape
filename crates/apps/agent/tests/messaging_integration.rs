@@ -6,6 +6,11 @@ use agent_interface::{
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::Host;
 use messaging::Messaging;
+use messaging_interface::{
+    ChatMessage, MessagingMsg, MessagingQuery, MessagingReply,
+    decode_reply as decode_messaging_reply, encode_msg as encode_messaging_msg,
+    encode_query as encode_messaging_query,
+};
 use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
 
 struct TestCtx {
@@ -51,6 +56,13 @@ fn agent_msg(payload: AgentMsg) -> Msg {
     }
 }
 
+fn messaging_msg(payload: MessagingMsg) -> Msg {
+    Msg {
+        target: DEFAULT_MESSAGING_TARGET.into(),
+        payload: encode_messaging_msg(&payload),
+    }
+}
+
 fn entry(
     id: &str,
     session_id: &str,
@@ -80,6 +92,14 @@ async fn agent_query(host: &Host, query: AgentQuery) -> AgentReply {
         .await
         .unwrap();
     decode_reply(&reply).unwrap()
+}
+
+async fn messaging_query(host: &Host, query: MessagingQuery) -> MessagingReply {
+    let reply = host
+        .query(DEFAULT_MESSAGING_TARGET, &encode_messaging_query(&query))
+        .await
+        .unwrap();
+    decode_messaging_reply(&reply).unwrap()
 }
 
 async fn apply_commit<E>(module: &mut Agent<E>, at: u64, payload: AgentMsg)
@@ -404,6 +424,73 @@ fn missing_session_rolls_back_the_agent_backing_store() {
         assert_eq!(host.module_root(DEFAULT_AGENT_TARGET).unwrap(), agent_root);
         assert_eq!(
             agent_query(&host, AgentQuery::Sessions).await,
+            AgentReply::Sessions(vec![])
+        );
+    });
+}
+
+#[test]
+fn new_agent_genesis_does_not_implicitly_migrate_standalone_messaging_state() {
+    deterministic::Runner::default().start(|context| async move {
+        let messaging = Messaging::init(context.child("old"), DEFAULT_MESSAGING_TARGET).await;
+        let mut old_host = Host::genesis(vec![Box::new(messaging)]).unwrap();
+
+        old_host
+            .submit(messaging_msg(MessagingMsg::CreateChannel {
+                channel_id: "s1".into(),
+                name: "Planning".into(),
+            }))
+            .await
+            .unwrap();
+        old_host
+            .submit(messaging_msg(MessagingMsg::PostMessage {
+                channel_id: "s1".into(),
+                message_id: "m1".into(),
+                author: "planner".into(),
+                body: "old standalone storage".into(),
+            }))
+            .await
+            .unwrap();
+
+        let old_messaging_root = old_host.module_root(DEFAULT_MESSAGING_TARGET).unwrap();
+        assert_eq!(
+            messaging_query(
+                &old_host,
+                MessagingQuery::Messages {
+                    channel_id: "s1".into()
+                },
+            )
+            .await,
+            MessagingReply::Messages(vec![ChatMessage {
+                id: "m1".into(),
+                channel_id: "s1".into(),
+                author: "planner".into(),
+                body: "old standalone storage".into(),
+                sequence: 1,
+                sent_at: 0,
+                thread_id: None,
+                reply_count: 0,
+                last_reply_at: None,
+            }])
+        );
+
+        // The demo cutover is a new genesis/app-hash shape, not an implicit
+        // in-place migration from an already registered standalone messaging
+        // module into the agent wrapper.
+        let agent = Agent::init_with_messaging_id(
+            context.child("new"),
+            DEFAULT_AGENT_TARGET,
+            "agent-messaging-new",
+        )
+        .await;
+        let new_host = Host::genesis(vec![Box::new(agent)]).unwrap();
+
+        assert_ne!(
+            new_host.module_root(DEFAULT_AGENT_TARGET).unwrap(),
+            old_messaging_root
+        );
+        assert_eq!(
+            agent_query(&new_host, AgentQuery::Sessions).await,
             AgentReply::Sessions(vec![])
         );
     });

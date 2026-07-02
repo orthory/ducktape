@@ -1,11 +1,15 @@
-//! the module interface crate — the ONLY crate a feature module may depend on.
+//! the module interface crate — the only universal dependency for modules.
 //!
 //! a super-app feature (documents, forge, chat, tasks, …) is an isolated module:
-//! a crate that implements [`Module`] and depends on `sdk` and nothing else in
-//! the workspace. the host composes each module's [`StateRoot`] into the global
-//! app-hash (see the `state` crate); how a module *computes* that root — a qmdb
-//! merkle root, a git HEAD oid — is private to the module. the host only ever
-//! sees `root() -> StateRoot`.
+//! a crate that implements [`Module`] and normally depends on `sdk` plus
+//! types-only interface crates for any modules it talks to. a narrow wrapper
+//! exception exists for modules that embed a shared storage implementation as a
+//! private substrate: the substrate is not a separately registered module, and
+//! all durable state must move through the wrapper's [`StateRoot`],
+//! commit/abort, and sync boundary. the host composes each module's
+//! [`StateRoot`] into the global app-hash (see the `state` crate); how a module
+//! *computes* that root — a qmdb merkle root, a git HEAD oid — is private to the
+//! module. the host only ever sees `root() -> StateRoot`.
 //!
 //! this crate also carries the deterministic *system api*: the [`Ctx`] a module
 //! touches during state-machine application (own-state r/w lives in `self`;
