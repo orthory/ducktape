@@ -1,4 +1,0 @@
-interface:
-  display_name: "Reviewing PRs"
-  short_description: "Run clean-context PR review loops before merge."
-  default_prompt: "Use $reviewing-prs when reviewing a pull request, addressing accepted feedback, and deciding whether it is ready to merge into main."

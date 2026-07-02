@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan"
+  short_description: "Plan judgment-heavy repo work before editing."
+  default_prompt: "Use $plan before writing or changing code in Ducktape, especially for multi-step work or delegation decisions."
