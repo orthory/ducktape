@@ -397,9 +397,32 @@ impl MeshView {
     }
 }
 
+/// the documented v1 preimage (docs/wireguard-tunnel-upgrade.md "Mesh
+/// Version"): HASH(domain || namespace || epoch || valset_root ||
+/// admission_root || SORT_ASC(endpoint_record_hashes)). the epoch tuple is
+/// hashed at the TOP LEVEL — not only inside each record hash — exactly as
+/// the doc specifies, so an independent implementation working from the doc
+/// produces the same version. records carrying mismatched tuples cannot
+/// version at all (a mixed set is a protocol violation, never hashable).
 pub fn compute_mesh_version(records: &[EndpointRecord]) -> Result<MeshVersion, UpgradeError> {
-    if records.is_empty() {
+    let Some(first) = records.first() else {
         return Err(UpgradeError::MissingAdvertisement);
+    };
+    let tuple = (
+        first.namespace.as_str(),
+        first.epoch,
+        first.valset_root,
+        first.admission_root,
+    );
+    if records.iter().any(|r| {
+        (
+            r.namespace.as_str(),
+            r.epoch,
+            r.valset_root,
+            r.admission_root,
+        ) != tuple
+    }) {
+        return Err(UpgradeError::MeshVersionMismatch);
     }
     let mut hashes: Vec<[u8; 32]> = records
         .iter()
@@ -412,6 +435,10 @@ pub fn compute_mesh_version(records: &[EndpointRecord]) -> Result<MeshVersion, U
     hashes.sort();
     let mut out = Vec::new();
     put_str(&mut out, "ducktape:validator-mesh-version:v1");
+    put_str(&mut out, &first.namespace);
+    put_u64(&mut out, first.epoch);
+    put_root(&mut out, first.valset_root);
+    put_admission_root(&mut out, first.admission_root);
     for hash in hashes {
         put_fixed(&mut out, &hash);
     }

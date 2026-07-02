@@ -48,12 +48,13 @@ together and shows their roots moving under one composed app-hash:
 cargo run -p demo
 ```
 
-Run two real nodes as separate OS processes, converging on a byte-identical
-app-hash over localhost TCP via a live Simplex BFT engine:
+Run the real-socket cluster e2e — REAL node processes over localhost TCP,
+driven through the rpc: BFT convergence, a chat product loop, a governance
+vote, a live epoch cutover, a crash-fault liveness check, and a sync-only
+joiner rebuilding every module to the identical app-hash:
 
 ```sh
-cd bin/node
-./examples/demo-2node.sh
+cargo test -p node-bin --test cluster_e2e
 ```
 
 Run the joiner state-sync proof — a fresh joiner rebuilds every module and
@@ -61,6 +62,13 @@ lands on the source app-hash:
 
 ```sh
 cargo test -p demo --test joiner_rebuilds_global_app_hash
+```
+
+Run everything the repo can verify locally (rust workspace including the e2e
+suites, then the app suites against a freshly built daemon):
+
+```sh
+make test
 ```
 
 ## Run The App
