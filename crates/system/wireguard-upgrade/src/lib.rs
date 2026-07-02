@@ -213,7 +213,7 @@ pub enum MeshCapability {
     Relay,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ActiveValidatorSet {
     pub namespace: String,
     pub epoch: u64,
@@ -233,9 +233,7 @@ impl ActiveValidatorSet {
         if validators.is_empty() {
             return Err(UpgradeError::EmptyValidatorSet);
         }
-        if admission_root.0 == [0u8; 32] {
-            return Err(UpgradeError::MissingAdmissionRoot);
-        }
+        validate_admission_root(admission_root)?;
         let mut sorted = validators;
         sorted.sort();
         if sorted.windows(2).any(|w| w[0] == w[1]) {
@@ -326,6 +324,7 @@ impl MeshView {
         policy: &PortPolicy,
         current_view: u64,
     ) -> Result<Self, UpgradeError> {
+        validate_admission_root(active_set.admission_root)?;
         let mut selected: BTreeMap<ValidatorIdentity, EndpointAdvertisement> = BTreeMap::new();
         for ad in advertisements {
             let record = &ad.record;
@@ -730,16 +729,68 @@ impl ReplayCache {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TunnelInstallContext {
+    pub namespace: String,
+    pub epoch: u64,
+    pub valset_root: Root,
+    pub admission_root: AdmissionRoot,
+    pub mesh_version: MeshVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TunnelInstallPlan {
-    pub local_identity: ValidatorIdentity,
-    pub peer_identity: ValidatorIdentity,
-    pub local_wireguard_public_key: X25519PublicKey,
-    pub peer_wireguard_public_key: X25519PublicKey,
-    pub peer_endpoint: Endpoint,
-    pub local_interface_ips: Vec<AllowedIp>,
-    pub allowed_ips: Vec<AllowedIp>,
-    pub relay_candidates: Vec<ValidatorIdentity>,
-    pub keepalive_seconds: Option<u16>,
+    context: TunnelInstallContext,
+    local_identity: ValidatorIdentity,
+    peer_identity: ValidatorIdentity,
+    local_wireguard_public_key: X25519PublicKey,
+    peer_wireguard_public_key: X25519PublicKey,
+    peer_endpoint: Endpoint,
+    local_interface_ips: Vec<AllowedIp>,
+    allowed_ips: Vec<AllowedIp>,
+    relay_candidates: Vec<ValidatorIdentity>,
+    keepalive_seconds: Option<u16>,
+}
+
+impl TunnelInstallPlan {
+    pub fn context(&self) -> &TunnelInstallContext {
+        &self.context
+    }
+
+    pub fn local_identity(&self) -> ValidatorIdentity {
+        self.local_identity
+    }
+
+    pub fn peer_identity(&self) -> ValidatorIdentity {
+        self.peer_identity
+    }
+
+    pub fn local_wireguard_public_key(&self) -> X25519PublicKey {
+        self.local_wireguard_public_key
+    }
+
+    pub fn peer_wireguard_public_key(&self) -> X25519PublicKey {
+        self.peer_wireguard_public_key
+    }
+
+    pub fn peer_endpoint(&self) -> Endpoint {
+        self.peer_endpoint
+    }
+
+    pub fn local_interface_ips(&self) -> &[AllowedIp] {
+        &self.local_interface_ips
+    }
+
+    pub fn allowed_ips(&self) -> &[AllowedIp] {
+        &self.allowed_ips
+    }
+
+    pub fn relay_candidates(&self) -> &[ValidatorIdentity] {
+        &self.relay_candidates
+    }
+
+    pub fn keepalive_seconds(&self) -> Option<u16> {
+        self.keepalive_seconds
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,6 +804,7 @@ pub fn validate_upgrade(
     ack: &TunnelUpgradeAck,
     replay: &mut ReplayCache,
 ) -> Result<TunnelInstallPlan, UpgradeError> {
+    validate_admission_root(view.active_set.admission_root)?;
     request.verify_signature()?;
     response.verify_signature()?;
     ack.verify_signature()?;
@@ -865,6 +917,13 @@ pub fn validate_upgrade(
     }
 
     Ok(TunnelInstallPlan {
+        context: TunnelInstallContext {
+            namespace: view.active_set.namespace.clone(),
+            epoch: view.active_set.epoch,
+            valset_root: root,
+            admission_root,
+            mesh_version: view.mesh_version,
+        },
         local_identity: rq.initiator_identity,
         peer_identity: rq.responder_identity,
         local_wireguard_public_key: rq.initiator_wireguard_public_key,
@@ -1031,6 +1090,13 @@ fn to_defguard_allowed_ips(routes: &[AllowedIp]) -> Vec<IpAddrMask> {
 fn ensure_x25519(key: X25519PublicKey) -> Result<(), UpgradeError> {
     if key.0 == [0u8; 32] {
         return Err(UpgradeError::InvalidWireGuardKey);
+    }
+    Ok(())
+}
+
+fn validate_admission_root(admission_root: AdmissionRoot) -> Result<(), UpgradeError> {
+    if admission_root.0 == [0u8; 32] {
+        return Err(UpgradeError::MissingAdmissionRoot);
     }
     Ok(())
 }

@@ -241,13 +241,14 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
         &view, &policy, &overlay, 12, &request, &response, &ack, &mut cache,
     )
     .unwrap();
+    assert_eq!(plan.context().admission_root, set.admission_root);
     assert_eq!(
-        plan.peer_endpoint,
+        plan.peer_endpoint(),
         view.record(id(&b)).unwrap().wireguard_endpoint
     );
     assert_eq!(
-        plan.allowed_ips,
-        overlay.allowed_ips_for(&view, id(&b)).unwrap()
+        plan.allowed_ips(),
+        overlay.allowed_ips_for(&view, id(&b)).unwrap().as_slice()
     );
 
     let response_without_failure = TunnelUpgradeResponse::sign(
@@ -436,8 +437,8 @@ fn valid_plan_builds_defguard_peer_config() {
     .unwrap();
 
     let peer = DefguardPeerConfig::from_plan(&plan);
-    assert_eq!(peer.peer.endpoint, Some(plan.peer_endpoint.socket_addr()));
-    assert_eq!(peer.allowed_ips, plan.allowed_ips);
+    assert_eq!(peer.peer.endpoint, Some(plan.peer_endpoint().socket_addr()));
+    assert_eq!(peer.allowed_ips, plan.allowed_ips());
 
     let interface = DefguardInterfaceConfig::from_plan(
         "wg-ducktape0",
