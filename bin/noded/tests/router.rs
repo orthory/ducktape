@@ -6,8 +6,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
 use http_body_util::BodyExt as _;
+use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
 use tower::ServiceExt as _;
 
 /// a scripted actor: answers every command the same way, like a module host
@@ -16,7 +16,12 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
     tokio::spawn(async move {
         while let Some(cmd) = cmds.next().await {
             match cmd {
-                NodeCommand::Submit { target, payload, origin, reply } => {
+                NodeCommand::Submit {
+                    target,
+                    payload,
+                    origin,
+                    reply,
+                } => {
                     let result = match submit_err {
                         Some(err) => Err(err.to_string()),
                         None => {
@@ -165,7 +170,12 @@ async fn status_reports_app_hash_height_and_module_roots() {
     spawn_fake_actor(cmd_rx, None);
 
     let response = noded::router(handle)
-        .oneshot(Request::builder().uri("/v1/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 

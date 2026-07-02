@@ -46,28 +46,30 @@
 //! process's genesis line agrees, every converged line agrees, and the sync-only
 //! joiner's synced line equals the converged line.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
-use commonware_cryptography::{ed25519, Signer};
+use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_codec::DecodeExt as _;
 use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _};
 use commonware_runtime::{Clock, IoBuf, Quota, Runner, Spawner, Supervisor};
-use commonware_utils::{ordered::Set, NZU32};
+use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
 
-use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer};
+use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
+
+mod config;
+use config::{Resolved, hex_bytes, unhex};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 use chat::Chat;
 use directory::Directory;
-use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
+use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use document::Document;
 use forge::Forge;
 use governance::Governance;
@@ -76,12 +78,12 @@ use kv::Kv;
 use node::OrderedNode;
 use saga::SagaModule;
 use sdk::{Msg, StateRoot};
+use statesync::p2p::P2pSyncClient;
+use statesync::qmdb::RemoteQmdbResolver;
+use statesync::{SyncServer, fetch_manifest, fetch_snapshot};
 use tasks::Tasks;
 use valset::Valset;
 use vaults::Vaults;
-use statesync::p2p::P2pSyncClient;
-use statesync::qmdb::RemoteQmdbResolver;
-use statesync::{fetch_manifest, fetch_snapshot, SyncServer};
 
 /// the peer-set index. every node must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
@@ -110,7 +112,15 @@ const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
 const MODULE_IDS: [&str; 10] = [
-    "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults",
+    "kv",
+    "document",
+    "chat",
+    "forge",
+    "valset",
+    "governance",
+    "saga",
+    "tasks",
+    "vaults",
     "directory",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
@@ -143,52 +153,10 @@ fn epoch_floor(namespace: &[u8], epoch: u64) -> Digest {
     )
 }
 
-/// the plain-data node config, parsed from toml. mirrors legacy examples/node*.toml
-/// (seed identity, listen/advertised addrs, shared namespace + authorized peer
-/// seeds, a bootstrapper addr for non-zero nodes, an isolated storage root).
-#[derive(serde::Deserialize)]
-struct NodeConfig {
-    /// ed25519 identity seed (dev): the identity is `PrivateKey::from_seed(id)`.
-    id: u64,
-    /// address to bind/listen on.
-    listen: String,
-    /// address advertised to peers for dialing; defaults to `listen`.
-    advertised: Option<String>,
-    /// application namespace — MUST match across the mesh (domain-separates the
-    /// discovery handshake, the simplex scheme, and the genesis floor).
-    namespace: String,
-    /// the authorized MESH participant set as identity seeds; every node lists
-    /// the SAME set (including its own and any sync-only joiners), sorted into
-    /// the ed25519 `Set` discovery tracks.
-    peer_seeds: Vec<u64>,
-    /// the CONSENSUS participant subset (identity seeds). defaults to
-    /// `peer_seeds`. a seed in `peer_seeds` but not here is mesh-only — e.g. a
-    /// sync-only joiner that may fetch state but casts no votes.
-    validator_seeds: Option<Vec<u64>>,
-    /// node 0's dialable address. required for `id != 0` (they bootstrap off it).
-    bootstrapper_addr: Option<String>,
-    /// per-process FS storage root. REQUIRED to be distinct per process: the qmdb
-    /// `kv` module uses a fixed "kv" partition, so two processes sharing a root
-    /// would corrupt each other's state. defaults to a per-id temp dir.
-    storage_dir: Option<String>,
-    /// local rpc listen address (json-lines over tcp) for op submission,
-    /// queries, status, and shutdown. OFF when unset. bind loopback only —
-    /// the rpc trusts its caller (it stamps this node's own origin on submits).
-    rpc_listen: Option<String>,
-    /// http/ws app-surface listen address (the noded wire contract: /v1/submit,
-    /// /v1/query, /v1/status, /v1/shutdown, /v1/ws). OFF when unset. bind
-    /// loopback only — like the rpc, the surface trusts its caller and stamps
-    /// this node's own origin on submits. a submit reply is HELD until the op's
-    /// frame drains at a finalized boundary (the app's submit→re-query contract
-    /// needs the applied state visible when the reply lands), unlike the rpc's
-    /// accepted-not-finalized submit.
-    http_listen: Option<String>,
-}
-
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
 async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
-    use valset_interface::{decode_reply, encode_query, ValsetQuery, ValsetReply};
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
         .query("valset", &encode_query(&ValsetQuery::Validators))
         .await
@@ -204,24 +172,6 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
 /// hex-encode a state root for a stable, greppable log line.
 fn hex(root: &StateRoot) -> String {
     hex_bytes(&root.0)
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn unhex(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
-        return Err("hex string has odd length".into());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
 }
 
 /// the PRODUCTION module set — genesis state, identical on every node (a
@@ -300,10 +250,20 @@ struct RpcStatus {
 
 impl RpcReply {
     fn ok() -> Self {
-        Self { ok: true, error: None, reply_hex: None, status: None }
+        Self {
+            ok: true,
+            error: None,
+            reply_hex: None,
+            status: None,
+        }
     }
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(msg.into()), reply_hex: None, status: None }
+        Self {
+            ok: false,
+            error: Some(msg.into()),
+            reply_hex: None,
+            status: None,
+        }
     }
 }
 
@@ -358,24 +318,34 @@ fn spawn_rpc_listener(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse `--config <path> [--sync-only]`.
-    let mut args = std::env::args().skip(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("keygen") => return cmd_keygen(&args[1..]),
+        Some("init") => return cmd_init(&args[1..]),
+        Some("invite") => return cmd_invite(&args[1..]),
+        Some("admit") => return cmd_admit(&args[1..]),
+        Some("join") => return cmd_join(&args[1..]),
+        _ => {}
+    }
+
+    // the run path: `--config <path> [--sync-only]`.
     let mut cfg_path: Option<PathBuf> = None;
     let mut sync_only = false;
-    while let Some(a) = args.next() {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
-            "--config" => cfg_path = args.next().map(PathBuf::from),
+            "--config" => cfg_path = it.next().map(PathBuf::from),
             "--sync-only" => sync_only = true,
             other => {
-                return Err(
-                    format!("unexpected arg {other:?} (want --config <path> [--sync-only])")
-                        .into(),
+                return Err(format!(
+                    "unexpected arg {other:?} (want a subcommand — keygen|init|invite|admit|join \
+                     — or --config <path> [--sync-only])"
                 )
+                .into());
             }
         }
     }
     let cfg_path = cfg_path.ok_or("missing --config <path>")?;
-    let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(&cfg_path)?)?;
 
     // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
     tracing_subscriber::fmt()
@@ -383,7 +353,247 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    run_node(cfg, sync_only)
+    run_node(config::resolve(&cfg_path)?, sync_only)
+}
+
+// ============================================================================
+// onboarding verbs — keygen / init / invite / admit / join.
+// ============================================================================
+
+/// tiny flag parser: `--name value` pairs plus positionals; no deps.
+fn parse_flags(
+    args: &[String],
+) -> Result<(Vec<String>, std::collections::BTreeMap<String, String>), String> {
+    let mut positional = Vec::new();
+    let mut flags = std::collections::BTreeMap::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(name) = a.strip_prefix("--") {
+            let v = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
+            flags.insert(name.to_string(), v.clone());
+        } else {
+            positional.push(a.clone());
+        }
+    }
+    Ok((positional, flags))
+}
+
+/// `keygen [--out <path>]` — generate (or reuse) a persisted ed25519 identity.
+/// pubkey on stdout (scriptable); provenance on stderr.
+fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(
+        flags
+            .get("out")
+            .map(String::as_str)
+            .unwrap_or("identity.key"),
+    );
+    let (key, generated) = config::load_or_generate_identity(&out)?;
+    println!("{}", hex_bytes(key.public_key().as_ref()));
+    eprintln!(
+        "{} identity at {}",
+        if generated { "generated" } else { "reusing" },
+        out.display()
+    );
+    Ok(())
+}
+
+/// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
+/// [--rpc a]` — found a network: mint the chain-id, write the descriptor +
+/// node config, seed the genesis validator set with this identity.
+fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let name = flags
+        .get("name")
+        .ok_or("init needs --name <human-readable network name>")?;
+    let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
+    std::fs::create_dir_all(&dir)?;
+    // re-running init would mint a FRESH chain-id and reset the validator set
+    // to just this identity — silently un-founding the network under every
+    // holder of an existing invite. founding is once per directory.
+    let descriptor_path = dir.join("network.toml");
+    if descriptor_path.exists() {
+        return Err(format!(
+            "{} already exists — this directory is already a network. use `invite`/`admit` \
+             for membership, or delete the file to re-found from scratch",
+            descriptor_path.display()
+        )
+        .into());
+    }
+    let plumbing = config::merged_plumbing(
+        &dir,
+        flags.get("listen").map(String::as_str),
+        flags.get("advertised").map(String::as_str),
+        flags.get("http").map(String::as_str),
+        flags.get("rpc").map(String::as_str),
+    )?;
+
+    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
+    let me = key.public_key();
+    let chain_id = config::mint_chain_id(name, &me);
+    let mut descriptor = config::NetworkDescriptor {
+        chain_id: chain_id.clone(),
+        scheme: config::SCHEME_ED25519.into(),
+        validators: vec![hex_bytes(me.as_ref())],
+        bootstrap: Vec::new(),
+    };
+    if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
+        descriptor.add_bootstrap(&me, &addr);
+    }
+    descriptor.save(&descriptor_path)?;
+    config::write_node_toml(&dir, &plumbing)?;
+    eprintln!(
+        "{} identity {}",
+        if generated { "generated" } else { "reusing" },
+        hex_bytes(me.as_ref())
+    );
+    eprintln!("network {chain_id} initialized in {}", dir.display());
+    eprintln!("start:  ducktape-node --config {}/node.toml", dir.display());
+    eprintln!(
+        "invite: ducktape-node invite --config {}/node.toml",
+        dir.display()
+    );
+    println!("{chain_id}");
+    Ok(())
+}
+
+/// `invite [--config node.toml]` — emit the one-line paste blob: the network
+/// descriptor with THIS member's dial hint folded in (and persisted, so every
+/// future invite carries it).
+fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
+    let (raw, base) = config::load_node_toml(&cfg_path)?;
+    let network_rel = raw
+        .network
+        .as_deref()
+        .ok_or("invite needs a network-shape config (no `network` field found)")?;
+    let descriptor_path = base.join(network_rel);
+    let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
+    let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
+    match config::dialable(raw.advertised.as_deref(), &raw.listen)? {
+        Some(addr) => descriptor.add_bootstrap(&key.public_key(), &addr),
+        // an invite must carry SOME dialable member.
+        None if descriptor.bootstrap.is_empty() => {
+            return Err(
+                "no dialable address: give node.toml a concrete `listen` port or an \
+                        `advertised` addr so a joiner can reach the network"
+                    .into(),
+            );
+        }
+        None => {}
+    }
+    descriptor.save(&descriptor_path)?;
+    println!("{}", config::encode_invite(&descriptor));
+    Ok(())
+}
+
+/// `admit <hex pubkey> [--config node.toml]` — pre-genesis membership: add an
+/// identity to the descriptor's validator set. once the network has state,
+/// membership changes go through governance (AddValidator), not genesis edits.
+fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    let [pubkey_hex] = pos.as_slice() else {
+        return Err("admit needs exactly one <hex pubkey>".into());
+    };
+    let key = config::decode_key(pubkey_hex)?;
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
+    let (raw, base) = config::load_node_toml(&cfg_path)?;
+    let network_rel = raw
+        .network
+        .as_deref()
+        .ok_or("admit needs a network-shape config")?;
+    let storage = base.join(raw.storage_dir.as_deref().unwrap_or("storage"));
+    if storage.exists() {
+        return Err(format!(
+            "{} already has state — a running network admits members via governance \
+             (AddValidator), not by editing genesis",
+            storage.display()
+        )
+        .into());
+    }
+    let descriptor_path = base.join(network_rel);
+    let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
+    descriptor.admit(&key);
+    descriptor.save(&descriptor_path)?;
+    eprintln!("admitted {pubkey_hex} into {}", descriptor.chain_id);
+    eprintln!(
+        "re-run `ducktape-node invite` and share the REFRESHED invite — genesis must be \
+         identical on every member"
+    );
+    Ok(())
+}
+
+/// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
+/// [--rpc a]` — materialize a workspace from an invite: descriptor + identity
+/// (kept across re-joins) + node config. prints this identity for the
+/// inviter's pre-genesis `admit`.
+fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    let [blob] = pos.as_slice() else {
+        return Err("join needs exactly one <invite blob>".into());
+    };
+    let descriptor = config::decode_invite(blob)?;
+    let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
+    std::fs::create_dir_all(&dir)?;
+    config::guard_join_descriptor(&dir, &descriptor)?;
+    // plumbing merges: explicit flags win, an existing node.toml's values
+    // (network- or dev-shape) survive, defaults fill the rest. computed
+    // BEFORE anything lands on disk so a corrupt existing node.toml aborts
+    // the join without leaving a half-migrated dir. the file is ALWAYS
+    // rewritten in the network shape — a join must take effect even in a dir
+    // holding the app's dev-shape solo config.
+    let plumbing = config::merged_plumbing(
+        &dir,
+        flags.get("listen").map(String::as_str),
+        flags.get("advertised").map(String::as_str),
+        flags.get("http").map(String::as_str),
+        flags.get("rpc").map(String::as_str),
+    )?;
+    descriptor.save(&dir.join("network.toml"))?;
+    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
+    let me_hex = hex_bytes(key.public_key().as_ref());
+    config::write_node_toml(&dir, &plumbing)?;
+    eprintln!(
+        "{} identity {me_hex}",
+        if generated { "generated" } else { "reusing" }
+    );
+    eprintln!(
+        "workspace for {} written to {}",
+        descriptor.chain_id,
+        dir.display()
+    );
+    if descriptor.validators.contains(&me_hex) {
+        eprintln!(
+            "this identity is a member — start: ducktape-node --config {}/node.toml",
+            dir.display()
+        );
+    } else {
+        eprintln!("NOT yet a member. send this identity to a member, who runs:");
+        eprintln!("    ducktape-node admit {me_hex}");
+        eprintln!("then join again with the refreshed invite (the identity here is kept).");
+    }
+    println!("{me_hex}");
+    Ok(())
 }
 
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
@@ -393,70 +603,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// and you cannot start a runtime from inside one. so `main` is sync and hands
 /// off to `Runner::start`, which drives everything (including the engine's spawned
 /// tasks) on the runtime it owns.
-fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let id = cfg.id;
-    let listen: SocketAddr = cfg.listen.parse()?;
-    let advertised: SocketAddr = match cfg.advertised.as_deref() {
-        Some(a) => a.parse()?,
-        None => listen,
-    };
-    let namespace = cfg.namespace.clone().into_bytes();
+fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let Resolved {
+        signer,
+        label,
+        namespace,
+        mesh: peers,
+        validators,
+        bootstrappers,
+        listen,
+        advertised,
+        storage_dir: storage,
+        rpc_listen,
+        http_listen,
+        dev_demo,
+    } = resolved;
+    if !sync_only && !validators.contains(&signer.public_key()) {
+        return Err(format!(
+            "identity {} is not in the validator set — run with --sync-only (observer) or \
+             get admitted first",
+            hex_bytes(signer.public_key().as_ref())
+        )
+        .into());
+    }
 
-    // each seed -> an ed25519 identity; together the authorized MESH set.
-    let peers: Vec<ed25519::PublicKey> = cfg
-        .peer_seeds
-        .iter()
-        .map(|s| ed25519::PrivateKey::from_seed(*s).public_key())
+    // keep the raw (key, addr) pairs for statesync source selection before
+    // discovery's bootstrapper list converts to its own ingress address type.
+    let sync_candidates = bootstrappers.clone();
+    let bootstrappers: Vec<(ed25519::PublicKey, _)> = bootstrappers
+        .into_iter()
+        .map(|(k, a)| (k, a.into()))
         .collect();
-    // the consensus participant subset (defaults to the whole mesh).
-    let validator_seeds = cfg
-        .validator_seeds
-        .clone()
-        .unwrap_or_else(|| cfg.peer_seeds.clone());
-    let validators: Vec<ed25519::PublicKey> = validator_seeds
-        .iter()
-        .map(|s| ed25519::PrivateKey::from_seed(*s).public_key())
-        .collect();
 
-    // node 0 bootstraps nobody; everyone else dials node 0 (= peer_seeds[0]).
-    let bootstrappers: Vec<(ed25519::PublicKey, _)> = if id == 0 {
-        Vec::new()
-    } else {
-        let boot_seed = *cfg
-            .peer_seeds
-            .first()
-            .ok_or("a bootstrapping node needs peer_seeds[0] = node 0")?;
-        let boot_key = ed25519::PrivateKey::from_seed(boot_seed).public_key();
-        let boot_addr: SocketAddr = cfg
-            .bootstrapper_addr
-            .as_deref()
-            .ok_or("a non-zero node needs bootstrapper_addr set")?
-            .parse()?;
-        vec![(boot_key, boot_addr.into())]
-    };
-
-    // per-process storage isolation (see NodeConfig::storage_dir).
-    let storage = cfg
-        .storage_dir
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
-
-    for (i, seed) in cfg.peer_seeds.iter().enumerate() {
-        let pk = ed25519::PrivateKey::from_seed(*seed).public_key();
-        println!("[node #{id}] peer[{i}] seed={seed} identity={}", hex_bytes(pk.as_ref()));
+    for (i, pk) in peers.iter().enumerate() {
+        println!(
+            "[node {label}] peer[{i}] identity={}",
+            hex_bytes(pk.as_ref())
+        );
     }
     println!(
-        "[node #{id}] starting on {listen} ({} mesh peers, {} validators{}), storage {}",
-        cfg.peer_seeds.len(),
-        validator_seeds.len(),
+        "[node {label}] starting on {listen} ({} mesh peers, {} validators{}), namespace {}, storage {}",
+        peers.len(),
+        validators.len(),
         if sync_only { ", sync-only" } else { "" },
+        String::from_utf8_lossy(&namespace),
         storage.display()
     );
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise.
-    let rpc_listener = match cfg.rpc_listen.as_deref() {
+    let rpc_listener = match rpc_listen.as_deref() {
         Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
         _ => None,
     };
@@ -466,31 +662,37 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
-    match cfg.http_listen.as_deref() {
+    match http_listen.as_deref() {
         Some(addr) if !sync_only => {
             let listener = std::net::TcpListener::bind(addr)?;
             listener.set_nonblocking(true)?;
             println!(
-                "[node #{id}] app surface listening on http://{}",
-                listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                "[node {label}] app surface listening on http://{}",
+                listener
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
             );
-            std::thread::Builder::new().name("app-surface".into()).spawn(move || {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("app-surface tokio runtime")
-                    .block_on(async move {
-                        let listener = tokio::net::TcpListener::from_std(listener)
-                            .expect("adopt app-surface listener");
-                        if let Err(e) = noded::serve(listener, http_handle).await {
-                            eprintln!("app surface server error: {e}");
-                        }
-                    });
-                // a client asked the surface to shut down (POST /v1/shutdown) —
-                // mirror the rpc shutdown: exit the whole process gracefully.
-                println!("[node #{id}] shutdown requested via app surface — exiting");
-                std::process::exit(0);
-            })?;
+            let thread_label = label.clone();
+            std::thread::Builder::new()
+                .name("app-surface".into())
+                .spawn(move || {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("app-surface tokio runtime")
+                        .block_on(async move {
+                            let listener = tokio::net::TcpListener::from_std(listener)
+                                .expect("adopt app-surface listener");
+                            if let Err(e) = noded::serve(listener, http_handle).await {
+                                eprintln!("app surface server error: {e}");
+                            }
+                        });
+                    // a client asked the surface to shut down (POST /v1/shutdown) —
+                    // mirror the rpc shutdown: exit the whole process gracefully.
+                    println!("[node {thread_label}] shutdown requested via app surface — exiting");
+                    std::process::exit(0);
+                })?;
         }
         // surface off: dropping the handle terminates the command stream; the
         // pump's select arm sees one None and then never polls it again.
@@ -503,14 +705,19 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
-        let signer = ed25519::PrivateKey::from_seed(id);
-
         // the authorized MESH set, SORTED — what discovery tracks. the
         // consensus scheme uses the (possibly smaller) validator set below.
         let mesh_participants: Set<ed25519::PublicKey> =
             Set::try_from(peers.clone()).expect("authorized peer set has no duplicates");
         let validator_participants: Set<ed25519::PublicKey> =
             Set::try_from(validators.clone()).expect("validator set has no duplicates");
+
+        // the statesync source a --sync-only joiner pulls from: only
+        // validators serve the channel, so the candidate must be a validator
+        // that is not us (a non-validator hint or our own key would be
+        // retried forever — discovery never connects a node to itself).
+        let sync_source =
+            config::choose_sync_source(&sync_candidates, &validators, &signer.public_key());
 
         // the real encrypted TCP mesh. `local` is the dev preset (allows private
         // ips). MUST be the real tokio runtime — discovery live-locks under the
@@ -552,7 +759,13 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
             network.start();
 
-            let server_peer = peers.first().expect("peer_seeds is non-empty").clone();
+            let Some(server_peer) = sync_source else {
+                eprintln!(
+                    "[node {label}] no statesync source: no validator other than this node \
+                     is available to serve (only validators answer the statesync channel)"
+                );
+                std::process::exit(1);
+            };
             let client = P2pSyncClient::new(
                 context.child("sync_client"),
                 sync_tx,
@@ -566,13 +779,13 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                 match fetch_manifest(&client).await {
                     Ok(m) => break m,
                     Err(e) => {
-                        println!("[node #{id}] manifest not ready ({e}); retrying");
+                        println!("[node {label}] manifest not ready ({e}); retrying");
                         context.sleep(Duration::from_millis(500)).await;
                     }
                 }
             };
             println!(
-                "[node #{id}] manifest height={} app_hash={}",
+                "[node {label}] manifest height={} app_hash={}",
                 manifest.height,
                 hex(&manifest.app_hash)
             );
@@ -657,13 +870,13 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {
                 eprintln!(
-                    "[node #{id}] SYNC FAILED: composed {} != manifest {}",
+                    "[node {label}] SYNC FAILED: composed {} != manifest {}",
                     hex(&synced),
                     hex(&manifest.app_hash)
                 );
                 std::process::exit(1);
             }
-            println!("[node #{id}] synced app_hash={}", hex(&synced));
+            println!("[node {label}] synced app_hash={}", hex(&synced));
             return;
         }
 
@@ -739,7 +952,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                 .and_then(|s| s.take())
                 .unwrap_or_else(|| {
                     eprintln!(
-                        "[node #{id}] FATAL: epoch {epoch} exhausts the pre-registered                          channel bank ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
+                        "[node {label}] FATAL: epoch {epoch} exhausts the pre-registered                          channel bank ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
                     );
                     std::process::exit(1);
                 });
@@ -813,7 +1026,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         // the genesis app-hash BEFORE any op — the demo asserts this agrees across
         // processes (a fork here would be a genesis-determinism bug, not consensus).
         let genesis_hash = node.app_hash();
-        println!("[node #{id}] genesis app_hash={}", hex(&genesis_hash));
+        println!("[node {label}] genesis app_hash={}", hex(&genesis_hash));
 
         // introduce a DISTINCT op per process: node N writes directory key "kN" =
         // "node-N". distinct key + distinct origin -> distinct frame -> distinct
@@ -825,18 +1038,25 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         // cross the wire?) from op ordering. ONE submit — the automaton PEEKS
         // (never pops), so the digest rides out every nullified early view until
         // the mesh forms and this node leads and proposes it.
-        let op = Msg {
-            target: "directory".into(),
-            payload: encode_msg(&DirMsg::Set { key: format!("k{id}"), value: format!("node-{id}") }),
-        };
-        node.submit(&signer, 0, op).await.expect("submit op");
+        // dev shape only — a REAL network's genesis carries no demo scaffolding.
+        if dev_demo {
+            let n = label.trim_start_matches('#').to_string();
+            let op = Msg {
+                target: "directory".into(),
+                payload: encode_msg(&DirMsg::Set {
+                    key: format!("k{n}"),
+                    value: format!("node-{n}"),
+                }),
+            };
+            node.submit(&signer, 0, op).await.expect("submit op");
+        }
 
         // the local rpc bridge: blocking listener threads push parsed requests
         // into this bounded queue; the pump answers between drains.
         let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
         if let Some(listener) = rpc_listener {
             println!(
-                "[node #{id}] rpc listening on {}",
+                "[node {label}] rpc listening on {}",
                 listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
             );
             spawn_rpc_listener(listener, rpc_tx);
@@ -856,7 +1076,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         // this node has applied every VALIDATOR's op. this infinite loop IS the
         // "run forever" park (keeps the mesh + sync service alive for joiners);
         // rpc `shutdown` is the graceful exit.
-        let expected = validator_seeds.len();
+        let expected = validators.len();
         let mut applied = 0usize;
         let mut converged = false;
         // the app-surface lane: held submit replies keyed by the submitted
@@ -926,7 +1146,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                         }
                         RpcRequest::Shutdown => {
                             let _ = reply.send(RpcReply::ok());
-                            println!("[node #{id}] shutdown requested via rpc — exiting");
+                            println!("[node {label}] shutdown requested via rpc — exiting");
                             std::process::exit(0);
                         }
                     };
@@ -1016,7 +1236,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                     applied += match node.drain_delivered().await {
                         Ok(n) => n,
                         Err(e) => {
-                            eprintln!("[node #{id}] FATAL: {e} — halting");
+                            eprintln!("[node {label}] FATAL: {e} — halting");
                             std::process::exit(1);
                         }
                     };
@@ -1094,7 +1314,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                             orchestrator.observe_finalized_valset(engine_view, observed)
                         {
                             println!(
-                                "[node #{id}] membership change observed at view {} — cutover to epoch {} at view {}",
+                                "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
                                 cutover.observed_view(),
                                 cutover.next_epoch(),
                                 cutover.cutover_view()
@@ -1105,7 +1325,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                             let members = plan.valset().membership().consensus_members();
                             if !members.contains(&signer.public_key()) {
                                 println!(
-                                    "[node #{id}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
+                                    "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
                                     plan.epoch()
                                 );
                                 std::process::exit(0);
@@ -1118,7 +1338,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                                 spawn_epoch(&mut channel_bank, plan.epoch(), participants);
                             node.cutover(orderer, plan.cutover_app_height());
                             println!(
-                                "[node #{id}] cutover complete: epoch {} with {} validators (app height base {})",
+                                "[node {label}] cutover complete: epoch {} with {} validators (app height base {})",
                                 plan.epoch(),
                                 members.len(),
                                 plan.cutover_app_height()
@@ -1141,14 +1361,14 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                                     if let Err(e) =
                                         node.submit(&signer, seq, follow).await
                                     {
-                                        eprintln!("[node #{id}] worker follow-up submit failed: {e}");
+                                        eprintln!("[node {label}] worker follow-up submit failed: {e}");
                                     }
                                     claimed = true;
                                     break;
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
-                                    eprintln!("[node #{id}] worker error: {e}");
+                                    eprintln!("[node {label}] worker error: {e}");
                                     claimed = true; // errored ≠ unclaimed; don't double-log
                                     break;
                                 }
@@ -1156,14 +1376,14 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                         }
                         if !claimed {
                             println!(
-                                "[node #{id}] effect with no worker ({} bytes) — dropped",
+                                "[node {label}] effect with no worker ({} bytes) — dropped",
                                 eff.0.len()
                             );
                         }
                     }
-                    if !converged && applied >= expected {
+                    if dev_demo && !converged && applied >= expected {
                         let h = node.app_hash();
-                        println!("[node #{id}] converged app_hash={}", hex(&h));
+                        println!("[node {label}] converged app_hash={}", hex(&h));
                         // dump every directory key so the demo can eyeball the ops
                         // (each node ends holding the op it originated AND the peer's).
                         for k in 0..expected {
@@ -1173,7 +1393,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                                 .await
                                 .expect("directory query");
                             if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
-                                println!("[node #{id}]   directory k{k}={v:?}");
+                                println!("[node {label}]   directory k{k}={v:?}");
                             }
                         }
                         converged = true;

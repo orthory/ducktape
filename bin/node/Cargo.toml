@@ -53,6 +53,8 @@ commonware-codec = { workspace = true }
 
 serde = { workspace = true }
 toml = "0.8"
+# identity keygen entropy (`Signer::random`).
+rand = "0.8"
 # stderr tracing for the p2p/consensus internals (RUST_LOG=commonware_p2p=debug).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
