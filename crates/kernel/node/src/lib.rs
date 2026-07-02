@@ -327,6 +327,23 @@ use sdk::Origin;
 /// signed artifact in the system.
 const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 
+/// the content address of an encoded frame — sha256 over the exact bytes the
+/// orderer carries. computed identically at submit and at drain, so a caller
+/// holding the id [`OrderedNode::submit`] returned can recognize its own op in
+/// [`OrderedNode::take_drained`]. the matching is internal to this seam:
+/// nothing requires it to equal the consensus lane's content digest.
+pub type FrameId = [u8; 32];
+
+fn frame_id(bytes: &[u8]) -> FrameId {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let mut hasher = Sha256::default();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(digest.as_ref());
+    id
+}
+
 /// a wire frame: the ordered unit. carries the submitter's ed25519 public key
 /// (`origin`), a per-origin monotonic `seq` (so two intentionally identical
 /// msgs are still DISTINCT frames — the order key must be tie-free), and a
@@ -502,6 +519,32 @@ impl Orderer for ArrivalOrderer {
     }
 }
 
+/// how a drained frame landed. every finalized frame gets exactly one of
+/// these, and each is a deterministic function of the agreed order plus the
+/// agreed ceiling — so dispositions are identical on every honest validator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// applied via `host.submit_at`; its effects are in the effect queue.
+    Applied,
+    /// a deterministic no-op: the frame failed to decode or a module rejected
+    /// the op (host-lent rolled the block back).
+    Rejected,
+    /// finalized at or past the cutover ceiling — never applied; the submitter
+    /// resubmits in the new epoch.
+    Discarded,
+}
+
+/// one frame the ordered lane finished with — how a caller correlates its own
+/// submits (by [`FrameId`]) with finalized outcomes, e.g. an app surface
+/// holding a reply open until the op lands.
+#[derive(Clone, Copy, Debug)]
+pub struct DrainedFrame {
+    pub id: FrameId,
+    /// the app height stamped for this frame's view (`view_base + view`).
+    pub height: u64,
+    pub disposition: Disposition,
+}
+
 /// a replicated host on the ORDERED lane. owns its [`Host`] and an [`Orderer`].
 /// unlike [`Node`], `submit` does NOT apply to the local host — it only proposes
 /// into the agreed order; application happens exclusively in [`OrderedNode::
@@ -530,6 +573,10 @@ pub struct OrderedNode<O: Orderer> {
     /// the last ENGINE-relative view drained (what the valset orchestrator
     /// observes and compares cutover views against). reset on epoch respawn.
     last_engine_view: Option<u64>,
+    /// per-frame outcomes recorded by `drain_delivered` and not yet taken via
+    /// [`OrderedNode::take_drained`]. like `effects`, long-lived callers take
+    /// these every drain tick; the queue accumulates until taken.
+    drained: Vec<DrainedFrame>,
     /// the deterministic CUTOVER CEILING: frames finalized at or past this
     /// ENGINE view are DISCARDED, not applied. every honest node discards by
     /// the same agreed rule, so a straggler op that finalizes on only some
@@ -544,6 +591,7 @@ impl<O: Orderer> OrderedNode<O> {
             host,
             orderer,
             effects: Vec::new(),
+            drained: Vec::new(),
             finalized: None,
             view_base: 0,
             last_engine_view: None,
@@ -585,9 +633,13 @@ impl<O: Orderer> OrderedNode<O> {
     /// with `(origin, seq)` for a tie-free order key + replay identity. does NOT
     /// touch the local host: `app_hash()` is unchanged until the order delivers
     /// this frame back through [`OrderedNode::drain_delivered`] (the semantic
-    /// shift — no optimistic echo).
-    pub async fn submit(&mut self, signer: &PrivateKey, seq: u64, msg: Msg) -> Result<(), Error> {
-        self.orderer.submit(encode_frame(signer, seq, &msg)).await
+    /// shift — no optimistic echo). returns the frame's [`FrameId`] so the
+    /// caller can recognize this op's outcome in [`OrderedNode::take_drained`].
+    pub async fn submit(&mut self, signer: &PrivateKey, seq: u64, msg: Msg) -> Result<FrameId, Error> {
+        let frame = encode_frame(signer, seq, &msg);
+        let id = frame_id(&frame);
+        self.orderer.submit(frame).await?;
+        Ok(id)
     }
 
     /// DRAIN — apply every frame the order delivered, STRICTLY in agreed order,
@@ -614,12 +666,19 @@ impl<O: Orderer> OrderedNode<O> {
             // could never OBSERVE the views that carry it past its own cutover.
             applied += 1;
             last_view = Some(view);
+            let id = frame_id(&frame);
+            // the agreed view is the block coordinate: the APP HEIGHT is the
+            // engine view offset by the epoch base, so heights and the logical
+            // clock stay monotone across epoch cutovers — identical on every
+            // validator.
+            let height = self.view_base + view;
             // the CUTOVER CEILING: frames finalized at or past the agreed
             // cutover view are DISCARDED — the same view-based rule on every
             // honest node, so a straggler finalizing during teardown on only
             // some nodes cannot fork app state.
             if let Some(ceiling) = self.view_ceiling {
                 if view >= ceiling {
+                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Discarded });
                     continue;
                 }
             }
@@ -629,19 +688,22 @@ impl<O: Orderer> OrderedNode<O> {
             // the chain cannot fork — AND a byzantine proposer cannot HALT honest nodes
             // by getting a malformed op finalized. (the `?`-propagate that used to be
             // here stalled the whole drain on one bad op — the liveness gap.)
-            let Ok((origin, msg)) = decode_frame(&frame) else { continue };
-            // the agreed view is the block coordinate: the APP HEIGHT is the
-            // engine view offset by the epoch base, so heights and the logical
-            // clock stay monotone across epoch cutovers — identical on every
-            // validator. the frame carries the op's real submitter.
-            let height = self.view_base + view;
+            let Ok((origin, msg)) = decode_frame(&frame) else {
+                self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
+                continue;
+            };
             let ctx = BlockContext { height, consensus_time: height, origin };
             // surface each finalized block's effects for the reactor's worker
             // driver. a rejected op yields no outcome (deterministic no-op) and so
             // contributes no effects — same on every validator.
             match self.host.submit_at(ctx, msg).await {
-                Ok(outcome) => self.effects.extend(outcome.effects),
-                Err(host::SubmitError::Rejected(_)) => {}
+                Ok(outcome) => {
+                    self.effects.extend(outcome.effects);
+                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Applied });
+                }
+                Err(host::SubmitError::Rejected(_)) => {
+                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
+                }
                 Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
             }
         }
@@ -672,6 +734,14 @@ impl<O: Orderer> OrderedNode<O> {
     /// the ordered lane (the oracle-as-op over consensus).
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
+    }
+
+    /// take the per-frame outcomes recorded by [`OrderedNode::drain_delivered`]
+    /// since the last call, in agreed order. the drop-in counterpart of
+    /// [`OrderedNode::take_effects`] for callers holding replies open on their
+    /// own submitted [`FrameId`]s.
+    pub fn take_drained(&mut self) -> Vec<DrainedFrame> {
+        std::mem::take(&mut self.drained)
     }
 
     /// borrow the wrapped host (queries, module_root inspection, ...).
