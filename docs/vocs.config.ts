@@ -104,10 +104,20 @@ export default defineConfig({
   renderStrategy: 'full-static',
   aiCta: false,
   topNav: [
-    { text: 'Human EN', link: '/en/human' },
-    { text: 'Human KO', link: '/ko/human' },
-    { text: 'Agent EN', link: '/en/agent' },
-    { text: 'Agent KO', link: '/ko/agent' },
+    {
+      text: 'For Human',
+      items: [
+        { text: 'English', link: '/en/human' },
+        { text: 'Korean', link: '/ko/human' },
+      ],
+    },
+    {
+      text: 'For Agent',
+      items: [
+        { text: 'English', link: '/en/agent' },
+        { text: 'Korean', link: '/ko/agent' },
+      ],
+    },
   ],
   sidebar: {
     '/en/human': { backLink: true, items: humanEn },
