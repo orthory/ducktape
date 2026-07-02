@@ -61,6 +61,12 @@ use commonware_resolver::p2p::{
 };
 use commonware_resolver::{Consumer as ResolverConsumer, Delivery, Resolver as _};
 
+mod valset_orchestrator;
+pub use valset_orchestrator::{
+    EpochMembership, ObservationOutcome, ObservedValset, RespawnPlan, ScheduledCutover,
+    ValsetOrchestrator, ValsetRoot,
+};
+
 /// the concrete digest the consensus lane orders over: a sha256 of the frame
 /// bytes. fixing it here lets the [`ContentStore`] key on a plain `Copy` type.
 pub type Digest = sha256::Digest;
@@ -88,7 +94,10 @@ type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::
 /// finalizes, every validator tears down the current engine and RE-SPAWNS a new one with
 /// the new `(scheme, participants)`. finalizing the switch through the old engine FIRST is
 /// what makes every node cut over at the SAME point (else they fork). this one
-/// teardown-and-respawn mechanism backs both BLS migration and dynamic valset.
+/// teardown-and-respawn mechanism backs both BLS migration and dynamic valset. the same
+/// epoch boundary is where validator-owned transport membership rotates: bootnodes,
+/// relayers, and control participants must be derived from that epoch's validator set,
+/// not from a static external relay.
 ///
 /// # V1 implementation note
 /// [`SimplexOrderer`]'s engine is currently CONCRETE over ed25519 (its `Scheme` type + ~15
