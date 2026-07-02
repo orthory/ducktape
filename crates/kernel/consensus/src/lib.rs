@@ -36,23 +36,23 @@
 //! codec / `RoundOrderer` are all UNCHANGED — `SimplexOrderer` slots in behind
 //! the identical trait.
 
-use std::collections::{HashSet, HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use commonware_actor::Feedback;
 use commonware_consensus::{
-    simplex::{
-        types::{Activity, Context},
-        Plan,
-    },
     Automaton, CertifiableAutomaton, Relay, Reporter,
+    simplex::{
+        Plan,
+        types::{Activity, Context},
+    },
 };
 use commonware_cryptography::certificate::Scheme;
-use commonware_cryptography::{sha256, Hasher, Sha256};
-use commonware_utils::channel::oneshot;
-use commonware_utils::channel::fallible::OneshotExt;
+use commonware_cryptography::{Hasher, Sha256, sha256};
 use commonware_p2p::{Recipients, Sender};
 use commonware_runtime::IoBuf;
+use commonware_utils::channel::fallible::OneshotExt;
+use commonware_utils::channel::oneshot;
 
 use bytes::Bytes;
 use commonware_cryptography::Signer as _;
@@ -333,15 +333,31 @@ impl ContentStore {
             .cloned()
     }
 
+    /// whether this node currently holds the bytes for `digest` (pinned or
+    /// cached), WITHOUT cloning them — the hot-path check the automaton's
+    /// `verify` uses to refuse voting for a payload it cannot reconstruct.
+    pub fn contains(&self, digest: &Digest) -> bool {
+        let inner = self.inner.lock().expect("content store poisoned");
+        inner.pinned.contains_key(digest) || inner.cached.contains_key(digest)
+    }
+
     /// count of PINNED entries (own in-flight submissions) — an ops/metrics
     /// surface: sustained growth means this node's proposals are not finalizing.
     pub fn pinned_len(&self) -> usize {
-        self.inner.lock().expect("content store poisoned").pinned.len()
+        self.inner
+            .lock()
+            .expect("content store poisoned")
+            .pinned
+            .len()
     }
 
     /// count of CACHED entries — bounded by [`PAYLOAD_CACHE_CAP`].
     pub fn cached_len(&self) -> usize {
-        self.inner.lock().expect("content store poisoned").cached.len()
+        self.inner
+            .lock()
+            .expect("content store poisoned")
+            .cached
+            .len()
     }
 }
 
@@ -368,7 +384,10 @@ impl ConsensusHandle {
     /// proposal. the entire `submit` body — NO local apply.
     pub fn submit(&self, bytes: Vec<u8>) {
         let digest = self.store.pin(bytes);
-        self.pending.lock().expect("pending queue poisoned").push_back(digest);
+        self.pending
+            .lock()
+            .expect("pending queue poisoned")
+            .push_back(digest);
     }
 }
 
@@ -386,13 +405,17 @@ impl ConsensusHandle {
 #[derive(Clone)]
 pub struct ConsensusAutomaton<P> {
     pending: Arc<Mutex<VecDeque<Digest>>>,
+    /// the SAME per-process store the paired handle `put`s into and the reporter
+    /// `get`s from — `verify` gates a vote on holding the proposed payload here.
+    store: ContentStore,
     _marker: std::marker::PhantomData<fn() -> P>,
 }
 
 impl<P> ConsensusAutomaton<P> {
-    pub fn new() -> Self {
+    pub fn new(store: ContentStore) -> Self {
         Self {
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            store,
             _marker: std::marker::PhantomData,
         }
     }
@@ -400,7 +423,10 @@ impl<P> ConsensusAutomaton<P> {
     /// queue a digest to be proposed on the next `propose`. the bytes must
     /// already be in the [`ContentStore`] so peers can resolve them.
     pub fn enqueue(&self, digest: Digest) {
-        self.pending.lock().expect("pending queue poisoned").push_back(digest);
+        self.pending
+            .lock()
+            .expect("pending queue poisoned")
+            .push_back(digest);
     }
 
     /// mint a [`ConsensusHandle`] sharing THIS automaton's pending FIFO and the
@@ -412,7 +438,10 @@ impl<P> ConsensusAutomaton<P> {
     /// digest, the reporter `get`s by it on finalization. a mismatched store
     /// silently drops the finalized frame.
     pub fn handle(&self, store: ContentStore) -> ConsensusHandle {
-        ConsensusHandle { store, pending: Arc::clone(&self.pending) }
+        ConsensusHandle {
+            store,
+            pending: Arc::clone(&self.pending),
+        }
     }
 
     /// share THIS automaton's pending FIFO with its paired [`SimplexReporter`],
@@ -420,12 +449,6 @@ impl<P> ConsensusAutomaton<P> {
     /// finalized: propose peeks the front, the reporter removes on finalization).
     pub fn pending(&self) -> Arc<Mutex<VecDeque<Digest>>> {
         Arc::clone(&self.pending)
-    }
-}
-
-impl<P> Default for ConsensusAutomaton<P> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -444,7 +467,13 @@ where
         // removal happens at exactly one point — finalization, in
         // `SimplexReporter::report`. if nothing is queued we drop `tx` (the trait
         // reads that as "can't propose right now") and the engine moves on.
-        if let Some(digest) = self.pending.lock().expect("pending queue poisoned").front().copied() {
+        if let Some(digest) = self
+            .pending
+            .lock()
+            .expect("pending queue poisoned")
+            .front()
+            .copied()
+        {
             tx.send_lossy(digest);
         }
         rx
@@ -453,10 +482,21 @@ where
     async fn verify(
         &mut self,
         _context: Self::Context,
-        _payload: Self::Digest,
+        payload: Self::Digest,
     ) -> oneshot::Receiver<bool> {
+        // vote to finalize ONLY a digest whose bytes this node can reconstruct.
+        // a quorum then always contains enough honest holders to serve the
+        // payload post-finalization (the resolver backstop reaches them), so a
+        // byzantine leader that proposes a digest and withholds its bytes can
+        // never get it AGREED and then wedge the ordered gate on a slot no peer
+        // can resolve. the eager relay gossips a proposed frame to every peer at
+        // propose time, so an honest leader's payload is normally already
+        // stored; a not-yet-drained race just nullifies the view and the
+        // re-proposal re-gossips — self-healing, never a fork. (sim `spawn`
+        // shares ONE store, so every node always holds every digest and this
+        // stays true — the in-process proof is unaffected.)
         let (tx, rx) = oneshot::channel();
-        tx.send_lossy(true);
+        tx.send_lossy(self.store.contains(&payload));
         rx
     }
 }
@@ -527,7 +567,11 @@ impl<S, P> ConsensusRelay<S, P> {
     /// `sender` gossips on the payload channel; `store` MUST be the same
     /// [`ContentStore`] the proposer staged into and the reporter resolves from.
     pub fn new(sender: S, store: ContentStore) -> Self {
-        Self { store, sender, _marker: std::marker::PhantomData }
+        Self {
+            store,
+            sender,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
@@ -595,9 +639,7 @@ where
     E: commonware_runtime::Spawner + Send + 'static,
     R: commonware_p2p::Receiver + Send + 'static,
 {
-    context.spawn(move |_ctx| async move {
-        while receiver.recv().await.is_ok() {}
-    });
+    context.spawn(move |_ctx| async move { while receiver.recv().await.is_ok() {} });
 }
 
 // ============================================================================
@@ -774,7 +816,11 @@ impl FinalizedInbox {
     /// count of UNRELEASED slots (the awaiting window) — an ops/metrics surface:
     /// sustained growth means a missing payload is halting the release prefix.
     pub fn unreleased_len(&self) -> usize {
-        self.inner.lock().expect("finalized inbox poisoned").log.len()
+        self.inner
+            .lock()
+            .expect("finalized inbox poisoned")
+            .log
+            .len()
     }
 
     /// release the longest all-ready PREFIX of the log, in finalization
@@ -899,8 +945,9 @@ where
             // resolver enabled logs an AWAITING slot and we fetch the bytes —
             // moving delivery for the fetched case OFF this sync path into the
             // resolver's `Consumer::deliver`, which fills the slot.
-            let need_fetch =
-                self.inbox.record(view, digest, &self.store, self.mailbox.is_some());
+            let need_fetch = self
+                .inbox
+                .record(view, digest, &self.store, self.mailbox.is_some());
             if need_fetch {
                 self.fetch_or_defer(digest);
             }
@@ -1009,7 +1056,8 @@ impl SimplexOrderer {
                 Digest = Digest,
                 PublicKey = commonware_cryptography::ed25519::PublicKey,
                 Plan = Plan<commonware_cryptography::ed25519::PublicKey>,
-            > + Send + 'static,
+            > + Send
+            + 'static,
         VS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         VR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         CS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
@@ -1018,21 +1066,21 @@ impl SimplexOrderer {
         RR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
     {
         use commonware_consensus::simplex::{
+            Engine,
             config::{Config as SimplexConfig, Floor, ForwardingPolicy},
             elector::RoundRobin,
-            Engine,
         };
         use commonware_consensus::types::ViewDelta;
-        use commonware_cryptography::{ed25519, Sha256};
+        use commonware_cryptography::{Sha256, ed25519};
         use commonware_parallel::Sequential;
         use commonware_runtime::buffer::paged::CacheRef;
-        use commonware_utils::{NZUsize, NZU16};
+        use commonware_utils::{NZU16, NZUsize};
         use std::time::Duration;
 
         // this validator's consensus triple over the ONE shared store: the
         // automaton peeks the FIFO, the submit handle pushes onto it, the reporter
         // removes on finalization and buffers into the inbox we return.
-        let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
+        let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new(store.clone());
         let handle = automaton.handle(store.clone());
         let inbox = FinalizedInbox::new();
         let reporter =
@@ -1070,7 +1118,12 @@ impl SimplexOrderer {
         // KEEP the handle alive inside the orderer — dropping it aborts the engine.
         let engine_handle = engine.start(vote, certificate, resolver);
 
-        SimplexOrderer { handle, inbox, _engine: engine_handle, _resolver: None }
+        SimplexOrderer {
+            handle,
+            inbox,
+            _engine: engine_handle,
+            _resolver: None,
+        }
     }
 
     /// stand up a live simplex engine with a [`NoopRelay`] — the in-process-sim
@@ -1114,8 +1167,17 @@ impl SimplexOrderer {
     {
         let relay = NoopRelay::<commonware_cryptography::ed25519::PublicKey>::new();
         Self::build(
-            context, scheme, blocker, partition, epoch, genesis, store, relay, vote,
-            certificate, resolver,
+            context,
+            scheme,
+            blocker,
+            partition,
+            epoch,
+            genesis,
+            store,
+            relay,
+            vote,
+            certificate,
+            resolver,
         )
     }
 
@@ -1173,14 +1235,27 @@ impl SimplexOrderer {
     {
         let (payload_sender, payload_receiver) = payload;
         // store-ONLY drain: cache peer-relayed frames into THIS process's store.
-        spawn_payload_drain(context.child("payload_drain"), payload_receiver, store.clone());
+        spawn_payload_drain(
+            context.child("payload_drain"),
+            payload_receiver,
+            store.clone(),
+        );
         let relay = ConsensusRelay::<PS, commonware_cryptography::ed25519::PublicKey>::new(
             payload_sender,
             store.clone(),
         );
         Self::build(
-            context, scheme, blocker, partition, epoch, genesis, store, relay, vote,
-            certificate, resolver,
+            context,
+            scheme,
+            blocker,
+            partition,
+            epoch,
+            genesis,
+            store,
+            relay,
+            vote,
+            certificate,
+            resolver,
         )
     }
 
@@ -1239,8 +1314,7 @@ impl SimplexOrderer {
                 Digest,
                 PublicKey = commonware_cryptography::ed25519::PublicKey,
             >,
-        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>
-            + Clone,
+        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey> + Clone,
         D: commonware_p2p::Provider<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         PS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>
             + Clone
@@ -1260,15 +1334,15 @@ impl SimplexOrderer {
         RR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
     {
         use commonware_consensus::simplex::{
+            Engine,
             config::{Config as SimplexConfig, Floor, ForwardingPolicy},
             elector::RoundRobin,
-            Engine,
         };
         use commonware_consensus::types::ViewDelta;
-        use commonware_cryptography::{ed25519, Sha256};
+        use commonware_cryptography::{Sha256, ed25519};
         use commonware_parallel::Sequential;
         use commonware_runtime::buffer::paged::CacheRef;
-        use commonware_utils::{NZUsize, NZU16};
+        use commonware_utils::{NZU16, NZUsize};
         use std::time::Duration;
 
         let (payload_sender, payload_receiver) = payload;
@@ -1280,7 +1354,11 @@ impl SimplexOrderer {
         if starve {
             spawn_blackhole_drain(context.child("payload_starve"), payload_receiver);
         } else {
-            spawn_payload_drain(context.child("payload_drain"), payload_receiver, store.clone());
+            spawn_payload_drain(
+                context.child("payload_drain"),
+                payload_receiver,
+                store.clone(),
+            );
         }
 
         let relay = ConsensusRelay::<PS, ed25519::PublicKey>::new(payload_sender, store.clone());
@@ -1288,7 +1366,7 @@ impl SimplexOrderer {
         // the consensus triple; its ordered gate `inbox` is SHARED with the
         // resolver's consumer so a fetched payload FILLS the exact slot the reporter
         // logged for that digest.
-        let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new();
+        let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new(store.clone());
         let handle = automaton.handle(store.clone());
         let inbox = FinalizedInbox::new();
 
@@ -1298,8 +1376,13 @@ impl SimplexOrderer {
         let fetch_cfg = ResolverConfig {
             peer_provider: provider,
             blocker: blocker.clone(),
-            consumer: PayloadConsumer { store: store.clone(), inbox: inbox.clone() },
-            producer: PayloadProducer { store: store.clone() },
+            consumer: PayloadConsumer {
+                store: store.clone(),
+                inbox: inbox.clone(),
+            },
+            producer: PayloadProducer {
+                store: store.clone(),
+            },
             mailbox_size: NZUsize!(1024),
             me: Some(me),
             initial: Duration::from_millis(100),
@@ -1380,8 +1463,16 @@ mod tests {
         for i in 0..PAYLOAD_CACHE_CAP {
             store.put(format!("blob-{i:08}").into_bytes());
         }
-        assert_eq!(store.cached_len(), PAYLOAD_CACHE_CAP, "cache holds exactly the cap");
-        assert_eq!(store.get(&first), None, "the oldest cached entry was evicted");
+        assert_eq!(
+            store.cached_len(),
+            PAYLOAD_CACHE_CAP,
+            "cache holds exactly the cap"
+        );
+        assert_eq!(
+            store.get(&first),
+            None,
+            "the oldest cached entry was evicted"
+        );
         let last = digest_of(format!("blob-{:08}", PAYLOAD_CACHE_CAP - 1).as_bytes());
         assert!(store.get(&last).is_some(), "the newest entry survives");
     }
@@ -1440,7 +1531,11 @@ mod tests {
             assert_eq!(inbox.unreleased_len(), 1, "one awaiting slot before drain");
             let released = inbox.drain();
             assert_eq!(released.len(), 1);
-            assert_eq!(inbox.unreleased_len(), 0, "released slots are popped, not retained");
+            assert_eq!(
+                inbox.unreleased_len(),
+                0,
+                "released slots are popped, not retained"
+            );
         }
     }
 
@@ -1456,7 +1551,10 @@ mod tests {
         // resolver disabled: both are hits, logged + ready immediately (no await).
         assert!(!inbox.record(1, d_lo, &store, false));
         assert!(!inbox.record(2, d_hi, &store, false));
-        assert_eq!(inbox.drain(), vec![(1, b"view 1".to_vec()), (2, b"view 2".to_vec())]);
+        assert_eq!(
+            inbox.drain(),
+            vec![(1, b"view 1".to_vec()), (2, b"view 2".to_vec())]
+        );
         assert!(inbox.drain().is_empty());
     }
 
@@ -1471,12 +1569,24 @@ mod tests {
         let d1 = digest_of(b"view 1"); // NOT in the store: a missed eager broadcast.
         let d2 = store.put(b"view 2".to_vec());
         let inbox = FinalizedInbox::new();
-        assert!(inbox.record(1, d1, &store, true), "miss + resolver -> awaiting (fetch)");
-        assert!(!inbox.record(2, d2, &store, true), "hit -> ready, but held behind view 1");
-        assert!(inbox.drain().is_empty(), "gate holds the prefix behind the missing slot");
+        assert!(
+            inbox.record(1, d1, &store, true),
+            "miss + resolver -> awaiting (fetch)"
+        );
+        assert!(
+            !inbox.record(2, d2, &store, true),
+            "hit -> ready, but held behind view 1"
+        );
+        assert!(
+            inbox.drain().is_empty(),
+            "gate holds the prefix behind the missing slot"
+        );
         // the fetch resolves view 1's bytes (as the resolver's Consumer would).
         inbox.fill_fetched(d1, b"view 1".to_vec());
-        assert_eq!(inbox.drain(), vec![(1, b"view 1".to_vec()), (2, b"view 2".to_vec())]);
+        assert_eq!(
+            inbox.drain(),
+            vec![(1, b"view 1".to_vec()), (2, b"view 2".to_vec())]
+        );
         assert!(inbox.drain().is_empty());
     }
 
@@ -1486,30 +1596,53 @@ mod tests {
         // do NOT hash to the requested digest is rejected — `deliver` resolves
         // `false` (blocking it), the store is untouched, and the gate slot stays
         // unfilled. the matching bytes DO verify: stored, gate filled, releasable.
-        use commonware_runtime::{deterministic, Runner};
+        use commonware_runtime::{Runner, deterministic};
         use commonware_utils::vec::NonEmptyVec;
 
         deterministic::Runner::timed(std::time::Duration::from_secs(5)).start(|_ctx| async move {
             let store = ContentStore::new();
             let inbox = FinalizedInbox::new();
-            let mut consumer = PayloadConsumer { store: store.clone(), inbox: inbox.clone() };
+            let mut consumer = PayloadConsumer {
+                store: store.clone(),
+                inbox: inbox.clone(),
+            };
 
             let key = digest_of(b"the real finalized frame");
             let tampered = Bytes::from_static(b"byzantine garbage");
-            let bad = Delivery { key, subscribers: NonEmptyVec::new(()) };
+            let bad = Delivery {
+                key,
+                subscribers: NonEmptyVec::new(()),
+            };
             let valid = consumer.deliver(bad, tampered).await.expect("verdict");
-            assert!(!valid, "a hash mismatch resolves false (blocks the lying peer)");
+            assert!(
+                !valid,
+                "a hash mismatch resolves false (blocks the lying peer)"
+            );
             assert_eq!(store.get(&key), None, "reject must not store the garbage");
 
             let good = b"the real finalized frame".to_vec();
             let dg = digest_of(&good);
-            let ok = Delivery { key: dg, subscribers: NonEmptyVec::new(()) };
-            let valid = consumer.deliver(ok, Bytes::from(good.clone())).await.expect("verdict");
+            let ok = Delivery {
+                key: dg,
+                subscribers: NonEmptyVec::new(()),
+            };
+            let valid = consumer
+                .deliver(ok, Bytes::from(good.clone()))
+                .await
+                .expect("verdict");
             assert!(valid, "matching bytes verify (resolves true)");
-            assert_eq!(store.get(&dg), Some(good.clone()), "accepted bytes are stored");
+            assert_eq!(
+                store.get(&dg),
+                Some(good.clone()),
+                "accepted bytes are stored"
+            );
             // once the reporter logs this finalized slot, the filled bytes release.
             inbox.record(1, dg, &store, true);
-            assert_eq!(inbox.drain(), vec![(1, good)], "the filled slot releases in order");
+            assert_eq!(
+                inbox.drain(),
+                vec![(1, good)],
+                "the filled slot releases in order"
+            );
         });
     }
 
@@ -1593,9 +1726,9 @@ mod tests {
         // which this test deliberately never triggers.
         use commonware_consensus::simplex::types::Context;
         use commonware_consensus::types::{Epoch, Round, View};
-        use commonware_cryptography::ed25519::PrivateKey;
         use commonware_cryptography::Signer as _;
-        use commonware_runtime::{deterministic, Runner};
+        use commonware_cryptography::ed25519::PrivateKey;
+        use commonware_runtime::{Runner, deterministic};
 
         let executor = deterministic::Runner::timed(std::time::Duration::from_secs(5));
         executor.start(|_context| async move {
@@ -1603,7 +1736,9 @@ mod tests {
             let digest = store.put(b"queued frame".to_vec());
 
             let mut automaton =
-                ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new();
+                ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new(
+                    store.clone(),
+                );
             automaton.enqueue(digest);
 
             let leader = PrivateKey::from_seed(0).public_key();
@@ -1627,7 +1762,58 @@ mod tests {
                 .await
                 .await
                 .expect("a nullified view keeps the frame queued — re-propose succeeds");
-            assert_eq!(second, digest, "peek must keep the frame proposable after a nullified view");
+            assert_eq!(
+                second, digest,
+                "peek must keep the frame proposable after a nullified view"
+            );
+        });
+    }
+
+    #[test]
+    fn verify_refuses_to_vote_for_an_unheld_payload() {
+        use commonware_consensus::simplex::types::Context;
+        use commonware_consensus::types::{Epoch, Round, View};
+        use commonware_cryptography::Signer as _;
+        use commonware_cryptography::ed25519::PrivateKey;
+        use commonware_runtime::{Runner, deterministic};
+
+        let executor = deterministic::Runner::timed(std::time::Duration::from_secs(5));
+        executor.start(|_context| async move {
+            let store = ContentStore::new();
+            let mut automaton =
+                ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new(
+                    store.clone(),
+                );
+            let leader = PrivateKey::from_seed(0).public_key();
+            let ctx = |payload| Context {
+                round: Round::new(Epoch::new(0), View::new(1)),
+                leader: leader.clone(),
+                parent: (View::new(0), payload),
+            };
+
+            // a digest whose bytes this node never received: a withholding
+            // leader could propose it, but we must NOT vote to finalize what we
+            // cannot reconstruct — else the quorum could agree a slot no honest
+            // peer can serve, wedging the ordered gate forever.
+            let withheld = digest_of(b"a leader proposed this but never gossiped it");
+            let vote = automaton
+                .verify(ctx(withheld), withheld)
+                .await
+                .await
+                .expect("verify resolves");
+            assert!(!vote, "must refuse a payload the store does not hold");
+
+            // once the bytes arrive (eager relay drain / resolver fetch stores
+            // them), the same digest verifies — the vote is payload-gated, not
+            // a permanent reject.
+            let stored = store.put(b"a leader proposed this but never gossiped it".to_vec());
+            assert_eq!(stored, withheld, "content address matches");
+            let vote = automaton
+                .verify(ctx(withheld), withheld)
+                .await
+                .await
+                .expect("verify resolves");
+            assert!(vote, "must vote once the payload is reconstructible");
         });
     }
 }
