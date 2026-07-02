@@ -47,7 +47,8 @@ but product interaction still crosses only interface crates.
 | `crates/system/` | Consensus-infrastructure modules: `kv` (QMDB byte-KV), `valset` (ed25519 validator membership), `saga` (deterministic async continuations), `wireguard-upgrade` |
 | `crates/apps/` | Product modules: `forge` (git-backed project state), `messaging`, `chat`, `document`, `tasks`, `agent` |
 | `crates/examples/` | Demo and test scaffolding modules: `directory`, `greeter` |
-| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (real-socket validator process) |
+| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (real-socket validator process), `noded` (the node daemon serving the app over http/ws) |
+| `app/` | The Ducktape app: one React console shipping a web build and a Tauri desktop build, both clients of `noded` |
 | `docs/` | Vocs documentation site (human/agent tracks, English/Korean) |
 
 `*-interface` crates alongside each module are the only legal cross-module
@@ -81,6 +82,49 @@ lands on the source app-hash:
 
 ```sh
 cargo test -p demo --test joiner_rebuilds_global_app_hash
+```
+
+## Run The App
+
+The app is one React console with two builds, both clients of the node daemon
+(`ducktape-noded`): the web build dials it over http/ws; the desktop build
+spawns it as a detached subprocess (an orphan that keeps running after the
+window closes) and talks to it the same way.
+
+Web — start the daemon, then the dev server:
+
+```sh
+cargo run -p noded                        # http://127.0.0.1:8844, temp storage
+# cargo run -p noded -- --storage <dir>   # persistent module state
+
+cd app
+bun install
+bun run dev                               # http://localhost:1420
+```
+
+The web build dials `http://127.0.0.1:8844` by default; point it elsewhere
+with `VITE_DUCKTAPE_NODE_URL`.
+
+Desktop — the shell finds `ducktape-noded` next to its own executable (the
+shared cargo target dir in dev), so build the daemon once first:
+
+```sh
+cargo build -p noded
+cd app
+bun install
+bun run tauri dev
+```
+
+On launch the app adopts a daemon already listening on `127.0.0.1:8844`, or
+spawns one (state under the OS app-data dir, log at `node/daemon.log`). The
+Node screen has the stop/start control; `POST /v1/shutdown` retires a daemon
+from anywhere else.
+
+Bundling a distributable desktop app stages the daemon as a Tauri sidecar via
+`bun run sidecar` (wired into `beforeBuildCommand`):
+
+```sh
+cd app && bun run tauri build
 ```
 
 ## Documentation
