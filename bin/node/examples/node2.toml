@@ -1,12 +1,10 @@
-# node 2 — the SYNC-ONLY joiner. a mesh member (peer_seeds includes seed 2 on
-# every node) but NOT a consensus participant (validator_seeds stays [0, 1]).
-# run with `--sync-only`: it pulls a manifest + every module from node 0 over
-# the statesync channel, rebuilds them against their committed roots, prints
-# `synced app_hash=`, and exits.
+# node 2 — the THIRD validator. dials node 0; identical mesh + validator sets.
 id = 2
 listen = "127.0.0.1:52202"
 namespace = "ducktape-demo"
-peer_seeds = [0, 1, 2]
-validator_seeds = [0, 1]
+# mesh = validators + the sync-only joiner (seed 3); consensus is [0, 1, 2].
+peer_seeds = [0, 1, 2, 3]
+validator_seeds = [0, 1, 2]
 bootstrapper_addr = "127.0.0.1:52200"
 storage_dir = "/tmp/ducktape-node-2"
+rpc_listen = "127.0.0.1:52302"

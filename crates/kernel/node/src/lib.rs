@@ -516,16 +516,69 @@ pub struct OrderedNode<O: Orderer> {
     /// where the reactor's worker driver reads finalized `WorkerRequest`s from
     /// (via `take_effects`). accumulates in agreed-delivery order.
     effects: Vec<Effect>,
-    /// the latest APPLIED consensus boundary: the last drained view plus the
-    /// app-hash after that drain settled. this is what a state-sync service
-    /// serves from (`host::Host::capture_finalized_snapshot` demands exactly
-    /// this pair) — `None` until the first frame applies.
+    /// the latest APPLIED consensus boundary: the last drained APP HEIGHT
+    /// (`view_base + engine view`) plus the app-hash after that drain settled.
+    /// this is what a state-sync service serves from
+    /// (`host::Host::capture_finalized_snapshot` demands exactly this pair) —
+    /// `None` until the first frame applies.
     finalized: Option<host::FinalizedBlock>,
+    /// the app-height offset of the CURRENT engine's view 0. epoch cutover
+    /// respawns the engine with views restarting at 0; the base keeps `Env`
+    /// heights and the finalized boundary monotone across epochs
+    /// (`app_height = view_base + view` — the orchestrator's epoch_base).
+    view_base: u64,
+    /// the last ENGINE-relative view drained (what the valset orchestrator
+    /// observes and compares cutover views against). reset on epoch respawn.
+    last_engine_view: Option<u64>,
+    /// the deterministic CUTOVER CEILING: frames finalized at or past this
+    /// ENGINE view are DISCARDED, not applied. every honest node discards by
+    /// the same agreed rule, so a straggler op that finalizes on only some
+    /// nodes while engines are being torn down can never fork app state —
+    /// submitters resubmit in the new epoch.
+    view_ceiling: Option<u64>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
     pub fn new(host: Host, orderer: O) -> Self {
-        Self { host, orderer, effects: Vec::new(), finalized: None }
+        Self {
+            host,
+            orderer,
+            effects: Vec::new(),
+            finalized: None,
+            view_base: 0,
+            last_engine_view: None,
+            view_ceiling: None,
+        }
+    }
+
+    /// EPOCH CUTOVER: replace the orderer (dropping the old one aborts its
+    /// engine) and rebase app heights at `view_base` (the cutover app height —
+    /// the orchestrator's epoch_base). clears the ceiling and the
+    /// engine-relative view; the finalized boundary carries over.
+    ///
+    /// call this only after a final [`OrderedNode::drain_delivered`] under the
+    /// ceiling — anything the old engine finalized past the ceiling was
+    /// deterministically discarded on every honest node.
+    pub fn cutover(&mut self, orderer: O, view_base: u64) {
+        self.orderer = orderer;
+        self.view_base = view_base;
+        self.last_engine_view = None;
+        self.view_ceiling = None;
+        // effects of pre-cutover blocks remain takeable; frames buffered in
+        // the OLD orderer die with it (they were past the ceiling or already
+        // drained).
+    }
+
+    /// set the deterministic discard boundary for the CURRENT engine (see the
+    /// field doc). idempotent; cleared by [`OrderedNode::cutover`].
+    pub fn set_view_ceiling(&mut self, ceiling: u64) {
+        self.view_ceiling = Some(ceiling);
+    }
+
+    /// the last ENGINE-relative finalized view this node drained — the number
+    /// the valset orchestrator observes. `None` since the last cutover.
+    pub fn last_engine_view(&self) -> Option<u64> {
+        self.last_engine_view
     }
 
     /// SUBMIT — propose a locally-originated msg into the agreed order. framed
@@ -554,23 +607,35 @@ impl<O: Orderer> OrderedNode<O> {
         let mut applied = 0usize;
         let mut last_view: Option<u64> = None;
         for (view, frame) in delivered {
-            // a FINALIZED op counts as processed whether or not it applies cleanly.
+            // a FINALIZED op counts as processed whether or not it applies
+            // cleanly — and its VIEW advances the engine clock either way (the
+            // view was agreed; discarding or rejecting its op is the same
+            // deterministic no-op on every honest node). without this, a node
+            // could never OBSERVE the views that carry it past its own cutover.
+            applied += 1;
+            last_view = Some(view);
+            // the CUTOVER CEILING: frames finalized at or past the agreed
+            // cutover view are DISCARDED — the same view-based rule on every
+            // honest node, so a straggler finalizing during teardown on only
+            // some nodes cannot fork app state.
+            if let Some(ceiling) = self.view_ceiling {
+                if view >= ceiling {
+                    continue;
+                }
+            }
             // one that fails to decode, or that a module rejects, is a DETERMINISTIC
             // no-op: every honest validator finalized the identical op and handles it
             // identically (host-lent rolls back a rejected block, root unchanged), so
             // the chain cannot fork — AND a byzantine proposer cannot HALT honest nodes
             // by getting a malformed op finalized. (the `?`-propagate that used to be
             // here stalled the whole drain on one bad op — the liveness gap.)
-            applied += 1;
-            // even a rejected/malformed op advances the finalized boundary —
-            // the view was agreed, and every honest validator's app-hash at
-            // this view is identical (unchanged by the no-op).
-            last_view = Some(view);
             let Ok((origin, msg)) = decode_frame(&frame) else { continue };
-            // the agreed view is the block coordinate: height + consensus_time
-            // (a logical, agreed, monotonic clock — identical on every validator).
-            // the frame carries the op's real submitter as the root origin.
-            let ctx = BlockContext { height: view, consensus_time: view, origin };
+            // the agreed view is the block coordinate: the APP HEIGHT is the
+            // engine view offset by the epoch base, so heights and the logical
+            // clock stay monotone across epoch cutovers — identical on every
+            // validator. the frame carries the op's real submitter.
+            let height = self.view_base + view;
+            let ctx = BlockContext { height, consensus_time: height, origin };
             // surface each finalized block's effects for the reactor's worker
             // driver. a rejected op yields no outcome (deterministic no-op) and so
             // contributes no effects — same on every validator.
@@ -581,8 +646,9 @@ impl<O: Orderer> OrderedNode<O> {
             }
         }
         if let Some(view) = last_view {
+            self.last_engine_view = Some(view);
             self.finalized = Some(host::FinalizedBlock {
-                height: view,
+                height: self.view_base + view,
                 app_hash: self.host.app_hash(),
             });
         }

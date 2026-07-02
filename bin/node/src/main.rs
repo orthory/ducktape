@@ -50,6 +50,7 @@ use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{ed25519, Signer};
 use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_codec::DecodeExt as _;
 use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _};
 use commonware_runtime::{Clock, IoBuf, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{ordered::Set, NZU32};
@@ -89,15 +90,43 @@ const PEER_SET: u64 = 0;
 const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
-/// the dedicated channel the eager relay gossips proposed op-batch PAYLOAD
-/// bytes on. vote(0)/cert(1)/resolver(2) are the simplex engine's; 3 is the
-/// next free index (the leader broadcasts here at propose time; every peer's
-/// store-only drain caches the bytes so its reporter resolves the finalized
-/// digest for an op it did NOT originate).
-const CHANNEL_PAYLOAD: u64 = 3;
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 const CHANNEL_STATE_SYNC: u64 = 4;
+/// how many epochs of engine channels are PRE-REGISTERED. discovery channels
+/// can only be registered before `network.start()`, and every epoch's respawned
+/// engine needs FRESH channels (an aborted old engine must never collide with
+/// its successor) — so a bank is reserved up front. exhausting it is a
+/// fail-stop: restart the mesh with a wider bank (a config/build constant, not
+/// consensus state).
+const EPOCH_CHANNEL_BANK: u64 = 16;
+/// finalized views between OBSERVING a membership change and CUTTING OVER —
+/// the grace window in which every honest node sees the same change and arms
+/// the same deterministic discard ceiling. small for the demo network; a
+/// production mesh would size this in minutes of views.
+const CUTOVER_DELAY: u64 = 3;
+
+/// the four channels epoch `e`'s engine uses: vote, certificate, resolver, and
+/// the eager payload-relay lane. starts at 8, clear of the statesync channel.
+fn engine_channels(epoch: u64) -> (u64, u64, u64, u64) {
+    let base = 8 + epoch * 4;
+    (base, base + 1, base + 2, base + 3)
+}
+
+/// the per-epoch genesis floor: domain-separated by namespace AND epoch, so a
+/// respawned engine can never confuse an old epoch's certificates with its own
+/// (an old-epoch floor fails `Floor::assert` against the new epoch).
+fn epoch_floor(namespace: &[u8], epoch: u64) -> Digest {
+    digest_of(
+        &[
+            b"ducktape:consensus:genesis:v1:".as_ref(),
+            namespace,
+            b":epoch:",
+            &epoch.to_le_bytes(),
+        ]
+        .concat(),
+    )
+}
 
 /// the plain-data node config, parsed from toml. mirrors legacy examples/node*.toml
 /// (seed identity, listen/advertised addrs, shared namespace + authorized peer
@@ -131,6 +160,22 @@ struct NodeConfig {
     /// queries, status, and shutdown. OFF when unset. bind loopback only —
     /// the rpc trusts its caller (it stamps this node's own origin on submits).
     rpc_listen: Option<String>,
+}
+
+/// read the valset module's current membership projection (committed state —
+/// called between drains, outside any block).
+async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
+    use valset_interface::{decode_reply, encode_query, ValsetQuery, ValsetReply};
+    let Ok(reply) = host
+        .query("valset", &encode_query(&ValsetQuery::Validators))
+        .await
+    else {
+        return Vec::new();
+    };
+    match decode_reply(&reply) {
+        Ok(ValsetReply::Validators(v)) => v,
+        Err(_) => Vec::new(),
+    }
 }
 
 /// hex-encode a state root for a stable, greppable log line.
@@ -379,6 +424,10 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
 
+    for (i, seed) in cfg.peer_seeds.iter().enumerate() {
+        let pk = ed25519::PrivateKey::from_seed(*seed).public_key();
+        println!("[node #{id}] peer[{i}] seed={seed} identity={}", hex_bytes(pk.as_ref()));
+    }
     println!(
         "[node #{id}] starting on {listen} ({} mesh peers, {} validators{}), storage {}",
         cfg.peer_seeds.len(),
@@ -435,16 +484,16 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             // (a permanent connect/kill loop that drops every rpc). so a
             // mesh-member-but-not-validator must register every channel and
             // black-hole the consensus lanes it does not consume.
-            for (ch, label) in [
-                (0u64, "blackhole_vote"),
-                (1, "blackhole_certificate"),
-                (2, "blackhole_resolver"),
-                (CHANNEL_PAYLOAD, "blackhole_payload"),
-            ] {
-                let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
-                context.child(label).spawn(move |_ctx| async move {
-                    while rx.recv().await.is_ok() {}
-                });
+            for epoch in 0..EPOCH_CHANNEL_BANK {
+                let (vote, cert, res, payload) = engine_channels(epoch);
+                for ch in [vote, cert, res, payload] {
+                    let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
+                    let label: &'static str =
+                        Box::leak(format!("blackhole_{ch}").into_boxed_str());
+                    context.child(label).spawn(move |_ctx| async move {
+                        while rx.recv().await.is_ok() {}
+                    });
+                }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
             network.start();
@@ -583,16 +632,21 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
         // ---- a VALIDATOR: consensus engine + state-sync service -------------
 
-        // the simplex engine's three sub-channels, consumed positionally by
-        // `engine.start(vote, certificate, resolver)`, PLUS the payload channel
-        // and the statesync rpc channel.
-        let vote = network.register(0, quota, MAX_BACKLOG);
-        let certificate = network.register(1, quota, MAX_BACKLOG);
-        let resolver = network.register(2, quota, MAX_BACKLOG);
-        // the eager relay's gossip lane. registered BEFORE network.start() so its
-        // receiver buffers from the start; the drain is spawned inside
-        // `spawn_with_relay`.
-        let payload = network.register(CHANNEL_PAYLOAD, quota, MAX_BACKLOG);
+        // pre-register the ENTIRE epoch channel bank (registration is only
+        // possible before network.start(); every respawned engine needs fresh
+        // channels). bank[e] holds epoch e's (vote, certificate, resolver,
+        // payload) pairs until that epoch's engine consumes them.
+        let mut channel_bank: Vec<Option<_>> = (0..EPOCH_CHANNEL_BANK)
+            .map(|epoch| {
+                let (vote, cert, res, payload) = engine_channels(epoch);
+                Some((
+                    network.register(vote, quota, MAX_BACKLOG),
+                    network.register(cert, quota, MAX_BACKLOG),
+                    network.register(res, quota, MAX_BACKLOG),
+                    network.register(payload, quota, MAX_BACKLOG),
+                ))
+            })
+            .collect();
         let (mut sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
 
         // start the network actors (dialer/listener/router/tracker). registered
@@ -631,51 +685,71 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
         let forge_repo = storage_for_sync.join("forge-repo");
         let host = genesis_host(&context, &forge_repo, &validators).await;
 
-        // scheme built the production way: `signer` finds our key's index in the
-        // sorted VALIDATOR set, so we sign as exactly the participant our
-        // discovery identity represents. (NOT the mocks-gated `fixture`.)
-        // the consensus signature scheme is a GENESIS-WIDE constant (ConsensusScheme).
-        // today only V1 (ed25519). adding V2Bls makes this match non-exhaustive — the
-        // compiler-enforced point to wire a BLS engine + an epoch-transition rekey.
-        let scheme = match CONSENSUS_SCHEME {
-            ConsensusScheme::V1Ed25519 => simplex_ed25519::Scheme::signer(
-                &namespace,
-                validator_participants.clone(),
-                signer.clone(),
+        // spawn one epoch's engine from the channel bank. scheme built the
+        // production way (`signer` finds our key's index in the sorted
+        // participant set); per-epoch genesis floor + per-epoch storage
+        // partition, so a respawned engine can never collide with a
+        // predecessor. the consensus signature scheme is a GENESIS-WIDE
+        // constant (ConsensusScheme); adding V2Bls makes the match
+        // non-exhaustive — the compiler-enforced rekey point.
+        let spawn_epoch = |bank: &mut Vec<Option<_>>,
+                               epoch: u64,
+                               participants: Set<ed25519::PublicKey>|
+         -> SimplexOrderer {
+            let slot = bank
+                .get_mut(epoch as usize)
+                .and_then(|s| s.take())
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "[node #{id}] FATAL: epoch {epoch} exhausts the pre-registered                          channel bank ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
+                    );
+                    std::process::exit(1);
+                });
+            let (vote, certificate, resolver, payload) = slot;
+            let scheme = match CONSENSUS_SCHEME {
+                ConsensusScheme::V1Ed25519 => simplex_ed25519::Scheme::signer(
+                    &namespace,
+                    participants,
+                    signer.clone(),
+                )
+                .expect("our key is in the validator participant set"),
+            };
+            let label: &'static str =
+                Box::leak(format!("consensus_e{epoch}").into_boxed_str());
+            SimplexOrderer::spawn_with_relay(
+                context.child(label),
+                scheme,
+                oracle.clone(),
+                format!("{}-e{epoch}", signer.public_key()),
+                Epoch::new(epoch),
+                epoch_floor(&namespace, epoch),
+                // per-process, PER-EPOCH content store: pins/pending of a torn
+                // down epoch die with it (in-flight ops are resubmitted).
+                ContentStore::new(),
+                vote,
+                certificate,
+                resolver,
+                payload,
             )
-            .expect("our key is in the validator participant set"),
         };
 
-        // genesis floor: domain-separated by namespace so every node in THIS app
-        // computes the identical digest (else engines never agree -> hang). NOT
-        // the mocks-gated `mocks::application::genesis`.
-        let genesis_floor: Digest =
-            digest_of(&[b"ducktape:consensus:genesis:v1:".as_ref(), &namespace].concat());
-
-        // per-process content store (NOT shared across processes). the ONLY paths
-        // into it are this node's own `submit` and the payload drain (peer-relayed
-        // bytes) — so applying a peer's op is proof the relay crossed the wire.
-        let store = ContentStore::new();
-
-        // the live simplex Engine, wired to a fresh SimplexOrderer — REUSED
-        // verbatim from the sim. the discovery Oracle IS the Blocker; pubkey hex
-        // is an FS-safe per-node partition. the engine keepalive handle lives
-        // inside the returned orderer (held by the OrderedNode below, which the
-        // loop never drops — so the engine never aborts).
-        let orderer = SimplexOrderer::spawn_with_relay(
-            context.child("consensus"),
-            scheme,
-            oracle.clone(),
-            signer.public_key().to_string(),
-            Epoch::new(0),
-            genesis_floor,
-            store,
-            vote,
-            certificate,
-            resolver,
-            payload,
-        );
+        let orderer = spawn_epoch(&mut channel_bank, 0, validator_participants.clone());
         let mut node = OrderedNode::new(host, orderer);
+
+        // the valset ORCHESTRATOR: watches finalized valset module state and
+        // schedules deterministic epoch cutovers. the initial observation is
+        // the genesis-seeded membership.
+        let genesis_valset_root = node
+            .host()
+            .module_root("valset")
+            .expect("valset is registered");
+        let mut orchestrator = consensus::ValsetOrchestrator::new(
+            CUTOVER_DELAY,
+            consensus::ObservedValset::from_validator_set(
+                consensus::ValsetRoot(genesis_valset_root.0),
+                validators.clone(),
+            ),
+        );
 
         // the genesis app-hash BEFORE any op — the demo asserts this agrees across
         // processes (a fork here would be a genesis-determinism bug, not consensus).
@@ -820,6 +894,63 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                             std::process::exit(1);
                         }
                     };
+                    // the VALSET ORCHESTRATION step: observe the finalized
+                    // membership projection; a change schedules a deterministic
+                    // cutover (arming the discard ceiling), and crossing the
+                    // cutover view tears the engine down and respawns it over
+                    // the new participant set at the next epoch.
+                    if let Some(engine_view) = node.last_engine_view() {
+                        let members_raw = read_valset_members(node.host()).await;
+                        let valset_root = node
+                            .host()
+                            .module_root("valset")
+                            .expect("valset is registered");
+                        let mut member_keys: Vec<ed25519::PublicKey> = Vec::new();
+                        for key in &members_raw {
+                            if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
+                                member_keys.push(pk);
+                            }
+                        }
+                        let observed = consensus::ObservedValset::from_validator_set(
+                            consensus::ValsetRoot(valset_root.0),
+                            member_keys,
+                        );
+                        if let consensus::ObservationOutcome::Scheduled(cutover) =
+                            orchestrator.observe_finalized_valset(engine_view, observed)
+                        {
+                            println!(
+                                "[node #{id}] membership change observed at view {} — cutover to epoch {} at view {}",
+                                cutover.observed_view(),
+                                cutover.next_epoch(),
+                                cutover.cutover_view()
+                            );
+                            node.set_view_ceiling(cutover.cutover_view());
+                        }
+                        if let Some(plan) = orchestrator.respawn_if_due(engine_view) {
+                            let members = plan.valset().membership().consensus_members();
+                            if !members.contains(&signer.public_key()) {
+                                println!(
+                                    "[node #{id}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
+                                    plan.epoch()
+                                );
+                                std::process::exit(0);
+                            }
+                            let participants: Set<ed25519::PublicKey> = Set::try_from(
+                                members.iter().cloned().collect::<Vec<_>>(),
+                            )
+                            .expect("orchestrator membership has no duplicates");
+                            let orderer =
+                                spawn_epoch(&mut channel_bank, plan.epoch(), participants);
+                            node.cutover(orderer, plan.cutover_app_height());
+                            println!(
+                                "[node #{id}] cutover complete: epoch {} with {} validators (app height base {})",
+                                plan.epoch(),
+                                members.len(),
+                                plan.cutover_app_height()
+                            );
+                        }
+                    }
+
                     // the reactor seam: offer each finalized block's effects to
                     // the host-owned workers; a claiming worker's follow-up op
                     // re-enters through the ordered lane as its own block (the

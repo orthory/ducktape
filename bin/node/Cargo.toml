@@ -26,6 +26,7 @@ directory = { workspace = true }
 directory-interface = { workspace = true }
 # the production module set: system infrastructure + every product module.
 valset = { workspace = true }
+valset-interface = { workspace = true }
 governance = { workspace = true }
 saga = { workspace = true }
 forge = { workspace = true }
@@ -44,6 +45,7 @@ commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-utils = { workspace = true }
+commonware-codec = { workspace = true }
 
 serde = { workspace = true }
 toml = "0.8"
