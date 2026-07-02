@@ -1,8 +1,9 @@
-//! a runnable super-app demo: ten registered modules — a qmdb-backed kv, a sync
-//! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
-//! block DOCUMENT module, a qmdb-backed block-based CHAT module, an ed25519
-//! permissionless VALSET, the SAGA async-RPC ledger, the AGENT orchestrator,
-//! and a TASKS ledger — dispatched over ONE host, showing the app-hash evolve
+//! a runnable super-app demo: eleven registered modules — a qmdb-backed kv, a
+//! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
+//! qmdb-backed block DOCUMENT module, a qmdb-backed block-based CHAT module, an
+//! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
+//! orchestrator, a TASKS ledger, and a content-addressed FILES module —
+//! dispatched over ONE host, showing the app-hash evolve
 //! as typed cross-module ops flow, ending on the agent-collaboration beat: a
 //! mention becomes a run and a pending saga in one block.
 //!
@@ -30,6 +31,7 @@ use document_interface::{
     Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
     encode_msg as doc_encode_msg, encode_query as doc_encode_query,
 };
+use files::Files;
 use forge::Forge;
 use forge_interface::{
     ForgeMsg, ForgeQuery, ForgeReply, decode_reply as forge_decode_reply,
@@ -66,6 +68,7 @@ fn main() {
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");
         let tasks = Tasks::new("tasks");
+        let files = Files::new("files");
         let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -77,11 +80,12 @@ fn main() {
             Box::new(valset),
             Box::new(saga),
             Box::new(tasks),
+            Box::new(files),
             Box::new(agent),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 10 registered modules over one host ===");
+        println!("=== super-app demo — 11 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

@@ -1,0 +1,18 @@
+[package]
+name = "files"
+edition.workspace = true
+version.workspace = true
+
+# the files module: content-addressed manifests in consensus state, chunk bytes
+# in a node-local blob store served peer-to-peer (the NoKV metadata/body split).
+[dependencies]
+sdk = { workspace = true }
+files-interface = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+host = { workspace = true }
+sha2 = { workspace = true }
+files-interface = { workspace = true }
