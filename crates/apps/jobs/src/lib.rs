@@ -34,9 +34,15 @@
 //! overlay (`Option<Job>`: `Some` = upsert, `None` = staged delete) so `Prune`
 //! can remove a record atomically with the rest of the block. `snapshot`/
 //! `install` use the exact `root()` preimage; install verifies the expected root
-//! before adopting and rejects only structurally impossible bytes (non-ascending
-//! ids, trailing bytes) -- the root comparison, not an invariant sweep, is the
-//! integrity check, so install accepts every execute-reachable state.
+//! before adopting and rejects structurally impossible bytes (non-ascending ids,
+//! trailing bytes) plus the few execute-UNREACHABLE shapes that would wedge a
+//! job (e.g. `Processing` without a claim). everything execute-reachable is
+//! accepted -- the root comparison, not an invariant sweep, is the integrity
+//! check.
+//!
+//! queries (`Get`/`List`/`Counts`) answer from COMMITTED state only, never the
+//! staged overlay; transition guards keep an overlay-aware view internally so
+//! in-block effects (a first claim) are visible to later ops in the same block.
 //!
 //! # the board is a queue, not an archive
 //!
@@ -89,7 +95,13 @@ impl Jobs {
         }
     }
 
-    // ---- overlay-aware reads -------------------------------------------------
+    // ---- overlay-aware reads (execute-internal ONLY) --------------------------
+    //
+    // transition guards must see in-block effects -- a second claim in the same
+    // block has to observe the first claim's staged `Processing` -- so `get`/
+    // `require`/`live_count` read through the overlay. queries do NOT: they
+    // answer from COMMITTED state only (see [`Module::query`] below), so a read
+    // never leaks a staged write that a block abort would take back.
 
     /// the live view of a single job, reading through the staged overlay.
     fn get(&self, job_id: &str) -> Option<&Job> {
@@ -105,22 +117,6 @@ impl Jobs {
         self.get(job_id)
             .cloned()
             .ok_or_else(|| Error::Module(format!("job not found: {job_id}")))
-    }
-
-    /// the merged committed+overlay board (tombstones removed), keyed ascending.
-    fn merged(&self) -> BTreeMap<String, Job> {
-        let mut merged = self.jobs.clone();
-        for (id, entry) in &self.overlay {
-            match entry {
-                Some(job) => {
-                    merged.insert(id.clone(), job.clone());
-                }
-                None => {
-                    merged.remove(id);
-                }
-            }
-        }
-        merged
     }
 
     /// count of distinct live job ids, accounting for staged upserts/tombstones.
@@ -217,7 +213,7 @@ impl Jobs {
         }
         let worker = actor_from_origin(origin)?;
         job.status = JobStatus::Processing;
-        job.attempt += 1;
+        job.attempt = job.attempt.saturating_add(1);
         job.claim = Some(Claim {
             worker,
             claimed_at_height: height,
@@ -424,12 +420,17 @@ impl Jobs {
 /// derive the acting identity from the dispatch origin -- the ONLY authorship
 /// path. an empty external origin (the pre-consensus `Origin::External(vec![])`
 /// default) is not an authenticated submitter and is rejected.
+///
+/// external keys are domain-separated as `ext:` + lowercase hex (the cross-
+/// branch module convention) so a future module registered under a pure-hex id
+/// can never collide with an external key's hex; module ids pass verbatim and
+/// system is the literal "system".
 fn actor_from_origin(origin: &Origin) -> Result<String, Error> {
     match origin {
         Origin::External(bytes) if bytes.is_empty() => Err(Error::Module(
             "external origin must carry a non-empty submitter id".into(),
         )),
-        Origin::External(bytes) => Ok(hex_lower(bytes)),
+        Origin::External(bytes) => Ok(format!("ext:{}", hex_lower(bytes))),
         Origin::Module(id) => Ok(id.clone()),
         Origin::System => Ok("system".into()),
     }
@@ -511,17 +512,41 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, Job>, Error> {
         let created_at_height = read_u64(bytes, &mut off)?;
         let updated_at_height = read_u64(bytes, &mut off)?;
 
-        // structural check only: strictly-ascending ids match `BTreeMap`
-        // iteration, so a byte stream that would not re-encode to itself is
-        // rejected. NO status/claim/height invariant sweep -- the root
-        // comparison in `install` is the integrity check, and it must accept
-        // every execute-reachable state.
+        // structural check: strictly-ascending ids match `BTreeMap` iteration,
+        // so a byte stream that would not re-encode to itself is rejected.
         if jobs
             .last_key_value()
             .is_some_and(|(last, _)| last.as_str() >= job_id.as_str())
         {
             return Err(Error::Module(
                 "snapshot job ids not strictly ascending".into(),
+            ));
+        }
+
+        // execute-UNREACHABLE shapes are rejected -- these are exactly the
+        // invariants every execute path upholds, so refusing them can never
+        // refuse an honest validator's snapshot. anything weaker is left to the
+        // root comparison in `install`. in particular a `Processing` job
+        // without a claim would be permanently wedged: finalize/release need
+        // worker equality against the claim and reclaim needs its deadline, so
+        // no transition could ever repair it.
+        match (&status, &claim) {
+            (JobStatus::Processing, None) => {
+                return Err(Error::Module(
+                    "snapshot has processing job without claim".into(),
+                ));
+            }
+            (JobStatus::Pending, Some(_)) => {
+                // submit creates without a claim; release/reclaim clear it.
+                return Err(Error::Module("snapshot has pending job with claim".into()));
+            }
+            _ => {}
+        }
+        if matches!(status, JobStatus::Done | JobStatus::Failed) && result.is_none() {
+            // Done/Failed are only produced by finalize/exhausted-reclaim, and
+            // both store a result. (Cancelled legitimately has none.)
+            return Err(Error::Module(
+                "snapshot has finalized job without result".into(),
             ));
         }
         jobs.insert(
@@ -627,11 +652,14 @@ impl Module for Jobs {
         }
     }
 
+    /// read projections answer from COMMITTED state only -- never the staged
+    /// overlay. a query must not observe a write that a block abort would take
+    /// back; transition guards keep their own overlay-aware view internally.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            JobsQuery::Get { job_id } => {
-                Ok(encode_reply(&JobsReply::Job(self.get(&job_id).cloned())))
-            }
+            JobsQuery::Get { job_id } => Ok(encode_reply(&JobsReply::Job(
+                self.jobs.get(&job_id).cloned(),
+            ))),
             JobsQuery::List {
                 status,
                 kind_prefix,
@@ -639,20 +667,21 @@ impl Module for Jobs {
             } => {
                 let limit = limit.min(MAX_LIST_LIMIT) as usize;
                 let jobs: Vec<Job> = self
-                    .merged()
-                    .into_values()
+                    .jobs
+                    .values()
                     .filter(|job| match &status {
                         Some(want) => &job.status == want,
                         None => true,
                     })
                     .filter(|job| job.kind.starts_with(&kind_prefix))
                     .take(limit)
+                    .cloned()
                     .collect();
                 Ok(encode_reply(&JobsReply::Jobs(jobs)))
             }
             JobsQuery::Counts {} => {
                 let mut counts = BoardCounts::default();
-                for job in self.merged().values() {
+                for job in self.jobs.values() {
                     match job.status {
                         JobStatus::Pending => counts.pending += 1,
                         JobStatus::Processing => counts.processing += 1,

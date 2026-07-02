@@ -534,6 +534,7 @@ fn main() {
             "document",
             "forge",
             "greeter",
+            "jobs",
             "kv",
             "saga",
             "tasks",

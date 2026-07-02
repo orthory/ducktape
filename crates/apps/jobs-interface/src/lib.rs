@@ -50,8 +50,9 @@ pub struct Job {
     pub job_id: String,
     pub kind: String,
     pub spec: String,
-    /// origin-derived submitter identity (module id, lowercase-hex external key,
-    /// or "system"). set by the module, never carried on the wire.
+    /// origin-derived submitter identity (module id verbatim, `ext:` +
+    /// lowercase-hex external key, or "system"). set by the module, never
+    /// carried on the wire.
     pub submitter: String,
     pub status: JobStatus,
     /// total number of successful claims over this job's life.

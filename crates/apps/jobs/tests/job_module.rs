@@ -74,12 +74,13 @@ fn ext(id: &str) -> Origin {
     Origin::External(id.as_bytes().to_vec())
 }
 
-/// the module's own lowercase-hex derivation, mirrored so tests can name the
-/// exact worker/submitter string an external origin produces.
-fn hex(bytes: &[u8]) -> String {
+/// the module's own external-actor derivation, mirrored so tests can name the
+/// exact worker/submitter string an external origin produces: `ext:` +
+/// lowercase hex (domain-separated from module ids and "system").
+fn actor(id: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
+    let mut out = String::from("ext:");
+    for &b in id.as_bytes() {
         out.push(HEX[(b >> 4) as usize] as char);
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
@@ -203,7 +204,7 @@ fn full_lifecycle_happy_path() {
         let job = get(&jobs, "j1").await.expect("exists");
         assert_eq!(job.status, JobStatus::Pending);
         assert_eq!(job.attempt, 0);
-        assert_eq!(job.submitter, hex(b"submitter"));
+        assert_eq!(job.submitter, actor("submitter"));
         assert!(job.claim.is_none());
         assert_eq!(job.created_at_height, 1);
         assert_eq!(job.updated_at_height, 1);
@@ -213,7 +214,7 @@ fn full_lifecycle_happy_path() {
         assert_eq!(job.status, JobStatus::Processing);
         assert_eq!(job.attempt, 1);
         let c = job.claim.as_ref().expect("claim");
-        assert_eq!(c.worker, hex(b"worker-a"));
+        assert_eq!(c.worker, actor("worker-a"));
         assert_eq!(c.claimed_at_height, 2);
         assert_eq!(c.lease_views, 50);
         assert_eq!(job.updated_at_height, 2);
@@ -231,7 +232,7 @@ fn full_lifecycle_happy_path() {
         assert!(r.ok);
         assert_eq!(r.payload, "done-payload");
         // the claim is retained for the record.
-        assert_eq!(job.claim.as_ref().unwrap().worker, hex(b"worker-a"));
+        assert_eq!(job.claim.as_ref().unwrap().worker, actor("worker-a"));
         assert_eq!(job.updated_at_height, 3);
     });
 }
@@ -258,7 +259,7 @@ fn second_claim_is_rejected_same_and_later_block() {
         let job = get(&jobs, "j1").await.unwrap();
         assert_eq!(
             job.claim.unwrap().worker,
-            hex(b"worker-a"),
+            actor("worker-a"),
             "A still owns it"
         );
         assert_eq!(job.attempt, 1, "the losing claim never bumped attempt");
@@ -650,7 +651,8 @@ fn queries_get_list_filters_and_counts() {
 fn list_limit_is_clamped_to_256() {
     block_on(async {
         let mut jobs = Jobs::new(JOBS);
-        // stage 300 jobs (overlay-only reads work too).
+        // stage 300 jobs in one block, then commit — queries only see
+        // committed state.
         for i in 0..300u32 {
             stage(
                 &mut jobs,
@@ -661,6 +663,7 @@ fn list_limit_is_clamped_to_256() {
             .await
             .expect("stage");
         }
+        jobs.commit_block().await.expect("commit");
         let listed = list(&jobs, None, "", MAX_LIST_LIMIT * 100).await;
         assert_eq!(
             listed.len(),
@@ -692,7 +695,7 @@ fn identities_are_derived_from_origin() {
         apply(&mut jobs, 1, Origin::System, submit("j-sys", "k", "")).await;
 
         assert_eq!(get(&jobs, "j-mod").await.unwrap().submitter, "agent");
-        assert_eq!(get(&jobs, "j-ext").await.unwrap().submitter, hex(b"alice"));
+        assert_eq!(get(&jobs, "j-ext").await.unwrap().submitter, actor("alice"));
         assert_eq!(get(&jobs, "j-sys").await.unwrap().submitter, "system");
 
         // the pre-consensus empty-external default is not an authenticated actor.
@@ -841,6 +844,181 @@ fn install_rejects_wrong_root_and_corrupt_bytes() {
     });
 }
 
+// ---- hand-crafted snapshot bytes (the module's canonical encoding) ---------
+
+fn push_string(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// encode a one-job snapshot with full control over status/claim/result — the
+/// only way to present execute-unreachable shapes to `install`.
+fn snapshot_one(
+    status: u8,
+    attempt: u64,
+    claim: Option<(&str, u64, u64)>,
+    result: Option<(bool, &str)>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u64.to_le_bytes()); // job count
+    push_string(&mut out, "j1"); // job_id
+    push_string(&mut out, "k"); // kind
+    push_string(&mut out, "spec"); // spec
+    push_string(&mut out, "ext:00"); // submitter
+    out.push(status);
+    out.extend_from_slice(&attempt.to_le_bytes());
+    match claim {
+        None => out.push(0),
+        Some((worker, height, lease)) => {
+            out.push(1);
+            push_string(&mut out, worker);
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(&lease.to_le_bytes());
+        }
+    }
+    match result {
+        None => out.push(0),
+        Some((ok, payload)) => {
+            out.push(1);
+            out.push(u8::from(ok));
+            push_string(&mut out, payload);
+        }
+    }
+    out.extend_from_slice(&1u64.to_le_bytes()); // created_at_height
+    out.extend_from_slice(&1u64.to_le_bytes()); // updated_at_height
+    out
+}
+
+fn root_of_bytes(bytes: &[u8]) -> StateRoot {
+    use sha2::Digest as _;
+    StateRoot(sha2::Sha256::digest(bytes).into())
+}
+
+#[test]
+fn install_rejects_execute_unreachable_shapes() {
+    block_on(async {
+        // (status byte, claim, result, expected rejection)
+        let cases: Vec<(u8, Option<(&str, u64, u64)>, Option<(bool, &str)>, &str)> = vec![
+            // Processing without a claim would be permanently wedged: no
+            // transition (finalize/release/reclaim) can repair it.
+            (1, None, None, "processing job without claim"),
+            // Pending never carries a claim (submit/release/reclaim all clear it).
+            (0, Some(("ext:00", 1, 10)), None, "pending job with claim"),
+            // Done/Failed are only ever produced with a stored result.
+            (
+                2,
+                Some(("ext:00", 1, 10)),
+                None,
+                "finalized job without result",
+            ),
+            (
+                3,
+                Some(("ext:00", 1, 10)),
+                None,
+                "finalized job without result",
+            ),
+        ];
+        for (status, claim, result, needle) in cases {
+            let bytes = snapshot_one(status, 1, claim, result);
+            let mut target = Jobs::new(JOBS);
+            // decode rejects BEFORE the root comparison, so the expected root
+            // is irrelevant here.
+            let err = target
+                .install(&bytes, root_of_bytes(&bytes))
+                .expect_err("execute-unreachable shape must be rejected");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains(needle)),
+                "expected `{needle}`, got {err:?}"
+            );
+        }
+
+        // sanity: shapes satisfying the enforced invariants install fine —
+        // install checks exactly those four, nothing stricter.
+        let ok_cases: Vec<(u8, Option<(&str, u64, u64)>, Option<(bool, &str)>)> = vec![
+            (0, None, None),                                    // Pending
+            (1, Some(("ext:00", 1, 10)), None),                 // Processing
+            (2, Some(("ext:00", 1, 10)), Some((true, "done"))), // Done
+            (3, None, Some((false, "attempts exhausted"))),     // Failed, result stored
+            (4, None, None),                                    // Cancelled (no result)
+        ];
+        for (status, claim, result) in ok_cases {
+            let bytes = snapshot_one(status, 1, claim, result);
+            let mut target = Jobs::new(JOBS);
+            target
+                .install(&bytes, root_of_bytes(&bytes))
+                .expect("execute-reachable shape must install");
+        }
+    });
+}
+
+#[test]
+fn claim_attempt_saturates_instead_of_wrapping() {
+    block_on(async {
+        // attempt counts are only ever produced by claim, so u64::MAX is not
+        // execute-reachable organically — install a crafted (but shape-valid)
+        // board to prove the increment saturates instead of wrapping.
+        let bytes = snapshot_one(0, u64::MAX, None, None); // Pending, attempt MAX
+        let mut jobs = Jobs::new(JOBS);
+        jobs.install(&bytes, root_of_bytes(&bytes))
+            .expect("install crafted board");
+
+        apply(&mut jobs, 5, ext("worker-a"), claim("j1", 50)).await;
+        let job = get(&jobs, "j1").await.expect("exists");
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(job.attempt, u64::MAX, "saturated, not wrapped to zero");
+    });
+}
+
+// ============================================================================
+// committed-only query visibility
+// ============================================================================
+
+#[test]
+fn queries_answer_committed_state_only() {
+    block_on(async {
+        let mut jobs = Jobs::new(JOBS);
+
+        // a staged-but-uncommitted submit is invisible to every projection.
+        stage(&mut jobs, 1, ext("submitter"), submit("j1", "k", ""))
+            .await
+            .expect("stage submit");
+        assert!(get(&jobs, "j1").await.is_none(), "Get is blind to staging");
+        assert!(
+            list(&jobs, None, "", 256).await.is_empty(),
+            "List is blind to staging"
+        );
+        assert_eq!(
+            counts(&jobs).await,
+            BoardCounts::default(),
+            "Counts is blind to staging"
+        );
+
+        // commit publishes; the same queries now see it.
+        jobs.commit_block().await.expect("commit");
+        assert!(get(&jobs, "j1").await.is_some());
+        assert_eq!(list(&jobs, None, "", 256).await.len(), 1);
+        assert_eq!(counts(&jobs).await.pending, 1);
+
+        // a staged transition is equally invisible: claim staged, queries
+        // still report the committed Pending.
+        stage(&mut jobs, 2, ext("worker-a"), claim("j1", 50))
+            .await
+            .expect("stage claim");
+        assert_eq!(
+            get(&jobs, "j1").await.unwrap().status,
+            JobStatus::Pending,
+            "the staged claim is not served"
+        );
+        assert_eq!(counts(&jobs).await.pending, 1);
+        assert_eq!(counts(&jobs).await.processing, 0);
+        jobs.commit_block().await.expect("commit claim");
+        assert_eq!(
+            get(&jobs, "j1").await.unwrap().status,
+            JobStatus::Processing
+        );
+    });
+}
+
 // ============================================================================
 // staging semantics (commit publishes, abort discards)
 // ============================================================================
@@ -851,18 +1029,23 @@ fn commit_and_abort_staging_including_prune_tombstones() {
         let mut jobs = Jobs::new(JOBS);
         let root0 = jobs.root();
 
-        // a staged submit does not move the committed root, but is visible to queries.
+        // a staged submit moves neither the committed root nor the query view.
         stage(&mut jobs, 1, ext("submitter"), submit("j1", "k", ""))
             .await
             .expect("stage submit");
         assert_eq!(jobs.root(), root0, "staged write must not move the root");
-        assert!(get(&jobs, "j1").await.is_some(), "queries read the overlay");
+        assert!(
+            get(&jobs, "j1").await.is_none(),
+            "queries answer committed state only"
+        );
 
         jobs.commit_block().await.unwrap();
         let root1 = jobs.root();
         assert_ne!(root1, root0, "commit moves the root");
+        assert!(get(&jobs, "j1").await.is_some(), "committed, now visible");
 
-        // stage a prune tombstone: overlay hides it, root unchanged.
+        // stage a prune tombstone: root unchanged and the committed record is
+        // STILL served to queries (the tombstone lives only in the overlay).
         apply(&mut jobs, 2, ext("submitter"), cancel("j1")).await; // terminal
         let root2 = jobs.root();
         stage(&mut jobs, 3, ext("submitter"), prune("j1"))
@@ -870,14 +1053,14 @@ fn commit_and_abort_staging_including_prune_tombstones() {
             .expect("stage prune");
         assert_eq!(jobs.root(), root2, "staged prune must not move the root");
         assert!(
-            get(&jobs, "j1").await.is_none(),
-            "overlay tombstone hides it"
+            get(&jobs, "j1").await.is_some(),
+            "queries still serve the committed record"
         );
 
-        // abort restores the pre-block view byte-for-byte.
+        // abort discards the tombstone, leaving everything byte-identical.
         jobs.abort_block().await.unwrap();
         assert_eq!(jobs.root(), root2, "abort keeps the root byte-identical");
-        assert!(get(&jobs, "j1").await.is_some(), "the record is back");
+        assert!(get(&jobs, "j1").await.is_some(), "the record survived");
 
         // committing the prune actually removes it and moves the root.
         apply(&mut jobs, 4, ext("submitter"), prune("j1")).await;
@@ -946,7 +1129,7 @@ fn host_first_claim_wins_across_ordered_blocks() {
             "loser did not mutate state"
         );
         let job = host_get(&host, "j1").await.unwrap();
-        assert_eq!(job.claim.unwrap().worker, hex(b"worker-a"));
+        assert_eq!(job.claim.unwrap().worker, actor("worker-a"));
     });
 }
 

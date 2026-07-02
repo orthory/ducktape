@@ -12,3 +12,5 @@ async-trait = { workspace = true }
 [dev-dependencies]
 futures = "0.3"
 host = { workspace = true }
+# integration tests hand-craft snapshot bytes and need the matching root.
+sha2 = { workspace = true }
