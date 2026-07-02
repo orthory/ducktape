@@ -25,6 +25,7 @@ members = [
     "crates/apps/document", "crates/apps/document-interface",
     "crates/apps/messaging", "crates/apps/messaging-interface",
     "crates/apps/chat", "crates/apps/chat-interface",
+    "crates/apps/agent", "crates/apps/agent-interface",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
     # bin — runnable binaries
@@ -71,6 +72,7 @@ forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
 messaging = { path = "crates/apps/messaging" }
 chat = { path = "crates/apps/chat" }
+agent = { path = "crates/apps/agent" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
@@ -81,4 +83,5 @@ forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
 messaging-interface = { path = "crates/apps/messaging-interface" }
 chat-interface = { path = "crates/apps/chat-interface" }
+agent-interface = { path = "crates/apps/agent-interface" }
 directory-interface = { path = "crates/examples/directory-interface" }

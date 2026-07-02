@@ -10,10 +10,11 @@
 //! reproduce it — only the real sync path can. the joiner rebuilds kv and
 //! document / messaging through the qmdb sync engine (target + resolver), forge /
 //! valset / directory / saga through snapshot + install gated on the source root,
-//! and greeter fresh (stateless). every reconstructed module is then read back —
-//! content, not just digests — and one tampered snapshot must be refused
+//! and greeter / agent fresh (stateless). every reconstructed module is then read
+//! back — content, not just digests — and one tampered snapshot must be refused
 //! without disturbing the already-installed state.
 
+use agent::Agent;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -139,6 +140,7 @@ fn joiner_app_hash(
     kv: &dyn Module,
     document: &dyn Module,
     messaging: &dyn Module,
+    agent: &dyn Module,
     directory: &dyn Module,
     greeter: &dyn Module,
     forge: &dyn Module,
@@ -148,13 +150,14 @@ fn joiner_app_hash(
     let kv_entry = RegistryEntry::of("kv", kv);
     let document_entry = RegistryEntry::of("document", document);
     let messaging_entry = RegistryEntry::of("messaging", messaging);
-    let mods: [&dyn Module; 8] = [
+    let mods: [&dyn Module; 9] = [
         &kv_entry,
         directory,
         greeter,
         forge,
         &document_entry,
         &messaging_entry,
+        agent,
         valset,
         saga,
     ];
@@ -409,6 +412,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         .await;
 
         let src_greeter = Greeter::new("greeter");
+        let src_agent = Agent::new("agent");
 
         // ---- the source app-hash: what consensus commits to ------------------
         let src_kv_root = src_kv.root();
@@ -435,13 +439,14 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         }
 
         let src_global = {
-            let mods: [&dyn Module; 8] = [
+            let mods: [&dyn Module; 9] = [
                 &src_kv,
                 &src_directory,
                 &src_greeter,
                 &src_forge,
                 &src_document,
                 &src_messaging,
+                &src_agent,
                 &src_valset,
                 &src_saga,
             ];
@@ -505,6 +510,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             .install(&forge_bytes, src_forge_root)
             .expect("forge install");
         let join_greeter = Greeter::new("greeter");
+        let join_agent = Agent::new("agent");
 
         // every reconstructed root equals its source root...
         assert_eq!(
@@ -550,6 +556,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &join_kv,
                 &join_document,
                 &join_messaging,
+                &join_agent,
                 &join_directory,
                 &join_greeter,
                 &join_forge,
@@ -669,6 +676,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &join_kv,
                 &join_document,
                 &join_messaging,
+                &join_agent,
                 &join_directory,
                 &join_greeter,
                 &join_forge,
