@@ -1757,6 +1757,7 @@ dependencies = [
  "host",
  "kv",
  "kv-interface",
+ "memory",
  "saga",
  "saga-interface",
  "sdk",
@@ -3509,6 +3510,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "host",
+ "memory-interface",
+ "sdk",
+ "sha2",
+]
+
+[[package]]
+name = "memory-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3715,6 +3736,7 @@ dependencies = [
  "host",
  "kv",
  "kv-interface",
+ "memory",
  "node",
  "noded",
  "reactor",

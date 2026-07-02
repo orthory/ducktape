@@ -1,10 +1,11 @@
-//! a runnable super-app demo: ten registered modules — a qmdb-backed kv, a sync
-//! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
-//! block DOCUMENT module, a qmdb-backed block-based CHAT module, an ed25519
-//! permissionless VALSET, the SAGA async-RPC ledger, the AGENT orchestrator,
-//! and a TASKS ledger — dispatched over ONE host, showing the app-hash evolve
-//! as typed cross-module ops flow, ending on the agent-collaboration beat: a
-//! mention becomes a run and a pending saga in one block.
+//! a runnable super-app demo: eleven registered modules — a qmdb-backed kv, a
+//! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
+//! qmdb-backed block DOCUMENT module, a qmdb-backed block-based CHAT module, an
+//! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
+//! orchestrator, a TASKS ledger, and the MEMORY shared agent workspace —
+//! dispatched over ONE host, showing the app-hash evolve as typed cross-module
+//! ops flow, ending on the agent-collaboration beat: a mention becomes a run
+//! and a pending saga in one block.
 //!
 //! run: `cargo run -p demo`
 
@@ -37,6 +38,7 @@ use forge_interface::{
 };
 use greeter::Greeter;
 use host::{BlockContext, Host};
+use memory::Memory;
 use saga::SagaModule;
 use saga_interface::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
@@ -66,6 +68,7 @@ fn main() {
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");
         let tasks = Tasks::new("tasks");
+        let memory = Memory::new("memory");
         let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -77,11 +80,12 @@ fn main() {
             Box::new(valset),
             Box::new(saga),
             Box::new(tasks),
+            Box::new(memory),
             Box::new(agent),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 10 registered modules over one host ===");
+        println!("=== super-app demo — 11 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

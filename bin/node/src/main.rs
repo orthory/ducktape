@@ -73,6 +73,7 @@ use forge::Forge;
 use governance::Governance;
 use host::Host;
 use kv::Kv;
+use memory::Memory;
 use node::OrderedNode;
 use saga::SagaModule;
 use sdk::{Msg, StateRoot};
@@ -109,9 +110,9 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 10] = [
+const MODULE_IDS: [&str; 11] = [
     "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults",
-    "directory",
+    "memory", "directory",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
@@ -257,6 +258,9 @@ async fn genesis_host(
         Box::new(SagaModule::new("saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
+        // the shared agent workspace: a filesystem-shaped namespace with
+        // write-once publish, immutable generations, snapshots, and watches.
+        Box::new(Memory::new("memory")),
         Box::new(Directory::new("directory")),
     ])
     .expect("genesis host")
@@ -643,6 +647,10 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let mut vaults = Vaults::new("vaults");
             vaults.install(&bytes, root).expect("vaults install");
 
+            let (bytes, root) = snapshot_of("memory").await;
+            let mut memory = Memory::new("memory");
+            memory.install(&bytes, root).expect("memory install");
+
             let (bytes, root) = snapshot_of("forge").await;
             let forge_repo = storage_for_sync.join("forge-repo");
             let mut forge = Forge::init("forge", forge_repo).expect("joiner forge init");
@@ -650,9 +658,9 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 10] = [
+            let mods: [&dyn sdk::Module; 11] = [
                 &kv, &document, &chat, &directory, &valset, &governance,
-                &saga, &tasks, &vaults, &forge,
+                &saga, &tasks, &vaults, &memory, &forge,
             ];
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {

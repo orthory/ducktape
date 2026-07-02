@@ -21,6 +21,7 @@ agent-interface = { workspace = true }
 saga = { workspace = true }
 saga-interface = { workspace = true }
 tasks = { workspace = true }
+memory = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }
