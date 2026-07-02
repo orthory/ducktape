@@ -75,6 +75,7 @@ use saga::SagaModule;
 use sdk::{Msg, StateRoot};
 use tasks::Tasks;
 use valset::Valset;
+use vaults::Vaults;
 use statesync::p2p::P2pSyncClient;
 use statesync::qmdb::RemoteQmdbResolver;
 use statesync::{fetch_manifest, fetch_snapshot, SyncServer};
@@ -192,6 +193,7 @@ async fn genesis_host(
         Box::new(Governance::new("governance", "valset")),
         Box::new(SagaModule::new("saga")),
         Box::new(Tasks::new("tasks")),
+        Box::new(Vaults::new("vaults")),
         Box::new(Directory::new("directory")),
     ])
     .expect("genesis host")
@@ -551,6 +553,10 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let mut tasks = Tasks::new("tasks");
             tasks.install(&bytes, root).expect("tasks install");
 
+            let (bytes, root) = snapshot_of("vaults").await;
+            let mut vaults = Vaults::new("vaults");
+            vaults.install(&bytes, root).expect("vaults install");
+
             let (bytes, root) = snapshot_of("forge").await;
             let forge_repo = storage_for_sync.join("forge-repo");
             let mut forge = Forge::init("forge", forge_repo).expect("joiner forge init");
@@ -558,9 +564,9 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 11] = [
+            let mods: [&dyn sdk::Module; 12] = [
                 &kv, &document, &messaging, &chat, &agent, &directory, &valset, &governance,
-                &saga, &tasks, &forge,
+                &saga, &tasks, &vaults, &forge,
             ];
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {
@@ -760,7 +766,7 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                             let mut modules = std::collections::BTreeMap::new();
                             for m in [
                                 "kv", "document", "messaging", "chat", "agent", "forge",
-                                "valset", "governance", "saga", "tasks", "directory",
+                                "valset", "governance", "saga", "tasks", "vaults", "directory",
                             ] {
                                 if let Some(root) = node.host().module_root(m) {
                                     modules.insert(m.to_string(), hex(&root));
