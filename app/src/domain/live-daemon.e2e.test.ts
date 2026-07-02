@@ -11,9 +11,10 @@
 // CI builds the daemon first, so the skip path is local-dev-only.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -33,7 +34,16 @@ import type { BlockEvent, NodeTransport } from "./transport";
 
 const binaryPath = (): string | null => {
   const fromEnv = process.env.DUCKTAPE_NODED_BIN;
-  if (fromEnv) return existsSync(fromEnv) ? fromEnv : null;
+  if (fromEnv) {
+    // an explicit path is a promise the caller made (make test stakes its
+    // wire-parity guarantee on it) — a broken one must FAIL, never skip.
+    if (!existsSync(fromEnv)) {
+      throw new Error(
+        `DUCKTAPE_NODED_BIN is set but does not exist: ${fromEnv}`,
+      );
+    }
+    return fromEnv;
+  }
   const here = dirname(fileURLToPath(import.meta.url)); // app/src/domain
   for (const profile of ["debug", "release"]) {
     const candidate = resolve(here, "../../..", "target", profile, "ducktape-noded");
@@ -63,12 +73,19 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
   let daemon: ChildProcess;
   let base: string;
   let transport: NodeTransport;
+  let storage: string;
 
   beforeAll(async () => {
     const port = await freePort();
     base = `http://127.0.0.1:${port}`;
-    daemon = spawn(bin!, ["--listen", `127.0.0.1:${port}`], {
-      stdio: "ignore",
+    // explicit storage: the daemon's pid-derived default is never cleaned
+    // up, and a recycled pid would reopen a stale qmdb — fresh dir, removed
+    // in afterAll.
+    storage = mkdtempSync(join(tmpdir(), "ducktape-live-e2e-"));
+    daemon = spawn(bin!, ["--listen", `127.0.0.1:${port}`, "--storage", storage], {
+      // stderr stays visible so a startup failure reads as itself, not as a
+      // readiness timeout.
+      stdio: ["ignore", "ignore", "inherit"],
     });
     // readiness = a status answer (the daemon prints before binding, and
     // status only answers once genesis is done) — same rule as the app's
@@ -96,6 +113,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       // already gone
     }
     daemon?.kill();
+    if (storage) rmSync(storage, { recursive: true, force: true });
   });
 
   it("reports status for every genesis module", async () => {
@@ -166,24 +184,42 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
   });
 
   it("streams committed blocks over the websocket", async () => {
-    const seen: BlockEvent[] = [];
+    // the transport dials the shared socket lazily on first subscribe and
+    // exposes no "connected" signal, so there is no way to sequence
+    // subscribe-then-submit deterministically from here. instead: keep
+    // committing probe blocks (its OWN channel — no dependence on earlier
+    // tests) until one fans out to the listener. any heard event proves the
+    // ws wire; a dead stream exhausts the probes and fails.
+    let unsubscribe = () => {};
     const heard = new Promise<BlockEvent>((done) => {
-      const unsubscribe = transport.onBlock((block) => {
-        seen.push(block);
-        unsubscribe();
-        done(block);
+      unsubscribe = transport.onBlock(done);
+    });
+    try {
+      await createChannel(transport, {
+        channelId: "ws-probe",
+        name: "Ws Probe",
+        origin: "eddy",
       });
-    });
-    // give the shared socket a beat to connect before committing the block.
-    await new Promise((r) => setTimeout(r, 300));
-    const committed = await postMessage(transport, {
-      channelId: "general",
-      messageId: "m3",
-      text: "block event probe",
-      origin: "eddy",
-    });
-    const event = await heard;
-    expect(event.height).toBeGreaterThanOrEqual(committed.height);
-    expect(event.appHash).toMatch(/^[0-9a-f]{64}$/);
-  }, 15_000);
+      let event: BlockEvent | null = null;
+      for (let probe = 0; probe < 20 && !event; probe += 1) {
+        await postMessage(transport, {
+          channelId: "ws-probe",
+          messageId: `probe-${probe}`,
+          text: "block event probe",
+          origin: "eddy",
+        });
+        event = await Promise.race([
+          heard,
+          new Promise<null>((r) => setTimeout(() => r(null), 500)),
+        ]);
+      }
+      expect(event, "no block event ever reached the ws subscriber").not.toBeNull();
+      expect(event!.height).toBeGreaterThan(0);
+      expect(event!.appHash).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      // always detach — a leaked listener keeps the transport reconnecting
+      // to a daemon that afterAll is about to retire.
+      unsubscribe();
+    }
+  }, 20_000);
 });

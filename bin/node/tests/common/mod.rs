@@ -61,8 +61,14 @@ pub struct Cluster {
     /// rpc port per `peer_ids` position (every config gets one; `--sync-only`
     /// simply never binds it).
     pub rpc_ports: Vec<u16>,
-    dir: tempfile::TempDir,
+    /// http/ws app-surface port per `peer_ids` position (the noded wire
+    /// contract served by the validator itself; off under `--sync-only`).
+    pub http_ports: Vec<u16>,
+    /// declared BEFORE `dir` so drop order kills + reaps every child first —
+    /// removing the tempdir under live processes races their qmdb/journal
+    /// writes and silently leaks the subtree.
     nodes: Vec<Option<NodeProc>>,
+    dir: tempfile::TempDir,
 }
 
 impl Cluster {
@@ -72,14 +78,16 @@ impl Cluster {
         let seq = CLUSTER_SEQ.fetch_add(1, Ordering::Relaxed);
         let namespace = format!("ducktape-e2e-{}-{seq}", std::process::id());
         let dir = tempfile::TempDir::new().expect("cluster tempdir");
-        let ports = alloc_ports(peer_ids.len() * 2);
-        let (p2p_ports, rpc_ports) = ports.split_at(peer_ids.len());
+        let ports = alloc_ports(peer_ids.len() * 3);
+        let (p2p_ports, rest) = ports.split_at(peer_ids.len());
+        let (rpc_ports, http_ports) = rest.split_at(peer_ids.len());
         Self {
             namespace,
             peer_ids: peer_ids.to_vec(),
             validator_ids: validator_ids.to_vec(),
             p2p_ports: p2p_ports.to_vec(),
             rpc_ports: rpc_ports.to_vec(),
+            http_ports: http_ports.to_vec(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
         }
@@ -120,6 +128,10 @@ impl Cluster {
             "rpc_listen = \"127.0.0.1:{}\"\n",
             self.rpc_ports[idx]
         ));
+        cfg.push_str(&format!(
+            "http_listen = \"127.0.0.1:{}\"\n",
+            self.http_ports[idx]
+        ));
         std::fs::write(&path, cfg).expect("write node config");
         path
     }
@@ -150,7 +162,12 @@ impl Cluster {
     /// run the node at `idx` with `--sync-only` to completion and return
     /// (success, full log). the sync path exits on its own — 0 with a
     /// `synced app_hash=` line on parity, 1 on any mismatch.
-    pub fn run_sync_only(&self, idx: usize, timeout: Duration) -> (bool, String) {
+    pub fn run_sync_only(&mut self, idx: usize, timeout: Duration) -> (bool, String) {
+        // this port was reserved minutes ago (cluster layout) and nothing held
+        // it since — by joiner time another process may own it. re-allocate
+        // fresh: the listen addr lives only in THIS node's config (peers know
+        // the joiner by identity, not address).
+        self.p2p_ports[idx] = alloc_ports(1)[0];
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("node{id}-sync.log"));
@@ -227,7 +244,8 @@ impl Cluster {
                 Err(e) => {
                     assert!(
                         Instant::now() < deadline,
-                        "rpc connect to node idx {idx} (port {port}) failed: {e}"
+                        "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
+                        self.all_log_tails(40)
                     );
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -284,6 +302,50 @@ impl Cluster {
                 .as_str()
                 .expect("query reply carries hex"),
         ))
+    }
+
+    /// one request against node `idx`'s http/ws APP SURFACE (the noded wire
+    /// contract the validator now serves itself) — raw http/1.1 over std TCP,
+    /// returning (status, json body). the surface trusts localhost callers,
+    /// so a hand-rolled client is a full citizen by design.
+    pub fn http(
+        &self,
+        idx: usize,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        use std::io::Read as _;
+        let port = self.http_ports[idx];
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("app-surface read timeout");
+        let body_bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body_bytes.len()
+        );
+        stream.write_all(req.as_bytes()).expect("app-surface write");
+        stream
+            .write_all(&body_bytes)
+            .expect("app-surface write body");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("app-surface read");
+        let text = String::from_utf8_lossy(&raw);
+        let status: u16 = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let payload = text
+            .split("\r\n\r\n")
+            .nth(1)
+            .and_then(|b| serde_json::from_str(b.trim()).ok())
+            .unwrap_or(serde_json::Value::Null);
+        (status, payload)
     }
 
     /// every running node's log tail — the panic payload that makes a stalled

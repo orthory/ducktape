@@ -16,13 +16,17 @@
 //!
 //! payload dissemination is REAL: each process submits a DISTINCT op (node N
 //! writes directory key `kN`), so a peer that finalizes another node's op-digest
-//! has NO local bytes for it. `SimplexOrderer::spawn_with_relay` wires a
+//! has NO local bytes for it. `SimplexOrderer::spawn_with_resolver` wires a
 //! `ConsensusRelay` that, at propose time, gossips the proposed frame's bytes to
-//! all peers on `CHANNEL_PAYLOAD`; every peer's STORE-ONLY drain caches them, so
+//! all peers on the payload channel; every peer's STORE-ONLY drain caches them, so
 //! when that digest finalizes the reporter resolves it locally and delivers it in
 //! BFT order. content-addressing IS the verification (the drain re-hashes on
-//! receipt). this is what lets DISTINCT ops converge across processes with
-//! per-process stores — quorum votes still cross the real TCP mesh to finalize.
+//! receipt). the relay gossip is one-shot, and quorum is a SUBSET — a validator
+//! can finalize a view whose gossip it missed — so a lazy payload FETCH lane
+//! backstops it: the resolver pulls missing bytes by digest from the tracked
+//! mesh and fills the finalized slot instead of wedging the apply prefix. this
+//! is what lets DISTINCT ops converge across processes with per-process stores
+//! — quorum votes still cross the real TCP mesh to finalize.
 //!
 //! ## state-sync service and the sync-only joiner
 //!

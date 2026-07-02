@@ -31,29 +31,38 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
-    fn spawn(storage: Option<&Path>) -> Self {
+    /// every spawn gets an EXPLICIT storage dir: the daemon's default is
+    /// temp_dir()/ducktape-noded-{pid}, which the process never cleans up —
+    /// a leaked dir plus a recycled pid would reopen stale qmdb state and
+    /// fail this suite spuriously.
+    fn spawn(storage: &Path) -> Self {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"));
         cmd.arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
+            .arg("--storage")
+            .arg(storage)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(dir) = storage {
-            cmd.arg("--storage").arg(dir);
-        }
+            // startup failures (port stolen in the free_port window, bad
+            // storage) land on stderr — keep it visible or they read as an
+            // opaque readiness timeout.
+            .stderr(Stdio::inherit());
         let child = cmd.spawn().expect("spawn ducktape-noded");
-        let daemon = Self { child, port };
+        let mut daemon = Self { child, port };
         // readiness = a status answer, never the listen println: the daemon
         // prints before binding, and status only answers once genesis is done.
         daemon.await_status();
         daemon
     }
 
-    fn await_status(&self) {
+    fn await_status(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok((200, _)) = self.try_request("GET", "/v1/status", None) {
                 return;
+            }
+            if let Some(status) = self.child.try_wait().expect("poll daemon") {
+                panic!("daemon exited during startup ({status}) — see stderr above");
             }
             assert!(
                 Instant::now() < deadline,
@@ -219,7 +228,8 @@ fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Valu
 
 #[test]
 fn full_surface_blocks_authorship_and_ws() {
-    let daemon = Daemon::spawn(None);
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
 
     // status at genesis: build version, height 0, every registered module root.
     let status = daemon.status();
@@ -297,7 +307,7 @@ fn state_persists_across_restart() {
     let storage = tempfile::TempDir::new().expect("storage dir");
 
     {
-        let daemon = Daemon::spawn(Some(storage.path()));
+        let daemon = Daemon::spawn(storage.path());
         let (code, _) = daemon.submit(
             "chat",
             serde_json::json!({
@@ -335,7 +345,7 @@ fn state_persists_across_restart() {
 
     // a fresh daemon over the SAME storage root: qmdb state must survive; the
     // height counter is a local block counter and restarts at 0 by design.
-    let daemon = Daemon::spawn(Some(storage.path()));
+    let daemon = Daemon::spawn(storage.path());
     assert_eq!(daemon.status()["height"], 0);
     let reply = daemon.query(
         "chat",

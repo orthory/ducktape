@@ -236,14 +236,54 @@ fn cluster_lifecycle() {
     });
     assert_eq!(text, "epoch one lives");
 
+    // 8b. app integration on the NETWORKED node: the validator serves the
+    // noded /v1 wire itself, and a submit reply is HELD until the op's frame
+    // drains at a finalized boundary — so the block summary that comes back is
+    // already-applied consensus state, readable from any other validator.
+    let (code, block) = cluster.http(
+        0,
+        "POST",
+        "/v1/submit",
+        Some(&serde_json::json!({
+            "target": "directory",
+            "payload": { "Set": { "key": "via-app-surface", "value": "held" } },
+        })),
+    );
+    assert_eq!(code, 200, "app-surface submit failed: {block}");
+    assert!(
+        block["height"].as_u64().is_some_and(|h| h > 0),
+        "held submit must reply with the finalized block: {block}"
+    );
+    for reader in [1, 2] {
+        let value = poll_until("app-surface op readable via rpc", FINALIZE, || {
+            dir_value(&cluster, reader, "via-app-surface")
+        });
+        assert_eq!(value, "held", "node {reader} read a wrong value");
+    }
+
     // 9. quiesce, then the boundary every joiner must rebuild: identical
-    // status app-hashes across validators.
+    // status app-hashes across validators — and the app surface reports the
+    // same hash as the rpc (one state, two wires). both node-2 reads happen
+    // AFTER the quiesce with nothing left in flight, so a mismatch means the
+    // two wires project different host state, not a straggling block.
     std::thread::sleep(Duration::from_secs(2));
     let status0 = cluster.status(0);
     let status1 = cluster.status(1);
     assert_eq!(
         status0["app_hash"], status1["app_hash"],
         "post-rpc status app-hashes disagree"
+    );
+    let (code, http_status) = cluster.http(2, "GET", "/v1/status", None);
+    assert_eq!(code, 200, "app-surface status failed");
+    let http_hash = http_status["appHash"].as_str().unwrap_or_default();
+    assert!(
+        !http_hash.is_empty(),
+        "app-surface status carries appHash: {http_status}"
+    );
+    assert_eq!(
+        cluster.status(2)["app_hash"].as_str().unwrap_or_default(),
+        http_hash,
+        "the app surface and the rpc disagree on node 2's app-hash"
     );
     let boundary = status0["app_hash"]
         .as_str()

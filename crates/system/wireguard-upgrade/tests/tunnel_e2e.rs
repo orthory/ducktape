@@ -257,9 +257,10 @@ fn both_parties_validate_but_the_plan_is_initiator_local() {
 
     // the plan is a deterministic function of the triple — but it is ALWAYS
     // the initiator's perspective. the responder gets an identical plan whose
-    // `local_*` side is a, NOT itself: deriving b's install config from this
-    // return is the missing piece of node wiring (pinned on purpose — when a
-    // responder-side constructor lands, this assert should start failing).
+    // `local_*` side is a, NOT itself: the crate has no responder-side
+    // constructor today (TunnelInstallPlan is only built inside
+    // validate_upgrade), so deriving b's install config is a documented gap
+    // in the node wiring, not something these asserts can guard.
     assert_eq!(plan_a, plan_b);
     assert_eq!(plan_b.local_identity(), id(&a));
     assert_eq!(plan_b.peer_identity(), id(&b));
@@ -325,7 +326,7 @@ fn both_parties_validate_but_the_plan_is_initiator_local() {
 #[test]
 fn mesh_version_v1_fixed_vector() {
     const MESH_VERSION_V1_VECTOR: &str =
-        "b0cd1fb6c0df8da0bb5b621a145aa2164991bf46fa72c83b7480bf3608a1b314";
+        "2523c89471d7d40906b27c38b455b93abfa69428981890ed722822972accb0ed";
 
     let policy = PortPolicy::production();
     let literal_record = |identity_byte: u8, host_octet: u8, relay: bool| EndpointRecord {
@@ -585,7 +586,7 @@ fn relay_fallback_uses_only_admitted_relay_validators() {
         &view,
         &policy,
         &overlay,
-        Some((vec![id(&outsider)], failure)),
+        Some((vec![id(&outsider)], failure.clone())),
     );
     let mut cache = ReplayCache::default();
     assert_eq!(
@@ -597,6 +598,35 @@ fn relay_fallback_uses_only_admitted_relay_validators() {
             &hs_bad.request,
             &hs_bad.response,
             &hs_bad.ack,
+            &mut cache,
+        )
+        .unwrap_err(),
+        UpgradeError::InvalidRelay
+    );
+
+    // an ADMITTED validator without the Relay capability is refused too — this
+    // pins the capability check specifically (the outsider case above dies at
+    // the membership lookup and never reaches it).
+    let hs_no_cap = handshake(
+        &a,
+        &b,
+        xkey(0x0a),
+        xkey(0x0b),
+        &view,
+        &policy,
+        &overlay,
+        Some((vec![id(&a)], failure)),
+    );
+    let mut cache = ReplayCache::default();
+    assert_eq!(
+        validate_upgrade(
+            &view,
+            &policy,
+            &overlay,
+            12,
+            &hs_no_cap.request,
+            &hs_no_cap.response,
+            &hs_no_cap.ack,
             &mut cache,
         )
         .unwrap_err(),
