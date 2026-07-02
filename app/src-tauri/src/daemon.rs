@@ -55,6 +55,11 @@ pub fn daemon_spawn(app: tauri::AppHandle, listen: String) -> Result<String, Str
 }
 
 /// find the daemon binary (see module docs for the resolution order).
+///
+/// the sibling must pass [`usable`]: tauri copies the externalBin entry next
+/// to the app executable, and if the sidecar was never staged that copy is
+/// build.rs's EMPTY placeholder — spawning it fails with a baffling
+/// permission-denied. reject it here with an actionable message instead.
 fn noded_binary() -> Result<PathBuf, String> {
     if let Ok(explicit) = std::env::var("DUCKTAPE_NODED_BIN") {
         return Ok(PathBuf::from(explicit));
@@ -64,14 +69,33 @@ fn noded_binary() -> Result<PathBuf, String> {
         .parent()
         .ok_or_else(|| "app executable has no parent dir".to_string())?;
     let sibling = dir.join(format!("ducktape-noded{}", std::env::consts::EXE_SUFFIX));
-    if sibling.exists() {
+    if usable(&sibling) {
         return Ok(sibling);
     }
     Err(format!(
-        "ducktape-noded not found at {} — build it with `cargo build -p noded` \
-         or set DUCKTAPE_NODED_BIN",
+        "no usable ducktape-noded at {} — stage it with `bun run sidecar` \
+         (or `make sidecar` at the repo root), or set DUCKTAPE_NODED_BIN",
         sibling.display()
     ))
+}
+
+/// a real daemon binary: present, non-empty, executable.
+fn usable(path: &PathBuf) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(unix)]

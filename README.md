@@ -63,6 +63,50 @@ lands on the source app-hash:
 cargo test -p demo --test joiner_rebuilds_global_app_hash
 ```
 
+## Run The App
+
+The app is one React console with two builds, both clients of the node daemon
+(`ducktape-noded`): the web build dials it over http/ws; the desktop build
+spawns it as a detached subprocess (an orphan that keeps running after the
+window closes) and talks to it the same way.
+
+Install everything (daemon → `~/.cargo/bin`, `Ducktape.app` → `/Applications`):
+
+```sh
+make install
+```
+
+Web, for development — start the daemon, then the dev server:
+
+```sh
+cargo run -p noded                        # http://127.0.0.1:8844, temp storage
+# cargo run -p noded -- --storage <dir>   # persistent module state
+
+cd app
+bun install
+bun run dev                               # http://localhost:1420
+```
+
+The web build dials `http://127.0.0.1:8844` by default; point it elsewhere
+with `VITE_DUCKTAPE_NODE_URL`.
+
+Desktop, for development — `tauri dev` stages the daemon sidecar itself:
+
+```sh
+cd app
+bun install
+bun run tauri dev
+```
+
+On launch the app adopts a daemon already listening on `127.0.0.1:8844`, or
+spawns one (state under the OS app-data dir, log at `node/daemon.log`). The
+Node screen has the stop/start control; `POST /v1/shutdown` retires a daemon
+from anywhere else.
+
+`make app` builds the distributable desktop bundle (`.app`/`.dmg` under
+`target/release/bundle`); `make web` builds the static web bundle to
+`app/dist`.
+
 ## Documentation
 
 The docs are a separate Vocs project under `docs/` (package manager: Bun), so
