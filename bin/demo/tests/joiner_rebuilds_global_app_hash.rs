@@ -8,38 +8,44 @@
 //! demo binary does), including OVERWRITES in kv and document: a qmdb root is
 //! op-log ordered, so a naive "export current pairs and re-apply" could never
 //! reproduce it — only the real sync path can. the joiner rebuilds kv and
-//! document through the qmdb sync engine (target + resolver), forge / valset /
-//! directory / saga through snapshot + install gated on the source root, and
-//! greeter fresh (stateless). every reconstructed module is then read back —
+//! document / messaging through the qmdb sync engine (target + resolver), forge /
+//! valset / directory / saga through snapshot + install gated on the source root,
+//! and greeter fresh (stateless). every reconstructed module is then read back —
 //! content, not just digests — and one tampered snapshot must be refused
 //! without disturbing the already-installed state.
 
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{ed25519::PrivateKey, Signer as _};
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
-use directory_interface::{encode_msg as dir_encode_msg, DirMsg};
+use directory_interface::{DirMsg, encode_msg as dir_encode_msg};
 use document::Document;
 use document_interface::{
-    decode_reply as doc_decode_reply, encode_msg as doc_encode_msg,
-    encode_query as doc_encode_query, Block, BlockKind, DocMsg, DocQuery, DocReply,
+    Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
+    encode_msg as doc_encode_msg, encode_query as doc_encode_query,
 };
 use forge::Forge;
-use forge_interface::{encode_msg as forge_encode_msg, ForgeMsg};
+use forge_interface::{ForgeMsg, encode_msg as forge_encode_msg};
 use greeter::Greeter;
 use kv::Kv;
-use kv_interface::{encode as kv_encode, KvMsg};
+use kv_interface::{KvMsg, encode as kv_encode};
+use messaging::Messaging;
+use messaging_interface::{
+    ChatMessage, MessagingMsg, MessagingQuery, MessagingReply,
+    decode_reply as messaging_decode_reply, encode_msg as messaging_encode_msg,
+    encode_query as messaging_encode_query,
+};
 use saga::SagaModule;
 use saga_interface::{
-    decode_reply as saga_decode_reply, encode_msg as saga_encode_msg,
-    encode_query as saga_encode_query, SagaMsg, SagaQuery, SagaReply, SagaStatus,
+    SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
+    encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use state::global_root;
 use valset::Valset;
 use valset_interface::{
-    decode_reply as valset_decode_reply, encode_msg as valset_encode_msg,
-    encode_query as valset_encode_query, ValsetMsg, ValsetQuery, ValsetReply,
+    ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
+    encode_msg as valset_encode_msg, encode_query as valset_encode_query,
 };
 
 // a minimal Ctx so each module's execute can be driven without a full host.
@@ -81,8 +87,14 @@ impl Ctx for TestCtx {
 /// op log) is exactly what a validator would have produced.
 async fn commit_op(module: &mut dyn Module, at: u64, payload: Vec<u8>) {
     let target = module.id();
-    let msg = Msg { target: target.clone(), payload };
-    module.execute(&mut TestCtx::at(at, &target), &msg).await.unwrap();
+    let msg = Msg {
+        target: target.clone(),
+        payload,
+    };
+    module
+        .execute(&mut TestCtx::at(at, &target), &msg)
+        .await
+        .unwrap();
     module.commit_block().await.unwrap();
 }
 
@@ -99,7 +111,10 @@ struct RegistryEntry {
 }
 impl RegistryEntry {
     fn of(id: &str, module: &dyn Module) -> Self {
-        Self { id: id.to_string(), root: module.root() }
+        Self {
+            id: id.to_string(),
+            root: module.root(),
+        }
     }
 }
 #[async_trait::async_trait(?Send)]
@@ -123,6 +138,7 @@ impl Module for RegistryEntry {
 fn joiner_app_hash(
     kv: &dyn Module,
     document: &dyn Module,
+    messaging: &dyn Module,
     directory: &dyn Module,
     greeter: &dyn Module,
     forge: &dyn Module,
@@ -131,8 +147,17 @@ fn joiner_app_hash(
 ) -> StateRoot {
     let kv_entry = RegistryEntry::of("kv", kv);
     let document_entry = RegistryEntry::of("document", document);
-    let mods: [&dyn Module; 7] =
-        [&kv_entry, directory, greeter, forge, &document_entry, valset, saga];
+    let messaging_entry = RegistryEntry::of("messaging", messaging);
+    let mods: [&dyn Module; 8] = [
+        &kv_entry,
+        directory,
+        greeter,
+        forge,
+        &document_entry,
+        &messaging_entry,
+        valset,
+        saga,
+    ];
     global_root(&mods)
 }
 
@@ -148,9 +173,28 @@ fn validator_key(seed_byte: u8) -> Vec<u8> {
 }
 
 async fn validators(v: &Valset) -> Vec<Vec<u8>> {
-    let reply = v.query(&valset_encode_query(&ValsetQuery::Validators)).await.unwrap();
+    let reply = v
+        .query(&valset_encode_query(&ValsetQuery::Validators))
+        .await
+        .unwrap();
     match valset_decode_reply(&reply).unwrap() {
         ValsetReply::Validators(list) => list,
+    }
+}
+
+async fn messaging_messages<E>(m: &Messaging<E>, channel_id: &str) -> Vec<ChatMessage>
+where
+    E: commonware_storage::Context + commonware_runtime::BufferPooler,
+{
+    let reply = m
+        .query(&messaging_encode_query(&MessagingQuery::Messages {
+            channel_id: channel_id.into(),
+        }))
+        .await
+        .unwrap();
+    match messaging_decode_reply(&reply).unwrap() {
+        MessagingReply::Messages(messages) => messages,
+        other => panic!("unexpected messaging reply: {other:?}"),
     }
 }
 
@@ -170,83 +214,199 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
     deterministic::Runner::default().start(|context| async move {
         // ---- SOURCE: real content through every module's own op path --------
         let mut src_kv = Kv::init(context.child("source_kv"), "kv").await;
-        commit_op(&mut src_kv, 0, kv_encode(&KvMsg::Set {
-            key: b"greeting:name".to_vec(),
-            value: b"hello world".to_vec(),
-        })).await;
-        commit_op(&mut src_kv, 0, kv_encode(&KvMsg::Set {
-            key: b"motd".to_vec(),
-            value: b"draft".to_vec(),
-        })).await;
+        commit_op(
+            &mut src_kv,
+            0,
+            kv_encode(&KvMsg::Set {
+                key: b"greeting:name".to_vec(),
+                value: b"hello world".to_vec(),
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_kv,
+            0,
+            kv_encode(&KvMsg::Set {
+                key: b"motd".to_vec(),
+                value: b"draft".to_vec(),
+            }),
+        )
+        .await;
         // overwrite: two committed ops on one key — op-log order matters.
-        commit_op(&mut src_kv, 0, kv_encode(&KvMsg::Set {
-            key: b"motd".to_vec(),
-            value: b"final".to_vec(),
-        })).await;
+        commit_op(
+            &mut src_kv,
+            0,
+            kv_encode(&KvMsg::Set {
+                key: b"motd".to_vec(),
+                value: b"final".to_vec(),
+            }),
+        )
+        .await;
 
-        let mut src_document =
-            Document::init(context.child("source_document"), "document").await;
-        commit_op(&mut src_document, 0, doc_encode_msg(&DocMsg::CreateDoc {
-            doc_id: "readme".into(),
-        })).await;
-        commit_op(&mut src_document, 0, doc_encode_msg(&DocMsg::InsertBlock {
-            doc_id: "readme".into(),
-            after: None,
-            block: Block { id: "title".into(), kind: BlockKind::Heading, text: "ducktape".into() },
-        })).await;
-        commit_op(&mut src_document, 0, doc_encode_msg(&DocMsg::InsertBlock {
-            doc_id: "readme".into(),
-            after: Some("title".into()),
-            block: Block { id: "intro".into(), kind: BlockKind::Paragraph, text: "a draft".into() },
-        })).await;
+        let mut src_document = Document::init(context.child("source_document"), "document").await;
+        commit_op(
+            &mut src_document,
+            0,
+            doc_encode_msg(&DocMsg::CreateDoc {
+                doc_id: "readme".into(),
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_document,
+            0,
+            doc_encode_msg(&DocMsg::InsertBlock {
+                doc_id: "readme".into(),
+                after: None,
+                block: Block {
+                    id: "title".into(),
+                    kind: BlockKind::Heading,
+                    text: "ducktape".into(),
+                },
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_document,
+            0,
+            doc_encode_msg(&DocMsg::InsertBlock {
+                doc_id: "readme".into(),
+                after: Some("title".into()),
+                block: Block {
+                    id: "intro".into(),
+                    kind: BlockKind::Paragraph,
+                    text: "a draft".into(),
+                },
+            }),
+        )
+        .await;
         // overwrite of the doc's qmdb key — op-log order matters here too.
-        commit_op(&mut src_document, 0, doc_encode_msg(&DocMsg::UpdateBlock {
-            doc_id: "readme".into(),
-            block_id: "intro".into(),
-            text: "a block document, rebuilt by a joiner".into(),
-        })).await;
+        commit_op(
+            &mut src_document,
+            0,
+            doc_encode_msg(&DocMsg::UpdateBlock {
+                doc_id: "readme".into(),
+                block_id: "intro".into(),
+                text: "a block document, rebuilt by a joiner".into(),
+            }),
+        )
+        .await;
 
         let mut src_directory = Directory::new("directory");
-        commit_op(&mut src_directory, 0, dir_encode_msg(&DirMsg::Set {
-            key: "name".into(),
-            value: "world".into(),
-        })).await;
+        commit_op(
+            &mut src_directory,
+            0,
+            dir_encode_msg(&DirMsg::Set {
+                key: "name".into(),
+                value: "world".into(),
+            }),
+        )
+        .await;
+
+        let mut src_messaging =
+            Messaging::init(context.child("source_messaging"), "messaging").await;
+        commit_op(
+            &mut src_messaging,
+            10,
+            messaging_encode_msg(&MessagingMsg::CreateChannel {
+                channel_id: "general".into(),
+                name: "General".into(),
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_messaging,
+            20,
+            messaging_encode_msg(&MessagingMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: "m1".into(),
+                author: "alice".into(),
+                body: "hello".into(),
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_messaging,
+            21,
+            messaging_encode_msg(&MessagingMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: "m2".into(),
+                author: "bob".into(),
+                body: "storage-backed".into(),
+            }),
+        )
+        .await;
 
         let mut src_forge = Forge::init("forge", source_dir.clone()).expect("forge init");
-        commit_op(&mut src_forge, 100, forge_encode_msg(&ForgeMsg::Commit {
-            path: "README.md".into(),
-            content: "# ducktape\n".into(),
-            message: "init".into(),
-        })).await;
+        commit_op(
+            &mut src_forge,
+            100,
+            forge_encode_msg(&ForgeMsg::Commit {
+                path: "README.md".into(),
+                content: "# ducktape\n".into(),
+                message: "init".into(),
+            }),
+        )
+        .await;
         // a second commit: the snapshot pack must carry real history, not one object.
-        commit_op(&mut src_forge, 200, forge_encode_msg(&ForgeMsg::Commit {
-            path: "README.md".into(),
-            content: "# ducktape\n\nrebuilt from a snapshot\n".into(),
-            message: "expand".into(),
-        })).await;
+        commit_op(
+            &mut src_forge,
+            200,
+            forge_encode_msg(&ForgeMsg::Commit {
+                path: "README.md".into(),
+                content: "# ducktape\n\nrebuilt from a snapshot\n".into(),
+                message: "expand".into(),
+            }),
+        )
+        .await;
 
         let mut src_valset = Valset::new("valset");
-        commit_op(&mut src_valset, 0, valset_encode_msg(&ValsetMsg::Join {
-            key: validator_key(7),
-        })).await;
-        commit_op(&mut src_valset, 0, valset_encode_msg(&ValsetMsg::Join {
-            key: validator_key(9),
-        })).await;
+        commit_op(
+            &mut src_valset,
+            0,
+            valset_encode_msg(&ValsetMsg::Join {
+                key: validator_key(7),
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_valset,
+            0,
+            valset_encode_msg(&ValsetMsg::Join {
+                key: validator_key(9),
+            }),
+        )
+        .await;
 
         let mut src_saga = SagaModule::new("saga");
-        commit_op(&mut src_saga, 0, saga_encode_msg(&SagaMsg::Trigger {
-            saga_id: "greet".into(),
-            spec: b"reverse hello".to_vec(),
-        })).await;
-        commit_op(&mut src_saga, 0, saga_encode_msg(&SagaMsg::OracleResult {
-            saga_id: "greet".into(),
-            result: b"olleh".to_vec(),
-        })).await;
+        commit_op(
+            &mut src_saga,
+            0,
+            saga_encode_msg(&SagaMsg::Trigger {
+                saga_id: "greet".into(),
+                spec: b"reverse hello".to_vec(),
+            }),
+        )
+        .await;
+        commit_op(
+            &mut src_saga,
+            0,
+            saga_encode_msg(&SagaMsg::OracleResult {
+                saga_id: "greet".into(),
+                result: b"olleh".to_vec(),
+            }),
+        )
+        .await;
         // a second saga still in flight — Pending and Done must both survive the trip.
-        commit_op(&mut src_saga, 0, saga_encode_msg(&SagaMsg::Trigger {
-            saga_id: "translate".into(),
-            spec: b"hola".to_vec(),
-        })).await;
+        commit_op(
+            &mut src_saga,
+            0,
+            saga_encode_msg(&SagaMsg::Trigger {
+                saga_id: "translate".into(),
+                spec: b"hola".to_vec(),
+            }),
+        )
+        .await;
 
         let src_greeter = Greeter::new("greeter");
 
@@ -255,6 +415,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let src_document_root = src_document.root();
         let src_directory_root = src_directory.root();
         let src_forge_root = src_forge.root();
+        let src_messaging_root = src_messaging.root();
         let src_valset_root = src_valset.root();
         let src_saga_root = src_saga.root();
         for (id, root) in [
@@ -262,16 +423,27 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             ("document", src_document_root),
             ("directory", src_directory_root),
             ("forge", src_forge_root),
+            ("messaging", src_messaging_root),
             ("valset", src_valset_root),
             ("saga", src_saga_root),
         ] {
-            assert_ne!(root, StateRoot::ZERO, "{id}: the source must hold real state");
+            assert_ne!(
+                root,
+                StateRoot::ZERO,
+                "{id}: the source must hold real state"
+            );
         }
 
         let src_global = {
-            let mods: [&dyn Module; 7] = [
-                &src_kv, &src_directory, &src_greeter, &src_forge,
-                &src_document, &src_valset, &src_saga,
+            let mods: [&dyn Module; 8] = [
+                &src_kv,
+                &src_directory,
+                &src_greeter,
+                &src_forge,
+                &src_document,
+                &src_messaging,
+                &src_valset,
+                &src_saga,
             ];
             global_root(&mods)
         };
@@ -284,60 +456,124 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let saga_bytes = src_saga.snapshot();
         let forge_bytes = src_forge.snapshot().expect("forge snapshot");
         let src_validators = validators(&src_valset).await;
+        let src_messaging_messages = messaging_messages(&src_messaging, "general").await;
 
         let kv_target = src_kv.sync_target().await;
         let kv_resolver = src_kv.into_resolver();
         let document_target = src_document.sync_target().await;
         let document_resolver = src_document.into_resolver();
+        let messaging_target = src_messaging.sync_target().await;
+        let messaging_resolver = src_messaging.into_resolver();
 
         // ---- JOINER: reconstruct every stateful module -----------------------
-        let join_kv =
-            Kv::sync_from(context.child("joiner_kv"), "kv-rebuilt", kv_target, kv_resolver).await;
+        let join_kv = Kv::sync_from(
+            context.child("joiner_kv"),
+            "kv-rebuilt",
+            kv_target,
+            kv_resolver,
+        )
+        .await;
         let join_document = Document::sync_from(
             context.child("joiner_document"),
             "document-rebuilt",
             document_target,
             document_resolver,
-        ).await;
+        )
+        .await;
+        let join_messaging = Messaging::sync_from(
+            context.child("joiner_messaging"),
+            "messaging-rebuilt",
+            messaging_target,
+            messaging_resolver,
+        )
+        .await;
 
         let mut join_directory = Directory::new("directory");
-        join_directory.install(&directory_bytes, src_directory_root).expect("directory install");
+        join_directory
+            .install(&directory_bytes, src_directory_root)
+            .expect("directory install");
         let mut join_valset = Valset::new("valset");
-        join_valset.install(&valset_bytes, src_valset_root).expect("valset install");
+        join_valset
+            .install(&valset_bytes, src_valset_root)
+            .expect("valset install");
         let mut join_saga = SagaModule::new("saga");
-        join_saga.install(&saga_bytes, src_saga_root).expect("saga install");
+        join_saga
+            .install(&saga_bytes, src_saga_root)
+            .expect("saga install");
         let mut join_forge = Forge::init("forge", joiner_dir.clone()).expect("joiner forge init");
-        join_forge.install(&forge_bytes, src_forge_root).expect("forge install");
+        join_forge
+            .install(&forge_bytes, src_forge_root)
+            .expect("forge install");
         let join_greeter = Greeter::new("greeter");
 
         // every reconstructed root equals its source root...
-        assert_eq!(join_kv.root(), src_kv_root, "kv: synced root != source root");
-        assert_eq!(join_document.root(), src_document_root, "document: synced root != source root");
-        assert_eq!(join_directory.root(), src_directory_root, "directory: installed root != source root");
-        assert_eq!(join_valset.root(), src_valset_root, "valset: installed root != source root");
-        assert_eq!(join_saga.root(), src_saga_root, "saga: installed root != source root");
-        assert_eq!(join_forge.root(), src_forge_root, "forge: installed root != source root");
+        assert_eq!(
+            join_kv.root(),
+            src_kv_root,
+            "kv: synced root != source root"
+        );
+        assert_eq!(
+            join_document.root(),
+            src_document_root,
+            "document: synced root != source root"
+        );
+        assert_eq!(
+            join_messaging.root(),
+            src_messaging_root,
+            "messaging: synced root != source root"
+        );
+        assert_eq!(
+            join_directory.root(),
+            src_directory_root,
+            "directory: installed root != source root"
+        );
+        assert_eq!(
+            join_valset.root(),
+            src_valset_root,
+            "valset: installed root != source root"
+        );
+        assert_eq!(
+            join_saga.root(),
+            src_saga_root,
+            "saga: installed root != source root"
+        );
+        assert_eq!(
+            join_forge.root(),
+            src_forge_root,
+            "forge: installed root != source root"
+        );
 
         // ...and the composed app-hash over the same canonical ids is the exact
         // digest consensus committed on the source — THE joiner property.
         assert_eq!(
             joiner_app_hash(
-                &join_kv, &join_document, &join_directory, &join_greeter,
-                &join_forge, &join_valset, &join_saga,
+                &join_kv,
+                &join_document,
+                &join_messaging,
+                &join_directory,
+                &join_greeter,
+                &join_forge,
+                &join_valset,
+                &join_saga,
             ),
             src_global,
             "the joiner must land on the exact source app-hash"
         );
 
         // ---- the state is real: a content read per reconstructed module ------
-        assert_eq!(join_kv.get(b"motd").await.as_deref(), Some(b"final".as_ref()));
+        assert_eq!(
+            join_kv.get(b"motd").await.as_deref(),
+            Some(b"final".as_ref())
+        );
         assert_eq!(
             join_kv.get(b"greeting:name").await.as_deref(),
             Some(b"hello world".as_ref())
         );
 
         let reply = join_document
-            .query(&doc_encode_query(&DocQuery::GetDoc { doc_id: "readme".into() }))
+            .query(&doc_encode_query(&DocQuery::GetDoc {
+                doc_id: "readme".into(),
+            }))
             .await
             .unwrap();
         let DocReply::Doc(Some(blocks)) = doc_decode_reply(&reply).unwrap() else {
@@ -347,13 +583,20 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         assert_eq!(ids, ["title", "intro"]);
         assert_eq!(blocks[1].text, "a block document, rebuilt by a joiner");
 
+        assert_eq!(
+            messaging_messages(&join_messaging, "general").await,
+            src_messaging_messages
+        );
+
         assert_eq!(join_directory.get("name"), Some(&"world".to_string()));
 
         assert_eq!(src_validators.len(), 2);
         assert_eq!(validators(&join_valset).await, src_validators);
 
         let reply = join_saga
-            .query(&saga_encode_query(&SagaQuery::Get { saga_id: "greet".into() }))
+            .query(&saga_encode_query(&SagaQuery::Get {
+                saga_id: "greet".into(),
+            }))
             .await
             .unwrap();
         let SagaReply::Saga(Some(greet)) = saga_decode_reply(&reply).unwrap() else {
@@ -362,7 +605,9 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         assert_eq!(greet.status, SagaStatus::Done);
         assert_eq!(greet.result, Some(b"olleh".to_vec()));
         let reply = join_saga
-            .query(&saga_encode_query(&SagaQuery::Get { saga_id: "translate".into() }))
+            .query(&saga_encode_query(&SagaQuery::Get {
+                saga_id: "translate".into(),
+            }))
             .await
             .unwrap();
         let SagaReply::Saga(Some(translate)) = saga_decode_reply(&reply).unwrap() else {
@@ -376,7 +621,9 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // head oid that rehashes to the right root.
         {
             let repo = git2::Repository::open(&joiner_dir).expect("joiner repo opens");
-            let head = repo.refname_to_id("refs/heads/main").expect("joiner ref is born");
+            let head = repo
+                .refname_to_id("refs/heads/main")
+                .expect("joiner ref is born");
             let commit = repo.find_commit(head).unwrap();
             assert_eq!(
                 commit.parent_count(),
@@ -384,9 +631,14 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 "the pack must carry the full history, not just the head commit"
             );
             let tree = commit.tree().unwrap();
-            let entry = tree.get_name("README.md").expect("README.md in the head tree");
+            let entry = tree
+                .get_name("README.md")
+                .expect("README.md in the head tree");
             let blob = repo.find_blob(entry.id()).unwrap();
-            assert_eq!(blob.content(), b"# ducktape\n\nrebuilt from a snapshot\n".as_ref());
+            assert_eq!(
+                blob.content(),
+                b"# ducktape\n\nrebuilt from a snapshot\n".as_ref()
+            );
         }
 
         // ---- a byzantine snapshot is refused, and refusal leaves no trace ----
@@ -396,7 +648,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
         let err = join_valset.install(&tampered, src_valset_root).unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "a tampered snapshot must err with Module");
+        assert!(
+            matches!(err, Error::Module(_)),
+            "a tampered snapshot must err with Module"
+        );
         assert_eq!(
             join_valset.root(),
             src_valset_root,
@@ -411,8 +666,14 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // the joiner's composed app-hash still stands after the refusal.
         assert_eq!(
             joiner_app_hash(
-                &join_kv, &join_document, &join_directory, &join_greeter,
-                &join_forge, &join_valset, &join_saga,
+                &join_kv,
+                &join_document,
+                &join_messaging,
+                &join_directory,
+                &join_greeter,
+                &join_forge,
+                &join_valset,
+                &join_saga,
             ),
             src_global
         );

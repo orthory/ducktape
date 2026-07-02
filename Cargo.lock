@@ -1135,6 +1135,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
+ "commonware-storage",
  "directory",
  "directory-interface",
  "document",
@@ -2053,11 +2054,17 @@ name = "messaging"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "futures",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-storage",
+ "commonware-utils",
  "host",
  "messaging-interface",
  "sdk",
- "sha2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
