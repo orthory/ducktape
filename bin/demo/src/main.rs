@@ -1,11 +1,11 @@
-//! a runnable super-app demo: eleven registered modules — a qmdb-backed kv, a
+//! a runnable super-app demo: twelve registered modules — a qmdb-backed kv, a
 //! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
 //! qmdb-backed block DOCUMENT module, a qmdb-backed block-based CHAT module, an
 //! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
-//! orchestrator, a TASKS ledger, and the INBOX notification queues — dispatched
-//! over ONE host, showing the app-hash evolve as typed cross-module ops flow,
-//! ending on the agent-collaboration beat: a mention becomes a run and a pending
-//! saga in one block.
+//! orchestrator, a TASKS ledger, the AUTOMATIONS rule engine, and the INBOX
+//! notification queues — dispatched over ONE host, showing the app-hash evolve
+//! as typed cross-module ops flow, ending on the agent-collaboration beat: a
+//! mention becomes a run and a pending saga in one block.
 //!
 //! run: `cargo run -p demo`
 
@@ -15,6 +15,7 @@ use agent_interface::{
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
     encode_query as agent_encode_query,
 };
+use automations::Automations;
 use chat::Chat;
 use chat_interface::{
     Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, PostPolicy,
@@ -74,6 +75,7 @@ fn main() {
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        let automations = Automations::new("automations", "chat", "tasks");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
@@ -86,10 +88,11 @@ fn main() {
             Box::new(tasks),
             Box::new(inbox),
             Box::new(agent),
+            Box::new(automations),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 11 registered modules over one host ===");
+        println!("=== super-app demo — 12 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

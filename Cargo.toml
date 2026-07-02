@@ -32,6 +32,7 @@ members = [
     "crates/apps/agent", "crates/apps/agent-interface",
     "crates/apps/tasks", "crates/apps/tasks-interface",
     "crates/apps/vaults", "crates/apps/vaults-interface",
+    "crates/apps/automations", "crates/apps/automations-interface",
     "crates/apps/inbox", "crates/apps/inbox-interface",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
@@ -86,6 +87,7 @@ chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
+automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
@@ -102,5 +104,6 @@ chat-interface = { path = "crates/apps/chat-interface" }
 agent-interface = { path = "crates/apps/agent-interface" }
 tasks-interface = { path = "crates/apps/tasks-interface" }
 vaults-interface = { path = "crates/apps/vaults-interface" }
+automations-interface = { path = "crates/apps/automations-interface" }
 inbox-interface = { path = "crates/apps/inbox-interface" }
 directory-interface = { path = "crates/examples/directory-interface" }
