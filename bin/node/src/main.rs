@@ -65,6 +65,7 @@ use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
+use automations::Automations;
 use chat::Chat;
 use directory::Directory;
 use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
@@ -109,9 +110,9 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 10] = [
+const MODULE_IDS: [&str; 11] = [
     "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults",
-    "directory",
+    "directory", "automations",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
@@ -258,6 +259,9 @@ async fn genesis_host(
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
         Box::new(Directory::new("directory")),
+        // user-defined rules over chat posts: trusts the "chat" origin for hook
+        // events and emits chat/tasks follow-ups.
+        Box::new(Automations::new("automations", "chat", "tasks")),
     ])
     .expect("genesis host")
 }
@@ -643,6 +647,10 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             let mut vaults = Vaults::new("vaults");
             vaults.install(&bytes, root).expect("vaults install");
 
+            let (bytes, root) = snapshot_of("automations").await;
+            let mut automations = Automations::new("automations", "chat", "tasks");
+            automations.install(&bytes, root).expect("automations install");
+
             let (bytes, root) = snapshot_of("forge").await;
             let forge_repo = storage_for_sync.join("forge-repo");
             let mut forge = Forge::init("forge", forge_repo).expect("joiner forge init");
@@ -650,9 +658,9 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
             // compose and check THE property: the joiner's app-hash IS the
             // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 10] = [
+            let mods: [&dyn sdk::Module; 11] = [
                 &kv, &document, &chat, &directory, &valset, &governance,
-                &saga, &tasks, &vaults, &forge,
+                &saga, &tasks, &vaults, &forge, &automations,
             ];
             let synced = state::global_root(&mods);
             if synced != manifest.app_hash {

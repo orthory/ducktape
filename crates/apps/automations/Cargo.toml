@@ -1,0 +1,19 @@
+[package]
+name = "automations"
+edition.workspace = true
+version.workspace = true
+
+# user-defined rules over the chat hook seam: match posts, emit chat/tasks
+# follow-ups. depends only on sdk + the types-only interface crates it addresses.
+[dependencies]
+sdk = { workspace = true }
+automations-interface = { workspace = true }
+chat-interface = { workspace = true }
+tasks-interface = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+host = { workspace = true }
+tasks = { workspace = true }

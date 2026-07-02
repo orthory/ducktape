@@ -1,4 +1,4 @@
-//! a runnable super-app demo: ten registered modules — a qmdb-backed kv, a sync
+//! a runnable super-app demo: eleven registered modules — a qmdb-backed kv, a sync
 //! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
 //! block DOCUMENT module, a qmdb-backed block-based CHAT module, an ed25519
 //! permissionless VALSET, the SAGA async-RPC ledger, the AGENT orchestrator,
@@ -14,6 +14,7 @@ use agent_interface::{
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
     encode_query as agent_encode_query,
 };
+use automations::Automations;
 use chat::Chat;
 use chat_interface::{
     Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, PostPolicy,
@@ -67,6 +68,7 @@ fn main() {
         let saga = SagaModule::new("saga");
         let tasks = Tasks::new("tasks");
         let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        let automations = Automations::new("automations", "chat", "tasks");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
@@ -78,10 +80,11 @@ fn main() {
             Box::new(saga),
             Box::new(tasks),
             Box::new(agent),
+            Box::new(automations),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 10 registered modules over one host ===");
+        println!("=== super-app demo — 11 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

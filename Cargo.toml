@@ -32,6 +32,7 @@ members = [
     "crates/apps/agent", "crates/apps/agent-interface",
     "crates/apps/tasks", "crates/apps/tasks-interface",
     "crates/apps/vaults", "crates/apps/vaults-interface",
+    "crates/apps/automations", "crates/apps/automations-interface",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
     # bin — runnable binaries
@@ -85,6 +86,7 @@ chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
+automations = { path = "crates/apps/automations" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
@@ -100,4 +102,5 @@ chat-interface = { path = "crates/apps/chat-interface" }
 agent-interface = { path = "crates/apps/agent-interface" }
 tasks-interface = { path = "crates/apps/tasks-interface" }
 vaults-interface = { path = "crates/apps/vaults-interface" }
+automations-interface = { path = "crates/apps/automations-interface" }
 directory-interface = { path = "crates/examples/directory-interface" }
