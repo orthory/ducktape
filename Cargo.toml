@@ -24,6 +24,7 @@ members = [
     # system — consensus infrastructure modules
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
+    "crates/system/valset-mesh-interface",
     "crates/system/wireguard-upgrade",
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
@@ -32,6 +33,7 @@ members = [
     "crates/apps/messaging", "crates/apps/messaging-interface",
     "crates/apps/chat", "crates/apps/chat-interface",
     "crates/apps/agent", "crates/apps/agent-interface",
+    "crates/apps/tasks", "crates/apps/tasks-interface",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
     # bin — runnable binaries
@@ -80,11 +82,13 @@ document = { path = "crates/apps/document" }
 messaging = { path = "crates/apps/messaging" }
 chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }
+tasks = { path = "crates/apps/tasks" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 kv-interface = { path = "crates/system/kv-interface" }
 valset-interface = { path = "crates/system/valset-interface" }
+valset-mesh-interface = { path = "crates/system/valset-mesh-interface" }
 wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
@@ -92,4 +96,5 @@ document-interface = { path = "crates/apps/document-interface" }
 messaging-interface = { path = "crates/apps/messaging-interface" }
 chat-interface = { path = "crates/apps/chat-interface" }
 agent-interface = { path = "crates/apps/agent-interface" }
+tasks-interface = { path = "crates/apps/tasks-interface" }
 directory-interface = { path = "crates/examples/directory-interface" }

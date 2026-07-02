@@ -1,0 +1,11 @@
+[package]
+name = "valset-mesh-interface"
+edition.workspace = true
+version.workspace = true
+
+# types-only: deterministic projection from valset membership into the
+# validator-owned mesh control-plane contract.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

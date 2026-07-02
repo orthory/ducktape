@@ -1369,6 +1369,8 @@ dependencies = [
  "saga",
  "saga-interface",
  "sdk",
+ "serde",
+ "serde_json",
  "state",
  "valset",
  "valset-interface",
@@ -3615,6 +3617,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tasks"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "host",
+ "sdk",
+ "sha2",
+ "tasks-interface",
+]
+
+[[package]]
+name = "tasks-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4248,6 +4270,15 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "valset-mesh-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -15,7 +15,7 @@ use messaging_interface::{
     decode_reply as decode_messaging_reply, encode_msg as encode_messaging_msg,
     encode_query as encode_messaging_query,
 };
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
 pub struct Agent<E>
 where
@@ -123,6 +123,13 @@ where
 
     fn root(&self) -> StateRoot {
         self.messaging.root()
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::ResolverBacked {
+            backend: "qmdb".into(),
+            detail: "call Agent::sync_target() at this root and serve it with a DbResolver".into(),
+        })
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

@@ -109,7 +109,7 @@ use std::path::PathBuf;
 
 use forge_interface::{decode_msg, decode_query, encode_reply, ForgeMsg, ForgeQuery, ForgeReply};
 use git2::Oid;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
 /// the canonical branch this module commits to and reads HEAD from.
@@ -271,6 +271,10 @@ impl Module for Forge {
     /// cache). `None` -> `ZERO`.
     fn root(&self) -> StateRoot {
         self.head.map_or(StateRoot::ZERO, Self::oid_to_root)
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()?))
     }
 
     /// commit one file change to the repo. deterministic: a fixed `Signature`

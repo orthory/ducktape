@@ -28,7 +28,7 @@ use messaging_interface::{
     Channel, ChatMessage, MessagingMsg, MessagingQuery, MessagingReply, Thread, decode_msg,
     decode_query, encode_reply,
 };
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// the qmdb key: a fixed-width digest of a logical messaging record key.
@@ -414,6 +414,14 @@ where
 
     fn root(&self) -> StateRoot {
         StateRoot(self.db.root().0)
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::ResolverBacked {
+            backend: "qmdb".into(),
+            detail: "call Messaging::sync_target() at this root and serve it with a DbResolver"
+                .into(),
+        })
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

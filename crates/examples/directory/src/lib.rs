@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use directory_interface::{decode_msg, decode_query, encode_reply, DirMsg, DirQuery, DirReply};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
 pub struct Directory {
@@ -156,6 +156,10 @@ impl Module for Directory {
     /// order-independent (BTreeMap) and idempotent — f(current state), unlike qmdb.
     fn root(&self) -> StateRoot {
         Directory::root_of(&self.entries)
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
