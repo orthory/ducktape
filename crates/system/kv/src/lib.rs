@@ -47,6 +47,21 @@ use commonware_utils::range::NonEmptyRange;
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
+/// write-time cap on a LOGICAL key. the qmdb key is the 32-byte hash, so this is
+/// a hygiene bound at the interface seam (an unbounded key would still bloat the
+/// pending overlay and every message that carries it), not a storage-layout limit.
+pub const MAX_KEY_LEN: usize = 4 * 1024;
+
+/// write-time cap on a value. [`kv_config`]'s codec [`RangeCfg`] bounds a stored
+/// value at 1 MiB AT DECODE TIME — an oversized value would COMMIT fine and then
+/// panic every later read (and any log replay / sync batch decode) on every
+/// validator: a poison pill. rejecting here keeps it out of the log entirely.
+/// the 4 KiB margin below the 1 MiB codec bound covers the serialized operation's
+/// framing (32-byte hashed key, varint length prefix, operation tag), so the
+/// WHOLE stored form — not just the raw value — stays under the codec bound and
+/// under 1 MiB-scale wire-message caps when ops ship in sync batches.
+pub const MAX_VALUE_LEN: usize = (1 << 20) - 4 * 1024;
+
 /// the qmdb key: a fixed 32-byte sha256 digest of the logical key. fixed width is
 /// what lets a store be state-synced (commonware's resolvers require `K: Array`).
 type KvKey = <Sha256 as Hasher>::Digest;
@@ -147,7 +162,8 @@ where
 
     /// upsert `key -> value`, re-merkleize, apply, and flush. after this returns
     /// `root()` reflects the new committed merkle root. the qmdb key is
-    /// `sha256(key)`.
+    /// `sha256(key)`. a direct test/dev convenience — the consensus write path is
+    /// `execute` -> `stage`, which enforces the write-time size caps.
     pub async fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
         let batch = self
             .db
@@ -160,11 +176,34 @@ where
         self.db.commit().await.expect("commit failed");
     }
 
+    /// reject a write that would poison the store: [`kv_config`]'s codec bound is
+    /// enforced only at DECODE time, so an oversized value commits fine and then
+    /// panics every later read of that key on EVERY validator. checked at write
+    /// time (see [`MAX_KEY_LEN`] / [`MAX_VALUE_LEN`] for the cap rationale).
+    fn check_write_caps(key: &[u8], value: &[u8]) -> Result<(), Error> {
+        if key.len() > MAX_KEY_LEN {
+            return Err(Error::Module(format!(
+                "key too large: {} bytes exceeds the {MAX_KEY_LEN}-byte cap",
+                key.len()
+            )));
+        }
+        if value.len() > MAX_VALUE_LEN {
+            return Err(Error::Module(format!(
+                "value too large: {} bytes exceeds the {MAX_VALUE_LEN}-byte cap",
+                value.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// stage `key -> value` for this block WITHOUT committing. visible to `get`
     /// at once (read-your-writes) but folded into the qmdb store — and `root()` —
-    /// only when the host calls `commit_block` at the block boundary.
-    pub fn stage(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    /// only when the host calls `commit_block` at the block boundary. rejects an
+    /// over-cap key/value BEFORE staging, so a failed op leaves no overlay entry.
+    pub fn stage(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), Error> {
+        Self::check_write_caps(&key, &value)?;
         self.pending.insert(key, value);
+        Ok(())
     }
 
     /// read `key`: a STAGED (this-block) write shadows committed qmdb state, so a
@@ -276,12 +315,12 @@ where
 
     /// interpret the payload as a json-encoded `(key, value)` write and apply it
     /// to own state. the only `.await` is on own qmdb state — deterministic, so
-    /// this is replay-safe across validators.
+    /// this is replay-safe across validators. an over-cap key/value is rejected
+    /// here (write time), never staged, never committed — see [`MAX_VALUE_LEN`].
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match kv_interface::decode(&msg.payload).map_err(Error::Module)? {
             kv_interface::KvMsg::Set { key, value } => self.stage(key, value),
         }
-        Ok(())
     }
 
     /// real async read of own qmdb state — the async-query seam in action.
@@ -410,6 +449,104 @@ mod tests {
             if !ok { fails.push(seed); }
         }
         assert!(fails.is_empty(), "lost write / None on seeds: {:?}", fails);
+    }
+
+    // a minimal Ctx so execute can be driven without a full host.
+    struct TestCtx {
+        env: sdk::Env,
+    }
+    impl TestCtx {
+        fn new() -> Self {
+            Self {
+                env: sdk::Env {
+                    height: 0,
+                    consensus_time: 0,
+                    origin: sdk::Origin::System,
+                    me: "kv".into(),
+                },
+            }
+        }
+    }
+    #[async_trait::async_trait(?Send)]
+    impl Ctx for TestCtx {
+        fn env(&self) -> &sdk::Env {
+            &self.env
+        }
+        fn module_root(&self, _t: &str) -> Option<StateRoot> {
+            None
+        }
+        async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
+            Err(Error::QueryUnsupported)
+        }
+        fn emit_msg(&mut self, _m: Msg) {}
+        fn emit_event(&mut self, _e: sdk::Event) {}
+        fn request_effect(&mut self, _e: sdk::Effect) {}
+    }
+
+    // the poison-pill guard: an over-cap set is rejected at WRITE time — never
+    // staged, never committed, root unchanged — instead of committing fine and
+    // panicking every later decode of that key on every validator.
+    #[test]
+    fn oversized_writes_are_rejected_before_staging() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut kv = Kv::init(context, "kv").await;
+            let r0 = kv.root();
+
+            // value one byte over the cap -> rejected, nothing staged.
+            let huge_value = kv_interface::encode(&kv_interface::KvMsg::Set {
+                key: b"k".to_vec(),
+                value: vec![0u8; MAX_VALUE_LEN + 1],
+            });
+            let err = kv
+                .execute(
+                    &mut TestCtx::new(),
+                    &Msg {
+                        target: "kv".into(),
+                        payload: huge_value,
+                    },
+                )
+                .await
+                .expect_err("over-cap value must be rejected");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("value too large")),
+                "unexpected error: {err:?}"
+            );
+
+            // key one byte over the cap -> rejected, nothing staged.
+            let huge_key = kv_interface::encode(&kv_interface::KvMsg::Set {
+                key: vec![b'k'; MAX_KEY_LEN + 1],
+                value: b"v".to_vec(),
+            });
+            let err = kv
+                .execute(
+                    &mut TestCtx::new(),
+                    &Msg {
+                        target: "kv".into(),
+                        payload: huge_key,
+                    },
+                )
+                .await
+                .expect_err("over-cap key must be rejected");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("key too large")),
+                "unexpected error: {err:?}"
+            );
+
+            // the rejects happened BEFORE staging: no overlay entry, and a commit
+            // is a no-op that leaves the root byte-identical.
+            assert!(kv.pending.is_empty(), "a rejected write must not be staged");
+            kv.commit_block().await.expect("commit");
+            assert_eq!(kv.root(), r0, "a rejected write must not move the root");
+
+            // boundary: exactly-at-cap writes are accepted and commit fine.
+            kv.stage(vec![b'k'; MAX_KEY_LEN], vec![0u8; MAX_VALUE_LEN])
+                .expect("at-cap write");
+            kv.commit_block().await.expect("commit at-cap write");
+            assert_eq!(
+                kv.get(&vec![b'k'; MAX_KEY_LEN]).await.map(|v| v.len()),
+                Some(MAX_VALUE_LEN)
+            );
+        });
     }
 
     // isolation: two qmdb modules on ONE runtime context must not share storage.

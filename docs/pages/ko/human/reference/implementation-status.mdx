@@ -14,11 +14,17 @@
 
 ## Module State
 
-- QMDB-backed module은 실제 authenticated root와 state-sync target을 노출한다.
+- QMDB-backed module(`kv`, `document`)은 실제 authenticated root와 state-sync
+  target을 노출한다.
 - Forge는 git state에서 32바이트 state root를 계산하고 install 전에 object closure를
   verify한다.
-- Snapshot-style module은 module에 맞는 canonical byte를 사용한다.
-- Messaging, chat, agent module은 현재 workspace에 연결되어 있다.
+- Snapshot-style module(`valset`, `saga`, `tasks`, example `directory`)은 module에
+  맞는 canonical byte를 사용한다.
+- system crate에는 validator-derived mesh control-plane type
+  (`valset-mesh-interface`)과 WireGuard tunnel-upgrade protocol
+  (`wireguard-upgrade`)도 있다.
+- chat(단일 storage-owning chat module; messaging/agent facade가 folded-in)은
+  workspace member지만 binary consumer는 아직 없다.
 
 ## Verification Surface
 
@@ -32,6 +38,8 @@
 ## Still Open
 
 - live node에서 network-backed module sync.
-- epoch cutover 주변 dynamic valset orchestration.
+- live valset orchestration wiring. deterministic cutover state machine
+  (`ValsetOrchestrator`)은 구현되어 test까지 있고, old orderer stop, new epoch
+  start, membership에 맞춘 transport readiness 정렬이 남아 있다.
 - running node에서 snapshot-at-height serving.
-- chat, agent, tasks의 product depth.
+- chat, tasks module의 product depth.
