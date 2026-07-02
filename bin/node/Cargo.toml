@@ -37,6 +37,7 @@ vaults = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
+memory = { workspace = true }
 reactor = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }

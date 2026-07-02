@@ -35,6 +35,7 @@ members = [
     "crates/apps/automations", "crates/apps/automations-interface",
     "crates/apps/inbox", "crates/apps/inbox-interface",
     "crates/apps/files", "crates/apps/files-interface",
+    "crates/apps/memory", "crates/apps/memory-interface",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
     # bin — runnable binaries
@@ -91,6 +92,7 @@ vaults = { path = "crates/apps/vaults" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
+memory = { path = "crates/apps/memory" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
@@ -109,4 +111,5 @@ vaults-interface = { path = "crates/apps/vaults-interface" }
 automations-interface = { path = "crates/apps/automations-interface" }
 inbox-interface = { path = "crates/apps/inbox-interface" }
 files-interface = { path = "crates/apps/files-interface" }
+memory-interface = { path = "crates/apps/memory-interface" }
 directory-interface = { path = "crates/examples/directory-interface" }
