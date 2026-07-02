@@ -73,6 +73,8 @@ where
     let reply = module
         .query(&encode_query(&MessagingQuery::Messages {
             channel_id: channel_id.into(),
+            before: None,
+            limit: None,
         }))
         .await
         .unwrap();

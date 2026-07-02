@@ -1,9 +1,20 @@
 //! qmdb-backed messaging module with explicit channels.
 //!
-//! the module stores a small set of logical records in one commonware qmdb:
-//! a channel index, per-channel records, per-channel message histories, and
-//! message-id markers for global duplicate detection. like `document` and `kv`,
-//! writes are staged in memory during a block and flushed to qmdb in one batch at
+//! ## per-message storage (why one value per message, not one per channel)
+//!
+//! each message is a SEPARATE qmdb record keyed `(channel, sequence)`, and a
+//! per-channel counter record holds the next sequence. a post writes exactly
+//! two small records — the message and the bumped counter — so posting is O(1)
+//! regardless of channel size. the earlier layout stored a channel's WHOLE
+//! history as one value: every post re-read, appended, and rewrote it (O(n²)
+//! writes), and once that value crossed the journal codec's 1 MiB bound
+//! `commit_block` panicked — a busy channel was a deterministic whole-network
+//! liveness kill. per-message keys remove both the amplification and the bomb;
+//! a per-message body cap keeps any single value far under the bound.
+//!
+//! reads enumerate by counter (qmdb hashes keys, so there is no range scan):
+//! `messages` walks `1..=count`, and the paginated query walks only a window.
+//! writes stage in memory during a block and flush in one qmdb batch at
 //! `commit_block`; the module root is the real qmdb root and the joiner path is
 //! commonware storage sync.
 
@@ -46,6 +57,12 @@ pub type MessagingTarget = Target<mmr::Family, MessagingKey>;
 
 const CHANNEL_INDEX_KEY: &[u8] = b"channel-index";
 
+/// per-message body ceiling. keeps any single qmdb value far below the journal
+/// codec's 1 MiB bound, so a post can never grow a value past what
+/// `commit_block` can flush. generous for chat; a file/attachment belongs in a
+/// blob-addressed store, not inline.
+const MAX_BODY_LEN: usize = 16 * 1024;
+
 fn hash_key(key: &[u8]) -> MessagingKey {
     let mut h = Sha256::new();
     h.update(key);
@@ -64,8 +81,10 @@ fn channel_key(channel_id: &str) -> Vec<u8> {
     keyed(b"channel", channel_id)
 }
 
-fn messages_key(channel_id: &str) -> Vec<u8> {
-    keyed(b"messages", channel_id)
+/// the per-channel message COUNTER record: the number of top-level messages,
+/// which is also the highest assigned sequence (sequences are 1-based dense).
+fn channel_count_key(channel_id: &str) -> Vec<u8> {
+    keyed(b"channel-count", channel_id)
 }
 
 fn keyed_component(key: &mut Vec<u8>, value: &str) {
@@ -73,16 +92,51 @@ fn keyed_component(key: &mut Vec<u8>, value: &str) {
     key.extend_from_slice(value.as_bytes());
 }
 
-fn thread_key(channel_id: &str, thread_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(b"thread".len() + 16 + channel_id.len() + thread_id.len());
-    key.extend_from_slice(b"thread");
+/// one message's record key: `(channel, sequence)`. length-prefixed channel so
+/// no two `(channel, seq)` pairs can collide across channel-name boundaries.
+fn message_at_key(channel_id: &str, sequence: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(b"message-at".len() + 16 + channel_id.len());
+    key.extend_from_slice(b"message-at");
+    keyed_component(&mut key, channel_id);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+/// the per-thread reply COUNTER record.
+fn thread_count_key(channel_id: &str, thread_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(b"thread-count".len() + 24 + channel_id.len() + thread_id.len());
+    key.extend_from_slice(b"thread-count");
     keyed_component(&mut key, channel_id);
     keyed_component(&mut key, thread_id);
     key
 }
 
+/// one thread reply's record key: `(channel, thread, sequence)`.
+fn thread_reply_at_key(channel_id: &str, thread_id: &str, sequence: u64) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(b"thread-at".len() + 24 + channel_id.len() + thread_id.len());
+    key.extend_from_slice(b"thread-at");
+    keyed_component(&mut key, channel_id);
+    keyed_component(&mut key, thread_id);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+/// message-id marker: locates any message by its id for O(1) dedup AND for
+/// resolving a thread root's `(channel, seq)` without scanning.
 fn message_id_key(message_id: &str) -> Vec<u8> {
     keyed(b"message-id", message_id)
+}
+
+/// where a message lives, recorded under its id: its channel and its sequence
+/// (top-level or within a thread). lets a thread reply find and update its root
+/// message in place, and dedup stay O(1).
+#[derive(Serialize, serde::Deserialize, Clone)]
+struct MessageLocation {
+    channel_id: String,
+    sequence: u64,
+    /// `None` for a top-level message; `Some(thread)` for a reply.
+    thread_id: Option<String>,
 }
 
 fn messaging_config<E>(context: &E, id: &str) -> MessagingConfig
@@ -197,13 +251,61 @@ where
         Ok(self.channel_index().await?.into_values().collect())
     }
 
-    async fn messages(&self, channel_id: &str) -> Result<Vec<ChatMessage>, Error> {
-        let mut messages: Vec<ChatMessage> = self
-            .load(&messages_key(channel_id))
+    async fn channel_message_count(&self, channel_id: &str) -> Result<u64, Error> {
+        Ok(self.load(&channel_count_key(channel_id)).await?.unwrap_or(0))
+    }
+
+    async fn thread_reply_count(&self, channel_id: &str, thread_id: &str) -> Result<u64, Error> {
+        Ok(self
+            .load(&thread_count_key(channel_id, thread_id))
             .await?
-            .unwrap_or_default();
-        messages.sort_by(|a, b| a.sequence.cmp(&b.sequence).then_with(|| a.id.cmp(&b.id)));
-        Ok(messages)
+            .unwrap_or(0))
+    }
+
+    async fn message_at(
+        &self,
+        channel_id: &str,
+        sequence: u64,
+    ) -> Result<Option<ChatMessage>, Error> {
+        self.load(&message_at_key(channel_id, sequence)).await
+    }
+
+    /// a page of a channel's top-level messages, newest-first, by counter walk.
+    /// `before` is an exclusive keyset cursor (return `sequence < before`);
+    /// `limit` caps the page. `before = None, limit = None` returns the whole
+    /// history ascending — the pre-pagination behavior.
+    async fn messages_page(
+        &self,
+        channel_id: &str,
+        before: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ChatMessage>, Error> {
+        let count = self.channel_message_count(channel_id).await?;
+        // walk downward from the newest in-window sequence.
+        let mut seq = before.map_or(count, |b| b.saturating_sub(1).min(count));
+        let cap = limit.map(|l| l as usize);
+        let mut out: Vec<ChatMessage> = Vec::new();
+        while seq >= 1 {
+            if let Some(cap) = cap {
+                if out.len() >= cap {
+                    break;
+                }
+            }
+            if let Some(m) = self.message_at(channel_id, seq).await? {
+                out.push(m);
+            }
+            seq -= 1;
+        }
+        // unpaginated callers historically saw ascending order; preserve that
+        // for the whole-history read, but a paginated page is newest-first.
+        if before.is_none() && limit.is_none() {
+            out.reverse();
+        }
+        Ok(out)
+    }
+
+    async fn messages(&self, channel_id: &str) -> Result<Vec<ChatMessage>, Error> {
+        self.messages_page(channel_id, None, None).await
     }
 
     async fn thread_replies(
@@ -211,23 +313,38 @@ where
         channel_id: &str,
         thread_id: &str,
     ) -> Result<Vec<ChatMessage>, Error> {
-        let mut replies: Vec<ChatMessage> = self
-            .load(&thread_key(channel_id, thread_id))
-            .await?
-            .unwrap_or_default();
-        replies.sort_by(|a, b| a.sequence.cmp(&b.sequence).then_with(|| a.id.cmp(&b.id)));
+        let count = self.thread_reply_count(channel_id, thread_id).await?;
+        let mut replies: Vec<ChatMessage> = Vec::with_capacity(count as usize);
+        for seq in 1..=count {
+            if let Some(m) = self
+                .load(&thread_reply_at_key(channel_id, thread_id, seq))
+                .await?
+            {
+                replies.push(m);
+            }
+        }
         Ok(replies)
     }
 
     async fn thread(&self, channel_id: &str, thread_id: &str) -> Result<Option<Thread>, Error> {
-        let messages = self.messages(channel_id).await?;
-        let Some(root) = messages.into_iter().find(|m| m.id == thread_id) else {
+        let Some(loc) = self.locate(thread_id).await? else {
+            return Ok(None);
+        };
+        // a thread root must be a top-level message in this channel.
+        if loc.channel_id != channel_id || loc.thread_id.is_some() {
+            return Ok(None);
+        }
+        let Some(root) = self.message_at(channel_id, loc.sequence).await? else {
             return Ok(None);
         };
         Ok(Some(Thread {
             root,
             replies: self.thread_replies(channel_id, thread_id).await?,
         }))
+    }
+
+    async fn locate(&self, message_id: &str) -> Result<Option<MessageLocation>, Error> {
+        self.load(&message_id_key(message_id)).await
     }
 
     async fn message_exists(&self, message_id: &str) -> Result<bool, Error> {
@@ -260,6 +377,16 @@ where
         Ok(())
     }
 
+    fn validate_body(body: &str) -> Result<(), Error> {
+        Self::validate_non_empty("body", body)?;
+        if body.len() > MAX_BODY_LEN {
+            return Err(Error::Module(format!(
+                "body exceeds the {MAX_BODY_LEN}-byte ceiling"
+            )));
+        }
+        Ok(())
+    }
+
     async fn stage_message(
         &mut self,
         channel_id: String,
@@ -271,6 +398,7 @@ where
         Self::validate_non_empty("channel_id", &channel_id)?;
         Self::validate_non_empty("message_id", &message_id)?;
         Self::validate_non_empty("author", &author)?;
+        Self::validate_body(&body)?;
         if self.channel(&channel_id).await?.is_none() {
             return Err(Error::Module(format!("unknown channel: {channel_id}")));
         }
@@ -280,9 +408,10 @@ where
             )));
         }
 
-        let mut messages = self.messages(&channel_id).await?;
-        let sequence = messages.last().map_or(1, |m| m.sequence + 1);
-        messages.push(ChatMessage {
+        // O(1): read the counter, write ONE message record + the bumped counter
+        // + the id marker. no whole-history rewrite.
+        let sequence = self.channel_message_count(&channel_id).await? + 1;
+        let message = ChatMessage {
             id: message_id.clone(),
             channel_id: channel_id.clone(),
             author,
@@ -292,9 +421,13 @@ where
             thread_id: None,
             reply_count: 0,
             last_reply_at: None,
-        });
-        self.store(messages_key(&channel_id), &messages);
-        self.store(message_id_key(&message_id), &channel_id);
+        };
+        self.store(message_at_key(&channel_id, sequence), &message);
+        self.store(channel_count_key(&channel_id), &sequence);
+        self.store(
+            message_id_key(&message_id),
+            &MessageLocation { channel_id, sequence, thread_id: None },
+        );
         Ok(())
     }
 
@@ -311,6 +444,7 @@ where
         Self::validate_non_empty("thread_id", &thread_id)?;
         Self::validate_non_empty("message_id", &message_id)?;
         Self::validate_non_empty("author", &author)?;
+        Self::validate_body(&body)?;
         if self.channel(&channel_id).await?.is_none() {
             return Err(Error::Module(format!("unknown channel: {channel_id}")));
         }
@@ -320,19 +454,22 @@ where
             )));
         }
 
-        let mut messages = self.messages(&channel_id).await?;
-        let Some(root) = messages.iter_mut().find(|m| m.id == thread_id) else {
-            return Err(Error::Module(format!("unknown thread: {thread_id}")));
-        };
-        if root.thread_id.is_some() {
-            return Err(Error::Module(format!(
-                "thread replies cannot start subthreads: {thread_id}"
-            )));
-        }
+        // locate the root message by id (O(1)) — it must be a top-level message
+        // in this channel, not itself a reply.
+        let root_loc = self
+            .locate(&thread_id)
+            .await?
+            .filter(|l| l.channel_id == channel_id && l.thread_id.is_none())
+            .ok_or_else(|| Error::Module(format!("unknown thread: {thread_id}")))?;
+        let mut root = self
+            .message_at(&channel_id, root_loc.sequence)
+            .await?
+            .ok_or_else(|| Error::Module(format!("thread root vanished: {thread_id}")))?;
 
-        let mut replies = self.thread_replies(&channel_id, &thread_id).await?;
-        let sequence = replies.last().map_or(1, |m| m.sequence + 1);
-        replies.push(ChatMessage {
+        // O(1): one reply record + bumped thread counter + the root's updated
+        // metadata (a single small record) + the id marker.
+        let sequence = self.thread_reply_count(&channel_id, &thread_id).await? + 1;
+        let reply = ChatMessage {
             id: message_id.clone(),
             channel_id: channel_id.clone(),
             author,
@@ -342,13 +479,21 @@ where
             thread_id: Some(thread_id.clone()),
             reply_count: 0,
             last_reply_at: None,
-        });
-
+        };
         root.reply_count += 1;
         root.last_reply_at = Some(sent_at);
-        self.store(messages_key(&channel_id), &messages);
-        self.store(thread_key(&channel_id, &thread_id), &replies);
-        self.store(message_id_key(&message_id), &channel_id);
+
+        self.store(thread_reply_at_key(&channel_id, &thread_id, sequence), &reply);
+        self.store(thread_count_key(&channel_id, &thread_id), &sequence);
+        self.store(message_at_key(&channel_id, root_loc.sequence), &root);
+        self.store(
+            message_id_key(&message_id),
+            &MessageLocation {
+                channel_id,
+                sequence,
+                thread_id: Some(thread_id),
+            },
+        );
         Ok(())
     }
 
@@ -479,8 +624,12 @@ where
             MessagingQuery::Channel { channel_id } => Ok(encode_reply(&MessagingReply::Channel(
                 self.channel(&channel_id).await?,
             ))),
-            MessagingQuery::Messages { channel_id } => Ok(encode_reply(&MessagingReply::Messages(
-                self.messages(&channel_id).await?,
+            MessagingQuery::Messages {
+                channel_id,
+                before,
+                limit,
+            } => Ok(encode_reply(&MessagingReply::Messages(
+                self.messages_page(&channel_id, before, limit).await?,
             ))),
             MessagingQuery::Thread {
                 channel_id,

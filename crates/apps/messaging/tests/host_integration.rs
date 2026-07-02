@@ -46,6 +46,8 @@ fn host_commits_channel_messages_and_serves_history_queries() {
                 "messaging",
                 &encode_query(&MessagingQuery::Messages {
                     channel_id: "general".into(),
+                    before: None,
+                    limit: None,
                 }),
             )
             .await

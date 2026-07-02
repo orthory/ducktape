@@ -475,7 +475,9 @@ fn agent_uses_registered_messaging_backing_when_present() {
             messaging_query(
                 &host,
                 MessagingQuery::Messages {
-                    channel_id: "s1".into()
+                    channel_id: "s1".into(),
+                    before: None,
+                    limit: None,
                 },
             )
             .await,
@@ -522,7 +524,9 @@ fn new_agent_genesis_does_not_implicitly_migrate_standalone_messaging_state() {
             messaging_query(
                 &old_host,
                 MessagingQuery::Messages {
-                    channel_id: "s1".into()
+                    channel_id: "s1".into(),
+                    before: None,
+                    limit: None,
                 },
             )
             .await,

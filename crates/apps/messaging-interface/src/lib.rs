@@ -62,6 +62,14 @@ pub enum MessagingQuery {
     },
     Messages {
         channel_id: String,
+        /// return only messages with `sequence < before` (a keyset cursor for
+        /// paging backward through history). `None` starts at the newest.
+        #[serde(default)]
+        before: Option<u64>,
+        /// cap the page size. `None` returns the whole (remaining) history —
+        /// the pre-pagination behavior, so existing callers are unaffected.
+        #[serde(default)]
+        limit: Option<u32>,
     },
     Thread {
         channel_id: String,
