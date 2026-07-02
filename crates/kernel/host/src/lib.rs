@@ -327,6 +327,17 @@ impl Host {
         self.registry.get(id).map(|m| m.root())
     }
 
+    /// every registered module's `(id, root)`, in registry (sorted-id) order —
+    /// the exact input [`Host::app_hash`] composes over. a recovery journal
+    /// seals each applied block with these so a restarted node can locate every
+    /// module's replay position by root equality.
+    pub fn module_roots(&self) -> Vec<(ModuleId, StateRoot)> {
+        self.registry
+            .iter()
+            .map(|(id, m)| (id.clone(), m.root()))
+            .collect()
+    }
+
     /// capture the committed registry view for a finalized block.
     ///
     /// The caller supplies the finalized app-hash from consensus. The host

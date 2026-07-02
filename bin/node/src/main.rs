@@ -76,6 +76,7 @@ use governance::Governance;
 use host::Host;
 use kv::Kv;
 use node::OrderedNode;
+use recovery::{Manifest, Recovery};
 use saga::SagaModule;
 use sdk::{Msg, StateRoot};
 use statesync::p2p::P2pSyncClient;
@@ -210,6 +211,69 @@ async fn genesis_host(
         Box::new(Directory::new("directory")),
     ])
     .expect("genesis host")
+}
+
+/// the RESTORE twin of [`genesis_host`]: the disk substrates (qmdb modules,
+/// forge's git repo) reopen themselves at their own committed positions; the
+/// in-memory cohort installs its checkpoint snapshots, root-checked. the
+/// recovery replay then rolls everything forward to the journal tip.
+async fn restore_host(
+    context: &commonware_runtime::tokio::Context,
+    forge_repo: &std::path::Path,
+    manifest: &Manifest,
+) -> Result<Host, String> {
+    let kv = Kv::init(context.child("kv"), "kv").await;
+    let document = Document::init(context.child("document"), "document").await;
+    let chat = Chat::init(context.child("chat"), "chat").await;
+    let forge = Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge: {e}"))?;
+
+    let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
+        let bytes = manifest
+            .snapshot(id)
+            .ok_or_else(|| format!("checkpoint has no snapshot for module {id}"))?;
+        let root = manifest
+            .root(id)
+            .ok_or_else(|| format!("checkpoint has no root for module {id}"))?;
+        Ok((bytes, root))
+    };
+
+    let mut valset = Valset::new("valset");
+    let (bytes, root) = snapshot_of("valset")?;
+    valset.install(bytes, root).map_err(|e| format!("valset install: {e}"))?;
+
+    let mut governance = Governance::new("governance", "valset");
+    let (bytes, root) = snapshot_of("governance")?;
+    governance.install(bytes, root).map_err(|e| format!("governance install: {e}"))?;
+
+    let mut saga = SagaModule::new("saga");
+    let (bytes, root) = snapshot_of("saga")?;
+    saga.install(bytes, root).map_err(|e| format!("saga install: {e}"))?;
+
+    let mut tasks = Tasks::new("tasks");
+    let (bytes, root) = snapshot_of("tasks")?;
+    tasks.install(bytes, root).map_err(|e| format!("tasks install: {e}"))?;
+
+    let mut vaults = Vaults::new("vaults");
+    let (bytes, root) = snapshot_of("vaults")?;
+    vaults.install(bytes, root).map_err(|e| format!("vaults install: {e}"))?;
+
+    let mut directory = Directory::new("directory");
+    let (bytes, root) = snapshot_of("directory")?;
+    directory.install(bytes, root).map_err(|e| format!("directory install: {e}"))?;
+
+    Host::genesis(vec![
+        Box::new(kv),
+        Box::new(document),
+        Box::new(chat),
+        Box::new(forge),
+        Box::new(valset),
+        Box::new(governance),
+        Box::new(saga),
+        Box::new(tasks),
+        Box::new(vaults),
+        Box::new(directory),
+    ])
+    .map_err(|e| format!("restore host: {e}"))
 }
 
 // ============================================================================
@@ -617,6 +681,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         rpc_listen,
         http_listen,
         dev_demo,
+        checkpoint_blocks,
     } = resolved;
     if !sync_only && !validators.contains(&signer.public_key()) {
         return Err(format!(
@@ -706,11 +771,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
     executor.start(|context| async move {
         // the authorized MESH set, SORTED — what discovery tracks. the
-        // consensus scheme uses the (possibly smaller) validator set below.
+        // consensus scheme uses the (possibly smaller) validator set derived
+        // from committed valset state after the recovery boot below.
         let mesh_participants: Set<ed25519::PublicKey> =
             Set::try_from(peers.clone()).expect("authorized peer set has no duplicates");
-        let validator_participants: Set<ed25519::PublicKey> =
-            Set::try_from(validators.clone()).expect("validator set has no duplicates");
 
         // the statesync source a --sync-only joiner pulls from: only
         // validators serve the channel, so the candidate must be a validator
@@ -882,13 +946,162 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
         // ---- a VALIDATOR: consensus engine + state-sync service -------------
 
-        // pre-register the ENTIRE epoch channel bank (registration is only
-        // possible before network.start(); every respawned engine needs fresh
-        // channels). bank[e] holds epoch e's (vote, certificate, resolver,
-        // payload, fetch) pairs until that epoch's engine consumes them.
+        // recovery-aware boot FIRST: the app state (and with it the epoch to
+        // respawn) must be known before the mesh wiring below decides which
+        // epochs' channels to live on. everything here is local disk io.
+        let mut recovery = match Recovery::open(context.child("recovery")).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[node {label}] FATAL: cannot open the recovery store: {e}");
+                std::process::exit(1);
+            }
+        };
+        let manifest = match recovery.manifest() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[node {label}] FATAL: recovery checkpoint is damaged: {e}");
+                std::process::exit(1);
+            }
+        };
+        let forge_repo = storage_for_sync.join("forge-repo");
+        // (host, recovered-state, next local submit seq, last checkpoint
+        // (height, oplog position) for the pump's prune bookkeeping).
+        let (host, resumed, mut next_seq, mut prev_ckpt): (
+            Host,
+            Option<recovery::Recovered>,
+            u64,
+            (Option<u64>, u64),
+        ) = match manifest {
+            None => {
+                // a journal without a checkpoint is damage, not a fresh dir —
+                // booting genesis over it would silently fork this node.
+                if !recovery.journal_is_empty().await {
+                    eprintln!(
+                        "[node {label}] FATAL: recovery journal exists but the checkpoint is \
+                         missing — wipe the app state and re-sync (KEEP the consensus journal \
+                         partitions: they are what prevents this key from double-voting)"
+                    );
+                    std::process::exit(1);
+                }
+                let host = genesis_host(&context, &forge_repo, &validators).await;
+                let pos = recovery.oplog_pos().await;
+                // seq 0 is the dev demo op's; real submits start at 1.
+                let genesis_manifest = match Manifest::capture(&host, None, 0, 0, pos, 1) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[node {label}] FATAL: genesis checkpoint capture: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = recovery.write_manifest(&genesis_manifest).await {
+                    eprintln!("[node {label}] FATAL: genesis checkpoint write: {e}");
+                    std::process::exit(1);
+                }
+                (host, None, 1, (None, pos))
+            }
+            Some(manifest) => {
+                let mut host = match restore_host(&context, &forge_repo, &manifest).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("[node {label}] FATAL: checkpoint restore: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let rec = match recovery.recover(&mut host, &manifest).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[node {label}] FATAL: {e}\n\
+                             [node {label}] app state cannot be locally recovered. wipe the \
+                             app-state partitions and re-sync from a peer — but ALWAYS keep \
+                             the consensus journal partitions (\"<pubkey>-e<epoch>\"): they \
+                             are the anti-equivocation record for this key."
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                // advance the local submit sequence past everything this
+                // identity may already have framed: the checkpointed floor,
+                // then any retained frame of ours above it.
+                let me_bytes = signer.public_key().as_ref().to_vec();
+                let mut next_seq = manifest.next_seq;
+                for frame in &rec.frames {
+                    if let Some((origin, seq)) = node::frame_origin_seq(frame) {
+                        if origin == me_bytes {
+                            next_seq = next_seq.max(seq + 1);
+                        }
+                    }
+                }
+                println!(
+                    "[node {label}] recovered app_hash={} height={} epoch={} (replayed {}, \
+                     already-on-disk {}{})",
+                    hex(&rec.app_hash),
+                    rec.height.map(|h| h.to_string()).unwrap_or_else(|| "genesis".into()),
+                    rec.epoch,
+                    rec.applied,
+                    rec.skipped,
+                    if rec.rolled_forward { ", rolled 1 forward" } else { "" },
+                );
+                let prev = (manifest.height, manifest.oplog_pos);
+                (host, Some(rec), next_seq, prev)
+            }
+        };
+
+        // consensus membership comes from RECOVERED state (at genesis this is
+        // exactly the config seed — valset was just seeded from it). a key no
+        // longer in the set must not spawn an engine for the epoch.
+        let member_keys: Vec<ed25519::PublicKey> = {
+            let raw = read_valset_members(&host).await;
+            let mut keys = Vec::with_capacity(raw.len());
+            for k in &raw {
+                match ed25519::PublicKey::decode(k.as_slice()) {
+                    Ok(pk) => keys.push(pk),
+                    Err(e) => {
+                        eprintln!("[node {label}] FATAL: recovered valset holds a non-ed25519 key: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            keys
+        };
+        if !member_keys.contains(&signer.public_key()) {
+            println!(
+                "[node {label}] this identity is not in the recovered validator set — \
+                 halting (restart with --sync-only to observe)"
+            );
+            std::process::exit(0);
+        }
+        let participants: Set<ed25519::PublicKey> =
+            Set::try_from(member_keys.clone()).expect("valset membership has no duplicates");
+        let resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
+
+        // lanes for epochs BELOW the resume epoch are registered and
+        // black-holed (the sync-only arm's exact trick): a lagging peer still
+        // gossips there, and an unregistered channel is a protocol violation
+        // that would kill its connection — cutting off the very fetch lane it
+        // needs to catch up.
+        for epoch in 0..resume_epoch {
+            let (vote, cert, res, payload, fetch) = engine_channels(epoch);
+            for ch in [vote, cert, res, payload, fetch] {
+                let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
+                let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
+                context.child(label).spawn(move |_ctx| async move {
+                    while rx.recv().await.is_ok() {}
+                });
+            }
+        }
+
+        // pre-register the epoch channel bank from the RESUME epoch up
+        // (registration is only possible before network.start(); every
+        // respawned engine needs fresh channels). bank[i] holds epoch
+        // (bank_base + i)'s (vote, certificate, resolver, payload, fetch)
+        // pairs until that epoch's engine consumes them. a restart therefore
+        // re-arms the full window — EPOCH_CHANNEL_BANK bounds membership
+        // changes per process RUN, not per network lifetime.
+        let bank_base = resume_epoch;
         let mut channel_bank: Vec<Option<_>> = (0..EPOCH_CHANNEL_BANK)
-            .map(|epoch| {
-                let (vote, cert, res, payload, fetch) = engine_channels(epoch);
+            .map(|i| {
+                let (vote, cert, res, payload, fetch) = engine_channels(bank_base + i);
                 Some((
                     network.register(vote, quota, MAX_BACKLOG),
                     network.register(cert, quota, MAX_BACKLOG),
@@ -930,12 +1143,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
         });
 
-        // genesis host: the SAME module set on every node -> identical genesis
-        // app-hash. the full production set — system infrastructure plus every
-        // product module — with the genesis validators seeded into valset.
-        let forge_repo = storage_for_sync.join("forge-repo");
-        let host = genesis_host(&context, &forge_repo, &validators).await;
-
         // spawn one epoch's engine from the channel bank. scheme built the
         // production way (`signer` finds our key's index in the sorted
         // participant set); per-epoch genesis floor + per-epoch storage
@@ -945,10 +1152,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // non-exhaustive — the compiler-enforced rekey point.
         let spawn_epoch = |bank: &mut Vec<Option<_>>,
                                epoch: u64,
-                               participants: Set<ed25519::PublicKey>|
+                               participants: Set<ed25519::PublicKey>,
+                               store: ContentStore,
+                               floor_bytes: Option<Vec<u8>>|
          -> SimplexOrderer {
             let slot = bank
-                .get_mut(epoch as usize)
+                .get_mut(epoch.checked_sub(bank_base).expect("epochs never rebase down") as usize)
                 .and_then(|s| s.take())
                 .unwrap_or_else(|| {
                     eprintln!(
@@ -975,6 +1184,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     )
                 }
             };
+            // a SAME-EPOCH respawn passes the persisted finalization floor so
+            // the reopened journal's replay does not re-report history the
+            // recovered state already contains. a damaged floor FAILS — a
+            // silent genesis-floor fallback would resurrect the wedge.
+            let floor = floor_bytes.map(|bytes| {
+                match consensus::decode_finalization(&scheme, &bytes) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("[node {label}] FATAL: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            });
             let label: &'static str =
                 Box::leak(format!("consensus_e{epoch}").into_boxed_str());
             // spawn WITH the lazy payload-fetch backstop: quorum is a SUBSET
@@ -993,9 +1215,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 format!("{}-e{epoch}", signer.public_key()),
                 Epoch::new(epoch),
                 epoch_floor(&namespace, epoch),
+                floor,
                 // per-process, PER-EPOCH content store: pins/pending of a torn
-                // down epoch die with it (in-flight ops are resubmitted).
-                ContentStore::new(),
+                // down epoch die with it (in-flight ops are resubmitted). a
+                // RESTART's store arrives pre-seeded from the recovery journal.
+                store,
                 vote,
                 certificate,
                 resolver,
@@ -1005,28 +1229,71 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             )
         };
 
-        let orderer = spawn_epoch(&mut channel_bank, 0, validator_participants.clone());
-        let mut node = OrderedNode::new(host, orderer);
+        // the boot store: seeded with every retained journaled frame so
+        // finalizations the reopened engine re-reports (at most the floor
+        // cert itself, plus anything finalized-but-undrained at the crash)
+        // resolve locally instead of wedging the ordered gate.
+        let boot_store = ContentStore::new();
+        if let Some(rec) = &resumed {
+            for frame in &rec.frames {
+                boot_store.pin(frame.clone());
+            }
+        }
+        // the persisted floor is only valid for the epoch it was recorded in
+        // (Floor::assert pins the certificate to the engine's epoch).
+        let boot_floor = match recovery.floor_cert() {
+            Ok(cert) => cert.filter(|c| c.epoch == resume_epoch),
+            Err(e) => {
+                eprintln!("[node {label}] FATAL: persisted finalization floor is damaged: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut last_cert_height = boot_floor.as_ref().map(|c| c.height);
+        let orderer = spawn_epoch(
+            &mut channel_bank,
+            resume_epoch,
+            participants.clone(),
+            boot_store,
+            boot_floor.map(|c| c.cert),
+        );
+        let view_base = resumed.as_ref().map(|r| r.view_base).unwrap_or(0);
+        let mut node = match &resumed {
+            Some(rec) => OrderedNode::resume(
+                host,
+                orderer,
+                recovery,
+                rec.height
+                    .map(|height| host::FinalizedBlock { height, app_hash: rec.app_hash }),
+                rec.view_base,
+            ),
+            None => OrderedNode::with_sink(host, orderer, recovery),
+        };
 
         // the valset ORCHESTRATOR: watches finalized valset module state and
         // schedules deterministic epoch cutovers. the initial observation is
-        // the genesis-seeded membership.
-        let genesis_valset_root = node
+        // the CURRENT committed membership (genesis-seeded on a fresh boot,
+        // recovered on a restart), at the recovered epoch coordinates.
+        let valset_root = node
             .host()
             .module_root("valset")
             .expect("valset is registered");
-        let mut orchestrator = consensus::ValsetOrchestrator::new(
+        let mut orchestrator = consensus::ValsetOrchestrator::resume(
             CUTOVER_DELAY,
             consensus::ObservedValset::from_validator_set(
-                consensus::ValsetRoot(genesis_valset_root.0),
-                validators.clone(),
+                consensus::ValsetRoot(valset_root.0),
+                member_keys.clone(),
             ),
+            resume_epoch,
+            view_base,
         );
 
         // the genesis app-hash BEFORE any op — the demo asserts this agrees across
         // processes (a fork here would be a genesis-determinism bug, not consensus).
-        let genesis_hash = node.app_hash();
-        println!("[node {label}] genesis app_hash={}", hex(&genesis_hash));
+        // a RESTORED boot prints its recovered line above instead.
+        if resumed.is_none() {
+            let genesis_hash = node.app_hash();
+            println!("[node {label}] genesis app_hash={}", hex(&genesis_hash));
+        }
 
         // introduce a DISTINCT op per process: node N writes directory key "kN" =
         // "node-N". distinct key + distinct origin -> distinct frame -> distinct
@@ -1038,8 +1305,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // cross the wire?) from op ordering. ONE submit — the automaton PEEKS
         // (never pops), so the digest rides out every nullified early view until
         // the mesh forms and this node leads and proposes it.
-        // dev shape only — a REAL network's genesis carries no demo scaffolding.
-        if dev_demo {
+        // dev shape only — a REAL network's genesis carries no demo scaffolding
+        // (and a restored boot must not re-frame it: seq 0 was already spent).
+        if dev_demo && resumed.is_none() {
             let n = label.trim_start_matches('#').to_string();
             let op = Msg {
                 target: "directory".into(),
@@ -1066,8 +1334,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
         // the ordered lane SIGNS every frame. rpc submits are signed by THIS
         // node's identity (the node is the local caller's custodian until user
-        // keys reach the console); seq starts after the demo op's 0.
-        let mut next_seq: u64 = 1;
+        // keys reach the console); `next_seq` was set at boot — 1 on a fresh
+        // genesis (after the demo op's 0), or past every recovered frame.
 
         // pump: drain finalized frames on an interval, apply them in agreed
         // (ascending-view) order, serve statesync rpcs, answer local rpc, and
@@ -1093,6 +1361,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         > = std::collections::HashMap::new();
         let mut last_published: Option<u64> = None;
         let mut sync_server = SyncServer::new();
+        // recovery cadence: sealed blocks since the last checkpoint manifest.
+        let mut blocks_since_checkpoint: u64 = 0;
         // the host-owned worker set (reactor seam). EMPTY for now: effects of
         // finalized blocks are drained and logged so the lane is visibly live;
         // the agent LLM worker plugs in here.
@@ -1145,6 +1415,23 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         RpcRequest::Shutdown => {
+                            // best-effort final checkpoint + journal barrier so
+                            // the restart replays a minimal suffix; a failure
+                            // here is just the crash path, which also recovers.
+                            if let Some(f) = node.finalized() {
+                                let pos = node.sink_mut().oplog_pos().await;
+                                if let Ok(m) = Manifest::capture(
+                                    node.host(),
+                                    Some(f.height),
+                                    orchestrator.epoch(),
+                                    orchestrator.epoch_base(),
+                                    pos,
+                                    next_seq,
+                                ) {
+                                    let _ = node.sink_mut().write_manifest(&m).await;
+                                }
+                            }
+                            let _ = node.sink_mut().sync().await;
                             let _ = reply.send(RpcReply::ok());
                             println!("[node {label}] shutdown requested via rpc — exiting");
                             std::process::exit(0);
@@ -1244,7 +1531,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // drain finished with; every disposition is deterministic,
                     // so the reply faithfully reports the op's consensus fate.
                     let boundary_hash = hex(&node.app_hash());
-                    for d in node.take_drained() {
+                    let drained = node.take_drained();
+                    // sealed = journaled: applied and rejected frames both got
+                    // recovery seals; discarded frames were never journaled.
+                    blocks_since_checkpoint += drained
+                        .iter()
+                        .filter(|d| d.disposition != node::Disposition::Discarded)
+                        .count() as u64;
+                    for d in drained {
                         let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
                         let _ = reply.send(match d.disposition {
                             node::Disposition::Applied => Ok(noded::BlockSummary {
@@ -1286,6 +1580,77 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 app_hash: hex(&f.app_hash),
                             });
                             last_published = Some(f.height);
+                        }
+                    }
+
+                    // persist the finalization floor once everything at or
+                    // below it has drained. read the certificate FIRST, the
+                    // gate second: releases happen only on this thread, so a
+                    // zero gate proves the cert's view is fully applied — a
+                    // floor ahead of app state would suppress replay of
+                    // finalized ops a restart still needs.
+                    if let Some((view, cert)) = node.orderer().latest_finalization() {
+                        if view != 0 && node.orderer().unreleased_len() == 0 {
+                            let height = orchestrator.app_height(view);
+                            if last_cert_height.is_none_or(|h| height > h) {
+                                let fc = recovery::FloorCert {
+                                    epoch: orchestrator.epoch(),
+                                    height,
+                                    cert,
+                                };
+                                match node.sink_mut().write_floor_cert(&fc).await {
+                                    Ok(()) => last_cert_height = Some(height),
+                                    Err(e) => eprintln!(
+                                        "[node {label}] floor cert write failed (will retry): {e}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
+                    // periodic checkpoint: snapshot the in-memory cohort and
+                    // prune the op journal below the PREVIOUS checkpoint once
+                    // the persisted floor has passed it (pruned frames must
+                    // never be needed to resolve a re-reported finalization).
+                    if blocks_since_checkpoint >= checkpoint_blocks {
+                        if let Some(f) = node.finalized() {
+                            let pos = node.sink_mut().oplog_pos().await;
+                            let captured = Manifest::capture(
+                                node.host(),
+                                Some(f.height),
+                                orchestrator.epoch(),
+                                orchestrator.epoch_base(),
+                                pos,
+                                next_seq,
+                            );
+                            match captured {
+                                Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                                    Ok(()) => {
+                                        blocks_since_checkpoint = 0;
+                                        let floor_passed = matches!(
+                                            node.sink_mut().floor_cert(),
+                                            Ok(Some(fc))
+                                                if prev_ckpt.0.is_none_or(|h| fc.height >= h)
+                                        );
+                                        if floor_passed {
+                                            if let Err(e) =
+                                                node.sink_mut().prune_oplog(prev_ckpt.1).await
+                                            {
+                                                eprintln!(
+                                                    "[node {label}] oplog prune failed: {e}"
+                                                );
+                                            }
+                                        }
+                                        prev_ckpt = (m.height, pos);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[node {label}] checkpoint write failed (will retry): {e}"
+                                    ),
+                                },
+                                Err(e) => eprintln!(
+                                    "[node {label}] checkpoint capture failed (will retry): {e}"
+                                ),
+                            }
                         }
                     }
 
@@ -1334,9 +1699,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 members.iter().cloned().collect::<Vec<_>>(),
                             )
                             .expect("orchestrator membership has no duplicates");
-                            let orderer =
-                                spawn_epoch(&mut channel_bank, plan.epoch(), participants);
-                            node.cutover(orderer, plan.cutover_app_height());
+                            // a fresh epoch: new store (pins of the torn-down
+                            // epoch die with it), genesis floor.
+                            let orderer = spawn_epoch(
+                                &mut channel_bank,
+                                plan.epoch(),
+                                participants,
+                                ContentStore::new(),
+                                None,
+                            );
+                            if let Err(e) = node
+                                .cutover(orderer, plan.epoch(), plan.cutover_app_height())
+                                .await
+                            {
+                                eprintln!("[node {label}] FATAL: {e} — halting");
+                                std::process::exit(1);
+                            }
                             println!(
                                 "[node {label}] cutover complete: epoch {} with {} validators (app height base {})",
                                 plan.epoch(),

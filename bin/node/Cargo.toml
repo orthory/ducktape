@@ -17,6 +17,7 @@ path = "src/main.rs"
 host = { workspace = true }
 node = { workspace = true }
 consensus = { workspace = true }
+recovery = { workspace = true }
 sdk = { workspace = true }
 state = { workspace = true }
 statesync = { workspace = true }

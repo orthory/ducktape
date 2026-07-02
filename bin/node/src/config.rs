@@ -367,6 +367,9 @@ pub struct NodeToml {
     pub storage_dir: Option<String>,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
+    /// sealed blocks between recovery checkpoints (node-local operator
+    /// policy — never part of the network descriptor). default 32.
+    pub checkpoint_blocks: Option<u64>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -499,7 +502,13 @@ pub struct Resolved {
     /// dev-seed shape marker: gates the boot-time demo op + converged print
     /// (scaffolding a REAL network must not write into its genesis).
     pub dev_demo: bool,
+    /// sealed blocks between recovery checkpoints.
+    pub checkpoint_blocks: u64,
 }
+
+/// default recovery checkpoint cadence: small enough that boot replay stays
+/// cheap, large enough that snapshotting the in-memory cohort is amortized.
+pub const DEFAULT_CHECKPOINT_BLOCKS: u64 = 32;
 
 /// read + resolve a config file into its runnable form. paths inside the file
 /// (network, key_file, storage_dir) resolve relative to the file's directory,
@@ -573,6 +582,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
         dev_demo: false,
+        checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
     })
 }
 
@@ -651,6 +661,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
         dev_demo: true,
+        checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
     })
 }
 

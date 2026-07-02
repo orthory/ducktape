@@ -4,6 +4,11 @@
 //! greppable markers, and speaks the json-lines rpc — the rust replacement for
 //! what `demo-2node.sh` used to orchestrate in bash.
 //!
+//! shared by several test binaries, each using a different subset of the
+//! helpers — the per-binary dead-code lint would otherwise flag whichever
+//! helpers this particular binary skips.
+#![allow(dead_code)]
+//!
 //! the constraints this harness encodes (they are invariants of the node, not
 //! choices of the tests):
 //! - every process needs a DISTINCT storage root (qmdb + the simplex journal
@@ -157,6 +162,25 @@ impl Cluster {
     /// kill the node at `idx` (crash-fault injection) and reap it.
     pub fn kill(&mut self, idx: usize) {
         self.nodes[idx] = None; // NodeProc::drop kills + waits
+    }
+
+    /// wait for node `idx` to exit ON ITS OWN (a graceful shutdown path) and
+    /// reap it — the counterpart of [`Self::kill`] for restart tests.
+    pub fn wait_exit(&mut self, idx: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let node = self.nodes[idx].as_mut().expect("node is running");
+            if node.child.try_wait().expect("poll node").is_some() {
+                self.nodes[idx] = None;
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node idx {idx} did not exit within {timeout:?};\n{}",
+                self.all_log_tails(40)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// run the node at `idx` with `--sync-only` to completion and return

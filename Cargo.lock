@@ -3719,6 +3719,7 @@ dependencies = [
  "noded",
  "rand 0.8.6",
  "reactor",
+ "recovery",
  "saga",
  "sdk",
  "serde",
@@ -4771,6 +4772,25 @@ name = "readme-rustdocifier"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
+
+[[package]]
+name = "recovery"
+version = "0.1.0"
+dependencies = [
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "commonware-storage",
+ "commonware-utils",
+ "directory",
+ "directory-interface",
+ "futures",
+ "host",
+ "node",
+ "sdk",
+ "state",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "redox_syscall"

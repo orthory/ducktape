@@ -55,6 +55,12 @@ pub enum Error {
     /// applying blocks — every lane surfaces this instead of continuing.
     #[error("{0}")]
     Fatal(host::FatalError),
+    /// the recovery [`BlockSink`] failed to persist a record. as fatal as a
+    /// boundary fault: continuing to apply blocks without durability would let
+    /// a later restart silently lose finalized state, so the ordered lane
+    /// surfaces this and the caller fail-stops.
+    #[error("recovery journal: {0}")]
+    Journal(String),
 }
 
 impl From<host::SubmitError> for Error {
@@ -416,6 +422,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
     Ok((Origin::External(frame.origin), msg))
 }
 
+/// a frame's `(origin, seq)` submitter coordinates, without verifying the
+/// signature — recovery metadata only (a restarted node scans its retained
+/// frames to advance its local sequence past everything it may have framed).
+/// `None` for bytes that are not a frame.
+pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
+    let frame: Frame = serde_json::from_slice(bytes).ok()?;
+    Some((frame.origin, frame.seq))
+}
+
 /// total-order broadcast over opaque op frames. `submit` proposes a frame into
 /// the agreed sequence (it does NOT apply anything locally); `poll_delivered`
 /// yields the SAME sequence, in the SAME order, on EVERY validator. domain-
@@ -449,6 +464,13 @@ pub struct RoundOrderer {
 impl RoundOrderer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// resume stamping views at `next_view` — the harness analog of a real
+    /// engine reopening its journal and continuing its view counter, so a
+    /// resumed node's new frames land ABOVE its applied floor.
+    pub fn resume_at(next_view: u64) -> Self {
+        Self { pending: Vec::new(), next_view }
     }
 }
 
@@ -545,13 +567,98 @@ pub struct DrainedFrame {
     pub disposition: Disposition,
 }
 
+/// the durable outcome of one drained frame — everything a recovery journal
+/// needs to seal the block: its height, how it landed, and the FULL registry
+/// root vector after it settled. the roots are the replay positions: on boot a
+/// module whose live root equals a seal's recorded root has that block (and
+/// everything before it) applied, so per-block skip/apply decisions reduce to
+/// root equality — no per-module op counters needed (a qmdb root is an op-log
+/// commitment and never repeats; a git head oid never repeats).
+#[derive(Clone, Debug)]
+pub struct BlockSeal {
+    pub height: u64,
+    pub disposition: Disposition,
+    /// every registered module's `(id, root)` AFTER this block settled, in
+    /// registry (sorted-id) order — [`host::Host::module_roots`].
+    pub roots: Vec<(sdk::ModuleId, StateRoot)>,
+    /// the composed app-hash after this block settled.
+    pub app_hash: StateRoot,
+}
+
+/// the recovery seam on the ordered lane: a write-ahead journal for finalized
+/// frames plus their sealed outcomes. [`OrderedNode`] drives it at exactly the
+/// points recovery needs:
+///
+/// - [`BlockSink::pin`] at submit — the frame bytes become durable BEFORE the
+///   consensus engine can propose their digest. the in-memory content store
+///   and the engine's own journal (votes/certificates, no payloads) are the
+///   only other homes for those bytes, so without the pin a crash between
+///   finalization and drain loses a solo network's op forever.
+/// - [`BlockSink::pre_apply`] before a finalized frame mutates state (WAL
+///   discipline — a crash mid-apply rolls forward from this record).
+/// - [`BlockSink::seal`] after the block settles, with the post-block roots.
+/// - [`BlockSink::cutover`] at each epoch cutover, so a restart can respawn
+///   the engine at the persisted epoch over its existing journal partition.
+///
+/// errors are FATAL to the drain (see [`Error::Journal`]): applying blocks
+/// that recovery will never see again silently breaks the restart contract.
+pub trait BlockSink {
+    /// durably record a locally-submitted frame's bytes before the orderer
+    /// may propose them.
+    fn pin(&mut self, frame: &[u8]) -> impl std::future::Future<Output = Result<(), Error>>;
+    /// durably record a finalized frame about to be applied at `height`.
+    fn pre_apply(
+        &mut self,
+        height: u64,
+        frame: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), Error>>;
+    /// durably record a settled block's outcome.
+    fn seal(&mut self, seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>>;
+    /// durably record an epoch cutover: the new epoch and its app-height base.
+    fn cutover(
+        &mut self,
+        epoch: u64,
+        view_base: u64,
+    ) -> impl std::future::Future<Output = Result<(), Error>>;
+}
+
+/// the no-recovery sink: every hook is an immediate `Ok` no-op. the default
+/// sink, so every pre-recovery construction site and test keeps its exact
+/// behavior (and cost) unchanged.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NullSink;
+
+impl BlockSink for NullSink {
+    fn pin(&mut self, _frame: &[u8]) -> impl std::future::Future<Output = Result<(), Error>> {
+        async { Ok(()) }
+    }
+    fn pre_apply(
+        &mut self,
+        _height: u64,
+        _frame: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), Error>> {
+        async { Ok(()) }
+    }
+    fn seal(&mut self, _seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>> {
+        async { Ok(()) }
+    }
+    fn cutover(
+        &mut self,
+        _epoch: u64,
+        _view_base: u64,
+    ) -> impl std::future::Future<Output = Result<(), Error>> {
+        async { Ok(()) }
+    }
+}
+
 /// a replicated host on the ORDERED lane. owns its [`Host`] and an [`Orderer`].
 /// unlike [`Node`], `submit` does NOT apply to the local host — it only proposes
 /// into the agreed order; application happens exclusively in [`OrderedNode::
 /// drain_delivered`], in the order the [`Orderer`] delivers, identically on every
 /// validator. generic over the concrete orderer `O` (no `dyn`), so the same type
-/// serves the deterministic orderer today and the simplex orderer later.
-pub struct OrderedNode<O: Orderer> {
+/// serves the deterministic orderer today and the simplex orderer later — and
+/// over the recovery sink `S` (default [`NullSink`]: no journal, no cost).
+pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     host: Host,
     orderer: O,
     /// effects surfaced by every block APPLIED via `drain_delivered` and not yet
@@ -583,10 +690,28 @@ pub struct OrderedNode<O: Orderer> {
     /// nodes while engines are being torn down can never fork app state —
     /// submitters resubmit in the new epoch.
     view_ceiling: Option<u64>,
+    /// the recovery seam (see [`BlockSink`]); [`NullSink`] when recovery is off.
+    sink: S,
+    /// the RESUME SKIP floor: frames whose app height is at or below this were
+    /// already applied (and sealed) before a restart. the consensus engine
+    /// re-reports finalizations from its reopened journal above its replay
+    /// floor, and the exactly-once digest gate does not survive the process —
+    /// so recovered history can be delivered again. skipping by the agreed
+    /// height is deterministic; frames ABOVE the floor are genuinely new
+    /// (finalized pre-crash but never drained) and apply normally.
+    applied_floor: Option<u64>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
     pub fn new(host: Host, orderer: O) -> Self {
+        Self::with_sink(host, orderer, NullSink)
+    }
+}
+
+impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
+    /// wrap `host` with an orderer and a recovery sink, starting from genesis
+    /// (nothing applied). the sink journals from the very first block.
+    pub fn with_sink(host: Host, orderer: O, sink: S) -> Self {
         Self {
             host,
             orderer,
@@ -596,18 +721,49 @@ impl<O: Orderer> OrderedNode<O> {
             view_base: 0,
             last_engine_view: None,
             view_ceiling: None,
+            sink,
+            applied_floor: None,
+        }
+    }
+
+    /// RESUME after a restart: `host` already holds the recovered state at
+    /// `finalized` (the journal tip a recovery replay verified), and the
+    /// current epoch's app heights are based at `view_base`. the finalized
+    /// boundary doubles as the resume-skip floor — re-reported history at or
+    /// below it is dropped instead of re-applied.
+    pub fn resume(
+        host: Host,
+        orderer: O,
+        sink: S,
+        finalized: Option<host::FinalizedBlock>,
+        view_base: u64,
+    ) -> Self {
+        Self {
+            host,
+            orderer,
+            effects: Vec::new(),
+            drained: Vec::new(),
+            finalized,
+            view_base,
+            last_engine_view: None,
+            view_ceiling: None,
+            sink,
+            applied_floor: finalized.map(|f| f.height),
         }
     }
 
     /// EPOCH CUTOVER: replace the orderer (dropping the old one aborts its
     /// engine) and rebase app heights at `view_base` (the cutover app height —
     /// the orchestrator's epoch_base). clears the ceiling and the
-    /// engine-relative view; the finalized boundary carries over.
+    /// engine-relative view; the finalized boundary carries over. records the
+    /// cutover in the recovery sink FIRST, so a restart respawns the engine at
+    /// `epoch` over its own journal partition instead of a predecessor's.
     ///
     /// call this only after a final [`OrderedNode::drain_delivered`] under the
     /// ceiling — anything the old engine finalized past the ceiling was
     /// deterministically discarded on every honest node.
-    pub fn cutover(&mut self, orderer: O, view_base: u64) {
+    pub async fn cutover(&mut self, orderer: O, epoch: u64, view_base: u64) -> Result<(), Error> {
+        self.sink.cutover(epoch, view_base).await?;
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
@@ -615,6 +771,7 @@ impl<O: Orderer> OrderedNode<O> {
         // effects of pre-cutover blocks remain takeable; frames buffered in
         // the OLD orderer die with it (they were past the ceiling or already
         // drained).
+        Ok(())
     }
 
     /// set the deterministic discard boundary for the CURRENT engine (see the
@@ -638,6 +795,12 @@ impl<O: Orderer> OrderedNode<O> {
     pub async fn submit(&mut self, signer: &PrivateKey, seq: u64, msg: Msg) -> Result<FrameId, Error> {
         let frame = encode_frame(signer, seq, &msg);
         let id = frame_id(&frame);
+        // durably pin the bytes BEFORE the orderer may propose their digest:
+        // once the engine journals a finalization, these bytes are the only
+        // thing standing between a crash and an unrecoverable finalized op
+        // (the content store is memory; the engine journals votes, not
+        // payloads; a solo network has no peer to refetch from).
+        self.sink.pin(&frame).await?;
         self.orderer.submit(frame).await?;
         Ok(id)
     }
@@ -666,22 +829,36 @@ impl<O: Orderer> OrderedNode<O> {
             // could never OBSERVE the views that carry it past its own cutover.
             applied += 1;
             last_view = Some(view);
-            let id = frame_id(&frame);
             // the agreed view is the block coordinate: the APP HEIGHT is the
             // engine view offset by the epoch base, so heights and the logical
             // clock stay monotone across epoch cutovers — identical on every
             // validator.
             let height = self.view_base + view;
+            // the RESUME SKIP floor: recovered state already contains this
+            // frame (it was applied and sealed before the restart); the engine
+            // re-reported it from its reopened journal. dropping it by agreed
+            // height is the same deterministic no-op everywhere.
+            if let Some(floor) = self.applied_floor {
+                if height <= floor {
+                    continue;
+                }
+            }
+            let id = frame_id(&frame);
             // the CUTOVER CEILING: frames finalized at or past the agreed
             // cutover view are DISCARDED — the same view-based rule on every
             // honest node, so a straggler finalizing during teardown on only
-            // some nodes cannot fork app state.
+            // some nodes cannot fork app state. never journaled: a discarded
+            // frame leaves no state for a restart to recover.
             if let Some(ceiling) = self.view_ceiling {
                 if view >= ceiling {
                     self.drained.push(DrainedFrame { id, height, disposition: Disposition::Discarded });
                     continue;
                 }
             }
+            // WAL discipline: the frame is finalized and about to mutate state
+            // — journal its bytes FIRST, so a crash mid-apply rolls forward
+            // from this record instead of losing a finalized op.
+            self.sink.pre_apply(height, &frame).await?;
             // one that fails to decode, or that a module rejects, is a DETERMINISTIC
             // no-op: every honest validator finalized the identical op and handles it
             // identically (host-lent rolls back a rejected block, root unchanged), so
@@ -690,6 +867,7 @@ impl<O: Orderer> OrderedNode<O> {
             // here stalled the whole drain on one bad op — the liveness gap.)
             let Ok((origin, msg)) = decode_frame(&frame) else {
                 self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
+                self.seal(height, Disposition::Rejected).await?;
                 continue;
             };
             let ctx = BlockContext { height, consensus_time: height, origin };
@@ -700,21 +878,40 @@ impl<O: Orderer> OrderedNode<O> {
                 Ok(outcome) => {
                     self.effects.extend(outcome.effects);
                     self.drained.push(DrainedFrame { id, height, disposition: Disposition::Applied });
+                    self.seal(height, Disposition::Applied).await?;
                 }
                 Err(host::SubmitError::Rejected(_)) => {
                     self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
+                    self.seal(height, Disposition::Rejected).await?;
                 }
                 Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
             }
         }
         if let Some(view) = last_view {
             self.last_engine_view = Some(view);
-            self.finalized = Some(host::FinalizedBlock {
-                height: self.view_base + view,
-                app_hash: self.host.app_hash(),
-            });
+            let height = self.view_base + view;
+            // monotone: a resume-skipped re-report must never regress the
+            // finalized boundary below the recovered tip.
+            if self.finalized.is_none_or(|f| height > f.height) {
+                self.finalized = Some(host::FinalizedBlock {
+                    height,
+                    app_hash: self.host.app_hash(),
+                });
+            }
         }
         Ok(applied)
+    }
+
+    /// journal a settled block's outcome: disposition + the post-block root
+    /// vector (the replay positions) + the composed app-hash.
+    async fn seal(&mut self, height: u64, disposition: Disposition) -> Result<(), Error> {
+        let seal = BlockSeal {
+            height,
+            disposition,
+            roots: self.host.module_roots(),
+            app_hash: self.host.app_hash(),
+        };
+        self.sink.seal(&seal).await
     }
 
     /// the latest APPLIED consensus boundary — what a state-sync service serves
@@ -742,6 +939,18 @@ impl<O: Orderer> OrderedNode<O> {
     /// own submitted [`FrameId`]s.
     pub fn take_drained(&mut self) -> Vec<DrainedFrame> {
         std::mem::take(&mut self.drained)
+    }
+
+    /// borrow the recovery sink mutably — the pump drives checkpointing and
+    /// floor-cert persistence through the same store the drain journals into.
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
+    /// borrow the orderer (finalization-cert and gate inspection — the pump
+    /// reads these to decide when a floor certificate is safe to persist).
+    pub fn orderer(&self) -> &O {
+        &self.orderer
     }
 
     /// borrow the wrapped host (queries, module_root inspection, ...).
