@@ -1,16 +1,10 @@
-// The seam must be honest on both sides: remote maps the gateway's http/ws
-// wire, tauri maps commands + window events, and getTransport picks by the
-// webview marker.
+// The transport must map the daemon's http/ws wire honestly: request shapes,
+// error bodies, and the shared block stream.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getTransport, remoteTransport, tauriTransport } from "./transport";
+import { remoteTransport } from "./transport";
 import type { BlockEvent } from "./transport";
-
-const invokeMock = vi.hoisted(() => vi.fn());
-const listenMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
 
 // ── Fake websocket (records instances, scriptable) ──────
 
@@ -49,8 +43,6 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-// ── Remote variant ──────────────────────────────────────
-
 describe("remoteTransport", () => {
   it("submits over POST /v1/submit and returns the block", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
@@ -72,7 +64,7 @@ describe("remoteTransport", () => {
     });
   });
 
-  it("surfaces the gateway's error body as the thrown message", async () => {
+  it("surfaces the daemon's error body as the thrown message", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -98,8 +90,13 @@ describe("remoteTransport", () => {
     });
   });
 
-  it("fetches GET /v1/status", async () => {
-    const status = { appHash: "cd".repeat(32), height: 2, modules: [] };
+  it("fetches GET /v1/status including the daemon version", async () => {
+    const status = {
+      version: "0.1.0",
+      appHash: "cd".repeat(32),
+      height: 2,
+      modules: [],
+    };
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, status));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -124,72 +121,5 @@ describe("remoteTransport", () => {
 
     unsubscribe();
     expect(ws.closed).toBe(true);
-  });
-});
-
-// ── Tauri variant ───────────────────────────────────────
-
-describe("tauriTransport", () => {
-  it("routes submit/query/status through the node_* commands", async () => {
-    invokeMock.mockResolvedValue({ height: 1, appHash: "aa".repeat(32) });
-
-    const transport = tauriTransport();
-    await transport.submit("chat", { CreateChannel: { channel_id: "g", name: "G" } });
-    await transport.query("tasks", "List");
-    await transport.status();
-
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "node_submit", {
-      target: "chat",
-      payload: { CreateChannel: { channel_id: "g", name: "G" } },
-    });
-    expect(invokeMock).toHaveBeenNthCalledWith(2, "node_query", {
-      target: "tasks",
-      query: "List",
-    });
-    expect(invokeMock).toHaveBeenNthCalledWith(3, "node_status");
-  });
-
-  it("subscribes to ducktape://block window events", async () => {
-    const stop = vi.fn();
-    listenMock.mockResolvedValue(stop);
-
-    const transport = tauriTransport();
-    const seen: BlockEvent[] = [];
-    const unsubscribe = transport.onBlock((block) => seen.push(block));
-
-    // let the listen promise resolve, then feed one event through
-    await Promise.resolve();
-    const [eventName, handler] = listenMock.mock.calls[0];
-    expect(eventName).toBe("ducktape://block");
-    handler({ payload: { height: 2, appHash: "bb".repeat(32) } });
-    expect(seen).toEqual([{ height: 2, appHash: "bb".repeat(32) }]);
-
-    unsubscribe();
-    expect(stop).toHaveBeenCalled();
-  });
-});
-
-// ── Variant selection ───────────────────────────────────
-
-describe("getTransport", () => {
-  it("picks the tauri variant inside a tauri webview", async () => {
-    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
-    invokeMock.mockResolvedValue({ appHash: "", height: 0, modules: [] });
-
-    await getTransport().status();
-    expect(invokeMock).toHaveBeenCalledWith("node_status");
-
-    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
-  });
-
-  it("picks the remote variant in a plain browser", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse(200, { appHash: "", height: 0, modules: [] }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
-    await getTransport().status();
-    expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/status");
-    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

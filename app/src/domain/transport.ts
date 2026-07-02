@@ -1,25 +1,14 @@
-// The node transport seam — the ONE dependency-injection point between the UI
-// and a ducktape node.
+// The node transport — how every build of the app talks to a ducktape node.
 //
-// Two variants implement the same NodeTransport:
-//   - tauriTransport: the desktop build. The node runs in-process behind Tauri
-//     commands (node_submit / node_query / node_status) and pushes finalized
-//     blocks as `ducktape://block` window events.
-//   - remoteTransport: the web build. Talks to a running gateway (`cargo run
-//     -p gateway`) over http (/v1/submit, /v1/query, /v1/status) and a
-//     websocket block stream (/v1/ws).
-//
-// getTransport() picks the variant at runtime: inside a Tauri webview the
-// injected __TAURI_INTERNALS__ marker is present; anywhere else we are the web
-// build and dial the gateway. Everything above this seam (typed module
-// clients, store, views) is variant-blind.
+// There is exactly ONE data plane now: the daemon's http/ws surface
+// (`ducktape-noded`). The web build dials it directly; the desktop build
+// spawns the daemon as a detached subprocess and then talks to it the same
+// way. Which URL to dial — and whether a daemon must be spawned first — is
+// node-bootstrap.ts's job; this module only speaks the wire.
 //
 // Wire casing is the node's, verbatim: module payloads/replies use PascalCase
 // enum variants + snake_case fields (serde defaults of the `*-interface`
-// crates); the gateway envelope itself (appHash, height) is camelCase.
-
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+// crates); the daemon envelope itself (appHash, height, version) is camelCase.
 
 // ── Types ───────────────────────────────────────────────
 
@@ -34,6 +23,7 @@ export interface ModuleStatus {
 }
 
 export interface NodeStatus {
+  version: string;
   appHash: string;
   height: number;
   modules: ModuleStatus[];
@@ -49,44 +39,7 @@ export interface NodeTransport {
   onBlock(listener: (block: BlockEvent) => void): () => void;
 }
 
-// ── Variant selection ───────────────────────────────────
-
-const isTauri = (): boolean =>
-  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-
-// The web build's gateway address: VITE_DUCKTAPE_NODE_URL when baked in at
-// build time, else the gateway's dev default. Resolved once at module load.
-const nodeUrl: string =
-  import.meta.env.VITE_DUCKTAPE_NODE_URL || "http://127.0.0.1:8844";
-
-export const getTransport = (): NodeTransport =>
-  isTauri() ? tauriTransport() : remoteTransport(nodeUrl);
-
-// ── Tauri variant (embedded node) ───────────────────────
-
-export const tauriTransport = (): NodeTransport => ({
-  submit: (target, payload) =>
-    invoke<BlockEvent>("node_submit", { target, payload }),
-  query: (target, query) => invoke<unknown>("node_query", { target, query }),
-  status: () => invoke<NodeStatus>("node_status"),
-  onBlock: (listener) => {
-    let unlisten: (() => void) | null = null;
-    let cancelled = false;
-    listen<BlockEvent>("ducktape://block", (event) => listener(event.payload))
-      .then((stop) => {
-        // unsubscribed before the bridge resolved — stop immediately
-        if (cancelled) stop();
-        else unlisten = stop;
-      })
-      .catch(() => {}); // no event bridge — nothing to unlisten
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  },
-});
-
-// ── Remote variant (gateway over http/ws) ───────────────
+// ── The transport ───────────────────────────────────────
 
 interface WsBlockFrame {
   type: "block";
@@ -111,7 +64,7 @@ const postJson = <T>(url: string, body: unknown): Promise<T> =>
         .json()
         .then((payload) => String((payload as { error?: string }).error ?? ""))
         .catch(() => "");
-      throw new Error(detail || `gateway replied ${res.status}`);
+      throw new Error(detail || `node replied ${res.status}`);
     });
 
 export const remoteTransport = (baseUrl: string): NodeTransport => {
@@ -154,7 +107,7 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       Promise.resolve()
         .then(() => fetch(`${base}/v1/status`))
         .then((res) => {
-          if (!res.ok) throw new Error(`gateway replied ${res.status}`);
+          if (!res.ok) throw new Error(`node replied ${res.status}`);
           return res.json() as Promise<NodeStatus>;
         }),
     onBlock: (listener) => {

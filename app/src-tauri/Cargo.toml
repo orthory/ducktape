@@ -3,29 +3,15 @@ name = "ducktape-desktop"
 edition.workspace = true
 version.workspace = true
 
-# the self-contained desktop build of the ducktape app: the SAME react console
-# the web build serves, but with the node embedded in-process — a host::Host on
-# a dedicated actor thread (the gateway's ownership shape, minus the sockets),
-# durable module state under the OS app-data dir, and finalized blocks pushed
-# to the webview as `ducktape://block` events. commands node_submit/node_query/
-# node_status are the tauri twin of the gateway's /v1/* routes; the frontend's
-# transport seam picks between them at runtime.
+# the desktop shell of the ducktape app: the SAME react console the web build
+# serves, in a native window. the node does NOT live here — the shell spawns
+# `ducktape-noded` as a detached orphan (see src/daemon.rs) and the webview
+# talks to it over the daemon's http/ws surface exactly like the web build
+# does. keeping this crate free of host/module deps is the point: one node
+# process, every ui a client.
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-host = { workspace = true }
-sdk = { workspace = true }
-chat = { workspace = true }
-tasks = { workspace = true }
-document = { workspace = true }
-agent = { workspace = true }
-forge = { workspace = true }
-
-commonware-runtime = { workspace = true }
-
-serde = { workspace = true }
-serde_json = { workspace = true }
-futures = "0.3"
 tauri = { version = "2", features = [] }

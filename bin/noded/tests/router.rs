@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gateway::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
+use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
 
@@ -46,6 +46,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 }
                 NodeCommand::Status { reply } => {
                     let _ = reply.send(NodeStatus {
+                        version: "9.9.9".into(),
                         app_hash: "cd".repeat(32),
                         height: 3,
                         modules: vec![ModuleStatus {
@@ -78,7 +79,7 @@ async fn submit_forwards_the_payload_and_returns_the_block() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     spawn_fake_actor(cmd_rx, None);
 
-    let response = gateway::router(handle)
+    let response = noded::router(handle)
         .oneshot(post(
             "/v1/submit",
             serde_json::json!({
@@ -100,7 +101,7 @@ async fn submit_maps_a_module_error_to_bad_request() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     spawn_fake_actor(cmd_rx, Some("module error: channel already exists"));
 
-    let response = gateway::router(handle)
+    let response = noded::router(handle)
         .oneshot(post(
             "/v1/submit",
             serde_json::json!({ "target": "chat", "payload": {} }),
@@ -118,7 +119,7 @@ async fn query_returns_the_decoded_module_reply() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     spawn_fake_actor(cmd_rx, None);
 
-    let response = gateway::router(handle)
+    let response = noded::router(handle)
         .oneshot(post(
             "/v1/query",
             serde_json::json!({ "target": "tasks", "query": "List" }),
@@ -136,13 +137,14 @@ async fn status_reports_app_hash_height_and_module_roots() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     spawn_fake_actor(cmd_rx, None);
 
-    let response = gateway::router(handle)
+    let response = noded::router(handle)
         .oneshot(Request::builder().uri("/v1/status").body(Body::empty()).unwrap())
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
+    assert_eq!(body["version"], "9.9.9");
     assert_eq!(body["appHash"], "cd".repeat(32));
     assert_eq!(body["height"], 3);
     assert_eq!(body["modules"][0]["id"], "chat");
@@ -150,11 +152,35 @@ async fn status_reports_app_hash_height_and_module_roots() {
 }
 
 #[tokio::test]
+async fn shutdown_acknowledges_then_signals() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let signal = handle.clone();
+
+    let response = noded::router(handle)
+        .oneshot(post("/v1/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["ok"], true);
+    // the permit is stored, so awaiting after the request must resolve —
+    // guarded by a timeout so a broken signal fails instead of hanging.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        signal.shutdown_requested(),
+    )
+    .await
+    .expect("shutdown signal fired");
+}
+
+#[tokio::test]
 async fn a_dead_actor_maps_to_service_unavailable() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     drop(cmd_rx); // no actor at all
 
-    let response = gateway::router(handle)
+    let response = noded::router(handle)
         .oneshot(post(
             "/v1/submit",
             serde_json::json!({ "target": "chat", "payload": {} }),

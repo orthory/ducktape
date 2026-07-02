@@ -78,7 +78,7 @@ function TitleBar() {
               letterSpacing: ".05em",
             }}
           >
-            {"__TAURI_INTERNALS__" in window ? "LOCAL" : "REMOTE"}
+            {state.managed ? "LOCAL" : "REMOTE"}
           </span>
         </div>
       </div>
