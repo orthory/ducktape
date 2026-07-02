@@ -3182,6 +3182,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tasks"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "host",
+ "sdk",
+ "sha2",
+ "tasks-interface",
+]
+
+[[package]]
+name = "tasks-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
