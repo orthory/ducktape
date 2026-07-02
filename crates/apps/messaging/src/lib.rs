@@ -5,7 +5,7 @@
 //! and stages writes, `query` reads committed state plus the pending overlay, and
 //! `commit_block` publishes the block atomically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use messaging_interface::{
     Channel, ChatMessage, MessagingMsg, MessagingQuery, MessagingReply, decode_msg, decode_query,
@@ -80,6 +80,170 @@ impl Messaging {
             .map_or(1, |m| m.sequence + 1)
     }
 
+    fn snapshot_of(
+        channels: &BTreeMap<String, Channel>,
+        messages: &BTreeMap<String, ChatMessage>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(channels.len() as u64).to_le_bytes());
+        for channel in channels.values() {
+            write_string(&mut out, &channel.id);
+            write_string(&mut out, &channel.name);
+            out.extend_from_slice(&channel.created_at.to_le_bytes());
+        }
+        out.extend_from_slice(&(messages.len() as u64).to_le_bytes());
+        for message in messages.values() {
+            write_string(&mut out, &message.id);
+            write_string(&mut out, &message.channel_id);
+            write_string(&mut out, &message.author);
+            write_string(&mut out, &message.body);
+            out.extend_from_slice(&message.sequence.to_le_bytes());
+            out.extend_from_slice(&message.sent_at.to_le_bytes());
+        }
+        out
+    }
+
+    fn root_of(
+        channels: &BTreeMap<String, Channel>,
+        messages: &BTreeMap<String, ChatMessage>,
+    ) -> StateRoot {
+        if channels.is_empty() && messages.is_empty() {
+            return StateRoot::ZERO;
+        }
+        StateRoot(Sha256::digest(Self::snapshot_of(channels, messages)).into())
+    }
+
+    // ---- state-sync ---------------------------------------------------------
+    // A snapshot is committed state only. The serving peer is untrusted; install
+    // must rederive the expected root before mutating local state.
+
+    pub fn snapshot(&self) -> Vec<u8> {
+        Self::snapshot_of(&self.channels, &self.messages)
+    }
+
+    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
+        let (channels, messages) = Self::decode_snapshot(bytes)?;
+        let root = Self::root_of(&channels, &messages);
+        if root != expected {
+            return Err(Error::Module(format!(
+                "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
+            )));
+        }
+        self.channels = channels;
+        self.messages = messages;
+        self.pending = Pending::default();
+        Ok(())
+    }
+
+    fn decode_snapshot(
+        bytes: &[u8],
+    ) -> Result<(BTreeMap<String, Channel>, BTreeMap<String, ChatMessage>), Error> {
+        let mut off = 0usize;
+        let channel_count = read_u64(bytes, &mut off)?;
+        if channel_count > ((bytes.len() - off) / 24) as u64 {
+            return Err(Error::Module("snapshot truncated".into()));
+        }
+
+        let mut channels = BTreeMap::new();
+        for _ in 0..channel_count {
+            let id = read_string(bytes, &mut off)?;
+            let name = read_string(bytes, &mut off)?;
+            let created_at = read_u64(bytes, &mut off)?;
+            Self::validate_non_empty("channel_id", &id)?;
+            Self::validate_non_empty("name", &name)?;
+            if channels
+                .last_key_value()
+                .is_some_and(|(last, _)| *last >= id)
+            {
+                return Err(Error::Module(
+                    "snapshot channel ids not strictly ascending".into(),
+                ));
+            }
+            channels.insert(
+                id.clone(),
+                Channel {
+                    id,
+                    name,
+                    created_at,
+                },
+            );
+        }
+
+        let message_count = read_u64(bytes, &mut off)?;
+        if message_count > ((bytes.len() - off) / 48) as u64 {
+            return Err(Error::Module("snapshot truncated".into()));
+        }
+
+        let mut messages = BTreeMap::new();
+        let mut channel_sequences: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+        for _ in 0..message_count {
+            let id = read_string(bytes, &mut off)?;
+            let channel_id = read_string(bytes, &mut off)?;
+            let author = read_string(bytes, &mut off)?;
+            let body = read_string(bytes, &mut off)?;
+            let sequence = read_u64(bytes, &mut off)?;
+            let sent_at = read_u64(bytes, &mut off)?;
+
+            Self::validate_non_empty("message_id", &id)?;
+            Self::validate_non_empty("channel_id", &channel_id)?;
+            Self::validate_non_empty("author", &author)?;
+            if !channels.contains_key(&channel_id) {
+                return Err(Error::Module(format!(
+                    "snapshot message references unknown channel: {channel_id}"
+                )));
+            }
+            if sequence == 0 {
+                return Err(Error::Module(
+                    "snapshot message sequence must be positive".into(),
+                ));
+            }
+            if messages
+                .last_key_value()
+                .is_some_and(|(last, _)| *last >= id)
+            {
+                return Err(Error::Module(
+                    "snapshot message ids not strictly ascending".into(),
+                ));
+            }
+            if !channel_sequences
+                .entry(channel_id.clone())
+                .or_default()
+                .insert(sequence)
+            {
+                return Err(Error::Module(format!(
+                    "snapshot duplicate sequence {sequence} in channel {channel_id}"
+                )));
+            }
+
+            messages.insert(
+                id.clone(),
+                ChatMessage {
+                    id,
+                    channel_id,
+                    author,
+                    body,
+                    sequence,
+                    sent_at,
+                },
+            );
+        }
+
+        if off != bytes.len() {
+            return Err(Error::Module("snapshot has trailing bytes".into()));
+        }
+        for (channel_id, sequences) in channel_sequences {
+            for (idx, sequence) in sequences.into_iter().enumerate() {
+                let expected = idx as u64 + 1;
+                if sequence != expected {
+                    return Err(Error::Module(format!(
+                        "snapshot channel {channel_id} has non-contiguous sequence {sequence}, expected {expected}"
+                    )));
+                }
+            }
+        }
+        Ok((channels, messages))
+    }
+
     fn stage_channel(
         &mut self,
         channel_id: String,
@@ -146,28 +310,7 @@ impl Module for Messaging {
     }
 
     fn root(&self) -> StateRoot {
-        if self.channels.is_empty() && self.messages.is_empty() {
-            return StateRoot::ZERO;
-        }
-
-        let mut h = Sha256::new();
-        h.update(b"ducktape.messaging.v1");
-        h.update((self.channels.len() as u64).to_le_bytes());
-        for channel in self.channels.values() {
-            hash_str(&mut h, &channel.id);
-            hash_str(&mut h, &channel.name);
-            h.update(channel.created_at.to_le_bytes());
-        }
-        h.update((self.messages.len() as u64).to_le_bytes());
-        for message in self.messages.values() {
-            hash_str(&mut h, &message.id);
-            hash_str(&mut h, &message.channel_id);
-            hash_str(&mut h, &message.author);
-            hash_str(&mut h, &message.body);
-            h.update(message.sequence.to_le_bytes());
-            h.update(message.sent_at.to_le_bytes());
-        }
-        StateRoot(h.finalize().into())
+        Self::root_of(&self.channels, &self.messages)
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -216,7 +359,30 @@ impl Module for Messaging {
     }
 }
 
-fn hash_str(h: &mut Sha256, value: &str) {
-    h.update((value.len() as u64).to_le_bytes());
-    h.update(value.as_bytes());
+fn write_string(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn read_u64(bytes: &[u8], off: &mut usize) -> Result<u64, Error> {
+    let end = off
+        .checked_add(8)
+        .filter(|&end| end <= bytes.len())
+        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[*off..end]);
+    *off = end;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, Error> {
+    let len = read_u64(bytes, off)?;
+    let len = usize::try_from(len).map_err(|_| Error::Module("snapshot truncated".into()))?;
+    if len > bytes.len() - *off {
+        return Err(Error::Module("snapshot truncated".into()));
+    }
+    let s = std::str::from_utf8(&bytes[*off..*off + len])
+        .map_err(|_| Error::Module("snapshot string is not utf-8".into()))?;
+    *off += len;
+    Ok(s.to_owned())
 }
