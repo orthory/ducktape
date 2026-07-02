@@ -456,6 +456,13 @@ impl RoundOrderer {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// resume stamping views at `next_view` — the harness analog of a real
+    /// engine reopening its journal and continuing its view counter, so a
+    /// resumed node's new frames land ABOVE its applied floor.
+    pub fn resume_at(next_view: u64) -> Self {
+        Self { pending: Vec::new(), next_view }
+    }
 }
 
 impl Orderer for RoundOrderer {
@@ -923,6 +930,12 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// own submitted [`FrameId`]s.
     pub fn take_drained(&mut self) -> Vec<DrainedFrame> {
         std::mem::take(&mut self.drained)
+    }
+
+    /// borrow the recovery sink mutably — the pump drives checkpointing and
+    /// floor-cert persistence through the same store the drain journals into.
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
     }
 
     /// borrow the wrapped host (queries, module_root inspection, ...).

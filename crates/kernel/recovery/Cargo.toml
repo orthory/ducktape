@@ -1,0 +1,21 @@
+[package]
+name = "recovery"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+host = { workspace = true }
+node = { workspace = true }
+thiserror = { workspace = true }
+commonware-storage = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-codec = "2026.5.0"
+commonware-utils = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+state = { workspace = true }
+directory = { workspace = true }
+directory-interface = { workspace = true }
+commonware-cryptography = { workspace = true }
