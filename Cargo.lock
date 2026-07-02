@@ -460,6 +460,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chat-interface",
+ "commonware-runtime",
+ "commonware-storage",
+ "host",
+ "messaging",
+ "messaging-interface",
+ "sdk",
+]
+
+[[package]]
+name = "chat-interface"
+version = "0.1.0"
+dependencies = [
+ "messaging-interface",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

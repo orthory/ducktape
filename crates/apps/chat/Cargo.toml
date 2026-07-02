@@ -1,0 +1,17 @@
+[package]
+name = "chat"
+edition.workspace = true
+version.workspace = true
+
+# Slack-like facade over the storage-backed messaging module.
+[dependencies]
+sdk = { workspace = true }
+chat-interface = { workspace = true }
+messaging = { workspace = true }
+messaging-interface = { workspace = true }
+async-trait = { workspace = true }
+commonware-storage = { workspace = true }
+commonware-runtime = { workspace = true }
+
+[dev-dependencies]
+host = { workspace = true }

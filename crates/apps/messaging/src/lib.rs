@@ -35,7 +35,7 @@ use serde::{Serialize, de::DeserializeOwned};
 type MessagingKey = <Sha256 as Hasher>::Digest;
 
 /// one variable-value qmdb stores all messaging records.
-type MessagingDb<E> = Db<mmr::Family, E, MessagingKey, Vec<u8>, Sha256, TwoCap, Sequential>;
+pub type MessagingDb<E> = Db<mmr::Family, E, MessagingKey, Vec<u8>, Sha256, TwoCap, Sequential>;
 
 /// shared by fresh open and state-sync reconstruction so storage layout cannot
 /// drift between source and joiner.
