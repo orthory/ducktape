@@ -759,7 +759,7 @@ mod tests {
     fn join_guard_refuses_a_foreign_descriptor_but_allows_the_refresh() {
         let a = ed25519::PrivateKey::from_seed(11).public_key();
         let dir = tmp("joinguard");
-        let mut ours = NetworkDescriptor {
+        let ours = NetworkDescriptor {
             chain_id: "home#11111111".into(),
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
