@@ -422,6 +422,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
     Ok((Origin::External(frame.origin), msg))
 }
 
+/// a frame's `(origin, seq)` submitter coordinates, without verifying the
+/// signature — recovery metadata only (a restarted node scans its retained
+/// frames to advance its local sequence past everything it may have framed).
+/// `None` for bytes that are not a frame.
+pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
+    let frame: Frame = serde_json::from_slice(bytes).ok()?;
+    Some((frame.origin, frame.seq))
+}
+
 /// total-order broadcast over opaque op frames. `submit` proposes a frame into
 /// the agreed sequence (it does NOT apply anything locally); `poll_delivered`
 /// yields the SAME sequence, in the SAME order, on EVERY validator. domain-
@@ -936,6 +945,12 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// floor-cert persistence through the same store the drain journals into.
     pub fn sink_mut(&mut self) -> &mut S {
         &mut self.sink
+    }
+
+    /// borrow the orderer (finalization-cert and gate inspection — the pump
+    /// reads these to decide when a floor certificate is safe to persist).
+    pub fn orderer(&self) -> &O {
+        &self.orderer
     }
 
     /// borrow the wrapped host (queries, module_root inspection, ...).

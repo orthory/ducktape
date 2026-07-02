@@ -293,6 +293,11 @@ pub struct Manifest {
     /// below the PREVIOUS manifest's position is prunable once the persisted
     /// finalization floor has passed its height.
     pub oplog_pos: u64,
+    /// the node's next local submit sequence at checkpoint time — restored so
+    /// a restarted node advances past every sequence it may already have
+    /// framed (the exactly-once digest gate does not survive the process, so
+    /// a reused (origin, seq, payload) triple would re-apply).
+    pub next_seq: u64,
 }
 
 impl Manifest {
@@ -315,6 +320,7 @@ impl Manifest {
             put_bytes(&mut out, bytes);
         }
         put_u64(&mut out, self.oplog_pos);
+        put_u64(&mut out, self.next_seq);
         out
     }
 
@@ -340,8 +346,9 @@ impl Manifest {
             snapshots.push((id, c.bytes()?));
         }
         let oplog_pos = c.u64()?;
+        let next_seq = c.u64()?;
         c.done()?;
-        Ok(Self { height, epoch, view_base, app_hash, roots, snapshots, oplog_pos })
+        Ok(Self { height, epoch, view_base, app_hash, roots, snapshots, oplog_pos, next_seq })
     }
 
     /// look up a stored snapshot by module id.
@@ -369,6 +376,7 @@ impl Manifest {
         epoch: u64,
         view_base: u64,
         oplog_pos: u64,
+        next_seq: u64,
     ) -> Result<Self, Error> {
         let snapshot = host
             .capture_finalized_snapshot(host::FinalizedBlock {
@@ -399,6 +407,7 @@ impl Manifest {
             roots,
             snapshots,
             oplog_pos,
+            next_seq,
         })
     }
 }
@@ -933,6 +942,7 @@ mod tests {
                 ("valset".into(), vec![]),
             ],
             oplog_pos: 17,
+            next_seq: 5,
         };
         let decoded = Manifest::decode(&m.encode()).expect("roundtrip");
         assert_eq!(decoded, m);

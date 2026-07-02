@@ -970,6 +970,15 @@ impl SimplexOrderer {
             .expect("latest finalization poisoned")
             .clone()
     }
+
+    /// count of finalized slots not yet released by `poll_delivered`. a
+    /// recovery layer persists a finalization floor only when this is 0 —
+    /// read the certificate FIRST, then this: releases happen only on the
+    /// caller's own drain thread, so a zero here proves everything reported
+    /// before the certificate read has been released (and applied).
+    pub fn unreleased_len(&self) -> usize {
+        self.inbox.unreleased_len()
+    }
 }
 
 impl node::Orderer for SimplexOrderer {

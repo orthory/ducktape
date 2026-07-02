@@ -53,7 +53,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
 
         // genesis checkpoint: height 0 = nothing applied.
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest = Manifest::capture(node.host(), None, 0, 0, pos).expect("capture");
+        let manifest = Manifest::capture(node.host(), None, 0, 0, pos, 1).expect("capture");
         assert_eq!(manifest.app_hash, genesis_hash);
         node.sink_mut().write_manifest(&manifest).await.expect("write manifest");
 
@@ -67,7 +67,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         // ...checkpoint...
         let pos = node.sink_mut().oplog_pos().await;
         let manifest =
-            Manifest::capture(node.host(), Some(checkpoint_height), 0, 0, pos).expect("capture");
+            Manifest::capture(node.host(), Some(checkpoint_height), 0, 0, pos, 2).expect("capture");
         node.sink_mut().write_manifest(&manifest).await.expect("write manifest");
 
         // ...and two more ops the checkpoint does NOT cover (the journal
@@ -153,7 +153,7 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
         // — the crash point is after pre_apply, before the host mutated).
         let mut recovery = Recovery::open(context.child("r3")).await.expect("open recovery");
         let host = fresh_host();
-        let manifest = Manifest::capture(&host, None, 0, 0, 0).expect("capture");
+        let manifest = Manifest::capture(&host, None, 0, 0, 0, 1).expect("capture");
         recovery.write_manifest(&manifest).await.expect("write manifest");
 
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
