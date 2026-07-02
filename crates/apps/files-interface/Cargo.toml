@@ -3,7 +3,10 @@ name = "files-interface"
 edition.workspace = true
 version.workspace = true
 
-# types-only: the wire surface of the files module.
+# types-only: the wire surface of the files module, plus the pure receiver-side
+# chunk verification helper every fetcher must run (sha2 is deterministic and
+# dependency-free — the same greenlit spirit as the serde_json codec helpers).
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }

@@ -532,6 +532,7 @@ fn main() {
             "chat",
             "directory",
             "document",
+            "files",
             "forge",
             "greeter",
             "kv",

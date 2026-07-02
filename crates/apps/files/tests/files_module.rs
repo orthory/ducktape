@@ -5,8 +5,8 @@ use sha2::{Digest as _, Sha256};
 
 use files::Files;
 use files_interface::{
-    FilesMsg, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp, Manifest, decode_reply,
-    decode_sync_resp, encode_msg, encode_query, encode_sync_req,
+    FilesMsg, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp, MAX_MANIFESTS, Manifest,
+    decode_reply, decode_sync_resp, encode_msg, encode_query, encode_sync_req, verify_chunk,
 };
 
 const FILES: &str = "files";
@@ -296,7 +296,11 @@ fn owner_derives_from_origin_and_gates_remove() {
         files.commit_block().await.expect("commit add");
 
         let manifest = stat(&files, "doc/a").await.expect("manifest");
-        assert_eq!(manifest.owner, to_hex(b"alice"));
+        assert_eq!(
+            manifest.owner,
+            format!("ext:{}", to_hex(b"alice")),
+            "external owners are domain-separated as ext:<hex>"
+        );
 
         // wrong external origin may not remove.
         let err = files
@@ -365,61 +369,111 @@ fn blob_store_round_trips_and_digest_matches() {
     assert_eq!(files.get_chunk(&sha256(b"absent")), None);
 }
 
+/// fetch one chunk over the serve_sync wire and return (present, bytes).
+async fn fetch_chunk(files: &Files, digest: &str) -> (bool, Vec<u8>) {
+    let resp = files
+        .serve_sync(&encode_sync_req(&FilesSyncReq::GetChunk {
+            digest: digest.into(),
+        }))
+        .await
+        .expect("serve");
+    let FilesSyncResp::Chunk { present, bytes } = decode_sync_resp(&resp).expect("decode resp");
+    (present, bytes)
+}
+
 #[test]
 fn serve_sync_serves_chunks_and_receiver_detects_tampering() {
     block_on(async {
-        let (b0, d0) = chunk(b"real chunk bytes");
+        // length-consistent bodies: 4096 full + 904 tail = size 5000.
+        let (b0, d0) = chunk(&[0xAA; 4096]);
+        let (b1, d1) = chunk(&[0xBB; 904]);
         let mut files = Files::new(FILES);
-        // commit a manifest whose first chunk digest is d0.
-        let (_, d1) = chunk(b"second");
         files
             .execute(
                 &mut TestCtx::new(Origin::System, 1),
-                &add_msg("f", "n", "m", 5000, 4096, vec![d0.clone(), d1]),
+                &add_msg("f", "n", "m", 5000, 4096, vec![d0.clone(), d1.clone()]),
             )
             .await
             .expect("add");
         files.commit_block().await.expect("commit");
         // the node holds the body bytes off-consensus.
         files.put_chunk(b0.clone());
+        files.put_chunk(b1.clone());
 
-        let committed = stat(&files, "f").await.expect("manifest").chunks[0].clone();
+        let manifest = stat(&files, "f").await.expect("manifest");
 
-        // honest serve: present, and the bytes verify against the committed digest.
-        let resp = files
-            .serve_sync(&encode_sync_req(&FilesSyncReq::GetChunk {
-                digest: committed.clone(),
-            }))
-            .await
-            .expect("serve");
-        let FilesSyncResp::Chunk { present, bytes } = decode_sync_resp(&resp).expect("decode resp");
+        // honest serve: both chunks verify — digest AND exact implied length
+        // (chunk_size for chunk 0, size - chunk_size for the last).
+        let (present, bytes) = fetch_chunk(&files, &manifest.chunks[0]).await;
         assert!(present);
-        assert_eq!(
-            to_hex(&sha256(&bytes)),
-            committed,
-            "receiver verifies fetched bytes against committed digest"
+        verify_chunk(&manifest, 0, &bytes).expect("honest full chunk verifies");
+        let (present, tail) = fetch_chunk(&files, &manifest.chunks[1]).await;
+        assert!(present);
+        verify_chunk(&manifest, 1, &tail).expect("honest tail chunk verifies");
+        assert!(
+            verify_chunk(&manifest, 2, &bytes).is_err(),
+            "out-of-range index is rejected"
         );
 
-        // dishonest serve: flip a byte; the receiver's re-hash no longer matches.
+        // dishonest serve: flip a byte; the receiver detects the digest mismatch.
         let mut tampered = bytes.clone();
         tampered[0] ^= 0xff;
-        assert_ne!(
-            to_hex(&sha256(&tampered)),
-            committed,
-            "a flipped byte fails receiver verification"
-        );
+        let err = verify_chunk(&manifest, 0, &tampered).expect_err("tampered chunk must fail");
+        assert!(err.contains("digest mismatch"), "{err}");
 
         // absent chunk: present=false, empty bytes.
         let (_, missing) = chunk(b"never uploaded");
-        let resp = files
-            .serve_sync(&encode_sync_req(&FilesSyncReq::GetChunk {
-                digest: missing,
-            }))
-            .await
-            .expect("serve absent");
-        let FilesSyncResp::Chunk { present, bytes } = decode_sync_resp(&resp).expect("decode resp");
+        let (present, bytes) = fetch_chunk(&files, &missing).await;
         assert!(!present);
         assert!(bytes.is_empty());
+    });
+}
+
+#[test]
+fn receiver_length_check_defeats_the_empty_chunk_spoof() {
+    block_on(async {
+        // the spoof: a manifest claiming size=1 whose only chunk digest is
+        // sha256("") VALIDATES at execute (count/span math holds). a dishonest
+        // server can then serve 0 bytes whose digest matches the commitment —
+        // digest equality alone reconstructs a 0-byte file where consensus
+        // says 1 byte. the receiver's LENGTH check is what catches it.
+        let empty_digest = to_hex(&sha256(b""));
+        let mut files = Files::new(FILES);
+        files
+            .execute(
+                &mut TestCtx::new(Origin::System, 1),
+                &add_msg("spoof", "s", "m", 1, 4096, vec![empty_digest.clone()]),
+            )
+            .await
+            .expect("the spoof manifest validates at execute");
+        files.commit_block().await.expect("commit");
+        files.put_chunk(Vec::new());
+
+        let manifest = stat(&files, "spoof").await.expect("manifest");
+        let (present, bytes) = fetch_chunk(&files, &manifest.chunks[0]).await;
+        assert!(present);
+        assert_eq!(
+            to_hex(&sha256(&bytes)),
+            manifest.chunks[0],
+            "digest-only verification is fooled by the empty chunk"
+        );
+        let err = verify_chunk(&manifest, 0, &bytes).expect_err("length check must catch it");
+        assert!(err.contains("length mismatch"), "{err}");
+
+        // the honest 1-byte body passes both checks.
+        let honest = vec![0x42u8];
+        let mut files = Files::new(FILES);
+        let honest_digest = to_hex(&sha256(&honest));
+        files
+            .execute(
+                &mut TestCtx::new(Origin::System, 1),
+                &add_msg("real", "r", "m", 1, 4096, vec![honest_digest]),
+            )
+            .await
+            .expect("add");
+        files.commit_block().await.expect("commit");
+        let manifest = stat(&files, "real").await.expect("manifest");
+        verify_chunk(&manifest, 0, &honest).expect("honest 1-byte chunk verifies");
     });
 }
 
@@ -620,7 +674,171 @@ fn host_dispatch_moves_app_hash_and_serves_query() {
             FilesReply::Stat(m) => m.expect("manifest present"),
             other => panic!("expected Stat, got {other:?}"),
         };
-        assert_eq!(manifest.owner, to_hex(b"tester"));
+        assert_eq!(manifest.owner, format!("ext:{}", to_hex(b"tester")));
         assert_eq!(manifest.created_at_height, 9);
+    });
+}
+
+#[test]
+fn system_owned_manifest_survives_snapshot_install() {
+    block_on(async {
+        let (_, d0) = chunk(b"sys");
+        let mut source = Files::new(FILES);
+        source
+            .execute(
+                &mut TestCtx::new(Origin::System, 2),
+                &add_msg("sys/file", "n", "m", 10, 4096, vec![d0]),
+            )
+            .await
+            .expect("system add");
+        source.commit_block().await.expect("commit");
+        assert_eq!(
+            stat(&source, "sys/file").await.expect("manifest").owner,
+            "system"
+        );
+
+        let mut target = Files::new(FILES);
+        target
+            .install(&source.snapshot(), source.root())
+            .expect("install execute-reachable system-owned state");
+        assert_eq!(target.root(), source.root());
+        assert_eq!(
+            stat(&target, "sys/file").await.expect("manifest").owner,
+            "system"
+        );
+
+        // the owner gate still holds after install: external may not remove...
+        let err = target
+            .execute(
+                &mut TestCtx::new(Origin::External(b"alice".to_vec()), 3),
+                &remove_msg("sys/file"),
+            )
+            .await
+            .expect_err("external must not remove a system-owned manifest");
+        assert!(matches!(err, Error::Module(_)), "{err:?}");
+        // ...but the system origin may.
+        target
+            .execute(
+                &mut TestCtx::new(Origin::System, 3),
+                &remove_msg("sys/file"),
+            )
+            .await
+            .expect("system removes its manifest");
+    });
+}
+
+fn push_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// the canonical snapshot encoding of MAX_MANIFESTS identical-shape manifests —
+/// built directly (the format is the documented root() preimage) so the
+/// boundary is reachable without 65536 executes.
+fn snapshot_at_capacity() -> Vec<u8> {
+    let chunk_raw = sha256(b"cap");
+    let chunk_hex = to_hex(&chunk_raw);
+    let digest_hex = to_hex(&sha256(&chunk_raw));
+    let mut out = Vec::new();
+    out.extend_from_slice(&(MAX_MANIFESTS as u64).to_le_bytes());
+    for i in 0..MAX_MANIFESTS {
+        push_str(&mut out, &format!("cap/{i:08}"));
+        push_str(&mut out, "n");
+        push_str(&mut out, "m");
+        out.extend_from_slice(&1u64.to_le_bytes()); // size
+        out.extend_from_slice(&4096u64.to_le_bytes()); // chunk_size
+        out.extend_from_slice(&1u64.to_le_bytes()); // chunk count
+        push_str(&mut out, &chunk_hex);
+        push_str(&mut out, &digest_hex);
+        push_str(&mut out, "system");
+        out.extend_from_slice(&1u64.to_le_bytes()); // created_at_height
+    }
+    out
+}
+
+#[test]
+fn manifest_limit_boundary() {
+    block_on(async {
+        let bytes = snapshot_at_capacity();
+        let mut files = Files::new(FILES);
+        files
+            .install(&bytes, StateRoot(sha256(&bytes)))
+            .expect("install a full module (root() is sha256 of the snapshot bytes)");
+
+        // at capacity: a further add is rejected.
+        let (_, dn) = chunk(b"new");
+        let err = files
+            .execute(
+                &mut TestCtx::new(Origin::System, 5),
+                &add_msg("zzz/new", "n", "m", 1, 4096, vec![dn.clone()]),
+            )
+            .await
+            .expect_err("add at capacity must be rejected");
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("manifest limit reached")),
+            "{err:?}"
+        );
+
+        // a staged remove frees a slot within the SAME block (the cap counts
+        // through the pending overlay).
+        files
+            .execute(
+                &mut TestCtx::new(Origin::System, 5),
+                &remove_msg("cap/00000000"),
+            )
+            .await
+            .expect("remove one");
+        files
+            .execute(
+                &mut TestCtx::new(Origin::System, 5),
+                &add_msg("zzz/new", "n", "m", 1, 4096, vec![dn.clone()]),
+            )
+            .await
+            .expect("add fits the freed slot");
+        files.commit_block().await.expect("commit");
+        assert!(stat(&files, "zzz/new").await.is_some());
+
+        // back at capacity after commit: rejected again.
+        let err = files
+            .execute(
+                &mut TestCtx::new(Origin::System, 6),
+                &add_msg("zzz/new2", "n", "m", 1, 4096, vec![dn]),
+            )
+            .await
+            .expect_err("still at capacity");
+        assert!(matches!(err, Error::Module(_)), "{err:?}");
+    });
+}
+
+#[test]
+fn add_remove_readd_same_file_id_within_one_block() {
+    block_on(async {
+        let (_, d0) = chunk(b"v1");
+        let (_, d1) = chunk(b"v2");
+        let mut files = Files::new(FILES);
+        files
+            .execute(
+                &mut TestCtx::new(Origin::System, 1),
+                &add_msg("f", "first", "m", 10, 4096, vec![d0]),
+            )
+            .await
+            .expect("add");
+        files
+            .execute(&mut TestCtx::new(Origin::System, 1), &remove_msg("f"))
+            .await
+            .expect("remove the staged add");
+        files
+            .execute(
+                &mut TestCtx::new(Origin::System, 1),
+                &add_msg("f", "second", "m", 10, 4096, vec![d1]),
+            )
+            .await
+            .expect("re-add after the staged remove");
+        files.commit_block().await.expect("commit");
+
+        let manifest = stat(&files, "f")
+            .await
+            .expect("manifest present after commit");
+        assert_eq!(manifest.name, "second", "the re-add wins the block");
     });
 }

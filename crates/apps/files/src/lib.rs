@@ -30,7 +30,7 @@
 //! every size cap is enforced at execute time with rejection, so an oversized
 //! value never enters the root preimage.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -112,23 +112,28 @@ impl Files {
     }
 
     /// distinct `file_id` count after applying the pending overlay — the
-    /// projection `MAX_MANIFESTS` is checked against.
+    /// projection `MAX_MANIFESTS` is checked against. counted incrementally
+    /// off the committed length so a full-capacity module stays O(pending).
     fn effective_len(&self) -> usize {
-        let mut ids: BTreeSet<&str> = self.manifests.keys().map(String::as_str).collect();
+        let mut len = self.manifests.len();
         for (id, staged) in &self.pending {
-            if staged.is_some() {
-                ids.insert(id.as_str());
-            } else {
-                ids.remove(id.as_str());
+            match (staged.is_some(), self.manifests.contains_key(id)) {
+                (true, false) => len += 1,
+                (false, true) => len -= 1,
+                _ => {}
             }
         }
-        ids.len()
+        len
     }
 
+    /// derive the owner string from the dispatch origin: a module id verbatim,
+    /// `"ext:"` + lowercase hex for an external submitter (the prefix
+    /// domain-separates external identities from hex-looking module ids), or
+    /// `"system"`. never taken from the payload.
     fn owner_of(origin: &Origin) -> String {
         match origin {
             Origin::Module(id) => id.clone(),
-            Origin::External(bytes) => to_hex(bytes),
+            Origin::External(bytes) => format!("ext:{}", to_hex(bytes)),
             Origin::System => "system".to_string(),
         }
     }
