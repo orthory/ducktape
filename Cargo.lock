@@ -3715,6 +3715,7 @@ dependencies = [
  "kv-interface",
  "node",
  "noded",
+ "rand 0.8.6",
  "reactor",
  "saga",
  "sdk",
