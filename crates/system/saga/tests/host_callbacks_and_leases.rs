@@ -227,7 +227,7 @@ fn a_trigger_with_an_unknown_reply_to_is_rejected_up_front() {
             )
             .await
             .expect_err("unknown reply_to must reject");
-        assert!(matches!(err, Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
         assert_eq!(saga_view(&host, "s1").await, None, "no saga was created");
         assert_eq!(host.app_hash(), genesis, "the rejected block left no trace");
     });
@@ -264,7 +264,7 @@ fn a_failing_callback_arm_aborts_the_whole_block_and_the_saga_stays_pending() {
             )
             .await
             .expect_err("the poisoned callback aborts the block");
-        assert!(matches!(err, Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
 
         // no trace: the saga did NOT advance and no root moved.
         assert_eq!(
