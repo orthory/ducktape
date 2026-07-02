@@ -313,13 +313,23 @@ fn main() {
             .public_key()
             .as_ref()
             .to_vec();
+        // membership ops are governance-gated (external origins are refused);
+        // the demo's direct join rides a SYSTEM-origin block — the same trusted
+        // orchestration lane genesis seeding uses.
         let out = host
-            .submit(Msg {
-                target: "valset".into(),
-                payload: valset_encode_msg(&ValsetMsg::Join {
-                    key: new_validator.clone(),
-                }),
-            })
+            .submit_at(
+                host::BlockContext {
+                    height: 0,
+                    consensus_time: 0,
+                    origin: sdk::Origin::System,
+                },
+                Msg {
+                    target: "valset".into(),
+                    payload: valset_encode_msg(&ValsetMsg::Join {
+                        key: new_validator.clone(),
+                    }),
+                },
+            )
             .await
             .expect("submit block 6");
         println!("\n[block 6] valset <- Join(ed25519 pubkey) — a new validator joins");

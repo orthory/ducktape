@@ -78,7 +78,14 @@ pub fn commit(
     message: &str,
     consensus_time: u64,
 ) -> Result<Oid, git2::Error> {
-    let t = Time::new(consensus_time as i64, 0);
+    // a `consensus_time` past i64::MAX cannot be represented as a git Time —
+    // an `as` cast would silently wrap negative, minting a deterministic-but-
+    // corrupt commit date. reject instead: the same guard rejects on every
+    // validator (consensus_time is agreed), so this stays consensus-safe.
+    let secs = i64::try_from(consensus_time).map_err(|_| {
+        git2::Error::from_str("consensus_time exceeds the representable git commit time")
+    })?;
+    let t = Time::new(secs, 0);
     let sig = Signature::new(IDENT_NAME, IDENT_EMAIL, &t)?;
     let parents: Vec<&Commit> = parent.into_iter().collect();
     repo.commit(None, &sig, &sig, message, tree, &parents)

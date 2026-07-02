@@ -18,16 +18,34 @@ host = { workspace = true }
 node = { workspace = true }
 consensus = { workspace = true }
 sdk = { workspace = true }
+state = { workspace = true }
+statesync = { workspace = true }
 kv = { workspace = true }
 kv-interface = { workspace = true }
 directory = { workspace = true }
 directory-interface = { workspace = true }
+# the production module set: system infrastructure + every product module.
+valset = { workspace = true }
+valset-interface = { workspace = true }
+governance = { workspace = true }
+saga = { workspace = true }
+forge = { workspace = true }
+document = { workspace = true }
+chat = { workspace = true }
+tasks = { workspace = true }
+vaults = { workspace = true }
+reactor = { workspace = true }
+futures = "0.3"
+serde_json = { workspace = true }
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-utils = { workspace = true }
+commonware-codec = { workspace = true }
 
 serde = { workspace = true }
 toml = "0.8"
+# stderr tracing for the p2p/consensus internals (RUST_LOG=commonware_p2p=debug).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
