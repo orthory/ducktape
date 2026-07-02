@@ -34,6 +34,9 @@ document = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }
+automations = { workspace = true }
+inbox = { workspace = true }
+files = { workspace = true }
 memory = { workspace = true }
 reactor = { workspace = true }
 futures = "0.3"
