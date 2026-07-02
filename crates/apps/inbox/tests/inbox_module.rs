@@ -2,8 +2,8 @@ use futures::executor::block_on;
 use host::{BlockContext, Host};
 use inbox::Inbox;
 use inbox_interface::{
-    InboxMsg, InboxQuery, InboxReply, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS, MAX_QUERY_LIMIT,
-    Notification, decode_reply, encode_msg, encode_query,
+    InboxMsg, InboxQuery, InboxReply, MAX_BODY_BYTES, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS,
+    MAX_QUERY_LIMIT, Notification, decode_reply, encode_msg, encode_query,
 };
 use sdk::{
     Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
@@ -192,14 +192,23 @@ fn source_is_derived_from_origin() {
             .execute(&mut TestCtx::system(3), &deliver("m", "k", "from system"))
             .await
             .expect("system deliver");
+        inbox
+            .execute(
+                &mut TestCtx::new(Origin::External(Vec::new()), 4),
+                &deliver("m", "k", "from anonymous external"),
+            )
+            .await
+            .expect("empty-external deliver");
         inbox.commit_block().await.expect("commit");
 
         let items = list(&inbox, "m", 0, MAX_QUERY_LIMIT).await;
         let sources: Vec<&str> = items.iter().map(|n| n.source.as_str()).collect();
         assert_eq!(
             sources,
-            ["chat", "deadbeef", "system"],
-            "source = module id / lowercase hex of external bytes / \"system\", never caller-supplied"
+            ["chat", "ext:deadbeef", "system", "ext:"],
+            "source = module id verbatim / \"ext:\"+hex of external bytes / \
+             \"system\" — the ext: prefix domain-separates external keys from \
+             pure-hex module ids; never caller-supplied"
         );
     });
 }
@@ -633,5 +642,134 @@ fn noop_ack_follow_up_does_not_abort_the_block() {
 
         let items = host_list(&host, "alice").await;
         assert_eq!(items.len(), 1, "the delivery still committed");
+    });
+}
+
+// ---- crafted snapshots: decode hardening + the seq-exhaustion boundary ------
+//
+// these tests hand-encode the module's canonical byte layout (the exact root
+// preimage): member count, then per member (id, next_seq, item count, items
+// ascending by seq), length-prefixed strings and LE u64s throughout.
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_str(out: &mut Vec<u8>, value: &str) {
+    push_u64(out, value.len() as u64);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn push_item(out: &mut Vec<u8>, seq: u64, kind: &str, body: &str, source: &str) {
+    push_u64(out, seq);
+    push_str(out, kind);
+    push_str(out, body);
+    push_str(out, source);
+    push_u64(out, 0); // created_at
+    out.push(0); // read = false
+}
+
+/// one member with the given counter and items — a minimal crafted snapshot.
+fn snapshot_of_member(member: &str, next_seq: u64, items: &[(u64, &str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, 1); // member count
+    push_str(&mut out, member);
+    push_u64(&mut out, next_seq);
+    push_u64(&mut out, items.len() as u64);
+    for (seq, kind, body) in items {
+        push_item(&mut out, *seq, kind, body, "system");
+    }
+    out
+}
+
+/// the root a valid crafted snapshot must install against: the encoding IS the
+/// root preimage.
+fn root_of_bytes(bytes: &[u8]) -> StateRoot {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    StateRoot(h.finalize().into())
+}
+
+#[test]
+fn snapshot_with_zero_next_seq_is_rejected() {
+    // next_seq starts at 1 and only increments; 0 is not execute-reachable.
+    let bytes = snapshot_of_member("alice", 0, &[]);
+    let err = Inbox::new(INBOX)
+        .install(&bytes, root_of_bytes(&bytes))
+        .expect_err("next_seq == 0 must be rejected");
+    assert!(
+        matches!(err, Error::Module(ref m) if m.contains("next_seq is zero")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn snapshot_with_over_cap_fields_is_rejected() {
+    // execute rejects over-cap fields before staging, so no honest validator
+    // can commit them — an image carrying one is corrupt or hostile.
+    let big_body = "x".repeat(MAX_BODY_BYTES + 1);
+    let bytes = snapshot_of_member("alice", 2, &[(1, "k", big_body.as_str())]);
+    let err = Inbox::new(INBOX)
+        .install(&bytes, root_of_bytes(&bytes))
+        .expect_err("over-cap body must be rejected");
+    assert!(
+        matches!(err, Error::Module(ref m) if m.contains("body exceeds cap")),
+        "unexpected error: {err:?}"
+    );
+
+    let big_member = "m".repeat(257);
+    let bytes = snapshot_of_member(&big_member, 1, &[]);
+    Inbox::new(INBOX)
+        .install(&bytes, root_of_bytes(&bytes))
+        .expect_err("over-cap member id must be rejected");
+
+    let big_kind = "k".repeat(65);
+    let bytes = snapshot_of_member("alice", 2, &[(1, big_kind.as_str(), "b")]);
+    Inbox::new(INBOX)
+        .install(&bytes, root_of_bytes(&bytes))
+        .expect_err("over-cap kind must be rejected");
+}
+
+#[test]
+fn seq_exhaustion_rejects_deterministically() {
+    block_on(async {
+        // next_seq == u64::MAX is execute-reachable in principle (2^64 - 2
+        // deliveries), so install must ACCEPT it...
+        let bytes = snapshot_of_member("alice", u64::MAX, &[(1, "k", "survivor")]);
+        let mut inbox = Inbox::new(INBOX);
+        inbox
+            .install(&bytes, root_of_bytes(&bytes))
+            .expect("a maxed-out counter is a valid committed state");
+        let root_installed = inbox.root();
+
+        // ...but the NEXT delivery to that member has no seq left: reject
+        // deterministically, before any mutation — never panic or wrap.
+        let err = inbox
+            .execute(
+                &mut TestCtx::system(1),
+                &deliver("alice", "k", "one too many"),
+            )
+            .await
+            .expect_err("seq space exhaustion must reject");
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("seq space exhausted")),
+            "unexpected error: {err:?}"
+        );
+
+        // other members are unaffected, and the rejection left no trace.
+        inbox
+            .execute(
+                &mut TestCtx::system(1),
+                &deliver("bob", "k", "fresh member"),
+            )
+            .await
+            .expect("an unexhausted member still accepts deliveries");
+        inbox.abort_block().await.expect("abort");
+        assert_eq!(
+            inbox.root(),
+            root_installed,
+            "the rejected delivery staged nothing"
+        );
     });
 }

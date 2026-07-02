@@ -43,8 +43,9 @@ pub struct Notification {
     pub kind: String,
     pub body: String,
     /// the delivering origin, derived by the module from `Env.origin`: a module
-    /// id, the lowercase hex of external submitter bytes, or "system". NEVER
-    /// caller-supplied.
+    /// id verbatim, `"ext:"` + the lowercase hex of external submitter bytes,
+    /// or `"system"`. NEVER caller-supplied. the `ext:` prefix domain-separates
+    /// external keys from module ids that happen to be pure hex.
     pub source: String,
     pub created_at: u64,
     pub read: bool,

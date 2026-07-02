@@ -157,9 +157,18 @@ impl Inbox {
             )));
         }
 
+        // seq-space exhaustion is a deterministic rejection, checked BEFORE any
+        // mutation — never a panic or a wrapping re-assignment of an old seq.
+        let seq = self
+            .effective(&member)
+            .map(|queue| queue.next_seq)
+            .unwrap_or(1);
+        let bumped = seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Module(format!("member seq space exhausted: {member}")))?;
+
         let queue = self.stage_queue(&member);
-        let seq = queue.next_seq;
-        queue.next_seq += 1;
+        queue.next_seq = bumped;
         queue.items.insert(
             seq,
             Notification {
@@ -279,13 +288,15 @@ impl Inbox {
 }
 
 /// derive the delivering `source` from the dispatch origin — the only source of
-/// truth for who delivered. NEVER caller-supplied. an external submitter is
-/// recorded as the lowercase hex of its id bytes; a module as its id; genesis /
-/// system-internal as "system".
+/// truth for who delivered. NEVER caller-supplied. a module is recorded as its
+/// id verbatim; an external submitter as `"ext:"` + the lowercase hex of its id
+/// bytes (empty bytes -> `"ext:"`); genesis / system-internal as `"system"`.
+/// the `ext:` prefix is actor DOMAIN SEPARATION: a future module whose id
+/// happens to be pure hex can never collide with an external key's hex.
 fn source_from_origin(origin: &Origin) -> String {
     match origin {
         Origin::Module(id) => id.clone(),
-        Origin::External(bytes) => hex_lower(bytes),
+        Origin::External(bytes) => format!("ext:{}", hex_lower(bytes)),
         Origin::System => "system".to_owned(),
     }
 }
@@ -304,15 +315,26 @@ fn push_string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
+/// decode (and validate) a snapshot. install must accept every
+/// execute-reachable state — the root comparison is the integrity check — but
+/// states execute can NEVER produce are rejected as defense-in-depth: the caps
+/// below are all enforced at execute time, so an image violating them is
+/// corrupt or hostile, never an honest validator's state.
 fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error> {
     let mut off = 0usize;
     let member_count = read_u64(bytes, &mut off)?;
+    if member_count > MAX_MEMBERS as u64 {
+        return Err(Error::Module("snapshot exceeds member capacity".into()));
+    }
 
     let mut members: BTreeMap<String, MemberQueue> = BTreeMap::new();
     for _ in 0..member_count {
         let member = read_string(bytes, &mut off)?;
         if member.is_empty() {
             return Err(Error::Module("snapshot member id is empty".into()));
+        }
+        if member.len() > MAX_MEMBER_BYTES {
+            return Err(Error::Module("snapshot member id exceeds cap".into()));
         }
         if members
             .last_key_value()
@@ -324,7 +346,16 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error>
         }
 
         let next_seq = read_u64(bytes, &mut off)?;
+        if next_seq == 0 {
+            // next_seq starts at 1 and only ever increments.
+            return Err(Error::Module("snapshot next_seq is zero".into()));
+        }
         let item_count = read_u64(bytes, &mut off)?;
+        if item_count > MAX_ITEMS_PER_MEMBER as u64 {
+            return Err(Error::Module(
+                "snapshot member queue exceeds item capacity".into(),
+            ));
+        }
         let mut items: BTreeMap<u64, Notification> = BTreeMap::new();
         for _ in 0..item_count {
             let seq = read_u64(bytes, &mut off)?;
@@ -339,7 +370,13 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error>
                 return Err(Error::Module("snapshot item seq exceeds next_seq".into()));
             }
             let kind = read_string(bytes, &mut off)?;
+            if kind.len() > MAX_KIND_BYTES {
+                return Err(Error::Module("snapshot kind exceeds cap".into()));
+            }
             let body = read_string(bytes, &mut off)?;
+            if body.len() > MAX_BODY_BYTES {
+                return Err(Error::Module("snapshot body exceeds cap".into()));
+            }
             let source = read_string(bytes, &mut off)?;
             let created_at = read_u64(bytes, &mut off)?;
             let read = read_bool(bytes, &mut off)?;

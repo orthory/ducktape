@@ -540,7 +540,8 @@ fn main() {
                     height: 0,
                     consensus_time: 9,
                     // the submitter's id — the inbox derives `source` from this
-                    // origin (hex of the external bytes), never from the payload.
+                    // origin ("ext:" + hex of the external bytes), never from
+                    // the payload.
                     origin: Origin::External(b"cli".to_vec()),
                 },
                 Msg {
