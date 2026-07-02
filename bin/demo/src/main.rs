@@ -1,13 +1,13 @@
-//! a runnable super-app demo: seven isolated modules — a qmdb-backed kv, a sync
+//! a runnable super-app demo: eight isolated modules — a qmdb-backed kv, a sync
 //! in-memory directory, a stateless greeter, a GIT-backed forge, a qmdb-backed
-//! block DOCUMENT module, a qmdb-backed messaging app with channels, and an
-//! ed25519 permissionless VALSET — dispatched over ONE host, showing the app-hash
-//! evolve as typed cross-module ops flow, forge's git HEAD oid compose into that
-//! same app-hash as its root, document and messaging roots do the same, and a new
-//! validator JOIN move the valset root off ZERO.
+//! block DOCUMENT module, a stateless agent-session facade over a qmdb-backed
+//! messaging app, and an ed25519 permissionless VALSET — dispatched over ONE
+//! host, showing the app-hash evolve as typed cross-module ops flow.
 //!
 //! run: `cargo run -p demo`
 
+use agent::Agent;
+use agent_interface::{AgentMsg, encode_msg as agent_encode_msg};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -27,8 +27,8 @@ use greeter::Greeter;
 use host::Host;
 use messaging::Messaging;
 use messaging_interface::{
-    MessagingMsg, MessagingQuery, MessagingReply, decode_reply as messaging_decode_reply,
-    encode_msg as messaging_encode_msg, encode_query as messaging_encode_query,
+    MessagingQuery, MessagingReply, decode_reply as messaging_decode_reply,
+    encode_query as messaging_encode_query,
 };
 use sdk::Msg;
 use valset::Valset;
@@ -51,6 +51,7 @@ fn main() {
         let greeter = Greeter::new("greeter");
         let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
         let messaging = Messaging::init(context.child("messaging"), "messaging").await;
+        let agent = Agent::new("agent");
         let valset = Valset::new("valset");
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -59,11 +60,12 @@ fn main() {
             Box::new(forge),
             Box::new(document),
             Box::new(messaging),
+            Box::new(agent),
             Box::new(valset),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 7 isolated modules over one host ===");
+        println!("=== super-app demo — 8 isolated modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -175,31 +177,34 @@ fn main() {
             );
         }
 
-        // block 4: create a channel, then block 5 posts a message into that
-        // channel. messaging is an isolated product app module with a typed wire
-        // surface and a real qmdb storage root.
+        // block 4: open an agent session through the stateless facade, then
+        // block 5 appends a message. messaging owns the storage root.
         let out = host
             .submit(Msg {
-                target: "messaging".into(),
-                payload: messaging_encode_msg(&MessagingMsg::CreateChannel {
-                    channel_id: "general".into(),
-                    name: "General".into(),
+                target: "agent".into(),
+                payload: agent_encode_msg(&AgentMsg::OpenSession {
+                    session_id: "general".into(),
+                    title: "General".into(),
                 }),
             })
             .await
             .expect("submit block 4");
-        println!("\n[block 4] messaging <- CreateChannel(general)");
+        println!("\n[block 4] agent <- OpenSession(general)");
         println!(
             "  messaging root : {:?}",
             host.module_root("messaging").unwrap()
+        );
+        println!(
+            "  agent root     : {:?}",
+            host.module_root("agent").unwrap()
         );
         println!("  app-hash       : {:?}", out.app_hash);
 
         let out = host
             .submit(Msg {
-                target: "messaging".into(),
-                payload: messaging_encode_msg(&MessagingMsg::PostMessage {
-                    channel_id: "general".into(),
+                target: "agent".into(),
+                payload: agent_encode_msg(&AgentMsg::AppendMessage {
+                    session_id: "general".into(),
                     message_id: "m1".into(),
                     author: "demo".into(),
                     body: "hello channel".into(),
@@ -217,11 +222,15 @@ fn main() {
             .await
             .expect("query messaging");
         if let MessagingReply::Messages(messages) = messaging_decode_reply(&reply).unwrap() {
-            println!("\n[block 5] messaging <- PostMessage(general, m1)");
+            println!("\n[block 5] agent <- AppendMessage(general, m1)");
             println!("  message count  : {}", messages.len());
             println!(
                 "  messaging root : {:?}",
                 host.module_root("messaging").unwrap()
+            );
+            println!(
+                "  agent root     : {:?}",
+                host.module_root("agent").unwrap()
             );
             println!("  app-hash       : {:?}", out.app_hash);
         }
@@ -339,6 +348,7 @@ fn main() {
             "document",
             "forge",
             "greeter",
+            "agent",
             "kv",
             "messaging",
             "valset",

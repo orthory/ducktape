@@ -1,0 +1,10 @@
+[package]
+name = "agent-interface"
+edition.workspace = true
+version.workspace = true
+
+# Shared agent-session wire surface built on top of messaging-interface.
+[dependencies]
+messaging-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
