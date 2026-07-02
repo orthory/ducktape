@@ -103,15 +103,39 @@ pub struct MeshValidator {
 }
 
 /// The complete mesh projection for one admitted validator epoch.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeshView {
-    pub epoch: MeshEpoch,
-    pub admission_root: AdmissionRoot,
-    pub version: MeshVersion,
-    pub validators: Vec<MeshValidator>,
+    epoch: MeshEpoch,
+    admission_root: AdmissionRoot,
+    version: MeshVersion,
+    validators: Vec<MeshValidator>,
+}
+
+#[derive(Deserialize)]
+struct WireMeshView {
+    epoch: MeshEpoch,
+    admission_root: AdmissionRoot,
+    version: MeshVersion,
+    validators: Vec<MeshValidator>,
 }
 
 impl MeshView {
+    pub fn epoch(&self) -> MeshEpoch {
+        self.epoch
+    }
+
+    pub fn admission_root(&self) -> AdmissionRoot {
+        self.admission_root
+    }
+
+    pub fn version(&self) -> MeshVersion {
+        self.version
+    }
+
+    pub fn validators(&self) -> &[MeshValidator] {
+        &self.validators
+    }
+
     pub fn bootnodes(&self) -> impl Iterator<Item = &MeshValidator> {
         self.validators.iter().filter(|v| v.capabilities.bootnode)
     }
@@ -142,6 +166,7 @@ pub enum MeshDeriveError {
         identity: Vec<u8>,
         field: &'static str,
     },
+    NonCanonicalView,
 }
 
 impl fmt::Display for MeshDeriveError {
@@ -165,6 +190,7 @@ impl fmt::Display for MeshDeriveError {
             Self::EmptyEndpoint { identity, field } => {
                 write!(f, "empty {field} endpoint for validator {identity:?}")
             }
+            Self::NonCanonicalView => write!(f, "mesh view is not canonical"),
         }
     }
 }
@@ -247,7 +273,36 @@ pub fn encode_view(view: &MeshView) -> Vec<u8> {
 }
 
 pub fn decode_view(bytes: &[u8]) -> Result<MeshView, String> {
-    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+    let decoded: WireMeshView = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    validate_view(MeshView {
+        epoch: decoded.epoch,
+        admission_root: decoded.admission_root,
+        version: decoded.version,
+        validators: decoded.validators,
+    })
+    .map_err(|e| e.to_string())
+}
+
+pub fn validate_view(view: MeshView) -> Result<MeshView, MeshDeriveError> {
+    validate_admission_root(view.admission_root)?;
+    if view.validators.is_empty() {
+        return Err(MeshDeriveError::EmptyValidatorSet);
+    }
+    let advertisements: Vec<_> = view
+        .validators
+        .iter()
+        .map(|validator| {
+            ValidatorMeshAdvertisement::new(
+                validator.identity.as_bytes().to_vec(),
+                validator.endpoints.clone(),
+            )
+        })
+        .collect();
+    let canonical = derive_mesh(view.epoch, view.admission_root, advertisements)?;
+    if canonical != view {
+        return Err(MeshDeriveError::NonCanonicalView);
+    }
+    Ok(view)
 }
 
 fn validate_identity(identity: &[u8]) -> Result<(), MeshDeriveError> {
@@ -441,6 +496,28 @@ mod tests {
             .unwrap_err(),
             MeshDeriveError::MissingAdmissionRoot
         );
+    }
+
+    #[test]
+    fn decoded_views_are_revalidated() {
+        let keys = vec![key(1), key(2)];
+        let endpoints = endpoint_map(&keys);
+        let view = derive_mesh_from_admitted_set(40, admission(8), keys.clone(), |id| {
+            endpoints.get(id).cloned()
+        })
+        .expect("mesh view");
+        let encoded = encode_view(&view);
+        assert_eq!(decode_view(&encoded).unwrap(), view);
+
+        let mut zero_root = view.clone();
+        zero_root.admission_root = AdmissionRoot([0; 32]);
+        let encoded = encode_view(&zero_root);
+        assert!(decode_view(&encoded).is_err());
+
+        let mut forged_capability = view.clone();
+        forged_capability.validators[0].capabilities.relay = false;
+        let encoded = encode_view(&forged_capability);
+        assert!(decode_view(&encoded).is_err());
     }
 
     #[test]
