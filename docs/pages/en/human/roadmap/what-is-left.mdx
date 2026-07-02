@@ -1,41 +1,51 @@
 # What Is Left
 
-The repo has crossed the core architecture threshold. The remaining work is the
-live control plane and product depth around it.
+The core architecture and the live control plane are in place: network state
+sync, dynamic valset orchestration with epoch cutover, and a governed private
+network all run over real sockets in `bin/node/examples/demo-2node.sh`. What
+remains is durability, promotion flows, and product depth.
 
-## Network State Sync
+## Done (was open)
 
-The module sync paths are proven in-process. The missing live path is a resolver
-that serves and fetches module sync data over the running network rather than
-through test-only in-process resolvers.
+- **Network state sync.** A running validator serves the state-sync wire
+  protocol (manifest, chunked snapshots, live qmdb op-range serving via
+  `serve_sync`); a joiner rebuilds every module over it and composes the source
+  app-hash. Snapshot serving is the finalized-boundary capture cache.
+- **Dynamic valset orchestration.** The `ValsetOrchestrator` watches finalized
+  valset state, schedules a deterministic cutover, respawns the engine over the
+  new participant set, and rotates channels — all driven by governance-admitted
+  membership.
+- **Governance and vaults.** Member-gated proposals drive membership; vaults
+  replicate opaque secret ciphertext with owner-gated write integrity.
 
-## Dynamic Valset Orchestration
+## Durability And Promotion
 
-The consensus respawn behavior has test coverage for incorporating a joiner at
-an epoch boundary. The remaining work is connecting that behavior to live module
-state and node orchestration:
+- Restart/recovery from persisted state: the qmdb stores and the simplex journal
+  persist, but the node re-runs genesis on start. A resume path must avoid
+  double-applying replayed journal ops (the epoch/replay design).
+- A validator demoted at cutover currently halts; it should degrade to a
+  sync-server. A synced joiner should be able to auto-promote to a live validator
+  at an epoch boundary rather than requiring a manual restart.
+- Per-origin replay nonces in replicated state. Cross-epoch replay of a
+  byte-identical frame is currently gated only by the per-engine finalization
+  dedup.
 
-- watch finalized valset state;
-- decide and publish a deterministic cutover point;
-- stop old orderer instances and start the new epoch consistently;
-- keep transport and state-sync readiness aligned with membership changes.
+## Product Depth
 
-State sync is no longer the conceptual blocker for joiner catch-up, but live
-orchestration still needs to be wired.
+- Origin-bound message authorship (signed frames make this available — the author
+  is still a caller-supplied string).
+- The agent module should plug into the reactor worker seam so LLM output is
+  committed as ordered data, not hidden non-determinism, and connect to the
+  tasks module for agent task management.
 
-## Live Snapshot Serving
+## Mesh
 
-The capstone test proves a joiner can rebuild from module targets and snapshots.
-A running node still needs the pause/serve seam to provide a consistent
-all-module snapshot at a finalized height.
-
-## Product Modules
-
-Chat and agent need real product pressure. The agent module should plug into the
-reactor worker seam so LLM output is committed as ordered data, not hidden
-non-determinism. There is no checked-in tasks module yet.
+- The two parallel mesh type systems (`valset-mesh-interface` and
+  `wireguard-upgrade`) should unify on one contract, and the validated WireGuard
+  upgrade path needs a runtime consumer to bring up the private overlay.
 
 ## Deferred Deliberately
 
-- Commit-phase crash safety and full two-phase commit remain deferred because the
-  current host-lent atomicity covers execute-phase behavior.
+- Commit-phase crash safety and full two-phase commit remain deferred: the
+  host-lent atomicity covers execute-phase behavior, and a commit-phase fault is
+  now a fail-stop `SubmitError::Fatal` rather than silent corruption.
