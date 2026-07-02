@@ -85,7 +85,7 @@ fn host_rolls_back_failed_message_blocks() {
             }))
             .await
             .unwrap_err();
-        assert!(matches!(err, sdk::Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(sdk::Error::Module(_))));
         assert_eq!(host.module_root("messaging").unwrap(), root0);
         assert_eq!(host.app_hash(), app0);
     });

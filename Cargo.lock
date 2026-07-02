@@ -2835,6 +2835,7 @@ dependencies = [
  "commonware-runtime",
  "directory",
  "directory-interface",
+ "futures",
  "greeter",
  "kv",
  "kv-interface",

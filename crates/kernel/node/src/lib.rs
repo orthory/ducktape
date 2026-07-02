@@ -50,6 +50,23 @@ pub enum Error {
     Decode(#[from] serde_json::Error),
     #[error("host error: {0}")]
     Host(#[from] sdk::Error),
+    /// a node-local block-boundary fault (see [`host::FatalError`]): this node's
+    /// registry is indeterminate relative to its peers. the process must stop
+    /// applying blocks — every lane surfaces this instead of continuing.
+    #[error("{0}")]
+    Fatal(host::FatalError),
+}
+
+impl From<host::SubmitError> for Error {
+    fn from(e: host::SubmitError) -> Self {
+        match e {
+            // a deterministic rejection keeps its module-error shape.
+            host::SubmitError::Rejected(e) => Error::Host(e),
+            // a boundary fault keeps its fatality — callers match on this to
+            // fail-stop rather than treating it as one bad op.
+            host::SubmitError::Fatal(f) => Error::Fatal(f),
+        }
+    }
 }
 
 // ============================================================================
@@ -474,6 +491,15 @@ impl<O: Orderer> OrderedNode<O> {
     /// DRAIN — apply every frame the order delivered, STRICTLY in agreed order,
     /// via `host.submit`. returns the count applied (0 when idle) so a test can
     /// drive to a fixpoint deterministically.
+    ///
+    /// ## rejected vs fatal
+    ///
+    /// a DETERMINISTIC rejection (decode failure, module error, blown budget) is
+    /// a no-op: every honest validator finalized the identical op and rejects it
+    /// identically — the drain keeps going. a FATAL boundary fault
+    /// ([`host::SubmitError::Fatal`]) is node-local: this registry is now
+    /// indeterminate, so the drain STOPS and surfaces [`Error::Fatal`] — applying
+    /// even one more finalized op would compound a state no validator agreed on.
     pub async fn drain_delivered(&mut self) -> Result<usize, Error> {
         let delivered = self.orderer.poll_delivered();
         let mut applied = 0usize;
@@ -494,8 +520,10 @@ impl<O: Orderer> OrderedNode<O> {
             // surface each finalized block's effects for the reactor's worker
             // driver. a rejected op yields no outcome (deterministic no-op) and so
             // contributes no effects — same on every validator.
-            if let Ok(outcome) = self.host.submit_at(ctx, msg).await {
-                self.effects.extend(outcome.effects);
+            match self.host.submit_at(ctx, msg).await {
+                Ok(outcome) => self.effects.extend(outcome.effects),
+                Err(host::SubmitError::Rejected(_)) => {}
+                Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
             }
         }
         Ok(applied)

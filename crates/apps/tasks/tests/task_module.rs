@@ -202,7 +202,11 @@ fn failed_write_rolls_back_task_state() {
             .await
             .expect_err("missing task update must fail the block");
         assert!(
-            matches!(err, Error::Module(ref message) if message.contains("task not found")),
+            matches!(
+                err,
+                host::SubmitError::Rejected(Error::Module(ref message))
+                    if message.contains("task not found")
+            ),
             "unexpected error: {err:?}"
         );
 

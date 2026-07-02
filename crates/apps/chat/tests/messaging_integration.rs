@@ -408,7 +408,7 @@ fn missing_channel_rolls_back_the_shared_storage() {
             }))
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
         assert_eq!(host.module_root(DEFAULT_CHAT_TARGET).unwrap(), root0);
         assert_eq!(host.app_hash(), app0);
     });

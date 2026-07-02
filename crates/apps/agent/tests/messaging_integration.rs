@@ -374,7 +374,7 @@ fn append_turn_rolls_back_if_the_second_backing_write_fails() {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, sdk::Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(sdk::Error::Module(_))));
         assert_eq!(host.app_hash(), app_hash);
         assert_eq!(host.module_root(DEFAULT_AGENT_TARGET).unwrap(), agent_root);
         assert_eq!(
@@ -419,7 +419,7 @@ fn missing_session_rolls_back_the_agent_backing_store() {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, sdk::Error::Module(_)));
+        assert!(matches!(err, host::SubmitError::Rejected(sdk::Error::Module(_))));
         assert_eq!(host.app_hash(), app_hash);
         assert_eq!(host.module_root(DEFAULT_AGENT_TARGET).unwrap(), agent_root);
         assert_eq!(

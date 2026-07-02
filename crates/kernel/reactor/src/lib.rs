@@ -29,8 +29,11 @@ pub const MAX_WORKER_ROUNDS: u32 = 256;
 /// errors from driving the reactor.
 #[derive(Debug)]
 pub enum Error {
-    /// the host rejected a submitted op.
+    /// the host rejected a submitted op (deterministic, block rolled back).
     Host(sdk::Error),
+    /// a node-local block-boundary fault — the host registry is indeterminate
+    /// and the caller must fail-stop (see [`host::FatalError`]).
+    Fatal(host::FatalError),
     /// a worker failed to produce its result.
     Worker(String),
     /// the outer worker loop exceeded [`MAX_WORKER_ROUNDS`].
@@ -43,10 +46,20 @@ impl From<sdk::Error> for Error {
     }
 }
 
+impl From<host::SubmitError> for Error {
+    fn from(e: host::SubmitError) -> Self {
+        match e {
+            host::SubmitError::Rejected(e) => Error::Host(e),
+            host::SubmitError::Fatal(f) => Error::Fatal(f),
+        }
+    }
+}
+
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Host(e) => write!(f, "host error: {e}"),
+            Error::Fatal(e) => write!(f, "{e}"),
             Error::Worker(m) => write!(f, "worker error: {m}"),
             Error::BudgetExceeded => write!(f, "worker-round budget exceeded"),
         }
