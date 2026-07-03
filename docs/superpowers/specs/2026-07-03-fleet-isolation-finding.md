@@ -1,62 +1,71 @@
-# Fleet isolation finding (UNSOLVED — needs app-side investigation)
+# Fleet isolation finding — SOLVED (root cause + fix)
 
 - Date: 2026-07-03
 - Context: reconciling agent-driven QA into the fleet dashboard (PR #82 / #85).
-- **Status: the fleet's per-tile isolation is broken, and I could NOT fix it.**
-  This documents what's wrong, everything I tried that did **not** work, and where
-  the real problem is (the app's headless boot, not `fleet.sh` plumbing) — so the
-  next person doesn't repeat the dead ends.
+- **Status: root cause found and fixed. See PR #90 (merged to `dev`).**
 
-## The bug (confirmed)
+## Symptom
 
-`fleet.sh` isolates each instance's `$HOME`, so each app has its own `~/.ducktape`.
-That only pays off if the app boots into its **desktop/LOCAL** path and connects
-its own workspace node. It does **not**: verified read-only on a live tile,
+Fleet tiles were not isolated: every app showed `isTauri:true` but
+`state.managed===false` (REMOTE badge), no per-workspace data — they all looked
+like the shared `8844`, so the isolated `$HOME` seemed useless.
 
+## Root cause (NOT env/plumbing — a React StrictMode boot race)
+
+`DucktapeProvider`'s boot effect resolves the active `~/.ducktape` workspace
+asynchronously, guarded by a `bootStartedRef` so it runs once. Under React
+StrictMode (dev) the effect mounts → unmounts → remounts:
+
+- mount 1 sets the guard true and starts the async resolve;
+- cleanup sets `cancelled = true`;
+- mount 2 sees the guard already true → **early-returns** and never restarts;
+- mount 1's async then resolves, sees `cancelled` → **bails**.
+
+So `connectActive` never fires → the app never connects its workspace node →
+stuck unmanaged, even with a valid active workspace and a live node. It only
+surfaces when the `workspace_active`/`workspace_select` invokes are slow enough
+that cleanup wins the race — i.e. headless `tauri dev`.
+
+**This is why every prior "fix" failed** (they were all downstream of a boot that
+never connected): `VITE_DUCKTAPE_NODE_URL` via env / `vite.config` `define` /
+`.env.local`, and deferring the mount for `__TAURI_INTERNALS__`. All red herrings.
+`isTauri()` was true and the desktop branch *was* taken — it just got dropped.
+
+## The fix (PR #90, merged to `dev`)
+
+Reset the guard in the effect cleanup so the StrictMode remount re-runs the boot:
+
+```ts
+return () => {
+  cancelled = true;
+  bootStartedRef.current = false;   // <- the fix
+};
 ```
-isTauri: true,  badge: "REMOTE"  (state.managed === false)
-```
 
-In the web/REMOTE path the app dials `VITE_DUCKTAPE_NODE_URL || http://127.0.0.1:8844`,
-so absent that var **every tile talks to the shared 8844** — the isolated `$HOME`
-is never used and all tiles show one node.
+`connectActive` is idempotent (`workspace_select` adopts an already-listening node
+rather than double-spawning), so re-running the boot is safe.
 
-**Definitive check:** created a chat channel on a per-instance node (8851) via
-`/v1/submit`, reloaded the app — it did NOT appear (`No channels yet`). The app is
-not bound to the isolated node.
+**Verified end-to-end** on the headless app: with #90 + a valid active workspace +
+its node up, it boots **LOCAL** and renders that node's data — a channel created on
+the workspace node appears in the app (distinct from shared 8844). Previously stuck
+REMOTE with no data. app vitest green.
 
-## What did NOT work (dead ends — don't retry these)
+## fleet.sh follow-on (to make tiles isolated)
 
-1. **`VITE_DUCKTAPE_NODE_URL` in the app's process env** — Vite only surfaces
-   `VITE_*` from `.env` files, not `process.env`, so it never reached the client.
-2. **`vite.config.ts` `define` for `import.meta.env.VITE_DUCKTAPE_NODE_URL`** — Vite
-   handles `import.meta.env` specially; the `define` did not take. App still on 8844.
-3. **`app/.env.local` with the var** — app still did not bind to the isolated node.
-4. **Deferring the React mount until `__TAURI_INTERNALS__` is injected** (a `main.tsx`
-   guard) — did NOT flip REMOTE→LOCAL even with internals confirmed present at mount.
+With #90 in, each fleet worktree's app boots StrictMode-safe. To make a tile show a
+**live isolated** workspace (not the onboarding gate), `fleet.sh up_one` should, per
+instance:
 
-## The real problem is app-side, not fleet.sh
+1. **Rebase the worktree onto `dev`** so its app carries #90.
+2. Stage a stable `ducktape-node` **outside the shared target dir** (the tauri build
+   overwrites `target/debug/ducktape-node` with an empty placeholder → spawning it
+   fails `permission denied`); pass it as **`DUCKTAPE_NODE_BIN`** on the app env.
+3. **Seed a solo workspace** into the isolated `$HOME/.ducktape`: run the same verbs
+   `workspace_create` uses — `ducktape-node init --name <id> --dir <dir>
+   --listen/--advertised/--http/--rpc …` then `keygen --out <dir>/identity.key` — and
+   write `registry.json` with that workspace `active`.
 
-The contradiction is the crux: **`isTauri()` returns true, yet the app is
-`managed:false` (REMOTE)**. Per `DucktapeProvider`'s boot effect, `isTauri()===true`
-should take the desktop branch → `activeWorkspace()` → `connectActive` →
-`workspace_select` → `managed:true` (LOCAL). It doesn't. So the desktop/workspace
-connect is failing or being bypassed *silently* under headless `tauri dev` served
-from an external `devUrl`. Compounding it, the headless app's data layer looks
-non-functional (height stuck at the initial 0, no channels rendered from any node,
-`/v1/ws` not live), which makes UI-level verification unreliable.
-
-**Correction to an earlier draft of this doc:** it claimed the
-`VITE_DUCKTAPE_NODE_URL` fix was "verified (distinct appHash from 8844)." That was
-wrong — the distinct appHash was read from the *node* via curl; the *app's* actual
-connection was never confirmed, and later testing shows the app does not bind to the
-isolated node. No isolation fix is verified.
-
-## Recommended next step (for whoever owns the app)
-
-Investigate, in the headless `tauri dev` + external-`devUrl` setup, **why the app
-boots `isTauri:true` but `managed:false`** and why the workspace connect / data layer
-don't come up. That is the root cause; the `fleet.sh` side (isolated `$HOME`, VNC,
-dashboard, the `/tmp/tauri-mcp-<id>.sock` driving seam) is fine. Until the app boots
-LOCAL (or a client-visible node-url override lands), fleet tiles should be treated as
-**shared-node** — DOM/UI QA is valid, per-tile node-backed data is not isolated.
+Then the app boots straight to LOCAL on its own node (`workspace_select` spawns/adopts
+it via `DUCKTAPE_NODE_BIN`). No `VITE_DUCKTAPE_NODE_URL` needed — LOCAL mode uses the
+workspace, not that env. `fleet.sh`'s existing side (isolated `$HOME`, VNC, dashboard,
+the `/tmp/tauri-mcp-<id>.sock` seam) is unchanged.
