@@ -20,6 +20,7 @@
 //! this port.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -214,6 +215,14 @@ pub struct NodeHandle {
     /// crosses the actor command lane: the actor pushes into it as blocks
     /// commit, `GET /v1/telemetry` reads it directly.
     telemetry: TelemetryRing,
+    /// the forge module's on-disk repo base dir (`<storage>/<forge subdir>`);
+    /// each named repo lives at `<forge_repo>/<name>` as a real libgit2 repo.
+    /// threaded in so the git upload-pack (clone/fetch) handler can open a repo
+    /// READ-ONLY and serve its objects — the ONE route that reads forge's git
+    /// substrate directly instead of over the actor lane. `None` on a handle
+    /// that never serves the git lane (the router tests' fake actor), which
+    /// makes upload-pack a clean 500 there rather than a panic.
+    forge_repo: Option<PathBuf>,
 }
 
 impl NodeHandle {
@@ -234,8 +243,18 @@ impl NodeHandle {
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             blobs: files::BlobHandle::default(),
             telemetry: TelemetryRing::default(),
+            forge_repo: None,
         };
         (handle, cmd_rx, event_tx)
+    }
+
+    /// point this handle at the forge module's on-disk repo base dir so the git
+    /// upload-pack (clone/fetch) handler can open `<forge_repo>/<name>` and serve
+    /// its objects. the daemon passes the SAME base it hands `Forge::with_blobs`,
+    /// so the http fetch lane reads exactly the repos consensus materializes.
+    pub fn with_forge_repo(mut self, base: impl Into<PathBuf>) -> Self {
+        self.forge_repo = Some(base.into());
+        self
     }
 
     /// the blob store this surface serves. the daemon constructs its files
@@ -304,13 +323,20 @@ pub fn router(handle: NodeHandle) -> Router {
             )),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
-        // git smart-HTTP receive-pack: `git push http://<node>/forge/<repo> main`.
-        // the advertisement is tiny; the receive-pack POST carries a whole-repo
-        // packfile, so its body cap is lifted far above the json/chunk defaults.
         .route("/forge/{repo}/info/refs", get(git_info_refs))
+        // git smart-HTTP: forge is a full push+fetch remote over one route pair.
+        //   `git push  http://<node>/forge/<repo> main` — receive-pack (push)
+        //   `git clone http://<node>/forge/<repo>`      — upload-pack (fetch)
+        // the info/refs advertisement is tiny; both packfile POSTs carry a whole-
+        // repo pack, so their body caps are lifted far above the json/chunk
+        // defaults.
         .route(
             "/forge/{repo}/git-receive-pack",
-            post(git_receive_pack).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+            post(git_receive_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
+        )
+        .route(
+            "/forge/{repo}/git-upload-pack",
+            post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         )
         // the web app is served from a different origin than the node.
         .layer(CorsLayer::permissive())
@@ -455,17 +481,27 @@ async fn get_blob(State(handle): State<NodeHandle>, Path(digest): Path<String>) 
 }
 
 // ============================================================================
-// git smart-HTTP receive-pack: `git push http://<node>/forge/<repo> main`.
+// git smart-HTTP: forge is a full push+fetch remote.
 //
 // this is the ONE forge-specific corner of the surface (every other route is
-// module-agnostic opaque json). it speaks the git smart-HTTP `receive-pack`
-// protocol and bridges it to forge's consensus `Push` op:
-//   GET  /forge/{repo}/info/refs?service=git-receive-pack — advertise the head
-//   POST /forge/{repo}/git-receive-pack                   — receive the push
-// the packfile bytes land in the node-local blob store (never consensus);
-// only the (prev_oid, new_oid, pack_digest) CAS crosses into a block. the
-// daemon does NOT verify pack closure — forge's in-module `materialize` does,
-// against the repo's existing objects (which resolves thin-pack deltas).
+// module-agnostic opaque json). it speaks the git smart-HTTP protocol on both
+// sides so a stock `git` clones, pulls, and pushes `http://<node>/forge/<repo>`:
+//   GET  /forge/{repo}/info/refs?service=git-receive-pack — advertise for push
+//   GET  /forge/{repo}/info/refs?service=git-upload-pack  — advertise for fetch
+//   POST /forge/{repo}/git-receive-pack                   — receive a push
+//   POST /forge/{repo}/git-upload-pack                    — serve a fetch/clone
+//
+// PUSH bridges to forge's consensus `Push` op: the packfile bytes land in the
+// node-local blob store (never consensus); only the (prev_oid, new_oid,
+// pack_digest) CAS crosses into a block, and forge's in-module `materialize`
+// verifies the pack against the repo's objects.
+//
+// FETCH reads forge's git substrate DIRECTLY — the one route that opens the
+// on-disk repo (`<forge_repo>/<name>`, threaded onto the handle) instead of
+// talking to the actor. it builds a packfile of the wanted oids' full closure
+// and streams it back on side-band-64k. the MVP ignores `have`s and always
+// serves a full closure — always correct, just larger than an incremental
+// fetch; `git pull` works, it just refetches.
 // ============================================================================
 
 /// the capabilities forge's receive-pack advertises. deliberately NO
@@ -474,6 +510,20 @@ async fn get_blob(State(handle): State<NodeHandle>, Path(digest): Path<String>) 
 /// needs to read.
 const GIT_RECEIVE_PACK_CAPS: &str =
     "report-status report-status-v2 delete-refs ofs-delta agent=ducktape-forge/0.1";
+/// the capabilities forge's upload-pack (fetch/clone) advertises. `side-band-64k`
+/// muxes the packfile onto band 1 of the reply — git clients request it by
+/// default; `multi_ack_detailed` is the modern negotiation, `thin-pack`/
+/// `ofs-delta` are standard pack encodings. no fetch-side extras (shallow /
+/// filter): the MVP serves a full closure.
+const GIT_UPLOAD_PACK_CAPS: &str =
+    "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
+/// the body cap for a git packfile POST — push (whole-repo pack) and fetch
+/// (want/have negotiation). lifted far above the json/chunk defaults.
+const GIT_PACK_BODY_LIMIT: usize = 512 * 1024 * 1024;
+/// max PACK bytes per side-band-64k data pkt-line: prefixed with the 1-byte band
+/// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
+/// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
+const GIT_SIDE_BAND_CHUNK: usize = 65515;
 /// the only ref this MVP applies a push to; multi-branch is future work. both
 /// `git push <remote> main` and `git push <remote> HEAD:main` send this ref.
 const GIT_MAIN_REF: &str = "refs/heads/main";
@@ -613,10 +663,43 @@ pub struct InfoRefsParams {
     pub service: Option<String>,
 }
 
-/// GET /forge/{repo}/info/refs?service=git-receive-pack — the smart-HTTP ref
-/// advertisement `git push` fetches first to learn the remote's current head
-/// (its CAS baseline). only receive-pack (push) is served; upload-pack (fetch/
-/// clone) is a later phase.
+/// which smart-HTTP service an info/refs advertisement is for — push
+/// (receive-pack) or fetch (upload-pack). the two differ only in the banner,
+/// the capability set, the content-type, and whether a `HEAD` line rides along.
+#[derive(Clone, Copy)]
+enum GitService {
+    Receive,
+    Upload,
+}
+
+impl GitService {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Receive => "git-receive-pack",
+            Self::Upload => "git-upload-pack",
+        }
+    }
+    fn caps(self) -> &'static str {
+        match self {
+            Self::Receive => GIT_RECEIVE_PACK_CAPS,
+            Self::Upload => GIT_UPLOAD_PACK_CAPS,
+        }
+    }
+    fn advertisement_content_type(self) -> &'static str {
+        match self {
+            Self::Receive => "application/x-git-receive-pack-advertisement",
+            Self::Upload => "application/x-git-upload-pack-advertisement",
+        }
+    }
+}
+
+/// GET /forge/{repo}/info/refs?service=… — the smart-HTTP ref advertisement a
+/// `git push`/`git clone` fetches FIRST to learn the remote's current head. the
+/// advertised head is forge's COMMITTED head (from the actor lane, so it matches
+/// consensus); the fetch POST then serves the matching objects off disk. both
+/// receive-pack (push) and upload-pack (fetch) are served — the v0 banner we
+/// send makes git speak the classic protocol for the follow-up POST even when it
+/// probed with `Git-Protocol: version=2`.
 async fn git_info_refs(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,
@@ -625,39 +708,59 @@ async fn git_info_refs(
     let Some(repo) = norm_repo(&repo) else {
         return error_response(StatusCode::NOT_FOUND, "no such repo");
     };
-    if params.service.as_deref() != Some("git-receive-pack") {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "only the git-receive-pack service is served",
-        );
-    }
+    let service = match params.service.as_deref() {
+        Some("git-receive-pack") => GitService::Receive,
+        Some("git-upload-pack") => GitService::Upload,
+        _ => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "only git-receive-pack and git-upload-pack are served",
+            );
+        }
+    };
+    git_advertise_refs(&handle, &repo, service).await
+}
 
-    let head = match forge_head(&handle, &repo).await {
+/// build the smart-HTTP ref advertisement for `service`: the service banner, a
+/// flush, the ref line(s), then a flush. an unborn repo advertises the null oid
+/// against the magic `capabilities^{}` ref (so caps ride along with no real ref)
+/// — a clone then reports an empty repository. a born repo advertises its head
+/// against refs/heads/main with caps after a NUL; a fetch advertisement ALSO
+/// emits a `HEAD` line at the same oid so `git clone` resolves the branch to
+/// check out (git matches HEAD's oid to refs/heads/main).
+async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService) -> Response {
+    let head = match forge_head(handle, repo).await {
         Ok(head) => head,
         Err(resp) => return resp,
     };
+    let caps = service.caps();
 
     let mut body = Vec::new();
-    // the service banner + flush: the framing git expects before the ref list.
-    body.extend_from_slice(&pkt_line(b"# service=git-receive-pack\n"));
+    body.extend_from_slice(&pkt_line(
+        format!("# service={}\n", service.name()).as_bytes(),
+    ));
     body.extend_from_slice(GIT_FLUSH_PKT);
-    // the single ref line. an unborn repo advertises the null oid against the
-    // magic `capabilities^{}` ref (so caps still ride along with no real ref);
-    // a born repo advertises its head against refs/heads/main. caps follow a NUL.
-    let ref_line = match head {
-        Some(oid) => format!("{oid} {GIT_MAIN_REF}\0{GIT_RECEIVE_PACK_CAPS}\n"),
-        None => format!("{GIT_ZERO_OID} capabilities^{{}}\0{GIT_RECEIVE_PACK_CAPS}\n"),
-    };
-    body.extend_from_slice(&pkt_line(ref_line.as_bytes()));
+    match head {
+        Some(oid) => {
+            body.extend_from_slice(&pkt_line(
+                format!("{oid} {GIT_MAIN_REF}\0{caps}\n").as_bytes(),
+            ));
+            if matches!(service, GitService::Upload) {
+                body.extend_from_slice(&pkt_line(format!("{oid} HEAD\n").as_bytes()));
+            }
+        }
+        None => {
+            body.extend_from_slice(&pkt_line(
+                format!("{GIT_ZERO_OID} capabilities^{{}}\0{caps}\n").as_bytes(),
+            ));
+        }
+    }
     body.extend_from_slice(GIT_FLUSH_PKT);
 
     (
         StatusCode::OK,
         [
-            (
-                header::CONTENT_TYPE,
-                "application/x-git-receive-pack-advertisement",
-            ),
+            (header::CONTENT_TYPE, service.advertisement_content_type()),
             (header::CACHE_CONTROL, "no-cache"),
         ],
         body,
@@ -789,6 +892,154 @@ async fn git_receive_pack(
         }
         Err(_) => actor_gone(),
     }
+}
+
+/// POST /forge/{repo}/git-upload-pack — serve a fetch/clone. parse the pkt-line
+/// negotiation (`want <oid>` lines, capabilities on the FIRST; `have`/`done`
+/// lines are read but IGNORED — the MVP serves a full closure), open
+/// `<forge_repo>/{repo}` READ-ONLY, build a packfile of the wanted oids' closure,
+/// and reply `NAK` then the pack muxed on side-band-64k band 1. incremental
+/// (`have`-aware) fetch is future work: a full pack is always correct, just
+/// larger, and `git pull` still works (it refetches).
+async fn git_upload_pack(
+    State(handle): State<NodeHandle>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let Some(repo) = norm_repo(&repo) else {
+        return error_response(StatusCode::NOT_FOUND, "no such repo");
+    };
+    let Some(forge_repo) = handle.forge_repo.clone() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "forge repo path not configured on this node",
+        );
+    };
+    let body = match body {
+        Ok(bytes) => bytes,
+        // the DefaultBodyLimit layer rejects an oversized request with 413.
+        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+    };
+    let body = match decode_git_body(&headers, &body) {
+        Ok(bytes) => bytes,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    // the request opens with the `want` list (caps on the first want), then a
+    // flush-pkt, then have/done lines. parse_pkt_lines returns exactly the want
+    // section; the have/done tail after the flush is deliberately ignored (the
+    // full-closure MVP negotiates no common base).
+    let (lines, _rest) = match parse_pkt_lines(&body) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("malformed git-upload-pack request: {msg}"),
+            );
+        }
+    };
+
+    let mut wants: Vec<String> = Vec::new();
+    let mut side_band = false;
+    let mut first_want = true;
+    for line in &lines {
+        let text = std::str::from_utf8(line).map(str::trim_end).unwrap_or("");
+        let Some(rest) = text.strip_prefix("want ") else {
+            continue;
+        };
+        // `want <oid>[ <cap> <cap> …]` — the oid then space-separated caps on the
+        // first want line only.
+        let mut toks = rest.split(' ');
+        let Some(oid) = toks.next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        wants.push(oid.to_string());
+        if first_want {
+            side_band = toks.any(|c| c == "side-band-64k");
+            first_want = false;
+        }
+    }
+    if wants.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "git-upload-pack request carried no want lines",
+        );
+    }
+
+    // the pack build is blocking git2 IO over a non-Send `Repository`; run it off
+    // the async worker, moving only Send data (the dir + hex oids) across.
+    let repo_dir = forge_repo.join(&repo);
+    let pack = match tokio::task::spawn_blocking(move || build_upload_pack(&repo_dir, &wants)).await
+    {
+        Ok(Ok(pack)) => pack,
+        Ok(Err(msg)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "git pack builder task panicked",
+            );
+        }
+    };
+
+    let mut out = Vec::new();
+    // no common base was negotiated (haves ignored), so a single NAK precedes the
+    // pack — sent as a PLAIN pkt-line, BEFORE any side-band framing begins.
+    out.extend_from_slice(&pkt_line(b"NAK\n"));
+    if side_band {
+        // band 1 = pack data, chunked to the side-band-64k ceiling.
+        for chunk in pack.chunks(GIT_SIDE_BAND_CHUNK) {
+            let mut framed = Vec::with_capacity(chunk.len() + 1);
+            framed.push(0x01);
+            framed.extend_from_slice(chunk);
+            out.extend_from_slice(&pkt_line(&framed));
+        }
+        out.extend_from_slice(GIT_FLUSH_PKT);
+    } else {
+        // the client didn't request side-band: the raw pack follows NAK directly
+        // (no band framing, no trailing flush — the pack trailer ends the stream).
+        out.extend_from_slice(&pack);
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        out,
+    )
+        .into_response()
+}
+
+/// build a self-contained packfile of the FULL object closure of `want_hexes`
+/// from the repo at `repo_dir`, opened READ-ONLY. mirrors forge's
+/// `git::pack_closure`: a revwalk seeded with every wanted oid, each reachable
+/// commit inserted (the `PackBuilder` pulls its tree/blobs and dedups objects
+/// shared between commits). single-threaded so the bytes are a pure function of
+/// the closure. any git2 failure — a missing repo dir, an oid absent from the
+/// odb, a pack-write error — is returned as a message the handler surfaces.
+fn build_upload_pack(repo_dir: &std::path::Path, want_hexes: &[String]) -> Result<Vec<u8>, String> {
+    let repo = git2::Repository::open(repo_dir).map_err(|e| format!("open forge repo: {e}"))?;
+    let mut pb = repo
+        .packbuilder()
+        .map_err(|e| format!("packbuilder: {e}"))?;
+    pb.set_threads(1);
+    let mut walk = repo.revwalk().map_err(|e| format!("revwalk: {e}"))?;
+    for hex in want_hexes {
+        let oid = git2::Oid::from_str(hex).map_err(|e| format!("bad want oid {hex}: {e}"))?;
+        walk.push(oid)
+            .map_err(|e| format!("wanted oid {hex} not present: {e}"))?;
+    }
+    for oid in walk {
+        let oid = oid.map_err(|e| format!("revwalk step: {e}"))?;
+        pb.insert_commit(oid)
+            .map_err(|e| format!("insert commit {oid}: {e}"))?;
+    }
+    let mut buf = git2::Buf::new();
+    pb.write_buf(&mut buf)
+        .map_err(|e| format!("write pack: {e}"))?;
+    Ok(buf.to_vec())
 }
 
 /// serve the client surface on `listener` until a shutdown request lands

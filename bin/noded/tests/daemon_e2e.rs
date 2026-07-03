@@ -815,3 +815,100 @@ fn git_push_over_http_lands_in_forge_head() {
         "a rejected push must not move forge HEAD"
     );
 }
+
+// ============================================================================
+// git smart-HTTP upload-pack: the FULL push -> clone round trip. this is the
+// make-or-break gate for the fetch side: after a real `git push` lands two real
+// commits, a stock `git clone` of the same URL must reconstruct the repo
+// byte-for-byte — same HEAD oid, same file bytes, and the SAME two-commit
+// history with the SAME oids (proving faithful object transfer over the wire,
+// not a re-synthesized commit).
+// ============================================================================
+
+/// every commit oid on this repo's HEAD history, newest-first, one hex per line.
+fn log_oids(dir: &Path) -> Vec<u8> {
+    let out = git_capture(dir, &["log", "--format=%H"]);
+    assert!(out.status.success(), "git log failed:\n{}", render(&out));
+    out.stdout
+}
+
+#[test]
+fn git_clone_over_http_round_trips_full_history() {
+    if !have_git() {
+        eprintln!("skipping git_clone_over_http_round_trips_full_history: no `git` on PATH");
+        return;
+    }
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let url = format!("http://127.0.0.1:{}/forge/roundtrip", daemon.port);
+
+    // a scratch repo with TWO real commits, pushed to the daemon over http.
+    let work = tempfile::TempDir::new().expect("git work dir");
+    let wd = work.path();
+    git_ok(wd, &["init"]);
+    commit_file(wd, "readme.md", "line one\n", "first commit");
+    commit_file(wd, "readme.md", "line one\nline two\n", "second commit");
+    git_ok(wd, &["remote", "add", "ducktape", &url]);
+    let push = git_capture(wd, &["push", "ducktape", "main"]);
+    eprintln!("=== git push (2 commits) ===\n{}", render(&push));
+    assert!(push.status.success(), "push failed:\n{}", render(&push));
+
+    let pushed_head = rev_parse_head(wd);
+    assert_eq!(
+        forge_head(&daemon, "roundtrip"),
+        Some(pushed_head.clone()),
+        "forge HEAD must equal the pushed commit before we clone it back"
+    );
+    let pushed_oids = log_oids(wd);
+
+    // THE gate: a real `git clone` of the same URL into a fresh dir exits 0.
+    let clone_root = tempfile::TempDir::new().expect("clone root dir");
+    let dst = clone_root.path().join("clone");
+    let clone = git_capture(
+        clone_root.path(),
+        &["clone", &url, dst.to_str().expect("utf-8 clone path")],
+    );
+    eprintln!("=== git clone ===\n{}", render(&clone));
+    assert!(
+        clone.status.success(),
+        "git clone failed:\n{}",
+        render(&clone)
+    );
+
+    // the cloned HEAD is the pushed HEAD, to the oid.
+    let cloned_head = rev_parse_head(&dst);
+    assert_eq!(
+        cloned_head, pushed_head,
+        "cloned HEAD must equal the pushed HEAD"
+    );
+
+    // the checked-out file bytes match the source byte-for-byte.
+    let cloned_bytes = std::fs::read(dst.join("readme.md")).expect("read cloned file");
+    assert_eq!(
+        cloned_bytes, b"line one\nline two\n",
+        "cloned file content must match the pushed content byte-for-byte"
+    );
+
+    // full history: `git log --oneline` shows BOTH commits...
+    let log = git_capture(&dst, &["log", "--oneline"]);
+    eprintln!("=== git log --oneline (clone) ===\n{}", render(&log));
+    assert!(log.status.success(), "git log failed:\n{}", render(&log));
+    let log_text = String::from_utf8_lossy(&log.stdout);
+    assert_eq!(
+        log_text.lines().count(),
+        2,
+        "the clone must carry both commits:\n{log_text}"
+    );
+    assert!(
+        log_text.contains("first commit") && log_text.contains("second commit"),
+        "both commit messages must survive the clone:\n{log_text}"
+    );
+
+    // ...with the SAME oids in the SAME order as the source repo — the proof of
+    // faithful object transfer (real history, not a reconstructed commit).
+    assert_eq!(
+        log_oids(&dst),
+        pushed_oids,
+        "the cloned history oids must match the pushed repo exactly"
+    );
+}

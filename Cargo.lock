@@ -4085,6 +4085,7 @@ dependencies = [
  "forge",
  "forge-interface",
  "futures",
+ "git2",
  "host",
  "http-body-util",
  "inbox",
