@@ -1363,6 +1363,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    // point the http handle at this node's forge repo base (the same
+    // `storage/forge-repo` the host materializes into) so the git upload-pack
+    // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
+    let http_handle = http_handle.with_forge_repo(storage.join("forge-repo"));
     let blobs = http_handle.blob_handle();
     match http_listen.as_deref() {
         Some(addr) if !sync_only && !joiner => {

@@ -159,8 +159,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = storage.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("ducktape-noded-{}", std::process::id()))
     });
+    // forge's on-disk repo base, derived ONCE: the node actor's `Forge` and the
+    // http git upload-pack (clone) lane must agree on it, so both are handed the
+    // same path — the actor to materialize into, the http handle to serve from.
+    let forge_repo = storage.join("forge-git");
 
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
+    let handle = handle.with_forge_repo(forge_repo.clone());
 
     // the node actor gets its own thread: commonware's tokio runner owns that
     // thread's runtime, and the host must never leave it. the blob handle and
@@ -168,11 +173,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // registers the files module over the blobs and pushes per-block telemetry
     // into the ring, while the http layer reads both through its own clones.
     let actor_storage = storage.clone();
+    let actor_forge_repo = forge_repo.clone();
     let blobs = handle.blob_handle();
     let telemetry = handle.telemetry_ring();
     std::thread::Builder::new()
         .name("node-actor".into())
-        .spawn(move || run_node(actor_storage, blobs, telemetry, cmd_rx, event_tx))?;
+        .spawn(move || {
+            run_node(
+                actor_storage,
+                actor_forge_repo,
+                blobs,
+                telemetry,
+                cmd_rx,
+                event_tx,
+            )
+        })?;
 
     println!(
         "[noded] listening on {listen}, storage {}",
@@ -195,12 +210,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// commands in arrival order — every submit is its own block.
 fn run_node(
     storage: PathBuf,
+    forge_repo: PathBuf,
     blobs: files::BlobHandle,
     telemetry: TelemetryRing,
     mut cmds: mpsc::Receiver<NodeCommand>,
     events: broadcast::Sender<WsFrame>,
 ) {
-    let forge_repo = storage.join("forge-git");
+    // forge_repo is derived by the caller (shared with the http upload-pack lane).
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
