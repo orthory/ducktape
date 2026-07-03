@@ -82,8 +82,14 @@ const makeFakeNode = () => {
       if (target === "forge") {
         return Promise.resolve({ Head: forgeHead });
       }
+      if (target === "agent") {
+        if (query === "Agents") return Promise.resolve({ Agents: [] });
+        if (query === "Watches") return Promise.resolve({ Watches: [] });
+        return Promise.resolve({ Runs: [] });
+      }
       return Promise.resolve({ Tasks: [] });
     }),
+    putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
     status: vi.fn().mockResolvedValue({
       version: "0.1.0",
       appHash: "aa".repeat(32),

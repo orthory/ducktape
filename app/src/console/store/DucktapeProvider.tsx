@@ -27,6 +27,8 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 
+import * as agentClient from "../../domain/agent-client";
+import type { TurnPolicy } from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
 import type { Block, BlockKind } from "../../domain/document-client";
@@ -121,6 +123,27 @@ export interface ConsoleActions {
   removeBlock(blockId: string): void;
   /** Move a block within the active doc (see the `after` rule). */
   moveBlock(params: { blockId: string; after: string | null }): void;
+
+  // ── Agents (collaboration loop over the `agent` module) ──
+  /** Upload the prompt text to the blob store, then RegisterAgent with the
+   *  resulting 32-byte digest as its prompt_hash. */
+  registerAgent(params: {
+    displayName: string;
+    agentId: string;
+    modelRef: string;
+    prompt: string;
+    allowedActions: string[];
+  }): void;
+  /** Pause / resume an agent (owner-gated). */
+  pauseAgent(agentId: string): void;
+  resumeAgent(agentId: string): void;
+  /** Watch a channel under a turn policy / drop the watch. */
+  watchChannel(params: { channelId: string; policy: TurnPolicy }): void;
+  unwatchChannel(channelId: string): void;
+  /** Explicitly run an agent against a channel anchor. */
+  requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
+  /** Cancel an awaiting run (run-creator or owner only). */
+  cancelRun(runId: string): void;
 
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
@@ -306,9 +329,15 @@ export function DucktapeProvider({
             activeDoc
               ? documentClient.getDoc(live, activeDoc)
               : Promise.resolve<Block[] | null>(null),
+            agentClient.agents(live),
+            agentClient.watches(live),
+            // newest-first for the timeline; Runs is ascending on the wire.
+            agentClient
+              .runs(live, { channelId: null, limit: 50 })
+              .then((list) => [...list].reverse()),
           ]),
         )
-        .then(([status, channels, tasks, forgeHead, docBlocks]) => {
+        .then(([status, channels, tasks, forgeHead, docBlocks, agents, watches, runs]) => {
           const current = stateRef.current.activeChannel;
           const active =
             current && channels.some((c) => c.id === current)
@@ -327,6 +356,9 @@ export function DucktapeProvider({
                 activeChannel: active,
                 messages,
                 activeDocBlocks: docBlocks ?? [],
+                agents,
+                watches,
+                runs,
               })),
             );
         })
@@ -570,6 +602,85 @@ export function DucktapeProvider({
         );
       },
 
+      // ── Agents ──
+      registerAgent: ({ displayName, agentId, modelRef, prompt, allowedActions }) => {
+        const id = agentId.trim();
+        const name = displayName.trim();
+        const model = modelRef.trim();
+        if (!id || !name || !model) return;
+        submitThenRefresh((live) =>
+          // stage the prompt in the node's blob store, then register with its
+          // digest as prompt_hash — the blob is keyed by sha256(bytes), which
+          // IS the hash the oracle worker fetches the prompt by.
+          Promise.resolve()
+            .then(() => live.putBlob(new TextEncoder().encode(prompt)))
+            .then((digest) =>
+              agentClient.registerAgent(live, {
+                agentId: id,
+                displayName: name,
+                modelRef: model,
+                promptHash: agentClient.hexToBytes(digest),
+                allowedActions,
+                origin: stateRef.current.author,
+              }),
+            ),
+        );
+      },
+
+      pauseAgent: (agentId) => {
+        if (!agentId) return;
+        submitThenRefresh((live) =>
+          agentClient.pauseAgent(live, { agentId, origin: stateRef.current.author }),
+        );
+      },
+
+      resumeAgent: (agentId) => {
+        if (!agentId) return;
+        submitThenRefresh((live) =>
+          agentClient.resumeAgent(live, { agentId, origin: stateRef.current.author }),
+        );
+      },
+
+      watchChannel: ({ channelId, policy }) => {
+        if (!channelId) return;
+        submitThenRefresh((live) =>
+          agentClient.watchChannel(live, {
+            channelId,
+            policy,
+            origin: stateRef.current.author,
+          }),
+        );
+      },
+
+      unwatchChannel: (channelId) => {
+        if (!channelId) return;
+        submitThenRefresh((live) =>
+          agentClient.unwatchChannel(live, {
+            channelId,
+            origin: stateRef.current.author,
+          }),
+        );
+      },
+
+      requestRun: ({ agentId, channelId, anchorSeq }) => {
+        if (!agentId || !channelId) return;
+        submitThenRefresh((live) =>
+          agentClient.requestRun(live, {
+            agentId,
+            channelId,
+            anchorSeq,
+            origin: stateRef.current.author,
+          }),
+        );
+      },
+
+      cancelRun: (runId) => {
+        if (!runId) return;
+        submitThenRefresh((live) =>
+          agentClient.cancelRun(live, { runId, origin: stateRef.current.author }),
+        );
+      },
+
       stopNode: () => {
         const url = stateRef.current.nodeUrl;
         if (!url || !stateRef.current.managed) return;
@@ -643,6 +754,9 @@ export function DucktapeProvider({
           docIds: [],
           activeDoc: null,
           activeDocBlocks: [],
+          agents: [],
+          watches: [],
+          runs: [],
           onboardingPhase: null,
         }));
         connectActive(target).catch(fail);

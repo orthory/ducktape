@@ -42,6 +42,15 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M9.5 12h5M9.5 15.5h5" />
     </>
   ),
+  agent: (
+    <>
+      <rect x="5" y="8" width="14" height="11" rx="3" />
+      <path d="M12 4.7V8" />
+      <circle cx="12" cy="4" r="1.1" />
+      <circle cx="9.6" cy="13.3" r="1" />
+      <circle cx="14.4" cy="13.3" r="1" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof PATHS;

@@ -2,6 +2,7 @@
 // (channels/messages/tasks/status re-queried per block) plus local ui state
 // (screen, accent, author identity, thread panel).
 
+import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client";
 import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
 import type { Block } from "../../domain/document-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
@@ -40,6 +41,14 @@ export interface ConsoleState {
   /** Ordered blocks of the active doc (re-queried per block / on open). */
   activeDocBlocks: Block[];
 
+  // ── Agents (collaboration loop; see agent-client) ──
+  /** Every registered agent, re-queried per block like tasks. */
+  agents: AgentRecord[];
+  /** Every channel watch and its turn policy. */
+  watches: WatchView[];
+  /** Recent runs across all channels, newest-first for the timeline. */
+  runs: RunView[];
+
   error: string | null;
 
   // ── Workspaces / onboarding (desktop only; inert on web) ──
@@ -77,6 +86,9 @@ export const createInitialState = (): ConsoleState => ({
   docIds: [],
   activeDoc: null,
   activeDocBlocks: [],
+  agents: [],
+  watches: [],
+  runs: [],
   error: null,
   workspaces: [],
   workspace: null,
