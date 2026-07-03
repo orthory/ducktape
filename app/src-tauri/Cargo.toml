@@ -20,6 +20,7 @@ tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-pn
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
 # dev-only debug bridge: a local unix socket the app/scripts/tauri-debug.mjs
 # helper drives (screenshot / execute_js / input). registration is cfg-gated to

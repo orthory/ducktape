@@ -12,6 +12,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod forge_git;
 mod tray;
 mod workspaces;
 
@@ -27,6 +28,11 @@ fn main() {
             workspaces::workspace_admit,
             workspaces::workspace_select,
             workspaces::workspace_phase,
+            forge_git::forge_head,
+            forge_git::forge_log,
+            forge_git::forge_tree,
+            forge_git::forge_read_file,
+            forge_git::forge_diff,
             tray::tray_open_console,
             tray::tray_quit,
         ])
