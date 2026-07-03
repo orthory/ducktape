@@ -135,6 +135,29 @@ fn node_binary() -> Result<NodeBinary, String> {
     ))
 }
 
+/// resolve the networked `ducktape-node` binary path for the workspace flow:
+/// the `DUCKTAPE_NODE_BIN` override, else the sibling next to this executable.
+/// unlike [`node_binary`] there is no legacy-noded fallback — workspaces always
+/// run the network-shape node (real identity, real descriptor).
+pub(crate) fn resolve_node_bin() -> Result<PathBuf, String> {
+    if let Ok(explicit) = std::env::var("DUCKTAPE_NODE_BIN") {
+        return Ok(PathBuf::from(explicit));
+    }
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "app executable has no parent dir".to_string())?;
+    let sibling = dir.join(format!("ducktape-node{}", std::env::consts::EXE_SUFFIX));
+    if usable(&sibling) {
+        return Ok(sibling);
+    }
+    Err(format!(
+        "no usable ducktape-node at {} — stage it with `bun run sidecar` \
+         (or `make sidecar` at the repo root), or set DUCKTAPE_NODE_BIN",
+        sibling.display()
+    ))
+}
+
 /// a real node binary: present, non-empty, executable.
 fn usable(path: &PathBuf) -> bool {
     let Ok(meta) = fs::metadata(path) else {
@@ -155,14 +178,14 @@ fn usable(path: &PathBuf) -> bool {
 }
 
 #[cfg(unix)]
-fn detach(cmd: &mut Command) {
+pub(crate) fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
     // own process group: terminal signals aimed at the app never reach it
     cmd.process_group(0);
 }
 
 #[cfg(windows)]
-fn detach(cmd: &mut Command) {
+pub(crate) fn detach(cmd: &mut Command) {
     use std::os::windows::process::CommandExt as _;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;

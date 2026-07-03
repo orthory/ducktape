@@ -2029,8 +2029,11 @@ checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 name = "ducktape-desktop"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
+ "toml 0.8.23",
 ]
 
 [[package]]
