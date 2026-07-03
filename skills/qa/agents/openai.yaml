@@ -1,0 +1,4 @@
+interface:
+  display_name: "QA"
+  short_description: "Boot an isolated real Ducktape app per worktree and drive it."
+  default_prompt: "Use $qa to boot a fully isolated Ducktape desktop instance for a worktree (its own vite port, debug socket, daemon port, and daemon data dir) and drive the real native window via tauri-debug, so several worktrees' apps can be QA'd at once without colliding."

@@ -91,7 +91,15 @@ pub struct PhaseReport {
 // ── Path + registry io ──────────────────────────────────
 
 /// `~/.ducktape` — the registry root. created on demand.
+///
+/// overridable via `DUCKTAPE_HOME` (an absolute registry root, used verbatim —
+/// not joined with `.ducktape`) so several worktree QA instances can each keep a
+/// PRIVATE registry with its own workspaces, ports, and storage instead of
+/// sharing the one home-dir registry. unset → today's `~/.ducktape`.
 fn root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("DUCKTAPE_HOME") {
+        return Ok(PathBuf::from(dir));
+    }
     let home = app
         .path()
         .home_dir()
