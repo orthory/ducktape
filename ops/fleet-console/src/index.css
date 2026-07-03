@@ -110,13 +110,14 @@ body {
 
 /* graph view */
 .graph { flex: 1; min-height: 0; }
-.graph-node { width: 340px; }
-.graph-node[data-collapsed] { width: 280px; }
-/* xyflow nodes size to content — pin the live tile's screen so the RFB canvas
-   scales into a fixed box instead of blowing the node up to framebuffer size. */
-.graph-node .tile { width: 340px; }
-.graph-node .tile-screen { width: 340px; height: 190px; aspect-ratio: auto; overflow: hidden; }
-.graph-node .tile-screen .rfb { width: 340px; height: 190px; }
+/* Hard-cap each node's box to the exact height toGraph reserves for it (280
+   live / 92 collapsed) with overflow:hidden — so a node can NEVER spill into the
+   one packed below it, no matter how the RFB canvas sizes itself. */
+.graph-node { width: 340px; height: 272px; overflow: hidden; }
+.graph-node[data-collapsed] { width: 280px; height: 78px; }
+.graph-node .tile { width: 100%; height: 100%; }
+.graph-node .tile-screen { height: 190px; aspect-ratio: auto; overflow: hidden; flex: none; }
+.graph-node .tile-screen .rfb { width: 100%; height: 190px; }
 .graph-node .tile-screen canvas { max-width: 100%; max-height: 100%; }
 /* non-running worktrees: collapsed, disabled-looking, no screen */
 .tile[data-collapsed] { opacity: 0.5; }

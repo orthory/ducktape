@@ -16,8 +16,8 @@ export const isCollapsed = (n: FleetNode): boolean => n.status !== "up";
 
 const NODE_W = 340;
 const COL_GAP = 110; // horizontal gap between the base column and children
-const H_LIVE = 280; // header + pinned 190px screen + footer
-const H_COLLAPSED = 92; // header + activity only
+const H_LIVE = 272; // header + pinned 190px screen + footer (matches css cap)
+const H_COLLAPSED = 78; // header + activity only (matches css cap)
 const V_GAP = 18;
 
 const heightOf = (n: FleetNode): number =>
