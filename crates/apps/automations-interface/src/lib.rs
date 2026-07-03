@@ -7,8 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// what makes a rule fire. v1 has a single chat-post trigger. every `None`
-/// field is a wildcard; every `Some` field must match the triggering event.
+/// what makes a rule fire. every `None` field is a wildcard; every `Some` field
+/// must match the triggering event.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Trigger {
     MessagePosted {
@@ -21,9 +21,18 @@ pub enum Trigger {
         /// text blocks; `None` = no text constraint.
         text_contains: Option<String>,
     },
+    MemoryPublished {
+        /// a memory subtree prefix, or `None` for any published path. when set,
+        /// matching is segment-aware: `/a` matches `/a` and `/a/b`, never `/ab`.
+        prefix: Option<String>,
+        /// matches `event.meta["kind"]`; `None` = no kind constraint.
+        meta_kind: Option<String>,
+        /// case-sensitive substring tested against the memory event author.
+        author_contains: Option<String>,
+    },
 }
 
-/// what a firing rule does. v1 posts a chat message or creates a task.
+/// what a firing rule does.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// post `template` (after placeholder substitution) into `channel_id`. the
@@ -38,6 +47,13 @@ pub enum Action {
     CreateTask {
         task_id_prefix: String,
         title_template: String,
+    },
+    /// deliver an inbox notification. `kind` is literal; `member_template` and
+    /// `body_template` are substituted at fire time.
+    DeliverInbox {
+        member_template: String,
+        kind: String,
+        body_template: String,
     },
 }
 
@@ -57,6 +73,8 @@ pub struct Rule {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
     pub rule_id: String,
+    /// for chat-triggered records this is the triggering channel id; for
+    /// memory-triggered records this carries the triggering memory path.
     pub channel_id: String,
     pub seq: u64,
     pub height: u64,

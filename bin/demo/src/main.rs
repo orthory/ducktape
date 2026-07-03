@@ -84,7 +84,7 @@ fn main() {
         let memory = Memory::new("memory");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
-        let automations = Automations::new("automations", "chat", "tasks");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),

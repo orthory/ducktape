@@ -253,7 +253,13 @@ async fn genesis_host(
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
-        Box::new(Automations::new("automations", "chat", "tasks")),
+        Box::new(Automations::new(
+            "automations",
+            "chat",
+            "tasks",
+            "inbox",
+            "memory",
+        )),
     ])
     .expect("genesis host")
 }
@@ -341,7 +347,7 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("directory install: {e}"))?;
 
-    let mut automations = Automations::new("automations", "chat", "tasks");
+    let mut automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
     let (bytes, root) = snapshot_of("automations")?;
     automations
         .install(bytes, root)
@@ -502,7 +508,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("jobs install: {e}"))?;
 
     let (bytes, root) = snapshot_of("automations").await?;
-    let mut automations = Automations::new("automations", "chat", "tasks");
+    let mut automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
     automations
         .install(&bytes, root)
         .map_err(|e| format!("automations install: {e}"))?;
