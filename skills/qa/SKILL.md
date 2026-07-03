@@ -44,15 +44,16 @@ ops/fleet.sh down <branch>                     # when done
 `/tmp/tauri-mcp-<id>.sock`. Independent instances are a natural fit for parallel
 agents — one per worktree, each socket-scoped.
 
-## Caveat — isolation (read before trusting per-tile data)
+## Caveat — isolation is BROKEN (read before trusting per-tile data)
 
-There is a **verified isolation bug** in the current fleet bring-up: the app boots in
-REMOTE (web-client) mode and, absent `VITE_DUCKTAPE_NODE_URL`, every tile dials the
-shared `127.0.0.1:8844` — so tiles show the *same* node's data, not per-worktree
-isolated state. UI/DOM QA is still valid; **node-backed data QA is not isolated until
-the fix lands.** See `docs/superpowers/specs/2026-07-03-fleet-isolation-finding.md` for
-the bug + the verified fix (per-instance node + `VITE_DUCKTAPE_NODE_URL` in
-`fleet.sh up_one`).
+Confirmed bug (unfixed): the app boots in REMOTE (web-client) mode and dials the
+shared `127.0.0.1:8844`, so **every tile shows the same node's data, not per-worktree
+isolated state**. UI/DOM QA over the socket is still valid; **node-backed data QA is
+NOT isolated.** The root cause is app-side (the headless app boots `isTauri:true` yet
+`managed:false`, never reaching its workspace) — not `fleet.sh`. Several plumbing
+fixes were tried and did not work. See
+`docs/superpowers/specs/2026-07-03-fleet-isolation-finding.md` for the full account
+and the recommended app-side investigation.
 
 ## Notes
 
