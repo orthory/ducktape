@@ -122,14 +122,17 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     expect(status.appHash).toMatch(/^[0-9a-f]{64}$/);
     expect(status.modules.map((m) => m.id)).toEqual([
       "chat",
+      "saga",
       "tasks",
       "inbox",
       "automations",
       "jobs",
+      "agent",
       "document",
       "forge",
       "files",
       "memory",
+      "profiles",
     ]);
   });
 

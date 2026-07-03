@@ -123,7 +123,7 @@ pub struct Effect(pub Vec<u8>);
 
 /// who triggered the current dispatch. varies across follow-ups: the root op is
 /// `External`/`System`; an emitted follow-up is `Module(emitter_id)`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Origin {
     /// an external submitter, identified by (e.g.) an ed25519 id.
     External(Vec<u8>),

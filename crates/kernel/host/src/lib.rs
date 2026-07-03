@@ -64,6 +64,24 @@ impl Default for BlockContext {
     }
 }
 
+/// one dispatch in a block's drain: the module that ran, what triggered it, and
+/// how many intents it emitted. a DETERMINISTIC structural trace — pure function
+/// of `(registry state, msg, env)`, identical on every honest validator — so it
+/// is safe to expose for observability (it carries NO wall-clock; timing lives
+/// in the effectful node layer). recorded in dispatch (drain FIFO) order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchRecord {
+    /// the module dispatched this step (`msg.target`).
+    pub module: ModuleId,
+    /// what triggered this dispatch: the root op's real `origin`, or
+    /// `Origin::Module(emitter)` for a follow-up.
+    pub origin: Origin,
+    /// count of follow-up `Msg`s this dispatch emitted (the causal fan-out).
+    pub emitted_msgs: usize,
+    /// count of observability `Event`s this dispatch emitted.
+    pub emitted_events: usize,
+}
+
 /// the result of applying one block (`submit`).
 #[derive(Debug)]
 pub struct BlockOutcome {
@@ -73,6 +91,10 @@ pub struct BlockOutcome {
     pub events: Vec<Event>,
     /// effect intents emitted during the block — stub sink this slice.
     pub effects: Vec<Effect>,
+    /// the deterministic dispatch trace: one entry per module dispatched this
+    /// block, in drain order. the "what happened" spine the node layer tags with
+    /// node-local timing for telemetry.
+    pub dispatches: Vec<DispatchRecord>,
 }
 
 /// a finalized consensus boundary the host is allowed to serve from.
@@ -430,7 +452,7 @@ impl Host {
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
 
         match self.drain(ctx, msg, &mut touched).await {
-            Ok((events, effects)) => {
+            Ok((events, effects, dispatches)) => {
                 // clean drain: publish every touched module's staged writes. this
                 // is the ONLY place a module's state advances, so recompose the
                 // app-hash AFTER. a commit failure is FATAL, not a rejection: the
@@ -451,6 +473,7 @@ impl Host {
                     app_hash: self.app_hash(),
                     events,
                     effects,
+                    dispatches,
                 })
             }
             Err(e) => {
@@ -491,7 +514,7 @@ impl Host {
         ctx: BlockContext,
         msg: Msg,
         touched: &mut BTreeSet<ModuleId>,
-    ) -> Result<(Vec<Event>, Vec<Effect>), Error> {
+    ) -> Result<(Vec<Event>, Vec<Effect>, Vec<DispatchRecord>), Error> {
         // block-constant across every dispatch this block — the agreed values.
         let height = ctx.height;
         let consensus_time = ctx.consensus_time;
@@ -500,6 +523,7 @@ impl Host {
         let mut queue: VecDeque<(Origin, Msg)> = VecDeque::from([(ctx.origin, msg)]);
         let mut events: Vec<Event> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
+        let mut dispatches: Vec<DispatchRecord> = Vec::new();
         let mut n: u32 = 0;
 
         while let Some((origin, msg)) = queue.pop_front() {
@@ -526,11 +550,13 @@ impl Host {
                 .collect();
             snapshot.insert(msg.target.clone(), me.root());
 
+            // keep the trigger origin for the dispatch record; the env takes a clone.
+            let trigger = origin;
             let mut ctx = HostCtx {
                 env: Env {
                     height,
                     consensus_time,
-                    origin,
+                    origin: trigger.clone(),
                     me: msg.target.clone(),
                 },
                 snapshot,
@@ -556,6 +582,16 @@ impl Host {
             self.registry.insert(msg.target.clone(), me);
             res?;
 
+            // record this (successful) dispatch for the deterministic trace. only
+            // committed blocks yield a BlockOutcome, so a later abort discards the
+            // whole trace with the block — it never reports a rolled-back dispatch.
+            dispatches.push(DispatchRecord {
+                module: msg.target.clone(),
+                origin: trigger,
+                emitted_msgs: out_msgs.len(),
+                emitted_events: out_events.len(),
+            });
+
             // local-only re-entry: emitted msgs become follow-up ops, never
             // re-broadcast. events/effects leave the state machine.
             for m in out_msgs {
@@ -565,7 +601,7 @@ impl Host {
             effects.extend(out_effects);
         }
 
-        Ok((events, effects))
+        Ok((events, effects, dispatches))
     }
 }
 

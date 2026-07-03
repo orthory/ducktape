@@ -51,6 +51,7 @@ const PATHS: Record<string, ReactNode> = {
       <circle cx="14.4" cy="13.3" r="1" />
     </>
   ),
+  telemetry: <path d="M3 12.5h3.5l2-5.5 3 12 2.5-8.5 1.5 2h4.5" />,
 };
 
 export type IconName = keyof typeof PATHS;

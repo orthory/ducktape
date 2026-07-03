@@ -30,7 +30,9 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   query: vi.fn().mockResolvedValue(reply),
   putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
   status: vi.fn(),
+  telemetry: vi.fn(),
   onBlock: vi.fn(),
+  onTelemetry: vi.fn(),
 });
 
 describe("hexToBytes", () => {

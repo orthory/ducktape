@@ -103,6 +103,8 @@ const makeFakeNode = () => {
       blockListeners.add(listener);
       return () => blockListeners.delete(listener);
     }),
+    telemetry: vi.fn().mockResolvedValue([]),
+    onTelemetry: vi.fn(() => () => {}),
   };
   const finalize = (block: BlockEvent) =>
     blockListeners.forEach((notify) => notify(block));
