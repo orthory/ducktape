@@ -26,7 +26,7 @@ use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -313,6 +313,14 @@ pub fn router(handle: NodeHandle) -> Router {
             )),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
+        // git smart-HTTP receive-pack: `git push http://<node>/forge/<repo> main`.
+        // the advertisement is tiny; the receive-pack POST carries a whole-repo
+        // packfile, so its body cap is lifted far above the json/chunk defaults.
+        .route("/forge/{repo}/info/refs", get(git_info_refs))
+        .route(
+            "/forge/{repo}/git-receive-pack",
+            post(git_receive_pack).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         // the web app is served from a different origin than the node.
         .layer(CorsLayer::permissive())
         .with_state(handle)
@@ -474,6 +482,343 @@ async fn get_blob(State(handle): State<NodeHandle>, Path(digest): Path<String>) 
         )
             .into_response(),
         None => error_response(StatusCode::NOT_FOUND, "no chunk with that digest"),
+    }
+}
+
+// ============================================================================
+// git smart-HTTP receive-pack: `git push http://<node>/forge/<repo> main`.
+//
+// this is the ONE forge-specific corner of the surface (every other route is
+// module-agnostic opaque json). it speaks the git smart-HTTP `receive-pack`
+// protocol and bridges it to forge's consensus `Push` op:
+//   GET  /forge/{repo}/info/refs?service=git-receive-pack — advertise the head
+//   POST /forge/{repo}/git-receive-pack                   — receive the push
+// the packfile bytes land in the node-local blob store (never consensus);
+// only the (prev_oid, new_oid, pack_digest) CAS crosses into a block. the
+// daemon does NOT verify pack closure — forge's in-module `materialize` does,
+// against the repo's existing objects (which resolves thin-pack deltas).
+// ============================================================================
+
+/// the capabilities forge's receive-pack advertises. deliberately NO
+/// `side-band-64k`, so the client sends the report-status back as plain
+/// pkt-lines (not muxed onto a side channel) — the minimal wire this bridge
+/// needs to read.
+const GIT_RECEIVE_PACK_CAPS: &str =
+    "report-status report-status-v2 delete-refs ofs-delta agent=ducktape-forge/0.1";
+/// the only ref this MVP applies a push to; multi-branch is future work. both
+/// `git push <remote> main` and `git push <remote> HEAD:main` send this ref.
+const GIT_MAIN_REF: &str = "refs/heads/main";
+/// 40 ascii zeros: git's "null" oid — the old value of a ref being created, and
+/// the head advertised for an unborn repo.
+const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
+/// raw sha1 oid length in bytes. git's wire oids are 40 hex chars == 20 bytes;
+/// forge's `Push` op wants exactly these raw bytes (it re-length-checks too).
+const GIT_OID_RAW_LEN: usize = 20;
+/// the flush-pkt: a zero-length pkt that ends a pkt-line stream or section.
+const GIT_FLUSH_PKT: &[u8] = b"0000";
+
+/// encode one git pkt-line: a 4-hex length (INCLUDING the 4 length bytes)
+/// followed by the payload. every line this bridge emits is tiny, well under
+/// the 65516-byte payload cap, so no splitting is needed.
+fn pkt_line(payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() + 4;
+    let mut out = format!("{len:04x}").into_bytes();
+    out.extend_from_slice(payload);
+    out
+}
+
+/// split a leading pkt-line section off `buf`: parse length-framed lines until a
+/// flush-pkt (`0000`), returning each payload (WITHOUT its 4-byte length header)
+/// and the bytes AFTER the flush (for receive-pack, the raw packfile). a
+/// truncated or malformed length is a clean error, never a panic — a corrupt
+/// body becomes a 400.
+fn parse_pkt_lines(buf: &[u8]) -> Result<(Vec<Vec<u8>>, &[u8]), String> {
+    let mut lines = Vec::new();
+    let mut rest = buf;
+    loop {
+        if rest.len() < 4 {
+            return Err("truncated pkt-line length header".into());
+        }
+        let hdr =
+            std::str::from_utf8(&rest[..4]).map_err(|_| "non-ascii pkt-line length".to_string())?;
+        let len = usize::from_str_radix(hdr, 16)
+            .map_err(|_| "invalid pkt-line length hex".to_string())?;
+        if len == 0 {
+            // flush-pkt terminates the command section; the rest is the pack.
+            return Ok((lines, &rest[4..]));
+        }
+        if len < 4 || len > rest.len() {
+            return Err("pkt-line length out of range".into());
+        }
+        lines.push(rest[4..len].to_vec());
+        rest = &rest[len..];
+    }
+}
+
+/// decode an even-length hex string to raw bytes; `None` on an odd length or any
+/// non-hex nibble. turns a git pkt-line oid (40 hex) into raw sha1 bytes.
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+/// validate a `{repo}` path segment the SAME way forge's `norm_repo` does (empty
+/// -> the default repo; otherwise 1..=64 bytes of `[a-z0-9._-]` and never
+/// `.`/`..`). returns the normalized slug, or `None` for an invalid name (a 404
+/// at the route). keeping this in lockstep means an accepted URL always names a
+/// repo the module will also accept.
+fn norm_repo(repo: &str) -> Option<String> {
+    if repo.is_empty() {
+        return Some("default".to_string());
+    }
+    if repo.len() > 64 || repo == "." || repo == ".." {
+        return None;
+    }
+    repo.bytes()
+        .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+        .then(|| repo.to_string())
+}
+
+/// query the forge module for a repo's committed HEAD oid hex (`None` == unborn).
+/// errors surface as an http `Response` so callers can early-return them.
+async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, Response> {
+    let req = forge_interface::encode_query(&forge_interface::ForgeQuery::HeadOf {
+        repo: repo.to_string(),
+    });
+    let (reply, rx) = oneshot::channel();
+    handle
+        .send(NodeCommand::Query {
+            target: "forge".into(),
+            req,
+            reply,
+        })
+        .await?;
+    let bytes = rx
+        .await
+        .map_err(|_| actor_gone())?
+        .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err))?;
+    match forge_interface::decode_reply(&bytes) {
+        Ok(forge_interface::ForgeReply::Head(head)) => Ok(head),
+        Ok(_) => Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected forge reply to HeadOf",
+        )),
+        Err(err) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &err)),
+    }
+}
+
+/// build a receive-pack `report-status` body: `unpack ok`, one ref status line,
+/// then a flush. `err` is `None` for success (`ok <ref>`) or `Some(reason)` for
+/// a rejection (`ng <ref> <reason>`). the pack is always received by the time we
+/// answer, so `unpack ok` is unconditional (we don't verify closure here).
+fn git_report_status(refname: &str, err: Option<&str>) -> Response {
+    let mut body = Vec::new();
+    body.extend_from_slice(&pkt_line(b"unpack ok\n"));
+    let status_line = match err {
+        None => format!("ok {refname}\n"),
+        Some(reason) => format!("ng {refname} {reason}\n"),
+    };
+    body.extend_from_slice(&pkt_line(status_line.as_bytes()));
+    body.extend_from_slice(GIT_FLUSH_PKT);
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/x-git-receive-pack-result",
+            ),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// query params for the ref advertisement; git always sends `service=`.
+#[derive(Debug, Deserialize)]
+pub struct InfoRefsParams {
+    pub service: Option<String>,
+}
+
+/// GET /forge/{repo}/info/refs?service=git-receive-pack — the smart-HTTP ref
+/// advertisement `git push` fetches first to learn the remote's current head
+/// (its CAS baseline). only receive-pack (push) is served; upload-pack (fetch/
+/// clone) is a later phase.
+async fn git_info_refs(
+    State(handle): State<NodeHandle>,
+    Path(repo): Path<String>,
+    Query(params): Query<InfoRefsParams>,
+) -> Response {
+    let Some(repo) = norm_repo(&repo) else {
+        return error_response(StatusCode::NOT_FOUND, "no such repo");
+    };
+    if params.service.as_deref() != Some("git-receive-pack") {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "only the git-receive-pack service is served",
+        );
+    }
+
+    let head = match forge_head(&handle, &repo).await {
+        Ok(head) => head,
+        Err(resp) => return resp,
+    };
+
+    let mut body = Vec::new();
+    // the service banner + flush: the framing git expects before the ref list.
+    body.extend_from_slice(&pkt_line(b"# service=git-receive-pack\n"));
+    body.extend_from_slice(GIT_FLUSH_PKT);
+    // the single ref line. an unborn repo advertises the null oid against the
+    // magic `capabilities^{}` ref (so caps still ride along with no real ref);
+    // a born repo advertises its head against refs/heads/main. caps follow a NUL.
+    let ref_line = match head {
+        Some(oid) => format!("{oid} {GIT_MAIN_REF}\0{GIT_RECEIVE_PACK_CAPS}\n"),
+        None => format!("{GIT_ZERO_OID} capabilities^{{}}\0{GIT_RECEIVE_PACK_CAPS}\n"),
+    };
+    body.extend_from_slice(&pkt_line(ref_line.as_bytes()));
+    body.extend_from_slice(GIT_FLUSH_PKT);
+
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/x-git-receive-pack-advertisement",
+            ),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// return the request body, gzip-inflated if `Content-Encoding: gzip`. git may
+/// compress a receive-pack request; any other encoding is passed through.
+fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
+    let gzip = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("gzip"));
+    if !gzip {
+        return Ok(body.to_vec());
+    }
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(body)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("gzip inflate failed: {e}"))?;
+    Ok(out)
+}
+
+/// POST /forge/{repo}/git-receive-pack — receive a push: parse the ref-update
+/// command list + packfile, stash the whole pack in the node-local blob store,
+/// and CAS the repo head through forge's `Push` op (one submit == one block).
+/// the response is a git `report-status` reflecting whether the CAS committed.
+async fn git_receive_pack(
+    State(handle): State<NodeHandle>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let Some(repo) = norm_repo(&repo) else {
+        return error_response(StatusCode::NOT_FOUND, "no such repo");
+    };
+    let body = match body {
+        Ok(bytes) => bytes,
+        // the DefaultBodyLimit layer rejects an oversized pack with 413.
+        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+    };
+    let body = match decode_git_body(&headers, &body) {
+        Ok(bytes) => bytes,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    // the body is a pkt-line command list, a flush-pkt, then the raw packfile.
+    let (commands, pack) = match parse_pkt_lines(&body) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("malformed git command stream: {msg}"),
+            );
+        }
+    };
+    let Some(first) = commands.first() else {
+        return error_response(StatusCode::BAD_REQUEST, "empty git command list");
+    };
+
+    // the first command carries the ref update, with capabilities after a NUL.
+    // strip the caps (from the first NUL on) and any trailing newline.
+    let nul = first.iter().position(|&b| b == 0).unwrap_or(first.len());
+    let line = std::str::from_utf8(&first[..nul])
+        .map(str::trim_end)
+        .unwrap_or("");
+    let mut parts = line.split(' ');
+    let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next()) else {
+        return error_response(StatusCode::BAD_REQUEST, "malformed ref-update command");
+    };
+
+    if refname != GIT_MAIN_REF {
+        // consume-and-refuse: the pack was fully received; we just don't apply
+        // it. reporting `ng` (not an http error) lets git print a clean reason.
+        return git_report_status(refname, Some(&format!("only {GIT_MAIN_REF} is supported")));
+    }
+
+    // old == the null oid means "create" (unborn -> prev_oid None); otherwise it
+    // is the 40-hex prev the forge CAS must match. new is always a real oid.
+    let prev_oid = if old == GIT_ZERO_OID {
+        None
+    } else {
+        match hex_to_bytes(old).filter(|b| b.len() == GIT_OID_RAW_LEN) {
+            Some(bytes) => Some(bytes),
+            None => return error_response(StatusCode::BAD_REQUEST, "malformed old oid"),
+        }
+    };
+    let Some(new_oid) = hex_to_bytes(new).filter(|b| b.len() == GIT_OID_RAW_LEN) else {
+        return error_response(StatusCode::BAD_REQUEST, "malformed new oid");
+    };
+
+    // stash the WHOLE packfile as one node-local blob, keyed by its sha256; forge
+    // materializes it by this digest. the bytes never cross consensus.
+    let pack_digest = handle.blobs.put_chunk(pack.to_vec());
+
+    // CAS the head through a forge Push op and await the block result.
+    let payload = forge_interface::encode_msg(&forge_interface::ForgeMsg::Push {
+        repo,
+        prev_oid,
+        new_oid,
+        pack_digest: pack_digest.to_vec(),
+    });
+    let (reply, rx) = oneshot::channel();
+    if let Err(resp) = handle
+        .send(NodeCommand::Submit {
+            target: "forge".into(),
+            payload,
+            origin: DEFAULT_ORIGIN.as_bytes().to_vec(),
+            reply,
+        })
+        .await
+    {
+        return resp;
+    }
+    match rx.await {
+        Ok(Ok(_block)) => git_report_status(GIT_MAIN_REF, None),
+        Ok(Err(reason)) => {
+            // a CAS mismatch's rejection carries "non-fast-forward" — surface
+            // exactly that token so git prints its standard "fetch first" hint.
+            // any other rejection passes through as a single-line reason.
+            let reason = if reason.contains("non-fast-forward") {
+                "non-fast-forward".to_string()
+            } else {
+                reason.replace('\n', " ")
+            };
+            git_report_status(GIT_MAIN_REF, Some(&reason))
+        }
+        Err(_) => actor_gone(),
     }
 }
 

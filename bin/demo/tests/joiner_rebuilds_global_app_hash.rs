@@ -399,6 +399,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             &mut src_forge,
             100,
             forge_encode_msg(&ForgeMsg::Commit {
+                repo: String::new(),
                 path: "README.md".into(),
                 content: "# ducktape\n".into(),
                 message: "init".into(),
@@ -410,6 +411,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             &mut src_forge,
             200,
             forge_encode_msg(&ForgeMsg::Commit {
+                repo: String::new(),
                 path: "README.md".into(),
                 content: "# ducktape\n\nrebuilt from a snapshot\n".into(),
                 message: "expand".into(),
@@ -863,7 +865,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // proof the pack landed real objects (commit, tree, blob), not just a
         // head oid that rehashes to the right root.
         {
-            let repo = git2::Repository::open(&joiner_dir).expect("joiner repo opens");
+            // forge now namespaces repos under base/<name>; the default repo
+            // (an empty `repo` field) lives at joiner_dir/default.
+            let repo =
+                git2::Repository::open(joiner_dir.join("default")).expect("joiner repo opens");
             let head = repo
                 .refname_to_id("refs/heads/main")
                 .expect("joiner ref is born");

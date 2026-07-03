@@ -707,3 +707,167 @@ fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
         "OpenMetrics EOF terminator"
     );
 }
+
+// ============================================================================
+// git smart-HTTP receive-pack: REAL `git push` against the daemon's /forge lane.
+//
+// this is the make-or-break gate for the git-http bridge: a stock `git` client
+// pushes to http://127.0.0.1:<port>/forge/testrepo and the pushed commit must
+// become forge's committed HEAD. exercises the whole path — info/refs ref
+// advertisement, the pkt-line command + packfile POST, the node-local pack
+// stash, and the consensus `Push` CAS.
+// ============================================================================
+
+/// whether a `git` binary is on PATH (the bridge test needs a real client).
+fn have_git() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// a `git` invocation in `dir` with a hermetic config: no host global/system
+/// config leaks in (gpg signing, aliases), the default branch is `main`, a fixed
+/// identity, and no interactive credential/gpg prompts can hang the test.
+fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "user.name=Ducktape Test",
+            "-c",
+            "user.email=test@ducktape.local",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args);
+    cmd
+}
+
+/// run a git command, capturing stdout+stderr (git prints push progress and
+/// rejections to stderr), WITHOUT asserting success — the caller decides.
+fn git_capture(dir: &Path, args: &[&str]) -> std::process::Output {
+    git_cmd(dir, args).output().expect("spawn git")
+}
+
+/// run a git command that must succeed.
+fn git_ok(dir: &Path, args: &[&str]) {
+    let out = git_capture(dir, args);
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        render(&out)
+    );
+}
+
+/// a legible dump of a git subprocess result for assertion messages / logs.
+fn render(out: &std::process::Output) -> String {
+    format!(
+        "status: {}\n--- stdout ---\n{}--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// stage a file with `content`, then commit it with `message`.
+fn commit_file(dir: &Path, name: &str, content: &str, message: &str) {
+    std::fs::write(dir.join(name), content).expect("write work file");
+    git_ok(dir, &["add", name]);
+    git_ok(dir, &["commit", "-m", message]);
+}
+
+/// this repo's current HEAD oid hex.
+fn rev_parse_head(dir: &Path) -> String {
+    let out = git_capture(dir, &["rev-parse", "HEAD"]);
+    assert!(out.status.success(), "rev-parse failed:\n{}", render(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// forge's committed HEAD oid hex for `repo` over /v1/query (`None` == unborn).
+fn forge_head(daemon: &Daemon, repo: &str) -> Option<String> {
+    let reply = daemon.query("forge", serde_json::json!({ "HeadOf": { "repo": repo } }));
+    reply["Head"].as_str().map(str::to_string)
+}
+
+#[test]
+fn git_push_over_http_lands_in_forge_head() {
+    if !have_git() {
+        eprintln!("skipping git_push_over_http_lands_in_forge_head: no `git` on PATH");
+        return;
+    }
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let url = format!("http://127.0.0.1:{}/forge/testrepo", daemon.port);
+
+    // an unborn repo advertises no head.
+    assert_eq!(forge_head(&daemon, "testrepo"), None, "repo starts unborn");
+
+    // a scratch repo with one commit, wired to push at the daemon.
+    let work = tempfile::TempDir::new().expect("git work dir");
+    let wd = work.path();
+    git_ok(wd, &["init"]);
+    commit_file(wd, "hello.txt", "hi from git\n", "first commit");
+    git_ok(wd, &["remote", "add", "ducktape", &url]);
+
+    // THE gate: a real `git push` to the daemon exits 0 and updates the ref.
+    let push1 = git_capture(wd, &["push", "ducktape", "main"]);
+    eprintln!("=== git push #1 (create) ===\n{}", render(&push1));
+    assert!(
+        push1.status.success(),
+        "git push failed:\n{}",
+        render(&push1)
+    );
+    let head1 = rev_parse_head(wd);
+    assert_eq!(
+        forge_head(&daemon, "testrepo"),
+        Some(head1.clone()),
+        "forge HEAD must equal the pushed commit"
+    );
+
+    // a second commit fast-forwards: the CAS matches the prev head and advances.
+    commit_file(wd, "hello.txt", "hi again\n", "second commit");
+    let head2 = rev_parse_head(wd);
+    assert_ne!(head2, head1, "second commit is a new oid");
+    let push2 = git_capture(wd, &["push", "ducktape", "main"]);
+    eprintln!("=== git push #2 (fast-forward) ===\n{}", render(&push2));
+    assert!(
+        push2.status.success(),
+        "fast-forward push failed:\n{}",
+        render(&push2)
+    );
+    assert_eq!(
+        forge_head(&daemon, "testrepo"),
+        Some(head2.clone()),
+        "forge HEAD must fast-forward to the second commit"
+    );
+
+    // a non-fast-forward push is rejected: rewind one commit, commit a divergent
+    // history, and push without force. git detects the non-ff against the
+    // advertised head and refuses; forge's HEAD stays put.
+    git_ok(wd, &["reset", "--hard", "HEAD~1"]);
+    commit_file(wd, "hello.txt", "divergent line\n", "divergent commit");
+    let push3 = git_capture(wd, &["push", "ducktape", "main"]);
+    eprintln!(
+        "=== git push #3 (non-fast-forward, expected reject) ===\n{}",
+        render(&push3)
+    );
+    assert!(
+        !push3.status.success(),
+        "a non-fast-forward push must be rejected:\n{}",
+        render(&push3)
+    );
+    assert_eq!(
+        forge_head(&daemon, "testrepo"),
+        Some(head2),
+        "a rejected push must not move forge HEAD"
+    );
+}
