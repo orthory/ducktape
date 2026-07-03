@@ -12,6 +12,32 @@ const shortRoot = (hex: string): string =>
 
 const monoOf = (id: string): string => id.slice(0, 2).toUpperCase();
 
+// Human-facing name + one-line purpose per known genesis module. The node's
+// /v1/status only carries {id, root}, so this static map turns cryptic ids into
+// a legible module set. Unknown ids fall back to the raw id + a generic note.
+const MODULE_INFO: Record<string, { label: string; desc: string }> = {
+  chat: { label: "Chat", desc: "Channels, messages, threads, and reactions." },
+  tasks: { label: "Tasks", desc: "A shared, ordered task list." },
+  forge: { label: "Forge", desc: "A git-backed repository (one commit per block)." },
+  document: { label: "Documents", desc: "Block-structured collaborative documents." },
+  agent: { label: "Agents", desc: "The agent collaboration loop and run ledger." },
+  governance: { label: "Governance", desc: "Validator-set proposals and quorum voting." },
+  vaults: { label: "Vaults", desc: "Encrypted team secrets with an owner/reader ACL." },
+  valset: { label: "Validator set", desc: "The active validator set backing consensus." },
+  profiles: { label: "Profiles", desc: "Display names bound to member public keys." },
+  inbox: { label: "Inbox", desc: "Per-member notification queues." },
+  automations: { label: "Automations", desc: "Event-triggered rules over module events." },
+  jobs: { label: "Jobs", desc: "A consensus-native job / claim board." },
+  memory: { label: "Memory", desc: "A shared, filesystem-shaped agent workspace." },
+  files: { label: "Files", desc: "Content-addressed file manifests + chunk sync." },
+  saga: { label: "Saga", desc: "The deterministic async-RPC ledger behind agents." },
+  kv: { label: "KV", desc: "A key-value store (internal scaffold)." },
+  directory: { label: "Directory", desc: "An example / demo module (internal)." },
+};
+
+const infoOf = (id: string): { label: string; desc: string } =>
+  MODULE_INFO[id] ?? { label: id, desc: "A registered genesis module." };
+
 function CorePill() {
   return (
     <span
@@ -84,11 +110,12 @@ function ModuleRow({
   copied: boolean;
   onCopy: () => void;
 }) {
+  const info = infoOf(id);
   return (
     <div
       style={{
         display: "flex",
-        alignItems: "center",
+        alignItems: "flex-start",
         gap: 13,
         padding: "12px 14px",
         borderRadius: radius.md,
@@ -124,11 +151,24 @@ function ModuleRow({
               textOverflow: "ellipsis",
             }}
           >
+            {info.label}
+          </span>
+          <span style={{ font: `400 11px ${font.mono}`, color: color.muted2, flexShrink: 0 }}>
             {id}
           </span>
           <CorePill />
         </div>
-        <div style={{ marginTop: 5, minWidth: 0 }}>
+        <div
+          style={{
+            marginTop: 2,
+            font: `400 12px ${font.sans}`,
+            color: color.muted,
+            lineHeight: 1.4,
+          }}
+        >
+          {info.desc}
+        </div>
+        <div style={{ marginTop: 7, minWidth: 0 }}>
           <RootButton root={root} copied={copied} onCopy={onCopy} />
         </div>
       </div>
