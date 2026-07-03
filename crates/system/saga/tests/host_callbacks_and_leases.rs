@@ -155,7 +155,7 @@ fn the_callback_lands_in_the_same_block_as_the_oracle_result() {
         .expect("genesis");
 
         host.submit_at(
-            at(1, Origin::External(b"alice".to_vec())),
+            at(1, Origin::Module("agent".into())),
             trigger("s1", Some("agent")),
         )
         .await
@@ -249,7 +249,7 @@ fn a_failing_callback_arm_aborts_the_whole_block_and_the_saga_stays_pending() {
         .expect("genesis");
 
         host.submit_at(
-            at(1, Origin::External(b"alice".to_vec())),
+            at(1, Origin::Module("agent".into())),
             trigger("s1", Some("agent")),
         )
         .await

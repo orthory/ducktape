@@ -50,24 +50,24 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
-use commonware_cryptography::{ed25519, Signer};
+use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_codec::DecodeExt as _;
 use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _};
 use commonware_runtime::{Clock, IoBuf, Quota, Runner, Spawner, Supervisor};
-use commonware_utils::{ordered::Set, NZU32};
+use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
 
-use consensus::{digest_of, ConsensusScheme, ContentStore, Digest, SimplexOrderer};
+use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 use chat::Chat;
 use directory::Directory;
-use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
+use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use document::Document;
 use forge::Forge;
 use governance::Governance;
@@ -76,12 +76,12 @@ use kv::Kv;
 use node::OrderedNode;
 use saga::SagaModule;
 use sdk::{Msg, StateRoot};
+use statesync::p2p::P2pSyncClient;
+use statesync::qmdb::RemoteQmdbResolver;
+use statesync::{SyncServer, fetch_manifest, fetch_snapshot};
 use tasks::Tasks;
 use valset::Valset;
 use vaults::Vaults;
-use statesync::p2p::P2pSyncClient;
-use statesync::qmdb::RemoteQmdbResolver;
-use statesync::{fetch_manifest, fetch_snapshot, SyncServer};
 
 /// the peer-set index. every node must `track` the same authorized set at the
 /// same index for discovery's bit-vector gossip to line up.
@@ -110,7 +110,15 @@ const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
 const MODULE_IDS: [&str; 10] = [
-    "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults",
+    "kv",
+    "document",
+    "chat",
+    "forge",
+    "valset",
+    "governance",
+    "saga",
+    "tasks",
+    "vaults",
     "directory",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
@@ -188,7 +196,7 @@ struct NodeConfig {
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
 async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
-    use valset_interface::{decode_reply, encode_query, ValsetQuery, ValsetReply};
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
         .query("valset", &encode_query(&ValsetQuery::Validators))
         .await
@@ -300,10 +308,20 @@ struct RpcStatus {
 
 impl RpcReply {
     fn ok() -> Self {
-        Self { ok: true, error: None, reply_hex: None, status: None }
+        Self {
+            ok: true,
+            error: None,
+            reply_hex: None,
+            status: None,
+        }
     }
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(msg.into()), reply_hex: None, status: None }
+        Self {
+            ok: false,
+            error: Some(msg.into()),
+            reply_hex: None,
+            status: None,
+        }
     }
 }
 
@@ -367,10 +385,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--config" => cfg_path = args.next().map(PathBuf::from),
             "--sync-only" => sync_only = true,
             other => {
-                return Err(
-                    format!("unexpected arg {other:?} (want --config <path> [--sync-only])")
-                        .into(),
+                return Err(format!(
+                    "unexpected arg {other:?} (want --config <path> [--sync-only])"
                 )
+                .into());
             }
         }
     }
@@ -444,7 +462,10 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
 
     for (i, seed) in cfg.peer_seeds.iter().enumerate() {
         let pk = ed25519::PrivateKey::from_seed(*seed).public_key();
-        println!("[node #{id}] peer[{i}] seed={seed} identity={}", hex_bytes(pk.as_ref()));
+        println!(
+            "[node #{id}] peer[{i}] seed={seed} identity={}",
+            hex_bytes(pk.as_ref())
+        );
     }
     println!(
         "[node #{id}] starting on {listen} ({} mesh peers, {} validators{}), storage {}",
@@ -472,25 +493,30 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
             listener.set_nonblocking(true)?;
             println!(
                 "[node #{id}] app surface listening on http://{}",
-                listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                listener
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
             );
-            std::thread::Builder::new().name("app-surface".into()).spawn(move || {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("app-surface tokio runtime")
-                    .block_on(async move {
-                        let listener = tokio::net::TcpListener::from_std(listener)
-                            .expect("adopt app-surface listener");
-                        if let Err(e) = noded::serve(listener, http_handle).await {
-                            eprintln!("app surface server error: {e}");
-                        }
-                    });
-                // a client asked the surface to shut down (POST /v1/shutdown) —
-                // mirror the rpc shutdown: exit the whole process gracefully.
-                println!("[node #{id}] shutdown requested via app surface — exiting");
-                std::process::exit(0);
-            })?;
+            std::thread::Builder::new()
+                .name("app-surface".into())
+                .spawn(move || {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("app-surface tokio runtime")
+                        .block_on(async move {
+                            let listener = tokio::net::TcpListener::from_std(listener)
+                                .expect("adopt app-surface listener");
+                            if let Err(e) = noded::serve(listener, http_handle).await {
+                                eprintln!("app surface server error: {e}");
+                            }
+                        });
+                    // a client asked the surface to shut down (POST /v1/shutdown) —
+                    // mirror the rpc shutdown: exit the whole process gracefully.
+                    println!("[node #{id}] shutdown requested via app surface — exiting");
+                    std::process::exit(0);
+                })?;
         }
         // surface off: dropping the handle terminates the command stream; the
         // pump's select arm sees one None and then never polls it again.
@@ -560,53 +586,82 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                 server_peer,
             );
 
-            // the mesh takes a moment to connect, and the server only serves
-            // once it has a finalized boundary — retry until the manifest lands.
-            let manifest = loop {
-                match fetch_manifest(&client).await {
-                    Ok(m) => break m,
-                    Err(e) => {
-                        println!("[node #{id}] manifest not ready ({e}); retrying");
-                        context.sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            };
-            println!(
-                "[node #{id}] manifest height={} app_hash={}",
-                manifest.height,
-                hex(&manifest.app_hash)
-            );
-
             // rebuild EVERY module in the manifest. a REAL joiner owns its
             // disk, so every store opens under its canonical module id.
             //
             // resolver lane: live target through the module lane (must sit at
-            // the manifest boundary — a parked demo source guarantees it; a
-            // busy source would be retried by refetching the manifest), then
-            // merkle-verified op batches through the remote resolver.
+            // the manifest boundary; a busy source may advance between the
+            // manifest and target fetch, so refetch the manifest and retry),
+            // then merkle-verified op batches through the remote resolver.
             // snapshot lane: chunked bytes, install gated on the manifest root.
-            let fetch_target = |module: &'static str| {
-                let resolver = RemoteQmdbResolver::new(client.clone(), module);
-                let entry_root = manifest.entry(module).expect("module in manifest").root;
-                async move {
-                    let target = resolver.fetch_target().await.expect("target");
-                    assert_eq!(
-                        StateRoot(target.root.0),
-                        entry_root,
-                        "parked source: live {module} target equals the manifest root"
-                    );
-                    (target, resolver)
+            let mut target_attempts = 0u32;
+            let (manifest, kv_sync, document_sync, chat_sync) = loop {
+                target_attempts += 1;
+                // the mesh takes a moment to connect, and the server only serves
+                // once it has a finalized boundary — retry until the manifest lands.
+                let manifest = loop {
+                    match fetch_manifest(&client).await {
+                        Ok(m) => break m,
+                        Err(e) => {
+                            println!("[node #{id}] manifest not ready ({e}); retrying");
+                            context.sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                };
+                println!(
+                    "[node #{id}] manifest height={} app_hash={}",
+                    manifest.height,
+                    hex(&manifest.app_hash)
+                );
+
+                let fetch_target = |module: &'static str| {
+                    let resolver = RemoteQmdbResolver::new(client.clone(), module);
+                    let entry_root = manifest.entry(module).expect("module in manifest").root;
+                    async move {
+                        let target = resolver.fetch_target().await.expect("target");
+                        let live_root = StateRoot(target.root.0);
+                        if live_root != entry_root {
+                            return Err(format!(
+                                "live {module} target {} != manifest root {}",
+                                hex(&live_root),
+                                hex(&entry_root)
+                            ));
+                        }
+                        Ok((target, resolver))
+                    }
+                };
+
+                let targets = async {
+                    let kv = fetch_target("kv").await?;
+                    let document = fetch_target("document").await?;
+                    let chat = fetch_target("chat").await?;
+                    Ok::<_, String>((kv, document, chat))
+                }
+                .await;
+
+                match targets {
+                    Ok((kv, document, chat)) => break (manifest, kv, document, chat),
+                    Err(e) if target_attempts < 10 => {
+                        println!("[node #{id}] {e}; refetching manifest");
+                        context.sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[node #{id}] sync target mismatch after {target_attempts} attempts: {e}"
+                        );
+                        std::process::exit(1);
+                    }
                 }
             };
 
-            let (target, resolver) = fetch_target("kv").await;
+            let (target, resolver) = kv_sync;
             let kv = Kv::sync_from(context.child("kv"), "kv", target, resolver).await;
 
-            let (target, resolver) = fetch_target("document").await;
+            let (target, resolver) = document_sync;
             let document =
                 Document::sync_from(context.child("document"), "document", target, resolver).await;
 
-            let (target, resolver) = fetch_target("chat").await;
+            let (target, resolver) = chat_sync;
             let chat = Chat::sync_from(context.child("chat"), "chat", target, resolver).await;
 
             let snapshot_of = |module: &'static str| {
@@ -1020,16 +1075,16 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                             std::process::exit(1);
                         }
                     };
-                    // resolve held app-surface submits against what this
-                    // drain finished with; every disposition is deterministic,
-                    // so the reply faithfully reports the op's consensus fate.
-                    let boundary_hash = hex(&node.app_hash());
-                    for d in node.take_drained() {
+                    // resolve held app-surface submits against each frame's
+                    // own boundary; every disposition is deterministic, so the
+                    // reply faithfully reports the op's consensus fate.
+                    let drained = node.take_drained();
+                    for d in &drained {
                         let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
                         let _ = reply.send(match d.disposition {
                             node::Disposition::Applied => Ok(noded::BlockSummary {
                                 height: d.height,
-                                app_hash: boundary_hash.clone(),
+                                app_hash: hex(&d.app_hash),
                             }),
                             node::Disposition::Rejected => {
                                 Err("op finalized but rejected (deterministic no-op)".into())
@@ -1059,13 +1114,15 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                     }
                     // publish each newly-applied boundary to ws subscribers
                     // (send only errs when nobody is subscribed — fine).
-                    if let Some(f) = node.finalized() {
-                        if last_published != Some(f.height) {
+                    for d in &drained {
+                        if !matches!(d.disposition, node::Disposition::Discarded)
+                            && last_published != Some(d.height)
+                        {
                             let _ = http_events.send(noded::BlockSummary {
-                                height: f.height,
-                                app_hash: hex(&f.app_hash),
+                                height: d.height,
+                                app_hash: hex(&d.app_hash),
                             });
-                            last_published = Some(f.height);
+                            last_published = Some(d.height);
                         }
                     }
 

@@ -33,8 +33,8 @@
 //! real commonware transport (a later slice) will add its own inbound plumbing
 //! behind the same [`Transport`] seam.
 
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -87,13 +87,19 @@ struct WireMsg {
 
 impl From<&Msg> for WireMsg {
     fn from(m: &Msg) -> Self {
-        WireMsg { target: m.target.clone(), payload: m.payload.clone() }
+        WireMsg {
+            target: m.target.clone(),
+            payload: m.payload.clone(),
+        }
     }
 }
 
 impl From<WireMsg> for Msg {
     fn from(w: WireMsg) -> Self {
-        Msg { target: w.target, payload: w.payload }
+        Msg {
+            target: w.target,
+            payload: w.payload,
+        }
     }
 }
 
@@ -148,7 +154,13 @@ impl LoopbackHub {
             peers.push(tx);
             peers.len() - 1
         };
-        (LoopbackTransport { id, peers: self.peers.clone() }, rx)
+        (
+            LoopbackTransport {
+                id,
+                peers: self.peers.clone(),
+            },
+            rx,
+        )
     }
 }
 
@@ -200,7 +212,11 @@ impl<T: Transport> Node<T> {
     /// wrap `host` with a `transport` handle and that transport's `inbound`
     /// receiver.
     pub fn new(host: Host, transport: T, inbound: mpsc::Receiver<Inbound>) -> Self {
-        Self { host, transport, inbound }
+        Self {
+            host,
+            transport,
+            inbound,
+        }
     }
 
     /// OUTBOUND — a locally-originated msg. apply it to the local host first (the
@@ -263,14 +279,23 @@ mod tests {
         // node1 receives it.
         assert_eq!(node1_rx.recv().expect("node1 got msg"), b"hi");
         // node0 (the sender) does not.
-        assert!(matches!(node0_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            node0_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
     fn wire_roundtrip_preserves_target_and_payload() {
         let msgs = vec![
-            Msg { target: "directory".into(), payload: b"hello".to_vec() },
-            Msg { target: "kv".into(), payload: vec![] },
+            Msg {
+                target: "directory".into(),
+                payload: b"hello".to_vec(),
+            },
+            Msg {
+                target: "kv".into(),
+                payload: vec![],
+            },
         ];
         let decoded = decode_batch(&encode_batch(&msgs)).expect("roundtrips");
         assert_eq!(decoded.len(), 2);
@@ -317,8 +342,8 @@ mod tests {
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{
-    ed25519::{PrivateKey, PublicKey, Signature},
     Signer as _, Verifier as _,
+    ed25519::{PrivateKey, PublicKey, Signature},
 };
 use sdk::Origin;
 
@@ -407,8 +432,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
     let sig = Signature::decode(frame.sig.as_slice())
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
-    let msg = Msg { target: frame.target, payload: frame.payload };
-    if !pubkey.verify(FRAME_NS, &frame_preimage(&frame.origin, frame.seq, &msg), &sig) {
+    let msg = Msg {
+        target: frame.target,
+        payload: frame.payload,
+    };
+    if !pubkey.verify(
+        FRAME_NS,
+        &frame_preimage(&frame.origin, frame.seq, &msg),
+        &sig,
+    ) {
         return Err(Error::Host(sdk::Error::Module(
             "frame signature does not bind this op to its origin".into(),
         )));
@@ -542,6 +574,8 @@ pub struct DrainedFrame {
     pub id: FrameId,
     /// the app height stamped for this frame's view (`view_base + view`).
     pub height: u64,
+    /// the app-hash after this frame's deterministic disposition settled.
+    pub app_hash: StateRoot,
     pub disposition: Disposition,
 }
 
@@ -559,8 +593,8 @@ pub struct OrderedNode<O: Orderer> {
     /// where the reactor's worker driver reads finalized `WorkerRequest`s from
     /// (via `take_effects`). accumulates in agreed-delivery order.
     effects: Vec<Effect>,
-    /// the latest APPLIED consensus boundary: the last drained APP HEIGHT
-    /// (`view_base + engine view`) plus the app-hash after that drain settled.
+    /// the latest NON-DISCARDED consensus boundary: the last drained APP HEIGHT
+    /// (`view_base + engine view`) plus the app-hash after that frame settled.
     /// this is what a state-sync service serves from
     /// (`host::Host::capture_finalized_snapshot` demands exactly this pair) —
     /// `None` until the first frame applies.
@@ -635,7 +669,12 @@ impl<O: Orderer> OrderedNode<O> {
     /// this frame back through [`OrderedNode::drain_delivered`] (the semantic
     /// shift — no optimistic echo). returns the frame's [`FrameId`] so the
     /// caller can recognize this op's outcome in [`OrderedNode::take_drained`].
-    pub async fn submit(&mut self, signer: &PrivateKey, seq: u64, msg: Msg) -> Result<FrameId, Error> {
+    pub async fn submit(
+        &mut self,
+        signer: &PrivateKey,
+        seq: u64,
+        msg: Msg,
+    ) -> Result<FrameId, Error> {
         let frame = encode_frame(signer, seq, &msg);
         let id = frame_id(&frame);
         self.orderer.submit(frame).await?;
@@ -658,6 +697,7 @@ impl<O: Orderer> OrderedNode<O> {
         let delivered = self.orderer.poll_delivered();
         let mut applied = 0usize;
         let mut last_view: Option<u64> = None;
+        let mut last_finalized: Option<host::FinalizedBlock> = None;
         for (view, frame) in delivered {
             // a FINALIZED op counts as processed whether or not it applies
             // cleanly — and its VIEW advances the engine clock either way (the
@@ -678,7 +718,12 @@ impl<O: Orderer> OrderedNode<O> {
             // some nodes cannot fork app state.
             if let Some(ceiling) = self.view_ceiling {
                 if view >= ceiling {
-                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Discarded });
+                    self.drained.push(DrainedFrame {
+                        id,
+                        height,
+                        app_hash: self.host.app_hash(),
+                        disposition: Disposition::Discarded,
+                    });
                     continue;
                 }
             }
@@ -689,36 +734,60 @@ impl<O: Orderer> OrderedNode<O> {
             // by getting a malformed op finalized. (the `?`-propagate that used to be
             // here stalled the whole drain on one bad op — the liveness gap.)
             let Ok((origin, msg)) = decode_frame(&frame) else {
-                self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
+                let app_hash = self.host.app_hash();
+                self.drained.push(DrainedFrame {
+                    id,
+                    height,
+                    app_hash,
+                    disposition: Disposition::Rejected,
+                });
+                last_finalized = Some(host::FinalizedBlock { height, app_hash });
                 continue;
             };
-            let ctx = BlockContext { height, consensus_time: height, origin };
+            let ctx = BlockContext {
+                height,
+                consensus_time: height,
+                origin,
+            };
             // surface each finalized block's effects for the reactor's worker
             // driver. a rejected op yields no outcome (deterministic no-op) and so
             // contributes no effects — same on every validator.
             match self.host.submit_at(ctx, msg).await {
                 Ok(outcome) => {
                     self.effects.extend(outcome.effects);
-                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Applied });
+                    let app_hash = self.host.app_hash();
+                    self.drained.push(DrainedFrame {
+                        id,
+                        height,
+                        app_hash,
+                        disposition: Disposition::Applied,
+                    });
+                    last_finalized = Some(host::FinalizedBlock { height, app_hash });
                 }
                 Err(host::SubmitError::Rejected(_)) => {
-                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
+                    let app_hash = self.host.app_hash();
+                    self.drained.push(DrainedFrame {
+                        id,
+                        height,
+                        app_hash,
+                        disposition: Disposition::Rejected,
+                    });
+                    last_finalized = Some(host::FinalizedBlock { height, app_hash });
                 }
                 Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
             }
         }
         if let Some(view) = last_view {
             self.last_engine_view = Some(view);
-            self.finalized = Some(host::FinalizedBlock {
-                height: self.view_base + view,
-                app_hash: self.host.app_hash(),
-            });
+        }
+        if let Some(finalized) = last_finalized {
+            self.finalized = Some(finalized);
         }
         Ok(applied)
     }
 
-    /// the latest APPLIED consensus boundary — what a state-sync service serves
-    /// from. `None` until the first delivered frame applies.
+    /// the latest NON-DISCARDED consensus boundary — what state-sync serves
+    /// from. `None` until the first delivered frame applies or rejects.
     pub fn finalized(&self) -> Option<host::FinalizedBlock> {
         self.finalized
     }

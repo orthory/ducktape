@@ -106,7 +106,7 @@ fn source() -> SagaModule {
     exec(
         &mut m,
         1,
-        alice.clone(),
+        Origin::Module("agent".into()),
         &trigger("s-failed", Some("agent"), 2, Some(50)),
     );
     exec(

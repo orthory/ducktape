@@ -29,8 +29,8 @@
 //! the terminal transition and the requester callback commit in one block; a
 //! callback that ERRORS aborts that finalized block, which replays as a
 //! deterministic no-op — wedging the saga at `Pending` forever. two defenses:
-//! `reply_to` is validated against `ctx.module_root` at trigger time (an
-//! unknown or self-targeting callback is rejected before a saga exists), and
+//! `reply_to` is validated at trigger time as a module-origin self-callback
+//! to a known non-saga module; external and system requesters poll instead.
 //! requester callback arms MUST be no-fail by construction — treat a decode
 //! failure as a staged no-op plus an event, never an `Err`.
 //!
@@ -630,13 +630,10 @@ impl Module for SagaModule {
                         reply_payload.len()
                     )));
                 }
-                // the callback-poison rule (design §4): a callback aimed at an
-                // unknown module — or at this module itself, which cannot
-                // decode its own callback — would abort every future terminal
-                // block and wedge the saga at Pending forever. reject at
-                // trigger time, while rejection is still cheap and local.
+                // the callback-poison rule (design §4): only module-origin
+                // self-callbacks to known non-saga modules may be armed.
                 if let Some(target) = &reply_to {
-                    if *target == ctx.env().me {
+                    if target == &ctx.env().me {
                         return Err(Error::Module(
                             "trigger reply_to must not target the saga module itself".into(),
                         ));
@@ -645,6 +642,20 @@ impl Module for SagaModule {
                         return Err(Error::Module(format!(
                             "trigger reply_to targets unknown module {target}"
                         )));
+                    }
+                    match &ctx.env().origin {
+                        Origin::Module(module) if target == module => {}
+                        Origin::Module(_) => {
+                            return Err(Error::Module(
+                                "module trigger reply_to must target the triggering module".into(),
+                            ));
+                        }
+                        Origin::External(_) | Origin::System => {
+                            return Err(Error::Module(
+                                "external/system trigger must not set reply_to; poll for the result"
+                                    .into(),
+                            ));
+                        }
                     }
                 }
                 let now = ctx.env().consensus_time;
@@ -1101,7 +1112,9 @@ mod tests {
         // the callback-poison pin, half (a): an unknown callback target would
         // abort every future terminal block, so it never becomes a saga.
         let mut m = SagaModule::new("saga");
-        let mut ctx = CaptureCtx::new().knowing("agent");
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::Module("agent".into()))
+            .knowing("agent");
         let err = exec(
             &mut m,
             &mut ctx,
@@ -1142,7 +1155,7 @@ mod tests {
             "self reply_to rejects at trigger"
         );
 
-        // a KNOWN reply_to passes the same gate.
+        // a module-origin self reply_to passes the same gate.
         exec(
             &mut m,
             &mut ctx,
@@ -1161,9 +1174,38 @@ mod tests {
     }
 
     #[test]
+    fn external_origin_reply_to_is_rejected_at_trigger_time() {
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"alice".to_vec()))
+            .knowing("agent");
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: Vec::new(),
+                reply_to: Some("agent".into()),
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Module(message) if message.contains("must not set reply_to"))
+        );
+        assert_eq!(get(&m, "s1"), None, "no saga was staged");
+        assert!(ctx.effects.is_empty(), "a rejected trigger fires no worker");
+    }
+
+    #[test]
     fn ok_result_lands_done_and_emits_the_callback() {
         let mut m = SagaModule::new("saga");
-        let mut ctx = CaptureCtx::new().knowing("agent");
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::Module("agent".into()))
+            .knowing("agent");
         exec(
             &mut m,
             &mut ctx,
@@ -1269,7 +1311,9 @@ mod tests {
     #[test]
     fn err_result_with_attempts_exhausted_lands_failed() {
         let mut m = SagaModule::new("saga");
-        let mut ctx = CaptureCtx::new().knowing("agent");
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::Module("agent".into()))
+            .knowing("agent");
         exec(
             &mut m,
             &mut ctx,
@@ -1486,7 +1530,9 @@ mod tests {
     #[test]
     fn crank_times_out_a_past_deadline_saga_and_deadline_dominates_lease() {
         let mut m = SagaModule::new("saga");
-        let mut ctx = CaptureCtx::new().knowing("agent");
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::Module("agent".into()))
+            .knowing("agent");
         exec(
             &mut m,
             &mut ctx,
@@ -1640,12 +1686,12 @@ mod tests {
 
     #[test]
     fn cancel_is_gated_to_the_trigger_origin() {
-        let alice = Origin::External(b"alice".to_vec());
+        let agent = Origin::Module("agent".into());
         let mallory = Origin::External(b"mallory".to_vec());
 
         let mut m = SagaModule::new("saga");
         let mut ctx = CaptureCtx::new()
-            .from_origin(alice.clone())
+            .from_origin(agent.clone())
             .knowing("agent");
         exec(
             &mut m,
@@ -1682,7 +1728,7 @@ mod tests {
         // the trigger origin cancels: terminal + callback.
         let mut ctx = CaptureCtx::new()
             .at(9)
-            .from_origin(alice.clone())
+            .from_origin(agent.clone())
             .knowing("agent");
         exec(
             &mut m,
@@ -1705,7 +1751,7 @@ mod tests {
         let cancelled_root = m.root();
 
         // cancelling a TERMINAL saga (and an unknown one) is a no-op.
-        let mut ctx = CaptureCtx::new().from_origin(alice).knowing("agent");
+        let mut ctx = CaptureCtx::new().from_origin(agent).knowing("agent");
         exec(
             &mut m,
             &mut ctx,
