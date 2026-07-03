@@ -5,8 +5,8 @@
 //! it depends only on `directory-interface` and `kv-interface` — never on the
 //! directory or kv IMPL crates. that is the whole isolation thesis in one file.
 
-use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
-use kv_interface::{encode as kv_encode, KvMsg};
+use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use kv_interface::{KvMsg, encode as kv_encode};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
 pub struct Greeter {
@@ -17,7 +17,11 @@ pub struct Greeter {
 
 impl Greeter {
     pub fn new(id: impl Into<ModuleId>) -> Self {
-        Self { id: id.into(), directory: "directory".into(), kv: "kv".into() }
+        Self {
+            id: id.into(),
+            directory: "directory".into(),
+            kv: "kv".into(),
+        }
     }
 }
 
@@ -38,11 +42,16 @@ impl Module for Greeter {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         // the payload is the directory key to greet.
-        let key = String::from_utf8(msg.payload.clone())
-            .map_err(|e| Error::Module(e.to_string()))?;
+        let key =
+            String::from_utf8(msg.payload.clone()).map_err(|e| Error::Module(e.to_string()))?;
 
         // typed cross-module READ (sync, host-routed) of the directory module.
-        let reply = ctx.query(&self.directory, &encode_query(&DirQuery::Get { key: key.clone() })).await?;
+        let reply = ctx
+            .query(
+                &self.directory,
+                &encode_query(&DirQuery::Get { key: key.clone() }),
+            )
+            .await?;
         let name = match decode_reply(&reply).map_err(Error::Module)? {
             DirReply::Value(Some(v)) => v,
             DirReply::Value(None) => return Ok(()), // nothing to greet — no-op
@@ -55,11 +64,17 @@ impl Module for Greeter {
         // and to kv (the qmdb store). one module composing two others, interfaces only.
         ctx.emit_msg(Msg {
             target: self.directory.clone(),
-            payload: encode_msg(&DirMsg::Set { key: gkey.clone(), value: greeting.clone() }),
+            payload: encode_msg(&DirMsg::Set {
+                key: gkey.clone(),
+                value: greeting.clone(),
+            }),
         });
         ctx.emit_msg(Msg {
             target: self.kv.clone(),
-            payload: kv_encode(&KvMsg::Set { key: gkey.into_bytes(), value: greeting.into_bytes() }),
+            payload: kv_encode(&KvMsg::Set {
+                key: gkey.into_bytes(),
+                value: greeting.into_bytes(),
+            }),
         });
         Ok(())
     }

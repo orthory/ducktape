@@ -47,7 +47,11 @@ impl Module for Probe {
         };
         self.log.lock().unwrap().push((
             msg.payload.clone(),
-            Seen { height: env.height, consensus_time: env.consensus_time, origin },
+            Seen {
+                height: env.height,
+                consensus_time: env.consensus_time,
+                origin,
+            },
         ));
         Ok(())
     }
@@ -58,7 +62,10 @@ fn probe_host(log: Arc<Mutex<Vec<(Vec<u8>, Seen)>>>) -> host::Host {
 }
 
 fn op(payload: &[u8]) -> Msg {
-    Msg { target: "probe".into(), payload: payload.to_vec() }
+    Msg {
+        target: "probe".into(),
+        payload: payload.to_vec(),
+    }
 }
 
 async fn drain_to_fixpoint(node: &mut OrderedNode<RoundOrderer>) {
@@ -75,7 +82,10 @@ fn env_reflects_agreed_view_height_time_and_real_origin() {
         let mut nodes: Vec<OrderedNode<RoundOrderer>> = Vec::new();
         for _ in 0..N {
             let log = Arc::new(Mutex::new(Vec::new()));
-            nodes.push(OrderedNode::new(probe_host(log.clone()), RoundOrderer::new()));
+            nodes.push(OrderedNode::new(
+                probe_host(log.clone()),
+                RoundOrderer::new(),
+            ));
             logs.push(log);
         }
 
@@ -88,7 +98,9 @@ fn env_reflects_agreed_view_height_time_and_real_origin() {
 
         // PHASE 2: a LATER op (submitter "bob") -> agreed view 1 (strictly higher).
         for node in nodes.iter_mut() {
-            node.submit(&sk(11), 0, op(b"second")).await.expect("submit");
+            node.submit(&sk(11), 0, op(b"second"))
+                .await
+                .expect("submit");
             drain_to_fixpoint(node).await;
         }
 
@@ -113,12 +125,20 @@ fn env_reflects_agreed_view_height_time_and_real_origin() {
 
         // origin is the REAL submitter — the VERIFIED ed25519 public key the
         // frame was signed with, not caller-chosen bytes.
-        assert_eq!(s0.origin, pk(10), "root origin is the verified submitter key");
+        assert_eq!(
+            s0.origin,
+            pk(10),
+            "root origin is the verified submitter key"
+        );
         assert_eq!(s1.origin, pk(11));
 
         // DETERMINISM: every validator agrees on what each op saw.
         for log in &logs {
-            assert_eq!(*log.lock().unwrap(), v0, "all validators agree on Env per op");
+            assert_eq!(
+                *log.lock().unwrap(),
+                v0,
+                "all validators agree on Env per op"
+            );
         }
     });
 }

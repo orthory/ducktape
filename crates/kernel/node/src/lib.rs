@@ -33,8 +33,8 @@
 //! real commonware transport (a later slice) will add its own inbound plumbing
 //! behind the same [`Transport`] seam.
 
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,13 +93,19 @@ struct WireMsg {
 
 impl From<&Msg> for WireMsg {
     fn from(m: &Msg) -> Self {
-        WireMsg { target: m.target.clone(), payload: m.payload.clone() }
+        WireMsg {
+            target: m.target.clone(),
+            payload: m.payload.clone(),
+        }
     }
 }
 
 impl From<WireMsg> for Msg {
     fn from(w: WireMsg) -> Self {
-        Msg { target: w.target, payload: w.payload }
+        Msg {
+            target: w.target,
+            payload: w.payload,
+        }
     }
 }
 
@@ -154,7 +160,13 @@ impl LoopbackHub {
             peers.push(tx);
             peers.len() - 1
         };
-        (LoopbackTransport { id, peers: self.peers.clone() }, rx)
+        (
+            LoopbackTransport {
+                id,
+                peers: self.peers.clone(),
+            },
+            rx,
+        )
     }
 }
 
@@ -206,7 +218,11 @@ impl<T: Transport> Node<T> {
     /// wrap `host` with a `transport` handle and that transport's `inbound`
     /// receiver.
     pub fn new(host: Host, transport: T, inbound: mpsc::Receiver<Inbound>) -> Self {
-        Self { host, transport, inbound }
+        Self {
+            host,
+            transport,
+            inbound,
+        }
     }
 
     /// OUTBOUND — a locally-originated msg. apply it to the local host first (the
@@ -269,14 +285,23 @@ mod tests {
         // node1 receives it.
         assert_eq!(node1_rx.recv().expect("node1 got msg"), b"hi");
         // node0 (the sender) does not.
-        assert!(matches!(node0_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            node0_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
     fn wire_roundtrip_preserves_target_and_payload() {
         let msgs = vec![
-            Msg { target: "directory".into(), payload: b"hello".to_vec() },
-            Msg { target: "kv".into(), payload: vec![] },
+            Msg {
+                target: "directory".into(),
+                payload: b"hello".to_vec(),
+            },
+            Msg {
+                target: "kv".into(),
+                payload: vec![],
+            },
         ];
         let decoded = decode_batch(&encode_batch(&msgs)).expect("roundtrips");
         assert_eq!(decoded.len(), 2);
@@ -323,8 +348,8 @@ mod tests {
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{
-    ed25519::{PrivateKey, PublicKey, Signature},
     Signer as _, Verifier as _,
+    ed25519::{PrivateKey, PublicKey, Signature},
 };
 use sdk::Origin;
 
@@ -413,8 +438,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
     let sig = Signature::decode(frame.sig.as_slice())
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
-    let msg = Msg { target: frame.target, payload: frame.payload };
-    if !pubkey.verify(FRAME_NS, &frame_preimage(&frame.origin, frame.seq, &msg), &sig) {
+    let msg = Msg {
+        target: frame.target,
+        payload: frame.payload,
+    };
+    if !pubkey.verify(
+        FRAME_NS,
+        &frame_preimage(&frame.origin, frame.seq, &msg),
+        &sig,
+    ) {
         return Err(Error::Host(sdk::Error::Module(
             "frame signature does not bind this op to its origin".into(),
         )));
@@ -470,7 +502,10 @@ impl RoundOrderer {
     /// engine reopening its journal and continuing its view counter, so a
     /// resumed node's new frames land ABOVE its applied floor.
     pub fn resume_at(next_view: u64) -> Self {
-        Self { pending: Vec::new(), next_view }
+        Self {
+            pending: Vec::new(),
+            next_view,
+        }
     }
 }
 
@@ -832,7 +867,12 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// this frame back through [`OrderedNode::drain_delivered`] (the semantic
     /// shift — no optimistic echo). returns the frame's [`FrameId`] so the
     /// caller can recognize this op's outcome in [`OrderedNode::take_drained`].
-    pub async fn submit(&mut self, signer: &PrivateKey, seq: u64, msg: Msg) -> Result<FrameId, Error> {
+    pub async fn submit(
+        &mut self,
+        signer: &PrivateKey,
+        seq: u64,
+        msg: Msg,
+    ) -> Result<FrameId, Error> {
         let frame = encode_frame(signer, seq, &msg);
         let id = frame_id(&frame);
         // durably pin the bytes BEFORE the orderer may propose their digest:
@@ -901,7 +941,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // frame leaves no state for a restart to recover.
             if let Some(ceiling) = self.view_ceiling {
                 if view >= ceiling {
-                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Discarded });
+                    self.drained.push(DrainedFrame {
+                        id,
+                        height,
+                        disposition: Disposition::Discarded,
+                    });
                     continue;
                 }
             }
@@ -916,12 +960,20 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // by getting a malformed op finalized. (the `?`-propagate that used to be
             // here stalled the whole drain on one bad op — the liveness gap.)
             let Ok((origin, msg)) = decode_frame(&frame) else {
-                self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
+                self.drained.push(DrainedFrame {
+                    id,
+                    height,
+                    disposition: Disposition::Rejected,
+                });
                 self.seal(height, Disposition::Rejected).await?;
                 last_sealed_view = Some(view);
                 continue;
             };
-            let ctx = BlockContext { height, consensus_time: height, origin };
+            let ctx = BlockContext {
+                height,
+                consensus_time: height,
+                origin,
+            };
             // the observation barrier compares the watched root across the
             // apply — only an APPLIED block can move it (rejected blocks roll
             // back, discards never run).
@@ -935,11 +987,18 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             match self.host.submit_at(ctx, msg).await {
                 Ok(outcome) => {
                     self.effects.extend(outcome.effects);
-                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Applied });
+                    self.drained.push(DrainedFrame {
+                        id,
+                        height,
+                        disposition: Disposition::Applied,
+                    });
                     self.seal(height, Disposition::Applied).await?;
                     last_sealed_view = Some(view);
                     if let Some(before) = watched_before {
-                        let module = self.watch_module.as_deref().expect("watched_before implies watch_module");
+                        let module = self
+                            .watch_module
+                            .as_deref()
+                            .expect("watched_before implies watch_module");
                         if self.host.module_root(module) != before {
                             // end the batch AT the changing block: the
                             // remainder stays deferred so a once-per-drain
@@ -950,7 +1009,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     }
                 }
                 Err(host::SubmitError::Rejected(_)) => {
-                    self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
+                    self.drained.push(DrainedFrame {
+                        id,
+                        height,
+                        disposition: Disposition::Rejected,
+                    });
                     self.seal(height, Disposition::Rejected).await?;
                     last_sealed_view = Some(view);
                 }

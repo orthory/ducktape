@@ -11,14 +11,14 @@ use std::time::Duration;
 
 use commonware_consensus::simplex::{mocks, scheme::ed25519 as simplex_ed25519};
 use commonware_consensus::types::Epoch;
-use commonware_cryptography::{ed25519, Sha256, Signer as _};
+use commonware_cryptography::{Sha256, Signer as _, ed25519};
 use commonware_p2p::simulated;
-use commonware_runtime::{deterministic, Clock as _, Quota, Runner as _, Supervisor as _};
-use commonware_utils::{NZUsize, NZU32};
+use commonware_runtime::{Clock as _, Quota, Runner as _, Supervisor as _, deterministic};
+use commonware_utils::{NZU32, NZUsize};
 
 use consensus::{ContentStore, Digest, SimplexOrderer};
 use directory::Directory;
-use directory_interface::{encode_msg, DirMsg};
+use directory_interface::{DirMsg, encode_msg};
 use host::Host;
 use node::OrderedNode;
 use sdk::Msg;
@@ -26,7 +26,10 @@ use sdk::Msg;
 fn dir_set(k: &str, v: &str) -> Msg {
     Msg {
         target: "directory".into(),
-        payload: encode_msg(&DirMsg::Set { key: k.into(), value: v.into() }),
+        payload: encode_msg(&DirMsg::Set {
+            key: k.into(),
+            value: v.into(),
+        }),
     }
 }
 
@@ -58,7 +61,10 @@ fn a_single_validator_finalizes_sequential_blocks() {
         let quota = Quota::per_second(NZU32!(128));
         let control = oracle.control(me.clone());
         let vote = control.register(0, quota).await.expect("register vote");
-        let certificate = control.register(1, quota).await.expect("register certificate");
+        let certificate = control
+            .register(1, quota)
+            .await
+            .expect("register certificate");
         let resolver = control.register(2, quota).await.expect("register resolver");
 
         let genesis_floor: Digest = mocks::application::genesis::<Sha256>(epoch);
@@ -83,8 +89,12 @@ fn a_single_validator_finalizes_sequential_blocks() {
         // proposes them across successive self-led views.
         let a = ed25519::PrivateKey::from_seed(201);
         let b = ed25519::PrivateKey::from_seed(202);
-        node.submit(&a, 0, dir_set("solo", "first")).await.expect("submit first");
-        node.submit(&b, 0, dir_set("solo2", "second")).await.expect("submit second");
+        node.submit(&a, 0, dir_set("solo", "first"))
+            .await
+            .expect("submit first");
+        node.submit(&b, 0, dir_set("solo2", "second"))
+            .await
+            .expect("submit second");
 
         // pump simulated time until BOTH ops applied in finalized order.
         let mut applied = 0usize;
@@ -93,6 +103,10 @@ fn a_single_validator_finalizes_sequential_blocks() {
             applied += node.drain_delivered().await.expect("drain");
         }
 
-        assert_ne!(node.app_hash(), genesis, "finalized solo blocks moved the app-hash");
+        assert_ne!(
+            node.app_hash(),
+            genesis,
+            "finalized solo blocks moved the app-hash"
+        );
     });
 }

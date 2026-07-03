@@ -38,7 +38,7 @@
 use std::collections::BTreeMap;
 
 use host::{FinalizedBlock, Host};
-use sdk::{ModuleId, StateRoot, StateSyncHandle, ROOT_LEN};
+use sdk::{ModuleId, ROOT_LEN, StateRoot, StateSyncHandle};
 
 pub mod p2p;
 pub mod qmdb;
@@ -721,7 +721,10 @@ mod tests {
             module_id: "m".into(),
             offset: 0,
         });
-        assert!(decode_request(&bytes[..bytes.len() - 1]).is_err(), "truncation rejects");
+        assert!(
+            decode_request(&bytes[..bytes.len() - 1]).is_err(),
+            "truncation rejects"
+        );
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(decode_request(&trailing).is_err(), "trailing bytes reject");

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use directory_interface::{decode_msg, decode_query, encode_reply, DirMsg, DirQuery, DirReply};
+use directory_interface::{DirMsg, DirQuery, DirReply, decode_msg, decode_query, encode_reply};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
@@ -23,7 +23,11 @@ pub struct Directory {
 
 impl Directory {
     pub fn new(id: impl Into<ModuleId>) -> Self {
-        Self { id: id.into(), entries: BTreeMap::new(), pending: BTreeMap::new() }
+        Self {
+            id: id.into(),
+            entries: BTreeMap::new(),
+            pending: BTreeMap::new(),
+        }
     }
 
     /// direct sync write (used by `execute` and handy for tests/genesis seeding).
@@ -101,7 +105,10 @@ impl Directory {
         for _ in 0..count {
             let key = read_string(bytes, &mut off)?;
             let value = read_string(bytes, &mut off)?;
-            if entries.last_key_value().is_some_and(|(last, _)| *last >= key) {
+            if entries
+                .last_key_value()
+                .is_some_and(|(last, _)| *last >= key)
+            {
                 return Err(Error::Module("snapshot keys not strictly ascending".into()));
             }
             entries.insert(key, value);
@@ -173,9 +180,7 @@ impl Module for Directory {
     /// async per the trait, though the in-memory body has nothing to await.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            DirQuery::Get { key } => {
-                Ok(encode_reply(&DirReply::Value(self.get(&key).cloned())))
-            }
+            DirQuery::Get { key } => Ok(encode_reply(&DirReply::Value(self.get(&key).cloned()))),
         }
     }
 
@@ -209,7 +214,9 @@ mod tests {
         let r1 = d.root();
         assert_ne!(r0, r1, "a write must move the root");
 
-        let reply = futures::executor::block_on(d.query(&encode_query(&DirQuery::Get { key: "a".into() }))).unwrap();
+        let reply =
+            futures::executor::block_on(d.query(&encode_query(&DirQuery::Get { key: "a".into() })))
+                .unwrap();
         assert_eq!(
             directory_interface::decode_reply(&reply).unwrap(),
             DirReply::Value(Some("1".into()))
@@ -218,6 +225,10 @@ mod tests {
         // state-based: same final content -> same root regardless of history.
         let mut e = Directory::new("directory");
         e.set("a".into(), "1".into());
-        assert_eq!(r1, e.root(), "root must be f(state), order/history-independent");
+        assert_eq!(
+            r1,
+            e.root(),
+            "root must be f(state), order/history-independent"
+        );
     }
 }

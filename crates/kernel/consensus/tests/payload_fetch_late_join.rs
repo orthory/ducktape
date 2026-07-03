@@ -25,15 +25,15 @@ use commonware_consensus::simplex::{mocks, scheme::ed25519 as simplex_ed25519};
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::Sha256;
 use commonware_p2p::simulated::{self, Link};
-use commonware_runtime::{deterministic, Clock as _, Quota, Runner as _, Supervisor as _};
-use commonware_utils::{NZUsize, NZU32};
+use commonware_runtime::{Clock as _, Quota, Runner as _, Supervisor as _, deterministic};
+use commonware_utils::{NZU32, NZUsize};
 
 use consensus::{ContentStore, Digest, SimplexOrderer};
 use directory::Directory;
-use directory_interface::{encode_msg, DirMsg};
+use directory_interface::{DirMsg, encode_msg};
 use host::Host;
 use kv::Kv;
-use kv_interface::{encode, KvMsg};
+use kv_interface::{KvMsg, encode};
 use node::OrderedNode;
 use sdk::Msg;
 
@@ -49,11 +49,23 @@ async fn genesis_host(ctx: deterministic::Context) -> Host {
 }
 
 fn kv_set(k: &[u8], v: &[u8]) -> Msg {
-    Msg { target: "kv".into(), payload: encode(&KvMsg::Set { key: k.to_vec(), value: v.to_vec() }) }
+    Msg {
+        target: "kv".into(),
+        payload: encode(&KvMsg::Set {
+            key: k.to_vec(),
+            value: v.to_vec(),
+        }),
+    }
 }
 
 fn dir_set(k: &str, v: &str) -> Msg {
-    Msg { target: "directory".into(), payload: encode_msg(&DirMsg::Set { key: k.into(), value: v.into() }) }
+    Msg {
+        target: "directory".into(),
+        payload: encode_msg(&DirMsg::Set {
+            key: k.into(),
+            value: v.into(),
+        }),
+    }
 }
 
 /// distinct origins/keys so the final kv CONTENT is permutation-invariant
@@ -99,7 +111,10 @@ async fn run_late_join(mut context: deterministic::Context) {
     for v in participants.iter() {
         let control = oracle.control(v.clone());
         let vote = control.register(0, quota).await.expect("register vote");
-        let certificate = control.register(1, quota).await.expect("register certificate");
+        let certificate = control
+            .register(1, quota)
+            .await
+            .expect("register certificate");
         let resolver = control.register(2, quota).await.expect("register resolver");
         let payload = control.register(3, quota).await.expect("register payload");
         let fetch = control.register(4, quota).await.expect("register fetch");
@@ -108,13 +123,20 @@ async fn run_late_join(mut context: deterministic::Context) {
         fetch_chans.insert(v.clone(), fetch);
     }
 
-    let link = Link { latency: Duration::from_millis(10), jitter: Duration::from_millis(1), success_rate: 1.0 };
+    let link = Link {
+        latency: Duration::from_millis(10),
+        jitter: Duration::from_millis(1),
+        success_rate: 1.0,
+    };
     for v1 in participants.iter() {
         for v2 in participants.iter() {
             if v1 == v2 {
                 continue;
             }
-            oracle.add_link(v1.clone(), v2.clone(), link.clone()).await.expect("link validators");
+            oracle
+                .add_link(v1.clone(), v2.clone(), link.clone())
+                .await
+                .expect("link validators");
         }
     }
 
@@ -154,7 +176,11 @@ async fn run_late_join(mut context: deterministic::Context) {
 
     let genesis = nodes[0].app_hash();
     for n in &nodes {
-        assert_eq!(n.app_hash(), genesis, "identical genesis -> identical app-hash");
+        assert_eq!(
+            n.app_hash(),
+            genesis,
+            "identical genesis -> identical app-hash"
+        );
     }
 
     // the order-INDEPENDENT directory root the two legit dir writes MUST produce,
@@ -168,7 +194,10 @@ async fn run_late_join(mut context: deterministic::Context) {
 
     let ops = op_set();
     for (i, (origin, seq, msg)) in ops.iter().enumerate() {
-        nodes[i].submit(origin, *seq, msg.clone()).await.expect("submit");
+        nodes[i]
+            .submit(origin, *seq, msg.clone())
+            .await
+            .expect("submit");
     }
 
     // PUMP to convergence: stop only when EVERY node (incl. the starved one, which
@@ -189,10 +218,20 @@ async fn run_late_join(mut context: deterministic::Context) {
     // starved one that reached its ops purely through the resolver fetch path ----
     let converged = nodes[0].app_hash();
     let converged_kv = nodes[0].host().module_root("kv").unwrap();
-    assert_ne!(converged, genesis, "the finalized ops moved the app-hash off genesis");
+    assert_ne!(
+        converged, genesis,
+        "the finalized ops moved the app-hash off genesis"
+    );
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(applied[i], target, "validator {i} applied EXACTLY the finalized ops");
-        assert_eq!(n.app_hash(), converged, "validator {i} converges on the identical app-hash");
+        assert_eq!(
+            applied[i], target,
+            "validator {i} applied EXACTLY the finalized ops"
+        );
+        assert_eq!(
+            n.app_hash(),
+            converged,
+            "validator {i} converges on the identical app-hash"
+        );
         assert_eq!(
             n.host().module_root("kv").unwrap(),
             converged_kv,

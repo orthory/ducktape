@@ -8,7 +8,7 @@
 //! a second, independent deterministic run must yield the byte-identical
 //! app-hash.
 
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::Host;
 use kv::Kv;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
@@ -40,7 +40,10 @@ impl Module for Relay {
             key: WRITE_KEY.to_vec(),
             value: WRITE_VAL.to_vec(),
         });
-        ctx.emit_msg(Msg { target: KV_ID.to_string(), payload });
+        ctx.emit_msg(Msg {
+            target: KV_ID.to_string(),
+            payload,
+        });
         Ok(())
     }
 }
@@ -58,7 +61,10 @@ async fn run_block(context: deterministic::Context) -> StateRoot {
 
     // submit to RELAY, not kv. any kv change therefore came via the follow-up.
     let outcome = host
-        .submit(Msg { target: RELAY_ID.to_string(), payload: Vec::new() })
+        .submit(Msg {
+            target: RELAY_ID.to_string(),
+            payload: Vec::new(),
+        })
         .await
         .expect("submit must terminate and succeed (no BudgetExceeded)");
 
@@ -70,11 +76,18 @@ async fn run_block(context: deterministic::Context) -> StateRoot {
         kv_root_before, kv_root_after,
         "kv root must move — the relay's follow-up write must reach kv"
     );
-    assert_ne!(kv_root_after, StateRoot::ZERO, "kv root after write is real");
+    assert_ne!(
+        kv_root_after,
+        StateRoot::ZERO,
+        "kv root after write is real"
+    );
 
     // (b) the app-hash moved, and recomputing it is identical (idempotent over
     //     the settled registry).
-    assert_ne!(app_before, outcome.app_hash, "app-hash must move after the write");
+    assert_ne!(
+        app_before, outcome.app_hash,
+        "app-hash must move after the write"
+    );
     assert_eq!(
         outcome.app_hash,
         host.app_hash(),
@@ -94,9 +107,14 @@ fn relay_follow_up_reaches_kv_and_moves_app_hash() {
 
 #[test]
 fn app_hash_is_deterministic_across_runs() {
-    let a = deterministic::Runner::default().start(|context| async move { run_block(context).await });
-    let b = deterministic::Runner::default().start(|context| async move { run_block(context).await });
-    assert_eq!(a, b, "same submit on a fresh fixed-seed host -> identical app-hash");
+    let a =
+        deterministic::Runner::default().start(|context| async move { run_block(context).await });
+    let b =
+        deterministic::Runner::default().start(|context| async move { run_block(context).await });
+    assert_eq!(
+        a, b,
+        "same submit on a fresh fixed-seed host -> identical app-hash"
+    );
 }
 
 #[test]
@@ -107,10 +125,16 @@ fn unknown_target_is_rejected_without_corrupting_the_registry() {
         host.register(Box::new(kv));
 
         let err = host
-            .submit(Msg { target: "ghost".to_string(), payload: Vec::new() })
+            .submit(Msg {
+                target: "ghost".to_string(),
+                payload: Vec::new(),
+            })
             .await
             .expect_err("unknown target must error");
-        assert_eq!(err, host::SubmitError::Rejected(Error::UnknownModule("ghost".to_string())));
+        assert_eq!(
+            err,
+            host::SubmitError::Rejected(Error::UnknownModule("ghost".to_string()))
+        );
 
         // registry intact: kv is still routable.
         assert!(host.module_root(KV_ID).is_some());
@@ -123,7 +147,10 @@ fn app_hash_is_schedule_independent() {
     // scheduling. each seed drives a different deterministic schedule; every node
     // (modeled here as a seed) must agree on the same app-hash.
     let roots: Vec<StateRoot> = (0..16u64)
-        .map(|s| deterministic::Runner::seeded(s).start(|context| async move { run_block(context).await }))
+        .map(|s| {
+            deterministic::Runner::seeded(s)
+                .start(|context| async move { run_block(context).await })
+        })
         .collect();
     assert!(
         roots.windows(2).all(|w| w[0] == w[1]),

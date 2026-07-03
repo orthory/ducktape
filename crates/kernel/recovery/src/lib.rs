@@ -45,15 +45,15 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 use commonware_codec::RangeCfg;
-use commonware_runtime::buffer::paged::CacheRef;
 use commonware_runtime::BufferPooler;
-use commonware_storage::journal::contiguous::{variable, Reader as _};
+use commonware_runtime::buffer::paged::CacheRef;
+use commonware_storage::journal::contiguous::{Reader as _, variable};
 use commonware_storage::metadata;
 use commonware_utils::sequence::U64;
-use futures::{pin_mut, StreamExt as _};
+use futures::{StreamExt as _, pin_mut};
 
 use host::{BlockContext, Host, SubmitError};
-use node::{decode_frame, BlockSeal, BlockSink, Disposition};
+use node::{BlockSeal, BlockSink, Disposition, decode_frame};
 use sdk::{ModuleId, StateRoot};
 
 /// runtime bounds every store here needs (same alias the storage crate uses:
@@ -133,7 +133,9 @@ impl<'a> Cursor<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>, Error> {
         let len = self.u64()? as usize;
         if len > MAX_LEN {
-            return Err(Error::Corrupt(format!("length {len} exceeds the record cap")));
+            return Err(Error::Corrupt(format!(
+                "length {len} exceeds the record cap"
+            )));
         }
         Ok(self.take(len)?.to_vec())
     }
@@ -163,7 +165,9 @@ fn put_roots(out: &mut Vec<u8>, roots: &[(ModuleId, StateRoot)]) {
 fn get_roots(c: &mut Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
     let n = c.u64()? as usize;
     if n > 4096 {
-        return Err(Error::Corrupt(format!("{n} module roots exceeds sanity cap")));
+        return Err(Error::Corrupt(format!(
+            "{n} module roots exceeds sanity cap"
+        )));
     }
     let mut roots = Vec::with_capacity(n);
     for _ in 0..n {
@@ -184,7 +188,9 @@ fn put_keys(out: &mut Vec<u8>, keys: &[Vec<u8>]) {
 fn get_keys(c: &mut Cursor) -> Result<Vec<Vec<u8>>, Error> {
     let n = c.u64()? as usize;
     if n > 4096 {
-        return Err(Error::Corrupt(format!("{n} participant keys exceeds sanity cap")));
+        return Err(Error::Corrupt(format!(
+            "{n} participant keys exceeds sanity cap"
+        )));
     }
     let mut keys = Vec::with_capacity(n);
     for _ in 0..n {
@@ -245,7 +251,12 @@ impl Record {
                 put_u64(&mut out, *height);
                 put_bytes(&mut out, frame);
             }
-            Record::Seal { height, disposition, roots, app_hash } => {
+            Record::Seal {
+                height,
+                disposition,
+                roots,
+                app_hash,
+            } => {
                 out.push(TAG_SEAL);
                 put_u64(&mut out, *height);
                 // discarded frames are never journaled — the tag is two-valued.
@@ -257,7 +268,11 @@ impl Record {
                 put_roots(&mut out, roots);
                 put_root(&mut out, app_hash);
             }
-            Record::Cutover { epoch, view_base, participants } => {
+            Record::Cutover {
+                epoch,
+                view_base,
+                participants,
+            } => {
                 out.push(TAG_CUTOVER);
                 put_u64(&mut out, *epoch);
                 put_u64(&mut out, *view_base);
@@ -272,7 +287,10 @@ impl Record {
         let tag = c.take(1)?[0];
         let record = match tag {
             TAG_PINNED => Record::Pinned { frame: c.bytes()? },
-            TAG_BLOCK => Record::Block { height: c.u64()?, frame: c.bytes()? },
+            TAG_BLOCK => Record::Block {
+                height: c.u64()?,
+                frame: c.bytes()?,
+            },
             TAG_SEAL => {
                 let height = c.u64()?;
                 let disposition = match c.take(1)?[0] {
@@ -282,7 +300,12 @@ impl Record {
                 };
                 let roots = get_roots(&mut c)?;
                 let app_hash = c.root()?;
-                Record::Seal { height, disposition, roots, app_hash }
+                Record::Seal {
+                    height,
+                    disposition,
+                    roots,
+                    app_hash,
+                }
             }
             TAG_CUTOVER => Record::Cutover {
                 epoch: c.u64()?,
@@ -505,7 +528,11 @@ impl FloorCert {
 
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut c = Cursor::new(bytes);
-        let out = Self { epoch: c.u64()?, height: c.u64()?, cert: c.bytes()? };
+        let out = Self {
+            epoch: c.u64()?,
+            height: c.u64()?,
+            cert: c.bytes()?,
+        };
         c.done()?;
         Ok(out)
     }
@@ -580,7 +607,11 @@ where
         )
         .await
         .map_err(storage_err)?;
-        Ok(Self { journal, manifest_store, cert_store })
+        Ok(Self {
+            journal,
+            manifest_store,
+            cert_store,
+        })
     }
 
     /// the persisted checkpoint, if any. `None` means this storage dir has
@@ -642,7 +673,11 @@ where
     /// passed that manifest's height — pruned frames must never be needed to
     /// resolve a re-reported finalization.
     pub async fn prune_oplog(&mut self, pos: u64) -> Result<(), Error> {
-        self.journal.prune(pos).await.map(|_| ()).map_err(storage_err)
+        self.journal
+            .prune(pos)
+            .await
+            .map(|_| ())
+            .map_err(storage_err)
     }
 }
 
@@ -655,11 +690,11 @@ impl<E> BlockSink for Recovery<E>
 where
     E: Context + BufferPooler + commonware_runtime::Supervisor,
 {
-    fn pin(
-        &mut self,
-        frame: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        let record = Record::Pinned { frame: frame.to_vec() }.encode();
+    fn pin(&mut self, frame: &[u8]) -> impl std::future::Future<Output = Result<(), node::Error>> {
+        let record = Record::Pinned {
+            frame: frame.to_vec(),
+        }
+        .encode();
         async move {
             self.journal.append(&record).await.map_err(storage_err)?;
             self.journal.sync().await.map_err(storage_err)?;
@@ -672,7 +707,11 @@ where
         height: u64,
         frame: &[u8],
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        let record = Record::Block { height, frame: frame.to_vec() }.encode();
+        let record = Record::Block {
+            height,
+            frame: frame.to_vec(),
+        }
+        .encode();
         async move {
             self.journal.append(&record).await.map_err(storage_err)?;
             self.journal.sync().await.map_err(storage_err)?;
@@ -761,7 +800,11 @@ where
     /// already contains (root equality) and re-applying the rest, verifying
     /// each re-applied block against its sealed roots and the final state
     /// against the tip's sealed app-hash.
-    pub async fn recover(&mut self, host: &mut Host, manifest: &Manifest) -> Result<Recovered, Error> {
+    pub async fn recover(
+        &mut self,
+        host: &mut Host,
+        manifest: &Manifest,
+    ) -> Result<Recovered, Error> {
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.app_hash;
@@ -794,7 +837,11 @@ where
         for record in records {
             match record {
                 Record::Pinned { frame } => frames.push(frame),
-                Record::Cutover { epoch: e, view_base: b, participants: p } => {
+                Record::Cutover {
+                    epoch: e,
+                    view_base: b,
+                    participants: p,
+                } => {
                     // monotone: a stale record retained from below the
                     // checkpoint must not regress the manifest's values.
                     if e > epoch {
@@ -816,7 +863,12 @@ where
                     frames.push(frame.clone());
                     pending = Some((height, frame));
                 }
-                Record::Seal { height, disposition, roots, app_hash } => {
+                Record::Seal {
+                    height,
+                    disposition,
+                    roots,
+                    app_hash,
+                } => {
                     if manifest.height.is_some_and(|h| height <= h) {
                         continue;
                     }
@@ -903,7 +955,9 @@ where
                 roots: host.module_roots(),
                 app_hash: host.app_hash(),
             };
-            BlockSink::seal(self, &seal).await.map_err(|e| Error::Storage(e.to_string()))?;
+            BlockSink::seal(self, &seal)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?;
             self.journal.sync().await.map_err(storage_err)?;
             blocks.push((height, seal.roots.clone()));
             tip_height = Some(height);
@@ -947,7 +1001,11 @@ async fn apply_block(
 ) -> Result<Disposition, Error> {
     let outcome = match decode_frame(frame) {
         Ok((origin, msg)) => {
-            let ctx = BlockContext { height, consensus_time: height, origin };
+            let ctx = BlockContext {
+                height,
+                consensus_time: height,
+                origin,
+            };
             match host.submit_at(ctx, msg).await {
                 Ok(_) => Disposition::Applied,
                 Err(SubmitError::Rejected(_)) => Disposition::Rejected,
@@ -983,8 +1041,13 @@ mod tests {
     #[test]
     fn record_roundtrip() {
         let records = vec![
-            Record::Pinned { frame: b"frame-bytes".to_vec() },
-            Record::Block { height: 7, frame: vec![0, 1, 2] },
+            Record::Pinned {
+                frame: b"frame-bytes".to_vec(),
+            },
+            Record::Block {
+                height: 7,
+                frame: vec![0, 1, 2],
+            },
             Record::Seal {
                 height: 7,
                 disposition: Disposition::Applied,
@@ -1011,7 +1074,11 @@ mod tests {
 
     #[test]
     fn record_rejects_damage() {
-        let good = Record::Block { height: 7, frame: vec![0, 1, 2] }.encode();
+        let good = Record::Block {
+            height: 7,
+            frame: vec![0, 1, 2],
+        }
+        .encode();
         // truncation
         assert!(Record::decode(&good[..good.len() - 1]).is_err());
         // trailing garbage
@@ -1049,7 +1116,11 @@ mod tests {
 
     #[test]
     fn floor_cert_roundtrip() {
-        let c = FloorCert { epoch: 3, height: 99, cert: b"certificate".to_vec() };
+        let c = FloorCert {
+            epoch: 3,
+            height: 99,
+            cert: b"certificate".to_vec(),
+        };
         assert_eq!(FloorCert::decode(&c.encode()).expect("roundtrip"), c);
     }
 }

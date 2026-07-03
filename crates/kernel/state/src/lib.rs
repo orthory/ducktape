@@ -77,7 +77,10 @@ mod tests {
     }
 
     fn m(id: &'static str, fill: u8) -> StubModule {
-        StubModule { id, root: StateRoot([fill; 32]) }
+        StubModule {
+            id,
+            root: StateRoot([fill; 32]),
+        }
     }
 
     #[test]
@@ -97,7 +100,10 @@ mod tests {
         let before = global_root(&[&a, &b]);
         let b2 = m("forge", 9);
         let after = global_root(&[&a, &b2]);
-        assert_ne!(before, after, "changing a module root must change the global root");
+        assert_ne!(
+            before, after,
+            "changing a module root must change the global root"
+        );
     }
 
     #[test]

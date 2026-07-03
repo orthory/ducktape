@@ -9,19 +9,19 @@
 //! live network runs.
 
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{ed25519::PrivateKey, Signer as _};
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 use governance::Governance;
 use governance_interface::{
-    encode_msg as gov_encode, encode_query as gov_query, decode_reply as gov_decode,
-    GovAction, GovMsg, GovQuery, GovReply, ProposalStatus,
+    GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, decode_reply as gov_decode,
+    encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Module as _, Msg, Origin};
 use valset::Valset;
 use valset_interface::{
-    decode_reply as valset_decode, encode_msg as valset_encode, encode_query as valset_query,
-    ValsetMsg, ValsetQuery, ValsetReply,
+    ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode,
+    encode_msg as valset_encode, encode_query as valset_query,
 };
 
 fn member_key(seed: u8) -> Vec<u8> {
@@ -59,7 +59,10 @@ async fn submit_as(
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
         },
-        Msg { target: target.into(), payload },
+        Msg {
+            target: target.into(),
+            payload,
+        },
     )
     .await
     .map(|_| ())
@@ -77,7 +80,12 @@ async fn validators(host: &Host) -> Vec<Vec<u8>> {
 
 async fn proposal_status(host: &Host, id: &str) -> Option<ProposalStatus> {
     let reply = host
-        .query("governance", &gov_query(&GovQuery::Proposal { proposal_id: id.into() }))
+        .query(
+            "governance",
+            &gov_query(&GovQuery::Proposal {
+                proposal_id: id.into(),
+            }),
+        )
         .await
         .expect("gov query");
     match gov_decode(&reply).expect("decode") {
@@ -94,9 +102,15 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
 
         // DIRECT external valset writes are refused — the old one-message
         // liveness kill is closed.
-        let err = submit_as(&mut host, &m1, 1, "valset", valset_encode(&ValsetMsg::Leave { key: m2.clone() }))
-            .await
-            .expect_err("external valset write must be refused");
+        let err = submit_as(
+            &mut host,
+            &m1,
+            1,
+            "valset",
+            valset_encode(&ValsetMsg::Leave { key: m2.clone() }),
+        )
+        .await
+        .expect_err("external valset write must be refused");
         assert!(
             matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("governance")),
             "got {err:?}"
@@ -104,35 +118,64 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
         assert_eq!(validators(&host).await.len(), 2, "membership untouched");
 
         // propose + both members vote yes -> early-decidable majority.
-        submit_as(&mut host, &m1, 2, "governance", gov_encode(&GovMsg::Propose {
-            proposal_id: "add-9".into(),
-            action: GovAction::AddValidator { key: newcomer.clone() },
-            voting_period: 100,
-        }))
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "add-9".into(),
+                action: GovAction::AddValidator {
+                    key: newcomer.clone(),
+                },
+                voting_period: 100,
+            }),
+        )
         .await
         .expect("propose");
-        submit_as(&mut host, &m1, 3, "governance", gov_encode(&GovMsg::Vote {
-            proposal_id: "add-9".into(),
-            approve: true,
-        }))
+        submit_as(
+            &mut host,
+            &m1,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "add-9".into(),
+                approve: true,
+            }),
+        )
         .await
         .expect("vote m1");
-        submit_as(&mut host, &m2, 4, "governance", gov_encode(&GovMsg::Vote {
-            proposal_id: "add-9".into(),
-            approve: true,
-        }))
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "add-9".into(),
+                approve: true,
+            }),
+        )
         .await
         .expect("vote m2");
 
         // early execution: yes-ballots already form a strict majority. the
         // valset op rides the SAME block as a governance-origin follow-up.
-        submit_as(&mut host, &m2, 5, "governance", gov_encode(&GovMsg::Execute {
-            proposal_id: "add-9".into(),
-        }))
+        submit_as(
+            &mut host,
+            &m2,
+            5,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "add-9".into(),
+            }),
+        )
         .await
         .expect("execute");
 
-        assert_eq!(proposal_status(&host, "add-9").await, Some(ProposalStatus::Passed));
+        assert_eq!(
+            proposal_status(&host, "add-9").await,
+            Some(ProposalStatus::Passed)
+        );
         let members = validators(&host).await;
         assert_eq!(members.len(), 3, "the admitted validator is a member");
         assert!(members.contains(&newcomer));
@@ -156,36 +199,67 @@ fn a_single_member_ballot_is_a_deciding_majority() {
         ])
         .expect("genesis");
 
-        submit_as(&mut host, &founder, 1, "governance", gov_encode(&GovMsg::Propose {
-            proposal_id: "add-friend".into(),
-            action: GovAction::AddValidator { key: friend.clone() },
-            voting_period: 100,
-        }))
+        submit_as(
+            &mut host,
+            &founder,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "add-friend".into(),
+                action: GovAction::AddValidator {
+                    key: friend.clone(),
+                },
+                voting_period: 100,
+            }),
+        )
         .await
         .expect("propose");
 
         // proposing is NOT voting: executing with zero ballots is not
         // decidable before the deadline, even at n=1.
-        let err = submit_as(&mut host, &founder, 2, "governance", gov_encode(&GovMsg::Execute {
-            proposal_id: "add-friend".into(),
-        }))
+        let err = submit_as(
+            &mut host,
+            &founder,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "add-friend".into(),
+            }),
+        )
         .await
         .expect_err("no ballots -> not decidable early");
-        assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable")));
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable"))
+        );
 
-        submit_as(&mut host, &founder, 3, "governance", gov_encode(&GovMsg::Vote {
-            proposal_id: "add-friend".into(),
-            approve: true,
-        }))
+        submit_as(
+            &mut host,
+            &founder,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "add-friend".into(),
+                approve: true,
+            }),
+        )
         .await
         .expect("vote");
-        submit_as(&mut host, &founder, 4, "governance", gov_encode(&GovMsg::Execute {
-            proposal_id: "add-friend".into(),
-        }))
+        submit_as(
+            &mut host,
+            &founder,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "add-friend".into(),
+            }),
+        )
         .await
         .expect("the single ballot decides");
 
-        assert_eq!(proposal_status(&host, "add-friend").await, Some(ProposalStatus::Passed));
+        assert_eq!(
+            proposal_status(&host, "add-friend").await,
+            Some(ProposalStatus::Passed)
+        );
         let members = validators(&host).await;
         assert_eq!(members.len(), 2, "the friend is admitted");
         assert!(members.contains(&friend));
@@ -199,53 +273,94 @@ fn non_members_cannot_propose_or_vote_and_minority_rejects() {
         let (m1, m2, outsider) = (member_key(1), member_key(2), member_key(7));
 
         // an outsider cannot propose...
-        let err = submit_as(&mut host, &outsider, 1, "governance", gov_encode(&GovMsg::Propose {
-            proposal_id: "p".into(),
-            action: GovAction::Signal { text: "hi".into() },
-            voting_period: 10,
-        }))
+        let err = submit_as(
+            &mut host,
+            &outsider,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p".into(),
+                action: GovAction::Signal { text: "hi".into() },
+                voting_period: 10,
+            }),
+        )
         .await
         .expect_err("outsider propose must be refused");
         assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member")));
 
         // ...a member proposes, an outsider cannot vote...
-        submit_as(&mut host, &m1, 2, "governance", gov_encode(&GovMsg::Propose {
-            proposal_id: "p".into(),
-            action: GovAction::Signal { text: "hi".into() },
-            voting_period: 10,
-        }))
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p".into(),
+                action: GovAction::Signal { text: "hi".into() },
+                voting_period: 10,
+            }),
+        )
         .await
         .expect("member propose");
-        let err = submit_as(&mut host, &outsider, 3, "governance", gov_encode(&GovMsg::Vote {
-            proposal_id: "p".into(),
-            approve: true,
-        }))
+        let err = submit_as(
+            &mut host,
+            &outsider,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
         .await
         .expect_err("outsider vote must be refused");
         assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member")));
 
         // ...one yes of two members is NOT a strict majority: not decidable
         // early, and after the deadline it rejects.
-        submit_as(&mut host, &m1, 4, "governance", gov_encode(&GovMsg::Vote {
-            proposal_id: "p".into(),
-            approve: true,
-        }))
+        submit_as(
+            &mut host,
+            &m1,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
         .await
         .expect("m1 votes yes");
-        let err = submit_as(&mut host, &m2, 5, "governance", gov_encode(&GovMsg::Execute {
-            proposal_id: "p".into(),
-        }))
+        let err = submit_as(
+            &mut host,
+            &m2,
+            5,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p".into(),
+            }),
+        )
         .await
         .expect_err("not decidable before the deadline without a majority");
-        assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable")));
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable"))
+        );
 
         // past the deadline (proposed at 2, period 10 -> deadline 12).
-        submit_as(&mut host, &m2, 13, "governance", gov_encode(&GovMsg::Execute {
-            proposal_id: "p".into(),
-        }))
+        submit_as(
+            &mut host,
+            &m2,
+            13,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p".into(),
+            }),
+        )
         .await
         .expect("execute after deadline");
-        assert_eq!(proposal_status(&host, "p").await, Some(ProposalStatus::Rejected));
+        assert_eq!(
+            proposal_status(&host, "p").await,
+            Some(ProposalStatus::Rejected)
+        );
     });
 }
 
@@ -255,33 +370,77 @@ fn votes_close_at_the_deadline_and_ballots_are_per_member() {
         let mut host = gov_host();
         let (m1, m2) = (member_key(1), member_key(2));
 
-        submit_as(&mut host, &m1, 1, "governance", gov_encode(&GovMsg::Propose {
-            proposal_id: "p".into(),
-            action: GovAction::Signal { text: "x".into() },
-            voting_period: 5,
-        }))
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p".into(),
+                action: GovAction::Signal { text: "x".into() },
+                voting_period: 5,
+            }),
+        )
         .await
         .expect("propose");
 
         // a re-vote overwrites (yes -> no), it does not double-count.
-        submit_as(&mut host, &m1, 2, "governance", gov_encode(&GovMsg::Vote { proposal_id: "p".into(), approve: true }))
-            .await
-            .expect("m1 yes");
-        submit_as(&mut host, &m1, 3, "governance", gov_encode(&GovMsg::Vote { proposal_id: "p".into(), approve: false }))
-            .await
-            .expect("m1 flips to no");
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m1 yes");
+        submit_as(
+            &mut host,
+            &m1,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: false,
+            }),
+        )
+        .await
+        .expect("m1 flips to no");
 
         // voting closes AT the deadline (proposed at 1, period 5 -> deadline 6).
-        let err = submit_as(&mut host, &m2, 6, "governance", gov_encode(&GovMsg::Vote { proposal_id: "p".into(), approve: true }))
-            .await
-            .expect_err("vote at the deadline is closed");
+        let err = submit_as(
+            &mut host,
+            &m2,
+            6,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect_err("vote at the deadline is closed");
         assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("closed")));
 
         // tally: zero CURRENT yes-ballots -> rejected.
-        submit_as(&mut host, &m2, 7, "governance", gov_encode(&GovMsg::Execute { proposal_id: "p".into() }))
-            .await
-            .expect("execute");
-        assert_eq!(proposal_status(&host, "p").await, Some(ProposalStatus::Rejected));
+        submit_as(
+            &mut host,
+            &m2,
+            7,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p".into(),
+            }),
+        )
+        .await
+        .expect("execute");
+        assert_eq!(
+            proposal_status(&host, "p").await,
+            Some(ProposalStatus::Rejected)
+        );
     });
 }
 
@@ -290,22 +449,42 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
     block_on(async {
         let mut host = gov_host();
         let m1 = member_key(1);
-        submit_as(&mut host, &m1, 1, "governance", gov_encode(&GovMsg::Propose {
-            proposal_id: "p".into(),
-            action: GovAction::Signal { text: "snapshot me".into() },
-            voting_period: 50,
-        }))
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p".into(),
+                action: GovAction::Signal {
+                    text: "snapshot me".into(),
+                },
+                voting_period: 50,
+            }),
+        )
         .await
         .expect("propose");
-        submit_as(&mut host, &m1, 2, "governance", gov_encode(&GovMsg::Vote { proposal_id: "p".into(), approve: true }))
-            .await
-            .expect("vote");
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote");
 
         // rebuild a fresh instance from the snapshot, gated on the root.
         let root = host.module_root("governance").expect("gov root");
         let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
             // reach the handle through the host's finalized-snapshot surface.
-            let finalized = host::FinalizedBlock { height: 2, app_hash: host.app_hash() };
+            let finalized = host::FinalizedBlock {
+                height: 2,
+                app_hash: host.app_hash(),
+            };
             host.capture_finalized_snapshot(finalized)
                 .expect("capture")
                 .module("governance")
@@ -318,14 +497,25 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
 
         let mut rebuilt = Governance::new("governance", "valset");
         rebuilt.install(&bytes, root).expect("install");
-        assert_eq!(rebuilt.root(), root, "installed root equals the source root");
+        assert_eq!(
+            rebuilt.root(),
+            root,
+            "installed root equals the source root"
+        );
 
         // a flipped bit must be refused without touching state.
         let mut tampered = bytes.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
         let mut fresh = Governance::new("governance", "valset");
-        assert!(fresh.install(&tampered, root).is_err(), "tampered snapshot refused");
-        assert_eq!(fresh.root(), sdk::StateRoot::ZERO, "refused install leaves no trace");
+        assert!(
+            fresh.install(&tampered, root).is_err(),
+            "tampered snapshot refused"
+        );
+        assert_eq!(
+            fresh.root(),
+            sdk::StateRoot::ZERO,
+            "refused install leaves no trace"
+        );
     });
 }

@@ -10,9 +10,11 @@
 //! (c) read-your-writes: a later op in the SAME block sees an earlier staged
 //!     write (through a cross-module `ctx.query`), before any commit.
 
-use commonware_runtime::{deterministic, Runner as _};
+use commonware_runtime::{Runner as _, deterministic};
 use directory::Directory;
-use directory_interface::{decode_reply, encode_msg as dir_encode, encode_query, DirMsg, DirQuery, DirReply};
+use directory_interface::{
+    DirMsg, DirQuery, DirReply, decode_reply, encode_msg as dir_encode, encode_query,
+};
 use host::Host;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, StateRoot};
 
@@ -58,11 +60,20 @@ impl Module for Fanout {
     async fn execute(&mut self, ctx: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> {
         ctx.emit_msg(Msg {
             target: DIR.into(),
-            payload: dir_encode(&DirMsg::Set { key: "k".into(), value: "v".into() }),
+            payload: dir_encode(&DirMsg::Set {
+                key: "k".into(),
+                value: "v".into(),
+            }),
         });
-        ctx.emit_msg(Msg { target: KV.into(), payload: kv_set("k", "v") });
+        ctx.emit_msg(Msg {
+            target: KV.into(),
+            payload: kv_set("k", "v"),
+        });
         if self.fail {
-            ctx.emit_msg(Msg { target: "boom".into(), payload: Vec::new() });
+            ctx.emit_msg(Msg {
+                target: "boom".into(),
+                payload: Vec::new(),
+            });
         }
         Ok(())
     }
@@ -86,22 +97,40 @@ fn failed_block_rolls_back_every_module() {
         let app0 = host.app_hash();
 
         let err = host
-            .submit(Msg { target: "fanout".into(), payload: Vec::new() })
+            .submit(Msg {
+                target: "fanout".into(),
+                payload: Vec::new(),
+            })
             .await
             .expect_err("the boom follow-up must fail the block");
-        assert_eq!(err, host::SubmitError::Rejected(Error::Module("boom".into())));
+        assert_eq!(
+            err,
+            host::SubmitError::Rejected(Error::Module("boom".into()))
+        );
 
         // no trace: every root and the app-hash are byte-identical to pre-block.
-        assert_eq!(host.module_root(DIR).unwrap(), dir0, "directory must roll back");
+        assert_eq!(
+            host.module_root(DIR).unwrap(),
+            dir0,
+            "directory must roll back"
+        );
         assert_eq!(host.module_root(KV).unwrap(), kv0, "kv must roll back");
-        assert_eq!(host.app_hash(), app0, "app-hash must be unchanged after a failed block");
+        assert_eq!(
+            host.app_hash(),
+            app0,
+            "app-hash must be unchanged after a failed block"
+        );
 
         // the staged value is truly gone — not merely root-invisible.
         let r = host
             .query(DIR, &encode_query(&DirQuery::Get { key: "k".into() }))
             .await
             .unwrap();
-        assert_eq!(decode_reply(&r).unwrap(), DirReply::Value(None), "staged write must be discarded");
+        assert_eq!(
+            decode_reply(&r).unwrap(),
+            DirReply::Value(None),
+            "staged write must be discarded"
+        );
     });
 }
 
@@ -120,9 +149,15 @@ impl Module for Looper {
         // stage a directory write, then re-emit to self forever -> BudgetExceeded.
         ctx.emit_msg(Msg {
             target: DIR.into(),
-            payload: dir_encode(&DirMsg::Set { key: "k".into(), value: "v".into() }),
+            payload: dir_encode(&DirMsg::Set {
+                key: "k".into(),
+                value: "v".into(),
+            }),
         });
-        ctx.emit_msg(Msg { target: "looper".into(), payload: Vec::new() });
+        ctx.emit_msg(Msg {
+            target: "looper".into(),
+            payload: Vec::new(),
+        });
         Ok(())
     }
 }
@@ -130,23 +165,31 @@ impl Module for Looper {
 #[test]
 fn budget_exceeded_also_rolls_back() {
     deterministic::Runner::default().start(|_| async move {
-        let mut host = Host::genesis(vec![
-            Box::new(Directory::new(DIR)),
-            Box::new(Looper),
-        ])
-        .expect("genesis");
+        let mut host =
+            Host::genesis(vec![Box::new(Directory::new(DIR)), Box::new(Looper)]).expect("genesis");
 
         let dir0 = host.module_root(DIR).unwrap();
         let app0 = host.app_hash();
 
         let err = host
-            .submit(Msg { target: "looper".into(), payload: Vec::new() })
+            .submit(Msg {
+                target: "looper".into(),
+                payload: Vec::new(),
+            })
             .await
             .expect_err("must hit the dispatch budget");
         assert_eq!(err, host::SubmitError::Rejected(Error::BudgetExceeded));
 
-        assert_eq!(host.module_root(DIR).unwrap(), dir0, "directory must roll back on budget exhaustion");
-        assert_eq!(host.app_hash(), app0, "app-hash unchanged after a budget-exceeded block");
+        assert_eq!(
+            host.module_root(DIR).unwrap(),
+            dir0,
+            "directory must roll back on budget exhaustion"
+        );
+        assert_eq!(
+            host.app_hash(),
+            app0,
+            "app-hash unchanged after a budget-exceeded block"
+        );
     });
 }
 
@@ -167,15 +210,29 @@ fn successful_multi_write_block_commits_all_together() {
         let app0 = host.app_hash();
 
         let out = host
-            .submit(Msg { target: "fanout".into(), payload: Vec::new() })
+            .submit(Msg {
+                target: "fanout".into(),
+                payload: Vec::new(),
+            })
             .await
             .expect("clean block must succeed");
 
         // both writes landed at the boundary — both roots moved.
-        assert_ne!(host.module_root(DIR).unwrap(), dir0, "directory must commit");
+        assert_ne!(
+            host.module_root(DIR).unwrap(),
+            dir0,
+            "directory must commit"
+        );
         assert_ne!(host.module_root(KV).unwrap(), kv0, "kv must commit");
-        assert_ne!(out.app_hash, app0, "app-hash must reflect the committed writes");
-        assert_eq!(out.app_hash, host.app_hash(), "app-hash must be recompute-stable");
+        assert_ne!(
+            out.app_hash, app0,
+            "app-hash must reflect the committed writes"
+        );
+        assert_eq!(
+            out.app_hash,
+            host.app_hash(),
+            "app-hash must be recompute-stable"
+        );
 
         // and the values are readable post-commit.
         let r = host
@@ -205,9 +262,15 @@ impl Module for RywProbe {
                 // within the same block. FIFO guarantees the write dispatches first.
                 ctx.emit_msg(Msg {
                     target: DIR.into(),
-                    payload: dir_encode(&DirMsg::Set { key: "ryw".into(), value: "staged".into() }),
+                    payload: dir_encode(&DirMsg::Set {
+                        key: "ryw".into(),
+                        value: "staged".into(),
+                    }),
                 });
-                ctx.emit_msg(Msg { target: "ryw".into(), payload: b"verify".to_vec() });
+                ctx.emit_msg(Msg {
+                    target: "ryw".into(),
+                    payload: b"verify".to_vec(),
+                });
                 Ok(())
             }
             b"verify" => {
@@ -220,7 +283,11 @@ impl Module for RywProbe {
                 };
                 ctx.emit_event(Event {
                     source: "ryw".into(),
-                    payload: if seen { b"SAW".to_vec() } else { b"MISS".to_vec() },
+                    payload: if seen {
+                        b"SAW".to_vec()
+                    } else {
+                        b"MISS".to_vec()
+                    },
                 });
                 Ok(())
             }
@@ -244,13 +311,24 @@ impl Module for KvRywProbe {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match msg.payload.as_slice() {
             b"start" => {
-                ctx.emit_msg(Msg { target: KV.into(), payload: kv_set("kryw", "staged") });
-                ctx.emit_msg(Msg { target: "kvryw".into(), payload: b"verify".to_vec() });
+                ctx.emit_msg(Msg {
+                    target: KV.into(),
+                    payload: kv_set("kryw", "staged"),
+                });
+                ctx.emit_msg(Msg {
+                    target: "kvryw".into(),
+                    payload: b"verify".to_vec(),
+                });
                 Ok(())
             }
             b"verify" => {
                 let reply = ctx
-                    .query(KV, &kv_interface::encode_query(&kv_interface::KvQuery::Get { key: b"kryw".to_vec() }))
+                    .query(
+                        KV,
+                        &kv_interface::encode_query(&kv_interface::KvQuery::Get {
+                            key: b"kryw".to_vec(),
+                        }),
+                    )
                     .await?;
                 let seen = matches!(
                     kv_interface::decode_reply(&reply).map_err(Error::Module)?,
@@ -258,7 +336,11 @@ impl Module for KvRywProbe {
                 );
                 ctx.emit_event(Event {
                     source: "kvryw".into(),
-                    payload: if seen { b"SAW".to_vec() } else { b"MISS".to_vec() },
+                    payload: if seen {
+                        b"SAW".to_vec()
+                    } else {
+                        b"MISS".to_vec()
+                    },
                 });
                 Ok(())
             }
@@ -275,7 +357,10 @@ fn read_your_writes_against_qmdb_within_a_block() {
 
         let kv0 = host.module_root(KV).unwrap();
         let out = host
-            .submit(Msg { target: "kvryw".into(), payload: b"start".to_vec() })
+            .submit(Msg {
+                target: "kvryw".into(),
+                payload: b"start".to_vec(),
+            })
             .await
             .expect("clean block");
 
@@ -284,21 +369,25 @@ fn read_your_writes_against_qmdb_within_a_block() {
             "a later op must see an earlier staged QMDB write before commit"
         );
         // and it did commit at the boundary — the qmdb root moved.
-        assert_ne!(host.module_root(KV).unwrap(), kv0, "kv must commit at the boundary");
+        assert_ne!(
+            host.module_root(KV).unwrap(),
+            kv0,
+            "kv must commit at the boundary"
+        );
     });
 }
 
 #[test]
 fn read_your_writes_within_a_block() {
     deterministic::Runner::default().start(|_| async move {
-        let mut host = Host::genesis(vec![
-            Box::new(Directory::new(DIR)),
-            Box::new(RywProbe),
-        ])
-        .expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(Directory::new(DIR)), Box::new(RywProbe)])
+            .expect("genesis");
 
         let out = host
-            .submit(Msg { target: "ryw".into(), payload: b"start".to_vec() })
+            .submit(Msg {
+                target: "ryw".into(),
+                payload: b"start".to_vec(),
+            })
             .await
             .expect("clean block");
 

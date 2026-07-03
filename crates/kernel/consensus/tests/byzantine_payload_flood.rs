@@ -33,16 +33,18 @@ use commonware_consensus::types::Epoch;
 use commonware_cryptography::Sha256;
 use commonware_p2p::simulated::{self, Link};
 use commonware_p2p::{Recipients, Sender as _};
-use commonware_runtime::{deterministic, Clock as _, IoBuf, Quota, Runner as _, Spawner as _, Supervisor as _};
-use commonware_utils::{NZUsize, NZU32};
+use commonware_runtime::{
+    Clock as _, IoBuf, Quota, Runner as _, Spawner as _, Supervisor as _, deterministic,
+};
+use commonware_utils::{NZU32, NZUsize};
 
-use consensus::{digest_of, ContentStore, Digest, SimplexOrderer};
+use consensus::{ContentStore, Digest, SimplexOrderer, digest_of};
 use directory::Directory;
-use directory_interface::{encode_msg, DirMsg};
+use directory_interface::{DirMsg, encode_msg};
 use host::Host;
 use kv::Kv;
-use kv_interface::{encode, KvMsg};
-use node::{encode_frame, OrderedNode};
+use kv_interface::{KvMsg, encode};
+use node::{OrderedNode, encode_frame};
 use sdk::Msg;
 
 const N: usize = 5;
@@ -57,11 +59,23 @@ async fn genesis_host(ctx: deterministic::Context) -> Host {
 }
 
 fn kv_set(k: &[u8], v: &[u8]) -> Msg {
-    Msg { target: "kv".into(), payload: encode(&KvMsg::Set { key: k.to_vec(), value: v.to_vec() }) }
+    Msg {
+        target: "kv".into(),
+        payload: encode(&KvMsg::Set {
+            key: k.to_vec(),
+            value: v.to_vec(),
+        }),
+    }
 }
 
 fn dir_set(k: &str, v: &str) -> Msg {
-    Msg { target: "directory".into(), payload: encode_msg(&DirMsg::Set { key: k.into(), value: v.into() }) }
+    Msg {
+        target: "directory".into(),
+        payload: encode_msg(&DirMsg::Set {
+            key: k.into(),
+            value: v.into(),
+        }),
+    }
 }
 
 /// same op-set as the shared-store proof: distinct origins/keys so the FINAL kv
@@ -130,20 +144,30 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
     for v in participants.iter() {
         let control = oracle.control(v.clone());
         let vote = control.register(0, quota).await.expect("register vote");
-        let certificate = control.register(1, quota).await.expect("register certificate");
+        let certificate = control
+            .register(1, quota)
+            .await
+            .expect("register certificate");
         let resolver = control.register(2, quota).await.expect("register resolver");
         let payload = control.register(3, quota).await.expect("register payload");
         registrations.insert(v.clone(), (vote, certificate, resolver));
         payload_chans.insert(v.clone(), payload);
     }
 
-    let link = Link { latency: Duration::from_millis(10), jitter: Duration::from_millis(1), success_rate: 1.0 };
+    let link = Link {
+        latency: Duration::from_millis(10),
+        jitter: Duration::from_millis(1),
+        success_rate: 1.0,
+    };
     for v1 in participants.iter() {
         for v2 in participants.iter() {
             if v1 == v2 {
                 continue;
             }
-            oracle.add_link(v1.clone(), v2.clone(), link.clone()).await.expect("link validators");
+            oracle
+                .add_link(v1.clone(), v2.clone(), link.clone())
+                .await
+                .expect("link validators");
         }
     }
 
@@ -169,10 +193,15 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
                     // (a) a distinct random content-address every tick ...
                     let _ = byz_sender.send(Recipients::All, IoBuf::from(garbage_blob(i)), false);
                     // (b) the resent random sentinel (reliably lands everywhere) ...
-                    let _ = byz_sender.send(Recipients::All, IoBuf::from(sentinel_garbage()), false);
+                    let _ =
+                        byz_sender.send(Recipients::All, IoBuf::from(sentinel_garbage()), false);
                     // (c) a WELL-FORMED frame never proposed to consensus — the
                     // adversarial case a skeptic can't wave off as "wouldn't decode".
-                    let _ = byz_sender.send(Recipients::All, IoBuf::from(unproposed_valid_frame()), false);
+                    let _ = byz_sender.send(
+                        Recipients::All,
+                        IoBuf::from(unproposed_valid_frame()),
+                        false,
+                    );
                     ctx.sleep(Duration::from_millis(30)).await;
                 }
             });
@@ -199,7 +228,11 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
 
     let genesis = nodes[0].app_hash();
     for n in &nodes {
-        assert_eq!(n.app_hash(), genesis, "identical genesis -> identical app-hash");
+        assert_eq!(
+            n.app_hash(),
+            genesis,
+            "identical genesis -> identical app-hash"
+        );
     }
     let genesis_kv = nodes[0].host().module_root("kv").unwrap();
     // the order-INDEPENDENT directory root the two legit dir writes MUST produce,
@@ -213,10 +246,17 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
 
     let ops = op_set();
     for (i, (origin, seq, msg)) in ops.iter().enumerate() {
-        nodes[i].submit(origin, *seq, msg.clone()).await.expect("submit");
+        nodes[i]
+            .submit(origin, *seq, msg.clone())
+            .await
+            .expect("submit");
     }
     for n in &nodes {
-        assert_eq!(n.app_hash(), genesis, "no optimistic echo: submit does not advance app-hash");
+        assert_eq!(
+            n.app_hash(),
+            genesis,
+            "no optimistic echo: submit does not advance app-hash"
+        );
     }
 
     // PUMP to convergence: stop only when EVERY node has applied the whole op-set.
@@ -239,11 +279,21 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
     // ---- convergence: identical CORRECT state on every validator ----
     let converged = nodes[0].app_hash();
     let converged_kv = nodes[0].host().module_root("kv").unwrap();
-    assert_ne!(converged, genesis, "the finalized ops moved the app-hash off genesis");
+    assert_ne!(
+        converged, genesis,
+        "the finalized ops moved the app-hash off genesis"
+    );
     assert_ne!(converged_kv, genesis_kv, "the qmdb root moved off genesis");
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(applied[i], target, "validator {i} applied EXACTLY the finalized ops (nothing flooded entered delivery)");
-        assert_eq!(n.app_hash(), converged, "validator {i} converges on the identical app-hash");
+        assert_eq!(
+            applied[i], target,
+            "validator {i} applied EXACTLY the finalized ops (nothing flooded entered delivery)"
+        );
+        assert_eq!(
+            n.app_hash(),
+            converged,
+            "validator {i} converges on the identical app-hash"
+        );
         assert_eq!(
             n.host().module_root("kv").unwrap(),
             converged_kv,
@@ -275,14 +325,18 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
     let mut landed = false;
     for _ in 0..200 {
         if honest.iter().all(|&i| {
-            stores[i].get(&sentinel_digest).is_some() && stores[i].get(&valid_frame_digest).is_some()
+            stores[i].get(&sentinel_digest).is_some()
+                && stores[i].get(&valid_frame_digest).is_some()
         }) {
             landed = true;
             break;
         }
         context.sleep(Duration::from_millis(50)).await;
     }
-    assert!(landed, "byzantine garbage + unproposed frame reached every honest store via the payload lane");
+    assert!(
+        landed,
+        "byzantine garbage + unproposed frame reached every honest store via the payload lane"
+    );
 
     for &i in &honest {
         // random bytes: keyed by their OWN content-address (re-hash on put).
@@ -305,12 +359,14 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
 
 #[test]
 fn relay_path_converges_including_qmdb_root() {
-    deterministic::Runner::timed(Duration::from_secs(300)).start(|context| run_relay(context, false));
+    deterministic::Runner::timed(Duration::from_secs(300))
+        .start(|context| run_relay(context, false));
 }
 
 #[test]
 fn byzantine_payload_flood_is_inert() {
-    deterministic::Runner::timed(Duration::from_secs(300)).start(|context| run_relay(context, true));
+    deterministic::Runner::timed(Duration::from_secs(300))
+        .start(|context| run_relay(context, true));
 }
 
 #[test]

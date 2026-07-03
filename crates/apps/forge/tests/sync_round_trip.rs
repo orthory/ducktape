@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use forge::Forge;
-use forge_interface::{encode_msg, ForgeMsg};
+use forge_interface::{ForgeMsg, encode_msg};
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
 
 /// the module's canonical branch — the ref install must (and may only) move.
@@ -92,7 +92,10 @@ fn source(tag: &str) -> (PathBuf, Forge) {
 /// module's cache looks clean).
 fn assert_repo_untouched(dir: &PathBuf) {
     let repo = git2::Repository::open(dir).unwrap();
-    assert!(repo.refname_to_id(MAIN_REF).is_err(), "ref must not have moved");
+    assert!(
+        repo.refname_to_id(MAIN_REF).is_err(),
+        "ref must not have moved"
+    );
     let packs = std::fs::read_dir(dir.join(".git/objects/pack"))
         .map(|d| d.count())
         .unwrap_or(0);
@@ -112,7 +115,11 @@ fn snapshot_reconstructs_root_and_content_on_a_fresh_module() {
     dst.install(&bytes, root).unwrap();
 
     // THE PROPERTY: identical root — the app-hash linkage a joiner needs.
-    assert_eq!(dst.root(), root, "installed root must equal the source root");
+    assert_eq!(
+        dst.root(),
+        root,
+        "installed root must equal the source root"
+    );
 
     // content oracle: read the installed repo with git2 directly — the head
     // commit, its message, both blobs, and the parent link all came through.
@@ -173,21 +180,33 @@ fn corrupt_or_garbage_pack_bytes_are_rejected() {
     // an honest oid prefix over pure garbage instead of a pack.
     let mut garbage = bytes[..OID_LEN].to_vec();
     garbage.extend(std::iter::repeat_n(0xab, 256));
-    assert!(dst.install(&garbage, root).is_err(), "garbage pack must be rejected");
+    assert!(
+        dst.install(&garbage, root).is_err(),
+        "garbage pack must be rejected"
+    );
 
     // a real pack with its trailer checksum flipped.
     let mut flipped = bytes.clone();
     *flipped.last_mut().unwrap() ^= 0xff;
-    assert!(dst.install(&flipped, root).is_err(), "corrupted pack must be rejected");
+    assert!(
+        dst.install(&flipped, root).is_err(),
+        "corrupted pack must be rejected"
+    );
 
     // truncation below the oid header.
-    assert!(dst.install(&bytes[..10], root).is_err(), "truncated snapshot must be rejected");
+    assert!(
+        dst.install(&bytes[..10], root).is_err(),
+        "truncated snapshot must be rejected"
+    );
 
     // failed packs may strand junk in the odb, but the ref never moved and
     // the root is byte-identical to before every attempt.
     assert_eq!(dst.root(), StateRoot::ZERO);
     let repo = git2::Repository::open(&dst_dir).unwrap();
-    assert!(repo.refname_to_id(MAIN_REF).is_err(), "ref must not have moved");
+    assert!(
+        repo.refname_to_id(MAIN_REF).is_err(),
+        "ref must not have moved"
+    );
 
     let _ = std::fs::remove_dir_all(&src_dir);
     let _ = std::fs::remove_dir_all(&dst_dir);
@@ -198,7 +217,11 @@ fn empty_snapshot_round_trips_the_unborn_state() {
     let src_dir = tmp_repo("empty-src");
     let src = Forge::init("forge", src_dir.clone()).unwrap();
     let bytes = src.snapshot().unwrap();
-    assert_eq!(bytes, vec![0u8; OID_LEN], "unborn state must serialize as the zero-oid marker");
+    assert_eq!(
+        bytes,
+        vec![0u8; OID_LEN],
+        "unborn state must serialize as the zero-oid marker"
+    );
 
     let dst_dir = tmp_repo("empty-dst");
     let mut dst = Forge::init("forge", dst_dir.clone()).unwrap();
@@ -207,7 +230,10 @@ fn empty_snapshot_round_trips_the_unborn_state() {
 
     // the marker binds to ZERO the way root() does — any other expectation
     // fails…
-    assert!(dst.install(&bytes, StateRoot([1u8; sdk::ROOT_LEN])).is_err());
+    assert!(
+        dst.install(&bytes, StateRoot([1u8; sdk::ROOT_LEN]))
+            .is_err()
+    );
     // …and it must not smuggle trailing bytes.
     let mut padded = bytes.clone();
     padded.push(0);
@@ -226,7 +252,11 @@ fn install_replaces_a_divergent_head() {
     let dst_dir = tmp_repo("replace-dst");
     let mut dst = Forge::init("forge", dst_dir.clone()).unwrap();
     commit_one(&mut dst, 9, "z.txt", "other", "unrelated");
-    assert_ne!(dst.root(), root, "the destination starts on an unrelated head");
+    assert_ne!(
+        dst.root(),
+        root,
+        "the destination starts on an unrelated head"
+    );
 
     // install is a replacement, not a merge: the unrelated (non-fast-forward)
     // head is overwritten.
@@ -261,7 +291,10 @@ fn a_partial_closure_pack_is_rejected_before_the_ref_moves() {
     let dst_dir = tmp_repo("partial-dst");
     let mut dst = Forge::init("forge", dst_dir).unwrap();
     let err = dst.install(&bytes, expected).unwrap_err();
-    assert!(matches!(err, Error::Module(_)), "incomplete closure errs with Module");
+    assert!(
+        matches!(err, Error::Module(_)),
+        "incomplete closure errs with Module"
+    );
     assert_eq!(dst.root(), StateRoot::ZERO, "the ref never moved");
 }
 
@@ -277,7 +310,11 @@ fn empty_state_installed_over_a_born_repo_unbinds_it_durably() {
     assert_ne!(dst.root(), StateRoot::ZERO, "destination starts born");
 
     dst.install(&marker, StateRoot::ZERO).unwrap();
-    assert_eq!(dst.root(), StateRoot::ZERO, "in-memory root returns to ZERO");
+    assert_eq!(
+        dst.root(),
+        StateRoot::ZERO,
+        "in-memory root returns to ZERO"
+    );
 
     // durability: a re-init re-reads the ref from DISK — if install had only
     // cleared the cached head and left the ref, the old root would resurrect

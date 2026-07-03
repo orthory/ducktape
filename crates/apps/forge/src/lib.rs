@@ -107,7 +107,7 @@ mod git;
 
 use std::path::PathBuf;
 
-use forge_interface::{decode_msg, decode_query, encode_reply, ForgeMsg, ForgeQuery, ForgeReply};
+use forge_interface::{ForgeMsg, ForgeQuery, ForgeReply, decode_msg, decode_query, encode_reply};
 use git2::Oid;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
@@ -146,7 +146,12 @@ impl Forge {
             git::init(&repo_dir).map_err(|e| Error::Module(e.to_string()))?
         };
         let head = git::resolve_ref(&repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?;
-        Ok(Self { id: id.into(), repo: repo_dir, head, staged: None })
+        Ok(Self {
+            id: id.into(),
+            repo: repo_dir,
+            head,
+            staged: None,
+        })
     }
 
     /// map a HEAD sha1 oid into the fixed-width state root: the 20 raw oid bytes
@@ -283,8 +288,11 @@ impl Module for Forge {
     /// with no `.await`, so the "await only deterministic resources" rule holds
     /// vacuously — the git2 call is forge's private state substrate, not an effect.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let ForgeMsg::Commit { path, content, message } =
-            decode_msg(&msg.payload).map_err(Error::Module)?;
+        let ForgeMsg::Commit {
+            path,
+            content,
+            message,
+        } = decode_msg(&msg.payload).map_err(Error::Module)?;
 
         let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
 
@@ -302,7 +310,9 @@ impl Module for Forge {
 
         // 2. write the blob to the odb and build the tree in-memory (seeded from
         //    the parent's tree = incremental). no on-disk index, no worktree.
-        let blob = repo.blob(content.as_bytes()).map_err(|e| Error::Module(e.to_string()))?;
+        let blob = repo
+            .blob(content.as_bytes())
+            .map_err(|e| Error::Module(e.to_string()))?;
         let base_tree = parent_commit
             .as_ref()
             .map(|c| c.tree())
@@ -310,7 +320,9 @@ impl Module for Forge {
             .map_err(|e| Error::Module(e.to_string()))?;
         let tree_oid = git::build_tree(&repo, base_tree.as_ref(), &path, blob)
             .map_err(|e| Error::Module(e.to_string()))?;
-        let tree = repo.find_tree(tree_oid).map_err(|e| Error::Module(e.to_string()))?;
+        let tree = repo
+            .find_tree(tree_oid)
+            .map_err(|e| Error::Module(e.to_string()))?;
 
         // 3. deterministic commit object: date from consensus_time, fixed identity.
         let ts = ctx.env().consensus_time;
@@ -418,7 +430,10 @@ mod tests {
     // "some 32 bytes that moved". independent of forge's `head` cache. no `git`
     // binary involved (that's the whole point of vendoring libgit2).
     fn git_head_oid(repo: &PathBuf) -> Oid {
-        git2::Repository::open(repo).unwrap().refname_to_id(MAIN_REF).unwrap()
+        git2::Repository::open(repo)
+            .unwrap()
+            .refname_to_id(MAIN_REF)
+            .unwrap()
     }
 
     #[test]
@@ -427,13 +442,18 @@ mod tests {
         let mut forge = Forge::init("forge", dir.clone()).unwrap();
         assert_eq!(forge.root(), StateRoot::ZERO, "unborn repo -> ZERO root");
 
-        futures::executor::block_on(
-            forge.execute(&mut TestCtx::at(100), &commit_msg("a.txt", "hello", "first")),
-        )
+        futures::executor::block_on(forge.execute(
+            &mut TestCtx::at(100),
+            &commit_msg("a.txt", "hello", "first"),
+        ))
         .unwrap();
         futures::executor::block_on(forge.commit_block()).unwrap();
 
-        assert_ne!(forge.root(), StateRoot::ZERO, "a commit must move the root off ZERO");
+        assert_ne!(
+            forge.root(),
+            StateRoot::ZERO,
+            "a commit must move the root off ZERO"
+        );
 
         // root() == sha256(HEAD oid) — tracks the real ref (not the cache).
         let head_oid = git_head_oid(&dir);
@@ -486,7 +506,10 @@ mod tests {
         .unwrap();
         futures::executor::block_on(forge.commit_block()).unwrap();
         let after = state::global_root(&[&forge as &dyn Module]);
-        assert_ne!(before, after, "forge's git-backed root must move the global app-hash");
+        assert_ne!(
+            before, after,
+            "forge's git-backed root must move the global app-hash"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -500,17 +523,23 @@ mod tests {
         let db = tmp_repo("det-b");
         let mut fa = Forge::init("forge", da.clone()).unwrap();
         let mut fb = Forge::init("forge", db.clone()).unwrap();
-        futures::executor::block_on(
-            fa.execute(&mut TestCtx::at(555), &commit_msg("f.txt", "same", "same-msg")),
-        )
+        futures::executor::block_on(fa.execute(
+            &mut TestCtx::at(555),
+            &commit_msg("f.txt", "same", "same-msg"),
+        ))
         .unwrap();
         futures::executor::block_on(fa.commit_block()).unwrap();
-        futures::executor::block_on(
-            fb.execute(&mut TestCtx::at(555), &commit_msg("f.txt", "same", "same-msg")),
-        )
+        futures::executor::block_on(fb.execute(
+            &mut TestCtx::at(555),
+            &commit_msg("f.txt", "same", "same-msg"),
+        ))
         .unwrap();
         futures::executor::block_on(fb.commit_block()).unwrap();
-        assert_eq!(fa.root(), fb.root(), "pinned identity+date -> reproducible commit oid");
+        assert_eq!(
+            fa.root(),
+            fb.root(),
+            "pinned identity+date -> reproducible commit oid"
+        );
         let _ = std::fs::remove_dir_all(&da);
         let _ = std::fs::remove_dir_all(&db);
     }

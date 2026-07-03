@@ -31,14 +31,14 @@
 use std::collections::BTreeMap;
 
 use governance_interface::{
-    decode_msg, decode_query, encode_reply, GovAction, GovMsg, GovQuery, GovReply, ProposalStatus,
-    ProposalView,
+    GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, ProposalView, decode_msg, decode_query,
+    encode_reply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset_interface::{
-    decode_reply as valset_decode_reply, encode_msg as valset_encode_msg,
-    encode_query as valset_encode_query, ValsetMsg, ValsetQuery, ValsetReply,
+    ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
+    encode_msg as valset_encode_msg, encode_query as valset_encode_query,
 };
 
 /// ceiling on `voting_period` (in consensus-time units) — a fat-fingered or
@@ -97,7 +97,10 @@ impl Governance {
     /// projection, via the host-routed read lane.
     async fn members(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
         let reply = ctx
-            .query(&self.valset_id, &valset_encode_query(&ValsetQuery::Validators))
+            .query(
+                &self.valset_id,
+                &valset_encode_query(&ValsetQuery::Validators),
+            )
             .await?;
         match valset_decode_reply(&reply).map_err(Error::Module)? {
             ValsetReply::Validators(members) => Ok(members),
@@ -227,9 +230,9 @@ impl Governance {
         self.require_member(ctx, &proposer).await?;
 
         let now = ctx.env().consensus_time;
-        let deadline = now.checked_add(voting_period).ok_or_else(|| {
-            Error::Module("voting deadline overflows consensus time".into())
-        })?;
+        let deadline = now
+            .checked_add(voting_period)
+            .ok_or_else(|| Error::Module("voting deadline overflows consensus time".into()))?;
         self.pending.insert(
             proposal_id,
             Proposal {
@@ -347,7 +350,10 @@ impl Module for Governance {
                 proposal_id,
                 action,
                 voting_period,
-            } => self.handle_propose(ctx, proposal_id, action, voting_period).await,
+            } => {
+                self.handle_propose(ctx, proposal_id, action, voting_period)
+                    .await
+            }
             GovMsg::Vote {
                 proposal_id,
                 approve,
@@ -364,14 +370,12 @@ impl Module for Governance {
                 for (id, p) in &self.pending {
                     merged.insert(id.clone(), p.clone());
                 }
-                let views = merged
-                    .iter()
-                    .map(|(id, p)| Self::view_of(id, p))
-                    .collect();
+                let views = merged.iter().map(|(id, p)| Self::view_of(id, p)).collect();
                 Ok(encode_reply(&GovReply::Proposals(views)))
             }
             GovQuery::Proposal { proposal_id } => Ok(encode_reply(&GovReply::Proposal(
-                self.get(&proposal_id).map(|p| Self::view_of(&proposal_id, p)),
+                self.get(&proposal_id)
+                    .map(|p| Self::view_of(&proposal_id, p)),
             ))),
         }
     }
@@ -446,9 +450,15 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Proposal>, Error> {
             ));
         }
         let action = match take_u8(&mut buf)? {
-            0 => GovAction::AddValidator { key: take_vec(&mut buf)? },
-            1 => GovAction::RemoveValidator { key: take_vec(&mut buf)? },
-            2 => GovAction::Signal { text: take_string(&mut buf)? },
+            0 => GovAction::AddValidator {
+                key: take_vec(&mut buf)?,
+            },
+            1 => GovAction::RemoveValidator {
+                key: take_vec(&mut buf)?,
+            },
+            2 => GovAction::Signal {
+                text: take_string(&mut buf)?,
+            },
             other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
         };
         let proposer = take_vec(&mut buf)?;
@@ -484,7 +494,14 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Proposal>, Error> {
         prev_id = Some(id.clone());
         proposals.insert(
             id,
-            Proposal { action, proposer, created_at, deadline, status, votes },
+            Proposal {
+                action,
+                proposer,
+                created_at,
+                deadline,
+                status,
+                votes,
+            },
         );
     }
     if !buf.is_empty() {

@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 /// one op == one commit, so the HEAD (and thus `root()`) advances per message.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ForgeMsg {
-    Commit { path: String, content: String, message: String },
+    Commit {
+        path: String,
+        content: String,
+        message: String,
+    },
 }
 
 /// reads: the current canonical head of the repo.
@@ -29,9 +33,21 @@ pub enum ForgeReply {
     Head(Option<String>),
 }
 
-pub fn encode_msg(m: &ForgeMsg) -> Vec<u8> { serde_json::to_vec(m).expect("serializable") }
-pub fn decode_msg(b: &[u8]) -> Result<ForgeMsg, String> { serde_json::from_slice(b).map_err(|e| e.to_string()) }
-pub fn encode_query(q: &ForgeQuery) -> Vec<u8> { serde_json::to_vec(q).expect("serializable") }
-pub fn decode_query(b: &[u8]) -> Result<ForgeQuery, String> { serde_json::from_slice(b).map_err(|e| e.to_string()) }
-pub fn encode_reply(r: &ForgeReply) -> Vec<u8> { serde_json::to_vec(r).expect("serializable") }
-pub fn decode_reply(b: &[u8]) -> Result<ForgeReply, String> { serde_json::from_slice(b).map_err(|e| e.to_string()) }
+pub fn encode_msg(m: &ForgeMsg) -> Vec<u8> {
+    serde_json::to_vec(m).expect("serializable")
+}
+pub fn decode_msg(b: &[u8]) -> Result<ForgeMsg, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+pub fn encode_query(q: &ForgeQuery) -> Vec<u8> {
+    serde_json::to_vec(q).expect("serializable")
+}
+pub fn decode_query(b: &[u8]) -> Result<ForgeQuery, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+pub fn encode_reply(r: &ForgeReply) -> Vec<u8> {
+    serde_json::to_vec(r).expect("serializable")
+}
+pub fn decode_reply(b: &[u8]) -> Result<ForgeReply, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}

@@ -15,7 +15,11 @@ fn respawn_waits_until_cutover_view() {
     };
     assert_eq!(cutover.cutover_view(), 13);
 
-    assert!(orchestrator.respawn_if_due(12, members(&["a", "b", "c", "d"])).is_none());
+    assert!(
+        orchestrator
+            .respawn_if_due(12, members(&["a", "b", "c", "d"]))
+            .is_none()
+    );
     assert_eq!(orchestrator.epoch(), 0);
 
     let respawn = orchestrator
@@ -78,7 +82,11 @@ fn boundary_read_absorbs_a_second_change_inside_the_window() {
         .respawn_if_due(13, members(&["a", "b", "c", "d", "e"]))
         .expect("due at the armed boundary");
     assert_eq!(respawn.epoch(), 1);
-    assert_eq!(respawn.valset().consensus_members().len(), 5, "boundary set includes both joins");
+    assert_eq!(
+        respawn.valset().consensus_members().len(),
+        5,
+        "boundary set includes both joins"
+    );
     assert_eq!(orchestrator.current_members().len(), 5);
 
     // nothing further pending: the next identical observation is Unchanged.
@@ -117,7 +125,11 @@ fn unchanged_valset_does_not_churn_epochs() {
         };
         let outcome = orchestrator.observe_members(view, observed);
         assert_eq!(outcome, ObservationOutcome::Unchanged);
-        assert!(orchestrator.respawn_if_due(view, members(&["a", "b", "c"])).is_none());
+        assert!(
+            orchestrator
+                .respawn_if_due(view, members(&["a", "b", "c"]))
+                .is_none()
+        );
     }
 
     assert_eq!(orchestrator.epoch(), 0);
@@ -127,7 +139,7 @@ fn unchanged_valset_does_not_churn_epochs() {
 /// a node that crashed mid-window resumes with the recorded pending boundary
 /// and crosses it exactly like its uninterrupted peers.
 #[test]
-fn resume_rearms_a_pending_cutover()  {
+fn resume_rearms_a_pending_cutover() {
     // pre-crash: epoch 2 based at 100, spawn set {a,b,c}, a join observed at
     // view 10 armed a cutover at view 13 — all recorded, then the crash.
     let mut orchestrator =

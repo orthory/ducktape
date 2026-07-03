@@ -11,9 +11,7 @@
 //! commonware/BFT ordering slice is for.)
 
 use directory::Directory;
-use directory_interface::{
-    decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply,
-};
+use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use futures::executor::block_on;
 use host::Host;
 use node::{LoopbackHub, Node};
@@ -27,7 +25,10 @@ fn genesis_host() -> Host {
 fn set_name_world() -> Msg {
     Msg {
         target: "directory".into(),
-        payload: encode_msg(&DirMsg::Set { key: "name".into(), value: "world".into() }),
+        payload: encode_msg(&DirMsg::Set {
+            key: "name".into(),
+            value: "world".into(),
+        }),
     }
 }
 
@@ -36,7 +37,10 @@ fn set_name_world() -> Msg {
 async fn read_name<T: node::Transport>(n: &Node<T>) -> Option<String> {
     let reply = n
         .host()
-        .query("directory", &encode_query(&DirQuery::Get { key: "name".into() }))
+        .query(
+            "directory",
+            &encode_query(&DirQuery::Get { key: "name".into() }),
+        )
         .await
         .expect("directory query ok");
     match decode_reply(&reply).expect("decode reply") {
@@ -55,16 +59,34 @@ fn two_nodes_converge_on_identical_app_hash() {
 
         // identical genesis module set -> identical app-hash at the start.
         let genesis = a.app_hash();
-        assert_eq!(genesis, b.app_hash(), "identical genesis -> identical app-hash");
+        assert_eq!(
+            genesis,
+            b.app_hash(),
+            "identical genesis -> identical app-hash"
+        );
 
         // originate an op at A: apply locally + propagate to peers.
-        a.apply_local(set_name_world()).await.expect("A applies + propagates");
+        a.apply_local(set_name_world())
+            .await
+            .expect("A applies + propagates");
 
         // A advanced; B has not polled yet -> they diverge (the intermediate,
         // deterministic "A is ahead" state).
-        assert_ne!(a.app_hash(), genesis, "A's op moved its app-hash off genesis");
-        assert_ne!(a.app_hash(), b.app_hash(), "before B polls, A and B diverge");
-        assert_eq!(read_name(&a).await, Some("world".into()), "A holds the write it originated");
+        assert_ne!(
+            a.app_hash(),
+            genesis,
+            "A's op moved its app-hash off genesis"
+        );
+        assert_ne!(
+            a.app_hash(),
+            b.app_hash(),
+            "before B polls, A and B diverge"
+        );
+        assert_eq!(
+            read_name(&a).await,
+            Some("world".into()),
+            "A holds the write it originated"
+        );
         assert_eq!(read_name(&b).await, None, "B has not seen the op yet");
 
         // B drains the propagated op and applies it.
@@ -73,16 +95,31 @@ fn two_nodes_converge_on_identical_app_hash() {
 
         // THE MILESTONE: both nodes now hold the byte-identical app-hash AND the
         // replicated module STATE (the value crossed the wire, not just the hash).
-        assert_eq!(a.app_hash(), b.app_hash(), "A and B converge on identical app-hash");
-        assert_eq!(read_name(&a).await, Some("world".into()), "A still holds name=world");
-        assert_eq!(read_name(&b).await, Some("world".into()), "the write REPLICATED to B");
+        assert_eq!(
+            a.app_hash(),
+            b.app_hash(),
+            "A and B converge on identical app-hash"
+        );
+        assert_eq!(
+            read_name(&a).await,
+            Some("world".into()),
+            "A still holds name=world"
+        );
+        assert_eq!(
+            read_name(&b).await,
+            Some("world".into()),
+            "the write REPLICATED to B"
+        );
 
         // the local-only rule: B applying an INBOUND op must not have propagated
         // anything back. so A, polling now, sees zero traffic — no echo, no
         // ping-pong. this is the property that keeps a 2-node loop finite (the
         // run terminates: no infinite re-propagation).
         let echoed_back = a.poll_inbound().await.expect("A polls");
-        assert_eq!(echoed_back, 0, "an inbound op is never re-broadcast (local-only rule)");
+        assert_eq!(
+            echoed_back, 0,
+            "an inbound op is never re-broadcast (local-only rule)"
+        );
     });
 }
 
@@ -96,11 +133,21 @@ fn originating_at_either_node_converges() {
         let mut a = Node::new(genesis_host(), ta, ra);
         let mut b = Node::new(genesis_host(), tb, rb);
 
-        b.apply_local(set_name_world()).await.expect("B applies + propagates");
+        b.apply_local(set_name_world())
+            .await
+            .expect("B applies + propagates");
         let applied = a.poll_inbound().await.expect("A drains inbound");
         assert_eq!(applied, 1);
         assert_eq!(a.app_hash(), b.app_hash(), "converge when B originates");
-        assert_eq!(read_name(&a).await, Some("world".into()), "the write REPLICATED to A");
-        assert_eq!(read_name(&b).await, Some("world".into()), "B still holds name=world");
+        assert_eq!(
+            read_name(&a).await,
+            Some("world".into()),
+            "the write REPLICATED to A"
+        );
+        assert_eq!(
+            read_name(&b).await,
+            Some("world".into()),
+            "B still holds name=world"
+        );
     });
 }

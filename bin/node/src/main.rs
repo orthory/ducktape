@@ -130,8 +130,21 @@ const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
 const MODULE_IDS: [&str; 15] = [
-    "kv", "document", "chat", "forge", "valset", "governance", "saga", "tasks", "vaults", "inbox",
-    "directory", "automations", "files", "memory", "jobs",
+    "kv",
+    "document",
+    "chat",
+    "forge",
+    "valset",
+    "governance",
+    "saga",
+    "tasks",
+    "vaults",
+    "inbox",
+    "directory",
+    "automations",
+    "files",
+    "memory",
+    "jobs",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
@@ -257,7 +270,8 @@ async fn restore_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
-    let forge = Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge: {e}"))?;
+    let forge =
+        Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge: {e}"))?;
 
     let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
         let bytes = manifest
@@ -271,47 +285,67 @@ async fn restore_host(
 
     let mut valset = Valset::new("valset");
     let (bytes, root) = snapshot_of("valset")?;
-    valset.install(bytes, root).map_err(|e| format!("valset install: {e}"))?;
+    valset
+        .install(bytes, root)
+        .map_err(|e| format!("valset install: {e}"))?;
 
     let mut governance = Governance::new("governance", "valset");
     let (bytes, root) = snapshot_of("governance")?;
-    governance.install(bytes, root).map_err(|e| format!("governance install: {e}"))?;
+    governance
+        .install(bytes, root)
+        .map_err(|e| format!("governance install: {e}"))?;
 
     let mut saga = SagaModule::new("saga");
     let (bytes, root) = snapshot_of("saga")?;
-    saga.install(bytes, root).map_err(|e| format!("saga install: {e}"))?;
+    saga.install(bytes, root)
+        .map_err(|e| format!("saga install: {e}"))?;
 
     let mut tasks = Tasks::new("tasks");
     let (bytes, root) = snapshot_of("tasks")?;
-    tasks.install(bytes, root).map_err(|e| format!("tasks install: {e}"))?;
+    tasks
+        .install(bytes, root)
+        .map_err(|e| format!("tasks install: {e}"))?;
 
     let mut vaults = Vaults::new("vaults");
     let (bytes, root) = snapshot_of("vaults")?;
-    vaults.install(bytes, root).map_err(|e| format!("vaults install: {e}"))?;
+    vaults
+        .install(bytes, root)
+        .map_err(|e| format!("vaults install: {e}"))?;
 
     let mut inbox = Inbox::new("inbox");
     let (bytes, root) = snapshot_of("inbox")?;
-    inbox.install(bytes, root).map_err(|e| format!("inbox install: {e}"))?;
+    inbox
+        .install(bytes, root)
+        .map_err(|e| format!("inbox install: {e}"))?;
 
     let mut files = Files::new("files");
     let (bytes, root) = snapshot_of("files")?;
-    files.install(bytes, root).map_err(|e| format!("files install: {e}"))?;
+    files
+        .install(bytes, root)
+        .map_err(|e| format!("files install: {e}"))?;
 
     let mut memory = Memory::new("memory");
     let (bytes, root) = snapshot_of("memory")?;
-    memory.install(bytes, root).map_err(|e| format!("memory install: {e}"))?;
+    memory
+        .install(bytes, root)
+        .map_err(|e| format!("memory install: {e}"))?;
 
     let mut jobs = Jobs::new("jobs");
     let (bytes, root) = snapshot_of("jobs")?;
-    jobs.install(bytes, root).map_err(|e| format!("jobs install: {e}"))?;
+    jobs.install(bytes, root)
+        .map_err(|e| format!("jobs install: {e}"))?;
 
     let mut directory = Directory::new("directory");
     let (bytes, root) = snapshot_of("directory")?;
-    directory.install(bytes, root).map_err(|e| format!("directory install: {e}"))?;
+    directory
+        .install(bytes, root)
+        .map_err(|e| format!("directory install: {e}"))?;
 
     let mut automations = Automations::new("automations", "chat", "tasks");
     let (bytes, root) = snapshot_of("automations")?;
-    automations.install(bytes, root).map_err(|e| format!("automations install: {e}"))?;
+    automations
+        .install(bytes, root)
+        .map_err(|e| format!("automations install: {e}"))?;
 
     Host::genesis(vec![
         Box::new(kv),
@@ -354,9 +388,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
             .ok_or_else(|| format!("module {module} missing from the manifest"))?
             .root)
     };
-    let child_label = |name: &str| -> &'static str {
-        Box::leak(format!("{name}_a{attempt}").into_boxed_str())
-    };
+    let child_label =
+        |name: &str| -> &'static str { Box::leak(format!("{name}_a{attempt}").into_boxed_str()) };
 
     // resolver lane: live target through the module lane, gated on the
     // manifest root (a busy source has moved on -> Err -> the caller
@@ -384,9 +417,13 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let kv = Kv::sync_from(context.child(child_label("kv")), "kv", target, resolver).await;
 
     let (target, resolver) = fetch_target("document").await?;
-    let document =
-        Document::sync_from(context.child(child_label("document")), "document", target, resolver)
-            .await;
+    let document = Document::sync_from(
+        context.child(child_label("document")),
+        "document",
+        target,
+        resolver,
+    )
+    .await;
 
     let (target, resolver) = fetch_target("chat").await?;
     let chat = Chat::sync_from(context.child(child_label("chat")), "chat", target, resolver).await;
@@ -408,52 +445,74 @@ async fn sync_all_modules<C: statesync::SyncClient>(
 
     let (bytes, root) = snapshot_of("directory").await?;
     let mut directory = Directory::new("directory");
-    directory.install(&bytes, root).map_err(|e| format!("directory install: {e}"))?;
+    directory
+        .install(&bytes, root)
+        .map_err(|e| format!("directory install: {e}"))?;
 
     let (bytes, root) = snapshot_of("valset").await?;
     let mut valset = Valset::new("valset");
-    valset.install(&bytes, root).map_err(|e| format!("valset install: {e}"))?;
+    valset
+        .install(&bytes, root)
+        .map_err(|e| format!("valset install: {e}"))?;
 
     let (bytes, root) = snapshot_of("saga").await?;
     let mut saga = SagaModule::new("saga");
-    saga.install(&bytes, root).map_err(|e| format!("saga install: {e}"))?;
+    saga.install(&bytes, root)
+        .map_err(|e| format!("saga install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance = Governance::new("governance", "valset");
-    governance.install(&bytes, root).map_err(|e| format!("governance install: {e}"))?;
+    governance
+        .install(&bytes, root)
+        .map_err(|e| format!("governance install: {e}"))?;
 
     let (bytes, root) = snapshot_of("tasks").await?;
     let mut tasks = Tasks::new("tasks");
-    tasks.install(&bytes, root).map_err(|e| format!("tasks install: {e}"))?;
+    tasks
+        .install(&bytes, root)
+        .map_err(|e| format!("tasks install: {e}"))?;
 
     let (bytes, root) = snapshot_of("vaults").await?;
     let mut vaults = Vaults::new("vaults");
-    vaults.install(&bytes, root).map_err(|e| format!("vaults install: {e}"))?;
+    vaults
+        .install(&bytes, root)
+        .map_err(|e| format!("vaults install: {e}"))?;
 
     let (bytes, root) = snapshot_of("inbox").await?;
     let mut inbox = Inbox::new("inbox");
-    inbox.install(&bytes, root).map_err(|e| format!("inbox install: {e}"))?;
+    inbox
+        .install(&bytes, root)
+        .map_err(|e| format!("inbox install: {e}"))?;
 
     let (bytes, root) = snapshot_of("files").await?;
     let mut files = Files::new("files");
-    files.install(&bytes, root).map_err(|e| format!("files install: {e}"))?;
+    files
+        .install(&bytes, root)
+        .map_err(|e| format!("files install: {e}"))?;
 
     let (bytes, root) = snapshot_of("memory").await?;
     let mut memory = Memory::new("memory");
-    memory.install(&bytes, root).map_err(|e| format!("memory install: {e}"))?;
+    memory
+        .install(&bytes, root)
+        .map_err(|e| format!("memory install: {e}"))?;
 
     let (bytes, root) = snapshot_of("jobs").await?;
     let mut jobs = Jobs::new("jobs");
-    jobs.install(&bytes, root).map_err(|e| format!("jobs install: {e}"))?;
+    jobs.install(&bytes, root)
+        .map_err(|e| format!("jobs install: {e}"))?;
 
     let (bytes, root) = snapshot_of("automations").await?;
     let mut automations = Automations::new("automations", "chat", "tasks");
-    automations.install(&bytes, root).map_err(|e| format!("automations install: {e}"))?;
+    automations
+        .install(&bytes, root)
+        .map_err(|e| format!("automations install: {e}"))?;
 
     let (bytes, root) = snapshot_of("forge").await?;
     let mut forge =
         Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge init: {e}"))?;
-    forge.install(&bytes, root).map_err(|e| format!("forge install: {e}"))?;
+    forge
+        .install(&bytes, root)
+        .map_err(|e| format!("forge install: {e}"))?;
 
     // compose and check THE property: the rebuilt app-hash IS the manifest's.
     // keep this registry in sync with [`genesis_host`] — a missing module
@@ -853,7 +912,9 @@ fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, St
     let mut writer = conn.try_clone().map_err(|e| format!("rpc clone: {e}"))?;
     let mut line = serde_json::to_string(req).expect("rpc request serializes");
     line.push('\n');
-    writer.write_all(line.as_bytes()).map_err(|e| format!("rpc write: {e}"))?;
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("rpc write: {e}"))?;
     let mut reply = String::new();
     BufReader::new(conn)
         .read_line(&mut reply)
@@ -870,7 +931,11 @@ fn rpc_query(addr: &str, target: &str, req: &[u8]) -> Result<Vec<u8>, String> {
     if reply["ok"] != true {
         return Err(format!("query {target}: {}", reply["error"]));
     }
-    unhex(reply["reply_hex"].as_str().ok_or("query reply carries no payload")?)
+    unhex(
+        reply["reply_hex"]
+            .as_str()
+            .ok_or("query reply carries no payload")?,
+    )
 }
 
 /// submit an op through the rpc (accepted != finalized — poll afterwards).
@@ -886,7 +951,7 @@ fn rpc_submit(addr: &str, target: &str, payload: &[u8]) -> Result<(), String> {
 }
 
 fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
-    use valset_interface::{decode_reply, encode_query, ValsetQuery, ValsetReply};
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
     match decode_reply(&raw)? {
         ValsetReply::Validators(v) => Ok(v),
@@ -897,11 +962,13 @@ fn read_proposal(
     addr: &str,
     id: &str,
 ) -> Result<Option<governance_interface::ProposalView>, String> {
-    use governance_interface::{decode_reply, encode_query, GovQuery, GovReply};
+    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
     let raw = rpc_query(
         addr,
         "governance",
-        &encode_query(&GovQuery::Proposal { proposal_id: id.into() }),
+        &encode_query(&GovQuery::Proposal {
+            proposal_id: id.into(),
+        }),
     )?;
     match decode_reply(&raw)? {
         GovReply::Proposal(view) => Ok(view),
@@ -938,7 +1005,7 @@ fn poll_proposal(
 /// proposal's valset Join schedules the epoch cutover that re-tracks the
 /// mesh, at which point the parked joiner syncs and promotes itself.
 fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use governance_interface::{encode_msg, GovAction, GovMsg, ProposalStatus};
+    use governance_interface::{GovAction, GovMsg, ProposalStatus, encode_msg};
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
@@ -969,15 +1036,17 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
     if !members.contains(&me_bytes) {
-        return Err("this node's identity is not a current member — only members admit \
+        return Err(
+            "this node's identity is not a current member — only members admit \
                     validators"
-            .into());
+                .into(),
+        );
     }
 
     // adopt an existing OPEN proposal for exactly this action, else mint an
     // unused id (settled proposals keep their ids forever — a re-admitted
     // key gets a fresh suffix).
-    use governance_interface::{decode_reply, encode_query, GovQuery, GovReply};
+    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
         &rpc_addr,
         "governance",
@@ -986,7 +1055,9 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         GovReply::Proposals(views) => views,
         other => return Err(format!("unexpected governance reply: {other:?}").into()),
     };
-    let wanted = GovAction::AddValidator { key: key_bytes.clone() };
+    let wanted = GovAction::AddValidator {
+        key: key_bytes.clone(),
+    };
     let proposal_id = match proposals
         .iter()
         .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
@@ -1022,12 +1093,17 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     rpc_submit(
         &rpc_addr,
         "governance",
-        &encode_msg(&GovMsg::Vote { proposal_id: proposal_id.clone(), approve: true }),
+        &encode_msg(&GovMsg::Vote {
+            proposal_id: proposal_id.clone(),
+            approve: true,
+        }),
     )?;
     let after_vote = poll_proposal(&rpc_addr, &proposal_id, "this ballot to finalize", |p| {
         p.as_ref().is_some_and(|v| {
             v.status != ProposalStatus::Open
-                || v.votes.iter().any(|(voter, yes)| voter == &me_bytes && *yes)
+                || v.votes
+                    .iter()
+                    .any(|(voter, yes)| voter == &me_bytes && *yes)
         })
     })?
     .expect("the poll only accepts a present proposal");
@@ -1057,7 +1133,9 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         rpc_submit(
             &rpc_addr,
             "governance",
-            &encode_msg(&GovMsg::Execute { proposal_id: proposal_id.clone() }),
+            &encode_msg(&GovMsg::Execute {
+                proposal_id: proposal_id.clone(),
+            }),
         )?;
     }
     let settled = poll_proposal(&rpc_addr, &proposal_id, "the tally to settle", |p| {
