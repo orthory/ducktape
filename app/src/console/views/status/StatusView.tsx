@@ -22,22 +22,32 @@ const sectionLabelStyle = {
   color: color.muted2,
 } as const;
 
-const statusPill = (connected: boolean) =>
-  connected
-    ? {
-        text: "Synced",
-        color: "#5f9e74",
-        dot: color.green,
-        bg: "#eef5f0",
-        border: "#cfe3d7",
-      }
-    : {
-        text: "Stopped",
-        color: color.red,
-        dot: "#cf6a5e",
-        bg: "#fbeeec",
-        border: "#eccfc9",
-      };
+const STATUS_PILLS = {
+  synced: {
+    label: "Synced",
+    text: "#5f9e74",
+    dot: color.green,
+    bg: "#eef5f0",
+    border: "#cfe3d7",
+  },
+  stopped: {
+    label: "Stopped",
+    text: color.red,
+    dot: "#cf6a5e",
+    bg: "#fbeeec",
+    border: "#eccfc9",
+  },
+  offline: {
+    label: "Offline",
+    text: "#a07b32",
+    dot: "#e3b443",
+    bg: "#fbf4e6",
+    border: "#ecdcae",
+  },
+} as const;
+
+const statusPill = (connected: boolean, managed: boolean) =>
+  connected ? STATUS_PILLS.synced : managed ? STATUS_PILLS.stopped : STATUS_PILLS.offline;
 
 const shortValue = (value: string | null | undefined, start = 12, end = 8): string => {
   if (!value) return "—";
@@ -97,8 +107,8 @@ function workspaceRole(workspace: {
   } as const;
 }
 
-function StatusPill({ connected }: { connected: boolean }) {
-  const pill = statusPill(connected);
+function StatusPill({ connected, managed }: { connected: boolean; managed: boolean }) {
+  const pill = statusPill(connected, managed);
   return (
     <span
       style={{
@@ -110,7 +120,7 @@ function StatusPill({ connected }: { connected: boolean }) {
         borderRadius: radius.sm,
         padding: "3px 9px",
         font: `600 11px ${font.mono}`,
-        color: pill.color,
+        color: pill.text,
       }}
     >
       <span
@@ -121,7 +131,7 @@ function StatusPill({ connected }: { connected: boolean }) {
           background: pill.dot,
         }}
       />
-      {pill.text}
+      {pill.label}
     </span>
   );
 }
@@ -132,11 +142,12 @@ function RolePill({ text, active }: { text: string; active: boolean }) {
       style={{
         font: `600 9.5px ${font.mono}`,
         letterSpacing: ".05em",
-        color: active ? color.onDark : color.muted3,
-        background: active ? color.dark : color.paper,
-        border: `1px solid ${active ? color.dark : color.borderStrong}`,
+        color: active ? color.onDark : color.amber,
+        background: active ? color.dark : "#fbf4e6",
+        border: `1px solid ${active ? color.dark : "#ecdcae"}`,
         borderRadius: radius.sm,
         padding: "4px 9px",
+        textTransform: "uppercase",
       }}
     >
       {text}
@@ -205,7 +216,7 @@ function NodeHeader({
         <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>
           This node
         </div>
-        <StatusPill connected={state.connected} />
+        <StatusPill connected={state.connected} managed={state.managed} />
         <RolePill text={role.pill} active={role.validator} />
 
         {state.managed && (
@@ -308,7 +319,7 @@ function CheckRow({ text, active }: { text: string; active: boolean }) {
           flexShrink: 0,
         }}
       >
-        {active ? "✓" : "–"}
+        {active ? "✓" : "−"}
       </span>
       {text}
     </div>
@@ -411,7 +422,9 @@ function AccessCard() {
       >
         <CheckRow text="Read node status" active={state.connected} />
         <CheckRow text="Verify committed roots" active={Boolean(state.status)} />
+        <CheckRow text="Submit module messages" active={state.connected} />
         <CheckRow text="Validate blocks" active={role.validator} />
+        <CheckRow text="Admit waiting workspaces" active={role.validator} />
         <CheckRow text="Local daemon controls" active={role.validator && state.managed} />
       </div>
     </div>
@@ -427,12 +440,13 @@ function StatCard({
   value: string;
   hint?: string;
 }) {
+  const unavailable = value === "—";
   return (
     <div
       style={{
-        border: `1px solid ${color.border}`,
+        border: `1px solid ${unavailable ? color.borderSoft : color.border}`,
         borderRadius: radius.lg,
-        background: color.paper,
+        background: unavailable ? color.sunken : color.paper,
         padding: "12px 14px",
         minWidth: 0,
       }}
@@ -449,7 +463,7 @@ function StatCard({
       <div
         style={{
           font: `700 20px ${font.mono}`,
-          color: color.dark,
+          color: unavailable ? color.muted2 : color.dark,
           marginTop: 4,
           minHeight: 24,
         }}
@@ -462,6 +476,7 @@ function StatCard({
             font: `400 11px ${font.sans}`,
             color: color.muted2,
             marginTop: 4,
+            lineHeight: 1.35,
           }}
         >
           {hint}
@@ -485,34 +500,40 @@ function CopyValue({
   prominent?: boolean;
 }) {
   const hasValue = Boolean(value);
+  const labelText = label.toLowerCase().replace(/[_-]+/g, " ");
   return (
     <button
       type="button"
       disabled={!hasValue}
       onClick={onCopy}
       title={value ?? undefined}
+      aria-label={`${copied ? "Copied" : "Copy"} ${labelText}`}
       style={{
         all: "unset",
         cursor: hasValue ? "pointer" : "default",
         display: "grid",
-        gridTemplateColumns: prominent ? "1fr" : "128px minmax(0, 1fr) auto",
+        gridTemplateColumns: prominent ? "1fr" : "132px minmax(0, 1fr) 64px",
         gap: prominent ? 7 : 12,
         alignItems: prominent ? "start" : "center",
         padding: prominent ? "13px 14px" : "10px 13px",
         borderRadius: radius.md,
-        border: `1px solid ${color.border}`,
-        background: prominent ? color.sunken : color.paper,
+        border: `1px solid ${copied ? "#cfe3d7" : color.border}`,
+        background: copied ? "#eef5f0" : prominent ? color.sunken : color.paper,
         minWidth: 0,
         boxSizing: "border-box",
       }}
     >
       <span
         style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 6,
           font: `700 8.5px ${font.mono}`,
           letterSpacing: ".08em",
           color: color.muted2,
         }}
       >
+        {prominent && <Icon name="hash" size={12} strokeWidth={1.7} />}
         {label}
       </span>
       <span
@@ -581,7 +602,9 @@ function StateCommitment() {
       >
         <SectionLabel>STATE COMMITMENT</SectionLabel>
         <span style={{ font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-          app hash + per-module merkle roots
+          {status
+            ? `h ${status.height.toLocaleString()} · ${status.modules.length} modules`
+            : "waiting for /v1/status"}
         </span>
       </div>
 
@@ -591,10 +614,11 @@ function StateCommitment() {
           border: `1px solid ${color.border}`,
           borderRadius: radius.lg,
           background: color.paper,
-          padding: 10,
+          padding: 11,
           display: "flex",
           flexDirection: "column",
           gap: 9,
+          boxShadow: shadow.card,
         }}
       >
         <CopyValue
@@ -616,7 +640,7 @@ function StateCommitment() {
         >
           <span style={sectionLabelStyle}>MODULE ROOTS</span>
           <span style={{ font: `500 10px ${font.mono}`, color: color.muted2 }}>
-            {status ? `${status.modules.length} modules` : "waiting"}
+            {status ? "click any root to copy" : "waiting"}
           </span>
         </div>
 
@@ -681,24 +705,99 @@ function OverviewTab() {
   );
 }
 
-const permissionRows = [
-  { label: "Read committed node status", validator: true, guest: true },
-  { label: "Inspect app hash and module roots", validator: true, guest: true },
-  { label: "Run as an admitted validator", validator: true, guest: false },
-  { label: "Admit joiners from a member workspace", validator: true, guest: false },
+const permissionRows = (managed: boolean) => [
+  {
+    label: "Read committed node status",
+    detail: "Connection, version, height, app hash, and module roots.",
+    validator: true,
+    guest: true,
+  },
+  {
+    label: "Inspect app hash and module roots",
+    detail: "Copy the committed state hash and every reported module root.",
+    validator: true,
+    guest: true,
+  },
+  {
+    label: "Submit module messages",
+    detail: "Uses the node API; module policies may still reject a write.",
+    validator: true,
+    guest: true,
+  },
+  {
+    label: "Validate/finalize blocks",
+    detail: "Requires an admitted workspace validator identity.",
+    validator: true,
+    guest: false,
+  },
+  {
+    label: "Start/stop managed daemon",
+    detail: managed
+      ? "Available because this desktop app owns the local daemon lifecycle."
+      : "Unavailable when this app is only connected to a remote node.",
+    validator: managed,
+    guest: false,
+  },
+  {
+    label: "Admit waiting workspaces",
+    detail: "Runs through the active member workspace, not a public guest link.",
+    validator: true,
+    guest: false,
+  },
 ];
 
-function MatrixCell({ on }: { on: boolean }) {
+const permissionGrid = "minmax(220px, 1fr) 116px 116px";
+
+function MatrixCell({
+  on,
+  active,
+  label,
+}: {
+  on: boolean;
+  active: boolean;
+  label: string;
+}) {
   return (
-    <div style={{ textAlign: "center", padding: "11px 0" }}>
+    <div
+      role="cell"
+      aria-label={`${label}: ${on ? "available" : "not available"}`}
+      style={{
+        textAlign: "center",
+        padding: "12px 0",
+        background: active ? "#f6f3ee" : "transparent",
+      }}
+    >
       <span
         style={{
           color: on ? "#5f9e74" : color.muted2,
           font: `700 13px ${font.sans}`,
         }}
       >
-        {on ? "✓" : "–"}
+        {on ? "✓" : "−"}
       </span>
+    </div>
+  );
+}
+
+function HeaderCell({
+  label,
+  active,
+}: {
+  label: string;
+  active: boolean;
+}) {
+  return (
+    <div
+      role="columnheader"
+      style={{
+        textAlign: "center",
+        padding: "10px 0",
+        font: `700 10.5px ${font.sans}`,
+        color: color.inkSoft,
+        background: active ? "#ebebeb" : "transparent",
+      }}
+    >
+      {label}
     </div>
   );
 }
@@ -706,6 +805,8 @@ function MatrixCell({ on }: { on: boolean }) {
 function PermissionsTab() {
   const { state } = useDucktape();
   const role = workspaceRole(state.workspace);
+  const rows = permissionRows(state.managed);
+  const validatorCount = state.members.length;
 
   return (
     <>
@@ -717,12 +818,15 @@ function PermissionsTab() {
           maxWidth: 680,
         }}
       >
-        This panel only distinguishes roles the app can honestly derive today:
-        an admitted workspace validator, or a guest connection with no local
-        workspace identity loaded.
+        This panel only distinguishes the roles this app can derive today: an
+        admitted workspace validator, or a guest client with no local validator
+        identity loaded. Consensus round, peer count, and finality timing are
+        intentionally not invented.
       </div>
 
       <div
+        role="table"
+        aria-label="Node capability matrix"
         style={{
           marginTop: 13,
           border: `1px solid ${color.border}`,
@@ -733,55 +837,60 @@ function PermissionsTab() {
         }}
       >
         <div
+          role="row"
           style={{
             display: "grid",
-            gridTemplateColumns: "minmax(180px, 1fr) 112px 112px",
+            gridTemplateColumns: permissionGrid,
             alignItems: "center",
             background: color.sunken,
           }}
         >
-          <div style={{ font: `600 11px ${font.sans}`, color: color.muted, padding: "10px 14px" }}>
+          <div
+            role="columnheader"
+            style={{ font: `600 11px ${font.sans}`, color: color.muted, padding: "10px 14px" }}
+          >
             capability
           </div>
-          <div
-            style={{
-              textAlign: "center",
-              padding: "10px 0",
-              font: `700 10.5px ${font.sans}`,
-              color: color.inkSoft,
-              background: role.validator ? "#f6f3ee" : "transparent",
-            }}
-          >
-            Validator
-          </div>
-          <div
-            style={{
-              textAlign: "center",
-              padding: "10px 0",
-              font: `700 10.5px ${font.sans}`,
-              color: color.inkSoft,
-              background: !role.validator ? "#f6f3ee" : "transparent",
-            }}
-          >
-            Guest
-          </div>
+          <HeaderCell label="Validator" active={role.validator} />
+          <HeaderCell label="Guest client" active={!role.validator} />
         </div>
 
-        {permissionRows.map((row) => (
+        {rows.map((row) => (
           <div
             key={row.label}
+            role="row"
             style={{
               display: "grid",
-              gridTemplateColumns: "minmax(180px, 1fr) 112px 112px",
+              gridTemplateColumns: permissionGrid,
               alignItems: "center",
               borderTop: `1px solid ${color.borderSoft}`,
             }}
           >
-            <div style={{ font: `400 12px ${font.sans}`, color: color.inkSoft, padding: "11px 14px" }}>
-              {row.label}
+            <div role="cell" style={{ padding: "11px 14px" }}>
+              <div style={{ font: `400 12px ${font.sans}`, color: color.inkSoft }}>
+                {row.label}
+              </div>
+              <div
+                style={{
+                  font: `400 10.5px ${font.sans}`,
+                  color: color.muted2,
+                  lineHeight: 1.35,
+                  marginTop: 2,
+                }}
+              >
+                {row.detail}
+              </div>
             </div>
-            <MatrixCell on={row.validator} />
-            <MatrixCell on={row.guest} />
+            <MatrixCell
+              on={row.validator}
+              active={role.validator}
+              label={`${row.label} for validator`}
+            />
+            <MatrixCell
+              on={row.guest}
+              active={!role.validator}
+              label={`${row.label} for guest client`}
+            />
           </div>
         ))}
       </div>
@@ -812,7 +921,7 @@ function PermissionsTab() {
             flexShrink: 0,
           }}
         >
-          <Icon name="tasks" size={18} strokeWidth={1.7} />
+          <Icon name="node" size={18} strokeWidth={1.7} />
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ font: `600 13px ${font.sans}`, color: color.dark }}>
@@ -828,6 +937,21 @@ function PermissionsTab() {
           >
             Daemon controls only appear for managed desktop workspaces; web and
             remote-node builds stay read/submit clients over the configured node.
+          </div>
+        </div>
+        <div style={{ textAlign: "right", flexShrink: 0 }}>
+          <div style={{ font: `700 17px ${font.mono}`, color: color.dark }}>
+            {validatorCount ? validatorCount.toLocaleString() : "—"}
+          </div>
+          <div
+            style={{
+              font: `600 8px ${font.mono}`,
+              letterSpacing: ".06em",
+              color: color.muted2,
+              marginTop: 1,
+            }}
+          >
+            VALIDATORS
           </div>
         </div>
       </div>

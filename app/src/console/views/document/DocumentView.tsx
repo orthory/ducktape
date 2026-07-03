@@ -1,13 +1,10 @@
 // The docs surface over the node's `document` module: a block-based store where
-// a document IS exactly an ordered list of blocks keyed by doc_id.
+// a document is exactly an ordered list of blocks keyed by doc_id.
 //
-// The module has no "list docs" query, so known doc-ids come from a client-side
-// registry the store keeps per node (see DucktapeProvider). This view offers an
-// "open by id" input and a "new doc" button to grow that registry, then edits
-// the open doc block-by-block: inline text edits (UpdateBlock), append with a
-// kind selector (InsertBlock), reorder (MoveBlock), and delete (RemoveBlock).
-// Kind is fixed at insert time — the module has no change-kind op. No optimistic
-// state: every write goes through the store's submit-then-refresh.
+// The module has no "list docs" query, so known doc ids come from a client-side
+// registry the store keeps per node. This view keeps that limitation visible:
+// the rail switches remembered docs, while explicit create/open forms let an
+// operator add a known id without pretending the node can enumerate documents.
 
 import { useEffect, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
@@ -15,17 +12,35 @@ import type { CSSProperties, FormEvent, ReactNode } from "react";
 import type { Block, BlockKind } from "../../../domain/document-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { accentVar, color, font, radius } from "../../theme/tokens";
+import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
 const KINDS: BlockKind[] = ["Paragraph", "Heading", "Code"];
 
-const KIND_PILL: Record<
+const KIND_META: Record<
   BlockKind,
-  { label: string; text: string; bg: string; border: string }
+  { label: string; editLabel: string; text: string; bg: string; border: string }
 > = {
-  Paragraph: { label: "TEXT", text: color.blue, bg: "#f1f4f8", border: "#d7e0eb" },
-  Heading: { label: "HEAD", text: color.purple, bg: "#f1edf5", border: "#ddd2e6" },
-  Code: { label: "CODE", text: color.green, bg: "#eef5f0", border: "#cfe3d7" },
+  Paragraph: {
+    label: "TEXT",
+    editLabel: "paragraph",
+    text: color.blue,
+    bg: "#f1f4f8",
+    border: "#d7e0eb",
+  },
+  Heading: {
+    label: "HEAD",
+    editLabel: "heading",
+    text: color.purple,
+    bg: "#f1edf5",
+    border: "#ddd2e6",
+  },
+  Code: {
+    label: "CODE",
+    editLabel: "code",
+    text: color.green,
+    bg: "#eef5f0",
+    border: "#cfe3d7",
+  },
 };
 
 const ACTIVE_PILL = {
@@ -35,16 +50,24 @@ const ACTIVE_PILL = {
   border: "#ddd2e6",
 };
 
-const fieldStyle: CSSProperties = {
+const inputStyle: CSSProperties = {
   width: "100%",
+  minWidth: 0,
   boxSizing: "border-box",
   padding: "8px 10px",
   borderRadius: radius.sm,
-  border: `1px solid ${color.border}`,
+  border: `1px solid ${color.borderStrong}`,
   background: color.paper,
-  font: `400 12px ${font.sans}`,
+  font: `400 12px ${font.mono}`,
   color: color.ink,
   outline: "none",
+};
+
+const sectionLabelStyle: CSSProperties = {
+  font: `600 9px ${font.mono}`,
+  letterSpacing: ".11em",
+  color: color.muted2,
+  textTransform: "uppercase",
 };
 
 const monoId: CSSProperties = {
@@ -53,21 +76,39 @@ const monoId: CSSProperties = {
   wordBreak: "break-all",
 };
 
+const srOnly: CSSProperties = {
+  position: "absolute",
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: "hidden",
+  clip: "rect(0, 0, 0, 0)",
+  whiteSpace: "nowrap",
+  border: 0,
+};
+
 function shortId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;
+  return id.length > 16 ? `${id.slice(0, 9)}...${id.slice(-5)}` : id;
 }
 
 function SectionLabel({ children }: { children: ReactNode }) {
+  return <div style={sectionLabelStyle}>{children}</div>;
+}
+
+function FieldLabel({
+  htmlFor,
+  children,
+  hidden = false,
+}: {
+  htmlFor: string;
+  children: ReactNode;
+  hidden?: boolean;
+}) {
   return (
-    <div
-      style={{
-        font: `600 9px ${font.mono}`,
-        letterSpacing: ".12em",
-        color: color.muted2,
-      }}
-    >
+    <label htmlFor={htmlFor} style={hidden ? srOnly : sectionLabelStyle}>
       {children}
-    </div>
+    </label>
   );
 }
 
@@ -95,6 +136,7 @@ function StatusPill({
         font: `600 9px ${font.mono}`,
         letterSpacing: ".06em",
         color: text,
+        whiteSpace: "nowrap",
       }}
     >
       {label}
@@ -114,7 +156,7 @@ function EmptyState({
   return (
     <div
       style={{
-        minHeight: 280,
+        minHeight: 240,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -122,7 +164,7 @@ function EmptyState({
         color: color.muted2,
       }}
     >
-      <div style={{ maxWidth: 310, padding: 22 }}>
+      <div style={{ maxWidth: 330, padding: 22 }}>
         <div
           style={{
             width: 42,
@@ -156,14 +198,14 @@ function EmptyState({
 
 function IconButton({
   name,
-  title,
+  label,
   onClick,
   disabled = false,
   rotate = 0,
   danger = false,
 }: {
   name: "chevronRight" | "close";
-  title: string;
+  label: string;
   onClick: () => void;
   disabled?: boolean;
   rotate?: number;
@@ -172,20 +214,22 @@ function IconButton({
   return (
     <button
       type="button"
-      title={title}
+      aria-label={label}
+      title={label}
       disabled={disabled}
       onClick={onClick}
       style={{
         all: "unset",
         cursor: disabled ? "default" : "pointer",
-        width: 26,
-        height: 26,
+        width: 27,
+        height: 27,
         borderRadius: 7,
+        border: disabled ? "1px solid transparent" : `1px solid ${color.border}`,
+        background: disabled ? "transparent" : color.paper,
+        color: disabled ? color.iconIdle : danger ? color.red : color.muted3,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        color: disabled ? color.iconIdle : danger ? color.red : color.muted3,
-        background: disabled ? "transparent" : color.sunken,
       }}
     >
       <Icon name={name} size={13} style={{ transform: `rotate(${rotate}deg)` }} />
@@ -194,21 +238,23 @@ function IconButton({
 }
 
 function RailSubmitButton({
-  title,
+  label,
   disabled,
   children,
 }: {
-  title: string;
+  label: string;
   disabled: boolean;
   children: ReactNode;
 }) {
   return (
     <button
       type="submit"
-      title={title}
+      aria-label={label}
+      title={label}
+      disabled={disabled}
       style={{
         all: "unset",
-        cursor: "pointer",
+        cursor: disabled ? "default" : "pointer",
         flexShrink: 0,
         width: 32,
         height: 32,
@@ -225,7 +271,47 @@ function RailSubmitButton({
   );
 }
 
-// ── One editable block ──────────────────────────────────
+function DocIdForm({
+  id,
+  label,
+  placeholder,
+  value,
+  setValue,
+  submitLabel,
+  icon,
+  onSubmit,
+}: {
+  id: string;
+  label: string;
+  placeholder: string;
+  value: string;
+  setValue: (value: string) => void;
+  submitLabel: string;
+  icon: "plus" | "chevronRight";
+  onSubmit: (event: FormEvent) => void;
+}) {
+  return (
+    <form onSubmit={onSubmit} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <FieldLabel htmlFor={id}>{label}</FieldLabel>
+      <div style={{ display: "flex", gap: 7 }}>
+        <input
+          id={id}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          placeholder={placeholder}
+          spellCheck={false}
+          autoCapitalize="none"
+          style={inputStyle}
+        />
+        <RailSubmitButton label={submitLabel} disabled={!value.trim()}>
+          <Icon name={icon} size={14} strokeWidth={1.9} />
+        </RailSubmitButton>
+      </div>
+    </form>
+  );
+}
+
+// -- One editable block ------------------------------------------------------
 
 function BlockRow({
   block,
@@ -245,8 +331,7 @@ function BlockRow({
   onMoveDown: () => void;
 }) {
   const [draft, setDraft] = useState(block.text);
-  // Re-sync when the committed text changes under us (a refresh landed) — there
-  // is no optimistic state, so the queried block is the source of truth.
+
   useEffect(() => setDraft(block.text), [block.text]);
 
   const commit = () => {
@@ -255,56 +340,57 @@ function BlockRow({
 
   const code = block.kind === "Code";
   const heading = block.kind === "Heading";
-  const pill = KIND_PILL[block.kind];
+  const meta = KIND_META[block.kind];
+  const blockNumber = index + 1;
 
   return (
     <article
       style={{
         display: "grid",
-        gridTemplateColumns: "82px minmax(0, 1fr) 32px",
-        gap: 14,
-        padding: "21px 0",
+        gridTemplateColumns: "74px minmax(0, 1fr) 34px",
+        gap: 15,
+        padding: "22px 0",
         borderBottom: `1px solid ${color.borderSoft}`,
       }}
     >
-      <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-        <StatusPill label={pill.label} text={pill.text} bg={pill.bg} border={pill.border} />
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" }}>
+        <StatusPill label={meta.label} text={meta.text} bg={meta.bg} border={meta.border} />
         <span style={{ font: `500 10px ${font.mono}`, color: color.muted2 }}>
-          {String(index + 1).padStart(2, "0")}
+          {String(blockNumber).padStart(2, "0")}
         </span>
       </div>
 
       <div style={{ minWidth: 0 }}>
         <textarea
+          aria-label={`Edit ${meta.editLabel} block ${blockNumber}`}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onBlur={commit}
           onKeyDown={(event) => {
-            // Cmd/Ctrl+Enter commits without leaving the block; plain Enter keeps
-            // adding lines (paragraphs and code are multi-line).
             if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
               event.preventDefault();
               commit();
             }
           }}
           rows={code ? 7 : heading ? 2 : 4}
-          placeholder="empty block"
+          placeholder={heading ? "Untitled heading" : code ? "code block" : "write a paragraph"}
+          spellCheck={!code}
           style={{
             width: "100%",
             boxSizing: "border-box",
-            minHeight: heading ? 56 : code ? 160 : 104,
+            minHeight: heading ? 58 : code ? 158 : 102,
             resize: "vertical",
             border: code ? `1px solid ${color.border}` : "none",
             borderRadius: code ? radius.md : 0,
             outline: "none",
             background: code ? color.sunken : "transparent",
             color: color.ink,
-            padding: code ? 13 : 0,
+            padding: code ? 13 : "1px 0",
             font: heading
-              ? `650 24px/1.22 ${font.sans}`
+              ? `650 25px/1.2 ${font.sans}`
               : code
                 ? `400 12.5px/1.55 ${font.mono}`
-                : `400 14px/1.62 ${font.sans}`,
+                : `400 14.5px/1.62 ${font.sans}`,
           }}
         />
         <div
@@ -322,28 +408,40 @@ function BlockRow({
         </div>
       </div>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 6,
+          alignItems: "flex-end",
+        }}
+      >
         <IconButton
           name="chevronRight"
-          title="Move up"
+          label={`Move block ${blockNumber} up`}
           disabled={index === 0}
           rotate={-90}
           onClick={onMoveUp}
         />
         <IconButton
           name="chevronRight"
-          title="Move down"
+          label={`Move block ${blockNumber} down`}
           disabled={index === total - 1}
           rotate={90}
           onClick={onMoveDown}
         />
-        <IconButton name="close" title="Delete block" danger onClick={onRemove} />
+        <IconButton
+          name="close"
+          label={`Remove block ${blockNumber}`}
+          danger
+          onClick={onRemove}
+        />
       </div>
     </article>
   );
 }
 
-// ── Append composer ─────────────────────────────────────
+// -- Insert composer ---------------------------------------------------------
 
 function AddBlock({ onAdd }: { onAdd: (kind: BlockKind, text: string) => void }) {
   const [kind, setKind] = useState<BlockKind>("Paragraph");
@@ -367,9 +465,11 @@ function AddBlock({ onAdd }: { onAdd: (kind: BlockKind, text: string) => void })
         padding: 15,
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <SectionLabel>INSERT</SectionLabel>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
+        <SectionLabel>Insert Block</SectionLabel>
         <div
+          role="group"
+          aria-label="Block kind"
           style={{
             display: "flex",
             gap: 4,
@@ -385,6 +485,8 @@ function AddBlock({ onAdd }: { onAdd: (kind: BlockKind, text: string) => void })
               <button
                 key={option}
                 type="button"
+                aria-label={`Insert ${option} block`}
+                aria-pressed={active}
                 onClick={() => setKind(option)}
                 style={{
                   all: "unset",
@@ -402,13 +504,19 @@ function AddBlock({ onAdd }: { onAdd: (kind: BlockKind, text: string) => void })
           })}
         </div>
       </div>
+
+      <FieldLabel htmlFor="document-new-block-text" hidden>
+        New block text
+      </FieldLabel>
       <textarea
+        id="document-new-block-text"
         value={text}
         onChange={(event) => setText(event.target.value)}
-        placeholder={`New ${kind.toLowerCase()} block`}
+        placeholder={`New ${KIND_META[kind].editLabel} block`}
         rows={code ? 5 : 3}
+        spellCheck={!code}
         style={{
-          ...fieldStyle,
+          ...inputStyle,
           marginTop: 12,
           minHeight: code ? 118 : 76,
           resize: "vertical",
@@ -431,7 +539,7 @@ function AddBlock({ onAdd }: { onAdd: (kind: BlockKind, text: string) => void })
             font: `600 12px ${font.sans}`,
           }}
         >
-          <Icon name="plus" size={13} />
+          <Icon name="plus" size={13} strokeWidth={1.9} />
           Insert block
         </button>
       </div>
@@ -439,7 +547,7 @@ function AddBlock({ onAdd }: { onAdd: (kind: BlockKind, text: string) => void })
   );
 }
 
-// ── Registry rail ──────────────────────────────────────
+// -- Registry rail -----------------------------------------------------------
 
 function DocRail({
   docIds,
@@ -465,7 +573,7 @@ function DocRail({
   return (
     <aside
       style={{
-        width: 266,
+        width: 292,
         flexShrink: 0,
         borderRight: `1px solid ${color.borderSoft}`,
         background: color.sidebar,
@@ -485,31 +593,61 @@ function DocRail({
           borderBottom: `1px solid ${color.borderSoft}`,
         }}
       >
-        <Icon name="document" size={15} color={color.muted} />
-        <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Documents</div>
+        <span
+          style={{
+            width: 26,
+            height: 26,
+            borderRadius: 8,
+            background: color.dark,
+            color: color.onDark,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="document" size={14} strokeWidth={1.7} />
+        </span>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Documents</div>
+          <div style={{ marginTop: 1, font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+            local registry
+          </div>
+        </div>
         <div style={{ marginLeft: "auto", font: `500 11px ${font.mono}`, color: color.muted2 }}>
           {docIds.length}
         </div>
       </div>
 
-      <div style={{ padding: "14px 14px 10px", borderBottom: `1px solid ${color.borderSoft}` }}>
-        <SectionLabel>NEW DOCUMENT</SectionLabel>
-        <form onSubmit={onCreate} style={{ marginTop: 9, display: "flex", gap: 7 }}>
-          <input
-            value={newId}
-            onChange={(event) => setNewId(event.target.value)}
-            placeholder="new doc id"
-            style={{ ...fieldStyle, font: `400 12px ${font.mono}` }}
-          />
-          <RailSubmitButton title="Create doc" disabled={!newId.trim()}>
-            <Icon name="plus" size={14} />
-          </RailSubmitButton>
-        </form>
+      <div style={{ padding: "14px", borderBottom: `1px solid ${color.borderSoft}` }}>
+        <DocIdForm
+          id="document-create-id"
+          label="Create document id"
+          placeholder="release-notes"
+          value={newId}
+          setValue={setNewId}
+          submitLabel="Create document"
+          icon="plus"
+          onSubmit={onCreate}
+        />
+      </div>
+
+      <div style={{ padding: "14px", borderBottom: `1px solid ${color.borderSoft}` }}>
+        <DocIdForm
+          id="document-open-id"
+          label="Open document id"
+          placeholder="existing-doc-id"
+          value={openId}
+          setValue={setOpenId}
+          submitLabel="Open document"
+          icon="chevronRight"
+          onSubmit={onOpen}
+        />
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "13px 8px" }}>
         <div style={{ padding: "0 8px 8px" }}>
-          <SectionLabel>KNOWN DOCS</SectionLabel>
+          <SectionLabel>Known Documents</SectionLabel>
         </div>
         {docIds.length === 0 ? (
           <div
@@ -523,7 +661,7 @@ function DocRail({
               color: color.muted2,
             }}
           >
-            No known docs yet. Create one or open an existing id.
+            No documents have been opened on this node yet.
           </div>
         ) : (
           docIds.map((id) => {
@@ -532,8 +670,9 @@ function DocRail({
               <button
                 key={id}
                 type="button"
-                onClick={() => openDoc(id)}
+                aria-label={`Open ${id}`}
                 title={id}
+                onClick={() => openDoc(id)}
                 style={{
                   all: "unset",
                   cursor: "pointer",
@@ -541,7 +680,7 @@ function DocRail({
                   width: "100%",
                   display: "flex",
                   alignItems: "center",
-                  gap: 8,
+                  gap: 9,
                   margin: "1px 0",
                   padding: "9px 10px",
                   borderRadius: radius.sm,
@@ -549,35 +688,62 @@ function DocRail({
                   color: active ? color.ink : color.inkSofter,
                 }}
               >
-                <Icon name="hash" size={12} color={active ? accentVar : color.muted2} />
+                <span
+                  style={{
+                    width: 24,
+                    height: 24,
+                    borderRadius: 7,
+                    border: `1px solid ${active ? color.borderStrong : color.border}`,
+                    background: active ? color.paper : color.sunken,
+                    color: active ? accentVar : color.muted2,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                  }}
+                >
+                  <Icon name="hash" size={12} strokeWidth={1.8} />
+                </span>
                 <span style={{ ...monoId, color: active ? color.ink : color.inkSofter }}>
                   {id}
                 </span>
+                {active ? (
+                  <span
+                    style={{
+                      marginLeft: "auto",
+                      font: `600 8.5px ${font.mono}`,
+                      color: color.onDark,
+                      background: color.dark,
+                      borderRadius: 4,
+                      padding: "2px 5px",
+                      letterSpacing: ".05em",
+                      flexShrink: 0,
+                    }}
+                  >
+                    OPEN
+                  </span>
+                ) : null}
               </button>
             );
           })
         )}
       </div>
 
-      <div style={{ padding: 14, borderTop: `1px solid ${color.borderSoft}` }}>
-        <SectionLabel>OPEN BY ID</SectionLabel>
-        <form onSubmit={onOpen} style={{ marginTop: 9, display: "flex", gap: 7 }}>
-          <input
-            value={openId}
-            onChange={(event) => setOpenId(event.target.value)}
-            placeholder="existing doc id"
-            style={{ ...fieldStyle, font: `400 12px ${font.mono}` }}
-          />
-          <RailSubmitButton title="Open doc" disabled={!openId.trim()}>
-            <Icon name="chevronRight" size={14} />
-          </RailSubmitButton>
-        </form>
+      <div
+        style={{
+          padding: "12px 14px 14px",
+          borderTop: `1px solid ${color.borderSoft}`,
+          font: `400 11.5px/1.45 ${font.sans}`,
+          color: color.muted2,
+        }}
+      >
+        The node does not expose document discovery; opened ids are remembered locally.
       </div>
     </aside>
   );
 }
 
-// ── The view ────────────────────────────────────────────
+// -- The view ----------------------------------------------------------------
 
 export function DocumentView() {
   const { state, actions } = useDucktape();
@@ -601,19 +767,16 @@ export function DocumentView() {
   };
 
   const addBlock = (kind: BlockKind, text: string) => {
-    // Append: after the last block, or null (front) when the doc is empty.
     const after = blocks.length > 0 ? blocks[blocks.length - 1].id : null;
     actions.insertBlock({ after, kind, text });
   };
 
   const moveUp = (index: number) => {
-    // Land after the block two positions up, or null (front) from index 1.
     const after = index >= 2 ? blocks[index - 2].id : null;
     actions.moveBlock({ blockId: blocks[index].id, after });
   };
 
   const moveDown = (index: number) => {
-    // Land after the block currently one position below.
     const after = blocks[index + 1].id;
     actions.moveBlock({ blockId: blocks[index].id, after });
   };
@@ -654,7 +817,7 @@ export function DocumentView() {
             background: color.paper,
           }}
         >
-          <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Docs</div>
+          <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Documents</div>
           {state.activeDoc ? (
             <>
               <StatusPill
@@ -667,6 +830,7 @@ export function DocumentView() {
                 title={state.activeDoc}
                 style={{
                   marginLeft: 2,
+                  minWidth: 0,
                   font: `500 12px ${font.mono}`,
                   color: color.muted2,
                   overflow: "hidden",
@@ -687,23 +851,36 @@ export function DocumentView() {
           )}
         </header>
 
-        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", background: color.paper }}>
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflowY: "auto",
+            background: color.sidebar,
+            padding: state.activeDoc ? "22px 26px" : 0,
+          }}
+        >
           {!state.activeDoc ? (
             <EmptyState
               title="No document open"
-              body="Create a document from the rail or open a known id to load its block list."
+              body="Create a document from the rail or open a known id to load its blocks."
             />
           ) : (
             <div
               style={{
-                maxWidth: 820,
+                maxWidth: 880,
                 margin: "0 auto",
-                padding: "34px 38px 46px",
+                minHeight: "100%",
+                border: `1px solid ${color.border}`,
+                borderRadius: radius.lg,
+                background: color.paper,
+                boxShadow: shadow.card,
+                overflow: "hidden",
               }}
             >
               <div
                 style={{
-                  paddingBottom: 20,
+                  padding: "28px 34px 24px",
                   borderBottom: blocks.length > 0 ? `1px solid ${color.borderSoft}` : undefined,
                 }}
               >
@@ -729,6 +906,7 @@ export function DocumentView() {
                         font: `650 28px/1.16 ${font.sans}`,
                         color: color.dark,
                         letterSpacing: 0,
+                        overflowWrap: "anywhere",
                       }}
                     >
                       {state.activeDoc}
@@ -747,36 +925,38 @@ export function DocumentView() {
                       </span>
                       <span style={{ width: 3, height: 3, borderRadius: "50%", background: color.chip }} />
                       <span style={{ font: `500 11px ${font.mono}`, color: color.muted2 }}>
-                        {blocks.length} blocks
+                        {blocks.length} {blocks.length === 1 ? "block" : "blocks"}
                       </span>
                     </div>
                   </div>
                 </div>
               </div>
 
-              {blocks.length === 0 ? (
-                <EmptyState
-                  title="This document is empty"
-                  body="Insert a heading, paragraph, or code block to start shaping the page."
-                  icon="hash"
-                />
-              ) : (
-                <div>
-                  {blocks.map((block, index) => (
-                    <BlockRow
-                      key={block.id}
-                      block={block}
-                      index={index}
-                      total={blocks.length}
-                      onUpdate={(text) => actions.updateBlock({ blockId: block.id, text })}
-                      onRemove={() => actions.removeBlock(block.id)}
-                      onMoveUp={() => moveUp(index)}
-                      onMoveDown={() => moveDown(index)}
-                    />
-                  ))}
-                </div>
-              )}
-              <AddBlock onAdd={addBlock} />
+              <div style={{ padding: "0 34px 34px" }}>
+                {blocks.length === 0 ? (
+                  <EmptyState
+                    title="This document is empty"
+                    body="Insert a heading, paragraph, or code block to start shaping the page."
+                    icon="hash"
+                  />
+                ) : (
+                  <div>
+                    {blocks.map((block, index) => (
+                      <BlockRow
+                        key={block.id}
+                        block={block}
+                        index={index}
+                        total={blocks.length}
+                        onUpdate={(text) => actions.updateBlock({ blockId: block.id, text })}
+                        onRemove={() => actions.removeBlock(block.id)}
+                        onMoveUp={() => moveUp(index)}
+                        onMoveDown={() => moveDown(index)}
+                      />
+                    ))}
+                  </div>
+                )}
+                <AddBlock onAdd={addBlock} />
+              </div>
             </div>
           )}
         </div>
