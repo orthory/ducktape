@@ -50,6 +50,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent::AgentModule;
+use agent_oracle::{AuthStore, LlmWorker};
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
@@ -220,6 +221,7 @@ async fn genesis_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
+    blobs: files::BlobHandle,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
@@ -247,7 +249,7 @@ async fn genesis_host(
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
-        Box::new(Files::new("files")),
+        Box::new(Files::with_blobs("files", blobs)),
         // the shared agent workspace: a filesystem-shaped namespace with
         // write-once publish, immutable generations, snapshots, and watches.
         Box::new(Memory::new("memory", "files")),
@@ -281,6 +283,7 @@ async fn restore_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
     manifest: &Manifest,
+    blobs: files::BlobHandle,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
@@ -333,7 +336,7 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("inbox install: {e}"))?;
 
-    let mut files = Files::new("files");
+    let mut files = Files::with_blobs("files", blobs);
     let (bytes, root) = snapshot_of("files")?;
     files
         .install(bytes, root)
@@ -1337,6 +1340,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    let blobs = http_handle.blob_handle();
     match http_listen.as_deref() {
         Some(addr) if !sync_only && !joiner => {
             let listener = std::net::TcpListener::bind(addr)?;
@@ -1749,7 +1753,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let host = genesis_host(&context, &forge_repo, &validators).await;
+                let host = genesis_host(&context, &forge_repo, &validators, blobs.clone()).await;
                 let pos = recovery.oplog_pos().await;
                 let genesis_participants: Vec<Vec<u8>> =
                     validators.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -1770,7 +1774,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 (host, None, 1, (None, pos), None)
             }
             Some(manifest) => {
-                let mut host = match restore_host(&context, &forge_repo, &manifest).await {
+                let restored = restore_host(&context, &forge_repo, &manifest, blobs.clone()).await;
+                let mut host = match restored {
                     Ok(h) => h,
                     Err(e) => {
                         eprintln!("[node {label}] FATAL: checkpoint restore: {e}");
@@ -2206,10 +2211,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut blocks_since_checkpoint: u64 = 0;
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
-        // the host-owned worker set (reactor seam). EMPTY for now: effects of
-        // finalized blocks are drained and logged so the lane is visibly live;
-        // the agent LLM worker plugs in here.
-        let workers: Vec<Box<dyn reactor::Worker>> = Vec::new();
+        // the host-owned worker set (reactor seam): effects of finalized
+        // blocks are offered here, and claimed follow-ups re-enter the ordered
+        // lane as their own blocks.
+        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
+            blobs.clone(),
+            AuthStore::from_default_path(),
+            "gpt-5.1".into(),
+        ))];
         loop {
             futures::select_biased! {
                 job = rpc_ingress.next() => {

@@ -378,6 +378,10 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
             context_hash(&window),
             "the pin re-derives from the log (P4)"
         );
+        assert_eq!(
+            llm.transcript, window,
+            "the worker receives the pinned transcript"
+        );
 
         // nothing downstream exists yet: the reply, the task, and the
         // terminal states all wait on the oracle op.

@@ -36,6 +36,14 @@ impl Daemon {
     /// a leaked dir plus a recycled pid would reopen stale qmdb state and
     /// fail this suite spuriously.
     fn spawn(storage: &Path) -> Self {
+        Self::spawn_inner(storage, false)
+    }
+
+    fn spawn_with_echo_oracle(storage: &Path) -> Self {
+        Self::spawn_inner(storage, true)
+    }
+
+    fn spawn_inner(storage: &Path, echo_oracle: bool) -> Self {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"));
         cmd.arg("--listen")
@@ -47,6 +55,9 @@ impl Daemon {
             // storage) land on stderr — keep it visible or they read as an
             // opaque readiness timeout.
             .stderr(Stdio::inherit());
+        if echo_oracle {
+            cmd.env("DUCKTAPE_NODED_ECHO_ORACLE", "1");
+        }
         let child = cmd.spawn().expect("spawn ducktape-noded");
         let mut daemon = Self { child, port };
         // readiness = a status answer, never the listen println: the daemon
@@ -259,6 +270,31 @@ fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Valu
     })
 }
 
+fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "PostMessage": {
+            "channel_id": channel,
+            "message_id": message_id,
+            "blocks": [{
+                "Paragraph": [
+                    { "text": "hey ", "marks": [] },
+                    {
+                        "text": format!("@{agent_id}"),
+                        "marks": [{
+                            "Mention": {
+                                "Agent": { "module": "agent", "agent_id": agent_id }
+                            }
+                        }]
+                    },
+                    { "text": " can you handle this?", "marks": [] }
+                ]
+            }],
+            "thread": null,
+            "as_agent": null,
+        }
+    })
+}
+
 #[test]
 fn full_surface_blocks_authorship_and_ws() {
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -348,6 +384,84 @@ fn full_surface_blocks_authorship_and_ws() {
     let (code, err) = daemon.submit("no-such-module", serde_json::json!({"Nope": {}}), None);
     assert_eq!(code, 400, "unknown target must reject: {err}");
     daemon.status(); // still alive, still answering.
+}
+
+#[test]
+fn agent_run_drains_oracle_effect_and_posts_reply() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn_with_echo_oracle(storage.path());
+
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "CreateChannel": { "channel_id": "general", "name": "General", "post_policy": "Open" }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    let prompt_hash = vec![7u8; 32];
+    let (code, block) = daemon.submit(
+        "agent",
+        serde_json::json!({
+            "RegisterAgent": {
+                "agent_id": "quackbot",
+                "display_name": "Quackbot",
+                "model_ref": "echo-model",
+                "prompt_hash": prompt_hash,
+                "allowed_actions": ["chat.post"]
+            }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "register agent failed: {block}");
+
+    let (code, block) = daemon.submit(
+        "agent",
+        serde_json::json!({
+            "WatchChannel": {
+                "channel_id": "general",
+                "policy": "Mention"
+            }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "watch channel failed: {block}");
+
+    let (code, block) = daemon.submit(
+        "chat",
+        post_mention("general", "m1", "quackbot"),
+        Some("eddy"),
+    );
+    assert_eq!(code, 200, "mention post failed: {block}");
+    assert_eq!(
+        block["height"], 5,
+        "the post block plus oracle follow-up block should both drain"
+    );
+
+    let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
+    let run = daemon.query("agent", serde_json::json!({ "Run": { "run_id": run_id } }));
+    assert_eq!(
+        run["Run"]["status"], "Done",
+        "run should settle Done: {run}"
+    );
+
+    let reply = daemon.query(
+        "chat",
+        serde_json::json!({ "MessagesLatest": { "channel_id": "general", "limit": 16 } }),
+    );
+    let messages = reply["Messages"].as_array().expect("Messages reply");
+    assert_eq!(messages.len(), 2, "user post plus agent reply should exist");
+    let agent_reply = &messages[1]["head"];
+    assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
+    assert_eq!(
+        agent_reply["author"],
+        serde_json::json!({ "Agent": { "module": "agent", "agent_id": "quackbot" } })
+    );
+    assert_eq!(
+        agent_reply["blocks"][0]["Paragraph"][0]["text"],
+        format!("echo: handling {run_id}")
+    );
 }
 
 #[test]

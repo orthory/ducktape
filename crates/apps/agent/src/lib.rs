@@ -867,7 +867,7 @@ impl AgentModule {
         ctx: &dyn Ctx,
         channel_id: &str,
         anchor_seq: u64,
-    ) -> Result<(Vec<u8>, Option<u64>), String> {
+    ) -> Result<(Vec<u8>, Option<u64>, Vec<MessageView>), String> {
         if anchor_seq == 0 {
             return Err("anchor_seq must be >= 1".into());
         }
@@ -893,7 +893,8 @@ impl AgentModule {
             return Err(format!("anchor does not exist: {channel_id}/{anchor_seq}"));
         };
         let thread_root = anchor.head.thread;
-        Ok((context_hash(&window), thread_root))
+        let hash = context_hash(&window);
+        Ok((hash, thread_root, window))
     }
 
     // ---- run creation ------------------------------------------------------------
@@ -917,6 +918,7 @@ impl AgentModule {
         model_ref: String,
         prompt_hash: Vec<u8>,
         context_hash: Vec<u8>,
+        transcript: Vec<MessageView>,
     ) {
         let now = ctx.env().consensus_time;
         let saga_id = saga_id_for(&run_id);
@@ -933,6 +935,7 @@ impl AgentModule {
                     anchor_seq,
                     job_id: job_id.clone(),
                     context_hash: context_hash.clone(),
+                    transcript,
                 }),
                 reply_to: Some(ctx.env().me.clone()),
                 reply_payload: run_id.clone().into_bytes(),
@@ -1049,6 +1052,7 @@ impl AgentModule {
             model_ref,
             prompt_hash,
             spec_hash,
+            Vec::new(),
         );
         Ok(())
     }
@@ -1135,7 +1139,7 @@ impl AgentModule {
                 (agent.model_ref.clone(), agent.prompt_hash.clone())
             };
             match self.pin_context(&*ctx, &channel_id, seq).await {
-                Ok((context_hash, thread_root)) => self.stage_run(
+                Ok((context_hash, thread_root, transcript)) => self.stage_run(
                     ctx,
                     run_id,
                     agent_id,
@@ -1148,6 +1152,7 @@ impl AgentModule {
                     model_ref,
                     prompt_hash,
                     context_hash,
+                    transcript,
                 ),
                 // a failed pin must not poison the posting block — same
                 // no-fail reasoning as the callback arm.
@@ -1658,7 +1663,7 @@ impl AgentModule {
                 // unlike the hook intake, an explicit request REJECTS on a
                 // failed pin: this is the root op of its own block, so an
                 // error poisons nothing but the request itself.
-                let (context_hash, thread_root) = self
+                let (context_hash, thread_root, transcript) = self
                     .pin_context(&*ctx, &channel_id, anchor_seq)
                     .await
                     .map_err(Error::Module)?;
@@ -1675,6 +1680,7 @@ impl AgentModule {
                     model_ref,
                     prompt_hash,
                     context_hash,
+                    transcript,
                 );
                 Ok(())
             }
@@ -2613,6 +2619,7 @@ mod tests {
                 anchor_seq: 3,
                 job_id: None,
                 context_hash: context_hash(&transcript(3)),
+                transcript: transcript(3),
             }
         );
     }
