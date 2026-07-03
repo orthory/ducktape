@@ -76,6 +76,183 @@ pub struct Cluster {
     dir: tempfile::TempDir,
 }
 
+/// a two-person network-shape ceremony: real `init`/`invite`/`join` verbs,
+/// key files, network.toml descriptors, and node.toml configs.
+pub struct NetworkShapeCluster {
+    pub p2p_ports: Vec<u16>,
+    pub rpc_ports: Vec<u16>,
+    pub http_ports: Vec<u16>,
+    pub founder_dir: PathBuf,
+    pub friend_dir: PathBuf,
+    nodes: Vec<Option<NodeProc>>,
+    dir: tempfile::TempDir,
+}
+
+impl NetworkShapeCluster {
+    pub fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("network-shape tempdir");
+        let ports = alloc_ports(6);
+        let (p2p_ports, rest) = ports.split_at(2);
+        let (rpc_ports, http_ports) = rest.split_at(2);
+        Self {
+            p2p_ports: p2p_ports.to_vec(),
+            rpc_ports: rpc_ports.to_vec(),
+            http_ports: http_ports.to_vec(),
+            founder_dir: dir.path().join("founder"),
+            friend_dir: dir.path().join("friend"),
+            nodes: vec![None, None],
+            dir,
+        }
+    }
+
+    pub fn init_founder(&self, name: &str) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args([
+                "init",
+                "--name",
+                name,
+                "--dir",
+                self.founder_dir.to_str().expect("utf-8 founder dir"),
+                "--listen",
+                &format!("127.0.0.1:{}", self.p2p_ports[0]),
+                "--advertised",
+                &format!("127.0.0.1:{}", self.p2p_ports[0]),
+                "--http",
+                &format!("127.0.0.1:{}", self.http_ports[0]),
+                "--rpc",
+                &format!("127.0.0.1:{}", self.rpc_ports[0]),
+            ])
+            .output()
+            .expect("run init");
+        assert!(
+            out.status.success(),
+            "init failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    pub fn invite(&self) -> String {
+        let cfg = self.config_file(0);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["invite", "--config"])
+            .arg(cfg)
+            .output()
+            .expect("run invite");
+        assert!(
+            out.status.success(),
+            "invite failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    pub fn join_friend(&self, invite: &str) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args([
+                "join",
+                invite,
+                "--dir",
+                self.friend_dir.to_str().expect("utf-8 friend dir"),
+                "--listen",
+                &format!("127.0.0.1:{}", self.p2p_ports[1]),
+                "--advertised",
+                &format!("127.0.0.1:{}", self.p2p_ports[1]),
+                "--http",
+                &format!("127.0.0.1:{}", self.http_ports[1]),
+                "--rpc",
+                &format!("127.0.0.1:{}", self.rpc_ports[1]),
+            ])
+            .output()
+            .expect("run join");
+        assert!(
+            out.status.success(),
+            "join failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    pub fn config_file(&self, idx: usize) -> PathBuf {
+        match idx {
+            0 => self.founder_dir.join("node.toml"),
+            1 => self.friend_dir.join("node.toml"),
+            _ => panic!("unknown network-shape node idx {idx}"),
+        }
+    }
+
+    pub fn spawn(&mut self, idx: usize) {
+        let cfg = self.config_file(idx);
+        let label = match idx {
+            0 => "founder",
+            1 => "friend",
+            _ => panic!("unknown network-shape node idx {idx}"),
+        };
+        let log = self.dir.path().join(format!("{label}.log"));
+        let out = std::fs::File::create(&log).expect("create node log");
+        let err = out.try_clone().expect("clone node log handle");
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .arg("--config")
+            .arg(&cfg)
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("spawn network-shape node");
+        self.nodes[idx] = Some(NodeProc {
+            id: idx as u64,
+            child,
+            log,
+        });
+    }
+
+    pub fn run_invite_accept(&self, pubkey_hex: &str) -> (bool, String) {
+        let cfg = self.config_file(0);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["invite-accept", pubkey_hex, "--config"])
+            .arg(cfg)
+            .output()
+            .expect("run invite-accept");
+        (out.status.success(), command_output(&out))
+    }
+
+    pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let node = self.nodes[idx].as_mut().expect("node is running");
+            let text = std::fs::read_to_string(&node.log).unwrap_or_default();
+            if let Some(rest) = find_marker(&text, marker) {
+                return rest;
+            }
+            let exited = node.child.try_wait().expect("poll node").is_some();
+            if exited || Instant::now() >= deadline {
+                let verb = if exited { "exited" } else { "timed out" };
+                panic!(
+                    "network-shape node idx {idx} {verb} without printing {marker:?};\n{}",
+                    self.all_log_tails(60),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    fn all_log_tails(&self, lines: usize) -> String {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, n)| {
+                n.as_ref().map(|n| {
+                    let text = std::fs::read_to_string(&n.log).unwrap_or_default();
+                    format!(
+                        "--- network-shape node idx {idx} log tail ---\n{}",
+                        log_tail(&text, lines)
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 impl Cluster {
     /// lay out a cluster: `peer_ids` is the full authorized mesh (index 0 is
     /// the bootstrapper), `validator_ids` the consensus subset.
@@ -477,6 +654,14 @@ impl Cluster {
         );
         reply["status"].clone()
     }
+}
+
+fn command_output(out: &std::process::Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// poll `probe` every 300ms until it returns `Some`, or panic with `what`
