@@ -57,7 +57,7 @@ use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
 use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _};
-use commonware_runtime::{Clock, IoBuf, Quota, Runner, Spawner, Supervisor};
+use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
 
@@ -2373,6 +2373,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 height: node.finalized().map(|f| f.height).unwrap_or(0),
                                 modules,
                             });
+                        }
+                        noded::NodeCommand::Metrics { reply } => {
+                            // the validator serves commonware's runtime registry;
+                            // the `ducktape_*` block series are the local daemon's
+                            // (noded's) surface, not wired into this consensus path.
+                            let _ = reply.send(context.encode());
                         }
                     }
                 }
