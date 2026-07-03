@@ -39,6 +39,16 @@ export const hasReacted = (message: MessageView, emoji: string, selfKey: string)
 // "Jan 1, 1970".
 const toMillis = (unixSeconds: number): number => unixSeconds * 1000;
 
+/** True when a timestamp is a plausible real wall-clock time (after 2001-01-01),
+ *  vs a genesis-relative counter. The node's `consensus_time` is currently a
+ *  chain-relative value (small: seconds since genesis), so rendering it as an
+ *  absolute clock/date yields nonsense like "Jan 1, 1970" / "20637d ago".
+ *  Display code guards on this and simply omits the time when it isn't real —
+ *  honest, and self-adjusting: the moment the node stamps real wall-clock time
+ *  (values > 2001), timestamps light up on their own. Relative ORDERING and
+ *  grouping stay correct either way (they use time DIFFERENCES, not the label). */
+export const isWallClock = (unixSeconds: number): boolean => unixSeconds > 978_307_200;
+
 const dayKeyOf = (unixSeconds: number): string => new Date(toMillis(unixSeconds)).toDateString();
 
 /** "Today" / "Yesterday" / a short locale date — the day-divider label.
@@ -68,7 +78,12 @@ export const buildStreamRows = (roots: MessageView[]): StreamRow[] => {
   let prev: MessageView | null = null;
   for (const message of roots) {
     const dayChanged = prev !== null && dayKeyOf(prev.head.created_at) !== dayKeyOf(message.head.created_at);
-    const dayDivider = prev === null || dayChanged ? dayLabelOf(message.head.created_at) : null;
+    // Only render a day divider when the timestamp is real wall-clock — a
+    // genesis-relative counter would label every divider "Jan 1, 1970".
+    const dayDivider =
+      (prev === null || dayChanged) && isWallClock(message.head.created_at)
+        ? dayLabelOf(message.head.created_at)
+        : null;
     const groupStart =
       prev === null ||
       dayChanged ||

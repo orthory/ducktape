@@ -9,7 +9,7 @@ import type { CSSProperties, ReactNode } from "react";
 
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../../../domain/chat-client";
-import { hasReacted, isAgentAuthor } from "./chat-helpers";
+import { hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
 import { HoverButton } from "./HoverButton";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -17,8 +17,12 @@ const QUICK_REACTS = ["👍", "✅", "👀"];
 
 // `created_at` is UNIX SECONDS (the node's consensus_time) — multiply by 1000
 // to get a JS `Date`, or every message renders as "Jan 1, 1970".
+// Empty when the timestamp isn't real wall-clock (the node's consensus_time is
+// genesis-relative today) — better to show no time than a fake "09:21 AM".
 const timeOf = (createdAtSeconds: number): string =>
-  new Date(createdAtSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  isWallClock(createdAtSeconds)
+    ? new Date(createdAtSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "";
 
 // ── Tiny local glyphs (Icon.tsx isn't ours to extend in this task) ─────
 

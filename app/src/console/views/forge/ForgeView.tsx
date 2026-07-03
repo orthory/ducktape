@@ -56,7 +56,11 @@ function shortHash(value: string | null | undefined): string {
 }
 
 function relTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "unknown";
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  // The node's commit time is genesis-relative today (not wall-clock), so a
+  // small value would render an absurd "20637d ago". Omit it until the node
+  // stamps real time (> 2001); ordering/history are unaffected.
+  if (seconds <= 978_307_200) return "";
   const diff = Math.max(0, Date.now() - seconds * 1000);
   const minute = 60 * 1000;
   const hour = 60 * minute;
@@ -740,7 +744,7 @@ function FileViewer({
               whiteSpace: "nowrap",
             }}
           >
-            {latest.summary} - {latest.author} - {relTime(latest.time)}
+            {[latest.summary, latest.author, relTime(latest.time)].filter(Boolean).join(" · ")}
           </span>
         )}
       </div>
@@ -857,7 +861,7 @@ function CommitRow({ commit }: { commit: CommitInfo }) {
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ font: `600 14px ${font.sans}`, color: color.ink }}>{commit.summary}</div>
         <div style={{ marginTop: 4, font: `400 11px ${font.mono}`, color: color.muted2 }}>
-          {shortHash(commit.id)} - {commit.author} - {relTime(commit.time)}
+          {[shortHash(commit.id), commit.author, relTime(commit.time)].filter(Boolean).join(" · ")}
         </div>
       </div>
     </div>
