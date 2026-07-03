@@ -16,7 +16,7 @@
 //!   deterministically validates it against the agent's allowed-action set.
 //! - [`AgentQuery`] -> [`AgentReply`] — reads over agents, watches, and runs.
 
-use chat_interface::Block;
+use chat_interface::{Block, MessageView};
 use saga_interface::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -186,6 +186,10 @@ pub struct LlmRequest {
     /// submitted job spec bytes instead of a chat transcript prefix.
     pub job_id: Option<String>,
     pub context_hash: Vec<u8>,
+    /// the pinned chat transcript window the run was staged from. older specs
+    /// decode with an empty transcript; job-backed runs also leave this empty.
+    #[serde(default)]
+    pub transcript: Vec<MessageView>,
 }
 
 /// one validated cross-module write an agent's output may request.

@@ -16,11 +16,13 @@
 //! with it, qmdb modules and the forge repo persist; the height counter still
 //! restarts at 0 — it is a local block counter, not consensus state.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
+use agent_oracle::{AuthStore, LlmWorker};
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Runner as _, Supervisor as _};
@@ -34,8 +36,9 @@ use inbox::Inbox;
 use jobs::Jobs;
 use memory::Memory;
 use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
+use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
-use sdk::{Msg, Origin};
+use sdk::{Effect, Msg, Origin};
 use tasks::Tasks;
 use tokio::sync::broadcast;
 
@@ -54,6 +57,7 @@ const MODULE_IDS: [&str; 11] = [
     "files",
     "memory",
 ];
+const ORACLE_ORIGIN: &[u8] = b"oracle";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
@@ -136,6 +140,7 @@ fn run_node(
         );
         let document = Document::init(context.child("document"), "document").await;
         let forge = Forge::init("forge", forge_repo).expect("forge init");
+        let worker_blobs = blobs.clone();
         let files = Files::with_blobs("files", blobs);
         let memory = Memory::new("memory", "files");
         let mut host = Host::genesis(vec![
@@ -155,6 +160,7 @@ fn run_node(
 
         println!("[noded] genesis app_hash={}", hex_root(&host.app_hash()));
 
+        let workers = oracle_workers(worker_blobs);
         let mut height = 0u64;
         while let Some(cmd) = cmds.next().await {
             match cmd {
@@ -164,34 +170,15 @@ fn run_node(
                     origin,
                     reply,
                 } => {
-                    let ctx = BlockContext {
-                        height: height + 1,
-                        consensus_time: unix_millis(),
-                        origin: Origin::External(origin),
-                    };
-                    let outcome = host.submit_at(ctx, Msg { target, payload }).await;
-                    let result = match outcome {
-                        Ok(out) => {
-                            height += 1;
-                            let block = BlockSummary {
-                                height,
-                                app_hash: hex_root(&out.app_hash),
-                            };
-                            // no subscribers is fine — send only fails then.
-                            let _ = events.send(block.clone());
-                            Ok(block)
-                        }
-                        // FAIL-STOP per the host contract: a Fatal means a
-                        // block-boundary hook failed and the registry may be
-                        // half-committed — applying even one more msg could
-                        // silently corrupt state. exit loudly; the managing
-                        // app respawns a fresh daemon over the storage dir.
-                        Err(SubmitError::Fatal(err)) => {
-                            eprintln!("[noded] FATAL: {err} — halting");
-                            std::process::exit(1);
-                        }
-                        Err(err @ SubmitError::Rejected(_)) => Err(err.to_string()),
-                    };
+                    let result = submit_and_drain(
+                        &mut host,
+                        &workers,
+                        &mut height,
+                        &events,
+                        Origin::External(origin),
+                        Msg { target, payload },
+                    )
+                    .await;
                     let _ = reply.send(result); // caller may have hung up
                 }
                 NodeCommand::Query { target, req, reply } => {
@@ -232,4 +219,158 @@ fn unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is past the epoch")
         .as_millis() as u64
+}
+
+fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("DUCKTAPE_NODED_ECHO_ORACLE").is_some() {
+            return vec![Box::new(EchoWorker)];
+        }
+    }
+    vec![Box::new(LlmWorker::new(
+        blobs,
+        AuthStore::from_default_path(),
+        "gpt-5.1".into(),
+    ))]
+}
+
+async fn submit_and_drain(
+    host: &mut Host,
+    workers: &[Box<dyn reactor::Worker>],
+    height: &mut u64,
+    events: &broadcast::Sender<BlockSummary>,
+    origin: Origin,
+    msg: Msg,
+) -> Result<BlockSummary, String> {
+    let (mut last, effects) = match submit_one(host, height, events, origin, msg).await {
+        Ok(out) => out,
+        Err(SubmitError::Fatal(err)) => {
+            eprintln!("[noded] FATAL: {err} — halting");
+            std::process::exit(1);
+        }
+        Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+    };
+
+    let mut queue = VecDeque::new();
+    offer_effects(workers, effects, &mut queue).await;
+    let mut rounds = 1u32;
+
+    while let Some(follow) = queue.pop_front() {
+        rounds += 1;
+        if rounds > MAX_WORKER_ROUNDS {
+            return Err("worker-round budget exceeded".into());
+        }
+        match submit_one(
+            host,
+            height,
+            events,
+            Origin::External(ORACLE_ORIGIN.to_vec()),
+            follow,
+        )
+        .await
+        {
+            Ok((block, effects)) => {
+                last = block;
+                offer_effects(workers, effects, &mut queue).await;
+            }
+            Err(SubmitError::Fatal(err)) => {
+                eprintln!("[noded] FATAL: {err} — halting");
+                std::process::exit(1);
+            }
+            Err(err @ SubmitError::Rejected(_)) => {
+                eprintln!("[noded] worker follow-up rejected: {err}");
+            }
+        }
+    }
+
+    Ok(last)
+}
+
+async fn submit_one(
+    host: &mut Host,
+    height: &mut u64,
+    events: &broadcast::Sender<BlockSummary>,
+    origin: Origin,
+    msg: Msg,
+) -> Result<(BlockSummary, Vec<Effect>), SubmitError> {
+    let ctx = BlockContext {
+        height: *height + 1,
+        consensus_time: unix_millis(),
+        origin,
+    };
+    let out = host.submit_at(ctx, msg).await?;
+    *height += 1;
+    let block = BlockSummary {
+        height: *height,
+        app_hash: hex_root(&out.app_hash),
+    };
+    // no subscribers is fine — send only fails then.
+    let _ = events.send(block.clone());
+    Ok((block, out.effects))
+}
+
+async fn offer_effects(
+    workers: &[Box<dyn reactor::Worker>],
+    effects: Vec<Effect>,
+    queue: &mut VecDeque<Msg>,
+) {
+    for eff in effects {
+        let mut claimed = false;
+        for w in workers {
+            match w.run(&eff).await {
+                Ok(Some(follow)) => {
+                    queue.push_back(follow);
+                    claimed = true;
+                    break;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("[noded] worker error: {err}");
+                    claimed = true;
+                    break;
+                }
+            }
+        }
+        if !claimed {
+            println!(
+                "[noded] effect with no worker ({} bytes) — dropped",
+                eff.0.len()
+            );
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+struct EchoWorker;
+
+#[cfg(debug_assertions)]
+#[async_trait::async_trait(?Send)]
+impl reactor::Worker for EchoWorker {
+    async fn run(&self, effect: &Effect) -> Result<Option<Msg>, reactor::Error> {
+        let request = match saga_interface::decode_worker_request(&effect.0) {
+            Ok(request) => request,
+            Err(_) => return Ok(None),
+        };
+        let llm = match agent_interface::decode_llm_request(&request.spec) {
+            Ok(llm) => llm,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(Msg {
+            target: "saga".into(),
+            payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
+                saga_id: request.saga_id,
+                attempt: request.attempt,
+                outcome: Ok(agent_interface::encode_output(
+                    &agent_interface::AgentOutput {
+                        reply_blocks: vec![chat_interface::Block::paragraph(format!(
+                            "echo: handling {}",
+                            llm.run_id
+                        ))],
+                        actions: Vec::new(),
+                    },
+                )),
+            }),
+        }))
+    }
 }

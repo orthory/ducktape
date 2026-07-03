@@ -24,11 +24,16 @@ inbox = { workspace = true }
 automations = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
+agent-interface = { workspace = true }
+agent-oracle = { workspace = true }
 saga = { workspace = true }
+saga-interface = { workspace = true }
 document = { workspace = true }
 forge = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
+chat-interface = { workspace = true }
+reactor = { workspace = true }
 # the blob lane shares the files wire constants (chunk cap) and, in tests, the
 # manifest verification helpers.
 files-interface = { workspace = true }
@@ -37,6 +42,7 @@ commonware-runtime = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }

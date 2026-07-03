@@ -42,6 +42,7 @@ files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
+agent-oracle = { workspace = true }
 reactor = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
