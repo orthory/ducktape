@@ -2,6 +2,7 @@
 // views/ + one entry here.
 
 import { ChatView } from "../views/chat/ChatView";
+import { DocumentView } from "../views/document/DocumentView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { StatusView } from "../views/status/StatusView";
 import { TasksView } from "../views/tasks/TasksView";
@@ -11,7 +12,8 @@ export const MODULES: AppModule[] = [
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0 }, Screen: ChatView },
   { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 1 }, Screen: TasksView },
   { id: "forge", nav: { icon: "forge", label: "Forge", order: 2 }, Screen: ForgeView },
-  { id: "status", nav: { icon: "node", label: "Node", order: 3 }, Screen: StatusView },
+  { id: "document", nav: { icon: "document", label: "Docs", order: 3 }, Screen: DocumentView },
+  { id: "status", nav: { icon: "node", label: "Node", order: 4 }, Screen: StatusView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

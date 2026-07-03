@@ -28,6 +28,8 @@ import {
 import type { ReactNode } from "react";
 
 import * as chatClient from "../../domain/chat-client";
+import * as documentClient from "../../domain/document-client";
+import type { Block, BlockKind } from "../../domain/document-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as tasksClient from "../../domain/tasks-client";
 import {
@@ -43,6 +45,7 @@ import type { NodeTransport } from "../../domain/transport";
 import {
   channelIdOf,
   createInitialState,
+  docIdOf,
   nextTaskStatus,
 } from "./state";
 import type { ConsoleState } from "./state";
@@ -59,6 +62,36 @@ const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
     ? list.map((w) => (w.id === next.id ? next : w))
     : [...list, next];
 
+// ── Per-node document registry ──────────────────────────
+//
+// The document module has NO "list docs" query — its store is keyed by
+// sha256(doc_id) and cannot enumerate — so the set of known doc-ids is tracked
+// CLIENT-SIDE and persisted per resolved node url (i.e. per workspace). This is
+// a convenience registry, not a source of truth: a doc created on another
+// client won't appear here until its id is opened by hand.
+const docRegistryKey = (nodeUrl: string): string => `ducktape.docs.${nodeUrl}`;
+
+const loadDocIds = (nodeUrl: string): string[] => {
+  try {
+    const raw = localStorage.getItem(docRegistryKey(nodeUrl));
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === "string")
+      : [];
+  } catch {
+    return []; // storage unavailable / corrupt entry — start from an empty list
+  }
+};
+
+const saveDocIds = (nodeUrl: string, docIds: string[]): void => {
+  try {
+    localStorage.setItem(docRegistryKey(nodeUrl), JSON.stringify(docIds));
+  } catch {
+    // storage may be unavailable (private mode / quota); the registry is a
+    // convenience, so a failed persist is non-fatal.
+  }
+};
+
 // ── Context ─────────────────────────────────────────────
 
 export interface ConsoleActions {
@@ -74,6 +107,21 @@ export interface ConsoleActions {
   addTask(title: string): void;
   advanceTask(taskId: string): void;
   commitForge(params: { path: string; content: string; message: string }): void;
+
+  // ── Documents (block store over the `document` module) ──
+  /** Create a doc (CreateDoc, idempotent), register it, and open it. */
+  createDoc(docId: string): void;
+  /** Register + open a doc by id, loading its blocks (like selectChannel). */
+  openDoc(docId: string): void;
+  /** Append/insert a fresh block into the active doc (id generated here). */
+  insertBlock(params: { after: string | null; kind: BlockKind; text: string }): void;
+  /** Replace a block's text in the active doc. */
+  updateBlock(params: { blockId: string; text: string }): void;
+  /** Remove a block from the active doc. */
+  removeBlock(blockId: string): void;
+  /** Move a block within the active doc (see the `after` rule). */
+  moveBlock(params: { blockId: string; after: string | null }): void;
+
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
@@ -245,6 +293,9 @@ export function DucktapeProvider({
     () => {
       const live = nodeRef.current;
       if (!live) return Promise.resolve();
+      // the document module has no bulk read, so re-query only the open doc
+      // (null when none is open) alongside the other projections.
+      const activeDoc = stateRef.current.activeDoc;
       return Promise.resolve()
         .then(() =>
           Promise.all([
@@ -252,9 +303,12 @@ export function DucktapeProvider({
             chatClient.channels(live),
             tasksClient.listTasks(live),
             forgeClient.head(live),
+            activeDoc
+              ? documentClient.getDoc(live, activeDoc)
+              : Promise.resolve<Block[] | null>(null),
           ]),
         )
-        .then(([status, channels, tasks, forgeHead]) => {
+        .then(([status, channels, tasks, forgeHead, docBlocks]) => {
           const current = stateRef.current.activeChannel;
           const active =
             current && channels.some((c) => c.id === current)
@@ -272,6 +326,7 @@ export function DucktapeProvider({
                 forgeHead,
                 activeChannel: active,
                 messages,
+                activeDocBlocks: docBlocks ?? [],
               })),
             );
         })
@@ -297,6 +352,20 @@ export function DucktapeProvider({
     document.documentElement.style.setProperty("--accent", state.accent);
   }, [state.accent]);
 
+  // 5. Load the per-node doc registry when the node url resolves or changes,
+  //    and drop any open doc — a different node has different documents.
+  //    Writes go the other way through openDoc (the only place docIds grows).
+  useEffect(() => {
+    const url = state.nodeUrl;
+    if (!url) return;
+    setState((prev) => ({
+      ...prev,
+      docIds: loadDocIds(url),
+      activeDoc: null,
+      activeDocBlocks: [],
+    }));
+  }, [state.nodeUrl]);
+
   const actions = useMemo<ConsoleActions>(() => {
     const submitThenRefresh = (submit: (live: NodeTransport) => Promise<unknown>) => {
       const live = nodeRef.current;
@@ -320,6 +389,31 @@ export function DucktapeProvider({
       Promise.resolve()
         .then(() => chatClient.latestMessages(live, channelId))
         .then((messages) => setState((prev) => ({ ...prev, messages })))
+        .catch(fail);
+    };
+
+    // the single entry point into a doc: record it in the per-node registry
+    // (persist), make it active, and load its blocks. Every path into a doc
+    // (new-doc, open-by-id, a registry click) goes here — like enterChannel.
+    const enterDoc = (rawId: string) => {
+      const live = nodeRef.current;
+      const docId = docIdOf(rawId);
+      if (!live || !docId) return;
+      const known = stateRef.current.docIds;
+      const docIds = known.includes(docId) ? known : [...known, docId];
+      const url = stateRef.current.nodeUrl;
+      if (url) saveDocIds(url, docIds);
+      setState((prev) => ({
+        ...prev,
+        docIds,
+        activeDoc: docId,
+        activeDocBlocks: [],
+      }));
+      Promise.resolve()
+        .then(() => documentClient.getDoc(live, docId))
+        .then((blocks) =>
+          setState((prev) => ({ ...prev, activeDocBlocks: blocks ?? [] })),
+        )
         .catch(fail);
     };
 
@@ -427,6 +521,55 @@ export function DucktapeProvider({
         );
       },
 
+      // ── Documents ──
+      openDoc: enterDoc,
+
+      createDoc: (rawId) => {
+        const docId = docIdOf(rawId);
+        if (!docId) return;
+        // CreateDoc is idempotent and REQUIRED before any block op; then open
+        // it (registers the id + loads blocks), mirroring createChannel.
+        submitThenRefresh((live) => documentClient.createDoc(live, { docId })).then(
+          () => enterDoc(docId),
+        );
+      },
+
+      insertBlock: ({ after, kind, text }) => {
+        const docId = stateRef.current.activeDoc;
+        if (!docId) return;
+        submitThenRefresh((live) =>
+          documentClient.insertBlock(live, {
+            docId,
+            after,
+            block: { id: crypto.randomUUID(), kind, text },
+          }),
+        );
+      },
+
+      updateBlock: ({ blockId, text }) => {
+        const docId = stateRef.current.activeDoc;
+        if (!docId) return;
+        submitThenRefresh((live) =>
+          documentClient.updateBlock(live, { docId, blockId, text }),
+        );
+      },
+
+      removeBlock: (blockId) => {
+        const docId = stateRef.current.activeDoc;
+        if (!docId) return;
+        submitThenRefresh((live) =>
+          documentClient.removeBlock(live, { docId, blockId }),
+        );
+      },
+
+      moveBlock: ({ blockId, after }) => {
+        const docId = stateRef.current.activeDoc;
+        if (!docId) return;
+        submitThenRefresh((live) =>
+          documentClient.moveBlock(live, { docId, blockId, after }),
+        );
+      },
+
       stopNode: () => {
         const url = stateRef.current.nodeUrl;
         if (!url || !stateRef.current.managed) return;
@@ -497,6 +640,9 @@ export function DucktapeProvider({
           activeChannel: null,
           activeThread: null,
           tasks: [],
+          docIds: [],
+          activeDoc: null,
+          activeDocBlocks: [],
           onboardingPhase: null,
         }));
         connectActive(target).catch(fail);

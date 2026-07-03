@@ -3,6 +3,7 @@
 // (screen, accent, author identity, thread panel).
 
 import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
+import type { Block } from "../../domain/document-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { NodeStatus } from "../../domain/transport";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
@@ -28,6 +29,17 @@ export interface ConsoleState {
   tasks: Task[];
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
+
+  // ── Documents (block store; see document-client) ──
+  /** Known doc-ids — a client-side registry, since the document module has no
+   *  "list docs" query (its store is keyed by sha256(doc_id) and can't
+   *  enumerate). Persisted per node url by the provider. */
+  docIds: string[];
+  /** The doc whose blocks are loaded, or null when none is open. */
+  activeDoc: string | null;
+  /** Ordered blocks of the active doc (re-queried per block / on open). */
+  activeDocBlocks: Block[];
+
   error: string | null;
 
   // ── Workspaces / onboarding (desktop only; inert on web) ──
@@ -62,6 +74,9 @@ export const createInitialState = (): ConsoleState => ({
   activeThread: null,
   tasks: [],
   forgeHead: null,
+  docIds: [],
+  activeDoc: null,
+  activeDocBlocks: [],
   error: null,
   workspaces: [],
   workspace: null,
@@ -76,6 +91,16 @@ export const createInitialState = (): ConsoleState => ({
 /** A channel id from a display name: lowercase, dash-separated, wire-safe. */
 export const channelIdOf = (name: string): string =>
   name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+
+/** A doc id from user input (new-doc or open-by-id): lowercase, dash-separated,
+ *  wire-safe. Slugging both entry points keeps "My Notes" and "my-notes" the
+ *  same document, mirroring channelIdOf. */
+export const docIdOf = (raw: string): string =>
+  raw
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
