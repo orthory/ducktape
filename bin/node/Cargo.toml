@@ -47,6 +47,8 @@ agent-oracle = { workspace = true }
 reactor = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
+# compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
+base64 = "0.22"
 # the http/ws app surface, shared with the embedded daemon: NodeCommand lane,
 # axum router, and serve() — this binary only owns the pump-side of the lane.
 noded = { path = "../noded" }

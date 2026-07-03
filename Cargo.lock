@@ -4019,6 +4019,7 @@ dependencies = [
  "agent",
  "agent-oracle",
  "automations",
+ "base64 0.22.1",
  "chat",
  "chat-interface",
  "commonware-codec",
