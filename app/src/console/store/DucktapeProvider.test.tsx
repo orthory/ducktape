@@ -87,6 +87,9 @@ const makeFakeNode = () => {
         if (query === "Watches") return Promise.resolve({ Watches: [] });
         return Promise.resolve({ Runs: [] });
       }
+      if (target === "profiles") {
+        return Promise.resolve({ Profiles: [] });
+      }
       return Promise.resolve({ Tasks: [] });
     }),
     putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),

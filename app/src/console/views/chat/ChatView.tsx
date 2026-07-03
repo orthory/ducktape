@@ -7,7 +7,7 @@ import { useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 
 import { authorName, blocksText } from "../../../domain/chat-client";
-import type { MessageView } from "../../../domain/chat-client";
+import type { AuthorNames, MessageView } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
@@ -89,12 +89,15 @@ function Composer({
 
 function MessageRow({
   message,
+  names,
   onOpenThread,
 }: {
   message: MessageView;
+  /** hex(key)→display name from `profiles`; resolves User authors to names. */
+  names: AuthorNames;
   onOpenThread?: (rootSeq: number) => void;
 }) {
-  const author = authorName(message.head.author);
+  const author = authorName(message.head.author, names);
   const replyCount = message.head.reply_count;
   return (
     <div
@@ -294,7 +297,7 @@ function ThreadPanel() {
         </button>
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "9px 0" }}>
-        <MessageRow message={thread.root} />
+        <MessageRow message={thread.root} names={state.authorNames} />
         {thread.replies.length > 0 && (
           <div
             style={{
@@ -304,7 +307,7 @@ function ThreadPanel() {
           />
         )}
         {thread.replies.map((reply) => (
-          <MessageRow key={reply.seq} message={reply} />
+          <MessageRow key={reply.seq} message={reply} names={state.authorNames} />
         ))}
       </div>
       <Composer placeholder="Reply in thread" onSubmit={actions.replyInThread} />
@@ -341,7 +344,12 @@ export function ChatView() {
 
         <div style={{ flex: 1, overflowY: "auto", padding: "9px 0" }}>
           {roots.map((message) => (
-            <MessageRow key={message.seq} message={message} onOpenThread={actions.openThread} />
+            <MessageRow
+              key={message.seq}
+              message={message}
+              names={state.authorNames}
+              onOpenThread={actions.openThread}
+            />
           ))}
           {channel && roots.length === 0 && (
             <div style={{ padding: "13px 17px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>

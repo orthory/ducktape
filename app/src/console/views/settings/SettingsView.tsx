@@ -183,22 +183,40 @@ export function SettingsView() {
           overflowY: "auto",
         }}
       >
-        <Row label="Display name">
-          <input
-            value={state.author}
-            onChange={(event) => actions.setAuthor(event.target.value)}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <Row label="Display name">
+            {/* Controlled over state.author: onChange keeps it live locally, but
+                the consensus SetName only fires on blur/Enter — never per
+                keystroke. */}
+            <input
+              value={state.author}
+              onChange={(event) => actions.setAuthor(event.target.value)}
+              onBlur={(event) => actions.setDisplayName(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+              style={{
+                width: 180,
+                padding: "6px 10px",
+                borderRadius: radius.sm,
+                border: `1px solid ${color.borderStrong}`,
+                background: color.sunken,
+                font: `500 12px ${font.sans}`,
+                color: color.ink,
+                textAlign: "right",
+              }}
+            />
+          </Row>
+          <span
             style={{
-              width: 180,
-              padding: "6px 10px",
-              borderRadius: radius.sm,
-              border: `1px solid ${color.borderStrong}`,
-              background: color.sunken,
-              font: `500 12px ${font.sans}`,
-              color: color.ink,
-              textAlign: "right",
+              paddingLeft: 15,
+              font: `400 10.5px ${font.sans}`,
+              color: color.muted2,
             }}
-          />
-        </Row>
+          >
+            shown to everyone on this network
+          </span>
+        </div>
 
         <Row label="Accent">
           <div style={{ display: "flex", gap: 7 }}>

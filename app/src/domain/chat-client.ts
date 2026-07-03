@@ -90,11 +90,22 @@ export const MAX_QUERY_LIMIT = 256;
 
 // ── Rendering helpers (wire → display) ──────────────────
 
+/** hex(User key bytes) → display name — the resolved `profiles` registry, keyed
+ *  so `authorName` can look a User author up by its origin bytes. */
+export type AuthorNames = Record<string, string>;
+
+/** Lowercase hex of a User author's key bytes — the map key into AuthorNames
+ *  (and the `profiles` Profile.key, which IS these same origin bytes). */
+export const keyHex = (bytes: number[]): string =>
+  bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+
 /** A display name for an author. A User author's bytes are the submitter
- *  identity the daemon stamped — for this app, the utf-8 display name. */
-export const authorName = (author: AuthorRef): string => {
+ *  identity the daemon stamped; when the `profiles` registry (`names`) resolves
+ *  those bytes it wins, else we fall back to the utf-8/hex handle. */
+export const authorName = (author: AuthorRef, names?: AuthorNames): string => {
   if (author === "System") return "system";
-  if ("User" in author) return displayUserBytes(author.User);
+  if ("User" in author)
+    return names?.[keyHex(author.User)] ?? displayUserBytes(author.User);
   if ("Agent" in author) return `${author.Agent.module}/${author.Agent.agent_id}`;
   return author.Module;
 };
@@ -111,8 +122,7 @@ const displayUserBytes = (bytes: number[]): string => {
   } catch {
     // fall through to the hex handle
   }
-  const hex = bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}…`;
+  return `${keyHex(bytes).slice(0, 8)}…`;
 };
 
 const spanText = (spans: Span[]): string => spans.map((span) => span.text).join("");
