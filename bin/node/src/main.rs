@@ -228,7 +228,10 @@ async fn genesis_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
-    let forge = Forge::init("forge", forge_repo.to_path_buf()).expect("forge init");
+    // forge shares the files body plane so a Push's packfile (staged on the blob
+    // lane before submit) can materialize locally; the pack never touches root.
+    let forge =
+        Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone()).expect("forge init");
     let mut valset = Valset::new("valset");
     // genesis-seed the validator set from config — deterministic and identical
     // on every node, so membership is IN consensus state from block zero (the
@@ -293,8 +296,9 @@ async fn restore_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
-    let forge =
-        Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge: {e}"))?;
+    // forge shares the files body plane (see genesis_host) for Push materialization.
+    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
+        .map_err(|e| format!("forge: {e}"))?;
 
     let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
         let bytes = manifest
