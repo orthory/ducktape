@@ -3,30 +3,56 @@
 This page tracks implementation gaps that agents should not accidentally present
 as finished.
 
-## Live Network State Sync
+## WireGuard Tunnel Runtime
 
-In-process module sync proofs exist, and `bin/demo/src/state_sync.rs` defines
-tested transport-neutral mesh frames with membership validation. A running node
-still needs network resolvers that serve and fetch those frames from the live
-validator path.
+`crates/system/wireguard-upgrade` remains a protocol leaf: no `bin/node` or
+`bin/noded` consumer applies its validated `TunnelInstallPlan` through defguard
+`WGApi`. The next slice is a mesh module that emits upgrade effects, a reactor
+worker that drives `WGApi`, an `admission_root` producer that fails closed until
+the finalized admission commitment exists, and a responder-side install-plan
+constructor.
 
-## Dynamic Valset Orchestration
+The two mesh contracts (`valset-mesh-interface` and `wireguard-upgrade`) should
+collapse onto one shape. A privileged Linux netns e2e that creates a real
+WireGuard interface is still deliberately descoped.
 
-Tests cover respawn behavior around an epoch boundary, and the deterministic
-core exists: the tested `ValsetOrchestrator` state machine
-(`crates/kernel/consensus/src/valset_orchestrator.rs`) watches finalized valset
-state and publishes a deterministic cutover point. The live loop still needs to
-stop old orderers, start new epoch instances, and keep transport/state-sync
-readiness aligned.
+## Demotion And Promotion Edges
 
-## Snapshot Serving
+A validator removed at epoch cutover still halts instead of staying online as a
+sync/observer. Joiner promotion itself has shipped: a parked joiner can sync an
+admitting boundary, write a promotion checkpoint, reboot, and vote. Do not list
+that as missing.
 
-The capstone joiner test proves rebuild math. A running node still needs a
-pause/serve seam for a consistent all-module snapshot at a finalized height.
+The remaining promotion-adjacent operator work is the stale local-state story:
+pre-recovery or damaged recovery directories fail loudly rather than migrating,
+and demoted nodes do not yet fall back into an observer role automatically.
 
-## Product Depth
+## Replay Nonces
 
-Chat and agent modules exist. The agent path still needs real reactor-backed LLM
-work so model output is committed as ordered data. A first tasks module is
-checked in (`crates/apps/tasks` plus `tasks-interface` and tests); qmdb backing,
-a richer task schema, and product wiring into the binaries remain.
+The ordered frame carries `(origin, seq)`, but replicated state does not enforce
+per-origin nonce monotonicity. A byte-identical cross-epoch replay is currently
+gated only by the per-engine finalization dedup; committed nonce state is the
+planned durable replacement.
+
+## Restart-Recovery Compatibility
+
+Restart recovery is live: checkpoints, op-journal replay, cutover records, and
+floor certificates recover current nodes. The edge is an older/pre-recovery
+storage directory: if local state exists without a recovery checkpoint, boot
+fails loudly and tells the operator to wipe/re-sync rather than migrating in
+place.
+
+## Agent/Reactor Product Path
+
+The agent module exists, and demo/tests show the model-output-as-ordered-op
+pattern. `bin/node`/`bin/noded` do not run an agent LLM worker yet: the node
+worker set is empty, production genesis does not include `agent`, and the path is
+not wired to tasks as live operator UX.
+
+## Module Integration Wave
+
+The next module wave is design/spec work before implementation: automations
+deliver to inbox via `Deliver`; automations can trigger from memory watches;
+memory bodies over 64 KiB ride through files manifests; agents can claim jobs;
+and tasks can be modeled as obligations with deadline state, cure/escalation
+lineage, and atomic cross-module creation.

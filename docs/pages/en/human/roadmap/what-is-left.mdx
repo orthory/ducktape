@@ -2,8 +2,11 @@
 
 The core architecture and the live control plane are in place: network state
 sync, dynamic valset orchestration with epoch cutover, and a governed private
-network all run over real sockets in `bin/node/examples/demo-2node.sh`. What
-remains is durability, promotion flows, and product depth.
+network all run over real sockets in the node e2e suite
+(`cargo test -p node-bin --test cluster_e2e`), with a human-runnable
+invite/join/admit ceremony in `bin/node/examples/demo-invite.sh`. What remains
+is durability edges, demotion behavior, WireGuard runtime wiring, and product
+depth.
 
 ## Done (was open)
 

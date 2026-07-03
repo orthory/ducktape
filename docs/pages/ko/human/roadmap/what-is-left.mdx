@@ -1,46 +1,50 @@
 # What Is Left
 
-repo는 core architecture threshold를 넘었다. 남은 일은 live control plane과 그
-주변의 product depth다.
+core architecture와 live control plane은 자리 잡았다. network state sync, epoch
+cutover가 있는 dynamic valset orchestration, governed private network는 node e2e
+suite(`cargo test -p node-bin --test cluster_e2e`)에서 real socket 위로 실행된다.
+human-runnable invite/join/admit ceremony는 `bin/node/examples/demo-invite.sh`에
+있다. 남은 일은 durability edge, demotion behavior, WireGuard runtime wiring,
+product depth다.
 
-## Network State Sync
+## Done (was open)
 
-module sync path는 in-process로 증명되어 있고, `bin/demo/src/state_sync.rs`는
-membership validation을 갖춘 transport-neutral mesh request/response frame을
-이미 정의하며 test로 검증된다. 아직 빠진 것은 live network path다. in-process
-wiring이 아니라 running validator mesh 위에서 이 frame을 serve하고 fetch하는
-resolver가 필요하다.
+- **Network state sync.** running validator는 state-sync wire protocol(manifest,
+  chunked snapshot, `serve_sync`를 통한 live qmdb op-range serving)을 serve한다.
+  joiner는 모든 module을 그 위에서 rebuild하고 source app-hash를 합성한다.
+- **Dynamic valset orchestration.** `ValsetOrchestrator`는 finalized valset state를
+  watch하고 deterministic cutover를 schedule하며, new participant set 위로 engine을
+  respawn하고 channel을 rotate한다.
+- **Governance and vaults.** member-gated proposal이 membership을 drive하고, vault는
+  owner-gated write integrity를 가진 opaque secret ciphertext를 replicate한다.
 
-## Dynamic Valset Orchestration
+## Durability And Promotion
 
-consensus respawn behavior는 epoch boundary에서 joiner를 편입하는 test coverage를
-가지며, deterministic core는 완료 상태다. test된 `ValsetOrchestrator` state
-machine(`crates/kernel/consensus/src/valset_orchestrator.rs`)이 finalized valset
-state를 watch하고 deterministic cutover point를 결정해 publish한다. 남은 일은 그
-core 주변의 live wiring이다.
+- ~~Restart/recovery from persisted state~~: shipped. write-ahead op journal과
+  periodic checkpoint가 composed app-hash를 boot에서 recover하고, engine은 persisted
+  epoch와 finalization floor 뒤에서 기존 journal partition으로 respawn한다. 남은
+  edge는 checkpoint 없는 pre-recovery storage dir이 migrate되지 않고 loud failure로
+  끝나는 것이다.
+- cutover에서 demoted validator는 현재 halt한다. sync-server로 degrade해야 한다.
+- replicated state의 per-origin replay nonce. byte-identical frame의 cross-epoch
+  replay는 현재 per-engine finalization dedup에만 걸린다.
 
-- old orderer instance를 stop하고 new epoch를 일관되게 start한다.
-- transport와 state-sync readiness를 membership change와 맞춘다.
+## Product Depth
 
-state sync는 joiner catch-up의 개념적 blocker가 아니지만, live orchestration은
-아직 wiring이 필요하다.
+- Origin-bound message authorship. signed frame은 authenticated origin을 제공하지만,
+  product-level author string은 아직 caller-supplied다.
+- agent module은 reactor worker seam에 연결되어야 한다. LLM output은 hidden
+  non-determinism이 아니라 ordered data로 commit되어야 하며, tasks module과도 live
+  pipeline으로 연결되어야 한다.
 
-## Live Snapshot Serving
+## Mesh
 
-capstone test는 joiner가 module target과 snapshot에서 rebuild할 수 있음을 증명한다.
-running node는 finalized height에서 consistent all-module snapshot을 제공하는
-pause/serve seam이 아직 필요하다.
-
-## Product Modules
-
-chat과 agent에는 실제 product pressure가 더 필요하다. agent module은 reactor
-worker seam에 연결되어야 한다. LLM output은 hidden non-determinism이 아니라
-ordered data로 commit되어야 한다. 첫 tasks module은 이미 checked-in 상태다
-(`crates/apps/tasks`와 `tasks-interface`, test 포함). staged in-memory state와
-검증된 snapshot/install을 갖추고 있고, 남은 일은 qmdb backing, 더 풍부한 task
-schema, binary로의 product wiring이다.
+두 parallel mesh type system(`valset-mesh-interface`, `wireguard-upgrade`)은 하나의
+contract로 합쳐져야 하며, validated WireGuard upgrade path는 private overlay를 실제로
+올리는 runtime consumer가 필요하다.
 
 ## Deferred Deliberately
 
 - commit-phase crash safety와 full two-phase commit은 deferred 상태다. 현재
-  host-lent atomicity가 execute-phase behavior를 커버하기 때문이다.
+  host-lent atomicity가 execute-phase behavior를 커버하고, commit-phase fault는 silent
+  corruption이 아니라 fail-stop `SubmitError::Fatal`이기 때문이다.
