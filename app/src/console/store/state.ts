@@ -27,6 +27,9 @@ export interface ConsoleState {
   /** Messages of the active channel only (all sequences; views filter). */
   messages: MessageView[];
   activeThread: ChatThread | null;
+  /** hex(user key bytes) → display name, from the `profiles` module; threaded
+   *  into author rendering so messages show chosen names, not hex handles. */
+  authorNames: Record<string, string>;
   tasks: Task[];
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
@@ -81,6 +84,7 @@ export const createInitialState = (): ConsoleState => ({
   activeChannel: null,
   messages: [],
   activeThread: null,
+  authorNames: {},
   tasks: [],
   forgeHead: null,
   docIds: [],

@@ -33,6 +33,7 @@ import * as chatClient from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
 import type { Block, BlockKind } from "../../domain/document-client";
 import * as forgeClient from "../../domain/forge-client";
+import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
 import {
   connectWorkspace,
@@ -100,6 +101,9 @@ export interface ConsoleActions {
   setScreen(screen: string): void;
   setAccent(accent: string): void;
   setAuthor(author: string): void;
+  /** Set our own display name in the `profiles` module (origin-gated SetName)
+   *  and keep it as the local author identity, so it propagates to everyone. */
+  setDisplayName(name: string): void;
   selectChannel(channelId: string): void;
   createChannel(name: string): void;
   sendMessage(body: string): void;
@@ -335,9 +339,15 @@ export function DucktapeProvider({
             agentClient
               .runs(live, { channelId: null, limit: 50 })
               .then((list) => [...list].reverse()),
+            profilesClient.allProfiles(live, { from: 0, limit: 256 }),
           ]),
         )
-        .then(([status, channels, tasks, forgeHead, docBlocks, agents, watches, runs]) => {
+        .then(([status, channels, tasks, forgeHead, docBlocks, agents, watches, runs, profiles]) => {
+          // Profile.key is the origin bytes — the same bytes AuthorRef::User
+          // carries — so hex(key) is exactly authorName's AuthorNames key.
+          const authorNames = Object.fromEntries(
+            profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
+          );
           const current = stateRef.current.activeChannel;
           const active =
             current && channels.some((c) => c.id === current)
@@ -355,6 +365,7 @@ export function DucktapeProvider({
                 forgeHead,
                 activeChannel: active,
                 messages,
+                authorNames,
                 activeDocBlocks: docBlocks ?? [],
                 agents,
                 watches,
@@ -453,6 +464,19 @@ export function DucktapeProvider({
       setScreen: (screen) => setState((prev) => ({ ...prev, screen })),
       setAccent: (accent) => setState((prev) => ({ ...prev, accent })),
       setAuthor: (author) => setState((prev) => ({ ...prev, author })),
+
+      // Keep the local author identity (still the web-origin string) AND submit
+      // SetName so the chosen name propagates: it's origin-gated, so passing our
+      // origin sets our OWN profile only. Refresh re-reads authorNames.
+      setDisplayName: (name) => {
+        setState((prev) => ({ ...prev, author: name }));
+        submitThenRefresh((live) =>
+          profilesClient.setName(live, {
+            displayName: name,
+            origin: stateRef.current.author,
+          }),
+        );
+      },
 
       selectChannel: enterChannel,
 
@@ -750,6 +774,7 @@ export function DucktapeProvider({
           messages: [],
           activeChannel: null,
           activeThread: null,
+          authorNames: {},
           tasks: [],
           docIds: [],
           activeDoc: null,
