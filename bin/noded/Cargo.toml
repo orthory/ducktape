@@ -31,6 +31,10 @@ saga = { workspace = true }
 saga-interface = { workspace = true }
 document = { workspace = true }
 forge = { workspace = true }
+# the forge module's wire types — the git smart-HTTP receive-pack bridge encodes
+# ForgeMsg::Push / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
+# route pair; every other route stays module-agnostic opaque json).
+forge-interface = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
 chat-interface = { workspace = true }
@@ -47,6 +51,8 @@ async-trait = { workspace = true }
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
+# inflate a gzip-compressed git receive-pack request body (Content-Encoding: gzip).
+flate2 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 
 [dev-dependencies]
