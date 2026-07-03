@@ -15,7 +15,7 @@ use inbox_interface::{
     InboxQuery, InboxReply, decode_reply as inbox_decode_reply, encode_query as inbox_encode_query,
 };
 use memory::Memory;
-use memory_interface::{MemoryMsg, Meta, encode_msg as memory_encode_msg};
+use memory_interface::{MemoryMsg, Meta, PublishBody, encode_msg as memory_encode_msg};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use tasks::Tasks;
 use tasks_interface::{
@@ -27,6 +27,7 @@ const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
 const INBOX: &str = "inbox";
 const MEMORY: &str = "memory";
+const FILES: &str = "files";
 
 /// a stand-in for chat that relays its payload to automations as a hook
 /// follow-up. because it is registered under the id "chat", the host stamps the
@@ -135,7 +136,7 @@ fn genesis() -> Host {
         Box::new(Tasks::new(TASKS)),
         Box::new(RelayChat),
         Box::new(Inbox::new(INBOX)),
-        Box::new(Memory::new(MEMORY)),
+        Box::new(Memory::new(MEMORY, FILES)),
         Box::new(Automations::new(AUTO, CHAT, TASKS, INBOX, MEMORY)),
     ])
     .expect("genesis")
@@ -195,7 +196,7 @@ fn memory_publish_fires_rule_and_delivers_inbox_atomically() {
                 },
                 memory_msg(MemoryMsg::Publish {
                     path: "/docs/a".into(),
-                    body: "body".into(),
+                    body: PublishBody::Inline("body".into()),
                     meta,
                 }),
             )
@@ -264,7 +265,7 @@ fn memory_event_authored_by_automations_does_not_fire() {
             },
             memory_msg(MemoryMsg::Publish {
                 path: "/docs/self".into(),
-                body: "body".into(),
+                body: PublishBody::Inline("body".into()),
                 meta: Meta::new(),
             }),
         )

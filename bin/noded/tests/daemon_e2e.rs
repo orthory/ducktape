@@ -278,10 +278,12 @@ fn full_surface_blocks_authorship_and_ws() {
         modules,
         [
             "chat",
+            "saga",
             "tasks",
             "inbox",
             "automations",
             "jobs",
+            "agent",
             "document",
             "forge",
             "files",

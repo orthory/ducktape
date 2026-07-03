@@ -29,6 +29,7 @@
 //!
 //! - `Origin::Module(chat)` → a [`ChatEvent`] (the hook intake);
 //! - `Origin::Module(saga)` → a [`SagaCallback`] (the completion intake);
+//! - `Origin::Module(jobs)` → a [`JobsEvent`] (the jobs-board intake);
 //! - anything else → an [`AgentMsg`] (admin ops and explicit runs). an
 //!   external submitter shipping hook- or callback-shaped bytes lands HERE
 //!   and fails the `AgentMsg` decode — it can never fake an intake.
@@ -49,6 +50,10 @@
 //! - the hook intake runs in the same block as the user's post. an `Err` here
 //!   would abort the post (and every other subscriber's delivery), so a
 //!   malformed event or a failed context pin is equally a staged no-op.
+//! - the jobs intake runs in the same block as the job submit. jobs queries are
+//!   committed-only, so the just-staged job is invisible to `JobsQuery::Get`;
+//!   this path skips that blind probe and relies on the documented single
+//!   claiming-worker cascade rule before emitting its `Claim`.
 //!
 //! ## loop prevention
 //!
@@ -79,12 +84,18 @@ use agent_interface::{
     ACTION_CHAT_POST, AgentAction, AgentMsg, AgentOutput, AgentQuery, AgentRecord, AgentReply,
     AgentStatus, KNOWN_ACTIONS, LlmRequest, MAX_ACTIONS_PER_RUN, MAX_AGENT_RECORD_BYTES,
     MAX_QUERY_LIMIT, MAX_REPLY_BLOCKS_BYTES, PROMPT_HASH_LEN, RunStatus, RunView, TurnPolicy,
-    WatchView, decode_msg, decode_output, decode_query, encode_llm_request, encode_reply,
+    WatchView, decode_msg, decode_output, decode_query, encode_llm_request, encode_output,
+    encode_reply,
 };
 use chat_interface::{
     AuthorRef, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_event as chat_decode_event, decode_reply as chat_decode_reply,
     encode_msg as chat_encode_msg, encode_query as chat_encode_query,
+};
+use jobs_interface::{
+    JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_event as jobs_decode_event,
+    decode_reply as jobs_decode_reply, encode_msg as jobs_encode_msg,
+    encode_query as jobs_encode_query,
 };
 use saga_interface::{
     SagaMsg, SagaOrigin, SagaOutcome, decode_callback as saga_decode_callback,
@@ -107,9 +118,25 @@ pub const RUN_DEADLINE_VIEWS: u64 = 1024;
 /// oracle attempts per run: one retry after a failed or expired attempt.
 pub const RUN_MAX_ATTEMPTS: u32 = 2;
 
+/// jobs-board claims created by the agent worker use a view-denominated lease.
+pub const JOB_RUN_LEASE_VIEWS: u64 = 1000;
+
+/// jobs finalization payloads must fit the jobs module's 64 KiB cap.
+const JOB_FINALIZE_PAYLOAD_BYTES: usize = 64 * 1024;
+
 /// the turn-claim key: first creation in consensus order wins.
 pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
     format!("{channel_id}/{anchor_seq}/{agent_id}")
+}
+
+/// the turn-claim key for a job-backed run.
+pub fn job_run_id_for(job_id: &str, agent_id: &str) -> String {
+    format!("job/{job_id}/{agent_id}")
+}
+
+/// canonical job-spec pin used by job-backed runs.
+pub fn job_spec_hash(spec: &[u8]) -> Vec<u8> {
+    Sha256::digest(spec).to_vec()
 }
 
 /// the saga a run rides on — namespaced so agent sagas cannot collide with
@@ -188,6 +215,8 @@ struct RunState {
     anchor_seq: u64,
     /// the anchor's thread root, if the anchor was a thread reply.
     thread_root: Option<u64>,
+    /// the jobs-board item this run owns, when created from a JobsEvent.
+    job_id: Option<String>,
     /// the run-creating origin — a cancel capability alongside the owner.
     requester: SagaOrigin,
     status: RunStatus,
@@ -215,6 +244,16 @@ fn put_opt_u64(out: &mut Vec<u8>, opt: Option<u64>) {
         Some(v) => {
             out.push(1);
             out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+fn put_opt_string(out: &mut Vec<u8>, opt: &Option<String>) {
+    match opt {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            put_bytes(out, value.as_bytes());
         }
     }
 }
@@ -277,6 +316,7 @@ fn encode_committed(
         put_bytes(&mut out, r.channel_id.as_bytes());
         out.extend_from_slice(&r.anchor_seq.to_le_bytes());
         put_opt_u64(&mut out, r.thread_root);
+        put_opt_string(&mut out, &r.job_id);
         put_origin(&mut out, &r.requester);
         match &r.status {
             RunStatus::AwaitingOracle { saga_id } => {
@@ -361,6 +401,14 @@ fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
     }
 }
 
+fn take_opt_string(buf: &mut &[u8]) -> Result<Option<String>, String> {
+    match take(buf, 1)?[0] {
+        0 => Ok(None),
+        1 => Ok(Some(take_lp_string(buf)?)),
+        t => Err(format!("snapshot has unknown option tag {t}")),
+    }
+}
+
 fn take_origin(buf: &mut &[u8]) -> Result<SagaOrigin, String> {
     match take(buf, 1)?[0] {
         0 => Ok(SagaOrigin::External(take_lp_bytes(buf)?)),
@@ -409,7 +457,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     // two u64s.
     const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
     const MIN_WATCH_BYTES: u64 = 8 + 1;
-    const MIN_RUN_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 1 + 8 + 8 + 8;
+    const MIN_RUN_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 8 + 8 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
@@ -475,6 +523,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         let channel_id = take_lp_string(&mut buf)?;
         let anchor_seq = take_u64(&mut buf)?;
         let thread_root = take_opt_u64(&mut buf)?;
+        let job_id = take_opt_string(&mut buf)?;
         let requester = take_origin(&mut buf)?;
         let status = match take(&mut buf, 1)?[0] {
             0 => RunStatus::AwaitingOracle {
@@ -498,6 +547,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
                 channel_id,
                 anchor_seq,
                 thread_root,
+                job_id,
                 requester,
                 status,
                 context_hash,
@@ -521,6 +571,7 @@ pub struct AgentModule {
     chat: ModuleId,
     saga: ModuleId,
     tasks: Option<ModuleId>,
+    jobs: Option<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
     agents: BTreeMap<String, AgentState>,
     watches: BTreeMap<String, TurnPolicy>,
@@ -543,6 +594,7 @@ impl AgentModule {
         chat: impl Into<ModuleId>,
         saga: impl Into<ModuleId>,
         tasks: Option<ModuleId>,
+        jobs: Option<ModuleId>,
     ) -> Self {
         let id = id.into();
         let chat = chat.into();
@@ -551,16 +603,20 @@ impl AgentModule {
         if let Some(tasks) = &tasks {
             ids.insert(tasks.clone());
         }
+        if let Some(jobs) = &jobs {
+            ids.insert(jobs.clone());
+        }
         assert_eq!(
             ids.len(),
-            3 + usize::from(tasks.is_some()),
-            "agent/chat/saga/tasks module ids must be pairwise distinct"
+            3 + usize::from(tasks.is_some()) + usize::from(jobs.is_some()),
+            "agent/chat/saga/tasks/jobs module ids must be pairwise distinct"
         );
         Self {
             id,
             chat,
             saga,
             tasks,
+            jobs,
             agents: BTreeMap::new(),
             watches: BTreeMap::new(),
             runs: BTreeMap::new(),
@@ -640,6 +696,7 @@ impl AgentModule {
             channel_id: r.channel_id.clone(),
             anchor_seq: r.anchor_seq,
             thread_root: r.thread_root,
+            job_id: r.job_id.clone(),
             requester: r.requester.clone(),
             status: r.status.clone(),
             context_hash: r.context_hash.clone(),
@@ -778,6 +835,7 @@ impl AgentModule {
         channel_id: String,
         anchor_seq: u64,
         thread_root: Option<u64>,
+        job_id: Option<String>,
         requester: SagaOrigin,
         model_ref: String,
         prompt_hash: Vec<u8>,
@@ -796,6 +854,7 @@ impl AgentModule {
                     prompt_hash,
                     channel_id: channel_id.clone(),
                     anchor_seq,
+                    job_id: job_id.clone(),
                     context_hash: context_hash.clone(),
                 }),
                 reply_to: Some(ctx.env().me.clone()),
@@ -812,6 +871,7 @@ impl AgentModule {
                 channel_id,
                 anchor_seq,
                 thread_root,
+                job_id,
                 requester,
                 status: RunStatus::AwaitingOracle { saga_id },
                 context_hash,
@@ -834,6 +894,69 @@ impl AgentModule {
             source: self.id.clone(),
             payload: what.into_bytes(),
         });
+    }
+
+    // ---- the jobs intake (origin == jobs) -----------------------------------------
+
+    /// NO-FAIL ARM. jobs submit fan-out runs in the submitter's block. jobs
+    /// queries are committed-only, so this in-cascade receiver cannot prove the
+    /// just-staged job via `JobsQuery::Get`; the single claiming-worker mode is
+    /// what makes the emitted claim safe for this slice.
+    async fn on_jobs_event(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
+        let Ok(event) = jobs_decode_event(payload) else {
+            self.note(ctx, "dropped undecodable jobs event".into());
+            return Ok(());
+        };
+        let JobsEvent::Submitted {
+            job_id,
+            kind,
+            spec_hash,
+            ..
+        } = event;
+        let Some(agent_id) = kind.strip_prefix("agent/").filter(|id| !id.is_empty()) else {
+            return Ok(());
+        };
+        let Some(agent) = self.agent(agent_id) else {
+            return Ok(());
+        };
+        if !agent.active {
+            return Ok(());
+        }
+        let run_id = job_run_id_for(&job_id, agent_id);
+        if self.run(&run_id).is_some() {
+            return Ok(());
+        }
+
+        let Some(jobs) = self.jobs.clone() else {
+            self.note(
+                ctx,
+                "dropped jobs event without configured jobs module".into(),
+            );
+            return Ok(());
+        };
+        let requester = canonical_origin(&ctx.env().origin);
+        let (model_ref, prompt_hash) = (agent.model_ref.clone(), agent.prompt_hash.clone());
+        ctx.emit_msg(Msg {
+            target: jobs,
+            payload: jobs_encode_msg(&JobsMsg::Claim {
+                job_id: job_id.clone(),
+                lease_views: JOB_RUN_LEASE_VIEWS,
+            }),
+        });
+        self.stage_run(
+            ctx,
+            run_id,
+            agent_id.to_string(),
+            String::new(),
+            0,
+            None,
+            Some(job_id),
+            requester,
+            model_ref,
+            prompt_hash,
+            spec_hash,
+        );
+        Ok(())
     }
 
     // ---- the hook intake (origin == chat) -----------------------------------------
@@ -925,6 +1048,7 @@ impl AgentModule {
                     channel_id.clone(),
                     seq,
                     thread_root,
+                    None,
                     requester.clone(),
                     model_ref,
                     prompt_hash,
@@ -976,28 +1100,49 @@ impl AgentModule {
             SagaOutcome::Done(bytes) => {
                 match self.validate_output(&*ctx, &run_id, &run, &bytes).await {
                     Ok(output) => {
+                        let payload = String::from_utf8(encode_output(&output))
+                            .expect("AgentOutput JSON is utf-8");
                         self.emit_output(ctx, &run_id, &run, output);
+                        self.emit_job_finalize_if_current_claimant(ctx, &run, true, payload)
+                            .await;
                         self.stage_run_status(run_id, run, RunStatus::Done, now);
                     }
                     // deterministically invalid output: the run fails, the
                     // block (and the saga's Done transition) commits.
                     Err(reason) => {
+                        self.emit_job_finalize_if_current_claimant(
+                            ctx,
+                            &run,
+                            false,
+                            reason.clone(),
+                        )
+                        .await;
                         self.stage_run_status(run_id, run, RunStatus::Failed { reason }, now)
                     }
                 }
             }
             SagaOutcome::Failed(reason) => {
+                self.emit_job_finalize_if_current_claimant(ctx, &run, false, reason.clone())
+                    .await;
                 self.stage_run_status(run_id, run, RunStatus::Failed { reason }, now)
             }
-            SagaOutcome::TimedOut => self.stage_run_status(
-                run_id,
-                run,
-                RunStatus::Failed {
-                    reason: "timed out".into(),
-                },
-                now,
-            ),
-            SagaOutcome::Cancelled => self.stage_run_status(run_id, run, RunStatus::Cancelled, now),
+            SagaOutcome::TimedOut => {
+                self.emit_job_finalize_if_current_claimant(ctx, &run, false, "timed out".into())
+                    .await;
+                self.stage_run_status(
+                    run_id,
+                    run,
+                    RunStatus::Failed {
+                        reason: "timed out".into(),
+                    },
+                    now,
+                )
+            }
+            SagaOutcome::Cancelled => {
+                self.emit_job_finalize_if_current_claimant(ctx, &run, false, "cancelled".into())
+                    .await;
+                self.stage_run_status(run_id, run, RunStatus::Cancelled, now)
+            }
         }
         Ok(())
     }
@@ -1030,6 +1175,9 @@ impl AgentModule {
         }
 
         if !output.reply_blocks.is_empty() {
+            if run.job_id.is_some() {
+                return Err("job runs cannot emit chat replies".into());
+            }
             if !agent.allowed_actions.contains(ACTION_CHAT_POST) {
                 return Err(format!(
                     "agent {} is not allowed to {ACTION_CHAT_POST}",
@@ -1138,6 +1286,80 @@ impl AgentModule {
         match tasks_decode_reply(&reply) {
             Ok(TaskReply::Tasks(list)) => Ok(list.into_iter().map(|t| t.id).collect()),
             Err(e) => Err(format!("undecodable tasks reply: {e}")),
+        }
+    }
+
+    fn truncate_job_payload(mut payload: String) -> String {
+        if payload.len() <= JOB_FINALIZE_PAYLOAD_BYTES {
+            return payload;
+        }
+        let marker = "\n[truncated by agent to fit jobs payload cap]";
+        let mut keep = JOB_FINALIZE_PAYLOAD_BYTES.saturating_sub(marker.len());
+        while keep > 0 && !payload.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        payload.truncate(keep);
+        payload.push_str(marker);
+        payload
+    }
+
+    async fn job_claimed_by_self(&self, ctx: &dyn Ctx, job_id: &str) -> Result<bool, String> {
+        let Some(jobs) = &self.jobs else {
+            return Ok(false);
+        };
+        let reply = ctx
+            .query(
+                jobs,
+                &jobs_encode_query(&JobsQuery::Get {
+                    job_id: job_id.to_string(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("jobs lookup failed: {e}"))?;
+        let job = match jobs_decode_reply(&reply) {
+            Ok(JobsReply::Job(job)) => job,
+            Ok(_) => return Err("unexpected jobs reply for a job lookup".into()),
+            Err(e) => return Err(format!("undecodable jobs reply: {e}")),
+        };
+        Ok(job.is_some_and(|job| {
+            job.status == JobStatus::Processing
+                && job.claim.as_ref().map(|claim| claim.worker.as_str()) == Some(self.id.as_str())
+        }))
+    }
+
+    async fn emit_job_finalize_if_current_claimant(
+        &self,
+        ctx: &mut dyn Ctx,
+        run: &RunState,
+        ok: bool,
+        payload: String,
+    ) {
+        let Some(job_id) = &run.job_id else {
+            return;
+        };
+        match self.job_claimed_by_self(&*ctx, job_id).await {
+            Ok(true) => {
+                let Some(jobs) = &self.jobs else {
+                    self.note(
+                        ctx,
+                        format!("job {job_id} finalize skipped: no jobs module"),
+                    );
+                    return;
+                };
+                ctx.emit_msg(Msg {
+                    target: jobs.clone(),
+                    payload: jobs_encode_msg(&JobsMsg::Finalize {
+                        job_id: job_id.clone(),
+                        ok,
+                        payload: Self::truncate_job_payload(payload),
+                    }),
+                });
+            }
+            Ok(false) => self.note(
+                ctx,
+                format!("job {job_id} finalize skipped: agent is not current claimant"),
+            ),
+            Err(reason) => self.note(ctx, format!("job {job_id} finalize skipped: {reason}")),
         }
     }
 
@@ -1323,6 +1545,7 @@ impl AgentModule {
                     channel_id,
                     anchor_seq,
                     thread_root,
+                    None,
                     requester,
                     model_ref,
                     prompt_hash,
@@ -1444,6 +1667,9 @@ impl Module for AgentModule {
             }
             Origin::Module(module) if module == self.saga => {
                 self.on_saga_callback(ctx, &msg.payload).await
+            }
+            Origin::Module(module) if self.jobs.as_ref() == Some(&module) => {
+                self.on_jobs_event(ctx, &msg.payload).await
             }
             _ => self.on_admin(ctx, msg).await,
         }
@@ -1680,7 +1906,13 @@ mod tests {
     // ---- fixtures -----------------------------------------------------------
 
     fn module() -> AgentModule {
-        AgentModule::new("agent", "chat", "saga", Some("tasks".into()))
+        AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        )
     }
 
     fn user(byte: u8) -> Origin {
@@ -2187,6 +2419,7 @@ mod tests {
                 prompt_hash: vec![7u8; 32],
                 channel_id: "general".into(),
                 anchor_seq: 3,
+                job_id: None,
                 context_hash: context_hash(&transcript(3)),
             }
         );
@@ -2787,7 +3020,7 @@ mod tests {
 
     #[test]
     fn task_actions_without_a_configured_tasks_module_fail_the_run() {
-        let mut m = AgentModule::new("agent", "chat", "saga", None);
+        let mut m = AgentModule::new("agent", "chat", "saga", None, None);
         let mut ctx = CaptureCtx::new().from_origin(user(9));
         exec(
             &mut m,

@@ -152,6 +152,8 @@ pub struct RunView {
     /// the anchor's thread root, if the anchor was a thread reply — the reply
     /// posts into the same thread.
     pub thread_root: Option<u64>,
+    /// present for jobs-board runs. chat-triggered runs leave this `None`.
+    pub job_id: Option<String>,
     /// the run-creating origin (the hook's chat module, or the explicit
     /// `RequestRun` submitter) — a cancel capability alongside the owner.
     pub requester: SagaOrigin,
@@ -177,6 +179,9 @@ pub struct LlmRequest {
     pub prompt_hash: Vec<u8>,
     pub channel_id: String,
     pub anchor_seq: u64,
+    /// present for jobs-board runs. for those runs `context_hash` pins the
+    /// submitted job spec bytes instead of a chat transcript prefix.
+    pub job_id: Option<String>,
     pub context_hash: Vec<u8>,
 }
 

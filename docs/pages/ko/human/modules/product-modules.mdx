@@ -116,8 +116,9 @@ claim할 수 있고, consensus order로 정확히 하나의 claim만 이긴다 �
 곧 lock이고, 진 claim은 모든 node에서 소리 내며 block을 fail한다. 그 rejection이
 race-resolution signal이다. lifecycle은 submit에서 pending으로, claim에서 view
 lease 아래 processing으로, 그리고 done 또는 failed로 finalize된다. write는
-`Submit`, `Claim`, `Finalize`, `Release`, `Reclaim`, `Cancel`, `Prune`으로,
-read는 `Get`, `List`, `Counts`로 가며 committed state에서만 답한다.
+`Submit`, `Claim`, `Finalize`, `Release`, `Reclaim`, `Cancel`, `Prune`,
+`RegisterWorker`, `UnregisterWorker`로, read는 `Get`, `List`, `Counts`로 가며
+committed state에서만 답한다.
 
 claim의 view lease가 만료되면 누구든 job을 `Reclaim`해 pending으로 되돌릴 수
 있다 — reclaim은 permissionless다. attempt는 8회로 cap되고, `Cancel`과
@@ -125,6 +126,19 @@ claim의 view lease가 만료되면 누구든 job을 `Reclaim`해 pending으로 
 행동하는 actor를 위한 product work board이고, saga는 node 자신의 worker loop가
 수행하는 off-consensus 작업을 위한 platform의 reactor-effect ledger다. jobs는
 saga도 reactor도 절대 건드리지 않는다.
+
+worker는 genesis config가 아니라 consensus state다. operator는
+`RegisterWorker { module_id }`로 worker module을 등록한다. target module은 이미
+존재해야 하고, jobs 자신은 worker로 등록할 수 없으며, worker set은 16개로
+cap된다. 성공한 `Submit`마다 같은 block 안에서 등록된 worker별
+`JobsEvent::Submitted` follow-up 하나를 emit한다. 이 fan-out도 host의 block
+dispatch budget을 소모한다.
+
+**Cascade rule:** 이 slice는 주어진 job kind에 대해 claim하는 worker가 하나인
+모드를 지원한다. 등록된 worker 둘이 submit cascade 안에서 같은 job을 모두
+claim하면, 두 번째 `Claim`은 첫 번째 staged claim을 보고 reject하며 P2에 따라
+전체 submit block을 abort한다. `MAX_WORKERS`는 나중의 off-cascade 전략을 위한
+상한이지, 같은 kind를 여러 worker가 in-cascade로 claim하라는 뜻이 아니다.
 
 ## Interface Shape
 

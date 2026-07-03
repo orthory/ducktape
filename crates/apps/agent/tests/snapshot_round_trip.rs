@@ -170,7 +170,13 @@ fn run_status(m: &AgentModule, run_id: &str) -> Option<RunStatus> {
 /// poking internals.
 fn source() -> AgentModule {
     let alice = Origin::External(b"alice".to_vec());
-    let mut m = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+    let mut m = AgentModule::new(
+        "agent",
+        "chat",
+        "saga",
+        Some("tasks".into()),
+        Some("jobs".into()),
+    );
     // "general": seqs 1..2 plain, seq 3 a thread reply to root 1.
     let general = vec![
         message_in("general", 1, "root", None),
@@ -328,7 +334,13 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
 
     // the joiner has UNCOMMITTED staged work of its own: install must drop it
     // — a snapshot describes a block boundary, nothing staged may shadow it.
-    let mut dst = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+    let mut dst = AgentModule::new(
+        "agent",
+        "chat",
+        "saga",
+        Some("tasks".into()),
+        Some("jobs".into()),
+    );
     exec(
         &mut dst,
         TestCtx::new(0, Origin::External(b"bob".to_vec())),
@@ -379,7 +391,13 @@ fn tampered_snapshot_is_rejected_and_leaves_state_untouched() {
 
     // the target already has COMMITTED state of its own, so "untouched" is
     // observable through both root and query.
-    let mut dst = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+    let mut dst = AgentModule::new(
+        "agent",
+        "chat",
+        "saga",
+        Some("tasks".into()),
+        Some("jobs".into()),
+    );
     exec(
         &mut dst,
         TestCtx::new(0, Origin::External(b"bob".to_vec())),
@@ -416,12 +434,12 @@ fn truncated_or_padded_snapshot_is_rejected() {
     let src = source();
     let src_root = src.root();
     let snap = src.snapshot();
-    let empty_root = AgentModule::new("agent", "chat", "saga", None).root();
+    let empty_root = AgentModule::new("agent", "chat", "saga", None, None).root();
 
     // EVERY strict prefix must fail — no cut point leaves a decodable
     // snapshot, and none of the failures may move the fresh module's root.
     for cut in 0..snap.len() {
-        let mut dst = AgentModule::new("agent", "chat", "saga", None);
+        let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
         assert!(
             dst.install(&snap[..cut], src_root).is_err(),
             "a {cut}-byte prefix of a {}-byte snapshot must be rejected",
@@ -437,7 +455,7 @@ fn truncated_or_padded_snapshot_is_rejected() {
     // trailing bytes after a complete snapshot are equally malformed.
     let mut padded = snap.clone();
     padded.push(0);
-    let mut dst = AgentModule::new("agent", "chat", "saga", None);
+    let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
     assert!(dst.install(&padded, src_root).is_err());
     assert_eq!(dst.root(), empty_root);
 
@@ -465,11 +483,11 @@ fn truncated_or_padded_snapshot_is_rejected() {
 ///          | model 8+1 | prompt 8+32 | action count 8 | status 1 | times 16
 /// watches: count 8 | channel 8+1 | policy 1
 /// runs:    count 8 | run id 8+5 | agent 8+1 | channel 8+1 | anchor 8
-///          | thread tag 1 | requester disc 1 + key 8+1 | status disc 1
+///          | thread tag 1 | job id tag 1 | requester disc 1 + key 8+1 | status disc 1
 ///          + saga id 8+11 | ctx hash 8+32 | times 16
 fn minimal_snapshot() -> Vec<u8> {
     let owner = Origin::External(vec![5]);
-    let mut m = AgentModule::new("agent", "chat", "saga", None);
+    let mut m = AgentModule::new("agent", "chat", "saga", None, None);
     exec(
         &mut m,
         TestCtx::new(0, owner.clone()),
@@ -500,30 +518,31 @@ fn minimal_snapshot() -> Vec<u8> {
     );
     commit(&mut m);
     let snap = m.snapshot();
-    assert_eq!(snap.len(), 262, "the minimal layout this test indexes into");
+    assert_eq!(snap.len(), 263, "the minimal layout this test indexes into");
     snap
 }
 
 #[test]
 fn unknown_discriminants_and_tags_are_rejected() {
-    let empty_root = AgentModule::new("agent", "chat", "saga", None).root();
+    let empty_root = AgentModule::new("agent", "chat", "saga", None, None).root();
     let snap = minimal_snapshot();
 
     // owner origin disc (17), agent status (93), watch policy (127), the run's
-    // thread-root option tag (175), requester origin disc (176), and run
-    // status disc (186) each admit exactly their known values — a state has
-    // ONE valid encoding.
+    // thread-root option tag (175), job-id option tag (176), requester origin
+    // disc (177), and run status disc (187) each admit exactly their known
+    // values — a state has ONE valid encoding.
     for (index, what) in [
         (17usize, "owner origin discriminant"),
         (93, "agent status"),
         (127, "watch policy"),
         (175, "thread-root option tag"),
-        (176, "requester origin discriminant"),
-        (186, "run status discriminant"),
+        (176, "job-id option tag"),
+        (177, "requester origin discriminant"),
+        (187, "run status discriminant"),
     ] {
         let mut bad = snap.clone();
         bad[index] = 9;
-        let mut dst = AgentModule::new("agent", "chat", "saga", None);
+        let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
         let err = dst.install(&bad, StateRoot::ZERO).unwrap_err();
         assert!(
             matches!(err, Error::Module(_)),
@@ -544,7 +563,7 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     // copying one over the other a duplicate-id stream — both must reject,
     // since sorted-unique keys are what make the encoding canonical.
     let owner = Origin::External(vec![5]);
-    let mut m = AgentModule::new("agent", "chat", "saga", None);
+    let mut m = AgentModule::new("agent", "chat", "saga", None, None);
     for id in ["a", "b"] {
         exec(
             &mut m,
@@ -574,18 +593,18 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
         let mut bytes = snap.clone();
         bytes[8..110].copy_from_slice(first);
         bytes[110..212].copy_from_slice(second);
-        let mut dst = AgentModule::new("agent", "chat", "saga", None);
+        let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
         let err = dst.install(&bytes, StateRoot::ZERO).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "{what} must be rejected");
         assert_eq!(
             dst.root(),
-            AgentModule::new("agent", "chat", "saga", None).root()
+            AgentModule::new("agent", "chat", "saga", None, None).root()
         );
     }
 
     // the untouched stream still installs — the rejection above is the
     // ordering check, not an artifact of the splicing.
-    let mut dst = AgentModule::new("agent", "chat", "saga", None);
+    let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
     dst.install(&snap, good_root).unwrap();
     assert_eq!(dst.root(), good_root);
 }

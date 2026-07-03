@@ -49,6 +49,7 @@ use inbox_interface::{
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
 use jobs::Jobs;
+use jobs_interface::{JobsMsg, encode_msg as jobs_encode_msg};
 use memory::Memory;
 use saga::SagaModule;
 use saga_interface::{
@@ -83,7 +84,13 @@ fn main() {
         let files = Files::new("files");
         let memory = Memory::new("memory", "files");
         let jobs = Jobs::new("jobs");
-        let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        let agent = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        );
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -446,7 +453,8 @@ fn main() {
         // block 8: the agent-collaboration loop (design §3). register an agent
         // (which model+prompt it runs is committed into the app-hash), watch
         // the chat channel under a Mention policy — the watch and chat's hook
-        // registration commit atomically — then post a message MENTIONING the
+        // registration commit atomically — register the agent module as the
+        // jobs-board worker by op (not genesis config), then post a message MENTIONING the
         // agent: the very same block carries the post, the hook delivery, the
         // run record, and the saga trigger. the emitted WorkerRequest effect
         // is the off-consensus LLM seam a reactor driver answers as an
@@ -466,6 +474,17 @@ fn main() {
         )
         .await
         .expect("submit block 8 register");
+        host.submit_at(
+            as_demo_user(),
+            Msg {
+                target: "jobs".into(),
+                payload: jobs_encode_msg(&JobsMsg::RegisterWorker {
+                    module_id: "agent".into(),
+                }),
+            },
+        )
+        .await
+        .expect("submit block 8 register jobs worker");
         host.submit_at(
             as_demo_user(),
             Msg {
@@ -506,7 +525,9 @@ fn main() {
             )
             .await
             .expect("submit block 8 mention");
-        println!("\n[block 8] agent <- Register + Watch(Mention); chat <- PostMessage(@quackbot)");
+        println!(
+            "\n[block 8] agent <- Register; jobs <- RegisterWorker(agent); agent <- Watch(Mention); chat <- PostMessage(@quackbot)"
+        );
         println!(
             "  effects        : {} WorkerRequest (the off-consensus LLM seam)",
             out.effects.len()

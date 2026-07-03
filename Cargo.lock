@@ -29,6 +29,8 @@ dependencies = [
  "commonware-runtime",
  "futures",
  "host",
+ "jobs",
+ "jobs-interface",
  "reactor",
  "saga",
  "saga-interface",
@@ -1789,6 +1791,7 @@ dependencies = [
  "inbox",
  "inbox-interface",
  "jobs",
+ "jobs-interface",
  "kv",
  "kv-interface",
  "memory",
@@ -3814,6 +3817,7 @@ dependencies = [
 name = "node-bin"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "automations",
  "chat",
  "chat-interface",
@@ -3862,6 +3866,7 @@ dependencies = [
 name = "noded"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "automations",
  "axum",
  "chat",
@@ -3876,6 +3881,7 @@ dependencies = [
  "inbox",
  "jobs",
  "memory",
+ "saga",
  "sdk",
  "serde",
  "serde_json",

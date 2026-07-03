@@ -119,8 +119,8 @@ the lock, and a losing claim fails its block loudly on every node; that
 rejection is the race-resolution signal. The lifecycle runs submit to pending,
 claim to processing under a view lease, then finalized as done or failed. Writes
 go through `Submit`, `Claim`, `Finalize`, `Release`, `Reclaim`, `Cancel`, and
-`Prune`; reads through `Get`, `List`, and `Counts`, answered from committed
-state only.
+`Prune`, `RegisterWorker`, and `UnregisterWorker`; reads through `Get`, `List`,
+and `Counts`, answered from committed state only.
 
 Once a claim's view lease expires, anyone may `Reclaim` the job — the reclaim is
 permissionless — returning it to pending; attempts are capped at eight, and
@@ -128,6 +128,19 @@ permissionless — returning it to pending; attempts are capped at eight, and
 product work board for actors acting over signed RPC ops, while saga is the
 platform's reactor-effect ledger for off-consensus work the node's own worker
 loop performs. Jobs never touches saga or the reactor.
+
+Workers are consensus state, not genesis config. An operator registers a worker
+module with `RegisterWorker { module_id }`; the target module must already
+exist, a module cannot register jobs itself, and the set is capped at 16
+workers. Every successful `Submit` emits one `JobsEvent::Submitted` follow-up to
+each registered worker in the same block. That fan-out counts against the host's
+block dispatch budget.
+
+**Cascade rule:** this slice supports one claiming worker for a given job kind.
+If two registered workers both claim the same submitted job inside the submit
+cascade, the second `Claim` observes the first staged claim, rejects, and aborts
+the entire submit block under P2. `MAX_WORKERS` exists for later off-cascade
+strategies, not for multiple in-cascade claimants of the same kind.
 
 ## Interface Shape
 
