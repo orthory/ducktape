@@ -918,7 +918,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     descriptor.save(&descriptor_path)?;
-    println!("{}", config::encode_invite(&descriptor));
+    println!("{}", config::encode_invite(&descriptor)?);
     Ok(())
 }
 

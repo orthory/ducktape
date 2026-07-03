@@ -155,7 +155,7 @@ export function OnboardingGate() {
               {mode === "join" && (
                 <textarea
                   value={blob}
-                  placeholder="Paste invite blob (ducktape-invite-v1:…)"
+                  placeholder="Paste invite blob (ducktape-invite-v2:…)"
                   onChange={(event) => setBlob(event.target.value)}
                   rows={3}
                   style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
