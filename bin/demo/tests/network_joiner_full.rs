@@ -279,9 +279,12 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
         };
 
         let server_side = async {
+            // fixed coordinates: this test exercises the module payload
+            // lanes; the epoch fields just ride the manifest.
+            let coords = statesync::BoundaryCoords::default();
             let mut rx = rx;
             while let Some((frame, reply)) = rx.next().await {
-                let resp = server.handle_frame(&host, Some(finalized), &frame).await;
+                let resp = server.handle_frame(&host, Some(finalized), &coords, &frame).await;
                 let _ = reply.send(resp);
             }
         };

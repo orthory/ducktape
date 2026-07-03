@@ -614,11 +614,16 @@ pub trait BlockSink {
     ) -> impl std::future::Future<Output = Result<(), Error>>;
     /// durably record a settled block's outcome.
     fn seal(&mut self, seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>>;
-    /// durably record an epoch cutover: the new epoch and its app-height base.
+    /// durably record an epoch cutover: the new epoch, its app-height base,
+    /// and the ENGINE PARTICIPANT SET it was spawned over (raw public-key
+    /// bytes). the set rides the record because a restart must respawn the
+    /// engine with the EPOCH'S set — the instantaneous valset projection may
+    /// already include a change awaiting the next cutover.
     fn cutover(
         &mut self,
         epoch: u64,
         view_base: u64,
+        participants: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>>;
 }
 
@@ -646,6 +651,7 @@ impl BlockSink for NullSink {
         &mut self,
         _epoch: u64,
         _view_base: u64,
+        _participants: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>> {
         async { Ok(()) }
     }
@@ -700,6 +706,19 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// height is deterministic; frames ABOVE the floor are genuinely new
     /// (finalized pre-crash but never drained) and apply normally.
     applied_floor: Option<u64>,
+    /// the OBSERVATION BARRIER: when set, [`OrderedNode::drain_delivered`]
+    /// ends its batch right after any block that CHANGES this module's root,
+    /// buffering the undrained remainder for the next call. a caller that
+    /// observes the watched module once per drain (the valset orchestrator)
+    /// then always observes at exactly the changing block's view — the same
+    /// view on every validator regardless of how deliveries batched locally.
+    /// without the split, two nodes draining the same views in different
+    /// batch shapes would observe a membership change at different views and
+    /// schedule DIFFERENT epoch cutovers: a cross-node fork.
+    watch_module: Option<sdk::ModuleId>,
+    /// frames delivered by the orderer but deferred past an observation
+    /// barrier — drained ahead of fresh deliveries on the next call.
+    deferred: std::collections::VecDeque<(u64, Vec<u8>)>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -723,6 +742,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             view_ceiling: None,
             sink,
             applied_floor: None,
+            watch_module: None,
+            deferred: std::collections::VecDeque::new(),
         }
     }
 
@@ -749,7 +770,16 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             view_ceiling: None,
             sink,
             applied_floor: finalized.map(|f| f.height),
+            watch_module: None,
+            deferred: std::collections::VecDeque::new(),
         }
+    }
+
+    /// arm the observation barrier on `module` (see the field doc): every
+    /// drain batch ends right after a block that changes its root, so a
+    /// once-per-drain observer sees the change at exactly its block's view.
+    pub fn watch_module(&mut self, module: impl Into<sdk::ModuleId>) {
+        self.watch_module = Some(module.into());
     }
 
     /// EPOCH CUTOVER: replace the orderer (dropping the old one aborts its
@@ -762,15 +792,25 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// call this only after a final [`OrderedNode::drain_delivered`] under the
     /// ceiling — anything the old engine finalized past the ceiling was
     /// deterministically discarded on every honest node.
-    pub async fn cutover(&mut self, orderer: O, epoch: u64, view_base: u64) -> Result<(), Error> {
-        self.sink.cutover(epoch, view_base).await?;
+    pub async fn cutover(
+        &mut self,
+        orderer: O,
+        epoch: u64,
+        view_base: u64,
+        participants: &[Vec<u8>],
+    ) -> Result<(), Error> {
+        self.sink.cutover(epoch, view_base, participants).await?;
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
         self.view_ceiling = None;
         // effects of pre-cutover blocks remain takeable; frames buffered in
         // the OLD orderer die with it (they were past the ceiling or already
-        // drained).
+        // drained). deferred frames carry OLD-epoch views — stamping them
+        // under the new base would corrupt heights, and a caller only cuts
+        // over after draining under the ceiling, so any leftover here was
+        // past the ceiling (a discard) anyway.
+        self.deferred.clear();
         Ok(())
     }
 
@@ -818,10 +858,20 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// indeterminate, so the drain STOPS and surfaces [`Error::Fatal`] — applying
     /// even one more finalized op would compound a state no validator agreed on.
     pub async fn drain_delivered(&mut self) -> Result<usize, Error> {
-        let delivered = self.orderer.poll_delivered();
+        // fresh deliveries queue BEHIND anything a previous observation
+        // barrier deferred — agreed order is preserved.
+        self.deferred.extend(self.orderer.poll_delivered());
         let mut applied = 0usize;
         let mut last_view: Option<u64> = None;
-        for (view, frame) in delivered {
+        // the last view with a JOURNALED outcome (applied or rejected) — what
+        // the finalized STATE boundary may advance to. a DISCARDED view moves
+        // only the engine clock: it is never journaled, so a boundary that
+        // included it would claim a height recovery cannot reproduce — and
+        // right after a cutover it would collide with the new epoch's first
+        // height, demanding a finalization floor that cannot exist until the
+        // new epoch finalizes (a joiner syncing that boundary would wedge).
+        let mut last_sealed_view: Option<u64> = None;
+        while let Some((view, frame)) = self.deferred.pop_front() {
             // a FINALIZED op counts as processed whether or not it applies
             // cleanly — and its VIEW advances the engine clock either way (the
             // view was agreed; discarding or rejecting its op is the same
@@ -868,9 +918,17 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             let Ok((origin, msg)) = decode_frame(&frame) else {
                 self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
                 self.seal(height, Disposition::Rejected).await?;
+                last_sealed_view = Some(view);
                 continue;
             };
             let ctx = BlockContext { height, consensus_time: height, origin };
+            // the observation barrier compares the watched root across the
+            // apply — only an APPLIED block can move it (rejected blocks roll
+            // back, discards never run).
+            let watched_before = self
+                .watch_module
+                .as_deref()
+                .map(|m| self.host.module_root(m));
             // surface each finalized block's effects for the reactor's worker
             // driver. a rejected op yields no outcome (deterministic no-op) and so
             // contributes no effects — same on every validator.
@@ -879,16 +937,30 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     self.effects.extend(outcome.effects);
                     self.drained.push(DrainedFrame { id, height, disposition: Disposition::Applied });
                     self.seal(height, Disposition::Applied).await?;
+                    last_sealed_view = Some(view);
+                    if let Some(before) = watched_before {
+                        let module = self.watch_module.as_deref().expect("watched_before implies watch_module");
+                        if self.host.module_root(module) != before {
+                            // end the batch AT the changing block: the
+                            // remainder stays deferred so a once-per-drain
+                            // observer sees this block's view — the same
+                            // observation point on every validator.
+                            break;
+                        }
+                    }
                 }
                 Err(host::SubmitError::Rejected(_)) => {
                     self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
                     self.seal(height, Disposition::Rejected).await?;
+                    last_sealed_view = Some(view);
                 }
                 Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
             }
         }
         if let Some(view) = last_view {
             self.last_engine_view = Some(view);
+        }
+        if let Some(view) = last_sealed_view {
             let height = self.view_base + view;
             // monotone: a resume-skipped re-report must never regress the
             // finalized boundary below the recovered tip.

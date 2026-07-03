@@ -54,22 +54,25 @@ fn ceiling_discards_and_cutover_rebases_heights() {
         assert_eq!(get(&node, "k1").await.as_deref(), Some("v1"));
         assert_eq!(get(&node, "k2").await, None, "the past-ceiling frame is discarded");
         // the AGREED view still advances the engine clock (a node must be able
-        // to observe the views that carry it past its own cutover) — the
-        // boundary height moves while the app-hash records the discard.
-        assert_eq!(node.finalized().expect("boundary").height, 2);
+        // to observe the views that carry it past its own cutover) — but the
+        // finalized STATE boundary stays at the last JOURNALED block: a
+        // discard is never sealed, so a boundary that included it would claim
+        // a height recovery cannot reproduce and, post-cutover, would collide
+        // with the new epoch's first height (wedging a joiner syncing it).
+        assert_eq!(node.finalized().expect("boundary").height, 1);
         assert_eq!(node.last_engine_view(), Some(2));
 
         // CUTOVER: fresh orderer (engine views restart at 0), app heights
         // rebased at the cutover height. the discarded op stays discarded; a
         // resubmission in the new epoch applies at a monotone height.
-        node.cutover(RoundOrderer::new(), 1, 2).await.expect("cutover");
+        node.cutover(RoundOrderer::new(), 1, 2, &[]).await.expect("cutover");
         assert_eq!(node.last_engine_view(), None, "engine view resets");
         node.submit(&sk(1), 3, set("k2", "v2-epoch1")).await.expect("resubmit");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(get(&node, "k2").await.as_deref(), Some("v2-epoch1"));
-        // heights are monotone (non-strict at the seam: the discarded view's
-        // height is reused by the new epoch's first block — identically on
-        // every node, with the discard recorded in neither's app state).
+        // the discarded view's height is taken by the new epoch's first block
+        // — identically on every node, and cleanly: the discard never claimed
+        // it, so the boundary advances strictly (1 -> 2).
         let boundary = node.finalized().expect("boundary");
         assert_eq!(boundary.height, 2, "engine view 0 + base 2 = app height 2");
         assert_eq!(node.last_engine_view(), Some(0), "engine-relative view restarted");

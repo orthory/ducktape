@@ -91,9 +91,21 @@ use tasks::Tasks;
 use valset::Valset;
 use vaults::Vaults;
 
-/// the peer-set index. every node must `track` the same authorized set at the
-/// same index for discovery's bit-vector gossip to line up.
+/// the peer-set index a node WITHOUT consensus coordinates tracks (a parked
+/// joiner, a sync-only observer): the genesis mesh at index 0. a VALIDATOR
+/// tracks its epoch's mesh at index = epoch instead — discovery requires
+/// strictly increasing indexes per `track`, ignores indexes a peer does not
+/// know, but KILLS a peer whose set at a SHARED index has a different
+/// length, so the set tracked at a given index must be identical on every
+/// node that tracks it (epoch participant sets are; instantaneous valset
+/// projections are not).
 const PEER_SET: u64 = 0;
+/// a deliberately-unregistered module target. while an epoch cutover is
+/// pending, validators submit empty frames against it: finalized views only
+/// advance with ops, so an idle network would otherwise park AT the armed
+/// boundary forever. the frame finalizes, rejects deterministically on every
+/// node (unknown module), advances the engine clock, and leaves no state.
+const NOP_TARGET: &str = "consensus.nop";
 /// max wire message size we accept on a channel (1 MiB) — generous for the small
 /// json frames + BFT metadata, and the statesync chunk size (256 KiB) plus
 /// framing stays far below it.
@@ -149,6 +161,18 @@ fn epoch_floor(namespace: &[u8], epoch: u64) -> Digest {
         ]
         .concat(),
     )
+}
+
+/// the orchestrator's current epoch participant set as raw key bytes — what
+/// checkpoints, cutover records, and the statesync manifest carry.
+fn participant_bytes(
+    orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
+) -> Vec<Vec<u8>> {
+    orchestrator
+        .current_members()
+        .iter()
+        .map(|k| k.as_ref().to_vec())
+        .collect()
 }
 
 /// read the valset module's current membership projection (committed state —
@@ -309,6 +333,181 @@ async fn restore_host(
     .map_err(|e| format!("restore host: {e}"))
 }
 
+/// rebuild EVERY production module from a peer's statesync service at
+/// `manifest`'s boundary and compose them into a [`Host`], verified against
+/// the manifest's app-hash. the disk substrates land under their canonical
+/// ids in this process's storage root — this IS the node's state afterwards,
+/// not a scratch copy. `attempt` disambiguates runtime child labels across
+/// retries (a busy source moves its qmdb targets past the captured boundary;
+/// the caller refetches the manifest and tries again, and metrics labels
+/// must not collide).
+async fn sync_all_modules<C: statesync::SyncClient>(
+    context: &commonware_runtime::tokio::Context,
+    client: &C,
+    manifest: &statesync::Manifest,
+    forge_repo: &std::path::Path,
+    attempt: usize,
+) -> Result<Host, String> {
+    let entry_root = |module: &str| -> Result<StateRoot, String> {
+        Ok(manifest
+            .entry(module)
+            .ok_or_else(|| format!("module {module} missing from the manifest"))?
+            .root)
+    };
+    let child_label = |name: &str| -> &'static str {
+        Box::leak(format!("{name}_a{attempt}").into_boxed_str())
+    };
+
+    // resolver lane: live target through the module lane, gated on the
+    // manifest root (a busy source has moved on -> Err -> the caller
+    // refetches the manifest at the new boundary), then merkle-verified op
+    // batches through the remote resolver.
+    let fetch_target = |module: &'static str| {
+        let resolver = RemoteQmdbResolver::new(client.clone(), module);
+        let root = entry_root(module);
+        async move {
+            let root = root?;
+            let target = resolver
+                .fetch_target()
+                .await
+                .map_err(|e| format!("{module} target: {e}"))?;
+            if StateRoot(target.root.0) != root {
+                return Err(format!(
+                    "{module} live target moved past the captured boundary (busy source)"
+                ));
+            }
+            Ok::<_, String>((target, resolver))
+        }
+    };
+
+    let (target, resolver) = fetch_target("kv").await?;
+    let kv = Kv::sync_from(context.child(child_label("kv")), "kv", target, resolver).await;
+
+    let (target, resolver) = fetch_target("document").await?;
+    let document =
+        Document::sync_from(context.child(child_label("document")), "document", target, resolver)
+            .await;
+
+    let (target, resolver) = fetch_target("chat").await?;
+    let chat = Chat::sync_from(context.child(child_label("chat")), "chat", target, resolver).await;
+
+    // snapshot lane: chunked bytes from the captured boundary, install gated
+    // on the manifest root (verify-then-adopt inside each module).
+    let snapshot_of = |module: &'static str| {
+        let client = client.clone();
+        let height = manifest.height;
+        let root = entry_root(module);
+        async move {
+            let root = root?;
+            let bytes = fetch_snapshot(&client, height, module)
+                .await
+                .map_err(|e| format!("{module} snapshot: {e}"))?;
+            Ok::<_, String>((bytes, root))
+        }
+    };
+
+    let (bytes, root) = snapshot_of("directory").await?;
+    let mut directory = Directory::new("directory");
+    directory.install(&bytes, root).map_err(|e| format!("directory install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("valset").await?;
+    let mut valset = Valset::new("valset");
+    valset.install(&bytes, root).map_err(|e| format!("valset install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("saga").await?;
+    let mut saga = SagaModule::new("saga");
+    saga.install(&bytes, root).map_err(|e| format!("saga install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("governance").await?;
+    let mut governance = Governance::new("governance", "valset");
+    governance.install(&bytes, root).map_err(|e| format!("governance install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("tasks").await?;
+    let mut tasks = Tasks::new("tasks");
+    tasks.install(&bytes, root).map_err(|e| format!("tasks install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("vaults").await?;
+    let mut vaults = Vaults::new("vaults");
+    vaults.install(&bytes, root).map_err(|e| format!("vaults install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("inbox").await?;
+    let mut inbox = Inbox::new("inbox");
+    inbox.install(&bytes, root).map_err(|e| format!("inbox install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("files").await?;
+    let mut files = Files::new("files");
+    files.install(&bytes, root).map_err(|e| format!("files install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("memory").await?;
+    let mut memory = Memory::new("memory");
+    memory.install(&bytes, root).map_err(|e| format!("memory install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("jobs").await?;
+    let mut jobs = Jobs::new("jobs");
+    jobs.install(&bytes, root).map_err(|e| format!("jobs install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("automations").await?;
+    let mut automations = Automations::new("automations", "chat", "tasks");
+    automations.install(&bytes, root).map_err(|e| format!("automations install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("forge").await?;
+    let mut forge =
+        Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge init: {e}"))?;
+    forge.install(&bytes, root).map_err(|e| format!("forge install: {e}"))?;
+
+    // compose and check THE property: the rebuilt app-hash IS the manifest's.
+    // keep this registry in sync with [`genesis_host`] — a missing module
+    // composes a different app-hash and the join fails its final check.
+    let host = Host::genesis(vec![
+        Box::new(kv),
+        Box::new(document),
+        Box::new(chat),
+        Box::new(forge),
+        Box::new(valset),
+        Box::new(governance),
+        Box::new(saga),
+        Box::new(tasks),
+        Box::new(vaults),
+        Box::new(inbox),
+        Box::new(files),
+        Box::new(memory),
+        Box::new(jobs),
+        Box::new(automations),
+        Box::new(directory),
+    ])
+    .map_err(|e| format!("compose synced host: {e}"))?;
+    if host.app_hash() != manifest.app_hash {
+        return Err(format!(
+            "composed {} != manifest {}",
+            hex(&host.app_hash()),
+            hex(&manifest.app_hash)
+        ));
+    }
+    Ok(host)
+}
+
+/// replace this process with a fresh invocation of itself (same argv): the
+/// clean way to re-enter boot with a different network topology — discovery
+/// channels can only be registered before `network.start()`, so a promoted
+/// joiner cannot grow a consensus engine in-process.
+fn reboot_self() -> ! {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let exe = std::env::current_exe().expect("current exe path");
+        let err = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        eprintln!("FATAL: validator reboot exec failed: {err}");
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    {
+        println!("promoted — restart this node to run as a validator");
+        std::process::exit(0);
+    }
+}
+
 // ============================================================================
 // the local rpc: json-lines over tcp, bridged from blocking threads.
 // ============================================================================
@@ -421,6 +620,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
+        Some("invite-accept") => return cmd_invite_accept(&args[1..]),
         Some("join") => return cmd_join(&args[1..]),
         _ => {}
     }
@@ -435,8 +635,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--sync-only" => sync_only = true,
             other => {
                 return Err(format!(
-                    "unexpected arg {other:?} (want a subcommand — keygen|init|invite|admit|join \
-                     — or --config <path> [--sync-only])"
+                    "unexpected arg {other:?} (want a subcommand — \
+                     keygen|init|invite|admit|invite-accept|join — or \
+                     --config <path> [--sync-only])"
                 )
                 .into());
             }
@@ -640,6 +841,241 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ---- invite-accept: post-genesis admission over the local rpc --------------
+
+/// one blocking json-lines rpc round-trip against the LOCAL node.
+fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let conn = std::net::TcpStream::connect(addr)
+        .map_err(|e| format!("connect rpc {addr}: {e} (is the node running?)"))?;
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+        .map_err(|e| format!("rpc timeout: {e}"))?;
+    let mut writer = conn.try_clone().map_err(|e| format!("rpc clone: {e}"))?;
+    let mut line = serde_json::to_string(req).expect("rpc request serializes");
+    line.push('\n');
+    writer.write_all(line.as_bytes()).map_err(|e| format!("rpc write: {e}"))?;
+    let mut reply = String::new();
+    BufReader::new(conn)
+        .read_line(&mut reply)
+        .map_err(|e| format!("rpc read: {e}"))?;
+    serde_json::from_str(reply.trim()).map_err(|e| format!("rpc reply: {e}"))
+}
+
+/// query a module through the rpc; the reply's hex payload, decoded.
+fn rpc_query(addr: &str, target: &str, req: &[u8]) -> Result<Vec<u8>, String> {
+    let reply = rpc_call(
+        addr,
+        &serde_json::json!({ "cmd": "query", "target": target, "req_hex": hex_bytes(req) }),
+    )?;
+    if reply["ok"] != true {
+        return Err(format!("query {target}: {}", reply["error"]));
+    }
+    unhex(reply["reply_hex"].as_str().ok_or("query reply carries no payload")?)
+}
+
+/// submit an op through the rpc (accepted != finalized — poll afterwards).
+fn rpc_submit(addr: &str, target: &str, payload: &[u8]) -> Result<(), String> {
+    let reply = rpc_call(
+        addr,
+        &serde_json::json!({ "cmd": "submit", "target": target, "payload_hex": hex_bytes(payload) }),
+    )?;
+    if reply["ok"] != true {
+        return Err(format!("submit to {target}: {}", reply["error"]));
+    }
+    Ok(())
+}
+
+fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
+    use valset_interface::{decode_reply, encode_query, ValsetQuery, ValsetReply};
+    let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
+    match decode_reply(&raw)? {
+        ValsetReply::Validators(v) => Ok(v),
+    }
+}
+
+fn read_proposal(
+    addr: &str,
+    id: &str,
+) -> Result<Option<governance_interface::ProposalView>, String> {
+    use governance_interface::{decode_reply, encode_query, GovQuery, GovReply};
+    let raw = rpc_query(
+        addr,
+        "governance",
+        &encode_query(&GovQuery::Proposal { proposal_id: id.into() }),
+    )?;
+    match decode_reply(&raw)? {
+        GovReply::Proposal(view) => Ok(view),
+        other => Err(format!("unexpected governance reply: {other:?}")),
+    }
+}
+
+/// poll a proposal until `pred` accepts its view, ~30s budget (ops finalize
+/// within a few pump ticks; the budget covers a mesh still forming quorum).
+fn poll_proposal(
+    addr: &str,
+    id: &str,
+    what: &str,
+    mut pred: impl FnMut(&Option<governance_interface::ProposalView>) -> bool,
+) -> Result<Option<governance_interface::ProposalView>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let view = read_proposal(addr, id)?;
+        if pred(&view) {
+            return Ok(view);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {what}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// `invite-accept <hex pubkey> [--config node.toml]` — post-genesis
+/// admission: drive a governance AddValidator proposal for `pubkey` through
+/// this member's own RUNNING node. idempotent across members — each runs the
+/// same command (propose if absent, cast a yes ballot, execute once
+/// decidable); the run that lands the deciding ballot executes. the passing
+/// proposal's valset Join schedules the epoch cutover that re-tracks the
+/// mesh, at which point the parked joiner syncs and promotes itself.
+fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use governance_interface::{encode_msg, GovAction, GovMsg, ProposalStatus};
+
+    let (pos, flags) = parse_flags(args)?;
+    let [pubkey_hex] = pos.as_slice() else {
+        return Err("invite-accept needs exactly one <hex pubkey>".into());
+    };
+    let key = config::decode_key(pubkey_hex)?;
+    let key_bytes = key.as_ref().to_vec();
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
+    // full config resolution (network- or dev-shape) so the verb derives the
+    // SAME identity the running node signs with — the ballots this verb
+    // casts are signed by the NODE (the ordered lane signs every rpc
+    // submit), and that key must be the member.
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("invite-accept drives the node's local rpc — set `rpc_listen` in node.toml")?;
+    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+
+    let members = read_members(&rpc_addr)?;
+    if members.contains(&key_bytes) {
+        eprintln!("{pubkey_hex} is already a validator — nothing to do");
+        return Ok(());
+    }
+    if !members.contains(&me_bytes) {
+        return Err("this node's identity is not a current member — only members admit \
+                    validators"
+            .into());
+    }
+
+    // adopt an existing OPEN proposal for exactly this action, else mint an
+    // unused id (settled proposals keep their ids forever — a re-admitted
+    // key gets a fresh suffix).
+    use governance_interface::{decode_reply, encode_query, GovQuery, GovReply};
+    let proposals = match decode_reply(&rpc_query(
+        &rpc_addr,
+        "governance",
+        &encode_query(&GovQuery::Proposals),
+    )?)? {
+        GovReply::Proposals(views) => views,
+        other => return Err(format!("unexpected governance reply: {other:?}").into()),
+    };
+    let wanted = GovAction::AddValidator { key: key_bytes.clone() };
+    let proposal_id = match proposals
+        .iter()
+        .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
+    {
+        Some(p) => {
+            eprintln!("joining open proposal {}", p.proposal_id);
+            p.proposal_id.clone()
+        }
+        None => {
+            let prefix: String = pubkey_hex.chars().take(16).collect();
+            let id = (0u64..)
+                .map(|n| format!("admit:{prefix}:{n}"))
+                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
+                .expect("the id space is unbounded");
+            rpc_submit(
+                &rpc_addr,
+                "governance",
+                &encode_msg(&GovMsg::Propose {
+                    proposal_id: id.clone(),
+                    action: wanted,
+                    // a far horizon in consensus-time units (heights advance
+                    // about one per finalized op): admission must not expire
+                    // under a slow second ballot.
+                    voting_period: 1_000_000,
+                }),
+            )?;
+            poll_proposal(&rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
+            eprintln!("proposed {id}");
+            id
+        }
+    };
+
+    rpc_submit(
+        &rpc_addr,
+        "governance",
+        &encode_msg(&GovMsg::Vote { proposal_id: proposal_id.clone(), approve: true }),
+    )?;
+    let after_vote = poll_proposal(&rpc_addr, &proposal_id, "this ballot to finalize", |p| {
+        p.as_ref().is_some_and(|v| {
+            v.status != ProposalStatus::Open
+                || v.votes.iter().any(|(voter, yes)| voter == &me_bytes && *yes)
+        })
+    })?
+    .expect("the poll only accepts a present proposal");
+    eprintln!("ballot cast as {}", hex_bytes(&me_bytes));
+
+    // execute only when decidable — a strict-majority shortfall is the
+    // normal n>=2 intermediate state, not an error.
+    let members = read_members(&rpc_addr)?;
+    let yes = members
+        .iter()
+        .filter(|m| {
+            after_vote
+                .votes
+                .iter()
+                .any(|(voter, approve)| voter == *m && *approve)
+        })
+        .count();
+    let majority = members.len() / 2 + 1;
+    if after_vote.status == ProposalStatus::Open && yes < majority {
+        eprintln!(
+            "{yes} of {majority} required ballots — waiting on other members. each runs:\n    \
+             ducktape-node invite-accept {pubkey_hex} --config <their node.toml>"
+        );
+        return Ok(());
+    }
+    if after_vote.status == ProposalStatus::Open {
+        rpc_submit(
+            &rpc_addr,
+            "governance",
+            &encode_msg(&GovMsg::Execute { proposal_id: proposal_id.clone() }),
+        )?;
+    }
+    let settled = poll_proposal(&rpc_addr, &proposal_id, "the tally to settle", |p| {
+        p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
+    })?
+    .expect("the poll only accepts a present proposal");
+    match settled.status {
+        ProposalStatus::Passed => {
+            eprintln!(
+                "admitted {pubkey_hex}: the validator set changes at the next epoch cutover, \
+                 and the joiner's parked node will sync and promote itself"
+            );
+            Ok(())
+        }
+        status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
+    }
+}
+
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a]` — materialize a workspace from an invite: descriptor + identity
 /// (kept across re-joins) + node config. prints this identity for the
@@ -685,9 +1121,15 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             dir.display()
         );
     } else {
-        eprintln!("NOT yet a member. send this identity to a member, who runs:");
-        eprintln!("    ducktape-node admit {me_hex}");
-        eprintln!("then join again with the refreshed invite (the identity here is kept).");
+        eprintln!("NOT yet a member. send this identity to a member, then:");
+        eprintln!("  running network: the member runs `ducktape-node invite-accept {me_hex}`,");
+        eprintln!(
+            "    and you start now — `ducktape-node --config {}/node.toml` parks on the \
+             mesh and promotes itself once admitted;",
+            dir.display()
+        );
+        eprintln!("  before genesis: the member runs `ducktape-node admit {me_hex}` and you");
+        eprintln!("    join again with the refreshed invite (the identity here is kept).");
     }
     println!("{me_hex}");
     Ok(())
@@ -716,13 +1158,29 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         dev_demo,
         checkpoint_blocks,
     } = resolved;
-    if !sync_only && !validators.contains(&signer.public_key()) {
-        return Err(format!(
-            "identity {} is not in the validator set — run with --sync-only (observer) or \
-             get admitted first",
+    // a key outside the GENESIS validator set is not an error: post-genesis
+    // members are admitted via governance. with a recovery checkpoint on disk
+    // (a previous run promoted this identity) boot proceeds as a validator
+    // off the recovery record; with a fresh storage dir the node enters
+    // JOINER mode — park on the mesh, sync a boundary whose participant set
+    // includes this key, fabricate the equivalent recovery checkpoint, and
+    // reboot through the normal restore path. this filesystem probe mirrors
+    // the recovery store's layout (storage_dir/<partition>/) and only gates
+    // which listeners bind — the runtime re-decides joiner-vs-validator from
+    // the real store.
+    let promoted = storage
+        .join("recovery-manifest")
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    let joiner = !sync_only && !validators.contains(&signer.public_key()) && !promoted;
+    if joiner {
+        println!(
+            "[node {label}] identity {} is not in the genesis validator set — joiner mode: \
+             parking on the mesh until a member runs `ducktape-node invite-accept {}`",
+            hex_bytes(signer.public_key().as_ref()),
             hex_bytes(signer.public_key().as_ref())
-        )
-        .into());
+        );
     }
 
     // keep the raw (key, addr) pairs for statesync source selection before
@@ -751,7 +1209,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise.
     let rpc_listener = match rpc_listen.as_deref() {
-        Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
+        Some(addr) if !sync_only && !joiner => Some(std::net::TcpListener::bind(addr)?),
         _ => None,
     };
 
@@ -761,7 +1219,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
     match http_listen.as_deref() {
-        Some(addr) if !sync_only => {
+        Some(addr) if !sync_only && !joiner => {
             let listener = std::net::TcpListener::bind(addr)?;
             listener.set_nonblocking(true)?;
             println!(
@@ -828,11 +1286,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             MAX_MESSAGE_SIZE,
         );
         let (mut network, mut oracle) = Network::new(context.child("network"), p2p_cfg);
-        oracle.track(PEER_SET, mesh_participants.clone());
 
         let quota = Quota::per_second(NZU32!(128));
 
         if sync_only {
+            // no consensus coordinates yet: track the genesis mesh at the
+            // base index. validators ignore this index if they have rotated
+            // past keeping it; connection authorization is the UNION of every
+            // tracked set on each side, so the descriptor's members stay
+            // reachable.
+            oracle.track(PEER_SET, mesh_participants.clone());
             // ---- the SYNC-ONLY joiner: no engine, no votes — just the wire ----
             //
             // validators broadcast consensus traffic (votes, certificates,
@@ -887,111 +1350,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 hex(&manifest.app_hash)
             );
 
-            // rebuild EVERY module in the manifest. a REAL joiner owns its
-            // disk, so every store opens under its canonical module id.
-            //
-            // resolver lane: live target through the module lane (must sit at
-            // the manifest boundary — a parked demo source guarantees it; a
-            // busy source would be retried by refetching the manifest), then
-            // merkle-verified op batches through the remote resolver.
-            // snapshot lane: chunked bytes, install gated on the manifest root.
-            let fetch_target = |module: &'static str| {
-                let resolver = RemoteQmdbResolver::new(client.clone(), module);
-                let entry_root = manifest.entry(module).expect("module in manifest").root;
-                async move {
-                    let target = resolver.fetch_target().await.expect("target");
-                    assert_eq!(
-                        StateRoot(target.root.0),
-                        entry_root,
-                        "parked source: live {module} target equals the manifest root"
-                    );
-                    (target, resolver)
-                }
-            };
-
-            let (target, resolver) = fetch_target("kv").await;
-            let kv = Kv::sync_from(context.child("kv"), "kv", target, resolver).await;
-
-            let (target, resolver) = fetch_target("document").await;
-            let document =
-                Document::sync_from(context.child("document"), "document", target, resolver).await;
-
-            let (target, resolver) = fetch_target("chat").await;
-            let chat = Chat::sync_from(context.child("chat"), "chat", target, resolver).await;
-
-            let snapshot_of = |module: &'static str| {
-                let client = client.clone();
-                let height = manifest.height;
-                let root = manifest.entry(module).expect("module in manifest").root;
-                async move {
-                    let bytes = fetch_snapshot(&client, height, module).await.expect("snapshot");
-                    (bytes, root)
-                }
-            };
-
-            let (bytes, root) = snapshot_of("directory").await;
-            let mut directory = Directory::new("directory");
-            directory.install(&bytes, root).expect("directory install");
-
-            let (bytes, root) = snapshot_of("valset").await;
-            let mut valset = Valset::new("valset");
-            valset.install(&bytes, root).expect("valset install");
-
-            let (bytes, root) = snapshot_of("saga").await;
-            let mut saga = SagaModule::new("saga");
-            saga.install(&bytes, root).expect("saga install");
-
-            let (bytes, root) = snapshot_of("governance").await;
-            let mut governance = Governance::new("governance", "valset");
-            governance.install(&bytes, root).expect("governance install");
-
-            let (bytes, root) = snapshot_of("tasks").await;
-            let mut tasks = Tasks::new("tasks");
-            tasks.install(&bytes, root).expect("tasks install");
-
-            let (bytes, root) = snapshot_of("vaults").await;
-            let mut vaults = Vaults::new("vaults");
-            vaults.install(&bytes, root).expect("vaults install");
-
-            let (bytes, root) = snapshot_of("automations").await;
-            let mut automations = Automations::new("automations", "chat", "tasks");
-            automations.install(&bytes, root).expect("automations install");
-
-            let (bytes, root) = snapshot_of("inbox").await;
-            let mut inbox = Inbox::new("inbox");
-            inbox.install(&bytes, root).expect("inbox install");
-
-            let (bytes, root) = snapshot_of("files").await;
-            let mut files = Files::new("files");
-            files.install(&bytes, root).expect("files install");
-            let (bytes, root) = snapshot_of("memory").await;
-            let mut memory = Memory::new("memory");
-            memory.install(&bytes, root).expect("memory install");
-            let (bytes, root) = snapshot_of("jobs").await;
-            let mut jobs = Jobs::new("jobs");
-            jobs.install(&bytes, root).expect("jobs install");
-
-            let (bytes, root) = snapshot_of("forge").await;
+            // rebuild EVERY module in the manifest (a REAL joiner owns its
+            // disk, so every store opens under its canonical module id) and
+            // print the greppable line the demo script asserts on.
             let forge_repo = storage_for_sync.join("forge-repo");
-            let mut forge = Forge::init("forge", forge_repo).expect("joiner forge init");
-            forge.install(&bytes, root).expect("forge install");
-
-            // compose and check THE property: the joiner's app-hash IS the
-            // manifest's. print the greppable line the demo script asserts on.
-            let mods: [&dyn sdk::Module; 15] = [
-                &kv, &document, &chat, &directory, &valset, &governance,
-                &saga, &tasks, &vaults, &inbox, &forge, &automations, &files, &memory, &jobs,
-            ];
-            let synced = state::global_root(&mods);
-            if synced != manifest.app_hash {
-                eprintln!(
-                    "[node {label}] SYNC FAILED: composed {} != manifest {}",
-                    hex(&synced),
-                    hex(&manifest.app_hash)
-                );
-                std::process::exit(1);
+            match sync_all_modules(&context, &client, &manifest, &forge_repo, 0).await {
+                Ok(host) => {
+                    println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
+                }
+                Err(e) => {
+                    eprintln!("[node {label}] SYNC FAILED: {e}");
+                    std::process::exit(1);
+                }
             }
-            println!("[node {label}] synced app_hash={}", hex(&synced));
             return;
         }
 
@@ -1015,13 +1386,238 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
         };
         let forge_repo = storage_for_sync.join("forge-repo");
+
+        // ---- the JOINER: park on the mesh, sync a boundary that includes
+        // this key, fabricate the equivalent recovery checkpoint, reboot ----
+        //
+        // decided from the REAL store (the pre-runtime probe only gated
+        // listeners): no checkpoint + a key outside the genesis set. after
+        // promotion the checkpoint exists, so a rebooted process falls
+        // through to the validator path below.
+        if manifest.is_none() && !validators.contains(&signer.public_key()) {
+            if !recovery.journal_is_empty().await {
+                eprintln!(
+                    "[node {label}] FATAL: recovery journal exists but the checkpoint is \
+                     missing — wipe the app state and re-join (KEEP any consensus journal \
+                     partitions: they are what prevents this key from double-voting)"
+                );
+                std::process::exit(1);
+            }
+            // the parked mesh identity: genesis set at the base index (no
+            // consensus coordinates yet), engine lanes black-holed exactly
+            // like the sync-only observer — an unregistered channel is a
+            // protocol violation that kills the very connection the sync
+            // client needs.
+            oracle.track(PEER_SET, mesh_participants.clone());
+            for epoch in 0..EPOCH_CHANNEL_BANK {
+                let (vote, cert, res, payload, fetch) = engine_channels(epoch);
+                for ch in [vote, cert, res, payload, fetch] {
+                    let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
+                    let label: &'static str =
+                        Box::leak(format!("blackhole_{ch}").into_boxed_str());
+                    context.child(label).spawn(move |_ctx| async move {
+                        while rx.recv().await.is_ok() {}
+                    });
+                }
+            }
+            let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            network.start();
+
+            let Some(server_peer) = sync_source else {
+                eprintln!(
+                    "[node {label}] no statesync source: no validator other than this node \
+                     is available to serve (only validators answer the statesync channel)"
+                );
+                std::process::exit(1);
+            };
+            let client =
+                P2pSyncClient::new(context.child("sync_client"), sync_tx, sync_rx, server_peer);
+
+            let me_bytes = signer.public_key().as_ref().to_vec();
+            let mut last_tracked = PEER_SET;
+            let mut attempt = 0usize;
+            let (boundary, host) = loop {
+                attempt += 1;
+                if attempt > 900 {
+                    // ~30 minutes of 2s retries: parking forever is operator
+                    // guidance territory, not a silent spin.
+                    eprintln!(
+                        "[node {label}] FATAL: still not admitted after {attempt} attempts — \
+                         has a member run `ducktape-node invite-accept {}`?",
+                        hex_bytes(&me_bytes)
+                    );
+                    std::process::exit(1);
+                }
+                context.sleep(Duration::from_secs(2)).await;
+                let m = match fetch_manifest(&client).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        println!("[node {label}] parked: mesh unreachable ({e}); retrying");
+                        continue;
+                    }
+                };
+                // follow the mesh rotation while parked. the participant
+                // list is an unverified serving hint — the union with the
+                // descriptor mesh keeps the real members reachable, and
+                // promotion re-derives everything from verified state.
+                if m.epoch > last_tracked {
+                    if m.epoch >= EPOCH_CHANNEL_BANK {
+                        println!(
+                            "[node {label}] warning: the network is at epoch {} — beyond this \
+                             process's pre-registered channel bank ({EPOCH_CHANNEL_BANK}); \
+                             expect reconnect churn while parked",
+                            m.epoch
+                        );
+                    }
+                    let mut union: std::collections::BTreeSet<ed25519::PublicKey> =
+                        peers.iter().cloned().collect();
+                    for k in &m.participants {
+                        if let Ok(pk) = ed25519::PublicKey::decode(k.as_slice()) {
+                            union.insert(pk);
+                        }
+                    }
+                    oracle.track(
+                        m.epoch,
+                        Set::try_from(union.into_iter().collect::<Vec<_>>())
+                            .expect("a btree-set union has no duplicates"),
+                    );
+                    last_tracked = m.epoch;
+                }
+                if !m.participants.iter().any(|k| k == &me_bytes) {
+                    println!(
+                        "[node {label}] parked: awaiting admission (epoch {} has {} validators)",
+                        m.epoch,
+                        m.participants.len()
+                    );
+                    continue;
+                }
+                // in the epoch set. a boundary PAST the epoch base needs its
+                // finalization floor served alongside, or the respawned
+                // engine would re-deliver history the synced state already
+                // contains — retry until the source's floor catches up.
+                if m.height > m.view_base && m.floor_cert.is_none() {
+                    println!(
+                        "[node {label}] admitted; boundary {} lacks its finalization floor \
+                         yet — retrying",
+                        m.height
+                    );
+                    continue;
+                }
+                println!(
+                    "[node {label}] admitted at epoch {} boundary {} — syncing {} modules",
+                    m.epoch,
+                    m.height,
+                    m.entries.len()
+                );
+                match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
+                    Ok(host) => break (m, host),
+                    // a busy source moves its live qmdb targets past the
+                    // captured boundary mid-sync; refetch and try again at
+                    // the new boundary.
+                    Err(e) => println!("[node {label}] sync at boundary {} failed: {e}", m.height),
+                }
+            };
+            println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
+
+            // validate the floor certificate against the epoch's scheme
+            // BEFORE persisting it — a lying source must fail the join here,
+            // not brick the validator boot after.
+            let floor = if boundary.height > boundary.view_base {
+                let cert = boundary
+                    .floor_cert
+                    .clone()
+                    .expect("the park loop only breaks past the base with a floor");
+                let mut keys = Vec::with_capacity(boundary.participants.len());
+                for k in &boundary.participants {
+                    match ed25519::PublicKey::decode(k.as_slice()) {
+                        Ok(pk) => keys.push(pk),
+                        Err(e) => {
+                            eprintln!(
+                                "[node {label}] FATAL: served participant set holds a \
+                                 non-ed25519 key: {e}"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                let participants =
+                    Set::try_from(keys).expect("served participant set has no duplicates");
+                let scheme = match CONSENSUS_SCHEME {
+                    ConsensusScheme::V1Ed25519 => simplex_ed25519::Scheme::signer(
+                        &namespace,
+                        participants,
+                        signer.clone(),
+                    )
+                    .expect("our key is in the served participant set"),
+                    ConsensusScheme::V2Bls => unimplemented!(
+                        "V2Bls joiner wiring lands with valset bls key registration"
+                    ),
+                };
+                if let Err(e) = consensus::decode_finalization(&scheme, &cert) {
+                    eprintln!(
+                        "[node {label}] FATAL: served finalization floor does not verify \
+                         against the epoch's participant set: {e}"
+                    );
+                    std::process::exit(1);
+                }
+                Some(cert)
+            } else {
+                None
+            };
+
+            // fabricate the checkpoint a restart would have left; the normal
+            // recovery boot turns it into a live validator. next_seq starts
+            // at 1 — this identity never framed ops on this network. (a
+            // REJOINING key that later resubmits a byte-identical (seq,
+            // payload) pair could be dropped by a peer's in-process digest
+            // gate; accepted edge until submit sequences ride app state.)
+            let pos = recovery.oplog_pos().await;
+            let ckpt = match Manifest::capture(
+                &host,
+                Some(boundary.height),
+                boundary.epoch,
+                boundary.view_base,
+                boundary.participants.clone(),
+                None,
+                pos,
+                1,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[node {label}] FATAL: promotion checkpoint capture: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = recovery.write_manifest(&ckpt).await {
+                eprintln!("[node {label}] FATAL: promotion checkpoint write: {e}");
+                std::process::exit(1);
+            }
+            if let Some(cert) = floor {
+                let fc = recovery::FloorCert {
+                    epoch: boundary.epoch,
+                    height: boundary.height,
+                    cert,
+                };
+                if let Err(e) = recovery.write_floor_cert(&fc).await {
+                    eprintln!("[node {label}] FATAL: promotion floor-cert write: {e}");
+                    std::process::exit(1);
+                }
+            }
+            println!(
+                "[node {label}] promoted: validator at epoch {} boundary {} — rebooting",
+                boundary.epoch, boundary.height
+            );
+            reboot_self();
+        }
         // (host, recovered-state, next local submit seq, last checkpoint
-        // (height, oplog position) for the pump's prune bookkeeping).
-        let (host, resumed, mut next_seq, mut prev_ckpt): (
+        // (height, oplog position) for the pump's prune bookkeeping, and a
+        // cutover the pre-crash process had armed but not crossed).
+        let (host, resumed, mut next_seq, mut prev_ckpt, pending_boot): (
             Host,
             Option<recovery::Recovered>,
             u64,
             (Option<u64>, u64),
+            Option<u64>,
         ) = match manifest {
             None => {
                 // a journal without a checkpoint is damage, not a fresh dir —
@@ -1036,19 +1632,23 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
                 let host = genesis_host(&context, &forge_repo, &validators).await;
                 let pos = recovery.oplog_pos().await;
+                let genesis_participants: Vec<Vec<u8>> =
+                    validators.iter().map(|k| k.as_ref().to_vec()).collect();
                 // seq 0 is the dev demo op's; real submits start at 1.
-                let genesis_manifest = match Manifest::capture(&host, None, 0, 0, pos, 1) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("[node {label}] FATAL: genesis checkpoint capture: {e}");
-                        std::process::exit(1);
-                    }
-                };
+                let genesis_manifest =
+                    match Manifest::capture(&host, None, 0, 0, genesis_participants, None, pos, 1)
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("[node {label}] FATAL: genesis checkpoint capture: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                 if let Err(e) = recovery.write_manifest(&genesis_manifest).await {
                     eprintln!("[node {label}] FATAL: genesis checkpoint write: {e}");
                     std::process::exit(1);
                 }
-                (host, None, 1, (None, pos))
+                (host, None, 1, (None, pos), None)
             }
             Some(manifest) => {
                 let mut host = match restore_host(&context, &forge_repo, &manifest).await {
@@ -1093,22 +1693,59 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     rec.skipped,
                     if rec.rolled_forward { ", rolled 1 forward" } else { "" },
                 );
+                // a cutover armed but not crossed before the crash: recorded
+                // in the checkpoint (valid only while no cutover happened
+                // since — a newer epoch means that boundary was crossed), or
+                // derived from the replayed seals: the first CURRENT-epoch
+                // block that moved the valset root armed the boundary at its
+                // view + the delay. deterministic — the same block arms the
+                // same boundary on every node.
+                let pending_boot = if rec.epoch == manifest.epoch {
+                    manifest.pending_cutover_view
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    let mut prev_root =
+                        manifest.root("valset").expect("valset is a genesis module");
+                    let mut armed = None;
+                    for (height, roots) in &rec.blocks {
+                        let root = roots
+                            .iter()
+                            .find(|(id, _)| id == "valset")
+                            .map(|(_, r)| *r)
+                            .expect("every seal carries the full root vector");
+                        if root != prev_root && *height > rec.view_base && armed.is_none() {
+                            armed = Some(*height - rec.view_base + CUTOVER_DELAY);
+                        }
+                        prev_root = root;
+                    }
+                    armed
+                });
                 let prev = (manifest.height, manifest.oplog_pos);
-                (host, Some(rec), next_seq, prev)
+                (host, Some(rec), next_seq, prev, pending_boot)
             }
         };
 
-        // consensus membership comes from RECOVERED state (at genesis this is
-        // exactly the config seed — valset was just seeded from it). a key no
-        // longer in the set must not spawn an engine for the epoch.
+        // consensus membership comes from the RECOVERY RECORD: the epoch's
+        // ENGINE PARTICIPANT SET (at genesis: exactly the config seed). the
+        // recovered valset projection is NOT it — a restart inside a cutover
+        // window would read a membership change whose boundary has not been
+        // crossed and spawn a different scheme than its peers are running.
         let member_keys: Vec<ed25519::PublicKey> = {
-            let raw = read_valset_members(&host).await;
+            let raw: Vec<Vec<u8>> = match &resumed {
+                Some(rec) => rec.participants.clone(),
+                None => validators.iter().map(|k| k.as_ref().to_vec()).collect(),
+            };
             let mut keys = Vec::with_capacity(raw.len());
             for k in &raw {
                 match ed25519::PublicKey::decode(k.as_slice()) {
                     Ok(pk) => keys.push(pk),
                     Err(e) => {
-                        eprintln!("[node {label}] FATAL: recovered valset holds a non-ed25519 key: {e}");
+                        eprintln!(
+                            "[node {label}] FATAL: recovered participant set holds a \
+                             non-ed25519 key: {e}"
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -1125,6 +1762,29 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let participants: Set<ed25519::PublicKey> =
             Set::try_from(member_keys.clone()).expect("valset membership has no duplicates");
         let resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
+
+        // the validator-owned transport mesh, tracked at index = epoch: the
+        // epoch's participants ∪ the descriptor mesh (genesis members + [dev]
+        // extras — kept authorized so demoted members and pre-genesis peers
+        // can still reach the statesync service). the SAME set on every node
+        // at this index: discovery kills peers whose bit-vector length
+        // disagrees at a shared index, and epoch participant sets are the
+        // only membership every node agrees on epoch-for-epoch.
+        let mesh_at = {
+            let descriptor_mesh = peers.clone();
+            move |epoch_members: &std::collections::BTreeSet<ed25519::PublicKey>| {
+                let mut union: std::collections::BTreeSet<ed25519::PublicKey> =
+                    descriptor_mesh.iter().cloned().collect();
+                union.extend(epoch_members.iter().cloned());
+                Set::try_from(union.into_iter().collect::<Vec<_>>())
+                    .expect("a btree-set union has no duplicates")
+            }
+        };
+        let mut mesh_oracle = oracle.clone();
+        mesh_oracle.track(
+            resume_epoch,
+            mesh_at(&member_keys.iter().cloned().collect()),
+        );
 
         // lanes for epochs BELOW the resume epoch are registered and
         // black-holed (the sync-only arm's exact trick): a lagging peer still
@@ -1300,6 +1960,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
         };
         let mut last_cert_height = boot_floor.as_ref().map(|c| c.height);
+        // the newest persisted finalization floor, kept in memory so the
+        // statesync service can serve it to joiners at a matching boundary.
+        let mut latest_floor: Option<recovery::FloorCert> = boot_floor.clone();
         let orderer = spawn_epoch(
             &mut channel_bank,
             resume_epoch,
@@ -1319,24 +1982,32 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             ),
             None => OrderedNode::with_sink(host, orderer, recovery),
         };
+        // the observation barrier: every drain batch ends AT a block that
+        // moves the valset root, so the orchestration step below observes a
+        // membership change at exactly its block's view — the same view on
+        // every validator, whatever the local batch shape. without it the
+        // armed cutover view (and with it the next epoch's height base)
+        // would depend on drain timing: a cross-node fork.
+        node.watch_module("valset");
 
         // the valset ORCHESTRATOR: watches finalized valset module state and
-        // schedules deterministic epoch cutovers. the initial observation is
-        // the CURRENT committed membership (genesis-seeded on a fresh boot,
-        // recovered on a restart), at the recovered epoch coordinates.
-        let valset_root = node
-            .host()
-            .module_root("valset")
-            .expect("valset is registered");
+        // schedules deterministic epoch cutovers. it resumes at the recovered
+        // epoch coordinates over the epoch's ENGINE PARTICIPANT SET, and
+        // re-arms a cutover the pre-crash process had scheduled.
         let mut orchestrator = consensus::ValsetOrchestrator::resume(
             CUTOVER_DELAY,
-            consensus::ObservedValset::from_validator_set(
-                consensus::ValsetRoot(valset_root.0),
-                member_keys.clone(),
-            ),
+            member_keys.clone(),
             resume_epoch,
             view_base,
+            pending_boot,
         );
+        if let Some(ceiling) = pending_boot {
+            node.set_view_ceiling(ceiling);
+            println!(
+                "[node {label}] re-armed pending cutover at view {ceiling} (epoch {})",
+                resume_epoch + 1
+            );
+        }
 
         // the genesis app-hash BEFORE any op — the demo asserts this agrees across
         // processes (a fork here would be a genesis-determinism bug, not consensus).
@@ -1414,6 +2085,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut sync_server = SyncServer::new();
         // recovery cadence: sealed blocks since the last checkpoint manifest.
         let mut blocks_since_checkpoint: u64 = 0;
+        // throttle for the pending-cutover nop pusher below.
+        let mut last_nop = std::time::Instant::now();
         // the host-owned worker set (reactor seam). EMPTY for now: effects of
         // finalized blocks are drained and logged so the lane is visibly live;
         // the agent LLM worker plugs in here.
@@ -1476,6 +2149,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     Some(f.height),
                                     orchestrator.epoch(),
                                     orchestrator.epoch_base(),
+                                    participant_bytes(&orchestrator),
+                                    orchestrator.pending_cutover().map(|c| c.cutover_view()),
                                     pos,
                                     next_seq,
                                 ) {
@@ -1556,8 +2231,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
                         continue; // malformed rpc envelope: drop, never crash.
                     };
+                    // the boundary's consensus coordinates ride the manifest.
+                    // the floor certificate is served only when it certifies
+                    // exactly the current boundary — a cert behind the
+                    // boundary would make a joiner skip history it needs.
+                    let coords = statesync::BoundaryCoords {
+                        epoch: orchestrator.epoch(),
+                        view_base: orchestrator.epoch_base(),
+                        participants: participant_bytes(&orchestrator),
+                        floor_cert: latest_floor
+                            .as_ref()
+                            .filter(|fc| fc.epoch == orchestrator.epoch())
+                            .filter(|fc| {
+                                node.finalized().is_some_and(|f| f.height == fc.height)
+                            })
+                            .map(|fc| fc.cert.clone()),
+                    };
                     let resp = sync_server
-                        .handle_frame(node.host(), node.finalized(), body)
+                        .handle_frame(node.host(), node.finalized(), &coords, body)
                         .await;
                     let _ = sync_tx.send(
                         Recipients::One(peer),
@@ -1650,7 +2341,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     cert,
                                 };
                                 match node.sink_mut().write_floor_cert(&fc).await {
-                                    Ok(()) => last_cert_height = Some(height),
+                                    Ok(()) => {
+                                        last_cert_height = Some(height);
+                                        latest_floor = Some(fc);
+                                    }
                                     Err(e) => eprintln!(
                                         "[node {label}] floor cert write failed (will retry): {e}"
                                     ),
@@ -1671,6 +2365,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 Some(f.height),
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
+                                participant_bytes(&orchestrator),
+                                orchestrator.pending_cutover().map(|c| c.cutover_view()),
                                 pos,
                                 next_seq,
                             );
@@ -1709,25 +2405,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // membership projection; a change schedules a deterministic
                     // cutover (arming the discard ceiling), and crossing the
                     // cutover view tears the engine down and respawns it over
-                    // the new participant set at the next epoch.
+                    // the set read AT the boundary. the observation barrier
+                    // guarantees this tick's last view IS the changing block's
+                    // view when membership moved.
                     if let Some(engine_view) = node.last_engine_view() {
                         let members_raw = read_valset_members(node.host()).await;
-                        let valset_root = node
-                            .host()
-                            .module_root("valset")
-                            .expect("valset is registered");
-                        let mut member_keys: Vec<ed25519::PublicKey> = Vec::new();
+                        let mut observed: Vec<ed25519::PublicKey> = Vec::new();
                         for key in &members_raw {
                             if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
-                                member_keys.push(pk);
+                                observed.push(pk);
                             }
                         }
-                        let observed = consensus::ObservedValset::from_validator_set(
-                            consensus::ValsetRoot(valset_root.0),
-                            member_keys,
-                        );
                         if let consensus::ObservationOutcome::Scheduled(cutover) =
-                            orchestrator.observe_finalized_valset(engine_view, observed)
+                            orchestrator.observe_members(engine_view, observed.iter().cloned())
                         {
                             println!(
                                 "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
@@ -1737,8 +2427,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             );
                             node.set_view_ceiling(cutover.cutover_view());
                         }
-                        if let Some(plan) = orchestrator.respawn_if_due(engine_view) {
-                            let members = plan.valset().membership().consensus_members();
+                        if let Some(plan) = orchestrator.respawn_if_due(engine_view, observed) {
+                            let members = plan.valset().consensus_members();
+                            let member_bytes: Vec<Vec<u8>> =
+                                members.iter().map(|k| k.as_ref().to_vec()).collect();
+                            // transport FIRST: the new epoch's mesh must admit
+                            // its members (a fresh joiner above all) before
+                            // anything is expected of them. index = epoch,
+                            // strictly increasing across cutovers.
+                            mesh_oracle.track(plan.epoch(), mesh_at(members));
                             if !members.contains(&signer.public_key()) {
                                 println!(
                                     "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
@@ -1760,11 +2457,47 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 None,
                             );
                             if let Err(e) = node
-                                .cutover(orderer, plan.epoch(), plan.cutover_app_height())
+                                .cutover(
+                                    orderer,
+                                    plan.epoch(),
+                                    plan.cutover_app_height(),
+                                    &member_bytes,
+                                )
                                 .await
                             {
                                 eprintln!("[node {label}] FATAL: {e} — halting");
                                 std::process::exit(1);
+                            }
+                            // checkpoint IMMEDIATELY: the manifest must record
+                            // the new epoch's participant set (the journal's
+                            // cutover record alone covers only the crash
+                            // window until this write lands).
+                            let pos = node.sink_mut().oplog_pos().await;
+                            let captured = Manifest::capture(
+                                node.host(),
+                                node.finalized().map(|f| f.height),
+                                orchestrator.epoch(),
+                                orchestrator.epoch_base(),
+                                participant_bytes(&orchestrator),
+                                None,
+                                pos,
+                                next_seq,
+                            );
+                            match captured {
+                                Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                                    Ok(()) => {
+                                        blocks_since_checkpoint = 0;
+                                        prev_ckpt = (m.height, pos);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[node {label}] post-cutover checkpoint write failed \
+                                         (the journal's cutover record covers a restart): {e}"
+                                    ),
+                                },
+                                Err(e) => eprintln!(
+                                    "[node {label}] post-cutover checkpoint capture failed \
+                                     (the journal's cutover record covers a restart): {e}"
+                                ),
                             }
                             println!(
                                 "[node {label}] cutover complete: epoch {} with {} validators (app height base {})",
@@ -1772,6 +2505,30 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 members.len(),
                                 plan.cutover_app_height()
                             );
+                        }
+                    }
+
+                    // a pending cutover only crosses when finalized views
+                    // REACH it, and views only advance with ops — an idle
+                    // network would park at the armed boundary forever. push
+                    // a deterministically-rejected nop (unknown module
+                    // target: rejects identically on every node, leaves no
+                    // state) until the boundary is crossed.
+                    if orchestrator.pending_cutover().is_some()
+                        && last_nop.elapsed() >= Duration::from_secs(1)
+                    {
+                        last_nop = std::time::Instant::now();
+                        let seq = next_seq;
+                        next_seq += 1;
+                        if let Err(e) = node
+                            .submit(
+                                &signer,
+                                seq,
+                                Msg { target: NOP_TARGET.into(), payload: Vec::new() },
+                            )
+                            .await
+                        {
+                            eprintln!("[node {label}] cutover nop submit failed: {e}");
                         }
                     }
 
