@@ -1,21 +1,11 @@
 // The agents surface over the node's `agent` module — the collaboration-loop
-// orchestrator. Three regions, all render-only over useDucktape:
-//
-//   - Agents roster: every registered agent as a card (status pill, model,
-//     granted actions) with a Pause/Resume toggle, plus a "New agent" composer.
-//     Registering UPLOADS the prompt text to the node's blob store and commits
-//     RegisterAgent with the resulting 32-byte digest as prompt_hash — see the
-//     store's registerAgent action.
-//   - Watches: the channels the module watches and their turn policy, with an
-//     Unwatch button, plus a "Watch channel" composer (channel + policy picker).
-//   - Runs: a newest-first timeline of runs (the store reverses the ascending
-//     wire order), each tinted by status, with a Cancel button while a run is
-//     still awaiting its oracle and a badge when it is job-backed.
+// orchestrator. It is render-only over useDucktape: roster, watches, recent
+// runs, and the local composers all submit through the store action facade.
 //
 // No optimistic state: every write goes through the store's submit-then-refresh.
 
 import { useState } from "react";
-import type { FormEvent } from "react";
+import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type {
   AgentRecord,
@@ -50,15 +40,35 @@ const POLICY_LABEL: Record<PolicyKind, string> = {
   Assigned: "Assigned",
 };
 
-const fieldStyle = {
-  padding: "6px 9px",
+const statusTone = {
+  success: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
+  warning: { text: "#a07b32", bg: "#fbf4e6", border: "#ecdcae" },
+  danger: { text: "#a35248", bg: "#fbeeec", border: "#eccfc9" },
+  neutral: { text: "#7a6f9e", bg: "#f1edf5", border: "#ddd2e6" },
+  agent: { text: accentVar, bg: "#f9f1ea", border: "#e7d2c4" },
+} as const;
+
+const fieldStyle: CSSProperties = {
+  width: "100%",
+  padding: "8px 10px",
   borderRadius: radius.sm,
   border: `1px solid ${color.borderStrong}`,
   background: color.paper,
   font: `400 12px ${font.sans}`,
   color: color.ink,
-  width: "100%",
-} as const;
+  outline: "none",
+};
+
+const ghostButton: CSSProperties = {
+  all: "unset",
+  cursor: "pointer",
+  padding: "7px 12px",
+  borderRadius: radius.sm,
+  border: `1px solid ${color.border}`,
+  background: color.paper,
+  color: color.inkSoft,
+  font: `600 11.5px ${font.sans}`,
+};
 
 // ── Wire → display helpers ──────────────────────────────
 
@@ -70,54 +80,192 @@ const slug = (raw: string): string =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
 
+const initialsOf = (name: string): string => {
+  const parts = name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (parts.length === 0) return "AI";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+};
+
+const hexPreview = (bytes: number[]): string => {
+  const hex = bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return hex.length > 18 ? `${hex.slice(0, 10)}…${hex.slice(-6)}` : hex;
+};
+
 const policyText = (policy: TurnPolicy): string => {
   if (policy === "Mention") return "Mention";
   if (policy === "All") return "All";
   if (policy === "RoundRobin") return "Round-robin";
-  return `Assigned → ${policy.Assigned}`;
+  return `Assigned · ${policy.Assigned}`;
 };
 
-/** A run's tint by lifecycle: running amber, done green, failed red, else grey. */
-const runTint = (status: RunStatus): string => {
-  if (status === "Done") return color.green;
-  if (status === "Cancelled") return color.muted2;
-  if ("AwaitingOracle" in status) return color.amber;
-  return color.red;
+const runTone = (status: RunStatus): (typeof statusTone)[keyof typeof statusTone] => {
+  if (status === "Done") return statusTone.success;
+  if (status === "Cancelled") return statusTone.neutral;
+  if ("AwaitingOracle" in status) return statusTone.warning;
+  return statusTone.danger;
 };
 
 const runLabel = (status: RunStatus): string => {
-  if (status === "Done") return "done ✓";
-  if (status === "Cancelled") return "cancelled";
-  if ("AwaitingOracle" in status) return "· running";
-  return `failed · ${status.Failed.reason}`;
+  if (status === "Done") return "DONE";
+  if (status === "Cancelled") return "CANCELLED";
+  if ("AwaitingOracle" in status) return "AWAITING ORACLE";
+  return "FAILED";
+};
+
+const runDetail = (status: RunStatus): string => {
+  if (typeof status === "object" && "Failed" in status) return status.Failed.reason;
+  if (typeof status === "object" && "AwaitingOracle" in status) {
+    return `saga ${status.AwaitingOracle.saga_id}`;
+  }
+  return status.toLowerCase();
 };
 
 /** Only an awaiting run can be cancelled — the sole non-terminal state. */
 const isAwaiting = (status: RunStatus): boolean =>
   status !== "Done" && status !== "Cancelled" && "AwaitingOracle" in status;
 
-// ── Small shared bits ───────────────────────────────────
+// ── Small local bits ────────────────────────────────────
 
-function SectionLabel({ text }: { text: string }) {
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <div
+      style={{
+        font: `600 9px ${font.mono}`,
+        letterSpacing: ".11em",
+        color: color.muted2,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function GroupCard({
+  children,
+  style,
+}: {
+  children: ReactNode;
+  style?: CSSProperties;
+}) {
+  return (
+    <div
+      style={{
+        border: `1px solid ${color.border}`,
+        borderRadius: radius.lg,
+        background: color.paper,
+        boxShadow: shadow.card,
+        overflow: "hidden",
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function StatusPill({
+  label,
+  tone,
+}: {
+  label: string;
+  tone: (typeof statusTone)[keyof typeof statusTone];
+}) {
   return (
     <span
       style={{
-        font: `600 10px ${font.sans}`,
-        color: color.muted,
+        display: "inline-flex",
+        alignItems: "center",
+        borderRadius: 5,
+        border: `1px solid ${tone.border}`,
+        background: tone.bg,
+        color: tone.text,
+        padding: "3px 7px",
+        font: `600 9px ${font.mono}`,
         letterSpacing: ".06em",
+        whiteSpace: "nowrap",
       }}
     >
-      {text}
+      {label}
     </span>
+  );
+}
+
+function AgentAvatar({ name, size = 34 }: { name: string; size?: number }) {
+  return (
+    <span
+      style={{
+        width: size,
+        height: size,
+        flexShrink: 0,
+        borderRadius: 8,
+        background: color.dark,
+        color: color.onDark,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        font: `600 ${Math.max(10, Math.round(size * 0.31))}px ${font.mono}`,
+        letterSpacing: 0,
+      }}
+    >
+      {initialsOf(name)}
+    </span>
+  );
+}
+
+function EmptyState({ icon, title, body }: { icon: "agent" | "hash"; title: string; body: string }) {
+  return (
+    <div
+      style={{
+        padding: "26px 18px",
+        borderRadius: radius.lg,
+        border: `1px dashed ${color.borderStrong}`,
+        background: color.sidebar,
+        display: "flex",
+        alignItems: "center",
+        gap: 13,
+      }}
+    >
+      <div
+        style={{
+          width: 38,
+          height: 38,
+          borderRadius: 9,
+          background: color.sunken,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: color.muted2,
+          flexShrink: 0,
+        }}
+      >
+        <Icon name={icon} size={18} />
+      </div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ font: `600 13px ${font.sans}`, color: color.ink }}>{title}</div>
+        <div style={{ marginTop: 2, font: `400 12px ${font.sans}`, color: color.muted2 }}>
+          {body}
+        </div>
+      </div>
+    </div>
   );
 }
 
 function Chip({ text, tint = color.muted3 }: { text: string; tint?: string }) {
   return (
     <span
+      title={text}
       style={{
-        padding: "2px 7px",
-        borderRadius: radius.sm,
+        minWidth: 0,
+        maxWidth: 220,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        padding: "3px 7px",
+        borderRadius: 5,
         background: color.sunken,
         border: `1px solid ${color.border}`,
         font: `500 10px ${font.mono}`,
@@ -129,42 +277,16 @@ function Chip({ text, tint = color.muted3 }: { text: string; tint?: string }) {
   );
 }
 
-function PillButton({
-  label,
-  tint,
-  onClick,
-}: {
-  label: string;
-  tint: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      style={{
-        all: "unset",
-        cursor: "pointer",
-        padding: "3px 10px",
-        borderRadius: radius.sm,
-        border: `1px solid ${color.border}`,
-        background: color.paper,
-        font: `600 10.5px ${font.sans}`,
-        color: tint,
-      }}
-    >
-      {label}
-    </button>
-  );
-}
-
 // ── Agents roster ───────────────────────────────────────
 
-function AgentCard({
+function AgentRow({
   agent,
+  last,
   onPause,
   onResume,
 }: {
   agent: AgentRecord;
+  last?: boolean;
   onPause: (id: string) => void;
   onResume: (id: string) => void;
 }) {
@@ -173,67 +295,78 @@ function AgentCard({
     <div
       style={{
         display: "flex",
-        flexDirection: "column",
-        gap: 7,
-        padding: 11,
-        borderRadius: radius.md,
-        border: `1px solid ${color.border}`,
-        background: color.paper,
-        boxShadow: shadow.card,
+        alignItems: "center",
+        gap: 12,
+        padding: "13px 15px",
+        borderBottom: last ? undefined : `1px solid ${color.borderSoft}`,
         animation: "ik-fade .16s ease-out",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-        <span style={{ font: `600 13px ${font.sans}`, color: color.ink }}>
-          {agent.display_name}
-        </span>
-        <span
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 5,
-            padding: "2px 8px",
-            borderRadius: radius.sm,
-            background: color.sunken,
-            font: `600 9.5px ${font.mono}`,
-            letterSpacing: ".04em",
-            color: active ? color.green : color.amber,
-          }}
-        >
+      <AgentAvatar name={agent.display_name} />
+
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
           <span
             style={{
-              width: 6,
-              height: 6,
-              borderRadius: "50%",
-              background: active ? color.green : color.amber,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              font: `600 13.5px ${font.sans}`,
+              color: color.ink,
             }}
-          />
-          {active ? "ACTIVE" : "PAUSED"}
-        </span>
-        <span style={{ marginLeft: "auto" }}>
-          {active ? (
-            <PillButton label="Pause" tint={color.amber} onClick={() => onPause(agent.agent_id)} />
-          ) : (
-            <PillButton label="Resume" tint={color.green} onClick={() => onResume(agent.agent_id)} />
-          )}
-        </span>
-      </div>
-
-      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-        <Chip text={agent.agent_id} />
-        <Chip text={agent.model_ref} tint={color.blue} />
-      </div>
-
-      <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
-        {agent.allowed_actions.length === 0 ? (
-          <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>
-            no actions granted
+          >
+            {agent.display_name}
           </span>
-        ) : (
-          agent.allowed_actions.map((name) => (
-            <Chip key={name} text={ACTION_LABEL[name] ?? name} />
-          ))
-        )}
+          <StatusPill label="AGENT" tone={statusTone.agent} />
+        </div>
+        <div
+          style={{
+            marginTop: 3,
+            display: "flex",
+            alignItems: "center",
+            gap: 7,
+            minWidth: 0,
+            flexWrap: "wrap",
+          }}
+        >
+          <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+            {agent.agent_id}
+          </span>
+          <span style={{ font: `400 10.5px ${font.mono}`, color: color.blue }}>
+            {agent.model_ref}
+          </span>
+          <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+            prompt {hexPreview(agent.prompt_hash)}
+          </span>
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "flex-end",
+          gap: 9,
+          flexShrink: 0,
+        }}
+      >
+        <StatusPill
+          label={active ? "ACTIVE" : "PAUSED"}
+          tone={active ? statusTone.success : statusTone.warning}
+        />
+        <button
+          type="button"
+          onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
+          style={{
+            ...ghostButton,
+            color: active ? color.amber : color.green,
+            minWidth: 58,
+            textAlign: "center",
+          }}
+        >
+          {active ? "Pause" : "Resume"}
+        </button>
       </div>
     </div>
   );
@@ -276,86 +409,112 @@ function NewAgentForm({
   };
 
   return (
-    <form
-      onSubmit={submit}
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-        padding: 11,
-        borderRadius: radius.md,
-        border: `1px dashed ${color.borderStrong}`,
-        background: color.sunken,
-      }}
-    >
-      <div style={{ display: "flex", gap: 7 }}>
-        <input
-          value={displayName}
-          onChange={(event) => setDisplayName(event.target.value)}
-          placeholder="Display name"
-          style={fieldStyle}
-        />
-        <input
-          value={agentId}
-          onChange={(event) => setAgentId(event.target.value)}
-          placeholder="agent-id"
-          style={{ ...fieldStyle, font: `400 12px ${font.mono}` }}
-        />
-        <input
-          value={modelRef}
-          onChange={(event) => setModelRef(event.target.value)}
-          placeholder="model"
-          style={{ ...fieldStyle, font: `400 12px ${font.mono}` }}
-        />
-      </div>
-      <textarea
-        value={prompt}
-        onChange={(event) => setPrompt(event.target.value)}
-        rows={3}
-        placeholder="System prompt — uploaded to the node's blob store, committed as prompt_hash"
-        style={{ ...fieldStyle, resize: "vertical", minHeight: 54 }}
-      />
-      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        {KNOWN_ACTIONS.map((name) => {
-          const on = actions.includes(name);
-          return (
-            <button
-              key={name}
-              type="button"
-              onClick={() => toggle(name)}
-              style={{
-                all: "unset",
-                cursor: "pointer",
-                padding: "3px 9px",
-                borderRadius: radius.sm,
-                border: `1px solid ${on ? accentVar : color.border}`,
-                background: on ? accentVar : color.paper,
-                color: on ? "#fff" : color.muted3,
-                font: `600 10.5px ${font.sans}`,
-              }}
-            >
-              {ACTION_LABEL[name]}
-            </button>
-          );
-        })}
-        <button
-          type="submit"
-          disabled={!ready}
+    <GroupCard>
+      <form
+        onSubmit={submit}
+        style={{ padding: 15, display: "flex", flexDirection: "column", gap: 11 }}
+      >
+        <div
           style={{
-            all: "unset",
-            cursor: ready ? "pointer" : "default",
-            marginLeft: "auto",
-            padding: "5px 13px",
-            borderRadius: radius.sm,
-            background: ready ? accentVar : color.chip,
-            color: "#fff",
-            font: `600 11.5px ${font.sans}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
           }}
         >
-          Register agent
-        </button>
-      </div>
-    </form>
+          <div>
+            <div style={{ font: `600 13px ${font.sans}`, color: color.ink }}>
+              Register agent
+            </div>
+            <div style={{ marginTop: 2, font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+              Prompt text is uploaded, then registered by its hash.
+            </div>
+          </div>
+          <AgentAvatar name={displayName || "AI"} size={30} />
+        </div>
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 160px), 1fr))",
+            gap: 8,
+          }}
+        >
+          <input
+            value={displayName}
+            onChange={(event) => setDisplayName(event.target.value)}
+            placeholder="Display name"
+            style={fieldStyle}
+          />
+          <input
+            value={agentId}
+            onChange={(event) => setAgentId(event.target.value)}
+            placeholder="agent-id"
+            style={{ ...fieldStyle, font: `400 12px ${font.mono}` }}
+          />
+          <input
+            value={modelRef}
+            onChange={(event) => setModelRef(event.target.value)}
+            placeholder="model"
+            style={{ ...fieldStyle, font: `400 12px ${font.mono}` }}
+          />
+        </div>
+
+        <textarea
+          value={prompt}
+          onChange={(event) => setPrompt(event.target.value)}
+          rows={4}
+          placeholder="System prompt"
+          style={{
+            ...fieldStyle,
+            resize: "vertical",
+            minHeight: 78,
+            lineHeight: 1.45,
+          }}
+        />
+
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
+          {KNOWN_ACTIONS.map((name) => {
+            const on = actions.includes(name);
+            return (
+              <button
+                key={name}
+                type="button"
+                onClick={() => toggle(name)}
+                style={{
+                  all: "unset",
+                  cursor: "pointer",
+                  padding: "5px 9px",
+                  borderRadius: radius.sm,
+                  border: `1px solid ${on ? statusTone.agent.border : color.border}`,
+                  background: on ? statusTone.agent.bg : color.paper,
+                  color: on ? accentVar : color.muted3,
+                  font: `600 10.5px ${font.sans}`,
+                }}
+              >
+                {ACTION_LABEL[name]}
+              </button>
+            );
+          })}
+          <button
+            type="submit"
+            disabled={!ready}
+            style={{
+              all: "unset",
+              cursor: ready ? "pointer" : "default",
+              marginLeft: "auto",
+              padding: "8px 15px",
+              borderRadius: radius.sm,
+              background: ready ? color.dark : color.chip,
+              color: color.onDark,
+              font: `600 12px ${font.sans}`,
+            }}
+          >
+            Register
+          </button>
+        </div>
+      </form>
+    </GroupCard>
   );
 }
 
@@ -367,29 +526,48 @@ function WatchRow({ watch, onUnwatch }: { watch: WatchView; onUnwatch: (id: stri
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 8,
-        padding: "8px 11px",
-        borderRadius: radius.sm,
-        border: `1px solid ${color.border}`,
-        background: color.paper,
-        boxShadow: shadow.card,
+        gap: 10,
+        padding: "12px 14px",
+        borderBottom: `1px solid ${color.borderSoft}`,
       }}
     >
-      <Icon name="hash" size={13} color={color.muted2} />
-      <span style={{ font: `500 12px ${font.mono}`, color: color.ink }}>
-        {watch.channel_id}
-      </span>
-      <Chip text={policyText(watch.policy)} tint={color.purple} />
+      <div
+        style={{
+          width: 30,
+          height: 30,
+          borderRadius: 8,
+          background: color.sunken,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: color.muted2,
+          flexShrink: 0,
+        }}
+      >
+        <Icon name="hash" size={15} />
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          title={watch.channel_id}
+          style={{
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            font: `600 12px ${font.mono}`,
+            color: color.ink,
+          }}
+        >
+          {watch.channel_id}
+        </div>
+        <div style={{ marginTop: 2, font: `400 11px ${font.sans}`, color: color.muted2 }}>
+          {policyText(watch.policy)}
+        </div>
+      </div>
       <button
+        type="button"
         onClick={() => onUnwatch(watch.channel_id)}
         title="Unwatch"
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          marginLeft: "auto",
-          font: `600 10.5px ${font.sans}`,
-          color: color.muted3,
-        }}
+        style={{ ...ghostButton, padding: "6px 10px", color: color.muted3 }}
       >
         Unwatch
       </button>
@@ -415,9 +593,11 @@ function WatchForm({
     return kind;
   };
 
+  const policy = buildPolicy();
+  const ready = channelId !== "" && policy !== null;
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const policy = buildPolicy();
     if (!channelId || !policy) return;
     onWatch({ channelId, policy });
     setChannelId("");
@@ -429,16 +609,15 @@ function WatchForm({
     <form
       onSubmit={submit}
       style={{
+        padding: 14,
+        borderTop: `1px solid ${color.borderSoft}`,
+        background: color.sidebar,
         display: "flex",
         flexDirection: "column",
-        gap: 8,
-        padding: 11,
-        borderRadius: radius.md,
-        border: `1px dashed ${color.borderStrong}`,
-        background: color.sunken,
+        gap: 9,
       }}
     >
-      <div style={{ display: "flex", gap: 7 }}>
+      <div style={{ display: "flex", gap: 8 }}>
         <select
           value={channelId}
           onChange={(event) => setChannelId(event.target.value)}
@@ -477,11 +656,11 @@ function WatchForm({
               style={{
                 all: "unset",
                 cursor: "pointer",
-                padding: "3px 9px",
+                padding: "5px 9px",
                 borderRadius: radius.sm,
-                border: `1px solid ${on ? accentVar : color.border}`,
-                background: on ? accentVar : color.paper,
-                color: on ? "#fff" : color.muted3,
+                border: `1px solid ${on ? statusTone.agent.border : color.border}`,
+                background: on ? statusTone.agent.bg : color.paper,
+                color: on ? accentVar : color.muted3,
                 font: `600 10.5px ${font.sans}`,
               }}
             >
@@ -491,18 +670,19 @@ function WatchForm({
         })}
         <button
           type="submit"
+          disabled={!ready}
           style={{
             all: "unset",
-            cursor: "pointer",
+            cursor: ready ? "pointer" : "default",
             marginLeft: "auto",
-            padding: "5px 13px",
+            padding: "7px 12px",
             borderRadius: radius.sm,
-            background: accentVar,
-            color: "#fff",
+            background: ready ? color.dark : color.chip,
+            color: color.onDark,
             font: `600 11.5px ${font.sans}`,
           }}
         >
-          Watch channel
+          Watch
         </button>
       </div>
     </form>
@@ -512,51 +692,92 @@ function WatchForm({
 // ── Runs timeline ───────────────────────────────────────
 
 function RunRow({ run, onCancel }: { run: RunView; onCancel: (id: string) => void }) {
-  const tint = runTint(run.status);
+  const tone = runTone(run.status);
   return (
     <div
       style={{
+        position: "relative",
         display: "flex",
-        alignItems: "center",
-        gap: 9,
-        padding: "9px 11px",
-        borderRadius: radius.sm,
-        border: `1px solid ${color.border}`,
-        borderLeft: `3px solid ${tint}`,
-        background: color.paper,
-        boxShadow: shadow.card,
+        alignItems: "flex-start",
+        gap: 12,
+        padding: "0 0 18px",
         animation: "ik-fade .16s ease-out",
       }}
     >
-      <div style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-          <span style={{ font: `600 12px ${font.sans}`, color: color.ink }}>
-            {run.agent_id}
-          </span>
-          <span style={{ font: `400 11px ${font.mono}`, color: color.muted3 }}>
-            {run.channel_id} @{run.anchor_seq}
-          </span>
-          {run.job_id && <Chip text="job" tint={color.blue} />}
-        </div>
-        <span style={{ font: `500 10.5px ${font.mono}`, color: tint }}>
-          {runLabel(run.status)}
-        </span>
-      </div>
-      {isAwaiting(run.status) && (
-        <button
-          onClick={() => onCancel(run.run_id)}
-          title="Cancel run"
+      <div
+        style={{
+          width: 10,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          alignSelf: "stretch",
+          paddingTop: 14,
+        }}
+      >
+        <span
           style={{
-            all: "unset",
-            cursor: "pointer",
-            marginLeft: "auto",
-            font: `600 10.5px ${font.sans}`,
-            color: color.red,
+            width: 8,
+            height: 8,
+            borderRadius: "50%",
+            background: tone.text,
+            boxShadow: `0 0 0 4px ${tone.bg}`,
+            flexShrink: 0,
           }}
-        >
-          Cancel
-        </button>
-      )}
+        />
+        <span style={{ width: 1, flex: 1, marginTop: 8, background: color.borderSoft }} />
+      </div>
+
+      <GroupCard style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ padding: "13px 14px", display: "flex", gap: 12 }}>
+          <AgentAvatar name={run.agent_id} size={30} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
+              <span style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>
+                {run.agent_id}
+              </span>
+              <StatusPill label={runLabel(run.status)} tone={tone} />
+              {run.job_id && <StatusPill label="JOB" tone={statusTone.agent} />}
+            </div>
+            <div
+              style={{
+                marginTop: 5,
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                flexWrap: "wrap",
+              }}
+            >
+              <Chip text={run.run_id} />
+              <Chip text={`${run.channel_id} @${run.anchor_seq}`} tint={color.blue} />
+              {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
+              {run.job_id && <Chip text={run.job_id} tint={color.blue} />}
+            </div>
+            <div
+              title={runDetail(run.status)}
+              style={{
+                marginTop: 6,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                font: `400 11px ${font.mono}`,
+                color: color.muted2,
+              }}
+            >
+              {runDetail(run.status)}
+            </div>
+          </div>
+          {isAwaiting(run.status) && (
+            <button
+              type="button"
+              onClick={() => onCancel(run.run_id)}
+              title="Cancel run"
+              style={{ ...ghostButton, color: color.red, padding: "6px 10px" }}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      </GroupCard>
     </div>
   );
 }
@@ -567,18 +788,37 @@ export function AgentView() {
   const { state, actions } = useDucktape();
 
   return (
-    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+    <div
+      data-screen-label="Agents"
+      style={{
+        flex: 1,
+        minWidth: 0,
+        minHeight: 0,
+        display: "flex",
+        flexDirection: "column",
+        background: "#fcfcfc",
+      }}
+    >
       <div
         style={{
+          height: 56,
+          flexShrink: 0,
           display: "flex",
           alignItems: "center",
-          gap: 7,
-          padding: "11px 17px",
+          gap: 10,
+          padding: "0 22px",
           borderBottom: `1px solid ${color.borderSoft}`,
         }}
       >
-        <Icon name="agent" size={15} color={color.muted} />
-        <span style={{ font: `600 13px ${font.sans}`, color: color.ink }}>Agents</span>
+        <Icon name="agent" size={17} color={color.muted} />
+        <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Agents</div>
+        <div style={{ font: `400 13px ${font.mono}`, color: color.muted2 }}>
+          {state.agents.length}
+        </div>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          <StatusPill label={`${state.watches.length} WATCHES`} tone={statusTone.neutral} />
+          <StatusPill label={`${state.runs.length} RUNS`} tone={statusTone.warning} />
+        </div>
       </div>
 
       <div
@@ -586,68 +826,91 @@ export function AgentView() {
           flex: 1,
           minHeight: 0,
           overflowY: "auto",
-          padding: 17,
-          display: "flex",
-          flexDirection: "column",
-          gap: 22,
+          padding: 22,
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 360px), 1fr))",
+          gap: 18,
+          alignItems: "start",
         }}
       >
-        {/* ── Agents roster + new-agent composer ── */}
-        <section style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <SectionLabel text="ROSTER" />
-          {state.agents.length === 0 ? (
-            <span style={{ font: `400 12px ${font.sans}`, color: color.muted2 }}>
-              No agents yet — register one below.
-            </span>
-          ) : (
-            state.agents.map((agent) => (
-              <AgentCard
-                key={agent.agent_id}
-                agent={agent}
-                onPause={actions.pauseAgent}
-                onResume={actions.resumeAgent}
-              />
-            ))
-          )}
-          <NewAgentForm onRegister={actions.registerAgent} />
-        </section>
+        <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 18 }}>
+          <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+            <SectionLabel>ROSTER</SectionLabel>
+            <GroupCard>
+              {state.agents.length === 0 ? (
+                <div style={{ padding: 14 }}>
+                  <EmptyState
+                    icon="agent"
+                    title="No agents registered"
+                    body="Register one below to give the node a collaboration-loop worker."
+                  />
+                </div>
+              ) : (
+                state.agents.map((agent, index) => (
+                  <AgentRow
+                    key={agent.agent_id}
+                    agent={agent}
+                    last={index === state.agents.length - 1}
+                    onPause={actions.pauseAgent}
+                    onResume={actions.resumeAgent}
+                  />
+                ))
+              )}
+            </GroupCard>
+          </section>
 
-        {/* ── Watched channels + watch composer ── */}
-        <section style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <SectionLabel text="WATCHES" />
-          {state.watches.length === 0 ? (
-            <span style={{ font: `400 12px ${font.sans}`, color: color.muted2 }}>
-              No watched channels — watch one to engage agents on new posts.
-            </span>
-          ) : (
-            state.watches.map((watch) => (
-              <WatchRow
-                key={watch.channel_id}
-                watch={watch}
-                onUnwatch={actions.unwatchChannel}
-              />
-            ))
-          )}
-          <WatchForm
-            channels={state.channels}
-            agents={state.agents}
-            onWatch={actions.watchChannel}
-          />
-        </section>
+          <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+            <SectionLabel>NEW AGENT</SectionLabel>
+            <NewAgentForm onRegister={actions.registerAgent} />
+          </section>
+        </div>
 
-        {/* ── Runs timeline (newest-first) ── */}
-        <section style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <SectionLabel text="RUNS" />
-          {state.runs.length === 0 ? (
-            <span style={{ font: `400 12px ${font.sans}`, color: color.muted2 }}>
-              No runs yet — an engaged post or a watched channel starts one.
-            </span>
-          ) : (
-            state.runs.map((run) => (
-              <RunRow key={run.run_id} run={run} onCancel={actions.cancelRun} />
-            ))
-          )}
-        </section>
+        <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 18 }}>
+          <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+            <SectionLabel>WATCHES</SectionLabel>
+            <GroupCard>
+              {state.watches.length === 0 ? (
+                <div style={{ padding: 14 }}>
+                  <EmptyState
+                    icon="hash"
+                    title="No watched channels"
+                    body="Watch a channel to let agents engage new posts by policy."
+                  />
+                </div>
+              ) : (
+                state.watches.map((watch) => (
+                  <WatchRow
+                    key={watch.channel_id}
+                    watch={watch}
+                    onUnwatch={actions.unwatchChannel}
+                  />
+                ))
+              )}
+              <WatchForm
+                channels={state.channels}
+                agents={state.agents}
+                onWatch={actions.watchChannel}
+              />
+            </GroupCard>
+          </section>
+
+          <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+            <SectionLabel>RUNS</SectionLabel>
+            {state.runs.length === 0 ? (
+              <EmptyState
+                icon="agent"
+                title="No runs yet"
+                body="Engaged posts and watched channels will appear here newest-first."
+              />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column" }}>
+                {state.runs.map((run) => (
+                  <RunRow key={run.run_id} run={run} onCancel={actions.cancelRun} />
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
       </div>
     </div>
   );
