@@ -364,9 +364,28 @@ fn blob_store_round_trips_and_digest_matches() {
     let digest = files.put_chunk(bytes.clone());
     assert_eq!(digest, sha256(&bytes), "put_chunk keys by sha256");
     assert!(files.has_chunk(&digest));
-    assert_eq!(files.get_chunk(&digest), Some(bytes.as_slice()));
+    assert_eq!(files.get_chunk(&digest), Some(bytes.clone()));
     assert!(!files.has_chunk(&sha256(b"absent")));
     assert_eq!(files.get_chunk(&sha256(b"absent")), None);
+}
+
+#[test]
+fn blob_handle_shares_one_store_with_the_module() {
+    block_on(async {
+        // the daemon seam: bytes uploaded through a CLONED handle must be the
+        // same store the registered module reads from and serves out of.
+        let files = Files::new(FILES);
+        let handle = files.blob_handle();
+        let bytes = b"uploaded through the daemon lane".to_vec();
+        let digest = handle.put_chunk(bytes.clone());
+        assert!(files.has_chunk(&digest), "module sees the handle's put");
+        assert_eq!(files.get_chunk(&digest), Some(bytes.clone()));
+        assert_eq!(handle.get_chunk(&digest), Some(bytes.clone()));
+
+        let (present, served) = fetch_chunk(&files, &to_hex(&digest)).await;
+        assert!(present, "serve_sync answers from the shared store");
+        assert_eq!(served, bytes);
+    });
 }
 
 /// fetch one chunk over the serve_sync wire and return (present, bytes).
