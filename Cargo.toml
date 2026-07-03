@@ -32,6 +32,7 @@ members = [
     "crates/apps/agent", "crates/apps/agent-interface", "crates/apps/agent-oracle",
     "crates/apps/tasks", "crates/apps/tasks-interface",
     "crates/apps/vaults", "crates/apps/vaults-interface",
+    "crates/apps/profiles", "crates/apps/profiles-interface",
     "crates/apps/automations", "crates/apps/automations-interface",
     "crates/apps/inbox", "crates/apps/inbox-interface",
     "crates/apps/files", "crates/apps/files-interface",
@@ -94,6 +95,7 @@ agent = { path = "crates/apps/agent" }
 agent-oracle = { path = "crates/apps/agent-oracle" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
+profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
@@ -114,6 +116,7 @@ chat-interface = { path = "crates/apps/chat-interface" }
 agent-interface = { path = "crates/apps/agent-interface" }
 tasks-interface = { path = "crates/apps/tasks-interface" }
 vaults-interface = { path = "crates/apps/vaults-interface" }
+profiles-interface = { path = "crates/apps/profiles-interface" }
 automations-interface = { path = "crates/apps/automations-interface" }
 inbox-interface = { path = "crates/apps/inbox-interface" }
 files-interface = { path = "crates/apps/files-interface" }

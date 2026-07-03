@@ -83,6 +83,7 @@ use jobs::Jobs;
 use kv::Kv;
 use memory::Memory;
 use node::OrderedNode;
+use profiles::Profiles;
 use recovery::{Manifest, Recovery};
 use saga::SagaModule;
 use sdk::{Msg, StateRoot};
@@ -131,7 +132,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 17] = [
     "kv",
     "document",
     "chat",
@@ -141,6 +142,7 @@ const MODULE_IDS: [&str; 16] = [
     "saga",
     "tasks",
     "vaults",
+    "profiles",
     "inbox",
     "directory",
     "automations",
@@ -246,6 +248,9 @@ async fn genesis_host(
         Box::new(SagaModule::new("saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
+        // the origin-gated display-name registry: each verified submit origin
+        // may set its own name, so the ui can resolve authors to names.
+        Box::new(Profiles::new("profiles")),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
@@ -330,6 +335,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("vaults install: {e}"))?;
 
+    let mut profiles = Profiles::new("profiles");
+    let (bytes, root) = snapshot_of("profiles")?;
+    profiles
+        .install(bytes, root)
+        .map_err(|e| format!("profiles install: {e}"))?;
+
     let mut inbox = Inbox::new("inbox");
     let (bytes, root) = snapshot_of("inbox")?;
     inbox
@@ -387,6 +398,7 @@ async fn restore_host(
         Box::new(saga),
         Box::new(tasks),
         Box::new(vaults),
+        Box::new(profiles),
         Box::new(inbox),
         Box::new(files),
         Box::new(memory),
@@ -509,6 +521,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("vaults install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("profiles").await?;
+    let mut profiles = Profiles::new("profiles");
+    profiles
+        .install(&bytes, root)
+        .map_err(|e| format!("profiles install: {e}"))?;
+
     let (bytes, root) = snapshot_of("inbox").await?;
     let mut inbox = Inbox::new("inbox");
     inbox
@@ -570,6 +588,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(saga),
         Box::new(tasks),
         Box::new(vaults),
+        Box::new(profiles),
         Box::new(inbox),
         Box::new(files),
         Box::new(memory),
