@@ -87,8 +87,9 @@ function WorkspaceSection() {
         </span>
       </Row>
 
-      {/* inviting + admitting members needs the node's live-admission path,
-          which isn't built yet (see LIVE_JOIN_SUPPORTED); hidden until it is. */}
+      {/* inviting + admitting members drives the node's live-admission path
+          (landed in PR #77); gated on LIVE_JOIN_SUPPORTED so the same kill-switch
+          hides invite/admit if live join is ever turned back off. */}
       {LIVE_JOIN_SUPPORTED && (
         <>
           <Row label="Invite a member">

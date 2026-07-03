@@ -2,13 +2,15 @@
 // founding connects; joining parks and surfaces the phase. Drives the provider
 // over a mocked Tauri `invoke` + a stubbed node surface.
 
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
+import { LIVE_JOIN_SUPPORTED } from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
+import { OnboardingGate } from "../views/onboarding/OnboardingGate";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -159,6 +161,68 @@ describe("desktop onboarding", () => {
       });
       expect(screen.getByTestId("ws").textContent).toBe("Guest");
       expect(screen.getByTestId("phase").textContent).toBe("parked");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// Live join (network-shape admission) landed at the node layer in PR #77, so the
+// gate's Join tab is reachable, not the disabled "temporarily unavailable" note.
+// This is the regression guard for LIVE_JOIN_SUPPORTED being flipped back off.
+describe("onboarding gate — live join UI", () => {
+  it("exposes the Join form and dispatches a join from it", async () => {
+    expect(LIVE_JOIN_SUPPORTED).toBe(true);
+    vi.useFakeTimers();
+    try {
+      markTauri();
+      const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
+      invokeMock.mockImplementation((cmd: string) => {
+        switch (cmd) {
+          case "workspace_list":
+            return Promise.resolve([]);
+          case "workspace_active":
+            return Promise.resolve(null);
+          case "workspace_join":
+            return Promise.resolve(guest);
+          case "workspace_select":
+            return Promise.resolve({ id: "g", httpUrl: "http://127.0.0.1:9002" });
+          case "workspace_phase":
+            return Promise.resolve({ phase: "parked", detail: "awaiting admission" });
+          default:
+            return Promise.resolve(null);
+        }
+      });
+      // a parked joiner's surface never answers; keep connect from throwing loudly.
+      vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("refused"))));
+
+      render(
+        <DucktapeProvider>
+          <OnboardingGate />
+        </DucktapeProvider>,
+      );
+      await act(async () => {}); // flush boot
+
+      // switch to the Join tab (the "Join" tab button, not the "Join workspace" submit)
+      fireEvent.click(screen.getByText("Join"));
+
+      // the join form is live — no disabled note, the invite-blob field is present
+      expect(screen.queryByText(/temporarily unavailable/i)).toBeNull();
+      fireEvent.change(screen.getByPlaceholderText("Workspace name"), {
+        target: { value: "Guest" },
+      });
+      fireEvent.change(screen.getByPlaceholderText(/Paste invite blob/i), {
+        target: { value: "ducktape-invite-v1:blob" },
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText("Join workspace"));
+      });
+
+      expect(invokeMock).toHaveBeenCalledWith("workspace_join", {
+        name: "Guest",
+        blob: "ducktape-invite-v1:blob",
+      });
     } finally {
       vi.useRealTimers();
     }

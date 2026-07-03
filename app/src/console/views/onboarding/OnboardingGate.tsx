@@ -60,8 +60,8 @@ export function OnboardingGate() {
   const [blob, setBlob] = useState("");
 
   const busy = state.onboardingBusy;
-  // joining a running network is blocked at the node layer (see
-  // LIVE_JOIN_SUPPORTED); the join form is disabled with an honest note.
+  // live join is enabled (LIVE_JOIN_SUPPORTED); joinGated is the kill-switch
+  // path that disables the join form should the flag ever be turned back off.
   const joinGated = mode === "join" && !LIVE_JOIN_SUPPORTED;
   const canSubmit =
     !joinGated &&
@@ -109,7 +109,7 @@ export function OnboardingGate() {
             {mode === "create"
               ? "Found a new network — you become its first member, with a fresh identity."
               : joinGated
-                ? "Joining an existing network is coming soon."
+                ? "Joining an existing network is temporarily unavailable."
                 : "Paste an invite from a member to join their network with a new identity."}
           </span>
         </div>
@@ -139,9 +139,8 @@ export function OnboardingGate() {
               lineHeight: 1.5,
             }}
           >
-            Joining a running network isn&apos;t available yet — live admission is
-            still being built at the node layer. Found a new network to get
-            started, and invite others from Settings.
+            Joining a running network is temporarily unavailable. Found a new
+            network to get started, and invite others from Settings.
           </div>
         ) : (
           <>

@@ -59,15 +59,13 @@ export interface PhaseReport {
 /** The registry is desktop-only; the web build never calls these. */
 export const isDesktop = (): boolean => isTauri();
 
-// Joining a RUNNING network (post-genesis, network shape) is blocked at the
-// node/consensus layer, not here: config.rs rejects an un-admitted network-shape
-// key ("live admission is not built yet"), and an un-admitted key can't even
-// connect to the mesh to be admitted. The park→promote flow only works in the
-// dev-seed shape, where every joiner is pre-listed in peer_seeds on all nodes.
-// The join/admit code below is complete and correct FOR WHEN that node feature
-// lands; until then the UI gates it behind this flag. Founding a network (the
-// create flow) is unaffected and fully works.
-export const LIVE_JOIN_SUPPORTED = false;
+// Live join/admit — joining a RUNNING network (post-genesis, network shape) and
+// admitting a joiner into it. The node's live-admission path landed in PR #77:
+// config.rs now resolves an un-admitted network-shape key as a pending joiner
+// that parks on the mesh until governance admits it (park→invite-accept→promote),
+// proven by bin/node/tests/live_admission_e2e.rs. So this UI is now live. The
+// flag remains a single named toggle should the flow ever need re-gating.
+export const LIVE_JOIN_SUPPORTED = true;
 
 // ── Reads ───────────────────────────────────────────────
 
