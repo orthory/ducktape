@@ -19,7 +19,6 @@ node = { workspace = true }
 consensus = { workspace = true }
 recovery = { workspace = true }
 sdk = { workspace = true }
-state = { workspace = true }
 statesync = { workspace = true }
 kv = { workspace = true }
 kv-interface = { workspace = true }
@@ -29,6 +28,8 @@ directory-interface = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 governance = { workspace = true }
+# the invite-accept verb drives governance ops through the local rpc.
+governance-interface = { workspace = true }
 saga = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
@@ -69,5 +70,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
 chat-interface = { workspace = true }
-governance-interface = { workspace = true }
 tempfile = "3"
