@@ -19,15 +19,22 @@ workspace는 platform layer별로 구성되어 있다.
 - `crates/system/kv`: QMDB byte-key value module.
 - `crates/system/valset`: ed25519 validator membership module.
 - `crates/system/saga`: async workflow의 deterministic continuation state.
+- `crates/system/governance`: valset 위의 validator-set governance.
 - `*-interface` crate: types-only payload와 query surface.
 
 ## Apps
 
 - `crates/apps/forge`: git-backed project state.
 - `crates/apps/document`: QMDB 위 block document state.
-- `crates/apps/messaging`: root-backed shared message storage.
-- `crates/apps/chat`: messaging 위 chat view.
-- `crates/apps/agent`: messaging-backed thread model 위 agent session.
+- `crates/apps/chat`: QMDB 위 storage-owning chat module, hook fan-out 포함.
+- `crates/apps/agent`: agent registry, channel watch, run record.
+- `crates/apps/tasks`: 작은 canonical task state.
+- `crates/apps/vaults`: 복제되는 opaque secret ciphertext.
+- `crates/apps/inbox`: follow-up으로 배달되는 per-member notification queue.
+- `crates/apps/automations`: chat hook seam 위의 operator rule.
+- `crates/apps/files`: node-local chunk byte 위의 consensus file manifest.
+- `crates/apps/memory`: filesystem 모양의 shared agent workspace.
+- `crates/apps/jobs`: consensus-native work board.
 - app `*-interface` crate: 합법적인 cross-module payload surface.
 
 ## Examples and Binaries

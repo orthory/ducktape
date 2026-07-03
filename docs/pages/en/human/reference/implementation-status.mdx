@@ -24,18 +24,27 @@ This status page is grounded in checked-in code, tests, and binaries.
 
 ## Module State
 
-- QMDB-backed modules (kv, document, messaging) expose real authenticated roots
-  and answer network state-sync over `serve_sync`; messaging stores one record
-  per message (no whole-history value, no 1 MiB commit bomb) with keyset
+- QMDB-backed modules (kv, document, chat) expose real authenticated roots
+  and answer network state-sync over `serve_sync`; chat stores one record
+  per entity (no whole-history value, no 1 MiB commit bomb) with computed-key
   pagination.
 - Forge derives a 32-byte state root from git state and verifies object closure
   before install.
 - Snapshot-style modules use canonical bytes where that fits the module: valset,
-  saga, tasks, directory, governance, vaults.
+  saga, tasks, directory, governance, vaults, inbox, automations, files, memory,
+  jobs.
 - System governance gates the validator set (member-only proposals, deterministic
   tally, follow-up membership ops); valset rejects external membership writes.
 - Vaults replicate opaque secret ciphertext with owner-gated write integrity.
-- Chat and agent are wrapper modules over the messaging substrate.
+- Agent is a pure state machine holding the agent registry, channel watches, and
+  run records; automations evaluates user-authored chat posts against operator
+  rules with probe-before-emit follow-up actions.
+- The module wave rounds out the workplace surface: inbox delivers notifications
+  as follow-up ops atomic with their cause (P2), files commits content-addressed
+  manifests while chunk bytes stay node-local behind digest-and-length
+  verification, memory is a generation-pinned shared agent workspace with prefix
+  watches and citable `duck://` reads, and jobs is a first-claim-wins work board
+  with view leases and permissionless reclaim.
 
 ## Verification Surface
 

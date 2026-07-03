@@ -9,11 +9,116 @@ product module은 platform이 호스팅하는 업무용 surface다. 같은 modul
   노출한다.
 - `forge`는 git-backed project state를 저장하고, git head에서 root를 계산하며
   connectivity verification으로 pack install을 보호한다.
-- `messaging`은 root-backed shared message storage를 제공한다.
-- `chat`은 messaging storage 위의 view다.
-- `agent`는 messaging-backed thread model을 통해 agent session을 저장한다.
-- `kv`, `valset`, `saga`, `directory`, `greeter`는 infrastructure, example,
-  test를 지원한다.
+- `chat`은 storage를 소유하는 chat module이다: channel, thread, edit, reaction,
+  membership을 entity당 QMDB record 하나로 저장하고, 구독한 module로 hook
+  fan-out을 보낸다.
+- `agent`는 agent registry, channel watch, run record를 담는 순수 state
+  machine이다.
+- `tasks`는 staged write 위의 작은 canonical task list를 저장한다.
+- `vaults`는 owner-gated write로 opaque secret ciphertext를 복제한다.
+- `inbox`는 follow-up op로 배달되는 per-member notification queue를 저장한다.
+- `automations`는 chat hook seam 위에서 도는 operator-defined rule을 저장한다.
+- `files`는 content-addressed file manifest를 commit한다. chunk byte는
+  node-local에 남는다.
+- `memory`는 immutable generation을 가진 filesystem 모양의 shared agent
+  workspace다.
+- `jobs`는 first-claim-wins claim을 쓰는 consensus-native work board다.
+- `kv`, `valset`, `saga`, `governance`, `directory`, `greeter`는 infrastructure,
+  example, test를 지원한다.
+
+## Inbox
+
+inbox는 per-member notification queue를 consensus state로 담는다: member마다
+seq가 붙은 item list와 read cursor 하나씩이다. write는 `Deliver`, `MarkRead`,
+`Clear`로, read는 `List`, `Unread`로 간다. cap은 execute에서 rejection으로
+강제된다(`kind` 64바이트, `body` 16 KiB, bounded member 수). 예외 하나가
+의도적이다: per-member item cap을 넘는 delivery는 가장 오래된 item을
+deterministic하게 drop한다 — 이것은 notification queue지 ledger가 아니다.
+
+핵심 mechanism은 atomic-with-cause delivery다. 다른 module이 notification을
+follow-up op로 배달하므로, notification은 그 원인이 된 event와 같은 block에서
+commit된다(platform promise P2). external push service는 없다 — queue 자체가
+delivery이고, 이것이 air-gap-native notification story다. 각 item의 `source`는
+배달한 origin을 기록한다 — module id, external submitter는 `ext:` + lowercase
+hex, 또는 `system` — module이 직접 계산하며 caller가 공급하지 않는다.
+
+## Automations
+
+automations는 operator-defined rule을 저장한다 — chat post filter 위의
+trigger와, chat message를 post하거나 task를 만드는 action — 그리고 bounded
+run-history ring을 함께 둔다. rule 관리는 `CreateRule`, `SetEnabled`,
+`DeleteRule`로, read는 `ListRules`, `GetRule`, `RunHistory`로 간다. hook
+event는 origin-gated다: `Origin::Module("chat")`만 hook arm에 도달하므로
+submitter가 hook event를 위조할 수 없다.
+
+rule은 post author가 user일 때만 발화한다. module이나 agent가 작성한 post —
+이 module 자신의 follow-up 포함 — 는 rule을 절대 trigger하지 않으므로, hooked
+channel에 post하는 automation이 cascade할 수 없다. event당 action budget은
+8이고, 모든 action은 emit 전에 probe된다: host-routed query로 target channel이
+존재하는지, 합성된 message/task id가 미사용인지 검증한다 — user가 합성 id를
+먼저 post해서 rule을 막아버리는 id-squatting을 차단한다. probe 실패나
+message-text fetch 실패는 block을 abort하는 대신 `action_ok = false`인 run
+record로 강등된다. probe가 볼 수 없는 것은 여전히 trigger한 post와 하나의
+atomic unit으로 commit되거나 abort된다(P2).
+
+## Files
+
+files는 절대 섞이면 안 되는 두 plane을 유지한다. metadata control plane은
+consensus state다: `file_id`로 key된 manifest가 file 이름, size, 순서 있는
+per-chunk sha256 digest, 그리고 whole-file digest-of-digests를 고정한다. root에
+접히는 files state는 이것뿐이고, state sync가 옮기는 것도 이것뿐이다. body
+store는 node-local이다: 자기 자신의 sha256으로 key된 chunk byte는 op stream에도
+consensus에도 절대 들어가지 않는다. write는 `AddManifest`, `RemoveManifest`로,
+read는 `Stat`, `List`로 간다. chunk byte는 전용 `serve_sync` lane으로
+peer-to-peer 이동한다. size cap은 execute에서 rejection으로 강제되어 oversized
+value가 root preimage에 들어가지 않는다.
+
+receiver contract가 부정직한 server를 무해하게 만든다: fetch한 모든 chunk는
+`verify_chunk`를 통과해야 하고, 이 함수는 sha256 digest와 manifest가 그 위치에
+암시하는 정확한 length를 둘 다 검사한다. length 검사는 belt-and-braces가 아니라
+load-bearing이다 — digest 동등성만으로는 digest가 맞는 zero-byte chunk를
+받아들여 잘못된 file을 재구성하게 된다.
+
+## Memory
+
+memory는 filesystem 모양의 shared agent workspace다 — NoKV 철학: agent가 원하는
+것은 key-value store가 아니라 filesystem이다. namespace는 절대 경로들의
+집합이고 directory는 암묵적이다. 모든 file은 immutable generation의 stack이며,
+publish는 write-once다 — 무언가를 제자리에서 고치는 대신 다음 generation을
+append한다. `(path, generation)` pair는 stable하고 hash-pinned된 reference로,
+무언가 pin하고 있는 동안 절대 rebind되거나 재사용되지 않는다. write는
+`Publish`, `Delete`, `Snapshot`, `DropSnapshot`, `RegisterWatch`,
+`UnregisterWatch`로 간다. read는 progressive-disclosure verb인 `Ls`, `Stat`,
+`Read`, `Find`, `Grep`이고, grep hit는 인용 가능한
+`duck://memory/<path>@<generation>#L<line>` evidence URI를 담는다.
+
+`Snapshot`은 namespace 전체의 현재 path-to-generation mapping을 pin한다 —
+mapping만이고 body 복사는 절대 아니다. `Delete`는 snapshot이 아직 pin한
+generation을 retain한다. generation record는 live file도 snapshot도 참조하지
+않을 때 정확히 그때 drop된다. watch는 canonical path prefix에 module을
+구독시키며 segment 단위로 match한다(`/a`는 `/a/b`에 match하고 `/ab`에는 절대
+match하지 않는다). 성공한 publish마다 match하는 watcher별 follow-up event
+하나가 같은 block에서 emit된다(P2). skill 공유도 같은 namespace를 탄다: shared
+skill은 `kind=skill` meta를 가진 `/skills/<name>` 아래 document이고, `/skills/`
+위의 `Find`로 발견한다.
+
+## Jobs
+
+jobs는 on-platform actor를 위한 consensus-native work board다: 사람과 agent
+fleet이 평범한 signed op를 제출한다. submitter가 job을 올리면 아무 worker나
+claim할 수 있고, consensus order로 정확히 하나의 claim만 이긴다 — total order가
+곧 lock이고, 진 claim은 모든 node에서 소리 내며 block을 fail한다. 그 rejection이
+race-resolution signal이다. lifecycle은 submit에서 pending으로, claim에서 view
+lease 아래 processing으로, 그리고 done 또는 failed로 finalize된다. write는
+`Submit`, `Claim`, `Finalize`, `Release`, `Reclaim`, `Cancel`, `Prune`으로,
+read는 `Get`, `List`, `Counts`로 가며 committed state에서만 답한다.
+
+claim의 view lease가 만료되면 누구든 job을 `Reclaim`해 pending으로 되돌릴 수
+있다 — reclaim은 permissionless다. attempt는 8회로 cap되고, `Cancel`과
+`Prune`은 submitter 전용이다. jobs는 saga와 구별된다: jobs는 signed RPC op로
+행동하는 actor를 위한 product work board이고, saga는 node 자신의 worker loop가
+수행하는 off-consensus 작업을 위한 platform의 reactor-effect ledger다. jobs는
+saga도 reactor도 절대 건드리지 않는다.
 
 ## Interface Shape
 
@@ -23,7 +128,8 @@ route한다. product module은 implementation API가 아니라 typed message와 
 
 ## Product Pressure
 
-checked-in module에서 유용한 pressure point가 보인다. chat은 shared messaging
-storage 위의 live product read를 검증하고, forge는 authenticated project state를
-검증하며, agent session은 future worker-backed agent가 필요로 할 storage 및 query
-boundary를 검증한다.
+checked-in module에서 유용한 pressure point가 보인다. chat은 QMDB-backed
+channel storage 위의 live product read를 검증하고, forge는 authenticated
+project state를 검증하며, module wave — inbox, automations, files, memory,
+jobs — 는 follow-up atomicity, hook fan-out, 그리고 앞으로의 collaboration
+기능이 기댈 consensus-metadata/node-local-bytes split을 검증한다.

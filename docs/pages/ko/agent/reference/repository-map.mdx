@@ -17,15 +17,22 @@
 - `crates/system/kv`: QMDB byte-key module.
 - `crates/system/valset`: validator membership state.
 - `crates/system/saga`: deterministic continuation state.
+- `crates/system/governance`: valset 위의 validator-set governance.
 - `*-interface`: typed payload와 query surface.
 
 ## Apps
 
 - `crates/apps/document`: QMDB document state.
 - `crates/apps/forge`: git-backed project state.
-- `crates/apps/messaging`: shared message storage.
-- `crates/apps/chat`: chat view.
-- `crates/apps/agent`: messaging-backed thread 위 agent session.
+- `crates/apps/chat`: hook fan-out을 갖춘 storage-owning chat module.
+- `crates/apps/agent`: agent registry, watch, run record.
+- `crates/apps/tasks`: 작은 canonical task state.
+- `crates/apps/vaults`: 복제되는 opaque secret ciphertext.
+- `crates/apps/inbox`: per-member notification queue.
+- `crates/apps/automations`: chat hook seam 위의 operator rule.
+- `crates/apps/files`: node-local chunk byte 위의 consensus manifest.
+- `crates/apps/memory`: filesystem 모양의 shared agent workspace.
+- `crates/apps/jobs`: consensus-native work board.
 
 ## Docs
 
