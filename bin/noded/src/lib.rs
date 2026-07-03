@@ -748,7 +748,21 @@ async fn git_receive_pack(
         }
     };
     let Some(first) = commands.first() else {
-        return error_response(StatusCode::BAD_REQUEST, "empty git command list");
+        // a push whose pack exceeds git's `http.postBuffer` (1 MiB default) is
+        // preceded by a flush-only PROBE POST (Content-Length: 4, body `0000`,
+        // zero commands) before git streams the real chunked request. an empty
+        // command list is a valid no-op: answer 200 with an empty result so the
+        // probe succeeds and git proceeds with the actual push. 400 here aborts
+        // every push larger than the post buffer.
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/x-git-receive-pack-result"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            GIT_FLUSH_PKT.to_vec(),
+        )
+            .into_response();
     };
 
     // the first command carries the ref update, with capabilities after a NUL.

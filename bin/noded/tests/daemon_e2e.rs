@@ -871,3 +871,39 @@ fn git_push_over_http_lands_in_forge_head() {
         "a rejected push must not move forge HEAD"
     );
 }
+
+/// Regression: a push whose data exceeds git's `http.postBuffer` is preceded by
+/// a flush-only PROBE POST (zero commands) before the real chunked request. The
+/// receive-pack handler must answer that probe 200, not 400 — otherwise every
+/// push larger than the buffer (the common case for a real repo) fails. Forcing
+/// `http.postBuffer=1` makes git take the probe path for even a one-commit push.
+#[test]
+fn git_push_larger_than_post_buffer_uses_the_probe_path() {
+    if !have_git() {
+        eprintln!("skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH");
+        return;
+    }
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let url = format!("http://127.0.0.1:{}/forge/probed", daemon.port);
+
+    let work = tempfile::TempDir::new().expect("git work dir");
+    let wd = work.path();
+    git_ok(wd, &["init"]);
+    commit_file(wd, "hello.txt", "hi from a probed push\n", "first commit");
+    git_ok(wd, &["remote", "add", "ducktape", &url]);
+
+    // `-c http.postBuffer=1` forces git through the large-request probe.
+    let push = git_capture(wd, &["-c", "http.postBuffer=1", "push", "ducktape", "main"]);
+    eprintln!("=== probed git push ===\n{}", render(&push));
+    assert!(
+        push.status.success(),
+        "a push through the postBuffer probe path must succeed:\n{}",
+        render(&push)
+    );
+    assert_eq!(
+        forge_head(&daemon, "probed"),
+        Some(rev_parse_head(wd)),
+        "forge HEAD must equal the pushed commit after a probed push"
+    );
+}
