@@ -21,8 +21,10 @@ ops/fleet.sh down                 # tear it all down
 ```
 
 The dashboard shows one live tile per worktree (branch, sha, ahead/behind vs
-`dev`, status). Click a tile to open a full-size **interactive** session for that
-worktree's app.
+`dev`, status, and an **agent activity** line — uncommitted-file count + latest
+commit). Toggle **Grid** ⇄ **Graph** (the git branch tree via `@xyflow/react`;
+`?view=graph` deep-links it). Click a tile to open a full-size **interactive**
+session plus that worktree's commit trail.
 
 ## How it works
 
@@ -48,5 +50,6 @@ per worktree:  Xvfb :11x → tauri dev (isolated $HOME) → x11vnc 127.0.0.1:591
 
 - Read-only console: it views and connects; bring instances up/down with the
   script (no lifecycle control in the UI — deferred by design).
-- `@xyflow/react` is installed for a later branch-tree view mode; v1 is the grid.
+- Activity source is git/worktree churn (provider-agnostic — works for any
+  agent). The `<ActivityFeed>` is pluggable if you want a richer source later.
 - Design spec: `docs/superpowers/specs/2026-07-03-agent-qa-fleet-dashboard-design.md`.

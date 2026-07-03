@@ -110,6 +110,10 @@ up_one(){
 { "build": { "beforeDevCommand": null, "devUrl": "http://localhost:$vite" } }
 JSON
 
+  # a dead instance leaves a stale socket file that would block restart; if the
+  # VNC (started after the app) is gone, the instance is dead — clear it.
+  if [ -S "$mcp" ] && ! port_up "$vnc"; then rm -f "$mcp"; fi
+
   # the app — isolated HOME, warm build caches, headless WebKit flags
   if ! [ -S "$mcp" ]; then
     ( cd "$app" && \
@@ -201,10 +205,19 @@ for w in wts:
     subj = sh("git", "-C", path, "log", "-1", "--pretty=%s")
     ahead = sh("git", "-C", path, "rev-list", "--count", f"{base}..HEAD") or "0"
     behind = sh("git", "-C", path, "rev-list", "--count", f"HEAD..{base}") or "0"
+    # agent activity: what's been done to this branch. \x1f is a field sep the
+    # commit subject can't contain. dirty = in-progress edits (the live pulse).
+    commits = []
+    for ln in sh("git", "-C", path, "log", "-4", "--pretty=%h\x1f%s\x1f%cr").splitlines():
+        p = ln.split("\x1f")
+        if len(p) == 3:
+            commits.append({"sha": p[0], "subject": p[1], "age": p[2]})
+    dirty = len([l for l in sh("git", "-C", path, "status", "--porcelain").splitlines() if l.strip()])
     node = {"id": wid, "branch": branch, "path": os.path.relpath(path, main),
             "head": {"sha": sha, "subject": subj},
             "parent": base if branch != base else None,
             "ahead": int(ahead or 0), "behind": int(behind or 0),
+            "activity": {"dirty": dirty, "commits": commits},
             "status": "down"}
     if wid in slots:
         slot = slots[wid]

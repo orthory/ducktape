@@ -82,8 +82,45 @@ body {
 
 .tile-foot {
   padding: 7px 10px; color: var(--muted); font-size: 12px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: center; gap: 8px;
 }
+.tile-foot .subj { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* view toggle */
+.toggle { display: flex; gap: 2px; background: #0006; border: 1px solid var(--line); border-radius: 7px; padding: 2px; }
+.toggle button {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 12px; padding: 3px 10px; border-radius: 5px;
+}
+.toggle button[data-active="true"] { background: var(--line); color: var(--fg); }
+
+/* activity feed */
+.activity-compact { display: flex; gap: 6px; white-space: nowrap; font-size: 11px; }
+.activity-compact .dirty { color: var(--building); }
+.activity-compact .clean { color: var(--down); }
+.activity-compact .lastcommit { color: var(--muted); }
+.activity-full { padding: 12px 14px; font-size: 12px; overflow: auto; }
+.activity-title { text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); font-size: 11px; margin-bottom: 8px; }
+.activity-full .dirty { color: var(--building); margin-bottom: 8px; }
+.activity-full .commits { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.activity-full .commits li { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; align-items: baseline; }
+.activity-full .commits .sha { color: var(--accent); font-family: ui-monospace, "Geist Mono", monospace; }
+.activity-full .commits .subj { color: var(--fg); }
+.activity-full .commits .age { grid-column: 2; color: var(--muted); font-size: 11px; }
+
+/* graph view */
+.graph { flex: 1; min-height: 0; }
+.graph-node { width: 340px; }
+.react-flow__handle { width: 6px; height: 6px; background: var(--line); border: none; }
+.react-flow__background { background: var(--bg); }
+.react-flow__controls { box-shadow: none; }
+.react-flow__controls button { background: var(--panel); border-bottom: 1px solid var(--line); color: var(--fg); fill: var(--fg); }
+.react-flow__controls button:hover { background: var(--line); }
+.react-flow__edge-path { stroke: var(--line); stroke-width: 1.5; }
+.react-flow__edge.animated .react-flow__edge-path { stroke: var(--up); }
+
+/* drawer body split: screen + activity side panel */
+.drawer-body { flex: 1; display: flex; min-height: 0; }
 
 .drawer-backdrop {
   position: fixed; inset: 0; background: #000a; z-index: 20;
@@ -99,3 +136,4 @@ body {
 .close { background: none; border: none; color: var(--muted); font-size: 16px; cursor: pointer; }
 .close:hover { color: var(--fg); }
 .drawer-screen { position: relative; flex: 1; background: var(--bg); }
+.drawer-side { width: 280px; border-left: 1px solid var(--line); background: var(--panel); overflow: auto; }

@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import type { FleetNode } from "../types";
 import { useRfb } from "../useRfb";
+import { ActivityFeed } from "./ActivityFeed";
 
 function AheadBehind({ ahead, behind }: { ahead: number; behind: number }) {
   if (!ahead && !behind) return null;
@@ -54,7 +55,10 @@ export function AppTile({
           </div>
         )}
       </div>
-      <div className="tile-foot">{node.head.subject}</div>
+      <div className="tile-foot">
+        <span className="subj">{node.head.subject}</span>
+        <ActivityFeed activity={node.activity} compact />
+      </div>
     </div>
   );
 }

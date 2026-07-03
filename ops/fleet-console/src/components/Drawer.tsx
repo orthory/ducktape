@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import type { FleetNode } from "../types";
 import { useRfb } from "../useRfb";
+import { ActivityFeed } from "./ActivityFeed";
 
 // Click-to-interact: a full-size, INTERACTIVE (viewOnly=false) session for one
 // worktree. Same token as its tile — websockify routes it to that VNC.
@@ -28,11 +29,16 @@ export function Drawer({
             ✕
           </button>
         </div>
-        <div className="drawer-screen">
-          <div ref={screenRef} className="rfb interactive" />
-          {status !== "connected" && (
-            <div className="tile-overlay">{status}…</div>
-          )}
+        <div className="drawer-body">
+          <div className="drawer-screen">
+            <div ref={screenRef} className="rfb interactive" />
+            {status !== "connected" && (
+              <div className="tile-overlay">{status}…</div>
+            )}
+          </div>
+          <aside className="drawer-side">
+            <ActivityFeed activity={node.activity} />
+          </aside>
         </div>
       </div>
     </div>
