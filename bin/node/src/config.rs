@@ -544,22 +544,13 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         return Err(format!("network {} has no validators", descriptor.chain_id));
     }
     let bootstrap = descriptor.bootstrap_entries()?;
-    // mesh = validators ∪ bootstrap identities (static until live admission
-    // lands; a key outside this set cannot even connect).
+    // mesh = validators ∪ bootstrap identities. A fresh network-shape joiner
+    // may be outside this set at genesis; it parks until governance admits it.
     let mut mesh = validators.clone();
     for (k, _) in &bootstrap {
         if !mesh.contains(k) {
             mesh.push(k.clone());
         }
-    }
-    if !mesh.contains(&me) {
-        return Err(format!(
-            "identity {} is not a member of network {} — pre-genesis, a member must run \
-             `ducktape-node admit {}` and re-share the invite (live admission is not built yet)",
-            hex_bytes(me.as_ref()),
-            descriptor.chain_id,
-            hex_bytes(me.as_ref()),
-        ));
     }
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
@@ -764,9 +755,9 @@ mod tests {
     }
 
     #[test]
-    fn a_non_member_identity_is_refused_with_admit_guidance() {
+    fn a_non_member_identity_resolves_as_a_pending_joiner() {
         let dir = tmp("nonmember");
-        let (_, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let other = ed25519::PrivateKey::from_seed(3).public_key();
         let d = NetworkDescriptor {
             chain_id: "closed#00000000".into(),
@@ -780,11 +771,11 @@ mod tests {
             "network = \"network.toml\"\nlisten = \"127.0.0.1:52202\"\n",
         )
         .expect("write");
-        let err = resolve(&dir.join("node.toml")).expect_err("non-member must be refused");
-        assert!(
-            err.contains("admit"),
-            "error carries the admit guidance: {err}"
-        );
+        let r = resolve(&dir.join("node.toml")).expect("non-member resolves as a joiner");
+        assert_eq!(r.signer.public_key(), me.public_key());
+        assert!(!r.validators.contains(&me.public_key()));
+        assert_eq!(r.validators, vec![other.clone()]);
+        assert_eq!(r.mesh, vec![other]);
     }
 
     #[test]
