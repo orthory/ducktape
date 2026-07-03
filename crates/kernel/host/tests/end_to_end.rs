@@ -9,9 +9,9 @@
 //! app-hash.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use host::Host;
+use host::{DispatchRecord, Host};
 use kv::Kv;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 
 const KV_ID: &str = "kv";
 const RELAY_ID: &str = "relay";
@@ -138,6 +138,46 @@ fn unknown_target_is_rejected_without_corrupting_the_registry() {
 
         // registry intact: kv is still routable.
         assert!(host.module_root(KV_ID).is_some());
+    });
+}
+
+#[test]
+fn dispatch_trace_records_every_dispatch_in_causal_order() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = Host::new();
+        let kv = Kv::init(context.child(KV_ID), KV_ID).await;
+        host.register(Box::new(kv));
+        host.register(Box::new(Relay));
+
+        let outcome = host
+            .submit(Msg {
+                target: RELAY_ID.to_string(),
+                payload: Vec::new(),
+            })
+            .await
+            .expect("submit succeeds");
+
+        // the deterministic trace: the root op (relay) then the follow-up it
+        // emitted (kv), in drain order — each tagged with its trigger origin and
+        // its intent fan-out. `submit` uses the default context, so the root
+        // op's origin is an empty External.
+        assert_eq!(
+            outcome.dispatches,
+            vec![
+                DispatchRecord {
+                    module: RELAY_ID.to_string(),
+                    origin: Origin::External(Vec::new()),
+                    emitted_msgs: 1,
+                    emitted_events: 0,
+                },
+                DispatchRecord {
+                    module: KV_ID.to_string(),
+                    origin: Origin::Module(RELAY_ID.to_string()),
+                    emitted_msgs: 0,
+                    emitted_events: 0,
+                },
+            ],
+        );
     });
 }
 

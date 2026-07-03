@@ -160,6 +160,12 @@ impl Daemon {
         reply
     }
 
+    fn telemetry(&self) -> serde_json::Value {
+        let (status, reply) = self.request("GET", "/v1/telemetry", None);
+        assert_eq!(status, 200, "telemetry failed: {reply}");
+        reply
+    }
+
     /// raw-byte request for the blob lane: returns status + the response body
     /// BYTES exactly as received. the json helpers above lossy-decode the
     /// whole response as utf-8, which would corrupt binary chunk bodies.
@@ -352,13 +358,42 @@ fn full_surface_blocks_authorship_and_ws() {
     assert_eq!(code, 200, "post failed: {block}");
     assert_eq!(block["height"], 2);
 
-    // the ws stream carries both blocks, tagged and in order.
-    for expected_height in [1u64, 2] {
+    // the ws stream now carries a Block AND a Telemetry frame per committed
+    // block, tagged and interleaved in order: Block(1), Telemetry(1), Block(2),
+    // Telemetry(2). classify by `type`, assert both block heights arrive in
+    // order, and that telemetry frames carry the deterministic dispatch trace
+    // plus this node's apply latency.
+    let mut block_heights: Vec<u64> = Vec::new();
+    let mut telemetry_frames: Vec<serde_json::Value> = Vec::new();
+    while block_heights.len() < 2 || telemetry_frames.len() < 2 {
         let frame: serde_json::Value =
             serde_json::from_str(&Daemon::ws_read_text(&mut ws)).expect("ws frame json");
-        assert_eq!(frame["type"], "block");
-        assert_eq!(frame["height"], expected_height);
+        match frame["type"].as_str() {
+            Some("block") => block_heights.push(frame["height"].as_u64().expect("block height")),
+            Some("telemetry") => telemetry_frames.push(frame),
+            other => panic!("unexpected ws frame type: {other:?}"),
+        }
     }
+    assert_eq!(block_heights, [1, 2], "both blocks fan out in order");
+    // block 1 (chat CreateChannel) telemetry traces the chat dispatch + latency.
+    let t1 = &telemetry_frames[0];
+    assert_eq!(t1["height"], 1);
+    assert!(
+        t1["latencyUs"].is_u64(),
+        "telemetry carries node-local apply latency: {t1}"
+    );
+    let dispatches = t1["dispatches"].as_array().expect("dispatches array");
+    assert!(
+        dispatches.iter().any(|d| d["module"] == "chat"),
+        "block 1 dispatched chat: {dispatches:?}"
+    );
+
+    // the same frames backfill over GET /v1/telemetry for a mid-stream client.
+    let pulled = daemon.telemetry();
+    let frames = pulled["frames"].as_array().expect("telemetry frames array");
+    assert!(frames.len() >= 2, "ring buffered both blocks: {frames:?}");
+    assert_eq!(frames[0]["height"], 1);
+    assert_eq!(frames[1]["height"], 2);
 
     // committed state reads back; authorship derived from the submit origin.
     let reply = daemon.query(

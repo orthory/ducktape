@@ -7,6 +7,7 @@ import { DocumentView } from "../views/document/DocumentView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { StatusView } from "../views/status/StatusView";
 import { TasksView } from "../views/tasks/TasksView";
+import { TelemetryView } from "../views/telemetry/TelemetryView";
 import type { AppModule } from "./module-def";
 
 export const MODULES: AppModule[] = [
@@ -15,8 +16,9 @@ export const MODULES: AppModule[] = [
   { id: "forge", nav: { icon: "forge", label: "Forge", order: 2 }, Screen: ForgeView },
   { id: "document", nav: { icon: "document", label: "Docs", order: 3 }, Screen: DocumentView },
   { id: "agent", nav: { icon: "agent", label: "Agents", order: 5 }, Screen: AgentView },
-  // Node (status) stays last on the rail, so it sits after Agents.
+  // Node (status) + Telemetry are the ops surfaces — grouped at the rail's foot.
   { id: "status", nav: { icon: "node", label: "Node", order: 6 }, Screen: StatusView },
+  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 7 }, Screen: TelemetryView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

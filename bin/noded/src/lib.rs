@@ -19,10 +19,13 @@
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -45,6 +48,83 @@ pub const EVENT_BUFFER: usize = 64;
 pub struct BlockSummary {
     pub height: u64,
     pub app_hash: String,
+}
+
+/// how many recent telemetry frames the daemon retains for `GET /v1/telemetry`.
+/// a client connecting mid-stream pulls this backfill, then follows the ws.
+pub const TELEMETRY_RING_CAP: usize = 256;
+
+/// the observability record for one finalized block: the host's DETERMINISTIC
+/// dispatch trace decorated with this node's WALL-CLOCK apply latency. rides the
+/// ws stream (`WsFrame::Telemetry`) and is buffered in the [`TelemetryRing`] for
+/// `GET /v1/telemetry`. keyed by `(height, source)` — the same space the future
+/// on-consensus telemetry module will use, so the two planes correlate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryFrame {
+    pub height: u64,
+    /// the block's AGREED logical clock (from the block context) — identical on
+    /// every node. NOT this node's wall clock.
+    pub consensus_time: u64,
+    /// node-local cost of applying this block, in microseconds. the ONE
+    /// non-deterministic field: it differs per node and never enters consensus.
+    pub latency_us: u64,
+    /// one entry per module dispatched this block, in drain (causal) order.
+    pub dispatches: Vec<DispatchInfo>,
+    /// observability events modules emitted during the block, in dispatch order.
+    pub events: Vec<TelemetryEvent>,
+}
+
+/// one dispatch in a block's drain — the wire twin of `host::DispatchRecord`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchInfo {
+    /// the module dispatched this step.
+    pub module: String,
+    /// what triggered it: `"external"`, `"external:<name>"`, `"system"`, or
+    /// `"module:<id>"` for a follow-up.
+    pub origin: String,
+    /// follow-up `Msg`s this dispatch emitted (its causal fan-out).
+    pub emitted_msgs: usize,
+    /// observability `Event`s this dispatch emitted.
+    pub emitted_events: usize,
+}
+
+/// one observability event a module emitted (`Ctx::emit_event`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryEvent {
+    /// the module that emitted it.
+    pub source: String,
+    /// best-effort UTF-8 preview of the (module-defined) payload, capped. binary
+    /// payloads render lossily; no module emits events yet, so this is forward
+    /// wiring for when they do.
+    pub payload: String,
+}
+
+/// a bounded, shared ring of the most recent telemetry frames. the node actor
+/// pushes from its own thread; the http layer reads from the server runtime, so
+/// it is an `Arc<Mutex>` — frames are plain data, cheap to clone out under the
+/// lock. drops oldest at [`TELEMETRY_RING_CAP`].
+#[derive(Clone, Default)]
+pub struct TelemetryRing(Arc<Mutex<VecDeque<TelemetryFrame>>>);
+
+impl TelemetryRing {
+    /// append a frame, evicting the oldest once the cap is reached.
+    pub fn push(&self, frame: TelemetryFrame) {
+        let mut ring = self.0.lock().expect("telemetry ring poisoned");
+        if ring.len() == TELEMETRY_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(frame);
+    }
+
+    /// the most recent `limit` frames, oldest-first (`None` → all buffered).
+    pub fn recent(&self, limit: Option<usize>) -> Vec<TelemetryFrame> {
+        let ring = self.0.lock().expect("telemetry ring poisoned");
+        let take = limit.map_or(ring.len(), |n| n.min(ring.len()));
+        ring.iter().skip(ring.len() - take).cloned().collect()
+    }
 }
 
 /// the status projection: daemon build version, global app-hash, and each
@@ -90,11 +170,12 @@ pub struct QueryRequest {
 }
 
 /// a ws frame. tagged so the stream can grow beyond block events without
-/// breaking subscribers.
+/// breaking subscribers — clients switch on `type` and ignore unknown kinds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WsFrame {
     Block(BlockSummary),
+    Telemetry(TelemetryFrame),
 }
 
 /// a request to the actor that owns the host. replies cross the channel as
@@ -123,12 +204,16 @@ pub enum NodeCommand {
 #[derive(Clone)]
 pub struct NodeHandle {
     cmds: mpsc::Sender<NodeCommand>,
-    events: broadcast::Sender<BlockSummary>,
+    events: broadcast::Sender<WsFrame>,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
     /// the files blob lane. NOT a command into the actor: chunk bytes stay
     /// node-local by design (never consensus state, never an op), so the http
     /// handlers read/write this store directly.
     blobs: files::BlobHandle,
+    /// recent per-block telemetry. like `blobs`, this is node-local and never
+    /// crosses the actor command lane: the actor pushes into it as blocks
+    /// commit, `GET /v1/telemetry` reads it directly.
+    telemetry: TelemetryRing,
 }
 
 impl NodeHandle {
@@ -139,7 +224,7 @@ impl NodeHandle {
     pub fn channel() -> (
         Self,
         mpsc::Receiver<NodeCommand>,
-        broadcast::Sender<BlockSummary>,
+        broadcast::Sender<WsFrame>,
     ) {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
@@ -148,6 +233,7 @@ impl NodeHandle {
             events: event_tx.clone(),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             blobs: files::BlobHandle::default(),
+            telemetry: TelemetryRing::default(),
         };
         (handle, cmd_rx, event_tx)
     }
@@ -157,6 +243,12 @@ impl NodeHandle {
     /// where the module's `serve_sync` reads.
     pub fn blob_handle(&self) -> files::BlobHandle {
         self.blobs.clone()
+    }
+
+    /// the telemetry ring this surface serves. the daemon actor pushes a frame
+    /// into a clone of it as each block commits; `GET /v1/telemetry` reads here.
+    pub fn telemetry_ring(&self) -> TelemetryRing {
+        self.telemetry.clone()
     }
 
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
@@ -200,6 +292,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/submit", post(submit))
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
+        .route("/v1/telemetry", get(telemetry))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
         .route(
@@ -283,6 +376,27 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
     }
 }
 
+/// query params for `GET /v1/telemetry`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryParams {
+    /// cap the response to the most recent N frames (default: all buffered).
+    pub limit: Option<usize>,
+}
+
+/// GET /v1/telemetry — recent per-block telemetry, oldest-first: `{"frames":[…]}`.
+///
+/// reads the node-local ring directly (no actor round-trip — the actor never
+/// blocks on an http read). a client connecting mid-stream backfills here, then
+/// follows `WsFrame::Telemetry` on `/v1/ws` for live frames.
+async fn telemetry(
+    State(handle): State<NodeHandle>,
+    Query(params): Query<TelemetryParams>,
+) -> Response {
+    let frames = handle.telemetry.recent(params.limit);
+    Json(serde_json::json!({ "frames": frames })).into_response()
+}
+
 async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     // reply first, then signal — the connection closes before the process does.
     handle.shutdown.notify_one();
@@ -345,17 +459,16 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
 }
 
 async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
-    let events = handle.events.subscribe();
-    upgrade.on_upgrade(move |socket| stream_blocks(socket, events))
+    let frames = handle.events.subscribe();
+    upgrade.on_upgrade(move |socket| stream_frames(socket, frames))
 }
 
-async fn stream_blocks(mut socket: WebSocket, mut events: broadcast::Receiver<BlockSummary>) {
+async fn stream_frames(mut socket: WebSocket, mut frames: broadcast::Receiver<WsFrame>) {
     loop {
-        match events.recv().await {
-            Ok(block) => {
-                let frame =
-                    serde_json::to_string(&WsFrame::Block(block)).expect("ws frame serializes");
-                if socket.send(Message::Text(frame.into())).await.is_err() {
+        match frames.recv().await {
+            Ok(frame) => {
+                let text = serde_json::to_string(&frame).expect("ws frame serializes");
+                if socket.send(Message::Text(text.into())).await.is_err() {
                     return; // client hung up
                 }
             }
@@ -364,5 +477,58 @@ async fn stream_blocks(mut socket: WebSocket, mut events: broadcast::Receiver<Bl
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(height: u64) -> TelemetryFrame {
+        TelemetryFrame {
+            height,
+            consensus_time: 0,
+            latency_us: 0,
+            dispatches: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ring_evicts_oldest_at_cap_and_recent_returns_newest_tail() {
+        let ring = TelemetryRing::default();
+        // fill two past the cap: the oldest two fall out, the newest survive.
+        for h in 0..(TELEMETRY_RING_CAP as u64 + 2) {
+            ring.push(frame(h));
+        }
+        let all = ring.recent(None);
+        assert_eq!(
+            all.len(),
+            TELEMETRY_RING_CAP,
+            "buffer holds exactly the cap"
+        );
+        assert_eq!(all.first().unwrap().height, 2, "oldest two evicted");
+        assert_eq!(
+            all.last().unwrap().height,
+            TELEMETRY_RING_CAP as u64 + 1,
+            "newest retained, oldest-first ordering"
+        );
+
+        // recent(limit) returns the newest `limit`, still oldest-first.
+        let tail: Vec<u64> = ring.recent(Some(3)).iter().map(|f| f.height).collect();
+        assert_eq!(
+            tail,
+            vec![
+                TELEMETRY_RING_CAP as u64 - 1,
+                TELEMETRY_RING_CAP as u64,
+                TELEMETRY_RING_CAP as u64 + 1,
+            ],
+        );
+
+        // a limit past the buffer size just returns everything.
+        assert_eq!(
+            ring.recent(Some(TELEMETRY_RING_CAP + 100)).len(),
+            TELEMETRY_RING_CAP,
+        );
     }
 }

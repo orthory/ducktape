@@ -2464,13 +2464,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                     // publish each newly-applied boundary to ws subscribers
-                    // (send only errs when nobody is subscribed — fine).
+                    // (send only errs when nobody is subscribed — fine). the
+                    // validator serves block frames only — telemetry frames come
+                    // from the local `noded` daemon, which owns the dispatch
+                    // trace this finalized-boundary seam does not carry.
                     if let Some(f) = node.finalized() {
                         if last_published != Some(f.height) {
-                            let _ = http_events.send(noded::BlockSummary {
+                            let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
                                 height: f.height,
                                 app_hash: hex(&f.app_hash),
-                            });
+                            }));
                             last_published = Some(f.height);
                         }
                     }

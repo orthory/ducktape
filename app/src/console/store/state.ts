@@ -6,7 +6,7 @@ import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client"
 import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
 import type { Block } from "../../domain/document-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
-import type { NodeStatus } from "../../domain/transport";
+import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
 // ── State shape ─────────────────────────────────────────
@@ -52,6 +52,11 @@ export interface ConsoleState {
   /** Recent runs across all channels, newest-first for the timeline. */
   runs: RunView[];
 
+  /** Recent per-block node telemetry, oldest-first (the view renders newest
+   *  first). Node-local observability — never re-queried from committed state;
+   *  backfilled from the node's ring on connect, then followed live over ws. */
+  telemetry: TelemetryFrame[];
+
   error: string | null;
 
   // ── Workspaces / onboarding (desktop only; inert on web) ──
@@ -93,6 +98,7 @@ export const createInitialState = (): ConsoleState => ({
   agents: [],
   watches: [],
   runs: [],
+  telemetry: [],
   error: null,
   workspaces: [],
   workspace: null,

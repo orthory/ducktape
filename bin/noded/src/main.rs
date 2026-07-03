@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
 use agent_oracle::{AuthStore, LlmWorker};
@@ -31,15 +31,18 @@ use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::{BlockContext, Host, SubmitError};
+use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use inbox::Inbox;
 use jobs::Jobs;
 use memory::Memory;
-use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
+use noded::{
+    BlockSummary, DispatchInfo, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, TelemetryEvent,
+    TelemetryFrame, TelemetryRing, WsFrame, hex_root,
+};
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
-use sdk::{Effect, Msg, Origin};
+use sdk::{Effect, Event, Msg, Origin};
 use tasks::Tasks;
 use tokio::sync::broadcast;
 
@@ -81,14 +84,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
 
     // the node actor gets its own thread: commonware's tokio runner owns that
-    // thread's runtime, and the host must never leave it. the blob handle is
-    // the one thing that crosses: the actor registers the files module over
-    // it, the http layer uploads/downloads through its own clone.
+    // thread's runtime, and the host must never leave it. the blob handle and
+    // the telemetry ring are the node-local surfaces that cross: the actor
+    // registers the files module over the blobs and pushes per-block telemetry
+    // into the ring, while the http layer reads both through its own clones.
     let actor_storage = storage.clone();
     let blobs = handle.blob_handle();
+    let telemetry = handle.telemetry_ring();
     std::thread::Builder::new()
         .name("node-actor".into())
-        .spawn(move || run_node(actor_storage, blobs, cmd_rx, event_tx))?;
+        .spawn(move || run_node(actor_storage, blobs, telemetry, cmd_rx, event_tx))?;
 
     println!(
         "[noded] listening on {listen}, storage {}",
@@ -112,8 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_node(
     storage: PathBuf,
     blobs: files::BlobHandle,
+    telemetry: TelemetryRing,
     mut cmds: mpsc::Receiver<NodeCommand>,
-    events: broadcast::Sender<BlockSummary>,
+    events: broadcast::Sender<WsFrame>,
 ) {
     let forge_repo = storage.join("forge-git");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
@@ -181,6 +187,7 @@ fn run_node(
                         &workers,
                         &mut height,
                         &events,
+                        &telemetry,
                         Origin::External(origin),
                         Msg { target, payload },
                     )
@@ -248,11 +255,12 @@ async fn submit_and_drain(
     host: &mut Host,
     workers: &[Box<dyn reactor::Worker>],
     height: &mut u64,
-    events: &broadcast::Sender<BlockSummary>,
+    events: &broadcast::Sender<WsFrame>,
+    telemetry: &TelemetryRing,
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
-    let (mut last, effects) = match submit_one(host, height, events, origin, msg).await {
+    let (mut last, effects) = match submit_one(host, height, events, telemetry, origin, msg).await {
         Ok(out) => out,
         Err(SubmitError::Fatal(err)) => {
             eprintln!("[noded] FATAL: {err} — halting");
@@ -274,6 +282,7 @@ async fn submit_and_drain(
             host,
             height,
             events,
+            telemetry,
             Origin::External(ORACLE_ORIGIN.to_vec()),
             follow,
         )
@@ -299,24 +308,73 @@ async fn submit_and_drain(
 async fn submit_one(
     host: &mut Host,
     height: &mut u64,
-    events: &broadcast::Sender<BlockSummary>,
+    events: &broadcast::Sender<WsFrame>,
+    telemetry: &TelemetryRing,
     origin: Origin,
     msg: Msg,
 ) -> Result<(BlockSummary, Vec<Effect>), SubmitError> {
+    let consensus_time = unix_millis();
     let ctx = BlockContext {
         height: *height + 1,
-        consensus_time: unix_millis(),
+        consensus_time,
         origin,
     };
+    // node-local wall-clock cost of applying this block — the telemetry plane's
+    // one non-deterministic signal. measured HERE in the effectful daemon layer,
+    // never inside the deterministic host, so the kernel stays clock-free.
+    let started = Instant::now();
     let out = host.submit_at(ctx, msg).await?;
+    let latency_us = started.elapsed().as_micros() as u64;
     *height += 1;
+
     let block = BlockSummary {
         height: *height,
         app_hash: hex_root(&out.app_hash),
     };
-    // no subscribers is fine — send only fails then.
-    let _ = events.send(block.clone());
+    let frame = TelemetryFrame {
+        height: *height,
+        consensus_time,
+        latency_us,
+        dispatches: out.dispatches.iter().map(dispatch_info).collect(),
+        events: out.events.iter().map(event_preview).collect(),
+    };
+    // buffer for GET /v1/telemetry, then fan both frames out live. no subscribers
+    // is fine — send only fails then.
+    telemetry.push(frame.clone());
+    let _ = events.send(WsFrame::Block(block.clone()));
+    let _ = events.send(WsFrame::Telemetry(frame));
     Ok((block, out.effects))
+}
+
+/// map a deterministic dispatch record to its telemetry wire twin.
+fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
+    DispatchInfo {
+        module: record.module.clone(),
+        origin: origin_tag(&record.origin),
+        emitted_msgs: record.emitted_msgs,
+        emitted_events: record.emitted_events,
+    }
+}
+
+/// a compact, human-legible tag for what triggered a dispatch.
+fn origin_tag(origin: &Origin) -> String {
+    match origin {
+        Origin::External(name) if name.is_empty() => "external".to_string(),
+        Origin::External(name) => format!("external:{}", String::from_utf8_lossy(name)),
+        Origin::Module(id) => format!("module:{id}"),
+        Origin::System => "system".to_string(),
+    }
+}
+
+/// best-effort text preview of an emitted event's (module-defined) payload,
+/// capped so a large payload can't bloat a telemetry frame.
+fn event_preview(ev: &Event) -> TelemetryEvent {
+    const PREVIEW_CAP: usize = 512;
+    let end = ev.payload.len().min(PREVIEW_CAP);
+    TelemetryEvent {
+        source: ev.source.clone(),
+        payload: String::from_utf8_lossy(&ev.payload[..end]).into_owned(),
+    }
 }
 
 async fn offer_effects(

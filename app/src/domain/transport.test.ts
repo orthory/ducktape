@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { remoteTransport } from "./transport";
-import type { BlockEvent } from "./transport";
+import type { BlockEvent, TelemetryFrame } from "./transport";
 
 // ── Fake websocket (records instances, scriptable) ──────
 
@@ -120,6 +120,63 @@ describe("remoteTransport", () => {
     expect(seen).toEqual([{ height: 9, appHash: "ee".repeat(32) }]);
 
     unsubscribe();
+    expect(ws.closed).toBe(true);
+  });
+
+  it("fetches GET /v1/telemetry and returns the frames, with an optional limit", async () => {
+    const frames: TelemetryFrame[] = [
+      { height: 1, consensusTime: 100, latencyUs: 42, dispatches: [], events: [] },
+    ];
+    // a Response body reads once, and this test fetches twice — hand back a
+    // fresh Response per call.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, { frames })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = remoteTransport("http://node.example:8844");
+    await expect(transport.telemetry()).resolves.toEqual(frames);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://node.example:8844/v1/telemetry");
+
+    await transport.telemetry(50);
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://node.example:8844/v1/telemetry?limit=50",
+    );
+  });
+
+  it("streams telemetry over the shared ws and ignores unknown frame kinds", () => {
+    const transport = remoteTransport("http://node.example:8844");
+    const blocks: BlockEvent[] = [];
+    const frames: TelemetryFrame[] = [];
+    const offBlock = transport.onBlock((block) => blocks.push(block));
+    const offTelemetry = transport.onTelemetry((frame) => frames.push(frame));
+
+    // both subscriptions share ONE socket.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    const ws = FakeWebSocket.instances[0];
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "telemetry",
+        height: 3,
+        consensusTime: 111,
+        latencyUs: 7,
+        dispatches: [
+          { module: "chat", origin: "external:eddy", emittedMsgs: 1, emittedEvents: 0 },
+        ],
+        events: [],
+      }),
+    });
+    // an unknown frame kind must be ignored, not crash the stream.
+    ws.onmessage?.({ data: JSON.stringify({ type: "mystery", height: 4 }) });
+
+    expect(blocks).toEqual([]);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].height).toBe(3);
+    expect(frames[0].dispatches[0].module).toBe("chat");
+
+    // the shared socket stays open until BOTH subscribers leave.
+    offBlock();
+    expect(ws.closed).toBe(false);
+    offTelemetry();
     expect(ws.closed).toBe(true);
   });
 });

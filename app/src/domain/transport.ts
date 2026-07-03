@@ -29,6 +29,40 @@ export interface NodeStatus {
   modules: ModuleStatus[];
 }
 
+// ── Telemetry ───────────────────────────────────────────
+//
+// The node-local observability plane: one frame per finalized block, carrying
+// the host's deterministic dispatch trace decorated with this node's wall-clock
+// apply latency. Delivered live over the ws stream and pullable (recent ring)
+// via GET /v1/telemetry. Keyed by (height, source) — the same space the future
+// on-consensus telemetry module uses.
+
+/** One dispatch in a block's drain — a module ran, triggered by `origin`. */
+export interface TelemetryDispatch {
+  module: string;
+  /** `"external"`, `"external:<name>"`, `"system"`, or `"module:<id>"`. */
+  origin: string;
+  emittedMsgs: number;
+  emittedEvents: number;
+}
+
+/** One observability event a module emitted during the block. */
+export interface TelemetryEvent {
+  source: string;
+  /** Best-effort utf-8 preview of the module-defined payload. */
+  payload: string;
+}
+
+export interface TelemetryFrame {
+  height: number;
+  /** The block's agreed logical clock — NOT this node's wall clock. */
+  consensusTime: number;
+  /** Node-local cost of applying the block, microseconds (non-deterministic). */
+  latencyUs: number;
+  dispatches: TelemetryDispatch[];
+  events: TelemetryEvent[];
+}
+
 export interface NodeTransport {
   /**
    * Submit one module msg — one block. Resolves once the block is committed.
@@ -51,8 +85,16 @@ export interface NodeTransport {
    */
   putBlob(bytes: Uint8Array<ArrayBuffer>): Promise<string>;
   status(): Promise<NodeStatus>;
+  /**
+   * Recent per-block telemetry from the node's ring, oldest-first — the
+   * backfill a client pulls on connect before following the live stream.
+   * `limit` caps the count (default: all buffered).
+   */
+  telemetry(limit?: number): Promise<TelemetryFrame[]>;
   /** Subscribe to finalized blocks. Returns the unsubscribe. */
   onBlock(listener: (block: BlockEvent) => void): () => void;
+  /** Subscribe to live per-block telemetry frames. Returns the unsubscribe. */
+  onTelemetry(listener: (frame: TelemetryFrame) => void): () => void;
 }
 
 // ── The transport ───────────────────────────────────────
@@ -62,6 +104,12 @@ interface WsBlockFrame {
   height: number;
   appHash: string;
 }
+
+interface WsTelemetryFrame extends TelemetryFrame {
+  type: "telemetry";
+}
+
+type WsFrame = WsBlockFrame | WsTelemetryFrame;
 
 const RECONNECT_DELAY_MS = 2_000;
 
@@ -87,20 +135,28 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
   const wsUrl = `${base.replace(/^http/, "ws")}/v1/ws`;
 
-  // One shared socket for every block subscriber; reconnects while any remain.
-  const listeners = new Set<(block: BlockEvent) => void>();
+  // One shared socket for every subscriber (blocks + telemetry); reconnects
+  // while any remain, closes once all unsubscribe.
+  const blockListeners = new Set<(block: BlockEvent) => void>();
+  const telemetryListeners = new Set<(frame: TelemetryFrame) => void>();
+  const hasSubscribers = (): boolean =>
+    blockListeners.size > 0 || telemetryListeners.size > 0;
   let socket: WebSocket | null = null;
 
   const connect = (): void => {
-    if (socket || listeners.size === 0) return;
+    if (socket || !hasSubscribers()) return;
     const ws = new WebSocket(wsUrl);
     socket = ws;
     ws.onmessage = (event) => {
-      const frame = JSON.parse(String(event.data)) as WsBlockFrame;
+      const frame = JSON.parse(String(event.data)) as WsFrame;
       switch (frame.type) {
         case "block": {
           const block = { height: frame.height, appHash: frame.appHash };
-          listeners.forEach((notify) => notify(block));
+          blockListeners.forEach((notify) => notify(block));
+          break;
+        }
+        case "telemetry": {
+          telemetryListeners.forEach((notify) => notify(frame));
           break;
         }
         default:
@@ -109,9 +165,17 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
     };
     ws.onclose = () => {
       socket = null;
-      if (listeners.size > 0) setTimeout(connect, RECONNECT_DELAY_MS);
+      if (hasSubscribers()) setTimeout(connect, RECONNECT_DELAY_MS);
     };
     ws.onerror = () => ws.close();
+  };
+
+  /** Drop the socket once nothing is subscribed. */
+  const closeIfIdle = (): void => {
+    if (!hasSubscribers()) {
+      socket?.close();
+      socket = null;
+    }
   };
 
   return {
@@ -147,15 +211,36 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
           if (!res.ok) throw new Error(`node replied ${res.status}`);
           return res.json() as Promise<NodeStatus>;
         }),
+    telemetry: (limit) =>
+      Promise.resolve()
+        .then(() =>
+          fetch(
+            limit === undefined
+              ? `${base}/v1/telemetry`
+              : `${base}/v1/telemetry?limit=${limit}`,
+          ),
+        )
+        .then((res) => {
+          if (!res.ok) throw new Error(`node replied ${res.status}`);
+          return res.json() as Promise<{ frames?: TelemetryFrame[] }>;
+        })
+        // best-effort observability: a node without a telemetry surface (or a
+        // malformed body) reads as "no telemetry", not an error.
+        .then((body) => body.frames ?? []),
     onBlock: (listener) => {
-      listeners.add(listener);
+      blockListeners.add(listener);
       connect();
       return () => {
-        listeners.delete(listener);
-        if (listeners.size === 0) {
-          socket?.close();
-          socket = null;
-        }
+        blockListeners.delete(listener);
+        closeIfIdle();
+      };
+    },
+    onTelemetry: (listener) => {
+      telemetryListeners.add(listener);
+      connect();
+      return () => {
+        telemetryListeners.delete(listener);
+        closeIfIdle();
       };
     },
   };
