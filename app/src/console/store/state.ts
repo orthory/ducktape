@@ -5,6 +5,7 @@
 import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { NodeStatus } from "../../domain/transport";
+import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
 // ── State shape ─────────────────────────────────────────
 
@@ -28,6 +29,21 @@ export interface ConsoleState {
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
   error: string | null;
+
+  // ── Workspaces / onboarding (desktop only; inert on web) ──
+  /** Every registered workspace, for the switcher. Empty on web. */
+  workspaces: Workspace[];
+  /** The active workspace whose node we talk to. Null on web / pre-onboarding. */
+  workspace: Workspace | null;
+  /** Desktop with no active workspace → show the onboarding gate. */
+  needsOnboarding: boolean;
+  /** An onboarding step is running (create/join/select) — disables the gate. */
+  onboardingBusy: boolean;
+  /** A joiner's live park→promote phase while its node is not yet a ready
+   *  validator; null on the founder/member path and once the node answers. */
+  onboardingPhase: PhaseReport | null;
+  /** The active workspace's invite blob, once revealed for sharing. */
+  inviteBlob: string | null;
 }
 
 export const DEFAULT_ACCENT = "#a05a3c";
@@ -47,6 +63,12 @@ export const createInitialState = (): ConsoleState => ({
   tasks: [],
   forgeHead: null,
   error: null,
+  workspaces: [],
+  workspace: null,
+  needsOnboarding: false,
+  onboardingBusy: false,
+  onboardingPhase: null,
+  inviteBlob: null,
 });
 
 // ── Pure helpers ────────────────────────────────────────

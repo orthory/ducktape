@@ -1,7 +1,12 @@
-// The console's one stateful component: resolves the node (adopt-or-spawn on
-// desktop, dial on web), hydrates from it, re-queries committed state on every
-// finalized block, and hands views a stable actions surface. Views stay
-// render-only.
+// The console's one stateful component: resolves the node (a ~/.ducktape
+// workspace on desktop, a dialed url on web), hydrates from it, re-queries
+// committed state on every finalized block, and hands views a stable actions
+// surface. Views stay render-only.
+//
+// Onboarding lives here too (desktop): with no active workspace the gate shows;
+// founding connects immediately, joining parks and this provider polls the
+// workspace phase (parked→admitted→promoted) until the promoted node's surface
+// answers — see connectActive.
 //
 // Writes follow the node's model: submit one msg (one block), then re-query —
 // there is no optimistic local state to reconcile. The post-submit refresh is
@@ -25,7 +30,15 @@ import type { ReactNode } from "react";
 import * as chatClient from "../../domain/chat-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as tasksClient from "../../domain/tasks-client";
-import { ensureDaemon, resolveNode, shutdownNode } from "../../domain/node-bootstrap";
+import {
+  connectWorkspace,
+  isTauri,
+  resolveNode,
+  shutdownNode,
+  waitUntilUp,
+} from "../../domain/node-bootstrap";
+import * as ws from "../../domain/workspace-client";
+import type { Workspace } from "../../domain/workspace-client";
 import type { NodeTransport } from "../../domain/transport";
 import {
   channelIdOf,
@@ -33,6 +46,18 @@ import {
   nextTaskStatus,
 } from "./state";
 import type { ConsoleState } from "./state";
+
+/** How often a parked joiner's phase is polled while it promotes. */
+const JOIN_POLL_MS = 1500;
+
+const wait = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Replace a workspace by id, else append — keeps the registry list current. */
+const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
+  list.some((w) => w.id === next.id)
+    ? list.map((w) => (w.id === next.id ? next : w))
+    : [...list, next];
 
 // ── Context ─────────────────────────────────────────────
 
@@ -54,6 +79,23 @@ export interface ConsoleActions {
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
   startNode(): void;
   dismissError(): void;
+
+  // ── Onboarding / workspaces (desktop only) ──
+  /** Found a new network and connect to it. */
+  createWorkspace(name: string): void;
+  /** Join an existing network from an invite blob, then park until admitted. */
+  joinWorkspace(name: string, blob: string): void;
+  /** Switch the active workspace (spawns/adopts its node). */
+  selectWorkspace(id: string): void;
+  /** Fetch the active workspace's invite blob into state for sharing. */
+  revealInvite(): void;
+  /** Admit a joiner by pubkey through the active (member) workspace. */
+  admitMember(pubkey: string): void;
+  /** Open the onboarding gate to add or switch workspaces (keeps the active
+   *  one running underneath). */
+  newWorkspace(): void;
+  /** Close the gate without changing workspaces (only if one is active). */
+  dismissOnboarding(): void;
 }
 
 export interface ConsoleContextValue {
@@ -83,25 +125,111 @@ export function DucktapeProvider({
   const nodeRef = useRef(node);
   nodeRef.current = node;
 
+  // stale-guards async boot/connect loops: each connectActive bumps the
+  // generation, so a superseded loop (workspace switch, re-select) sees its gen
+  // change and stops touching state.
+  const bootGenRef = useRef(0);
+  const bootStartedRef = useRef(false);
+
   const fail = useCallback(
     (err: unknown) => setState((prev) => ({ ...prev, error: String(err) })),
     [],
   );
 
-  // 1. Resolve the node once: adopt-or-spawn the daemon on desktop, dial the
-  //    configured url on web. Injected transports (tests) skip this.
+  // Connect the app to a workspace's node: select it (Rust spawns/adopts),
+  // then either wait for a member's surface to answer, or poll a joiner's
+  // park→promote phase until its promoted validator surface comes up.
+  const connectActive = useCallback(
+    (target: Workspace): Promise<void> => {
+      const gen = (bootGenRef.current += 1);
+      const stale = () => bootGenRef.current !== gen;
+      setState((prev) => ({
+        ...prev,
+        workspace: target,
+        needsOnboarding: false,
+        onboardingBusy: false,
+        inviteBlob: null,
+      }));
+      return Promise.resolve()
+        .then(() => ws.selectWorkspace(target.id))
+        .then((sel) => {
+          if (stale()) return;
+          setState((prev) => ({ ...prev, nodeUrl: sel.httpUrl, managed: true }));
+          const transport = connectWorkspace(sel.httpUrl).transport;
+          if (target.member) {
+            // founder / already-admitted member: the surface comes up promptly.
+            return waitUntilUp(transport).then(() => {
+              if (stale()) return;
+              setState((prev) => ({ ...prev, onboardingPhase: null }));
+              setNode(transport);
+            });
+          }
+          // joiner: the node parks (no surface) until a member admits it and
+          // the epoch cuts over; it then promotes, reboots as a validator, and
+          // its surface starts answering. Poll the phase until that happens.
+          const tick = (): Promise<void> => {
+            if (stale()) return Promise.resolve();
+            return transport.status().then(
+              () => {
+                if (stale()) return;
+                setState((prev) => ({ ...prev, onboardingPhase: null }));
+                setNode(transport);
+              },
+              () =>
+                ws.workspacePhase(target.id).then((report) => {
+                  if (stale()) return;
+                  setState((prev) => ({ ...prev, onboardingPhase: report }));
+                  if (report.phase === "fatal") {
+                    fail(report.detail ?? "the node failed to join");
+                    return;
+                  }
+                  return wait(JOIN_POLL_MS).then(tick);
+                }),
+            );
+          };
+          return tick();
+        })
+        .catch((err) => {
+          if (!stale()) {
+            setState((prev) => ({ ...prev, onboardingBusy: false }));
+            fail(err);
+          }
+        });
+    },
+    [fail],
+  );
+
+  // 1. Resolve the node once. Web: dial the configured url. Desktop: resolve
+  //    via the ~/.ducktape registry — connect the active workspace, or raise
+  //    the onboarding gate when there is none. Injected transports (tests) and
+  //    a re-run under StrictMode are both skipped.
   useEffect(() => {
-    if (node) return;
+    if (transport || bootStartedRef.current) return;
+    bootStartedRef.current = true;
+
+    if (!isTauri()) {
+      const resolution = resolveNode();
+      setState((prev) => ({
+        ...prev,
+        nodeUrl: resolution.url,
+        managed: false,
+        needsOnboarding: false,
+      }));
+      setNode(resolution.transport);
+      return;
+    }
+
     let cancelled = false;
-    resolveNode()
-      .then((resolution) => {
+    Promise.resolve()
+      .then(() => Promise.all([ws.listWorkspaces(), ws.activeWorkspace()]))
+      .then(([all, active]) => {
         if (cancelled) return;
-        setState((prev) => ({
-          ...prev,
-          nodeUrl: resolution.url,
-          managed: resolution.managed,
-        }));
-        setNode(resolution.transport);
+        setState((prev) => ({ ...prev, workspaces: all }));
+        if (!active) {
+          setState((prev) => ({ ...prev, needsOnboarding: true }));
+          return;
+        }
+        return connectActive(active);
       })
       .catch((err) => {
         if (!cancelled) fail(err);
@@ -109,7 +237,7 @@ export function DucktapeProvider({
     return () => {
       cancelled = true;
     };
-  }, [node, fail]);
+  }, [transport, fail, connectActive]);
 
   // 2. Pull every committed projection; adopt the first channel when none is
   //    active yet (or the active one vanished from a fresh node).
@@ -309,17 +437,98 @@ export function DucktapeProvider({
       },
 
       startNode: () => {
-        const live = nodeRef.current;
-        if (!live || !stateRef.current.managed) return;
+        const target = stateRef.current.workspace;
+        if (!stateRef.current.managed || !target) return;
+        // re-select the active workspace: Rust adopts a live node or respawns
+        // one, then connectActive reconnects and re-hydrates.
+        connectActive(target).catch(fail);
+      },
+
+      dismissError: () => setState((prev) => ({ ...prev, error: null })),
+
+      // ── Onboarding / workspaces ──
+      createWorkspace: (name) => {
+        if (!name.trim()) return;
+        setState((prev) => ({ ...prev, onboardingBusy: true, error: null }));
         Promise.resolve()
-          .then(() => ensureDaemon(live))
+          .then(() => ws.createWorkspace(name.trim()))
+          .then((created) => {
+            setState((prev) => ({
+              ...prev,
+              workspaces: mergeWorkspace(prev.workspaces, created),
+            }));
+            return connectActive(created);
+          })
+          .catch((err) => {
+            setState((prev) => ({ ...prev, onboardingBusy: false }));
+            fail(err);
+          });
+      },
+
+      joinWorkspace: (name, blob) => {
+        if (!name.trim() || !blob.trim()) return;
+        setState((prev) => ({ ...prev, onboardingBusy: true, error: null }));
+        Promise.resolve()
+          .then(() => ws.joinWorkspace(name.trim(), blob.trim()))
+          .then((joined) => {
+            setState((prev) => ({
+              ...prev,
+              workspaces: mergeWorkspace(prev.workspaces, joined),
+            }));
+            return connectActive(joined);
+          })
+          .catch((err) => {
+            setState((prev) => ({ ...prev, onboardingBusy: false }));
+            fail(err);
+          });
+      },
+
+      selectWorkspace: (id) => {
+        const target = stateRef.current.workspaces.find((w) => w.id === id);
+        if (!target || target.id === stateRef.current.workspace?.id) return;
+        // drop the old node + its projections so the switch shows no stale state.
+        setNode(null);
+        setState((prev) => ({
+          ...prev,
+          connected: false,
+          status: null,
+          channels: [],
+          messages: [],
+          activeChannel: null,
+          activeThread: null,
+          tasks: [],
+          onboardingPhase: null,
+        }));
+        connectActive(target).catch(fail);
+      },
+
+      revealInvite: () => {
+        const target = stateRef.current.workspace;
+        if (!target) return;
+        Promise.resolve()
+          .then(() => ws.inviteBlob(target.id))
+          .then((blob) => setState((prev) => ({ ...prev, inviteBlob: blob })))
+          .catch(fail);
+      },
+
+      admitMember: (pubkey) => {
+        const target = stateRef.current.workspace;
+        if (!target || !pubkey.trim()) return;
+        Promise.resolve()
+          .then(() => ws.admitMember(target.id, pubkey.trim()))
           .then(() => refresh())
           .catch(fail);
       },
 
-      dismissError: () => setState((prev) => ({ ...prev, error: null })),
+      newWorkspace: () =>
+        setState((prev) => ({ ...prev, needsOnboarding: true, inviteBlob: null })),
+
+      dismissOnboarding: () =>
+        setState((prev) =>
+          prev.workspace ? { ...prev, needsOnboarding: false } : prev,
+        ),
     };
-  }, [refresh, fail]);
+  }, [refresh, fail, connectActive]);
 
   const value = useMemo(() => ({ state, actions }), [state, actions]);
   return <ConsoleContext.Provider value={value}>{children}</ConsoleContext.Provider>;
