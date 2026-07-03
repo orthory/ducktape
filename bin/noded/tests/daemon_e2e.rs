@@ -166,6 +166,14 @@ impl Daemon {
         reply
     }
 
+    /// GET /metrics as raw OpenMetrics text (not json — the scrape body is a
+    /// text exposition, so reuse the byte lane and utf-8 decode it).
+    fn metrics(&self) -> String {
+        let (status, body) = self.request_bytes("GET", "/metrics", &[]);
+        assert_eq!(status, 200, "metrics failed");
+        String::from_utf8(body).expect("metrics body is utf-8")
+    }
+
     /// raw-byte request for the blob lane: returns status + the response body
     /// BYTES exactly as received. the json helpers above lossy-decode the
     /// whole response as utf-8, which would corrupt binary chunk bodies.
@@ -652,6 +660,54 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
         .expect("fetched bytes verify against the committed manifest");
 }
 
+#[test]
+fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // at genesis the ducktape series are registered but a block-derived series
+    // like the height gauge has not been observed yet — commit one block first.
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "CreateChannel": { "channel_id": "general", "name": "General", "post_policy": "Open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    let text = daemon.metrics();
+    // the daemon's own series, registered into commonware's registry.
+    assert!(
+        text.contains("ducktape_blocks_total"),
+        "blocks counter present: {text}"
+    );
+    assert!(
+        text.contains("ducktape_block_height"),
+        "height gauge present"
+    );
+    assert!(
+        text.contains("ducktape_block_apply_latency_seconds"),
+        "latency histogram present",
+    );
+    // the per-dispatch counter carries the low-cardinality labels, and the
+    // block above dispatched chat as an external submit.
+    assert!(
+        text.contains("ducktape_dispatch_total") && text.contains("module=\"chat\""),
+        "labelled dispatch counter present: {text}",
+    );
+    // the same encode() also carries commonware's runtime metrics — proof the
+    // series share one registry — and closes with the OpenMetrics EOF sentinel.
+    assert!(
+        text.contains("runtime_"),
+        "commonware runtime metrics present too"
+    );
+    assert!(
+        text.trim_end().ends_with("# EOF"),
+        "OpenMetrics EOF terminator"
+    );
+}
+
 // ============================================================================
 // git smart-HTTP receive-pack: REAL `git push` against the daemon's /forge lane.
 //
@@ -910,5 +966,41 @@ fn git_clone_over_http_round_trips_full_history() {
         log_oids(&dst),
         pushed_oids,
         "the cloned history oids must match the pushed repo exactly"
+    );
+}
+
+/// Regression: a push whose data exceeds git's `http.postBuffer` is preceded by
+/// a flush-only PROBE POST (zero commands) before the real chunked request. The
+/// receive-pack handler must answer that probe 200, not 400 — otherwise every
+/// push larger than the buffer (the common case for a real repo) fails. Forcing
+/// `http.postBuffer=1` makes git take the probe path for even a one-commit push.
+#[test]
+fn git_push_larger_than_post_buffer_uses_the_probe_path() {
+    if !have_git() {
+        eprintln!("skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH");
+        return;
+    }
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let url = format!("http://127.0.0.1:{}/forge/probed", daemon.port);
+
+    let work = tempfile::TempDir::new().expect("git work dir");
+    let wd = work.path();
+    git_ok(wd, &["init"]);
+    commit_file(wd, "hello.txt", "hi from a probed push\n", "first commit");
+    git_ok(wd, &["remote", "add", "ducktape", &url]);
+
+    // `-c http.postBuffer=1` forces git through the large-request probe.
+    let push = git_capture(wd, &["-c", "http.postBuffer=1", "push", "ducktape", "main"]);
+    eprintln!("=== probed git push ===\n{}", render(&push));
+    assert!(
+        push.status.success(),
+        "a push through the postBuffer probe path must succeed:\n{}",
+        render(&push)
+    );
+    assert_eq!(
+        forge_head(&daemon, "probed"),
+        Some(rev_parse_head(wd)),
+        "forge HEAD must equal the pushed commit after a probed push"
     );
 }
