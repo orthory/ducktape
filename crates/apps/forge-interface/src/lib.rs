@@ -7,14 +7,34 @@
 
 use serde::{Deserialize, Serialize};
 
-/// a write intent at forge: put `content` at `path` in the repo and commit it.
-/// one op == one commit, so the HEAD (and thus `root()`) advances per message.
+/// a write intent at forge: either the file-by-file [`ForgeMsg::Commit`] (forge
+/// builds the commit object itself) or [`ForgeMsg::Push`] — a git-faithful ref
+/// update that adopts a client's REAL commit history by oid, with the objects
+/// carried out-of-band in a node-local packfile (never in consensus).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ForgeMsg {
     Commit {
         path: String,
         content: String,
         message: String,
+    },
+    /// a git ref update over consensus. the ONLY consensus effect is a
+    /// compare-and-swap on the committed HEAD: forge's current HEAD must equal
+    /// `prev_oid`, and on match HEAD becomes `new_oid` (so `root()` becomes
+    /// `sha256(new_oid)` on EVERY validator, pack-holder or not). the git
+    /// objects themselves are node-local — fetched from the files blob store by
+    /// `pack_digest` and installed lazily — and NEVER influence root/accept.
+    Push {
+        /// the CAS guard: forge's committed HEAD must equal this or the push is
+        /// rejected (non-fast-forward). `None` == the repo is unborn (pushing to
+        /// an empty remote). 20 raw sha1 bytes when `Some`.
+        prev_oid: Option<Vec<u8>>,
+        /// the new committed HEAD after the push. 20 raw sha1 bytes.
+        new_oid: Vec<u8>,
+        /// sha256 digest of the packfile (full object closure of `new_oid`) in
+        /// the node's files blob store. objects are NODE-LOCAL, never consensus
+        /// state; this 32-byte locator has ZERO effect on root/accept-reject.
+        pack_digest: Vec<u8>,
     },
 }
 

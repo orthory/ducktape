@@ -141,7 +141,10 @@ fn run_node(
             Some("jobs".into()),
         );
         let document = Document::init(context.child("document"), "document").await;
-        let forge = Forge::init("forge", forge_repo).expect("forge init");
+        // forge shares the files body plane so a Push's packfile — uploaded to
+        // the blob lane before the op is submitted — materializes locally; the
+        // pack bytes never enter consensus (root stays sha256(head oid)).
+        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
         let worker_blobs = blobs.clone();
         let files = Files::with_blobs("files", blobs);
         let memory = Memory::new("memory", "files");

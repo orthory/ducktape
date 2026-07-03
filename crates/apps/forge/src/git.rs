@@ -147,6 +147,19 @@ pub fn delete_ref(repo: &Repository, name: &str) -> Result<(), git2::Error> {
     }
 }
 
+/// whether `head` is a descendant of (or equal to) `ancestor` — a real
+/// fast-forward. node-local materialization uses this to refuse moving the
+/// on-disk ref onto a head that does NOT build on the prior ref. `head ==
+/// ancestor` counts as a descendant so re-materializing an already-current ref
+/// is idempotent. purely LOCAL: never a consensus gate (a validator without the
+/// pack can't run it, and root must not depend on it).
+pub fn is_descendant(repo: &Repository, head: Oid, ancestor: Oid) -> Result<bool, git2::Error> {
+    if head == ancestor {
+        return Ok(true);
+    }
+    repo.graph_descendant_of(head, ancestor)
+}
+
 /// verify the FULL object closure reachable from `head` is present in the odb.
 /// pack indexing hash-verifies each object it CARRIES but says nothing about
 /// connectivity — a byzantine pack can ship a genuine head commit and omit the

@@ -115,6 +115,33 @@ use sha2::{Digest, Sha256};
 /// the canonical branch this module commits to and reads HEAD from.
 const MAIN_REF: &str = "refs/heads/main";
 
+/// parse exactly `OID_RAW_LEN` (20) raw sha1 bytes into an `Oid`, with a
+/// deterministic module error on any other length. validates the untrusted
+/// `Push` oid fields: `git2::Oid::from_bytes` length-checks too, but a
+/// field-named message makes a rejected op self-explaining and the check
+/// resolves identically on every validator (same bytes -> same decision).
+fn parse_oid(bytes: &[u8], field: &str) -> Result<Oid, Error> {
+    if bytes.len() != git::OID_RAW_LEN {
+        return Err(Error::Module(format!(
+            "forge: {field} must be {} bytes, got {}",
+            git::OID_RAW_LEN,
+            bytes.len()
+        )));
+    }
+    Oid::from_bytes(bytes).map_err(|e| Error::Module(e.to_string()))
+}
+
+/// lowercase-hex a byte slice — for human-readable log lines only (the pack
+/// digest in a `materialize` warning).
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 pub struct Forge {
     id: ModuleId,
     /// node-local repo dir — NOT consensus state (the path may differ per node);
@@ -126,19 +153,59 @@ pub struct Forge {
     /// for the committed parent; this cache never feeds a commit's parent. `None`
     /// == unborn repo.
     head: Option<Oid>,
-    /// the head STAGED by commits made this block: `execute` builds the commit
-    /// object and points this at it WITHOUT moving the ref. later commits in the
-    /// same block chain on it (read-your-writes via `query`); `commit_block`
-    /// publishes it (moves the ref), `abort_block` drops it. `None` == nothing
-    /// staged this block. NOT reflected in `root()` until committed.
+    /// the head STAGED this block: for a `Commit`, `execute` builds the commit
+    /// object and points this at it WITHOUT moving the ref; for a `Push`, it is
+    /// the pushed `new_oid` (its objects live off-repo, in a node-local pack).
+    /// later ops read-your-writes via `query`; `commit_block` publishes it,
+    /// `abort_block` drops it. `None` == nothing staged. NOT in `root()` until
+    /// committed.
     staged: Option<Oid>,
+    /// the node-local body store Push packfiles are fetched from by digest —
+    /// the SAME plane the files module serves. shared here only so a committed
+    /// Push head can be materialized onto the on-disk repo (`materialize`); it
+    /// is NEVER read by `root()`/`execute`/`commit_block` and so cannot affect
+    /// consensus. a Commit-only deployment can pass a default (unused) handle.
+    blobs: files::BlobHandle,
+    /// the pack digest that pairs with a `Push`-`staged` head (32 raw bytes).
+    /// `Some` ONLY for a staged Push — a Commit builds its objects straight into
+    /// the local odb, so there is nothing to fetch. `commit_block` promotes this
+    /// into `pending_pack`; `abort_block` drops it. node-local, never in root().
+    staged_pack: Option<[u8; 32]>,
+    /// node-local catch-up target: a committed Push head whose objects are not
+    /// yet installed on the on-disk `MAIN_REF`, plus the pack digest to fetch
+    /// them by. `materialize` clears it once the ref is moved. this is the whole
+    /// point of the decoupling — `root()` already reflects this head (it is
+    /// `self.head`) while the on-disk repo catches up lazily. NOT in `root()`.
+    pending_pack: Option<(Oid, [u8; 32])>,
+    /// one-shot guard so a not-yet-fetched (or invalid) pack logs ONCE per
+    /// pending target instead of on every opportunistic `materialize` retry.
+    materialize_warned: bool,
 }
 
 impl Forge {
     /// genesis wiring: init (or adopt) a git repo at `repo_dir`, then seed the
     /// cached head from its current `MAIN_REF` (`None` on a fresh empty repo, so
     /// `root()` starts at [`StateRoot::ZERO`]). deterministic given the dir state.
+    /// this convenience overload gives forge a private, default (empty) blob
+    /// store — enough for a `Commit`-only or test deployment. a node that wants
+    /// `Push` materialization to reuse the files body plane must build forge over
+    /// that shared handle with [`Forge::with_blobs`].
     pub fn init(id: impl Into<ModuleId>, repo_dir: impl Into<PathBuf>) -> Result<Self, Error> {
+        Self::with_blobs(id, repo_dir, files::BlobHandle::default())
+    }
+
+    /// genesis wiring over an EXISTING node-local blob store — mirrors
+    /// [`files::Files::with_blobs`]. the embedding daemon creates one handle,
+    /// registers the files module over it (uploads land there), and builds forge
+    /// over a clone so a `Push`'s packfile — uploaded before the op is submitted
+    /// — is visible to [`Forge::materialize`] without a byte ever crossing
+    /// consensus. the handle feeds ONLY node-local materialization; `root()` is
+    /// still `sha256(<committed head oid>)` and never touches the store.
+    pub fn with_blobs(
+        id: impl Into<ModuleId>,
+        repo_dir: impl Into<PathBuf>,
+        blobs: files::BlobHandle,
+    ) -> Result<Self, Error> {
         let repo_dir = repo_dir.into();
         let repo = if repo_dir.join(".git").exists() {
             git::open(&repo_dir).map_err(|e| Error::Module(e.to_string()))?
@@ -151,6 +218,10 @@ impl Forge {
             repo: repo_dir,
             head,
             staged: None,
+            blobs,
+            staged_pack: None,
+            pending_pack: None,
+            materialize_warned: false,
         })
     }
 
@@ -232,6 +303,7 @@ impl Forge {
             git::delete_ref(&repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?;
             self.head = None;
             self.staged = None;
+            self.clear_pending_materialization();
             return Ok(());
         }
 
@@ -261,39 +333,131 @@ impl Forge {
         git::update_ref(&repo, MAIN_REF, oid).map_err(|e| Error::Module(e.to_string()))?;
         self.head = Some(oid);
         self.staged = None;
+        // install ships the head's full closure and moves the ref in one shot,
+        // so the on-disk repo is already current: any pending Push catch-up is
+        // moot and must be dropped (its digest belonged to a superseded head).
+        self.clear_pending_materialization();
         Ok(())
     }
-}
 
-#[async_trait::async_trait(?Send)]
-impl Module for Forge {
-    fn id(&self) -> ModuleId {
-        self.id.clone()
+    /// forget any node-local Push catch-up target. called wherever the on-disk
+    /// ref is authoritatively resynced (install / a completed materialize) so a
+    /// stale `pending_pack` can't later stomp a newer head. never touches
+    /// `head`/`root()`.
+    fn clear_pending_materialization(&mut self) {
+        self.pending_pack = None;
+        self.materialize_warned = false;
     }
 
-    /// the repo's HEAD commit oid as a [`StateRoot`] (`sha256` of its 20 sha1
-    /// bytes) — pure, no IO (that's the whole reason `head` is a write-through
-    /// cache). `None` -> `ZERO`.
-    fn root(&self) -> StateRoot {
-        self.head.map_or(StateRoot::ZERO, Self::oid_to_root)
+    /// node-local catch-up (NON-consensus): if the on-disk `MAIN_REF` lags the
+    /// committed Push head, fetch the head's packfile from the blob store by its
+    /// recorded digest, install it (libgit2 re-hashes every object), require the
+    /// FULL closure to be present, confirm the head fast-forwards the prior ref,
+    /// then move the ref. it NEVER reads or writes `head`/`root()` — pack
+    /// possession is per-node, so a not-yet-fetched, corrupt, or non-fast-forward
+    /// pack is a SAFE no-op that leaves the ref behind (root already reflects the
+    /// committed head) and warns once; a later call retries. only a genuine repo
+    /// I/O failure surfaces as `Err`. idempotent, and a no-op when nothing is
+    /// pending.
+    ///
+    /// the SUBMITTER holds the pack locally (uploaded before submit) so its
+    /// `commit_block` materializes immediately; other nodes catch up when they
+    /// fetch the pack (or, for a fresh joiner, via the state-sync snapshot, which
+    /// already carries the closure through `install`). driving p2p pack fetch is
+    /// out of scope here — this makes the local-pack path work and the
+    /// missing-pack path safe.
+    pub fn materialize(&mut self) -> Result<(), Error> {
+        let Some((head, digest)) = self.pending_pack else {
+            return Ok(()); // nothing pending — the common Commit / caught-up case
+        };
+        let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
+
+        // already caught up (e.g. the snapshot install moved the ref)? drop the
+        // pending target and stop.
+        let prior = git::resolve_ref(&repo, MAIN_REF).map_err(|e| Error::Module(e.to_string()))?;
+        if prior == Some(head) {
+            self.clear_pending_materialization();
+            return Ok(());
+        }
+
+        // fetch the packfile from the node-local body store. absent == not
+        // fetched yet: leave the ref behind (root is already correct), warn once.
+        let Some(pack) = self.blobs.get_chunk(&digest) else {
+            self.warn_materialize(format!(
+                "pack {} for head {head} not in the blob store yet; on-disk ref \
+                 stays behind, root already reflects the committed head",
+                hex(&digest)
+            ));
+            return Ok(());
+        };
+
+        // a fetched pack that fails to install / complete the closure / fast-
+        // forward is treated exactly like an absent one: a safe no-op that keeps
+        // root correct. it is NODE-LOCAL and NEVER gates consensus.
+        if let Err(why) = Self::install_and_advance(&repo, head, prior, &pack) {
+            self.warn_materialize(format!(
+                "cannot advance on-disk ref to head {head}: {why}; leaving ref \
+                 behind (root already correct)"
+            ));
+            return Ok(());
+        }
+        self.clear_pending_materialization();
+        Ok(())
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()?))
+    /// the pure git side of one materialize attempt: install the pack, require
+    /// the full closure of `head`, refuse a non-fast-forward onto a born
+    /// `prior` ref, then move `MAIN_REF` to `head`. any failure is returned so
+    /// the caller can turn it into a safe no-op.
+    fn install_and_advance(
+        repo: &git2::Repository,
+        head: Oid,
+        prior: Option<Oid>,
+        pack: &[u8],
+    ) -> Result<(), Error> {
+        // install re-hashes every object; verify_closure then requires the head
+        // commit AND its whole tree/parent closure — a partial pack dies here
+        // before the ref moves.
+        git::install_pack(repo, pack).map_err(|e| Error::Module(e.to_string()))?;
+        git::verify_closure(repo, head).map_err(|e| Error::Module(e.to_string()))?;
+
+        // a born ref may only fast-forward: a normal push builds on the prior
+        // head. an unborn prior is the first push and is always allowed. (this
+        // is a LOCAL sanity gate — consensus already CAS'd prev_oid; a force
+        // push, out of scope here, would legitimately fail this and leave the
+        // ref behind with root still correct.)
+        if let Some(prior) = prior {
+            let ff =
+                git::is_descendant(repo, head, prior).map_err(|e| Error::Module(e.to_string()))?;
+            if !ff {
+                return Err(Error::Module(format!(
+                    "head does not fast-forward on-disk ref {prior}"
+                )));
+            }
+        }
+
+        git::update_ref(repo, MAIN_REF, head).map_err(|e| Error::Module(e.to_string()))?;
+        Ok(())
     }
 
-    /// commit one file change to the repo. deterministic: a fixed `Signature`
-    /// identity + a `consensus_time`-derived date + an in-memory tree build, so
-    /// the resulting sha1 commit oid is reproducible. all git2 IO is blocking
-    /// with no `.await`, so the "await only deterministic resources" rule holds
-    /// vacuously — the git2 call is forge's private state substrate, not an effect.
-    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let ForgeMsg::Commit {
-            path,
-            content,
-            message,
-        } = decode_msg(&msg.payload).map_err(Error::Module)?;
+    /// warn ONCE per pending target (reset when the target changes or clears).
+    fn warn_materialize(&mut self, msg: String) {
+        if !self.materialize_warned {
+            eprintln!("[forge] materialize: {msg}");
+            self.materialize_warned = true;
+        }
+    }
 
+    /// stage one `Commit`: build the deterministic commit object over the parent
+    /// tree and point `staged` at it WITHOUT moving the ref (the host publishes
+    /// at the block boundary). unchanged from the file-by-file commit path.
+    fn stage_commit(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        path: String,
+        content: String,
+        message: String,
+    ) -> Result<(), Error> {
         let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
 
         // 1. parent := the STAGED head if this block already committed here,
@@ -332,9 +496,98 @@ impl Module for Forge {
         // 4. STAGE the new head — do NOT move the ref. the host publishes it at
         //    the block boundary (`commit_block` -> `update_ref`); on abort the ref
         //    never moves and these commit objects stay orphaned in the odb (node-
-        //    local, not authenticated state — no trace in `root()`/app-hash).
+        //    local, not authenticated state — no trace in `root()`/app-hash). the
+        //    objects are already in this odb, so `staged_pack` stays `None`:
+        //    commit_block moves the ref directly, nothing to fetch.
         self.staged = Some(commit);
+        self.staged_pack = None;
         Ok(())
+    }
+
+    /// stage one `Push`: the git-faithful ref update. PURE and deterministic —
+    /// the only gate is a compare-and-swap on the COMMITTED head, fully
+    /// determined by consensus state, so accept/reject and the resulting `root()`
+    /// are identical on every validator whether or not it holds the packfile.
+    /// no repo is opened, nothing is installed, no ref moves here.
+    fn stage_push(
+        &mut self,
+        prev_oid: Option<Vec<u8>>,
+        new_oid: Vec<u8>,
+        pack_digest: Vec<u8>,
+    ) -> Result<(), Error> {
+        // 1. length-validate the untrusted wire fields (deterministic on every
+        //    validator: same op bytes -> same decision). a 20-byte sha1 oid, an
+        //    optional 20-byte prev, a 32-byte pack sha256.
+        let new = parse_oid(&new_oid, "new_oid")?;
+        let prev = prev_oid
+            .as_deref()
+            .map(|b| parse_oid(b, "prev_oid"))
+            .transpose()?;
+        let digest: [u8; 32] = pack_digest.as_slice().try_into().map_err(|_| {
+            Error::Module(format!(
+                "forge: pack_digest must be 32 bytes, got {}",
+                pack_digest.len()
+            ))
+        })?;
+
+        // 2. CAS on the COMMITTED head (never the staged one): this is the SOLE
+        //    consensus gate and it reads only agreed state. `None` prev must
+        //    match an unborn repo. a mismatch is a non-fast-forward — the client
+        //    raced another push and must fetch + retry.
+        if self.head != prev {
+            return Err(Error::Module(
+                "non-fast-forward: forge HEAD moved; fetch and retry".into(),
+            ));
+        }
+
+        // 3. stage the new head + remember its pack digest so commit_block can
+        //    record the node-local materialization target. `root()` still
+        //    reflects only the committed head until commit_block publishes this.
+        self.staged = Some(new);
+        self.staged_pack = Some(digest);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for Forge {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    /// the repo's HEAD commit oid as a [`StateRoot`] (`sha256` of its 20 sha1
+    /// bytes) — pure, no IO (that's the whole reason `head` is a write-through
+    /// cache). `None` -> `ZERO`.
+    fn root(&self) -> StateRoot {
+        self.head.map_or(StateRoot::ZERO, Self::oid_to_root)
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()?))
+    }
+
+    /// apply one write op. a `Commit` builds a deterministic commit object in the
+    /// local odb (fixed `Signature` + `consensus_time` date + in-memory tree, so
+    /// the sha1 oid is reproducible) and stages it. a `Push` is PURE: it does a
+    /// compare-and-swap on the committed HEAD and stages the new oid — no git IO,
+    /// no pack install, no ref move, so it stays fast and, crucially, its accept/
+    /// reject and resulting `root()` are identical on every validator regardless
+    /// of pack possession (materialization is deferred; see `commit_block` ->
+    /// `materialize`). all git2 IO is blocking with no `.await`, so the "await
+    /// only deterministic resources" rule holds vacuously.
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        match decode_msg(&msg.payload).map_err(Error::Module)? {
+            ForgeMsg::Commit {
+                path,
+                content,
+                message,
+            } => self.stage_commit(ctx, path, content, message),
+            ForgeMsg::Push {
+                prev_oid,
+                new_oid,
+                pack_digest,
+            } => self.stage_push(prev_oid, new_oid, pack_digest),
+        }
     }
 
     /// read projection: the current HEAD as hex (or `None` on an unborn repo).
@@ -351,21 +604,47 @@ impl Module for Forge {
         }
     }
 
-    /// publish the staged head: move `MAIN_REF` and refresh the committed mirror
-    /// so `root()` now reflects it. no-op if nothing was staged this block.
+    /// publish the staged head so `root()` now reflects it. for a `Commit` the
+    /// objects are already in the local odb, so the ref moves here directly (as
+    /// before). for a `Push` the objects live in a node-local pack this node may
+    /// not hold yet: publishing must NOT depend on the pack, or validators would
+    /// diverge — so it records a node-local materialization target and defers the
+    /// on-disk ref move to `materialize`, which it then invokes opportunistically
+    /// (the submitter, holding the pack, catches up immediately; a node lacking
+    /// the pack is a safe no-op with `root()` already correct). no-op if nothing
+    /// was staged this block.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        if let Some(oid) = self.staged.take() {
-            let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
-            git::update_ref(&repo, MAIN_REF, oid).map_err(|e| Error::Module(e.to_string()))?;
-            self.head = Some(oid);
+        let Some(oid) = self.staged.take() else {
+            return Ok(());
+        };
+        match self.staged_pack.take() {
+            None => {
+                // Commit: the commit object is in this odb; move the ref now.
+                let repo = git::open(&self.repo).map_err(|e| Error::Module(e.to_string()))?;
+                git::update_ref(&repo, MAIN_REF, oid).map_err(|e| Error::Module(e.to_string()))?;
+                self.head = Some(oid);
+            }
+            Some(digest) => {
+                // Push: publish the head for `root()` unconditionally (the
+                // determinism invariant), then try to materialize the on-disk ref
+                // from the local pack. a fresh target -> re-arm the one-shot warn.
+                self.head = Some(oid);
+                self.pending_pack = Some((oid, digest));
+                self.materialize_warned = false;
+                self.materialize()?;
+            }
         }
         Ok(())
     }
 
     /// discard the staged head — the ref was never moved, so `root()` is
-    /// unchanged; the built commit objects linger unreferenced in the odb.
+    /// unchanged; any built commit objects linger unreferenced in the odb, and a
+    /// staged Push's pack digest is dropped with it (a committed Push's pending
+    /// materialization target is untouched — it belongs to an already-published
+    /// head, not this aborted block).
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.staged = None;
+        self.staged_pack = None;
         Ok(())
     }
 }

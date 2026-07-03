@@ -9,6 +9,10 @@ version.workspace = true
 [dependencies]
 sdk = { workspace = true }
 forge-interface = { workspace = true }
+# the node-local blob store forge fetches Push packfiles from by digest. only
+# its `BlobHandle` is used — the same node-local body plane files serves; the
+# packfile bytes never enter consensus (see the `Push` op in lib.rs).
+files = { workspace = true }
 # sha2 rehashes the 20-byte sha1 HEAD oid into a 32-byte StateRoot (always used).
 sha2 = { workspace = true }
 async-trait = { workspace = true }
