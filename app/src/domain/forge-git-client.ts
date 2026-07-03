@@ -7,7 +7,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "./node-bootstrap";
 
 export interface RepoInfo {
+  id: string;
+  name: string;
   branch: "main";
+  defaultBranch: "main";
   head: string | null;
   browsable: boolean;
 }
@@ -54,7 +57,17 @@ export const forgeHead = (): Promise<string | null> =>
   desktopInvoke<string | null>("forge_head");
 
 export const forgeRepoInfo = (): Promise<RepoInfo> =>
-  forgeHead().then((head) => ({ branch: "main", head, browsable: head !== null }));
+  forgeHead().then((head) => ({
+    id: "ducktape",
+    name: "ducktape",
+    branch: "main",
+    defaultBranch: "main",
+    head,
+    browsable: head !== null,
+  }));
+
+export const forgeListRepos = (): Promise<RepoInfo[]> =>
+  forgeRepoInfo().then((repo) => [repo]);
 
 export const forgeLog = (limit = 24): Promise<CommitInfo[]> =>
   desktopInvoke<CommitInfo[]>("forge_log", { limit });
