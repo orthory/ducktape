@@ -618,7 +618,12 @@ fn run_node(cfg: NodeConfig, sync_only: bool) -> Result<(), Box<dyn std::error::
                     let resolver = RemoteQmdbResolver::new(client.clone(), module);
                     let entry_root = manifest.entry(module).expect("module in manifest").root;
                     async move {
-                        let target = resolver.fetch_target().await.expect("target");
+                        // a transient fetch error feeds the SAME bounded retry as a
+                        // root mismatch — never panic the joiner on a slow source.
+                        let target = resolver
+                            .fetch_target()
+                            .await
+                            .map_err(|e| format!("fetch {module} target: {e}"))?;
                         let live_root = StateRoot(target.root.0);
                         if live_root != entry_root {
                             return Err(format!(
