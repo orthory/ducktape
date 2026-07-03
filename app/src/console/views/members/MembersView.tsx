@@ -55,11 +55,15 @@ const shortKey = (hex: string, start = 10, end = 6): string => {
 };
 
 const initialsOf = (name: string): string => {
-  const trimmed = name.trim();
+  // Drop parenthetical qualifiers ("eddy (joined node)" → "eddy") and keep only
+  // words that START alphanumeric, so an initial never becomes "(" or other
+  // punctuation. Fall back to the first two alnum chars (e.g. a hex key → "4C").
+  const trimmed = name.replace(/\s*\([^)]*\)\s*/g, " ").trim();
   if (!trimmed) return "?";
-  const parts = trimmed.split(/\s+/).filter(Boolean);
-  if (parts.length >= 2) return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
-  return trimmed.slice(0, 2).toUpperCase();
+  const words = trimmed.split(/\s+/).filter((w) => /^[\p{L}\p{N}]/u.test(w));
+  if (words.length >= 2) return `${words[0][0]}${words[1][0]}`.toUpperCase();
+  const alnum = (words[0] ?? trimmed).replace(/[^\p{L}\p{N}]/gu, "");
+  return alnum.slice(0, 2).toUpperCase() || "?";
 };
 
 const copyText = (text: string): void => {
