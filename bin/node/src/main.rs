@@ -2236,7 +2236,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
             blobs.clone(),
             AuthStore::from_default_path(),
-            "gpt-5.1".into(),
+            // the ChatGPT/Codex subscription endpoint rejects gpt-5.1 (400 "not
+            // supported when using Codex with a ChatGPT account") — default to a
+            // model the account can serve; per-agent model_ref overrides this.
+            "gpt-5.3-codex-spark".into(),
         ))];
         loop {
             futures::select_biased! {

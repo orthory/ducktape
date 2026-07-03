@@ -237,7 +237,10 @@ fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
     vec![Box::new(LlmWorker::new(
         blobs,
         AuthStore::from_default_path(),
-        "gpt-5.1".into(),
+        // the ChatGPT/Codex subscription endpoint rejects gpt-5.1 (400 "not
+        // supported when using Codex with a ChatGPT account") — default to a
+        // model the account can serve; per-agent model_ref overrides this.
+        "gpt-5.3-codex-spark".into(),
     ))]
 }
 
