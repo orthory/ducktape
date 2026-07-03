@@ -36,6 +36,7 @@ document = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }
+profiles = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }

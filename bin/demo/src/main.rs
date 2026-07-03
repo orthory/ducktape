@@ -1,10 +1,11 @@
-//! a runnable super-app demo: fifteen registered modules — a qmdb-backed kv, a
+//! a runnable super-app demo: sixteen registered modules — a qmdb-backed kv, a
 //! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
 //! qmdb-backed block DOCUMENT module, a qmdb-backed block-based CHAT module, an
 //! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
-//! orchestrator, a TASKS ledger, the AUTOMATIONS rule engine, the INBOX
-//! notification queues, a content-addressed FILES module, the MEMORY shared
-//! agent workspace, and the JOBS work board — dispatched over ONE host, showing
+//! orchestrator, a TASKS ledger, the origin-gated PROFILES name registry, the
+//! AUTOMATIONS rule engine, the INBOX notification queues, a content-addressed
+//! FILES module, the MEMORY shared agent workspace, and the JOBS work board —
+//! dispatched over ONE host, showing
 //! the app-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
 //! block.
@@ -50,6 +51,7 @@ use inbox_interface::{
 };
 use jobs::Jobs;
 use memory::Memory;
+use profiles::Profiles;
 use saga::SagaModule;
 use saga_interface::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
@@ -79,6 +81,7 @@ fn main() {
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");
         let tasks = Tasks::new("tasks");
+        let profiles = Profiles::new("profiles");
         let inbox = Inbox::new("inbox");
         let files = Files::new("files");
         let memory = Memory::new("memory", "files");
@@ -101,6 +104,7 @@ fn main() {
             Box::new(valset),
             Box::new(saga),
             Box::new(tasks),
+            Box::new(profiles),
             Box::new(inbox),
             Box::new(files),
             Box::new(memory),
@@ -110,7 +114,7 @@ fn main() {
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 15 registered modules over one host ===");
+        println!("=== super-app demo — 16 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -624,6 +628,7 @@ fn main() {
             "inbox",
             "jobs",
             "kv",
+            "profiles",
             "saga",
             "tasks",
             "valset",

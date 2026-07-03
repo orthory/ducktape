@@ -323,7 +323,8 @@ fn full_surface_blocks_authorship_and_ws() {
             "document",
             "forge",
             "files",
-            "memory"
+            "memory",
+            "profiles"
         ]
     );
     let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();
