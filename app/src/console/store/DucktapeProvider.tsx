@@ -28,6 +28,7 @@ import {
 import type { ReactNode } from "react";
 
 import * as chatClient from "../../domain/chat-client";
+import * as forgeClient from "../../domain/forge-client";
 import * as tasksClient from "../../domain/tasks-client";
 import {
   connectWorkspace,
@@ -72,6 +73,7 @@ export interface ConsoleActions {
   replyInThread(body: string): void;
   addTask(title: string): void;
   advanceTask(taskId: string): void;
+  commitForge(params: { path: string; content: string; message: string }): void;
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
@@ -249,9 +251,10 @@ export function DucktapeProvider({
             live.status(),
             chatClient.channels(live),
             tasksClient.listTasks(live),
+            forgeClient.head(live),
           ]),
         )
-        .then(([status, channels, tasks]) => {
+        .then(([status, channels, tasks, forgeHead]) => {
           const current = stateRef.current.activeChannel;
           const active =
             current && channels.some((c) => c.id === current)
@@ -266,6 +269,7 @@ export function DucktapeProvider({
                 status,
                 channels,
                 tasks,
+                forgeHead,
                 activeChannel: active,
                 messages,
               })),
@@ -407,6 +411,18 @@ export function DucktapeProvider({
           tasksClient.updateStatus(live, {
             taskId,
             status: nextTaskStatus(task.status),
+          }),
+        );
+      },
+
+      commitForge: (params) => {
+        if (!params.path.trim() || params.content.length === 0) return;
+        submitThenRefresh((live) =>
+          forgeClient.commit(live, {
+            path: params.path.trim(),
+            content: params.content,
+            message: params.message.trim() || `commit ${params.path.trim()}`,
+            origin: stateRef.current.author,
           }),
         );
       },

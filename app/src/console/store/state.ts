@@ -26,6 +26,8 @@ export interface ConsoleState {
   messages: MessageView[];
   activeThread: ChatThread | null;
   tasks: Task[];
+  /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
+  forgeHead: string | null;
   error: string | null;
 
   // ── Workspaces / onboarding (desktop only; inert on web) ──
@@ -59,6 +61,7 @@ export const createInitialState = (): ConsoleState => ({
   messages: [],
   activeThread: null,
   tasks: [],
+  forgeHead: null,
   error: null,
   workspaces: [],
   workspace: null,
