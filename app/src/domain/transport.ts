@@ -39,6 +39,17 @@ export interface NodeTransport {
   submit(target: string, payload: unknown, origin?: string): Promise<BlockEvent>;
   /** Read committed state. The reply is the module's `*Reply` enum as json. */
   query(target: string, query: unknown): Promise<unknown>;
+  /**
+   * Stage raw bytes in the node's content-addressed blob store and get their
+   * sha256 digest back (64 lowercase hex). NOTHING is committed — a later
+   * `submit` references the digest. The agent flow uses this to upload a
+   * prompt's text so the oracle worker can fetch it by the registered
+   * `prompt_hash` (which IS this digest, since the store keys by sha256).
+   *
+   * The bytes must be backed by a plain ArrayBuffer (what `TextEncoder.encode`
+   * returns) so they go straight into the fetch body.
+   */
+  putBlob(bytes: Uint8Array<ArrayBuffer>): Promise<string>;
   status(): Promise<NodeStatus>;
   /** Subscribe to finalized blocks. Returns the unsubscribe. */
   onBlock(listener: (block: BlockEvent) => void): () => void;
@@ -110,6 +121,25 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       postJson<BlockEvent>(`${base}/v1/submit`, { target, payload, origin }),
     query: (target, query) =>
       postJson<unknown>(`${base}/v1/query`, { target, query }),
+    // raw bytes in, `{"digest":"<64-hex>"}` out — not json in, so this bypasses
+    // postJson; the error envelope is still the node's json `{error}` shape.
+    putBlob: (bytes) =>
+      Promise.resolve()
+        .then(() =>
+          fetch(`${base}/v1/files/blob`, {
+            method: "POST",
+            headers: { "content-type": "application/octet-stream" },
+            body: bytes,
+          }),
+        )
+        .then(async (res) => {
+          if (res.ok) return ((await res.json()) as { digest: string }).digest;
+          const detail = await res
+            .json()
+            .then((payload) => String((payload as { error?: string }).error ?? ""))
+            .catch(() => "");
+          throw new Error(detail || `node replied ${res.status}`);
+        }),
     status: () =>
       Promise.resolve()
         .then(() => fetch(`${base}/v1/status`))
