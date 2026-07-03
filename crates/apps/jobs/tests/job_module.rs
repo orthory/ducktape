@@ -73,16 +73,12 @@ fn prune(job_id: &str) -> Msg {
     })
 }
 
-fn register_worker(module_id: &str) -> Msg {
-    jobs_msg(JobsMsg::RegisterWorker {
-        module_id: module_id.into(),
-    })
+fn register_worker() -> Msg {
+    jobs_msg(JobsMsg::RegisterWorker {})
 }
 
-fn unregister_worker(module_id: &str) -> Msg {
-    jobs_msg(JobsMsg::UnregisterWorker {
-        module_id: module_id.into(),
-    })
+fn unregister_worker() -> Msg {
+    jobs_msg(JobsMsg::UnregisterWorker {})
 }
 
 fn ext(id: &str) -> Origin {
@@ -304,33 +300,39 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
         let mut jobs = Jobs::new(JOBS);
         let empty_root = jobs.root();
 
-        let err = stage_with_modules(&mut jobs, 1, ext("operator"), &[], register_worker("agent"))
+        let err = stage_with_modules(&mut jobs, 1, ext("operator"), &[], register_worker())
             .await
-            .expect_err("unknown target rejected");
-        assert!(matches!(err, Error::Module(m) if m.contains("unknown worker target")));
+            .expect_err("external registration rejected");
+        assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
         jobs.abort_block().await.unwrap();
 
-        let err = stage_with_modules(
-            &mut jobs,
-            1,
-            ext("operator"),
-            &[JOBS],
-            register_worker(JOBS),
-        )
-        .await
-        .expect_err("self-registration rejected");
-        assert!(matches!(err, Error::Module(m) if m.contains("cannot register itself")));
+        let err = stage_with_modules(&mut jobs, 1, ext("operator"), &[], unregister_worker())
+            .await
+            .expect_err("external unregistration rejected");
+        assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
+        jobs.abort_block().await.unwrap();
+
+        let err = stage_with_modules(&mut jobs, 1, Origin::System, &[], register_worker())
+            .await
+            .expect_err("system registration rejected");
+        assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
+        jobs.abort_block().await.unwrap();
+
+        let err = stage_with_modules(&mut jobs, 1, Origin::System, &[], unregister_worker())
+            .await
+            .expect_err("system unregistration rejected");
+        assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
         jobs.abort_block().await.unwrap();
 
         stage_with_modules(
             &mut jobs,
             2,
-            ext("operator"),
-            &["agent"],
-            register_worker("agent"),
+            Origin::Module("agent".into()),
+            &[],
+            register_worker(),
         )
         .await
-        .expect("register agent worker");
+        .expect("agent module self-registers");
         jobs.commit_block().await.unwrap();
         let registered_root = jobs.root();
         assert_ne!(registered_root, empty_root, "worker set is consensus state");
@@ -338,9 +340,9 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
         stage_with_modules(
             &mut jobs,
             3,
-            ext("operator"),
-            &["agent"],
-            register_worker("agent"),
+            Origin::Module("agent".into()),
+            &[],
+            register_worker(),
         )
         .await
         .expect("re-register is idempotent");
@@ -354,9 +356,9 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
         stage_with_modules(
             &mut jobs,
             4,
-            ext("operator"),
-            &["ghost"],
-            unregister_worker("ghost"),
+            Origin::Module("ghost".into()),
+            &[],
+            unregister_worker(),
         )
         .await
         .expect("absent unregister is a deterministic no-op");
@@ -366,9 +368,9 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
         stage_with_modules(
             &mut jobs,
             5,
-            ext("operator"),
-            &["agent"],
-            unregister_worker("agent"),
+            Origin::Module("agent".into()),
+            &[],
+            unregister_worker(),
         )
         .await
         .expect("unregister existing worker");
@@ -384,9 +386,9 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
             stage_with_modules(
                 &mut jobs,
                 10 + i as u64,
-                ext("operator"),
-                &[&module],
-                register_worker(&module),
+                Origin::Module(module),
+                &[],
+                register_worker(),
             )
             .await
             .expect("register within cap");
@@ -395,9 +397,9 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
         let err = stage_with_modules(
             &mut jobs,
             99,
-            ext("operator"),
-            &["worker-overflow"],
-            register_worker("worker-overflow"),
+            Origin::Module("worker-overflow".into()),
+            &[],
+            register_worker(),
         )
         .await
         .expect_err("worker cap enforced");
@@ -1138,9 +1140,9 @@ fn worker_set_snapshot_round_trip_and_strict_decode() {
             stage_with_modules(
                 &mut source,
                 1,
-                ext("operator"),
-                &[module],
-                register_worker(module),
+                Origin::Module(module.into()),
+                &[],
+                register_worker(),
             )
             .await
             .expect("register worker");
@@ -1350,9 +1352,12 @@ fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
         ])
         .expect("genesis");
 
-        host.submit_at(as_origin(1, ext("operator")), register_worker("agent"))
-            .await
-            .expect("register worker");
+        host.submit_at(
+            as_origin(1, Origin::Module("agent".into())),
+            register_worker(),
+        )
+        .await
+        .expect("register worker");
 
         host.submit_at(
             as_origin(2, ext("submitter")),

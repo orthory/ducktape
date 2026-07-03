@@ -482,9 +482,10 @@ fn truncated_or_padded_snapshot_is_rejected() {
 /// agents:  count 8 | id 8+1 | owner disc 1 + key 8+1 | display 8+1
 ///          | model 8+1 | prompt 8+32 | action count 8 | status 1 | times 16
 /// watches: count 8 | channel 8+1 | policy 1
-/// runs:    count 8 | run id 8+5 | agent 8+1 | channel 8+1 | anchor 8
-///          | thread tag 1 | job id tag 1 | requester disc 1 + key 8+1 | status disc 1
-///          + saga id 8+11 | ctx hash 8+32 | times 16
+/// runs:    count 8 | run id 8+10 | agent 8+1 | channel 8+1 | anchor 8
+///          | thread tag 1 | job id tag 1 | job claim height 8
+///          | requester disc 1 + key 8+1 | status disc 1
+///          + saga id 8+16 | ctx hash 8+32 | times 16
 fn minimal_snapshot() -> Vec<u8> {
     let owner = Origin::External(vec![5]);
     let mut m = AgentModule::new("agent", "chat", "saga", None, None);
@@ -518,7 +519,7 @@ fn minimal_snapshot() -> Vec<u8> {
     );
     commit(&mut m);
     let snap = m.snapshot();
-    assert_eq!(snap.len(), 263, "the minimal layout this test indexes into");
+    assert_eq!(snap.len(), 281, "the minimal layout this test indexes into");
     snap
 }
 
@@ -528,17 +529,17 @@ fn unknown_discriminants_and_tags_are_rejected() {
     let snap = minimal_snapshot();
 
     // owner origin disc (17), agent status (93), watch policy (127), the run's
-    // thread-root option tag (175), job-id option tag (176), requester origin
-    // disc (177), and run status disc (187) each admit exactly their known
+    // thread-root option tag (180), job-id option tag (181), requester origin
+    // disc (190), and run status disc (200) each admit exactly their known
     // values — a state has ONE valid encoding.
     for (index, what) in [
         (17usize, "owner origin discriminant"),
         (93, "agent status"),
         (127, "watch policy"),
-        (175, "thread-root option tag"),
-        (176, "job-id option tag"),
-        (177, "requester origin discriminant"),
-        (187, "run status discriminant"),
+        (180, "thread-root option tag"),
+        (181, "job-id option tag"),
+        (190, "requester origin discriminant"),
+        (200, "run status discriminant"),
     ] {
         let mut bad = snap.clone();
         bad[index] = 9;

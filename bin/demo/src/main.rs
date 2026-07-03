@@ -12,7 +12,7 @@
 //!
 //! run: `cargo run -p demo`
 
-use agent::AgentModule;
+use agent::{AgentModule, run_id_for, saga_id_for};
 use agent_interface::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, TurnPolicy,
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
@@ -49,7 +49,6 @@ use inbox_interface::{
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
 use jobs::Jobs;
-use jobs_interface::{JobsMsg, encode_msg as jobs_encode_msg};
 use memory::Memory;
 use saga::SagaModule;
 use saga_interface::{
@@ -453,8 +452,8 @@ fn main() {
         // block 8: the agent-collaboration loop (design §3). register an agent
         // (which model+prompt it runs is committed into the app-hash), watch
         // the chat channel under a Mention policy — the watch and chat's hook
-        // registration commit atomically — register the agent module as the
-        // jobs-board worker by op (not genesis config), then post a message MENTIONING the
+        // registration commit atomically — enable the agent module as the
+        // jobs-board worker by agent admin op (not genesis config), then post a message MENTIONING the
         // agent: the very same block carries the post, the hook delivery, the
         // run record, and the saga trigger. the emitted WorkerRequest effect
         // is the off-consensus LLM seam a reactor driver answers as an
@@ -477,14 +476,12 @@ fn main() {
         host.submit_at(
             as_demo_user(),
             Msg {
-                target: "jobs".into(),
-                payload: jobs_encode_msg(&JobsMsg::RegisterWorker {
-                    module_id: "agent".into(),
-                }),
+                target: "agent".into(),
+                payload: agent_encode_msg(&AgentMsg::EnableJobWorker { enabled: true }),
             },
         )
         .await
-        .expect("submit block 8 register jobs worker");
+        .expect("submit block 8 enable jobs worker");
         host.submit_at(
             as_demo_user(),
             Msg {
@@ -526,17 +523,18 @@ fn main() {
             .await
             .expect("submit block 8 mention");
         println!(
-            "\n[block 8] agent <- Register; jobs <- RegisterWorker(agent); agent <- Watch(Mention); chat <- PostMessage(@quackbot)"
+            "\n[block 8] agent <- Register; agent <- EnableJobWorker(true); agent <- Watch(Mention); chat <- PostMessage(@quackbot)"
         );
         println!(
             "  effects        : {} WorkerRequest (the off-consensus LLM seam)",
             out.effects.len()
         );
+        let run_id = run_id_for("general", 3, "quackbot");
         let reply = host
             .query(
                 "agent",
                 &agent_encode_query(&AgentQuery::Run {
-                    run_id: "general/3/quackbot".into(),
+                    run_id: run_id.clone(),
                 }),
             )
             .await
@@ -547,11 +545,12 @@ fn main() {
                 run.run_id, run.status, run.anchor_seq
             );
         }
+        let saga_id = saga_id_for(&run_id);
         let reply = host
             .query(
                 "saga",
                 &saga_encode_query(&SagaQuery::Get {
-                    saga_id: "agent/general/3/quackbot".into(),
+                    saga_id: saga_id.clone(),
                 }),
             )
             .await
@@ -560,8 +559,8 @@ fn main() {
             panic!("the run's saga must exist");
         };
         println!(
-            "  saga           : agent/general/3/quackbot {:?} (deadline view {:?})",
-            saga_view.status, saga_view.deadline
+            "  saga           : {} {:?} (deadline view {:?})",
+            saga_id, saga_view.status, saga_view.deadline
         );
         println!("  (post + hook + run + trigger: ONE block — the P2 atomic cascade)");
         println!("  app-hash       : {:?}", out.app_hash);

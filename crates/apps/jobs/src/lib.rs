@@ -190,7 +190,12 @@ impl Jobs {
         self.overlay.insert(job_id.to_owned(), None);
     }
 
-    fn register_worker(&mut self, ctx: &dyn Ctx, module_id: String) -> Result<(), Error> {
+    fn worker_module_from_origin(&self, origin: &Origin) -> Result<ModuleId, Error> {
+        let Origin::Module(module_id) = origin else {
+            return Err(Error::Module(
+                "worker registration requires a module origin".into(),
+            ));
+        };
         if module_id.is_empty() {
             return Err(Error::Module("worker module_id must not be empty".into()));
         }
@@ -199,14 +204,16 @@ impl Jobs {
                 "worker module_id exceeds {MAX_WORKER_MODULE_ID} bytes"
             )));
         }
-        if module_id == self.id {
+        if module_id == &self.id {
             return Err(Error::Module(
                 "jobs cannot register itself as a worker".into(),
             ));
         }
-        if ctx.module_root(&module_id).is_none() {
-            return Err(Error::Module(format!("unknown worker target: {module_id}")));
-        }
+        Ok(module_id.clone())
+    }
+
+    fn register_worker(&mut self, origin: &Origin) -> Result<(), Error> {
+        let module_id = self.worker_module_from_origin(origin)?;
         if self.has_worker(&module_id) {
             return Ok(());
         }
@@ -217,7 +224,8 @@ impl Jobs {
         Ok(())
     }
 
-    fn unregister_worker(&mut self, module_id: String) -> Result<(), Error> {
+    fn unregister_worker(&mut self, origin: &Origin) -> Result<(), Error> {
+        let module_id = self.worker_module_from_origin(origin)?;
         if !self.has_worker(&module_id) {
             return Ok(());
         }
@@ -773,8 +781,8 @@ impl Module for Jobs {
             JobsMsg::Reclaim { job_id } => self.reclaim(job_id, height),
             JobsMsg::Cancel { job_id } => self.cancel(job_id, &origin, height),
             JobsMsg::Prune { job_id } => self.prune(job_id, &origin),
-            JobsMsg::RegisterWorker { module_id } => self.register_worker(&*ctx, module_id),
-            JobsMsg::UnregisterWorker { module_id } => self.unregister_worker(module_id),
+            JobsMsg::RegisterWorker {} => self.register_worker(&origin),
+            JobsMsg::UnregisterWorker {} => self.unregister_worker(&origin),
         }
     }
 

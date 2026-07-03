@@ -90,10 +90,10 @@ pub enum JobsMsg {
     Cancel { job_id: String },
     /// the submitter removes a terminal job's record entirely.
     Prune { job_id: String },
-    /// register a module as a worker notified on every successful submit.
-    RegisterWorker { module_id: String },
-    /// remove a registered worker. absent workers are deterministic no-ops.
-    UnregisterWorker { module_id: String },
+    /// register the caller module as a worker notified on every successful submit.
+    RegisterWorker {},
+    /// remove the caller module as a worker. absent workers are deterministic no-ops.
+    UnregisterWorker {},
 }
 
 /// the notification payload sent by `jobs` to each registered worker module.

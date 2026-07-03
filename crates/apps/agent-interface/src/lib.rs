@@ -141,8 +141,9 @@ impl RunStatus {
 /// a run's observable state — the full read projection.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RunView {
-    /// `"{channel_id}/{anchor_seq}/{agent_id}"` — the turn-claim key: the
-    /// first creation in consensus order wins, duplicates are no-ops.
+    /// `"chat\x1f{channel_id}\x1f{anchor_seq}\x1f{agent_id}"` for chat runs
+    /// and `"job\x1f{job_id}\x1f{agent_id}\x1f{job_claim_height}"` for job runs:
+    /// the first creation in consensus order wins, duplicates are no-ops.
     pub run_id: String,
     pub agent_id: String,
     pub channel_id: String,
@@ -154,6 +155,8 @@ pub struct RunView {
     pub thread_root: Option<u64>,
     /// present for jobs-board runs. chat-triggered runs leave this `None`.
     pub job_id: Option<String>,
+    /// the jobs claim height for job-backed runs. chat-triggered runs use 0.
+    pub job_claim_height: u64,
     /// the run-creating origin (the hook's chat module, or the explicit
     /// `RequestRun` submitter) — a cancel capability alongside the owner.
     pub requester: SagaOrigin,
@@ -254,6 +257,9 @@ pub enum AgentMsg {
     },
     /// drop the watch and unregister the hook, atomically.
     UnwatchChannel { channel_id: String },
+    /// opt the agent module into or out of jobs-board submit notifications.
+    /// the jobs module derives the worker id from this module's follow-up origin.
+    EnableJobWorker { enabled: bool },
     /// explicitly run `agent_id` against `channel_id`/`anchor_seq` without a
     /// hook. the duplicate of an existing run is a deterministic no-op — the
     /// turn claim: first creation in consensus order wins.

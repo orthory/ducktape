@@ -65,11 +65,11 @@
 //!
 //! ## the turn claim
 //!
-//! `run_id = "{channel_id}/{anchor_seq}/{agent_id}"`. creating a run that
-//! already exists (staged or committed) is a deterministic no-op, so however
-//! many paths race to claim a turn — the hook and an explicit `RequestRun`,
-//! or two identical requests — the first in consensus order wins and the
-//! rest fall through silently.
+//! chat run ids and job run ids use disjoint `0x1f`-delimited keyspaces.
+//! creating a run that already exists (staged or committed) is a deterministic
+//! no-op, so however many paths race to claim a turn — the hook and an explicit
+//! `RequestRun`, or two identical requests — the first in consensus order wins
+//! and the rest fall through silently.
 //!
 //! `root()` folds in every field of all three maps, so any transition moves
 //! the app-hash. a joiner rebuilds this module from a peer via
@@ -123,15 +123,21 @@ pub const JOB_RUN_LEASE_VIEWS: u64 = 1000;
 
 /// jobs finalization payloads must fit the jobs module's 64 KiB cap.
 const JOB_FINALIZE_PAYLOAD_BYTES: usize = 64 * 1024;
+/// reserved delimiter separating run-key fields.
+const RUN_KEY_SEPARATOR: char = '\u{1f}';
 
 /// the turn-claim key: first creation in consensus order wins.
 pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
-    format!("{channel_id}/{anchor_seq}/{agent_id}")
+    format!(
+        "chat{RUN_KEY_SEPARATOR}{channel_id}{RUN_KEY_SEPARATOR}{anchor_seq}{RUN_KEY_SEPARATOR}{agent_id}"
+    )
 }
 
 /// the turn-claim key for a job-backed run.
-pub fn job_run_id_for(job_id: &str, agent_id: &str) -> String {
-    format!("job/{job_id}/{agent_id}")
+pub fn job_run_id_for(job_id: &str, agent_id: &str, claim_height: u64) -> String {
+    format!(
+        "job{RUN_KEY_SEPARATOR}{job_id}{RUN_KEY_SEPARATOR}{agent_id}{RUN_KEY_SEPARATOR}{claim_height}"
+    )
 }
 
 /// canonical job-spec pin used by job-backed runs.
@@ -217,6 +223,8 @@ struct RunState {
     thread_root: Option<u64>,
     /// the jobs-board item this run owns, when created from a JobsEvent.
     job_id: Option<String>,
+    /// the claim height this job-backed run is bound to; chat runs use 0.
+    job_claim_height: u64,
     /// the run-creating origin — a cancel capability alongside the owner.
     requester: SagaOrigin,
     status: RunStatus,
@@ -317,6 +325,7 @@ fn encode_committed(
         out.extend_from_slice(&r.anchor_seq.to_le_bytes());
         put_opt_u64(&mut out, r.thread_root);
         put_opt_string(&mut out, &r.job_id);
+        out.extend_from_slice(&r.job_claim_height.to_le_bytes());
         put_origin(&mut out, &r.requester);
         match &r.status {
             RunStatus::AwaitingOracle { saga_id } => {
@@ -443,6 +452,56 @@ fn insert_ascending<V>(map: &mut BTreeMap<String, V>, key: String, value: V) -> 
     Ok(())
 }
 
+fn contains_run_separator(value: &str) -> bool {
+    value.contains(RUN_KEY_SEPARATOR)
+}
+
+fn reject_run_separator(field: &str, value: &str) -> Result<(), Error> {
+    if contains_run_separator(value) {
+        return Err(Error::Module(format!(
+            "{field} must not contain the reserved unit separator"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_decoded_run_key(
+    id: &str,
+    agent_id: &str,
+    channel_id: &str,
+    anchor_seq: u64,
+    job_id: &Option<String>,
+    job_claim_height: u64,
+) -> Result<(), String> {
+    if contains_run_separator(agent_id) {
+        return Err("snapshot agent_id contains reserved unit separator".into());
+    }
+    match job_id {
+        Some(job_id) => {
+            if contains_run_separator(job_id) {
+                return Err("snapshot job_id contains reserved unit separator".into());
+            }
+            let expected = job_run_id_for(job_id, agent_id, job_claim_height);
+            if id != expected {
+                return Err("snapshot job run id does not match its fields".into());
+            }
+        }
+        None => {
+            if job_claim_height != 0 {
+                return Err("snapshot chat run has non-zero job claim height".into());
+            }
+            if contains_run_separator(channel_id) {
+                return Err("snapshot channel_id contains reserved unit separator".into());
+            }
+            let expected = run_id_for(channel_id, anchor_seq, agent_id);
+            if id != expected {
+                return Err("snapshot chat run id does not match its fields".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 type Committed = (
     BTreeMap<String, AgentState>,
     BTreeMap<String, TurnPolicy>,
@@ -457,12 +516,15 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     // two u64s.
     const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
     const MIN_WATCH_BYTES: u64 = 8 + 1;
-    const MIN_RUN_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 8 + 8 + 8;
+    const MIN_RUN_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 1 + 1 + 8 + 8 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
     for _ in 0..count {
         let id = take_lp_string(&mut buf)?;
+        if contains_run_separator(&id) {
+            return Err("snapshot agent_id contains reserved unit separator".into());
+        }
         let owner = take_origin(&mut buf)?;
         let display_name = take_lp_string(&mut buf)?;
         let model_ref = take_lp_string(&mut buf)?;
@@ -505,6 +567,9 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     let count = take_count(&mut buf, MIN_WATCH_BYTES, "watch")?;
     for _ in 0..count {
         let channel = take_lp_string(&mut buf)?;
+        if contains_run_separator(&channel) {
+            return Err("snapshot channel_id contains reserved unit separator".into());
+        }
         let policy = match take(&mut buf, 1)?[0] {
             0 => TurnPolicy::Mention,
             1 => TurnPolicy::All,
@@ -524,6 +589,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         let anchor_seq = take_u64(&mut buf)?;
         let thread_root = take_opt_u64(&mut buf)?;
         let job_id = take_opt_string(&mut buf)?;
+        let job_claim_height = take_u64(&mut buf)?;
         let requester = take_origin(&mut buf)?;
         let status = match take(&mut buf, 1)?[0] {
             0 => RunStatus::AwaitingOracle {
@@ -539,6 +605,14 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         let context_hash = take_lp_bytes(&mut buf)?;
         let created_at = take_u64(&mut buf)?;
         let updated_at = take_u64(&mut buf)?;
+        validate_decoded_run_key(
+            &id,
+            &agent_id,
+            &channel_id,
+            anchor_seq,
+            &job_id,
+            job_claim_height,
+        )?;
         insert_ascending(
             &mut runs,
             id,
@@ -548,6 +622,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
                 anchor_seq,
                 thread_root,
                 job_id,
+                job_claim_height,
                 requester,
                 status,
                 context_hash,
@@ -697,6 +772,7 @@ impl AgentModule {
             anchor_seq: r.anchor_seq,
             thread_root: r.thread_root,
             job_id: r.job_id.clone(),
+            job_claim_height: r.job_claim_height,
             requester: r.requester.clone(),
             status: r.status.clone(),
             context_hash: r.context_hash.clone(),
@@ -836,6 +912,7 @@ impl AgentModule {
         anchor_seq: u64,
         thread_root: Option<u64>,
         job_id: Option<String>,
+        job_claim_height: u64,
         requester: SagaOrigin,
         model_ref: String,
         prompt_hash: Vec<u8>,
@@ -872,6 +949,7 @@ impl AgentModule {
                 anchor_seq,
                 thread_root,
                 job_id,
+                job_claim_height,
                 requester,
                 status: RunStatus::AwaitingOracle { saga_id },
                 context_hash,
@@ -913,16 +991,31 @@ impl AgentModule {
             spec_hash,
             ..
         } = event;
+        if contains_run_separator(&job_id) {
+            self.note(
+                ctx,
+                format!("dropped jobs event with invalid job id {job_id}"),
+            );
+            return Ok(());
+        }
         let Some(agent_id) = kind.strip_prefix("agent/").filter(|id| !id.is_empty()) else {
             return Ok(());
         };
+        if contains_run_separator(agent_id) {
+            self.note(
+                ctx,
+                format!("dropped jobs event with invalid agent id {agent_id}"),
+            );
+            return Ok(());
+        }
         let Some(agent) = self.agent(agent_id) else {
             return Ok(());
         };
         if !agent.active {
             return Ok(());
         }
-        let run_id = job_run_id_for(&job_id, agent_id);
+        let claim_height = ctx.env().height;
+        let run_id = job_run_id_for(&job_id, agent_id, claim_height);
         if self.run(&run_id).is_some() {
             return Ok(());
         }
@@ -951,6 +1044,7 @@ impl AgentModule {
             0,
             None,
             Some(job_id),
+            claim_height,
             requester,
             model_ref,
             prompt_hash,
@@ -1049,6 +1143,7 @@ impl AgentModule {
                     seq,
                     thread_root,
                     None,
+                    0,
                     requester.clone(),
                     model_ref,
                     prompt_hash,
@@ -1303,7 +1398,12 @@ impl AgentModule {
         payload
     }
 
-    async fn job_claimed_by_self(&self, ctx: &dyn Ctx, job_id: &str) -> Result<bool, String> {
+    async fn job_claimed_by_run(
+        &self,
+        ctx: &dyn Ctx,
+        job_id: &str,
+        claim_height: u64,
+    ) -> Result<bool, String> {
         let Some(jobs) = &self.jobs else {
             return Ok(false);
         };
@@ -1324,6 +1424,7 @@ impl AgentModule {
         Ok(job.is_some_and(|job| {
             job.status == JobStatus::Processing
                 && job.claim.as_ref().map(|claim| claim.worker.as_str()) == Some(self.id.as_str())
+                && job.claim.as_ref().map(|claim| claim.claimed_at_height) == Some(claim_height)
         }))
     }
 
@@ -1337,7 +1438,10 @@ impl AgentModule {
         let Some(job_id) = &run.job_id else {
             return;
         };
-        match self.job_claimed_by_self(&*ctx, job_id).await {
+        match self
+            .job_claimed_by_run(&*ctx, job_id, run.job_claim_height)
+            .await
+        {
             Ok(true) => {
                 let Some(jobs) = &self.jobs else {
                     self.note(
@@ -1413,6 +1517,7 @@ impl AgentModule {
             } => {
                 let owner = Self::admin_origin(&ctx.env().origin)?;
                 Self::validate_non_empty("agent_id", &agent_id)?;
+                reject_run_separator("agent_id", &agent_id)?;
                 Self::validate_non_empty("display_name", &display_name)?;
                 Self::validate_non_empty("model_ref", &model_ref)?;
                 Self::validate_prompt_hash(&prompt_hash)?;
@@ -1467,6 +1572,7 @@ impl AgentModule {
             AgentMsg::WatchChannel { channel_id, policy } => {
                 Self::admin_origin(&ctx.env().origin)?;
                 Self::validate_non_empty("channel_id", &channel_id)?;
+                reject_run_separator("channel_id", &channel_id)?;
                 if let TurnPolicy::Assigned(assignee) = &policy {
                     if self.agent(assignee).is_none() {
                         return Err(Error::Module(format!(
@@ -1505,6 +1611,23 @@ impl AgentModule {
                 });
                 Ok(())
             }
+            AgentMsg::EnableJobWorker { enabled } => {
+                Self::admin_origin(&ctx.env().origin)?;
+                let jobs = self
+                    .jobs
+                    .clone()
+                    .ok_or_else(|| Error::Module("no jobs module is configured".into()))?;
+                let payload = if enabled {
+                    jobs_encode_msg(&JobsMsg::RegisterWorker {})
+                } else {
+                    jobs_encode_msg(&JobsMsg::UnregisterWorker {})
+                };
+                ctx.emit_msg(Msg {
+                    target: jobs,
+                    payload,
+                });
+                Ok(())
+            }
             AgentMsg::RequestRun {
                 agent_id,
                 channel_id,
@@ -1523,6 +1646,7 @@ impl AgentModule {
                 let Some(agent) = self.agent(&agent_id) else {
                     return Err(Error::Module(format!("unknown agent: {agent_id}")));
                 };
+                reject_run_separator("channel_id", &channel_id)?;
                 let run_id = run_id_for(&channel_id, anchor_seq, &agent_id);
                 if self.run(&run_id).is_some() {
                     return Ok(());
@@ -1546,6 +1670,7 @@ impl AgentModule {
                     anchor_seq,
                     thread_root,
                     None,
+                    0,
                     requester,
                     model_ref,
                     prompt_hash,
@@ -1810,6 +1935,9 @@ mod tests {
         fn from_saga(self) -> Self {
             self.from_origin(Origin::Module("saga".into()))
         }
+        fn from_jobs(self) -> Self {
+            self.from_origin(Origin::Module("jobs".into()))
+        }
         fn with_transcript(mut self, channel: &str, messages: Vec<MessageView>) -> Self {
             self.transcripts.insert(channel.into(), messages);
             self
@@ -1846,6 +1974,14 @@ mod tests {
                 .iter()
                 .filter(|m| m.target == "tasks")
                 .map(|m| tasks_decode_msg(&m.payload).expect("task msg"))
+                .collect()
+        }
+        /// decoded jobs msgs emitted this dispatch.
+        fn job_msgs(&self) -> Vec<JobsMsg> {
+            self.msgs
+                .iter()
+                .filter(|m| m.target == "jobs")
+                .map(|m| jobs_interface::decode_msg(&m.payload).expect("jobs msg"))
                 .collect()
         }
     }
@@ -2150,6 +2286,16 @@ mod tests {
             (
                 user(9),
                 AgentMsg::RegisterAgent {
+                    agent_id: "bad\u{1f}id".into(),
+                    display_name: "A".into(),
+                    model_ref: "m".into(),
+                    prompt_hash: vec![7u8; 32],
+                    allowed_actions: Vec::new(),
+                },
+            ),
+            (
+                user(9),
+                AgentMsg::RegisterAgent {
                     agent_id: "a".into(),
                     display_name: "A".into(),
                     model_ref: String::new(),
@@ -2176,6 +2322,52 @@ mod tests {
             abort(&mut m);
             assert_eq!(m.root(), root0, "a rejected register leaves no trace");
         }
+    }
+
+    #[test]
+    fn enable_job_worker_is_admin_gated_and_emits_self_registration() {
+        let mut m = module();
+
+        let mut intruder = CaptureCtx::new().from_origin(Origin::System);
+        let err = exec(
+            &mut m,
+            &mut intruder,
+            &admin(&AgentMsg::EnableJobWorker { enabled: true }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        abort(&mut m);
+
+        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::EnableJobWorker { enabled: true }),
+        )
+        .unwrap();
+        assert_eq!(ctx.job_msgs(), vec![JobsMsg::RegisterWorker {}]);
+        commit(&mut m);
+
+        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::EnableJobWorker { enabled: false }),
+        )
+        .unwrap();
+        assert_eq!(ctx.job_msgs(), vec![JobsMsg::UnregisterWorker {}]);
+        commit(&mut m);
+
+        let mut without_jobs =
+            AgentModule::new("agent", "chat", "saga", Some("tasks".into()), None);
+        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let err = exec(
+            &mut without_jobs,
+            &mut ctx,
+            &admin(&AgentMsg::EnableJobWorker { enabled: true }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(m) if m.contains("jobs module")));
     }
 
     #[test]
@@ -2614,6 +2806,66 @@ mod tests {
         assert!(ctx.msgs.is_empty());
         commit(&mut m);
         assert_eq!(m.root(), root, "a duplicate claim moves nothing");
+    }
+
+    #[test]
+    fn chat_and_job_run_keys_are_structurally_disjoint_and_reject_separator_inputs() {
+        assert_ne!(
+            run_id_for("job", 7, "duck"),
+            job_run_id_for("7", "duck", 3),
+            "a channel literally named job must not collide with job runs"
+        );
+
+        let mut m = watched(TurnPolicy::All, &[("bot", &[])]);
+        let root = m.root();
+
+        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::WatchChannel {
+                channel_id: "bad\u{1f}channel".into(),
+                policy: TurnPolicy::All,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(message) if message.contains("unit separator")));
+        abort(&mut m);
+
+        let mut ctx = CaptureCtx::new()
+            .from_origin(user(1))
+            .with_transcript("bad\u{1f}channel", transcript(1));
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::RequestRun {
+                agent_id: "bot".into(),
+                channel_id: "bad\u{1f}channel".into(),
+                anchor_seq: 1,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(message) if message.contains("unit separator")));
+        abort(&mut m);
+
+        let mut ctx = CaptureCtx::new().from_jobs();
+        exec(
+            &mut m,
+            &mut ctx,
+            &Msg {
+                target: "agent".into(),
+                payload: jobs_interface::encode_event(&JobsEvent::Submitted {
+                    job_id: "bad\u{1f}job".into(),
+                    kind: "agent/bot".into(),
+                    submitter: "system".into(),
+                    spec_hash: vec![1u8; 32],
+                }),
+            },
+        )
+        .expect("separator in a no-fail jobs event is a no-op");
+        assert!(ctx.msgs.is_empty(), "no claim emitted for a bad job id");
+        commit(&mut m);
+        assert_eq!(m.root(), root, "bad jobs event staged no run");
     }
 
     // ---- the no-fail arms ----------------------------------------------------------
