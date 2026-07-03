@@ -309,8 +309,14 @@ export function DucktapeProvider({
       .catch((err) => {
         if (!cancelled) fail(err);
       });
+    // Reset the guard on cleanup so StrictMode's mount→unmount→remount re-runs
+    // the boot: without this the first mount's async resolve is cancelled while
+    // the guard blocks the remount, so connectActive never fires and the app is
+    // stuck unmanaged. (The remount's connectActive is idempotent — it adopts an
+    // already-listening node rather than double-spawning.)
     return () => {
       cancelled = true;
+      bootStartedRef.current = false;
     };
   }, [transport, fail, connectActive]);
 
