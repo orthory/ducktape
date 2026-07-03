@@ -3857,15 +3857,20 @@ dependencies = [
 name = "noded"
 version = "0.1.0"
 dependencies = [
+ "automations",
  "axum",
  "chat",
  "commonware-runtime",
  "document",
+ "files",
+ "files-interface",
  "forge",
  "futures",
  "host",
  "http-body-util",
  "inbox",
+ "jobs",
+ "memory",
  "sdk",
  "serde",
  "serde_json",

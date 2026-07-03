@@ -32,6 +32,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex};
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
@@ -66,25 +67,70 @@ impl BlobStore {
     }
 }
 
+/// a cloneable, thread-safe handle to one node's [`BlobStore`]. the embedding
+/// daemon keeps one clone for its upload/download lane (http handlers on
+/// whatever runtime it likes) and registers the [`Files`] module over another,
+/// so uploaded bytes are visible to `serve_sync` without a chunk byte ever
+/// entering the op stream. this shares only the NODE-LOCAL body store — the
+/// consensus surface (`root()`, execute, state sync) is untouched by it.
+#[derive(Clone, Default)]
+pub struct BlobHandle(Arc<Mutex<BlobStore>>);
+
+impl BlobHandle {
+    /// store one chunk and return its sha256 digest.
+    pub fn put_chunk(&self, bytes: Vec<u8>) -> [u8; 32] {
+        self.0.lock().expect("blob store poisoned").put_chunk(bytes)
+    }
+
+    /// read one chunk's bytes back out (cloned — no borrow may outlive the lock).
+    pub fn get_chunk(&self, digest: &[u8; 32]) -> Option<Vec<u8>> {
+        self.0
+            .lock()
+            .expect("blob store poisoned")
+            .get_chunk(digest)
+            .map(<[u8]>::to_vec)
+    }
+
+    /// whether this node currently holds a chunk's bytes.
+    pub fn has_chunk(&self, digest: &[u8; 32]) -> bool {
+        self.0
+            .lock()
+            .expect("blob store poisoned")
+            .has_chunk(digest)
+    }
+}
+
 pub struct Files {
     id: ModuleId,
     manifests: BTreeMap<String, Manifest>,
     /// per-block overlay: `Some(m)` stages an upsert, `None` stages a delete.
     pending: BTreeMap<String, Option<Manifest>>,
-    blobs: BlobStore,
+    blobs: BlobHandle,
 }
 
 impl Files {
     pub fn new(id: impl Into<ModuleId>) -> Self {
+        Self::with_blobs(id, BlobHandle::default())
+    }
+
+    /// construct over an EXISTING blob store handle. the embedding daemon
+    /// creates the handle first, keeps a clone for its own http blob lane, and
+    /// registers the module with the other end — both sides see one store.
+    pub fn with_blobs(id: impl Into<ModuleId>, blobs: BlobHandle) -> Self {
         Self {
             id: id.into(),
             manifests: BTreeMap::new(),
             pending: BTreeMap::new(),
-            blobs: BlobStore::default(),
+            blobs,
         }
     }
 
     // ---- node-local blob store seam (never touches consensus state) --------
+
+    /// a cloneable handle to this module's node-local blob store.
+    pub fn blob_handle(&self) -> BlobHandle {
+        self.blobs.clone()
+    }
 
     /// store one chunk and return its sha256 digest. called by the daemon/RPC
     /// layer as bytes are uploaded — bytes never enter the op stream.
@@ -93,7 +139,7 @@ impl Files {
     }
 
     /// read one chunk's bytes back out of the local blob store.
-    pub fn get_chunk(&self, digest: &[u8; 32]) -> Option<&[u8]> {
+    pub fn get_chunk(&self, digest: &[u8; 32]) -> Option<Vec<u8>> {
         self.blobs.get_chunk(digest)
     }
 
@@ -279,8 +325,9 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// decode exactly 64 lowercase-hex chars into 32 bytes. rejects any other
 /// length and any non-`[0-9a-f]` byte (uppercase included) — so this doubles as
-/// the "valid 64-char lowercase hex" digest check.
-fn from_hex_32(s: &str) -> Option<[u8; 32]> {
+/// the "valid 64-char lowercase hex" digest check. pub because the daemon's
+/// blob lane validates client-supplied digests with the same rule.
+pub fn from_hex_32(s: &str) -> Option<[u8; 32]> {
     let bytes = s.as_bytes();
     if bytes.len() != 64 {
         return None;
@@ -439,7 +486,7 @@ impl Module for Files {
                 let resp = match from_hex_32(&digest).and_then(|d| self.get_chunk(&d)) {
                     Some(bytes) => FilesSyncResp::Chunk {
                         present: true,
-                        bytes: bytes.to_vec(),
+                        bytes,
                     },
                     None => FilesSyncResp::Chunk {
                         present: false,

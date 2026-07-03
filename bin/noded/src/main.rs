@@ -20,22 +20,36 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Runner as _, Supervisor as _};
 use document::Document;
+use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use inbox::Inbox;
-use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
 use host::{BlockContext, Host, SubmitError};
+use inbox::Inbox;
+use jobs::Jobs;
+use memory::Memory;
+use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
 use sdk::{Msg, Origin};
 use tasks::Tasks;
 use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 5] = ["chat", "tasks", "inbox", "document", "forge"];
+const MODULE_IDS: [&str; 9] = [
+    "chat",
+    "tasks",
+    "inbox",
+    "automations",
+    "jobs",
+    "document",
+    "forge",
+    "files",
+    "memory",
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
@@ -46,9 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--listen" => listen = args.next().ok_or("--listen needs an addr")?.parse()?,
             "--storage" => storage = args.next().map(PathBuf::from),
             other => {
-                return Err(
-                    format!("unexpected arg {other:?} (want --listen/--storage)").into(),
-                );
+                return Err(format!("unexpected arg {other:?} (want --listen/--storage)").into());
             }
         }
     }
@@ -59,13 +71,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
 
     // the node actor gets its own thread: commonware's tokio runner owns that
-    // thread's runtime, and the host must never leave it.
+    // thread's runtime, and the host must never leave it. the blob handle is
+    // the one thing that crosses: the actor registers the files module over
+    // it, the http layer uploads/downloads through its own clone.
     let actor_storage = storage.clone();
+    let blobs = handle.blob_handle();
     std::thread::Builder::new()
         .name("node-actor".into())
-        .spawn(move || run_node(actor_storage, cmd_rx, event_tx))?;
+        .spawn(move || run_node(actor_storage, blobs, cmd_rx, event_tx))?;
 
-    println!("[noded] listening on {listen}, storage {}", storage.display());
+    println!(
+        "[noded] listening on {listen}, storage {}",
+        storage.display()
+    );
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -83,29 +101,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// commands in arrival order — every submit is its own block.
 fn run_node(
     storage: PathBuf,
+    blobs: files::BlobHandle,
     mut cmds: mpsc::Receiver<NodeCommand>,
     events: broadcast::Sender<BlockSummary>,
 ) {
     let forge_repo = storage.join("forge-git");
-    let rt_cfg =
-        commonware_runtime::tokio::Config::default().with_storage_directory(storage);
+    let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
-        // genesis: chat + tasks + inbox as the first product surface, document +
-        // agent + forge so the whole app-hash story is visible from the status
-        // endpoint.
+        // genesis: the full product surface. chat/tasks/inbox as the core loop,
+        // automations bridging chat events into chat/tasks follow-ups, jobs for
+        // deferred work, document + forge for the substrate-backed stores, and
+        // files + memory for the content planes. files registers over the
+        // http layer's blob handle so uploads land in the store `serve_sync`
+        // reads — the bytes themselves never touch consensus.
         let chat = Chat::init(context.child("chat"), "chat").await;
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
+        let automations = Automations::new("automations", "chat", "tasks");
+        let jobs = Jobs::new("jobs");
         let document = Document::init(context.child("document"), "document").await;
         let forge = Forge::init("forge", forge_repo).expect("forge init");
+        let files = Files::with_blobs("files", blobs);
+        let memory = Memory::new("memory");
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(tasks),
             Box::new(inbox),
+            Box::new(automations),
+            Box::new(jobs),
             Box::new(document),
             Box::new(forge),
+            Box::new(files),
+            Box::new(memory),
         ])
         .expect("genesis");
 

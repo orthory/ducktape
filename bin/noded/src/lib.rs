@@ -8,16 +8,22 @@
 //! a fake actor on plain tokio. payloads stay opaque json: a submit/query body
 //! carries the module's own `*Msg`/`*Query` enum as a json value, encoded to the
 //! exact bytes the `*-interface` crates' `encode_*` helpers would produce
-//! (`serde_json::to_vec`), so the daemon needs no per-module knowledge.
+//! (`serde_json::to_vec`), so the daemon needs no per-module knowledge —
+//! with ONE deliberate exception: the files blob lane. chunk bytes must never
+//! transit consensus (no op carries them), so POST `/v1/files/blob` and GET
+//! `/v1/files/blob/{digest}` bypass the actor entirely and talk straight to
+//! the node-local [`files::BlobHandle`] the registered files module shares.
 //!
 //! lifecycle is part of the surface: `/v1/status` carries the daemon's build
 //! version (so a newer app can spot a stale orphan), and POST `/v1/shutdown`
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -112,17 +118,24 @@ pub enum NodeCommand {
 }
 
 /// the router's shared state: a command lane into the node actor, the
-/// block-event fan-out for websocket subscribers, and the shutdown signal.
+/// block-event fan-out for websocket subscribers, the shutdown signal, and the
+/// node-local blob store the files module shares.
 #[derive(Clone)]
 pub struct NodeHandle {
     cmds: mpsc::Sender<NodeCommand>,
     events: broadcast::Sender<BlockSummary>,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
+    /// the files blob lane. NOT a command into the actor: chunk bytes stay
+    /// node-local by design (never consensus state, never an op), so the http
+    /// handlers read/write this store directly.
+    blobs: files::BlobHandle,
 }
 
 impl NodeHandle {
     /// build the handle plus the actor-side ends: the command receiver the
     /// actor drains and the event sender it publishes finalized blocks on.
+    /// the blob store is born here — BEFORE genesis — so the embedding daemon
+    /// can register its files module over [`Self::blob_handle`].
     pub fn channel() -> (
         Self,
         mpsc::Receiver<NodeCommand>,
@@ -134,8 +147,16 @@ impl NodeHandle {
             cmds: cmd_tx,
             events: event_tx.clone(),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            blobs: files::BlobHandle::default(),
         };
         (handle, cmd_rx, event_tx)
+    }
+
+    /// the blob store this surface serves. the daemon constructs its files
+    /// module over a clone (`Files::with_blobs`) so http uploads land exactly
+    /// where the module's `serve_sync` reads.
+    pub fn blob_handle(&self) -> files::BlobHandle {
+        self.blobs.clone()
     }
 
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
@@ -155,7 +176,11 @@ impl NodeHandle {
 
 /// hex-encode a state root for the wire (stable, greppable, json-friendly).
 pub fn hex_root(root: &StateRoot) -> String {
-    root.0.iter().map(|b| format!("{b:02x}")).collect()
+    hex_bytes(&root.0)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -177,6 +202,15 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
+        .route(
+            "/v1/files/blob",
+            // one chunk per request, so the body cap IS the chunk cap. the
+            // json routes keep axum's (smaller) default limit.
+            post(put_blob).layer(DefaultBodyLimit::max(
+                files_interface::MAX_CHUNK_SIZE as usize,
+            )),
+        )
+        .route("/v1/files/blob/{digest}", get(get_blob))
         // the web app is served from a different origin than the node.
         .layer(CorsLayer::permissive())
         .with_state(handle)
@@ -253,6 +287,49 @@ async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     // reply first, then signal — the connection closes before the process does.
     handle.shutdown.notify_one();
     Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+/// POST /v1/files/blob — raw chunk bytes in, `{"digest":"<64-hex>"}` out.
+///
+/// bytes go straight into the node-local blob store; NOTHING reaches the node
+/// actor and no op is submitted — committing a manifest that references the
+/// digest is a separate, explicit `/v1/submit`. the route's body limit is
+/// `MAX_CHUNK_SIZE` (a bigger chunk could never be referenced by a valid
+/// manifest anyway), and an oversized body is a 413 in the daemon's json
+/// error envelope.
+async fn put_blob(
+    State(handle): State<NodeHandle>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let bytes = match body {
+        Ok(bytes) => bytes,
+        // the DefaultBodyLimit layer stops reading past the cap and the
+        // extractor rejects with 413 — re-wrap it in the json envelope.
+        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+    };
+    let digest = handle.blobs.put_chunk(bytes.to_vec());
+    Json(serde_json::json!({ "digest": hex_bytes(&digest) })).into_response()
+}
+
+/// GET /v1/files/blob/{digest} — chunk bytes back out of the node-local store.
+/// a malformed digest (anything but 64 lowercase hex chars) is a 400; a
+/// well-formed digest this node holds no bytes for is a 404.
+async fn get_blob(State(handle): State<NodeHandle>, Path(digest): Path<String>) -> Response {
+    let Some(raw) = files::from_hex_32(&digest) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "digest must be 64 characters of lowercase hex",
+        );
+    };
+    match handle.blobs.get_chunk(&raw) {
+        Some(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "no chunk with that digest"),
+    }
 }
 
 /// serve the client surface on `listener` until a shutdown request lands

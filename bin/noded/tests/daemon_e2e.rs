@@ -149,6 +149,39 @@ impl Daemon {
         reply
     }
 
+    /// raw-byte request for the blob lane: returns status + the response body
+    /// BYTES exactly as received. the json helpers above lossy-decode the
+    /// whole response as utf-8, which would corrupt binary chunk bodies.
+    fn request_bytes(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("read timeout");
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).expect("write head");
+        // best-effort body write: the daemon may legally answer 413 and stop
+        // reading mid-body, which can surface here as a broken pipe.
+        let _ = stream.write_all(body);
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read response");
+        // split head/body at the byte level — chunk bytes must round-trip
+        // untouched, so no utf-8 decoding of the body.
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http header terminator");
+        let status_line = String::from_utf8_lossy(&raw[..split]);
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, raw[split + 4..].to_vec())
+    }
+
     /// open /v1/ws with a minimal rfc6455 client handshake and return the
     /// stream positioned after the 101 response.
     fn ws_connect(&self) -> BufReader<TcpStream> {
@@ -241,7 +274,20 @@ fn full_surface_blocks_authorship_and_ws() {
         .iter()
         .map(|m| m["id"].as_str().expect("module id"))
         .collect();
-    assert_eq!(modules, ["chat", "tasks", "inbox", "document", "forge"]);
+    assert_eq!(
+        modules,
+        [
+            "chat",
+            "tasks",
+            "inbox",
+            "automations",
+            "jobs",
+            "document",
+            "forge",
+            "files",
+            "memory"
+        ]
+    );
     let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();
 
     // subscribe BEFORE submitting: every committed block must fan out.
@@ -357,4 +403,99 @@ fn state_persists_across_restart() {
         messages[0]["head"]["blocks"][0]["Paragraph"][0]["text"],
         "written before restart"
     );
+}
+
+#[test]
+fn files_blob_seam_round_trips_and_ties_into_consensus() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let genesis_hash = daemon.status()["appHash"]
+        .as_str()
+        .expect("appHash")
+        .to_string();
+
+    // upload: binary, non-utf8, deliberately smaller than the chunk size so
+    // the manifest's tail-length rule is exercised below.
+    let chunk: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &chunk);
+    assert_eq!(
+        code,
+        200,
+        "upload failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&body).expect("upload reply json");
+    let digest = reply["digest"].as_str().expect("digest").to_string();
+    assert_eq!(
+        digest,
+        files_interface::digest_hex(&chunk),
+        "the returned digest is sha256 of the exact uploaded bytes"
+    );
+
+    // fetch round-trips byte-identical.
+    let (code, fetched) = daemon.request_bytes("GET", &format!("/v1/files/blob/{digest}"), &[]);
+    assert_eq!(code, 200);
+    assert_eq!(fetched, chunk, "fetched bytes must be byte-identical");
+
+    // a well-formed digest nobody uploaded is a 404; a malformed digest
+    // (uppercase hex included) is a 400, not a miss.
+    let absent = files_interface::digest_hex(b"never uploaded");
+    let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{absent}"), &[]);
+    assert_eq!(code, 404, "absent chunk must be a 404");
+    let upper = digest.to_uppercase();
+    let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{upper}"), &[]);
+    assert_eq!(code, 400, "digest must be lowercase hex");
+
+    // the cap is MAX_CHUNK_SIZE inclusive: exactly 4 MiB lands...
+    let max = vec![0xABu8; files_interface::MAX_CHUNK_SIZE as usize];
+    let (code, _) = daemon.request_bytes("POST", "/v1/files/blob", &max);
+    assert_eq!(code, 200, "a chunk of exactly MAX_CHUNK_SIZE must land");
+    // ...and one byte more is a 413 in the daemon's error envelope.
+    let over = vec![0xCDu8; files_interface::MAX_CHUNK_SIZE as usize + 1];
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &over);
+    assert_eq!(
+        code,
+        413,
+        "oversized chunk must be rejected: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: serde_json::Value = serde_json::from_slice(&body).expect("413 body is json");
+    assert!(
+        err["error"].is_string(),
+        "413 uses the error envelope: {err}"
+    );
+
+    // the whole blob lane is off-consensus: no blocks, no app-hash movement.
+    let status = daemon.status();
+    assert_eq!(status["height"], 0, "blob puts must not commit blocks");
+    assert_eq!(
+        status["appHash"].as_str(),
+        Some(genesis_hash.as_str()),
+        "blob puts must not move the app hash"
+    );
+
+    // the consensus tie-in: ONLY the digest crosses /v1/submit. the committed
+    // manifest then verifies the fetched bytes end to end.
+    let (code, block) = daemon.submit(
+        "files",
+        serde_json::json!({
+            "AddManifest": {
+                "file_id": "f1",
+                "name": "blob.bin",
+                "mime": "application/octet-stream",
+                "size": 3000,
+                "chunk_size": 4096,
+                "chunks": [digest],
+            }
+        }),
+        Some("eddy"),
+    );
+    assert_eq!(code, 200, "AddManifest failed: {block}");
+    assert_eq!(block["height"], 1, "the manifest IS a block");
+
+    let reply = daemon.query("files", serde_json::json!({ "Stat": { "file_id": "f1" } }));
+    let manifest: files_interface::Manifest =
+        serde_json::from_value(reply["Stat"].clone()).expect("Stat carries the manifest");
+    files_interface::verify_chunk(&manifest, 0, &fetched)
+        .expect("fetched bytes verify against the committed manifest");
 }

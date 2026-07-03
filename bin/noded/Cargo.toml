@@ -21,8 +21,15 @@ sdk = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 inbox = { workspace = true }
+automations = { workspace = true }
+jobs = { workspace = true }
 document = { workspace = true }
 forge = { workspace = true }
+files = { workspace = true }
+memory = { workspace = true }
+# the blob lane shares the files wire constants (chunk cap) and, in tests, the
+# manifest verification helpers.
+files-interface = { workspace = true }
 
 commonware-runtime = { workspace = true }
 
