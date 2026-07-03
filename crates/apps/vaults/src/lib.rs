@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use vaults_interface::{
-    decode_msg, decode_query, encode_reply, SecretEntry, VaultMsg, VaultQuery, VaultReply,
-    VaultView,
+    SecretEntry, VaultMsg, VaultQuery, VaultReply, VaultView, decode_msg, decode_query,
+    encode_reply,
 };
 
 /// per-secret ciphertext ceiling: a vault holds credentials, not blobs. keeps
@@ -60,10 +60,13 @@ impl Vaults {
         self.pending.get(id).or_else(|| self.vaults.get(id))
     }
 
-    /// the AUTHENTICATED submitter. vault ops are user actions: module and
-    /// system origins are refused so no module can quietly become an owner.
-    fn external_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
-        match &ctx.env().origin {
+    /// the AUTHENTICATED, non-empty submitter. vault ops are user actions:
+    /// module and system origins are refused so no module can quietly become an owner.
+    fn external_owner(origin: &Origin) -> Result<Vec<u8>, Error> {
+        match origin {
+            Origin::External(key) if key.is_empty() => Err(Error::Module(
+                "vault ops require a non-empty submitter id".into(),
+            )),
             Origin::External(key) => Ok(key.clone()),
             other => Err(Error::Module(format!(
                 "vault ops require an external submitter, got {other:?}"
@@ -162,7 +165,7 @@ impl Module for Vaults {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let who = Self::external_origin(ctx)?;
+        let who = Self::external_owner(&ctx.env().origin)?;
         let now = ctx.env().consensus_time;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             VaultMsg::CreateVault { vault_id, name } => {
@@ -198,20 +201,16 @@ impl Module for Vaults {
             VaultMsg::RemoveOwner { vault_id, key } => {
                 self.stage_membership(&vault_id, &who, |v| {
                     if v.owners.len() == 1 && v.owners.contains(&key) {
-                        return Err(Error::Module(
-                            "a vault must keep at least one owner".into(),
-                        ));
+                        return Err(Error::Module("a vault must keep at least one owner".into()));
                     }
                     v.owners.remove(&key);
                     Ok(())
                 })
             }
-            VaultMsg::AddReader { vault_id, key } => {
-                self.stage_membership(&vault_id, &who, |v| {
-                    v.readers.insert(key.clone());
-                    Ok(())
-                })
-            }
+            VaultMsg::AddReader { vault_id, key } => self.stage_membership(&vault_id, &who, |v| {
+                v.readers.insert(key.clone());
+                Ok(())
+            }),
             VaultMsg::RemoveReader { vault_id, key } => {
                 self.stage_membership(&vault_id, &who, |v| {
                     if v.owners.contains(&key) {
@@ -283,7 +282,8 @@ impl Module for Vaults {
                 self.get(&vault_id).map(|v| Self::view_of(&vault_id, v)),
             ))),
             VaultQuery::Secret { vault_id, name } => Ok(encode_reply(&VaultReply::Secret(
-                self.get(&vault_id).and_then(|v| v.secrets.get(&name).cloned()),
+                self.get(&vault_id)
+                    .and_then(|v| v.secrets.get(&name).cloned()),
             ))),
         }
     }
@@ -439,4 +439,85 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
         return Err(Error::Module("snapshot carries trailing bytes".into()));
     }
     Ok(vaults)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use sdk::{Effect, Env, Event};
+    use vaults_interface::{decode_reply, encode_msg, encode_query};
+
+    struct TestCtx {
+        env: Env,
+    }
+
+    impl TestCtx {
+        fn from_origin(origin: Origin) -> Self {
+            Self {
+                env: Env {
+                    height: 0,
+                    consensus_time: 0,
+                    origin,
+                    me: "vaults".into(),
+                },
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Ctx for TestCtx {
+        fn env(&self) -> &Env {
+            &self.env
+        }
+
+        fn module_root(&self, _target: &str) -> Option<StateRoot> {
+            None
+        }
+
+        async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
+            Err(Error::QueryUnsupported)
+        }
+
+        fn emit_msg(&mut self, _msg: Msg) {}
+
+        fn emit_event(&mut self, _ev: Event) {}
+
+        fn request_effect(&mut self, _eff: Effect) {}
+    }
+
+    #[test]
+    fn create_rejects_empty_external_origin_without_staging_vault() {
+        block_on(async {
+            let mut vaults = Vaults::new("vaults");
+            let mut ctx = TestCtx::from_origin(Origin::External(Vec::new()));
+            let create = Msg {
+                target: "vaults".into(),
+                payload: encode_msg(&VaultMsg::CreateVault {
+                    vault_id: "empty-owner".into(),
+                    name: "Empty Owner".into(),
+                }),
+            };
+
+            let err = vaults
+                .execute(&mut ctx, &create)
+                .await
+                .expect_err("empty external origin must be refused");
+            assert_eq!(
+                err,
+                Error::Module("vault ops require a non-empty submitter id".into())
+            );
+
+            let reply = vaults
+                .query(&encode_query(&VaultQuery::Vault {
+                    vault_id: "empty-owner".into(),
+                }))
+                .await
+                .expect("query");
+            assert_eq!(
+                decode_reply(&reply).expect("decode"),
+                VaultReply::Vault(None)
+            );
+        });
+    }
 }
