@@ -65,6 +65,12 @@ fn frames_past_the_ceiling_drain_as_discarded() {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].id, id);
         assert_eq!(drained[0].disposition, Disposition::Discarded);
-        assert!(node.finalized().is_some(), "a discarded view still advances the engine clock");
+        // the engine clock advances (the view was agreed), but the finalized
+        // STATE boundary does not: a discard is never journaled, so a
+        // boundary that included it would claim a height recovery cannot
+        // reproduce — and right after a cutover it would collide with the
+        // new epoch's first height.
+        assert_eq!(node.last_engine_view(), Some(0), "the engine clock advances");
+        assert!(node.finalized().is_none(), "no journaled block, no state boundary");
     });
 }

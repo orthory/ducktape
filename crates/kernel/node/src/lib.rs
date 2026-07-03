@@ -863,6 +863,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.deferred.extend(self.orderer.poll_delivered());
         let mut applied = 0usize;
         let mut last_view: Option<u64> = None;
+        // the last view with a JOURNALED outcome (applied or rejected) — what
+        // the finalized STATE boundary may advance to. a DISCARDED view moves
+        // only the engine clock: it is never journaled, so a boundary that
+        // included it would claim a height recovery cannot reproduce — and
+        // right after a cutover it would collide with the new epoch's first
+        // height, demanding a finalization floor that cannot exist until the
+        // new epoch finalizes (a joiner syncing that boundary would wedge).
+        let mut last_sealed_view: Option<u64> = None;
         while let Some((view, frame)) = self.deferred.pop_front() {
             // a FINALIZED op counts as processed whether or not it applies
             // cleanly — and its VIEW advances the engine clock either way (the
@@ -910,6 +918,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             let Ok((origin, msg)) = decode_frame(&frame) else {
                 self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
                 self.seal(height, Disposition::Rejected).await?;
+                last_sealed_view = Some(view);
                 continue;
             };
             let ctx = BlockContext { height, consensus_time: height, origin };
@@ -928,6 +937,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     self.effects.extend(outcome.effects);
                     self.drained.push(DrainedFrame { id, height, disposition: Disposition::Applied });
                     self.seal(height, Disposition::Applied).await?;
+                    last_sealed_view = Some(view);
                     if let Some(before) = watched_before {
                         let module = self.watch_module.as_deref().expect("watched_before implies watch_module");
                         if self.host.module_root(module) != before {
@@ -942,12 +952,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 Err(host::SubmitError::Rejected(_)) => {
                     self.drained.push(DrainedFrame { id, height, disposition: Disposition::Rejected });
                     self.seal(height, Disposition::Rejected).await?;
+                    last_sealed_view = Some(view);
                 }
                 Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
             }
         }
         if let Some(view) = last_view {
             self.last_engine_view = Some(view);
+        }
+        if let Some(view) = last_sealed_view {
             let height = self.view_base + view;
             // monotone: a resume-skipped re-report must never regress the
             // finalized boundary below the recovered tip.
