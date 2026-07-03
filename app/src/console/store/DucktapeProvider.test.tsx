@@ -49,6 +49,7 @@ const makeFakeNode = () => {
   const messagesByChannel: Record<string, (typeof GENERAL_MESSAGE)[]> = {
     general: [GENERAL_MESSAGE],
   };
+  let forgeHead: string | null = null;
   const transport: NodeTransport = {
     submit: vi.fn((target: string, payload: unknown) => {
       const create = (payload as { CreateChannel?: { channel_id: string; name: string } })
@@ -56,6 +57,9 @@ const makeFakeNode = () => {
       if (target === "chat" && create) {
         channels.push(wireChannel(create.channel_id, create.name, 2));
         messagesByChannel[create.channel_id] = [];
+      }
+      if (target === "forge" && (payload as { Commit?: unknown }).Commit) {
+        forgeHead = "a".repeat(40);
       }
       return Promise.resolve({ height: 2, appHash: "bb".repeat(32) });
     }),
@@ -74,6 +78,9 @@ const makeFakeNode = () => {
         return Promise.resolve({
           Thread: { root: GENERAL_MESSAGE, replies: [] },
         });
+      }
+      if (target === "forge") {
+        return Promise.resolve({ Head: forgeHead });
       }
       return Promise.resolve({ Tasks: [] });
     }),
@@ -104,6 +111,7 @@ function Probe() {
       <span data-testid="channel">{state.activeChannel ?? "none"}</span>
       <span data-testid="messages">{state.messages.length}</span>
       <span data-testid="thread">{state.activeThread ? "open" : "closed"}</span>
+      <span data-testid="forge">{state.forgeHead ?? "unborn"}</span>
     </div>
   );
 }
@@ -203,6 +211,33 @@ describe("DucktapeProvider", () => {
       // the stale-pane bug left #general's message list (1) showing here
       expect(screen.getByTestId("messages").textContent).toBe("0");
       expect(screen.getByTestId("thread").textContent).toBe("closed");
+    });
+  });
+
+  it("commitForge submits a Commit msg and hydrates the new HEAD", async () => {
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("forge").textContent).toBe("unborn"),
+    );
+
+    await act(async () => {
+      capturedActions!.commitForge({
+        path: "README.md",
+        content: "hello forge",
+        message: "init",
+      });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("forge").textContent).toBe("a".repeat(40)),
+    );
+    const forgeCall = vi
+      .mocked(transport.submit)
+      .mock.calls.find((call) => call[0] === "forge");
+    expect(forgeCall).toBeTruthy();
+    expect(forgeCall![1]).toEqual({
+      Commit: { path: "README.md", content: "hello forge", message: "init" },
     });
   });
 });

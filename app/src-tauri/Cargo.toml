@@ -15,3 +15,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+
+# dev-only debug bridge: a local unix socket the app/scripts/tauri-debug.mjs
+# helper drives (screenshot / execute_js / input). registration is cfg-gated to
+# debug + desktop in main.rs so a release runtime never opens the socket.
+tauri-plugin-mcp = { git = "https://github.com/P3GLEG/tauri-plugin-mcp" }
