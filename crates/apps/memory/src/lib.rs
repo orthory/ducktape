@@ -16,6 +16,13 @@
 //! appends generation `latest + 1` (1 for a brand-new file). a `(path,
 //! generation)` pair is a stable, hash-pinned reference.
 //!
+//! large bodies can be published through the files module: memory probes a
+//! committed files manifest, then copies its digest and size into the immutable
+//! generation. that is pin-at-publish semantics — removing the files manifest
+//! later does not rewrite or invalidate the memory generation. the generation's
+//! copied digest/size are its consensus truth; body bytes remain fetched over
+//! the files chunk lane and receiver-verified with `files_interface::verify_chunk`.
+//!
 //! ## snapshots & the retention mechanism (design decision)
 //!
 //! `Snapshot { name }` pins the CURRENT `path -> latest generation` mapping of
@@ -38,12 +45,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use files_interface::{
+    FilesQuery, FilesReply, MAX_FILE_ID_BYTES, decode_reply as decode_files_reply,
+    encode_query as encode_files_query,
+};
 use memory_interface::{
-    FileStat, Generation, GrepHit, LsEntry, MAX_BODY_BYTES, MAX_FILES, MAX_GENERATIONS_PER_PATH,
-    MAX_GREP_LINE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES, MAX_META_VALUE_BYTES,
-    MAX_MODULE_ID_BYTES, MAX_PATH_BYTES, MAX_QUERY_LIMIT, MAX_SEGMENT_BYTES,
+    Body, FileStat, Generation, GrepHit, LsEntry, MAX_BODY_BYTES, MAX_FILES,
+    MAX_GENERATIONS_PER_PATH, MAX_GREP_LINE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
+    MAX_META_VALUE_BYTES, MAX_MODULE_ID_BYTES, MAX_PATH_BYTES, MAX_QUERY_LIMIT, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_NAME_BYTES, MAX_SNAPSHOTS, MAX_WATCHES, MemoryEvent, MemoryMsg, MemoryQuery,
-    MemoryReply, Meta, decode_msg, decode_query, encode_event, encode_reply,
+    MemoryReply, Meta, PublishBody, decode_msg, decode_query, encode_event, encode_reply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
@@ -74,6 +85,7 @@ struct Store {
 
 pub struct Memory {
     id: ModuleId,
+    files_module_id: ModuleId,
     /// what `root()` / `query` observe.
     committed: Store,
     /// the per-block working copy; `None` until the block's first mutation.
@@ -81,9 +93,10 @@ pub struct Memory {
 }
 
 impl Memory {
-    pub fn new(id: impl Into<ModuleId>) -> Self {
+    pub fn new(id: impl Into<ModuleId>, files_module_id: impl Into<ModuleId>) -> Self {
         Self {
             id: id.into(),
+            files_module_id: files_module_id.into(),
             committed: Store::default(),
             pending: None,
         }
@@ -99,21 +112,19 @@ impl Memory {
 
     // ---- mutations (staged) ------------------------------------------------
 
-    fn publish(
+    async fn publish(
         &mut self,
         ctx: &mut dyn Ctx,
         author: String,
         height: u64,
         path: String,
-        body: String,
+        body: PublishBody,
         meta: Meta,
     ) -> Result<(), Error> {
         let path = validate_file_path(&path)?;
         // caps enforced BEFORE staging, with rejection: an oversized value must
         // never enter the root preimage (the poison-value lesson).
-        if body.len() > MAX_BODY_BYTES {
-            return Err(Error::Module("body exceeds 64 KiB cap".into()));
-        }
+        let body = self.resolve_publish_body(ctx, body).await?;
         validate_meta(&meta)?;
 
         let (generation, targets) = {
@@ -182,6 +193,55 @@ impl Memory {
             }
         }
         Ok(())
+    }
+
+    async fn resolve_publish_body(
+        &self,
+        ctx: &mut dyn Ctx,
+        body: PublishBody,
+    ) -> Result<Body, Error> {
+        match body {
+            PublishBody::Inline(body) => {
+                if body.len() > MAX_BODY_BYTES {
+                    return Err(Error::Module("body exceeds 64 KiB cap".into()));
+                }
+                Ok(Body::Inline(body))
+            }
+            PublishBody::File { file_id } => {
+                validate_file_id(&file_id)?;
+                let req = encode_files_query(&FilesQuery::Stat {
+                    file_id: file_id.clone(),
+                });
+                let bytes = ctx
+                    .query(&self.files_module_id, &req)
+                    .await
+                    .map_err(|e| Error::Module(format!("files stat probe failed: {e}")))?;
+                let manifest = match decode_files_reply(&bytes).map_err(Error::Module)? {
+                    FilesReply::Stat(Some(manifest)) => manifest,
+                    FilesReply::Stat(None) => {
+                        return Err(Error::Module(format!(
+                            "files manifest not found: {file_id}"
+                        )));
+                    }
+                    FilesReply::List(_) => {
+                        return Err(Error::Module(
+                            "files stat probe returned an unexpected reply".into(),
+                        ));
+                    }
+                };
+                if manifest.file_id != file_id {
+                    return Err(Error::Module(
+                        "files stat probe returned a mismatched file_id".into(),
+                    ));
+                }
+                validate_digest_hex(&manifest.digest)?;
+                Ok(Body::File {
+                    file_id,
+                    digest: manifest.digest,
+                    size: manifest.size,
+                })
+            }
+        }
     }
 
     fn delete(&mut self, path: String) -> Result<(), Error> {
@@ -359,7 +419,7 @@ impl Store {
             latest_meta: latest.meta.clone(),
             latest_author: latest.author.clone(),
             latest_published_at_height: latest.published_at_height,
-            body_len: latest.body.len() as u64,
+            body_len: body_len(&latest.body),
         })
     }
 
@@ -473,7 +533,10 @@ impl Store {
             let Some(record) = self.gens.get(&(path.clone(), generation)) else {
                 continue;
             };
-            for (idx, line) in record.body.split('\n').enumerate() {
+            let Body::Inline(body) = &record.body else {
+                continue;
+            };
+            for (idx, line) in body.split('\n').enumerate() {
                 if hits.len() >= limit {
                     return hits;
                 }
@@ -506,7 +569,7 @@ impl Store {
         for ((path, g), rec) in &self.gens {
             push_str(&mut out, path);
             out.extend_from_slice(&g.to_le_bytes());
-            push_str(&mut out, &rec.body);
+            push_body(&mut out, &rec.body);
             push_meta(&mut out, &rec.meta);
             push_str(&mut out, &rec.author);
             out.extend_from_slice(&rec.published_at_height.to_le_bytes());
@@ -568,10 +631,7 @@ impl Store {
             if generation == 0 {
                 return Err(Error::Module("snapshot generation must be >= 1".into()));
             }
-            let body = read_string(bytes, &mut off)?;
-            if body.len() > MAX_BODY_BYTES {
-                return Err(Error::Module("snapshot body exceeds cap".into()));
-            }
+            let body = read_body(bytes, &mut off)?;
             let meta = read_meta(bytes, &mut off)?;
             validate_meta(&meta)?;
             let author = read_string(bytes, &mut off)?;
@@ -692,7 +752,7 @@ impl Module for Memory {
         let height = ctx.env().height;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             MemoryMsg::Publish { path, body, meta } => {
-                self.publish(ctx, author, height, path, body, meta)
+                self.publish(ctx, author, height, path, body, meta).await
             }
             MemoryMsg::Delete { path } => self.delete(path),
             MemoryMsg::Snapshot { name } => self.create_snapshot(name),
@@ -851,6 +911,36 @@ fn validate_meta(meta: &Meta) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_file_id(file_id: &str) -> Result<(), Error> {
+    if file_id.is_empty() {
+        return Err(Error::Module("file_id must not be empty".into()));
+    }
+    if file_id.len() > MAX_FILE_ID_BYTES {
+        return Err(Error::Module("file_id exceeds byte cap".into()));
+    }
+    Ok(())
+}
+
+fn validate_digest_hex(digest: &str) -> Result<(), Error> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(Error::Module(
+            "file digest must be 64-char lowercase hex".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn body_len(body: &Body) -> u64 {
+    match body {
+        Body::Inline(body) => body.len() as u64,
+        Body::File { size, .. } => *size,
+    }
+}
+
 /// a watch prefix is a CANONICAL absolute path — the same segment validation as
 /// file paths, with the root `"/"` additionally allowed (watch everything).
 fn validate_prefix(prefix: &str) -> Result<(), Error> {
@@ -894,6 +984,25 @@ fn push_meta(out: &mut Vec<u8>, meta: &Meta) {
     }
 }
 
+fn push_body(out: &mut Vec<u8>, body: &Body) {
+    match body {
+        Body::Inline(value) => {
+            out.push(0);
+            push_str(out, value);
+        }
+        Body::File {
+            file_id,
+            digest,
+            size,
+        } => {
+            out.push(1);
+            push_str(out, file_id);
+            push_str(out, digest);
+            out.extend_from_slice(&size.to_le_bytes());
+        }
+    }
+}
+
 /// a length-prefixed collection count, guarded so a corrupt count can never make
 /// the decoder loop or allocate unboundedly (each entry costs >= 1 byte).
 fn read_count(bytes: &[u8], off: &mut usize) -> Result<u64, Error> {
@@ -912,6 +1021,39 @@ fn read_meta(bytes: &[u8], off: &mut usize) -> Result<Meta, Error> {
         meta.insert(key, value);
     }
     Ok(meta)
+}
+
+fn read_body(bytes: &[u8], off: &mut usize) -> Result<Body, Error> {
+    match read_byte(bytes, off)? {
+        0 => {
+            let body = read_string(bytes, off)?;
+            if body.len() > MAX_BODY_BYTES {
+                return Err(Error::Module("snapshot body exceeds cap".into()));
+            }
+            Ok(Body::Inline(body))
+        }
+        1 => {
+            let file_id = read_string(bytes, off)?;
+            validate_file_id(&file_id)?;
+            let digest = read_string(bytes, off)?;
+            validate_digest_hex(&digest)?;
+            let size = read_u64(bytes, off)?;
+            Ok(Body::File {
+                file_id,
+                digest,
+                size,
+            })
+        }
+        _ => Err(Error::Module("snapshot body variant is invalid".into())),
+    }
+}
+
+fn read_byte(bytes: &[u8], off: &mut usize) -> Result<u8, Error> {
+    let b = *bytes
+        .get(*off)
+        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
+    *off += 1;
+    Ok(b)
 }
 
 fn read_u64(bytes: &[u8], off: &mut usize) -> Result<u64, Error> {

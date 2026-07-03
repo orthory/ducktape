@@ -81,7 +81,7 @@ fn main() {
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let files = Files::new("files");
-        let memory = Memory::new("memory");
+        let memory = Memory::new("memory", "files");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");

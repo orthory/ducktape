@@ -125,7 +125,7 @@ fn run_node(
         let document = Document::init(context.child("document"), "document").await;
         let forge = Forge::init("forge", forge_repo).expect("forge init");
         let files = Files::with_blobs("files", blobs);
-        let memory = Memory::new("memory");
+        let memory = Memory::new("memory", "files");
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(tasks),
