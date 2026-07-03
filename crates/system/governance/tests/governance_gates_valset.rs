@@ -139,6 +139,59 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
     });
 }
 
+/// the solo-network tally: with one member, majority = 1/2 + 1 = 1, so the
+/// founder's own ballot decides immediately — `invite-accept` on a network
+/// of one admits the friend in a single propose/vote/execute round, no
+/// second party required.
+#[test]
+fn a_single_member_ballot_is_a_deciding_majority() {
+    block_on(async {
+        let founder = member_key(1);
+        let friend = member_key(9);
+        let mut valset = Valset::new("valset");
+        valset.insert(founder.clone());
+        let mut host = Host::genesis(vec![
+            Box::new(valset),
+            Box::new(Governance::new("governance", "valset")),
+        ])
+        .expect("genesis");
+
+        submit_as(&mut host, &founder, 1, "governance", gov_encode(&GovMsg::Propose {
+            proposal_id: "add-friend".into(),
+            action: GovAction::AddValidator { key: friend.clone() },
+            voting_period: 100,
+        }))
+        .await
+        .expect("propose");
+
+        // proposing is NOT voting: executing with zero ballots is not
+        // decidable before the deadline, even at n=1.
+        let err = submit_as(&mut host, &founder, 2, "governance", gov_encode(&GovMsg::Execute {
+            proposal_id: "add-friend".into(),
+        }))
+        .await
+        .expect_err("no ballots -> not decidable early");
+        assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable")));
+
+        submit_as(&mut host, &founder, 3, "governance", gov_encode(&GovMsg::Vote {
+            proposal_id: "add-friend".into(),
+            approve: true,
+        }))
+        .await
+        .expect("vote");
+        submit_as(&mut host, &founder, 4, "governance", gov_encode(&GovMsg::Execute {
+            proposal_id: "add-friend".into(),
+        }))
+        .await
+        .expect("the single ballot decides");
+
+        assert_eq!(proposal_status(&host, "add-friend").await, Some(ProposalStatus::Passed));
+        let members = validators(&host).await;
+        assert_eq!(members.len(), 2, "the friend is admitted");
+        assert!(members.contains(&friend));
+    });
+}
+
 #[test]
 fn non_members_cannot_propose_or_vote_and_minority_rejects() {
     block_on(async {
