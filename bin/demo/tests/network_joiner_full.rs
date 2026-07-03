@@ -173,6 +173,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             Msg {
                 target: "forge".into(),
                 payload: forge_interface::encode_msg(&forge_interface::ForgeMsg::Commit {
+                    repo: String::new(),
                     path: "README.md".into(),
                     content: "# ducktape\n".into(),
                     message: "init".into(),

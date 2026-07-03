@@ -12,7 +12,7 @@
 //! blob store LACKS the pack reaches the SAME root as one that has it. that is
 //! the fork-safety invariant — pack possession is per-node, root is not.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use forge::Forge;
 use forge_interface::{ForgeMsg, ForgeQuery, ForgeReply, decode_reply, encode_msg, encode_query};
@@ -22,6 +22,8 @@ use sdk::{Ctx, Error, Module, Msg, StateRoot};
 const MAIN_REF: &str = "refs/heads/main";
 /// the raw width of a sha1 oid (a Push `prev_oid`/`new_oid` field).
 const OID_LEN: usize = 20;
+/// every op here targets the default repo, whose git dir is `base/default`.
+const DEFAULT_REPO: &str = "default";
 
 // a minimal Ctx so execute can read consensus_time without a full host.
 struct TestCtx {
@@ -62,11 +64,43 @@ fn tmp_repo(tag: &str) -> PathBuf {
     p
 }
 
-/// drive one file change through the REAL commit path (execute + publish).
+/// the default repo's git dir under a forge base.
+fn repo_dir(base: &Path) -> PathBuf {
+    base.join(DEFAULT_REPO)
+}
+
+/// parse forge's multi-repo snapshot container into `(name, head_oid, pack)`
+/// entries — the test-side inverse of `Forge::snapshot`.
+fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+    fn u32_at(bytes: &[u8], p: &mut usize) -> usize {
+        let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
+        *p += 4;
+        v
+    }
+    let mut p = 0;
+    let count = u32_at(bytes, &mut p);
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let nl = u32_at(bytes, &mut p);
+        let name = String::from_utf8(bytes[p..p + nl].to_vec()).unwrap();
+        p += nl;
+        let oid = bytes[p..p + OID_LEN].to_vec();
+        p += OID_LEN;
+        let pl = u32_at(bytes, &mut p);
+        let pack = bytes[p..p + pl].to_vec();
+        p += pl;
+        out.push((name, oid, pack));
+    }
+    out
+}
+
+/// drive one file change through the REAL commit path (execute + publish) on the
+/// default repo (empty `repo` -> back-compat default).
 fn commit_one(forge: &mut Forge, t: u64, path: &str, content: &str, message: &str) {
     let msg = Msg {
         target: "forge".into(),
         payload: encode_msg(&ForgeMsg::Commit {
+            repo: String::new(),
             path: path.into(),
             content: content.into(),
             message: message.into(),
@@ -98,21 +132,29 @@ impl Captured {
 }
 
 /// capture the current committed head of `src` (oid + full-closure pack + root).
+/// the head + pack come straight out of `snapshot()` (parsed from the single
+/// default-repo container) so materialize's git plumbing is proven the same way
+/// state sync is.
 fn capture(src: &Forge) -> Captured {
     let snap = src.snapshot().unwrap();
-    assert!(snap.len() > OID_LEN, "a born head must carry a pack");
+    let mut entries = parse_container(&snap);
+    assert_eq!(entries.len(), 1, "a single born default repo");
+    let (name, head, pack) = entries.remove(0);
+    assert_eq!(name, DEFAULT_REPO);
+    assert!(!pack.is_empty(), "a born head must carry a pack");
     Captured {
-        head: snap[..OID_LEN].to_vec(),
-        pack: snap[OID_LEN..].to_vec(),
+        head,
+        pack,
         root: src.root(),
     }
 }
 
-/// build a `Push` message.
+/// build a `Push` message on the default repo (empty `repo`).
 fn push_msg(prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
     Msg {
         target: "forge".into(),
         payload: encode_msg(&ForgeMsg::Push {
+            repo: String::new(),
             prev_oid: prev.map(<[u8]>::to_vec),
             new_oid: new.to_vec(),
             pack_digest: digest.to_vec(),
@@ -143,21 +185,23 @@ fn head_query(forge: &Forge) -> Option<String> {
     let reply = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::Head))).unwrap();
     match decode_reply(&reply).unwrap() {
         ForgeReply::Head(h) => h,
+        other => panic!("expected Head, got {other:?}"),
     }
 }
 
-/// the on-disk `MAIN_REF` oid, or `None` if unborn — the independent oracle
-/// that materialization really moved (or did not move) the real ref.
-fn on_disk_head(dir: &PathBuf) -> Option<git2::Oid> {
-    git2::Repository::open(dir)
-        .unwrap()
+/// the on-disk `MAIN_REF` oid of the default repo, or `None` if unborn (or the
+/// repo dir doesn't exist yet) — the independent oracle that materialization
+/// really moved (or did not move) the real ref.
+fn on_disk_head(base: &Path) -> Option<git2::Oid> {
+    git2::Repository::open(repo_dir(base))
+        .ok()?
         .refname_to_id(MAIN_REF)
         .ok()
 }
 
-/// read a file's bytes out of the materialized head tree.
-fn read_blob(dir: &PathBuf, name: &str) -> Vec<u8> {
-    let repo = git2::Repository::open(dir).unwrap();
+/// read a file's bytes out of the default repo's materialized head tree.
+fn read_blob(base: &Path, name: &str) -> Vec<u8> {
+    let repo = git2::Repository::open(repo_dir(base)).unwrap();
     let head = repo.refname_to_id(MAIN_REF).unwrap();
     let tree = repo.find_commit(head).unwrap().tree().unwrap();
     let entry = tree
@@ -231,7 +275,7 @@ fn fast_forward_push_advances_the_head() {
     assert_eq!(on_disk_head(&dst_dir), Some(c2.oid()), "ref fast-forwarded");
     assert_eq!(read_blob(&dst_dir, "b.txt"), b"two".to_vec());
     // history came through the closure pack, not just the tip.
-    let repo = git2::Repository::open(&dst_dir).unwrap();
+    let repo = git2::Repository::open(repo_dir(&dst_dir)).unwrap();
     assert_eq!(
         repo.find_commit(c2.oid()).unwrap().parent(0).unwrap().id(),
         c1.oid(),
