@@ -90,6 +90,24 @@ pub enum JobsMsg {
     Cancel { job_id: String },
     /// the submitter removes a terminal job's record entirely.
     Prune { job_id: String },
+    /// register the caller module as a worker notified on every successful submit.
+    RegisterWorker {},
+    /// remove the caller module as a worker. absent workers are deterministic no-ops.
+    UnregisterWorker {},
+}
+
+/// the notification payload sent by `jobs` to each registered worker module.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum JobsEvent {
+    /// a job was submitted. `spec_hash` is sha256 over the submitted spec bytes;
+    /// workers use it to pin job-backed runs during the submit cascade, where
+    /// committed-only jobs queries cannot see the just-staged job.
+    Submitted {
+        job_id: String,
+        kind: String,
+        submitter: String,
+        spec_hash: Vec<u8>,
+    },
 }
 
 /// read projections over the board.
@@ -129,6 +147,14 @@ pub fn encode_msg(m: &JobsMsg) -> Vec<u8> {
 }
 
 pub fn decode_msg(b: &[u8]) -> Result<JobsMsg, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+
+pub fn encode_event(e: &JobsEvent) -> Vec<u8> {
+    serde_json::to_vec(e).expect("serializable")
+}
+
+pub fn decode_event(b: &[u8]) -> Result<JobsEvent, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }
 

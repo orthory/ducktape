@@ -5,9 +5,12 @@
 
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
-use jobs::{Jobs, MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_LIST_LIMIT, MAX_PAYLOAD, MAX_SPEC};
+use jobs::{
+    Jobs, MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_LIST_LIMIT, MAX_PAYLOAD, MAX_SPEC, MAX_WORKERS,
+};
 use jobs_interface::{
-    BoardCounts, Job, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_reply, encode_msg,
+    BoardCounts, Job, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
+    decode_event as decode_jobs_event, decode_reply, encode_event as encode_jobs_event, encode_msg,
     encode_query,
 };
 use sdk::{Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
@@ -70,6 +73,14 @@ fn prune(job_id: &str) -> Msg {
     })
 }
 
+fn register_worker() -> Msg {
+    jobs_msg(JobsMsg::RegisterWorker {})
+}
+
+fn unregister_worker() -> Msg {
+    jobs_msg(JobsMsg::UnregisterWorker {})
+}
+
 fn ext(id: &str) -> Origin {
     Origin::External(id.as_bytes().to_vec())
 }
@@ -91,6 +102,7 @@ fn actor(id: &str) -> String {
 
 struct TestCtx {
     env: Env,
+    modules: Vec<ModuleId>,
 }
 
 impl TestCtx {
@@ -102,7 +114,13 @@ impl TestCtx {
                 origin,
                 me: JOBS.into(),
             },
+            modules: Vec::new(),
         }
+    }
+
+    fn with_modules(mut self, modules: &[&str]) -> Self {
+        self.modules = modules.iter().map(|module| (*module).to_string()).collect();
+        self
     }
 }
 
@@ -111,8 +129,11 @@ impl Ctx for TestCtx {
     fn env(&self) -> &Env {
         &self.env
     }
-    fn module_root(&self, _target: &str) -> Option<StateRoot> {
-        None
+    fn module_root(&self, target: &str) -> Option<StateRoot> {
+        self.modules
+            .iter()
+            .any(|module| module == target)
+            .then_some(StateRoot::ZERO)
     }
     async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::QueryUnsupported)
@@ -135,6 +156,20 @@ async fn apply(jobs: &mut Jobs, height: u64, origin: Origin, msg: Msg) {
 /// execute one op WITHOUT committing (leaves it staged).
 async fn stage(jobs: &mut Jobs, height: u64, origin: Origin, msg: Msg) -> Result<(), Error> {
     jobs.execute(&mut TestCtx::new(height, origin), &msg).await
+}
+
+async fn stage_with_modules(
+    jobs: &mut Jobs,
+    height: u64,
+    origin: Origin,
+    modules: &[&str],
+    msg: Msg,
+) -> Result<(), Error> {
+    jobs.execute(
+        &mut TestCtx::new(height, origin).with_modules(modules),
+        &msg,
+    )
+    .await
 }
 
 async fn get(jobs: &Jobs, job_id: &str) -> Option<Job> {
@@ -234,6 +269,141 @@ fn full_lifecycle_happy_path() {
         // the claim is retained for the record.
         assert_eq!(job.claim.as_ref().unwrap().worker, actor("worker-a"));
         assert_eq!(job.updated_at_height, 3);
+    });
+}
+
+// ============================================================================
+// worker registry + event codec
+// ============================================================================
+
+#[test]
+fn jobs_event_codec_round_trips_submitted() {
+    let event = JobsEvent::Submitted {
+        job_id: "j1".into(),
+        kind: "agent/duck".into(),
+        submitter: actor("submitter"),
+        spec_hash: vec![7u8; 32],
+    };
+    assert_eq!(
+        decode_jobs_event(&encode_jobs_event(&event)).unwrap(),
+        event
+    );
+    assert!(
+        decode_jobs_event(b"not an event").is_err(),
+        "bad event payloads must not decode"
+    );
+}
+
+#[test]
+fn register_worker_gating_idempotence_unregister_and_cap() {
+    block_on(async {
+        let mut jobs = Jobs::new(JOBS);
+        let empty_root = jobs.root();
+
+        let err = stage_with_modules(&mut jobs, 1, ext("operator"), &[], register_worker())
+            .await
+            .expect_err("external registration rejected");
+        assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
+        jobs.abort_block().await.unwrap();
+
+        let err = stage_with_modules(&mut jobs, 1, ext("operator"), &[], unregister_worker())
+            .await
+            .expect_err("external unregistration rejected");
+        assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
+        jobs.abort_block().await.unwrap();
+
+        let err = stage_with_modules(&mut jobs, 1, Origin::System, &[], register_worker())
+            .await
+            .expect_err("system registration rejected");
+        assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
+        jobs.abort_block().await.unwrap();
+
+        let err = stage_with_modules(&mut jobs, 1, Origin::System, &[], unregister_worker())
+            .await
+            .expect_err("system unregistration rejected");
+        assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
+        jobs.abort_block().await.unwrap();
+
+        stage_with_modules(
+            &mut jobs,
+            2,
+            Origin::Module("agent".into()),
+            &[],
+            register_worker(),
+        )
+        .await
+        .expect("agent module self-registers");
+        jobs.commit_block().await.unwrap();
+        let registered_root = jobs.root();
+        assert_ne!(registered_root, empty_root, "worker set is consensus state");
+
+        stage_with_modules(
+            &mut jobs,
+            3,
+            Origin::Module("agent".into()),
+            &[],
+            register_worker(),
+        )
+        .await
+        .expect("re-register is idempotent");
+        jobs.commit_block().await.unwrap();
+        assert_eq!(
+            jobs.root(),
+            registered_root,
+            "idempotent re-register moves no state"
+        );
+
+        stage_with_modules(
+            &mut jobs,
+            4,
+            Origin::Module("ghost".into()),
+            &[],
+            unregister_worker(),
+        )
+        .await
+        .expect("absent unregister is a deterministic no-op");
+        jobs.commit_block().await.unwrap();
+        assert_eq!(jobs.root(), registered_root);
+
+        stage_with_modules(
+            &mut jobs,
+            5,
+            Origin::Module("agent".into()),
+            &[],
+            unregister_worker(),
+        )
+        .await
+        .expect("unregister existing worker");
+        jobs.commit_block().await.unwrap();
+        assert_eq!(
+            jobs.root(),
+            empty_root,
+            "removing the only worker restores root"
+        );
+
+        for i in 0..MAX_WORKERS {
+            let module = format!("worker-{i:02}");
+            stage_with_modules(
+                &mut jobs,
+                10 + i as u64,
+                Origin::Module(module),
+                &[],
+                register_worker(),
+            )
+            .await
+            .expect("register within cap");
+            jobs.commit_block().await.unwrap();
+        }
+        let err = stage_with_modules(
+            &mut jobs,
+            99,
+            Origin::Module("worker-overflow".into()),
+            &[],
+            register_worker(),
+        )
+        .await
+        .expect_err("worker cap enforced");
+        assert!(matches!(err, Error::Module(m) if m.contains("worker cap reached")));
     });
 }
 
@@ -886,6 +1056,17 @@ fn snapshot_one(
     }
     out.extend_from_slice(&1u64.to_le_bytes()); // created_at_height
     out.extend_from_slice(&1u64.to_le_bytes()); // updated_at_height
+    out.extend_from_slice(&0u64.to_le_bytes()); // worker count
+    out
+}
+
+fn snapshot_workers(workers: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0u64.to_le_bytes()); // job count
+    out.extend_from_slice(&(workers.len() as u64).to_le_bytes());
+    for worker in workers {
+        push_string(&mut out, worker);
+    }
     out
 }
 
@@ -948,6 +1129,48 @@ fn install_rejects_execute_unreachable_shapes() {
                 .install(&bytes, root_of_bytes(&bytes))
                 .expect("execute-reachable shape must install");
         }
+    });
+}
+
+#[test]
+fn worker_set_snapshot_round_trip_and_strict_decode() {
+    block_on(async {
+        let mut source = Jobs::new(JOBS);
+        for module in ["agent", "bot"] {
+            stage_with_modules(
+                &mut source,
+                1,
+                Origin::Module(module.into()),
+                &[],
+                register_worker(),
+            )
+            .await
+            .expect("register worker");
+        }
+        source.commit_block().await.unwrap();
+
+        let bytes = source.snapshot();
+        let expected = source.root();
+        let mut target = Jobs::new(JOBS);
+        target
+            .install(&bytes, expected)
+            .expect("worker set round trip");
+        assert_eq!(target.root(), expected);
+
+        let unsorted = snapshot_workers(&["bot".into(), "agent".into()]);
+        let err = target
+            .install(&unsorted, root_of_bytes(&unsorted))
+            .expect_err("worker ids must be strictly ascending");
+        assert!(matches!(err, Error::Module(m) if m.contains("worker ids not strictly ascending")));
+
+        let too_many: Vec<String> = (0..=MAX_WORKERS)
+            .map(|i| format!("worker-{i:02}"))
+            .collect();
+        let capped = snapshot_workers(&too_many);
+        let err = target
+            .install(&capped, root_of_bytes(&capped))
+            .expect_err("worker cap must apply during decode");
+        assert!(matches!(err, Error::Module(m) if m.contains("worker cap")));
     });
 }
 
@@ -1095,6 +1318,67 @@ async fn host_get(host: &Host, job_id: &str) -> Option<Job> {
         JobsReply::Job(job) => job,
         other => panic!("expected Job, got {other:?}"),
     }
+}
+
+/// a worker module that claims every submitted job it is notified about.
+struct ClaimingWorker {
+    id: ModuleId,
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for ClaimingWorker {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        let JobsEvent::Submitted { job_id, .. } =
+            decode_jobs_event(&msg.payload).map_err(Error::Module)?;
+        ctx.emit_msg(claim(&job_id, 100));
+        Ok(())
+    }
+}
+
+#[test]
+fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
+    block_on(async {
+        let mut host = Host::genesis(vec![
+            Box::new(Jobs::new(JOBS)),
+            Box::new(ClaimingWorker { id: "agent".into() }),
+        ])
+        .expect("genesis");
+
+        host.submit_at(
+            as_origin(1, Origin::Module("agent".into())),
+            register_worker(),
+        )
+        .await
+        .expect("register worker");
+
+        host.submit_at(
+            as_origin(2, ext("submitter")),
+            submit("j1", "agent/duck", "quack spec"),
+        )
+        .await
+        .expect("submit cascades into claim");
+
+        let job = host_get(&host, "j1").await.expect("job exists");
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(
+            job.claim.as_ref().map(|claim| claim.worker.as_str()),
+            Some("agent"),
+            "the worker identity is host-assigned from the module origin"
+        );
+        assert_eq!(
+            job.submitter,
+            actor("submitter"),
+            "the submitted event carried the origin-derived submitter"
+        );
+    });
 }
 
 #[test]

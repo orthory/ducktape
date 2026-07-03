@@ -41,6 +41,7 @@ inbox = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
+agent = { workspace = true }
 reactor = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }

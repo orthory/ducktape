@@ -27,6 +27,7 @@ inbox-interface = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
+jobs-interface = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }

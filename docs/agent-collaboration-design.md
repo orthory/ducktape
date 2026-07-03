@@ -106,8 +106,8 @@ The run flow — each ✦ is a consensus op (one block):
    same-block, atomic (P2).
 2. The agent module receives the hook notification (`Origin::Module(chat)`
    enforced), applies the channel's turn policy (§5), and for each engaged
-   agent creates a `RunRecord` with `run_id = f(channel, anchor_seq,
-   agent_id)` (duplicate = deterministic no-op — the turn claim), computes the
+   agent creates a `RunRecord` with a source-tagged Unit Separator-delimited
+   run id (duplicate = deterministic no-op — the turn claim), computes the
    `ContextPin` by querying the transcript prefix (staged writes visible —
    deterministic), and emits `saga.Trigger{spec: LlmRequest{run_id, agent_id,
    config_hash, ContextPin}, reply_to: "agent", reply_payload: run_id,
@@ -220,8 +220,10 @@ The agent module stops being a messaging facade and becomes a real module:
 - **Turn policy per channel hook**: `Mention` (agents named in message blocks
   — mentions are structured spans, so parsing is deterministic), `Assigned`,
   `RoundRobin(anchor_seq % n)`, `All`. For externally-raced claims,
-  `run_id = f(channel, anchor_seq, agent_id)` dedup makes the first claim in
-  consensus order win; later claims are no-ops. No randomness, no clock.
+  the chat run id `chat\x1f{channel}\x1f{anchor_seq}\x1f{agent_id}` dedups the
+  first claim in consensus order; later claims are no-ops. Job-backed runs use
+  the disjoint `job\x1f{job_id}\x1f{agent_id}\x1f{claim_height}` keyspace.
+  No randomness, no clock.
 - **Output validation is the safety boundary.** `AgentOutput{reply_blocks,
   actions[]}` is data until the agent module deterministically validates it
   (schema, caps, `allowed_actions`) and emits the cross-module msgs. Fan-out

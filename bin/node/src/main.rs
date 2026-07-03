@@ -49,6 +49,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use agent::AgentModule;
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
@@ -129,7 +130,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 15] = [
+const MODULE_IDS: [&str; 16] = [
     "kv",
     "document",
     "chat",
@@ -145,6 +146,7 @@ const MODULE_IDS: [&str; 15] = [
     "files",
     "memory",
     "jobs",
+    "agent",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
@@ -250,6 +252,13 @@ async fn genesis_host(
         // write-once publish, immutable generations, snapshots, and watches.
         Box::new(Memory::new("memory", "files")),
         Box::new(Jobs::new("jobs")),
+        Box::new(AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
@@ -341,6 +350,18 @@ async fn restore_host(
     jobs.install(bytes, root)
         .map_err(|e| format!("jobs install: {e}"))?;
 
+    let mut agent = AgentModule::new(
+        "agent",
+        "chat",
+        "saga",
+        Some("tasks".into()),
+        Some("jobs".into()),
+    );
+    let (bytes, root) = snapshot_of("agent")?;
+    agent
+        .install(bytes, root)
+        .map_err(|e| format!("agent install: {e}"))?;
+
     let mut directory = Directory::new("directory");
     let (bytes, root) = snapshot_of("directory")?;
     directory
@@ -367,6 +388,7 @@ async fn restore_host(
         Box::new(files),
         Box::new(memory),
         Box::new(jobs),
+        Box::new(agent),
         Box::new(directory),
         Box::new(automations),
     ])
@@ -507,6 +529,18 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     jobs.install(&bytes, root)
         .map_err(|e| format!("jobs install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("agent").await?;
+    let mut agent = AgentModule::new(
+        "agent",
+        "chat",
+        "saga",
+        Some("tasks".into()),
+        Some("jobs".into()),
+    );
+    agent
+        .install(&bytes, root)
+        .map_err(|e| format!("agent install: {e}"))?;
+
     let (bytes, root) = snapshot_of("automations").await?;
     let mut automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
     automations
@@ -537,6 +571,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(files),
         Box::new(memory),
         Box::new(jobs),
+        Box::new(agent),
         Box::new(automations),
         Box::new(directory),
     ])

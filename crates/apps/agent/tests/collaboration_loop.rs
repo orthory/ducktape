@@ -13,7 +13,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use agent::{AgentModule, context_hash, reply_message_id, run_id_for, saga_id_for};
+use agent::{
+    AgentModule, context_hash, job_run_id_for, job_spec_hash, reply_message_id, run_id_for,
+    saga_id_for,
+};
 use agent_interface::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentOutput, AgentQuery,
     AgentReply, AgentStatus, LlmRequest, RunStatus, TurnPolicy, decode_llm_request, decode_reply,
@@ -27,6 +30,11 @@ use chat_interface::{
 };
 use commonware_runtime::{Runner as _, deterministic};
 use host::{BlockContext, Host};
+use jobs::Jobs;
+use jobs_interface::{
+    Job, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_reply as jobs_decode_reply,
+    encode_msg as jobs_encode_msg, encode_query as jobs_encode_query,
+};
 use reactor::{Reactor, Worker};
 use saga::SagaModule;
 use saga_interface::{
@@ -90,6 +98,10 @@ fn at(height: u64, origin: Origin) -> BlockContext {
         consensus_time: height,
         origin,
     }
+}
+
+fn as_user(byte: u8, height: u64) -> BlockContext {
+    at(height, Origin::External(vec![byte; 32]))
 }
 
 fn quackbot_ref() -> AuthorRef {
@@ -174,8 +186,10 @@ async fn genesis(context: deterministic::Context) -> Host {
             "chat",
             "saga",
             Some("tasks".into()),
+            Some("jobs".into()),
         )),
         Box::new(Tasks::new("tasks")),
+        Box::new(Jobs::new("jobs")),
     ])
     .expect("genesis")
 }
@@ -235,6 +249,63 @@ async fn task_ids(host: &Host) -> Vec<String> {
     match tasks_decode_reply(&reply).unwrap() {
         TaskReply::Tasks(tasks) => tasks.into_iter().map(|t| t.id).collect(),
     }
+}
+
+async fn job_view(host: &Host, job_id: &str) -> Option<Job> {
+    let reply = host
+        .query(
+            "jobs",
+            &jobs_encode_query(&JobsQuery::Get {
+                job_id: job_id.into(),
+            }),
+        )
+        .await
+        .unwrap();
+    match jobs_decode_reply(&reply).unwrap() {
+        JobsReply::Job(job) => job,
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+fn jobs_msg(payload: JobsMsg) -> Msg {
+    Msg {
+        target: "jobs".into(),
+        payload: jobs_encode_msg(&payload),
+    }
+}
+
+fn enable_job_worker() -> Msg {
+    Msg {
+        target: "agent".into(),
+        payload: encode_msg(&AgentMsg::EnableJobWorker { enabled: true }),
+    }
+}
+
+fn submit_job(job_id: &str, agent_id: &str, spec: &str) -> Msg {
+    jobs_msg(JobsMsg::Submit {
+        job_id: job_id.into(),
+        kind: format!("agent/{agent_id}"),
+        spec: spec.into(),
+    })
+}
+
+fn prune_job(job_id: &str) -> Msg {
+    jobs_msg(JobsMsg::Prune {
+        job_id: job_id.into(),
+    })
+}
+
+fn reclaim_job(job_id: &str) -> Msg {
+    jobs_msg(JobsMsg::Reclaim {
+        job_id: job_id.into(),
+    })
+}
+
+fn claim_job(job_id: &str) -> Msg {
+    jobs_msg(JobsMsg::Claim {
+        job_id: job_id.into(),
+        lease_views: 1000,
+    })
 }
 
 #[test]
@@ -430,6 +501,345 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
         "two instances, one op sequence -> byte-identical app-hash"
     );
     assert_ne!(settled_hash, StateRoot::ZERO);
+}
+
+#[test]
+fn an_agent_job_is_claimed_and_records_a_run_in_the_submit_cascade() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        host.submit_at(as_user(1, 1), enable_job_worker())
+            .await
+            .expect("enable the agent module as the single jobs worker");
+        host.submit_at(
+            as_user(1, 2),
+            Msg {
+                target: "agent".into(),
+                payload: encode_msg(&AgentMsg::RegisterAgent {
+                    agent_id: "duck".into(),
+                    display_name: "Duck".into(),
+                    model_ref: "mock-llm-1".into(),
+                    prompt_hash: vec![9u8; 32],
+                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
+                }),
+            },
+        )
+        .await
+        .expect("register duck");
+
+        let spec = "summarize this work item";
+        host.submit_at(as_user(2, 3), submit_job("job-1", "duck", spec))
+            .await
+            .expect("submit cascades to agent claim + run");
+
+        let job = job_view(&host, "job-1").await.expect("job exists");
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(
+            job.claim.as_ref().map(|claim| claim.worker.as_str()),
+            Some("agent")
+        );
+
+        let run_id = job_run_id_for("job-1", "duck", 3);
+        let run = run_view(&host, &run_id).await.expect("job run exists");
+        assert_eq!(run.job_id, Some("job-1".into()));
+        assert_eq!(run.agent_id, "duck");
+        assert_eq!(run.context_hash, job_spec_hash(spec.as_bytes()));
+        assert_eq!(
+            run.status,
+            RunStatus::AwaitingOracle {
+                saga_id: saga_id_for(&run_id),
+            }
+        );
+    });
+}
+
+#[test]
+fn an_agent_job_for_an_unknown_agent_commits_without_a_claim() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        host.submit_at(as_user(1, 1), enable_job_worker())
+            .await
+            .expect("enable the agent module as the jobs worker");
+
+        host.submit_at(as_user(2, 2), submit_job("job-ghost", "ghost", "spec"))
+            .await
+            .expect("unknown agent kind is a no-op for the worker");
+
+        let job = job_view(&host, "job-ghost").await.expect("job exists");
+        assert_eq!(job.status, JobStatus::Pending);
+        assert!(job.claim.is_none());
+        assert_eq!(
+            run_view(&host, &job_run_id_for("job-ghost", "ghost", 2)).await,
+            None
+        );
+    });
+}
+
+#[test]
+fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_output() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        host.submit_at(as_user(1, 1), enable_job_worker())
+            .await
+            .expect("enable the agent module as the jobs worker");
+        host.submit_at(
+            as_user(1, 2),
+            Msg {
+                target: "agent".into(),
+                payload: encode_msg(&AgentMsg::RegisterAgent {
+                    agent_id: "duck".into(),
+                    display_name: "Duck".into(),
+                    model_ref: "mock-llm-1".into(),
+                    prompt_hash: vec![9u8; 32],
+                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
+                }),
+            },
+        )
+        .await
+        .expect("register duck");
+        host.submit_at(as_user(2, 3), submit_job("job-1", "duck", "job spec"))
+            .await
+            .expect("submit job");
+
+        let run_id = job_run_id_for("job-1", "duck", 3);
+        let output = AgentOutput {
+            reply_blocks: Vec::new(),
+            actions: vec![AgentAction::CreateTask {
+                task_id: "job-task".into(),
+                title: "complete job".into(),
+            }],
+        };
+        host.submit_at(
+            at(10, Origin::External(b"oracle".to_vec())),
+            Msg {
+                target: "saga".into(),
+                payload: saga_encode_msg(&SagaMsg::OracleResult {
+                    saga_id: saga_id_for(&run_id),
+                    attempt: 0,
+                    outcome: Ok(encode_output(&output)),
+                }),
+            },
+        )
+        .await
+        .expect("oracle result finalizes the job");
+
+        assert_eq!(
+            run_view(&host, &run_id).await.unwrap().status,
+            RunStatus::Done
+        );
+        let job = job_view(&host, "job-1").await.expect("job exists");
+        assert_eq!(job.status, JobStatus::Done);
+        let result = job.result.expect("finalize result");
+        assert!(result.ok);
+        assert_eq!(
+            result.payload,
+            String::from_utf8(encode_output(&output)).expect("json output is utf8")
+        );
+        assert_eq!(task_ids(&host).await, vec!["job-task".to_string()]);
+    });
+}
+
+#[test]
+fn a_pruned_and_resubmitted_job_id_gets_a_fresh_episode_run() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        host.submit_at(as_user(1, 1), enable_job_worker())
+            .await
+            .expect("enable jobs worker");
+        host.submit_at(
+            as_user(1, 2),
+            Msg {
+                target: "agent".into(),
+                payload: encode_msg(&AgentMsg::RegisterAgent {
+                    agent_id: "duck".into(),
+                    display_name: "Duck".into(),
+                    model_ref: "mock-llm-1".into(),
+                    prompt_hash: vec![9u8; 32],
+                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
+                }),
+            },
+        )
+        .await
+        .expect("register duck");
+
+        host.submit_at(as_user(2, 3), submit_job("repeat", "duck", "first"))
+            .await
+            .expect("first submit");
+        let first_run_id = job_run_id_for("repeat", "duck", 3);
+        host.submit_at(
+            at(10, Origin::External(b"oracle".to_vec())),
+            Msg {
+                target: "saga".into(),
+                payload: saga_encode_msg(&SagaMsg::OracleResult {
+                    saga_id: saga_id_for(&first_run_id),
+                    attempt: 0,
+                    outcome: Ok(encode_output(&AgentOutput {
+                        reply_blocks: Vec::new(),
+                        actions: vec![AgentAction::CreateTask {
+                            task_id: "first-task".into(),
+                            title: "finish first".into(),
+                        }],
+                    })),
+                }),
+            },
+        )
+        .await
+        .expect("finish first episode");
+        host.submit_at(as_user(2, 11), prune_job("repeat"))
+            .await
+            .expect("prune first episode");
+
+        host.submit_at(as_user(2, 20), submit_job("repeat", "duck", "second"))
+            .await
+            .expect("resubmit same job id");
+        let second_run_id = job_run_id_for("repeat", "duck", 20);
+        assert_ne!(first_run_id, second_run_id);
+        assert!(
+            run_view(&host, &first_run_id).await.is_some(),
+            "the terminal first run remains in agent history"
+        );
+        let second = run_view(&host, &second_run_id)
+            .await
+            .expect("fresh run for second job episode");
+        assert_eq!(second.context_hash, job_spec_hash(b"second"));
+
+        let job = job_view(&host, "repeat")
+            .await
+            .expect("resubmitted job exists");
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(
+            job.claim.as_ref().map(|claim| claim.claimed_at_height),
+            Some(20)
+        );
+    });
+}
+
+#[test]
+fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        host.submit_at(as_user(1, 1), enable_job_worker())
+            .await
+            .expect("enable jobs worker");
+        host.submit_at(
+            as_user(1, 2),
+            Msg {
+                target: "agent".into(),
+                payload: encode_msg(&AgentMsg::RegisterAgent {
+                    agent_id: "duck".into(),
+                    display_name: "Duck".into(),
+                    model_ref: "mock-llm-1".into(),
+                    prompt_hash: vec![9u8; 32],
+                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
+                }),
+            },
+        )
+        .await
+        .expect("register duck");
+
+        host.submit_at(as_user(2, 3), submit_job("lease", "duck", "stale"))
+            .await
+            .expect("submit stale episode");
+        let stale_run_id = job_run_id_for("lease", "duck", 3);
+
+        host.submit_at(as_user(9, 1004), reclaim_job("lease"))
+            .await
+            .expect("lease expiry requeues the job");
+        host.submit_at(at(1005, Origin::Module("agent".into())), claim_job("lease"))
+            .await
+            .expect("agent reclaims a new episode");
+
+        host.submit_at(
+            at(1010, Origin::External(b"oracle".to_vec())),
+            Msg {
+                target: "saga".into(),
+                payload: saga_encode_msg(&SagaMsg::OracleResult {
+                    saga_id: saga_id_for(&stale_run_id),
+                    attempt: 0,
+                    outcome: Ok(encode_output(&AgentOutput {
+                        reply_blocks: Vec::new(),
+                        actions: vec![AgentAction::CreateTask {
+                            task_id: "stale-task".into(),
+                            title: "late stale output".into(),
+                        }],
+                    })),
+                }),
+            },
+        )
+        .await
+        .expect("late stale run closes agent state without finalizing the job");
+
+        assert_eq!(
+            run_view(&host, &stale_run_id).await.unwrap().status,
+            RunStatus::Done
+        );
+        let job = job_view(&host, "lease").await.expect("job remains");
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(job.result, None);
+        assert_eq!(
+            job.claim.as_ref().map(|claim| claim.claimed_at_height),
+            Some(1005)
+        );
+    });
+}
+
+#[test]
+fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        host.submit_at(as_user(1, 1), enable_job_worker())
+            .await
+            .expect("enable the agent module as the jobs worker");
+        host.submit_at(
+            as_user(1, 2),
+            Msg {
+                target: "agent".into(),
+                payload: encode_msg(&AgentMsg::RegisterAgent {
+                    agent_id: "duck".into(),
+                    display_name: "Duck".into(),
+                    model_ref: "mock-llm-1".into(),
+                    prompt_hash: vec![9u8; 32],
+                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
+                }),
+            },
+        )
+        .await
+        .expect("register duck");
+        host.submit_at(as_user(2, 3), submit_job("job-fail", "duck", "job spec"))
+            .await
+            .expect("submit job");
+
+        let run_id = job_run_id_for("job-fail", "duck", 3);
+        for attempt in 0..2u32 {
+            host.submit_at(
+                at(
+                    10 + u64::from(attempt),
+                    Origin::External(b"oracle".to_vec()),
+                ),
+                Msg {
+                    target: "saga".into(),
+                    payload: saga_encode_msg(&SagaMsg::OracleResult {
+                        saga_id: saga_id_for(&run_id),
+                        attempt,
+                        outcome: Err("model unavailable".into()),
+                    }),
+                },
+            )
+            .await
+            .expect("failing oracle result");
+        }
+
+        assert_eq!(
+            run_view(&host, &run_id).await.unwrap().status,
+            RunStatus::Failed {
+                reason: "model unavailable".into(),
+            }
+        );
+        let job = job_view(&host, "job-fail").await.expect("job exists");
+        assert_eq!(job.status, JobStatus::Failed);
+        let result = job.result.expect("finalize result");
+        assert!(!result.ok);
+        assert_eq!(result.payload, "model unavailable");
+    });
 }
 
 #[test]

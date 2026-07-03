@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent::AgentModule;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Runner as _, Supervisor as _};
@@ -33,18 +34,21 @@ use inbox::Inbox;
 use jobs::Jobs;
 use memory::Memory;
 use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, hex_root};
+use saga::SagaModule;
 use sdk::{Msg, Origin};
 use tasks::Tasks;
 use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 9] = [
+const MODULE_IDS: [&str; 11] = [
     "chat",
+    "saga",
     "tasks",
     "inbox",
     "automations",
     "jobs",
+    "agent",
     "document",
     "forge",
     "files",
@@ -118,20 +122,30 @@ fn run_node(
         // http layer's blob handle so uploads land in the store `serve_sync`
         // reads — the bytes themselves never touch consensus.
         let chat = Chat::init(context.child("chat"), "chat").await;
+        let saga = SagaModule::new("saga");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let jobs = Jobs::new("jobs");
+        let agent = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        );
         let document = Document::init(context.child("document"), "document").await;
         let forge = Forge::init("forge", forge_repo).expect("forge init");
         let files = Files::with_blobs("files", blobs);
         let memory = Memory::new("memory", "files");
         let mut host = Host::genesis(vec![
             Box::new(chat),
+            Box::new(saga),
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
             Box::new(jobs),
+            Box::new(agent),
             Box::new(document),
             Box::new(forge),
             Box::new(files),

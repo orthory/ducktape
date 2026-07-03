@@ -481,7 +481,13 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // the agent crate's own snapshot suite; this leg pins the joiner
         // path. admin ops are owner-gated, so they carry an external origin.
         let owner = sdk::Origin::External(b"agent-owner".to_vec());
-        let mut src_agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        let mut src_agent = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        );
         commit_op_as(
             &mut src_agent,
             30,
@@ -692,7 +698,13 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         join_saga
             .install(&saga_bytes, src_saga_root)
             .expect("saga install");
-        let mut join_agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        let mut join_agent = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        );
         join_agent
             .install(&agent_bytes, src_agent_root)
             .expect("agent install");

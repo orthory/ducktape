@@ -23,6 +23,8 @@ tasks = { workspace = true }
 inbox = { workspace = true }
 automations = { workspace = true }
 jobs = { workspace = true }
+agent = { workspace = true }
+saga = { workspace = true }
 document = { workspace = true }
 forge = { workspace = true }
 files = { workspace = true }
