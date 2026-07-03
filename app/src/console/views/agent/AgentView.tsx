@@ -252,7 +252,7 @@ function NewAgentForm({
 }) {
   const [displayName, setDisplayName] = useState("");
   const [agentId, setAgentId] = useState("");
-  const [modelRef, setModelRef] = useState("gpt-5.1");
+  const [modelRef, setModelRef] = useState("gpt-5.3-codex-spark");
   const [prompt, setPrompt] = useState("");
   const [actions, setActions] = useState<string[]>(["chat.post"]);
 
@@ -270,7 +270,7 @@ function NewAgentForm({
     onRegister({ displayName, agentId: id, modelRef, prompt, allowedActions: actions });
     setDisplayName("");
     setAgentId("");
-    setModelRef("gpt-5.1");
+    setModelRef("gpt-5.3-codex-spark");
     setPrompt("");
     setActions(["chat.post"]);
   };
