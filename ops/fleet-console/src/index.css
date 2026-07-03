@@ -111,6 +111,17 @@ body {
 /* graph view */
 .graph { flex: 1; min-height: 0; }
 .graph-node { width: 340px; }
+.graph-node[data-collapsed] { width: 280px; }
+/* xyflow nodes size to content — pin the live tile's screen so the RFB canvas
+   scales into a fixed box instead of blowing the node up to framebuffer size. */
+.graph-node .tile { width: 340px; }
+.graph-node .tile-screen { width: 340px; height: 190px; aspect-ratio: auto; overflow: hidden; }
+.graph-node .tile-screen .rfb { width: 340px; height: 190px; }
+.graph-node .tile-screen canvas { max-width: 100%; max-height: 100%; }
+/* non-running worktrees: collapsed, disabled-looking, no screen */
+.tile[data-collapsed] { opacity: 0.5; }
+.tile[data-collapsed] .tile-head { border-bottom: none; }
+.tile[data-collapsed] .tile-foot { padding-top: 0; }
 .react-flow__handle { width: 6px; height: 6px; background: var(--line); border: none; }
 .react-flow__background { background: var(--bg); }
 .react-flow__controls { box-shadow: none; }

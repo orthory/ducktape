@@ -19,18 +19,22 @@ function AheadBehind({ ahead, behind }: { ahead: number; behind: number }) {
 export function AppTile({
   node,
   onOpen,
+  collapsed = false,
 }: {
   node: FleetNode;
   onOpen: (n: FleetNode) => void;
+  /** Graph view passes this for non-running worktrees: no screen, disabled. */
+  collapsed?: boolean;
 }) {
   const screenRef = useRef<HTMLDivElement>(null);
-  const connectable = node.status === "up" && Boolean(node.token);
+  const connectable = node.status === "up" && Boolean(node.token) && !collapsed;
   const status = useRfb(screenRef, connectable ? node.token : undefined, true);
 
   return (
     <div
       className="tile"
       data-status={node.status}
+      data-collapsed={collapsed || undefined}
       onClick={() => connectable && onOpen(node)}
       role={connectable ? "button" : undefined}
       title={connectable ? "Click to interact" : undefined}
@@ -41,22 +45,27 @@ export function AppTile({
         <span className="sha">{node.head.sha}</span>
         <AheadBehind ahead={node.ahead} behind={node.behind} />
       </div>
-      <div className="tile-screen">
-        {connectable ? (
-          <>
-            <div ref={screenRef} className="rfb" />
-            {status !== "connected" && (
-              <div className="tile-overlay">{status}…</div>
-            )}
-          </>
-        ) : (
-          <div className="tile-overlay muted">
-            {node.status === "building" ? "building…" : "not running"}
-          </div>
-        )}
-      </div>
+      {!collapsed && (
+        <div className="tile-screen">
+          {connectable ? (
+            <>
+              <div ref={screenRef} className="rfb" />
+              {status !== "connected" && (
+                <div className="tile-overlay">{status}…</div>
+              )}
+            </>
+          ) : (
+            <div className="tile-overlay muted">
+              {node.status === "building" ? "building…" : "not running"}
+            </div>
+          )}
+        </div>
+      )}
       <div className="tile-foot">
-        <span className="subj">{node.head.subject}</span>
+        <span className="subj">
+          {collapsed && node.status === "building" ? "building… · " : ""}
+          {node.head.subject}
+        </span>
         <ActivityFeed activity={node.activity} compact />
       </div>
     </div>

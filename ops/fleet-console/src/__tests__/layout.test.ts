@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toGraph } from "../layout";
+import { toGraph, isCollapsed } from "../layout";
 import type { FleetNode } from "../types";
 
 const n = (over: Partial<FleetNode>): FleetNode => ({
@@ -14,8 +14,16 @@ const n = (over: Partial<FleetNode>): FleetNode => ({
   ...over,
 });
 
+describe("isCollapsed", () => {
+  it("collapses anything that is not live", () => {
+    expect(isCollapsed(n({ status: "up" }))).toBe(false);
+    expect(isCollapsed(n({ status: "building" }))).toBe(true);
+    expect(isCollapsed(n({ status: "down" }))).toBe(true);
+  });
+});
+
 describe("toGraph", () => {
-  it("puts the base at the root and worktrees as children with edges", () => {
+  it("lays out horizontally: base on the left, worktrees to the right", () => {
     const nodes = [
       n({ id: "dev", branch: "dev", parent: null }),
       n({ id: "a", branch: "feat/a", status: "up" }),
@@ -24,8 +32,8 @@ describe("toGraph", () => {
     const { rfNodes, rfEdges } = toGraph(nodes, "dev", () => {});
 
     expect(rfNodes).toHaveLength(3);
-    expect(rfNodes.find((x) => x.id === "dev")!.position.y).toBe(0);
-    expect(rfNodes.filter((x) => x.position.y > 0)).toHaveLength(2);
+    expect(rfNodes.find((x) => x.id === "dev")!.position.x).toBe(0);
+    expect(rfNodes.filter((x) => x.position.x > 0)).toHaveLength(2);
 
     expect(rfEdges).toHaveLength(2);
     expect(rfEdges.every((e) => e.source === "dev")).toBe(true);

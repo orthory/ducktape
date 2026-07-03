@@ -10,13 +10,22 @@ export interface WorktreeNodeData extends Record<string, unknown> {
 
 export type WorktreeGraphNode = Node<WorktreeNodeData, "worktree">;
 
-const COL_W = 380;
-const ROW_H = 320;
-const MARGIN = 24;
+// A worktree is "collapsed" in the graph unless its app is live — non-running
+// nodes carry no screen, so they render short.
+export const isCollapsed = (n: FleetNode): boolean => n.status !== "up";
 
-// Pure: turn the fleet into a branch tree — base (dev) at the top, every other
-// worktree a child fanned out beneath it, edge base→child (animated when live).
-// Kept free of React/xyflow rendering so it is unit-testable.
+const NODE_W = 340;
+const COL_GAP = 110; // horizontal gap between the base column and children
+const H_LIVE = 280; // header + pinned 190px screen + footer
+const H_COLLAPSED = 92; // header + activity only
+const V_GAP = 18;
+
+const heightOf = (n: FleetNode): number =>
+  isCollapsed(n) ? H_COLLAPSED : H_LIVE;
+
+// Pure: turn the fleet into a HORIZONTAL branch tree — base on the left, every
+// other worktree stacked to its right, edge base→child (animated when live).
+// Children are packed by their actual heights so collapsed nodes sit tight.
 export function toGraph(
   nodes: FleetNode[],
   base: string,
@@ -27,20 +36,30 @@ export function toGraph(
   const rfNodes: WorktreeGraphNode[] = [];
   const rfEdges: Edge[] = [];
 
-  const spanW = Math.max(children.length, 1) * COL_W;
+  // stack children vertically on the right, packed by height
+  let y = 0;
+  const placed = children.map((c) => {
+    const at = y;
+    y += heightOf(c) + V_GAP;
+    return { c, y: at };
+  });
+  const childrenSpan = Math.max(y - V_GAP, 0);
+  const childX = NODE_W + COL_GAP;
+
   if (baseNode) {
+    const baseY = Math.max((childrenSpan - heightOf(baseNode)) / 2, 0);
     rfNodes.push({
       id: baseNode.id,
       type: "worktree",
-      position: { x: MARGIN + spanW / 2 - COL_W / 2, y: 0 },
+      position: { x: 0, y: baseY },
       data: { node: baseNode, onOpen },
     });
   }
-  children.forEach((c, i) => {
+  placed.forEach(({ c, y: cy }) => {
     rfNodes.push({
       id: c.id,
       type: "worktree",
-      position: { x: MARGIN + i * COL_W, y: ROW_H },
+      position: { x: childX, y: cy },
       data: { node: c, onOpen },
     });
     if (baseNode) {
