@@ -21,8 +21,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{poll_until, serial, Cluster};
-use directory_interface::{decode_reply, encode_msg, encode_query, DirMsg, DirQuery, DirReply};
+use common::{Cluster, poll_until, serial};
+use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -31,7 +31,10 @@ const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
 
 fn dir_set(key: &str, value: &str) -> Vec<u8> {
-    encode_msg(&DirMsg::Set { key: key.into(), value: value.into() })
+    encode_msg(&DirMsg::Set {
+        key: key.into(),
+        value: value.into(),
+    })
 }
 
 fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
@@ -170,9 +173,11 @@ fn live_quorum_admits_a_fourth_validator() {
     // its frame bytes start out ONLY in its store, so this proves the joiner
     // is wired into the payload relay and the vote lanes of the live epoch.
     cluster.submit(joiner, "directory", &dir_set("from-the-fourth", "present"));
-    let value = poll_until("the fourth validator's op to read on node 2", FINALIZE, || {
-        dir_value(&cluster, 2, "from-the-fourth")
-    });
+    let value = poll_until(
+        "the fourth validator's op to read on node 2",
+        FINALIZE,
+        || dir_value(&cluster, 2, "from-the-fourth"),
+    );
     assert_eq!(value, "present");
 
     // and it holds the full replicated state (no fork after quiesce).

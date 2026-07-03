@@ -37,14 +37,18 @@ impl Module for Picky {
 }
 
 fn op(p: &[u8]) -> Msg {
-    Msg { target: "picky".into(), payload: p.to_vec() }
+    Msg {
+        target: "picky".into(),
+        payload: p.to_vec(),
+    }
 }
 
 #[test]
 fn a_rejected_finalized_op_is_a_noop_not_a_halt() {
     futures::executor::block_on(async {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let host = host::Host::genesis(vec![Box::new(Picky { seen: seen.clone() })]).expect("genesis");
+        let host =
+            host::Host::genesis(vec![Box::new(Picky { seen: seen.clone() })]).expect("genesis");
         let mut node = OrderedNode::new(host, RoundOrderer::new());
 
         // a good op applies.
@@ -61,10 +65,16 @@ fn a_rejected_finalized_op_is_a_noop_not_a_halt() {
 
         // the node keeps going — a later good op still lands.
         node.submit(&sk(1), 1, op(b"good2")).await.expect("submit");
-        assert!(node.drain_delivered().await.is_ok(), "node continues past the rejected op");
+        assert!(
+            node.drain_delivered().await.is_ok(),
+            "node continues past the rejected op"
+        );
 
         // exactly the two good ops landed; poison was inert.
-        assert_eq!(*seen.lock().unwrap(), vec![b"good1".to_vec(), b"good2".to_vec()]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![b"good1".to_vec(), b"good2".to_vec()]
+        );
     });
 }
 

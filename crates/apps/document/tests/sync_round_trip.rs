@@ -10,10 +10,10 @@
 //! real sync that ships the ACTUAL proven op range lands on the same root, which
 //! is precisely what makes this test discriminating rather than a tautology.
 
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use document::Document;
 use document_interface::{
-    decode_reply, encode_msg, encode_query, Block, BlockKind, DocMsg, DocQuery, DocReply,
+    Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply, encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
 
@@ -35,8 +35,12 @@ impl TestCtx {
 }
 #[async_trait::async_trait(?Send)]
 impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env { &self.env }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> { None }
+    fn env(&self) -> &sdk::Env {
+        &self.env
+    }
+    fn module_root(&self, _t: &str) -> Option<StateRoot> {
+        None
+    }
     async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::QueryUnsupported)
     }
@@ -46,7 +50,11 @@ impl Ctx for TestCtx {
 }
 
 fn blk(id: &str, text: &str) -> Block {
-    Block { id: id.into(), kind: BlockKind::Paragraph, text: text.into() }
+    Block {
+        id: id.into(),
+        kind: BlockKind::Paragraph,
+        text: text.into(),
+    }
 }
 
 // drive one op through the REAL module path: execute + commit_block (one op per
@@ -55,7 +63,10 @@ async fn apply_commit<E>(d: &mut Document<E>, m: &DocMsg)
 where
     E: commonware_storage::Context + commonware_runtime::BufferPooler,
 {
-    let msg = Msg { target: "document".into(), payload: encode_msg(m) };
+    let msg = Msg {
+        target: "document".into(),
+        payload: encode_msg(m),
+    };
     d.execute(&mut TestCtx::new(), &msg).await.unwrap();
     d.commit_block().await.unwrap();
 }
@@ -65,7 +76,9 @@ where
     E: commonware_storage::Context + commonware_runtime::BufferPooler,
 {
     let reply = d
-        .query(&encode_query(&DocQuery::GetDoc { doc_id: doc_id.into() }))
+        .query(&encode_query(&DocQuery::GetDoc {
+            doc_id: doc_id.into(),
+        }))
         .await
         .unwrap();
     match decode_reply(&reply).unwrap() {
@@ -80,16 +93,40 @@ fn synced_store_reconstructs_source_root() {
         // SOURCE: build a doc through the real op path, including an UPDATE that
         // overwrites the doc's key in the op log.
         let mut src = Document::init(context.child("src"), "src").await;
-        apply_commit(&mut src, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
-        apply_commit(&mut src, &DocMsg::InsertBlock {
-            doc_id: "doc1".into(), after: None, block: blk("b1", "draft"),
-        }).await;
-        apply_commit(&mut src, &DocMsg::InsertBlock {
-            doc_id: "doc1".into(), after: Some("b1".into()), block: blk("b2", "second"),
-        }).await;
-        apply_commit(&mut src, &DocMsg::UpdateBlock {
-            doc_id: "doc1".into(), block_id: "b1".into(), text: "final".into(),
-        }).await; // overwrite: op-log order matters
+        apply_commit(
+            &mut src,
+            &DocMsg::CreateDoc {
+                doc_id: "doc1".into(),
+            },
+        )
+        .await;
+        apply_commit(
+            &mut src,
+            &DocMsg::InsertBlock {
+                doc_id: "doc1".into(),
+                after: None,
+                block: blk("b1", "draft"),
+            },
+        )
+        .await;
+        apply_commit(
+            &mut src,
+            &DocMsg::InsertBlock {
+                doc_id: "doc1".into(),
+                after: Some("b1".into()),
+                block: blk("b2", "second"),
+            },
+        )
+        .await;
+        apply_commit(
+            &mut src,
+            &DocMsg::UpdateBlock {
+                doc_id: "doc1".into(),
+                block_id: "b1".into(),
+                text: "final".into(),
+            },
+        )
+        .await; // overwrite: op-log order matters
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
 

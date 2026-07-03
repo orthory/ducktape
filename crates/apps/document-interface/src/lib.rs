@@ -34,17 +34,33 @@ pub enum DocMsg {
     /// auto-create the doc).
     CreateDoc { doc_id: String },
     /// insert `block` into `doc_id` after the given anchor (see the `after` rule).
-    InsertBlock { doc_id: String, after: Option<String>, block: Block },
+    InsertBlock {
+        doc_id: String,
+        after: Option<String>,
+        block: Block,
+    },
     /// replace the text of an existing block.
-    UpdateBlock { doc_id: String, block_id: String, text: String },
+    UpdateBlock {
+        doc_id: String,
+        block_id: String,
+        text: String,
+    },
     /// remove a block from the document.
     RemoveBlock { doc_id: String, block_id: String },
     /// move an existing block to a new position (see the `after` rule).
-    MoveBlock { doc_id: String, block_id: String, after: Option<String> },
+    MoveBlock {
+        doc_id: String,
+        block_id: String,
+        after: Option<String>,
+    },
 }
 
-pub fn encode_msg(m: &DocMsg) -> Vec<u8> { serde_json::to_vec(m).expect("serializable") }
-pub fn decode_msg(b: &[u8]) -> Result<DocMsg, String> { serde_json::from_slice(b).map_err(|e| e.to_string()) }
+pub fn encode_msg(m: &DocMsg) -> Vec<u8> {
+    serde_json::to_vec(m).expect("serializable")
+}
+pub fn decode_msg(b: &[u8]) -> Result<DocMsg, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
 
 /// read requests the document module serves via `Module::query`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -62,7 +78,15 @@ pub enum DocReply {
     Block(Option<Block>),
 }
 
-pub fn encode_query(q: &DocQuery) -> Vec<u8> { serde_json::to_vec(q).expect("serializable") }
-pub fn decode_query(b: &[u8]) -> Result<DocQuery, String> { serde_json::from_slice(b).map_err(|e| e.to_string()) }
-pub fn encode_reply(r: &DocReply) -> Vec<u8> { serde_json::to_vec(r).expect("serializable") }
-pub fn decode_reply(b: &[u8]) -> Result<DocReply, String> { serde_json::from_slice(b).map_err(|e| e.to_string()) }
+pub fn encode_query(q: &DocQuery) -> Vec<u8> {
+    serde_json::to_vec(q).expect("serializable")
+}
+pub fn decode_query(b: &[u8]) -> Result<DocQuery, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+pub fn encode_reply(r: &DocReply) -> Vec<u8> {
+    serde_json::to_vec(r).expect("serializable")
+}
+pub fn decode_reply(b: &[u8]) -> Result<DocReply, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}

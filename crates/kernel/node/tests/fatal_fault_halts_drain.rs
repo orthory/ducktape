@@ -9,7 +9,7 @@
 
 use futures::executor::block_on;
 use host::Host;
-use node::{encode_frame, Orderer, OrderedNode, RoundOrderer};
+use node::{OrderedNode, Orderer, RoundOrderer, encode_frame};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 
 /// counts executes; `commit_block` fails once armed.
@@ -51,7 +51,10 @@ fn a_commit_fault_halts_the_drain_with_fatal() {
         .expect("genesis");
         let mut node = OrderedNode::new(host, RoundOrderer::new());
 
-        let op = Msg { target: "bomb".into(), payload: Vec::new() };
+        let op = Msg {
+            target: "bomb".into(),
+            payload: Vec::new(),
+        };
         // op 1 commits cleanly; op 2 arms the commit fault; op 3 must never
         // apply — the drain halts AT the fault instead of continuing past it.
         node.submit(&sk(1), 0, op.clone()).await.expect("submit 1");
@@ -73,7 +76,11 @@ fn a_commit_fault_halts_the_drain_with_fatal() {
         // the drain halted at the fault: the app-hash still reflects exactly
         // the last CLEAN block (op 2's commit failed, op 3 never applied —
         // executes stayed at 2, not 3).
-        assert_eq!(node.app_hash(), after_first, "no further block published a root");
+        assert_eq!(
+            node.app_hash(),
+            after_first,
+            "no further block published a root"
+        );
     });
 }
 
@@ -101,11 +108,25 @@ fn a_deterministic_rejection_does_not_halt_the_drain() {
         let host = Host::genesis(vec![Box::new(RejectAll)]).expect("genesis");
         let mut orderer = RoundOrderer::new();
         orderer
-            .submit(encode_frame(&sk(1), 0, &Msg { target: "reject".into(), payload: Vec::new() }))
+            .submit(encode_frame(
+                &sk(1),
+                0,
+                &Msg {
+                    target: "reject".into(),
+                    payload: Vec::new(),
+                },
+            ))
             .await
             .expect("frame 1");
         orderer
-            .submit(encode_frame(&sk(1), 1, &Msg { target: "reject".into(), payload: Vec::new() }))
+            .submit(encode_frame(
+                &sk(1),
+                1,
+                &Msg {
+                    target: "reject".into(),
+                    payload: Vec::new(),
+                },
+            ))
             .await
             .expect("frame 2");
         let mut node = OrderedNode::new(host, orderer);

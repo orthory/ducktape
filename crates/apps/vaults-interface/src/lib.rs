@@ -19,12 +19,27 @@ use serde::{Deserialize, Serialize};
 pub enum VaultMsg {
     /// create a vault; the (verified) submitter becomes its first owner and
     /// first reader.
-    CreateVault { vault_id: String, name: String },
+    CreateVault {
+        vault_id: String,
+        name: String,
+    },
     /// owner-gated membership bookkeeping.
-    AddOwner { vault_id: String, key: Vec<u8> },
-    RemoveOwner { vault_id: String, key: Vec<u8> },
-    AddReader { vault_id: String, key: Vec<u8> },
-    RemoveReader { vault_id: String, key: Vec<u8> },
+    AddOwner {
+        vault_id: String,
+        key: Vec<u8>,
+    },
+    RemoveOwner {
+        vault_id: String,
+        key: Vec<u8>,
+    },
+    AddReader {
+        vault_id: String,
+        key: Vec<u8>,
+    },
+    RemoveReader {
+        vault_id: String,
+        key: Vec<u8>,
+    },
     /// write (or rotate) a secret's ciphertext. owner-gated. `version` on the
     /// stored entry increments on every put.
     PutSecret {
@@ -33,7 +48,10 @@ pub enum VaultMsg {
         ciphertext: Vec<u8>,
     },
     /// remove a secret. owner-gated.
-    DeleteSecret { vault_id: String, name: String },
+    DeleteSecret {
+        vault_id: String,
+        name: String,
+    },
 }
 
 /// one secret's stored envelope (ciphertext + audit metadata).

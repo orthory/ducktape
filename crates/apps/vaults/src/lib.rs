@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use vaults_interface::{
-    decode_msg, decode_query, encode_reply, SecretEntry, VaultMsg, VaultQuery, VaultReply,
-    VaultView,
+    SecretEntry, VaultMsg, VaultQuery, VaultReply, VaultView, decode_msg, decode_query,
+    encode_reply,
 };
 
 /// per-secret ciphertext ceiling: a vault holds credentials, not blobs. keeps
@@ -198,20 +198,16 @@ impl Module for Vaults {
             VaultMsg::RemoveOwner { vault_id, key } => {
                 self.stage_membership(&vault_id, &who, |v| {
                     if v.owners.len() == 1 && v.owners.contains(&key) {
-                        return Err(Error::Module(
-                            "a vault must keep at least one owner".into(),
-                        ));
+                        return Err(Error::Module("a vault must keep at least one owner".into()));
                     }
                     v.owners.remove(&key);
                     Ok(())
                 })
             }
-            VaultMsg::AddReader { vault_id, key } => {
-                self.stage_membership(&vault_id, &who, |v| {
-                    v.readers.insert(key.clone());
-                    Ok(())
-                })
-            }
+            VaultMsg::AddReader { vault_id, key } => self.stage_membership(&vault_id, &who, |v| {
+                v.readers.insert(key.clone());
+                Ok(())
+            }),
             VaultMsg::RemoveReader { vault_id, key } => {
                 self.stage_membership(&vault_id, &who, |v| {
                     if v.owners.contains(&key) {
@@ -283,7 +279,8 @@ impl Module for Vaults {
                 self.get(&vault_id).map(|v| Self::view_of(&vault_id, v)),
             ))),
             VaultQuery::Secret { vault_id, name } => Ok(encode_reply(&VaultReply::Secret(
-                self.get(&vault_id).and_then(|v| v.secrets.get(&name).cloned()),
+                self.get(&vault_id)
+                    .and_then(|v| v.secrets.get(&name).cloned()),
             ))),
         }
     }

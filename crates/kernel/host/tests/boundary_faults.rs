@@ -25,7 +25,13 @@ struct BoundaryBomb {
 
 impl BoundaryBomb {
     fn new(id: &'static str, fail_commit: bool, fail_abort: bool) -> Self {
-        Self { id, fail_commit, fail_abort, staged: false, committed: 0 }
+        Self {
+            id,
+            fail_commit,
+            fail_abort,
+            staged: false,
+            committed: 0,
+        }
     }
 }
 
@@ -89,9 +95,15 @@ impl Module for Fanout {
         StateRoot::ZERO
     }
     async fn execute(&mut self, ctx: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> {
-        ctx.emit_msg(Msg { target: self.target.into(), payload: Vec::new() });
+        ctx.emit_msg(Msg {
+            target: self.target.into(),
+            payload: Vec::new(),
+        });
         if self.also_boom {
-            ctx.emit_msg(Msg { target: "boom".into(), payload: Vec::new() });
+            ctx.emit_msg(Msg {
+                target: "boom".into(),
+                payload: Vec::new(),
+            });
         }
         Ok(())
     }
@@ -102,12 +114,18 @@ fn commit_failure_is_fatal_not_rejected() {
     block_on(async {
         let mut host = Host::genesis(vec![
             Box::new(BoundaryBomb::new("bomb", true, false)),
-            Box::new(Fanout { target: "bomb", also_boom: false }),
+            Box::new(Fanout {
+                target: "bomb",
+                also_boom: false,
+            }),
         ])
         .expect("genesis");
 
         let err = host
-            .submit(Msg { target: "fanout".into(), payload: Vec::new() })
+            .submit(Msg {
+                target: "fanout".into(),
+                payload: Vec::new(),
+            })
             .await
             .expect_err("a failing commit_block must fail the submit");
 
@@ -132,12 +150,18 @@ fn abort_failure_is_fatal_not_rejected() {
         let mut host = Host::genesis(vec![
             Box::new(BoundaryBomb::new("bomb", false, true)),
             Box::new(Boom),
-            Box::new(Fanout { target: "bomb", also_boom: true }),
+            Box::new(Fanout {
+                target: "bomb",
+                also_boom: true,
+            }),
         ])
         .expect("genesis");
 
         let err = host
-            .submit(Msg { target: "fanout".into(), payload: Vec::new() })
+            .submit(Msg {
+                target: "fanout".into(),
+                payload: Vec::new(),
+            })
             .await
             .expect_err("the boom follow-up must fail the block");
 
@@ -162,13 +186,19 @@ fn clean_rejection_stays_rejected() {
         let mut host = Host::genesis(vec![
             Box::new(BoundaryBomb::new("bomb", false, false)),
             Box::new(Boom),
-            Box::new(Fanout { target: "bomb", also_boom: true }),
+            Box::new(Fanout {
+                target: "bomb",
+                also_boom: true,
+            }),
         ])
         .expect("genesis");
 
         let app0 = host.app_hash();
         let err = host
-            .submit(Msg { target: "fanout".into(), payload: Vec::new() })
+            .submit(Msg {
+                target: "fanout".into(),
+                payload: Vec::new(),
+            })
             .await
             .expect_err("the boom follow-up must fail the block");
 
@@ -193,9 +223,18 @@ fn abort_fault_still_aborts_the_remaining_modules() {
                 StateRoot::ZERO
             }
             async fn execute(&mut self, ctx: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> {
-                ctx.emit_msg(Msg { target: "a-bomb".into(), payload: Vec::new() });
-                ctx.emit_msg(Msg { target: "b-clean".into(), payload: Vec::new() });
-                ctx.emit_msg(Msg { target: "boom".into(), payload: Vec::new() });
+                ctx.emit_msg(Msg {
+                    target: "a-bomb".into(),
+                    payload: Vec::new(),
+                });
+                ctx.emit_msg(Msg {
+                    target: "b-clean".into(),
+                    payload: Vec::new(),
+                });
+                ctx.emit_msg(Msg {
+                    target: "boom".into(),
+                    payload: Vec::new(),
+                });
                 Ok(())
             }
         }
@@ -209,7 +248,10 @@ fn abort_fault_still_aborts_the_remaining_modules() {
         .expect("genesis");
 
         let err = host
-            .submit(Msg { target: "probe".into(), payload: Vec::new() })
+            .submit(Msg {
+                target: "probe".into(),
+                payload: Vec::new(),
+            })
             .await
             .expect_err("boom fails the block");
         match err {
@@ -224,7 +266,10 @@ fn abort_fault_still_aborts_the_remaining_modules() {
         // that block's stage — the earlier (aborted) stage did not leak into it.
         // (state is fatal anyway; this pins the best-effort abort sweep.)
         let out = host
-            .submit(Msg { target: "b-clean".into(), payload: Vec::new() })
+            .submit(Msg {
+                target: "b-clean".into(),
+                payload: Vec::new(),
+            })
             .await
             .expect("direct clean block");
         assert_ne!(out.app_hash, StateRoot::ZERO);

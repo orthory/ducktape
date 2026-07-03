@@ -10,7 +10,7 @@
 //! sync that ships the ACTUAL proven op range lands on the same root, which is
 //! precisely what makes this test discriminating rather than a tautology.
 
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use kv::Kv;
 use sdk::{Module, StateRoot};
 

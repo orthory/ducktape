@@ -16,12 +16,12 @@
 //! any node drains, every app-hash is still genesis — a locally-originated msg is
 //! NOT applied optimistically on the ordered lane.
 
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
-use directory_interface::{encode_msg, DirMsg};
+use directory_interface::{DirMsg, encode_msg};
 use host::Host;
 use kv::Kv;
-use kv_interface::{encode, KvMsg};
+use kv_interface::{KvMsg, encode};
 use node::{ArrivalOrderer, OrderedNode, Orderer, RoundOrderer};
 use sdk::Msg;
 
@@ -35,11 +35,23 @@ async fn genesis_host(ctx: deterministic::Context) -> Host {
 }
 
 fn kv_set(k: &[u8], v: &[u8]) -> Msg {
-    Msg { target: "kv".into(), payload: encode(&KvMsg::Set { key: k.to_vec(), value: v.to_vec() }) }
+    Msg {
+        target: "kv".into(),
+        payload: encode(&KvMsg::Set {
+            key: k.to_vec(),
+            value: v.to_vec(),
+        }),
+    }
 }
 
 fn dir_set(k: &str, v: &str) -> Msg {
-    Msg { target: "directory".into(), payload: encode_msg(&DirMsg::Set { key: k.into(), value: v.into() }) }
+    Msg {
+        target: "directory".into(),
+        payload: encode_msg(&DirMsg::Set {
+            key: k.into(),
+            value: v.into(),
+        }),
+    }
 }
 
 /// the canonical op-set: distinct origins (so every frame is distinct and the
@@ -61,7 +73,6 @@ fn sk(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
     commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
 }
 
-
 /// permute a vec by a rotation offset — a cheap way to give each validator a
 /// genuinely different arrival order of the identical set.
 fn rotated<T: Clone>(v: &[T], by: usize) -> Vec<T> {
@@ -76,7 +87,9 @@ async fn feed_and_drain<O: Orderer>(
     arrival: &[(commonware_cryptography::ed25519::PrivateKey, u64, Msg)],
 ) -> usize {
     for (origin, seq, msg) in arrival {
-        node.submit(origin, *seq, msg.clone()).await.expect("submit");
+        node.submit(origin, *seq, msg.clone())
+            .await
+            .expect("submit");
     }
     let mut total = 0;
     loop {
@@ -105,7 +118,11 @@ fn n_validators_converge_under_agreed_order_including_qmdb_root() {
         // identical genesis module set -> identical genesis app-hash.
         let genesis = nodes[0].app_hash();
         for n in &nodes {
-            assert_eq!(n.app_hash(), genesis, "identical genesis -> identical app-hash");
+            assert_eq!(
+                n.app_hash(),
+                genesis,
+                "identical genesis -> identical app-hash"
+            );
         }
         let genesis_kv = nodes[0].host().module_root("kv").unwrap();
 
@@ -114,14 +131,20 @@ fn n_validators_converge_under_agreed_order_including_qmdb_root() {
         for (i, node) in nodes.iter_mut().enumerate() {
             let arrival = rotated(&ops, i);
             for (origin, seq, msg) in &arrival {
-                node.submit(origin, *seq, msg.clone()).await.expect("submit");
+                node.submit(origin, *seq, msg.clone())
+                    .await
+                    .expect("submit");
             }
         }
 
         // SEMANTIC SHIFT: after submit, before any drain, EVERY node is still at
         // genesis. the originator is NOT ahead — nothing was applied optimistically.
         for n in &nodes {
-            assert_eq!(n.app_hash(), genesis, "no optimistic echo: submit does not advance app-hash");
+            assert_eq!(
+                n.app_hash(),
+                genesis,
+                "no optimistic echo: submit does not advance app-hash"
+            );
         }
 
         // drain every node to a fixpoint: all read the agreed order -> all apply
@@ -138,10 +161,17 @@ fn n_validators_converge_under_agreed_order_including_qmdb_root() {
         // genesis, INCLUDING the order-dependent qmdb root.
         let converged = nodes[0].app_hash();
         let converged_kv = nodes[0].host().module_root("kv").unwrap();
-        assert_ne!(converged, genesis, "the applied ops moved the app-hash off genesis");
+        assert_ne!(
+            converged, genesis,
+            "the applied ops moved the app-hash off genesis"
+        );
         assert_ne!(converged_kv, genesis_kv, "the qmdb root moved off genesis");
         for n in &nodes {
-            assert_eq!(n.app_hash(), converged, "all validators converge on identical app-hash");
+            assert_eq!(
+                n.app_hash(),
+                converged,
+                "all validators converge on identical app-hash"
+            );
             assert_eq!(
                 n.host().module_root("kv").unwrap(),
                 converged_kv,
@@ -159,8 +189,14 @@ fn arrival_order_forks_the_qmdb_root_but_not_the_directory_root() {
         let ops = op_set();
         let reversed: Vec<_> = ops.iter().rev().cloned().collect();
 
-        let mut a = OrderedNode::new(genesis_host(context.child("a")).await, ArrivalOrderer::new());
-        let mut b = OrderedNode::new(genesis_host(context.child("b")).await, ArrivalOrderer::new());
+        let mut a = OrderedNode::new(
+            genesis_host(context.child("a")).await,
+            ArrivalOrderer::new(),
+        );
+        let mut b = OrderedNode::new(
+            genesis_host(context.child("b")).await,
+            ArrivalOrderer::new(),
+        );
 
         // sanity: they start converged.
         assert_eq!(a.app_hash(), b.app_hash(), "identical genesis");
@@ -185,7 +221,11 @@ fn arrival_order_forks_the_qmdb_root_but_not_the_directory_root() {
         );
 
         // and the whole app-hash forks (it folds in the forked qmdb root).
-        assert_ne!(a.app_hash(), b.app_hash(), "the composed app-hash forks with the qmdb root");
+        assert_ne!(
+            a.app_hash(),
+            b.app_hash(),
+            "the composed app-hash forks with the qmdb root"
+        );
     });
 }
 
@@ -208,6 +248,10 @@ fn agreed_order_converges_where_arrival_order_forks_same_two_nodes() {
             b.host().module_root("kv").unwrap(),
             "the SAME opposite arrival orders CONVERGE the qmdb root once agreed-ordered"
         );
-        assert_eq!(a.app_hash(), b.app_hash(), "and the whole app-hash converges");
+        assert_eq!(
+            a.app_hash(),
+            b.app_hash(),
+            "and the whole app-hash converges"
+        );
     });
 }

@@ -48,8 +48,8 @@ use inbox_interface::{
     InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
-use memory::Memory;
 use jobs::Jobs;
+use memory::Memory;
 use saga::SagaModule;
 use saga_interface::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,

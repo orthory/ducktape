@@ -33,15 +33,14 @@ use std::sync::Arc;
 use commonware_codec::RangeCfg;
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::Sequential;
-use commonware_runtime::{buffer::paged::CacheRef, BufferPooler};
+use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_storage::{
-    journal, mmr,
+    Context, journal, mmr,
     qmdb::{
-        any::{unordered::variable::Db, VariableConfig},
-        sync::{self, engine::Config as SyncConfig, DbResolver, Target},
+        any::{VariableConfig, unordered::variable::Db},
+        sync::{self, DbResolver, Target, engine::Config as SyncConfig},
     },
     translator::TwoCap,
-    Context,
 };
 use commonware_utils::range::NonEmptyRange;
 
@@ -157,7 +156,11 @@ where
         let db = KvDb::<E>::init(context, cfg)
             .await
             .expect("qmdb init failed");
-        Self { id, db, pending: BTreeMap::new() }
+        Self {
+            id,
+            db,
+            pending: BTreeMap::new(),
+        }
     }
 
     /// upsert `key -> value`, re-merkleize, apply, and flush. after this returns
@@ -172,7 +175,10 @@ where
             .merkleize(&self.db, None::<Vec<u8>>)
             .await
             .expect("merkleize failed");
-        self.db.apply_batch(batch).await.expect("apply_batch failed");
+        self.db
+            .apply_batch(batch)
+            .await
+            .expect("apply_batch failed");
         self.db.commit().await.expect("commit failed");
     }
 
@@ -279,7 +285,11 @@ where
             max_retained_roots: 8,
         };
         let db = sync::sync(config).await.expect("qmdb sync failed");
-        Self { id, db, pending: BTreeMap::new() }
+        Self {
+            id,
+            db,
+            pending: BTreeMap::new(),
+        }
     }
 }
 
@@ -350,7 +360,10 @@ where
             .merkleize(&self.db, None::<Vec<u8>>)
             .await
             .expect("merkleize failed");
-        self.db.apply_batch(batch).await.expect("apply_batch failed");
+        self.db
+            .apply_batch(batch)
+            .await
+            .expect("apply_batch failed");
         self.db.commit().await.expect("commit failed");
         self.pending.clear();
         Ok(())
@@ -367,7 +380,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
     use state::global_root;
 
     // a fixed-root stand-in module, so we can prove the kv root composes into the
@@ -446,7 +459,9 @@ mod tests {
                     && g2.as_deref() == Some(b"v2".as_ref())
                     && kv.root() != StateRoot::ZERO
             });
-            if !ok { fails.push(seed); }
+            if !ok {
+                fails.push(seed);
+            }
         }
         assert!(fails.is_empty(), "lost write / None on seeds: {:?}", fails);
     }
@@ -560,7 +575,11 @@ mod tests {
             b.set(b"x".to_vec(), b"2".to_vec()).await;
             assert_eq!(a.get(b"x").await.as_deref(), Some(b"1".as_ref()));
             assert_eq!(b.get(b"x").await.as_deref(), Some(b"2".as_ref()));
-            assert_ne!(a.root(), b.root(), "isolated modules must have distinct roots");
+            assert_ne!(
+                a.root(),
+                b.root(),
+                "isolated modules must have distinct roots"
+            );
         });
     }
 }
