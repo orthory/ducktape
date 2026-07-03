@@ -1,6 +1,6 @@
 // The agents surface over the node's `agent` module — the collaboration-loop
-// orchestrator. It is render-only over useDucktape: roster, watches, recent
-// runs, and the local composers all submit through the store action facade.
+// orchestrator. It stays render-only over useDucktape: roster, watches, recent
+// runs, and composers all submit through the store action facade.
 //
 // No optimistic state: every write goes through the store's submit-then-refresh.
 
@@ -11,6 +11,7 @@ import type {
   AgentRecord,
   RunStatus,
   RunView,
+  SagaOrigin,
   TurnPolicy,
   WatchView,
 } from "../../../domain/agent-client";
@@ -22,14 +23,18 @@ import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
 // ── Static labels ───────────────────────────────────────
 
-/** Friendly labels for the action vocabulary (KNOWN_ACTIONS). */
 const ACTION_LABEL: Record<string, string> = {
   "chat.post": "Post to chat",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
 };
 
-/** The turn policies a watch composer can pick. `Assigned` needs an agent. */
+const ACTION_HINT: Record<string, string> = {
+  "chat.post": "Allow chat replies",
+  "tasks.create": "Allow creating tasks",
+  "tasks.update_status": "Allow task status updates",
+};
+
 const POLICY_KINDS = ["Mention", "All", "RoundRobin", "Assigned"] as const;
 type PolicyKind = (typeof POLICY_KINDS)[number];
 
@@ -40,39 +45,61 @@ const POLICY_LABEL: Record<PolicyKind, string> = {
   Assigned: "Assigned",
 };
 
+type Tone = { text: string; bg: string; border: string };
+
 const statusTone = {
   success: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
   warning: { text: "#a07b32", bg: "#fbf4e6", border: "#ecdcae" },
   danger: { text: "#a35248", bg: "#fbeeec", border: "#eccfc9" },
   neutral: { text: "#7a6f9e", bg: "#f1edf5", border: "#ddd2e6" },
+  blue: { text: "#5f7a9e", bg: "#edf2f7", border: "#cfdae7" },
   agent: { text: accentVar, bg: "#f9f1ea", border: "#e7d2c4" },
-} as const;
+} satisfies Record<string, Tone>;
 
-const fieldStyle: CSSProperties = {
+const inputStyle: CSSProperties = {
   width: "100%",
-  padding: "8px 10px",
+  boxSizing: "border-box",
+  padding: "9px 11px",
   borderRadius: radius.sm,
   border: `1px solid ${color.borderStrong}`,
   background: color.paper,
-  font: `400 12px ${font.sans}`,
+  font: `400 12.5px ${font.sans}`,
   color: color.ink,
-  outline: "none",
 };
 
-const ghostButton: CSSProperties = {
-  all: "unset",
-  cursor: "pointer",
-  padding: "7px 12px",
+const monoInputStyle: CSSProperties = {
+  ...inputStyle,
+  font: `400 12px ${font.mono}`,
+};
+
+const secondaryButton: CSSProperties = {
+  appearance: "none",
+  border: `1px solid ${color.borderStrong}`,
   borderRadius: radius.sm,
-  border: `1px solid ${color.border}`,
   background: color.paper,
   color: color.inkSoft,
-  font: `600 11.5px ${font.sans}`,
+  cursor: "pointer",
+  minHeight: 32,
+  padding: "0 12px",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 7,
+  font: `600 12px ${font.sans}`,
+  whiteSpace: "nowrap",
+  touchAction: "manipulation",
 };
+
+const primaryButton = (enabled: boolean): CSSProperties => ({
+  ...secondaryButton,
+  borderColor: enabled ? color.dark : color.chip,
+  background: enabled ? color.dark : color.chip,
+  color: enabled ? color.onDark : color.muted2,
+  cursor: enabled ? "pointer" : "default",
+});
 
 // ── Wire → display helpers ──────────────────────────────
 
-/** A wire-safe slug for an agent id — same rule as channelIdOf / docIdOf. */
 const slug = (raw: string): string =>
   raw
     .toLowerCase()
@@ -87,48 +114,66 @@ const initialsOf = (name: string): string => {
     .filter(Boolean);
   if (parts.length === 0) return "AI";
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+  return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
 };
 
-const hexPreview = (bytes: number[]): string => {
-  const hex = bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  return hex.length > 18 ? `${hex.slice(0, 10)}…${hex.slice(-6)}` : hex;
+const hexOf = (bytes: number[]): string =>
+  bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+
+const shortHex = (bytes: number[]): string => {
+  const hex = hexOf(bytes);
+  return hex.length > 18 ? `${hex.slice(0, 10)}…${hex.slice(-6)}` : hex || "—";
 };
 
-const policyText = (policy: TurnPolicy): string => {
+const shortText = (value: string): string =>
+  value.length > 32 ? `${value.slice(0, 18)}…${value.slice(-8)}` : value;
+
+const ownerText = (origin: SagaOrigin): string => {
+  if (origin === "System") return "system";
+  if ("Module" in origin) return `module:${origin.Module}`;
+  return `external:${shortHex(origin.External)}`;
+};
+
+const channelLabel = (channels: Channel[], channelId: string): string =>
+  channels.find((channel) => channel.id === channelId)?.name ?? channelId;
+
+const agentLabel = (agents: AgentRecord[], agentId: string): string =>
+  agents.find((agent) => agent.agent_id === agentId)?.display_name ?? agentId;
+
+const policyText = (policy: TurnPolicy, agents: AgentRecord[]): string => {
   if (policy === "Mention") return "Mention";
-  if (policy === "All") return "All";
+  if (policy === "All") return "All agents";
   if (policy === "RoundRobin") return "Round-robin";
-  return `Assigned · ${policy.Assigned}`;
+  return `Assigned · ${agentLabel(agents, policy.Assigned)}`;
 };
 
-const runTone = (status: RunStatus): (typeof statusTone)[keyof typeof statusTone] => {
+const isAwaiting = (
+  status: RunStatus,
+): status is { AwaitingOracle: { saga_id: string } } =>
+  typeof status === "object" && "AwaitingOracle" in status;
+
+const runTone = (status: RunStatus): Tone => {
   if (status === "Done") return statusTone.success;
   if (status === "Cancelled") return statusTone.neutral;
-  if ("AwaitingOracle" in status) return statusTone.warning;
+  if (isAwaiting(status)) return statusTone.warning;
   return statusTone.danger;
 };
 
 const runLabel = (status: RunStatus): string => {
   if (status === "Done") return "DONE";
   if (status === "Cancelled") return "CANCELLED";
-  if ("AwaitingOracle" in status) return "AWAITING ORACLE";
+  if (isAwaiting(status)) return "AWAITING ORACLE";
   return "FAILED";
 };
 
 const runDetail = (status: RunStatus): string => {
-  if (typeof status === "object" && "Failed" in status) return status.Failed.reason;
-  if (typeof status === "object" && "AwaitingOracle" in status) {
-    return `saga ${status.AwaitingOracle.saga_id}`;
-  }
-  return status.toLowerCase();
+  if (status === "Done") return "completed";
+  if (status === "Cancelled") return "cancelled";
+  if (isAwaiting(status)) return `saga ${status.AwaitingOracle.saga_id}`;
+  return status.Failed.reason;
 };
 
-/** Only an awaiting run can be cancelled — the sole non-terminal state. */
-const isAwaiting = (status: RunStatus): boolean =>
-  status !== "Done" && status !== "Cancelled" && "AwaitingOracle" in status;
-
-// ── Small local bits ────────────────────────────────────
+// ── Shared UI atoms ─────────────────────────────────────
 
 function SectionLabel({ children }: { children: ReactNode }) {
   return (
@@ -167,13 +212,7 @@ function GroupCard({
   );
 }
 
-function StatusPill({
-  label,
-  tone,
-}: {
-  label: string;
-  tone: (typeof statusTone)[keyof typeof statusTone];
-}) {
+function StatusPill({ label, tone }: { label: string; tone: Tone }) {
   return (
     <span
       style={{
@@ -197,11 +236,12 @@ function StatusPill({
 function AgentAvatar({ name, size = 34 }: { name: string; size?: number }) {
   return (
     <span
+      aria-hidden="true"
       style={{
         width: size,
         height: size,
         flexShrink: 0,
-        borderRadius: 8,
+        borderRadius: Math.max(7, Math.round(size * 0.22)),
         background: color.dark,
         color: color.onDark,
         display: "flex",
@@ -216,60 +256,119 @@ function AgentAvatar({ name, size = 34 }: { name: string; size?: number }) {
   );
 }
 
-function EmptyState({ icon, title, body }: { icon: "agent" | "hash"; title: string; body: string }) {
+function EmptyState({
+  icon,
+  title,
+  body,
+}: {
+  icon: "agent" | "hash";
+  title: string;
+  body: string;
+}) {
   return (
     <div
       style={{
-        padding: "26px 18px",
-        borderRadius: radius.lg,
-        border: `1px dashed ${color.borderStrong}`,
-        background: color.sidebar,
+        minHeight: 170,
+        padding: "30px 18px",
         display: "flex",
+        flexDirection: "column",
         alignItems: "center",
-        gap: 13,
+        justifyContent: "center",
+        textAlign: "center",
+        gap: 8,
+        color: color.muted2,
       }}
     >
-      <div
+      <span
         style={{
-          width: 38,
-          height: 38,
-          borderRadius: 9,
+          width: 36,
+          height: 36,
+          borderRadius: radius.md,
+          border: `1px solid ${color.border}`,
           background: color.sunken,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          color: color.muted2,
-          flexShrink: 0,
+          color: color.muted,
         }}
       >
-        <Icon name={icon} size={18} />
-      </div>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ font: `600 13px ${font.sans}`, color: color.ink }}>{title}</div>
-        <div style={{ marginTop: 2, font: `400 12px ${font.sans}`, color: color.muted2 }}>
-          {body}
-        </div>
+        <Icon name={icon} size={17} />
+      </span>
+      <div style={{ font: `600 14px ${font.sans}`, color: color.muted3 }}>{title}</div>
+      <div style={{ maxWidth: 300, font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+        {body}
       </div>
     </div>
   );
 }
 
-function Chip({ text, tint = color.muted3 }: { text: string; tint?: string }) {
+function FieldLabel({ htmlFor, children }: { htmlFor: string; children: ReactNode }) {
+  return (
+    <label
+      htmlFor={htmlFor}
+      style={{
+        display: "block",
+        marginBottom: 5,
+        font: `600 10px ${font.mono}`,
+        letterSpacing: ".05em",
+        color: color.muted2,
+      }}
+    >
+      {children}
+    </label>
+  );
+}
+
+function InfoRow({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        gap: 14,
+        border: `1px solid ${color.border}`,
+        borderRadius: radius.sm,
+        padding: "9px 11px",
+        font: `400 11px ${font.mono}`,
+        color: color.muted3,
+        minWidth: 0,
+      }}
+    >
+      <span style={{ color: color.muted2, whiteSpace: "nowrap" }}>{label}</span>
+      <span
+        title={typeof value === "string" ? value : undefined}
+        translate="no"
+        style={{
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          textAlign: "right",
+        }}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function Chip({ text, tone = statusTone.neutral }: { text: string; tone?: Tone }) {
   return (
     <span
       title={text}
+      translate="no"
       style={{
         minWidth: 0,
-        maxWidth: 220,
+        maxWidth: 230,
         overflow: "hidden",
         textOverflow: "ellipsis",
         whiteSpace: "nowrap",
         padding: "3px 7px",
         borderRadius: 5,
-        background: color.sunken,
-        border: `1px solid ${color.border}`,
+        background: tone.bg,
+        border: `1px solid ${tone.border}`,
         font: `500 10px ${font.mono}`,
-        color: tint,
+        color: tone.text,
       }}
     >
       {text}
@@ -277,35 +376,41 @@ function Chip({ text, tint = color.muted3 }: { text: string; tint?: string }) {
   );
 }
 
-// ── Agents roster ───────────────────────────────────────
+// ── Agents roster + detail ──────────────────────────────
 
-function AgentRow({
+function AgentListButton({
   agent,
-  last,
-  onPause,
-  onResume,
+  selected,
+  onSelect,
 }: {
   agent: AgentRecord;
-  last?: boolean;
-  onPause: (id: string) => void;
-  onResume: (id: string) => void;
+  selected: boolean;
+  onSelect: (agentId: string) => void;
 }) {
   const active = agent.status === "Active";
   return (
-    <div
+    <button
+      type="button"
+      aria-label={`Open details for ${agent.display_name}`}
+      onClick={() => onSelect(agent.agent_id)}
       style={{
+        appearance: "none",
+        border: 0,
+        borderBottom: `1px solid ${color.borderSoft}`,
+        width: "100%",
         display: "flex",
         alignItems: "center",
         gap: 12,
-        padding: "13px 15px",
-        borderBottom: last ? undefined : `1px solid ${color.borderSoft}`,
-        animation: "ik-fade .16s ease-out",
+        padding: "13px 14px",
+        background: selected ? color.paper : "transparent",
+        cursor: "pointer",
+        textAlign: "left",
+        boxShadow: selected ? `inset 3px 0 0 ${accentVar}` : undefined,
       }}
     >
       <AgentAvatar name={agent.display_name} />
-
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
           <span
             style={{
               minWidth: 0,
@@ -319,60 +424,268 @@ function AgentRow({
             {agent.display_name}
           </span>
           <StatusPill label="AGENT" tone={statusTone.agent} />
-        </div>
-        <div
+        </span>
+        <span
           style={{
             marginTop: 3,
             display: "flex",
             alignItems: "center",
             gap: 7,
             minWidth: 0,
-            flexWrap: "wrap",
           }}
         >
-          <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+          <span
+            translate="no"
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              font: `400 10.5px ${font.mono}`,
+              color: color.muted2,
+            }}
+          >
             {agent.agent_id}
           </span>
-          <span style={{ font: `400 10.5px ${font.mono}`, color: color.blue }}>
-            {agent.model_ref}
+          <span
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              background: active ? color.green : color.amber,
+              flexShrink: 0,
+            }}
+          />
+          <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted3 }}>
+            {active ? "Active" : "Paused"}
           </span>
-          <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
-            prompt {hexPreview(agent.prompt_hash)}
-          </span>
-        </div>
-      </div>
-
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "flex-end",
-          gap: 9,
-          flexShrink: 0,
-        }}
-      >
-        <StatusPill
-          label={active ? "ACTIVE" : "PAUSED"}
-          tone={active ? statusTone.success : statusTone.warning}
-        />
-        <button
-          type="button"
-          onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
-          style={{
-            ...ghostButton,
-            color: active ? color.amber : color.green,
-            minWidth: 58,
-            textAlign: "center",
-          }}
-        >
-          {active ? "Pause" : "Resume"}
-        </button>
-      </div>
-    </div>
+        </span>
+      </span>
+    </button>
   );
 }
 
-function NewAgentForm({
+function AgentDetail({
+  agent,
+  channels,
+  onPause,
+  onResume,
+  onRequestRun,
+}: {
+  agent: AgentRecord | null;
+  channels: Channel[];
+  onPause: (agentId: string) => void;
+  onResume: (agentId: string) => void;
+  onRequestRun: (params: { agentId: string; channelId: string; anchorSeq: number }) => void;
+}) {
+  if (!agent) {
+    return (
+      <section aria-label="Agent detail" style={{ minWidth: 0 }}>
+        <SectionLabel>AGENT DETAIL</SectionLabel>
+        <GroupCard style={{ marginTop: 9 }}>
+          <EmptyState
+            icon="agent"
+            title="No agent selected"
+            body="Register an agent or select one from the roster to inspect its backing data."
+          />
+        </GroupCard>
+      </section>
+    );
+  }
+
+  const active = agent.status === "Active";
+  return (
+    <section aria-label="Agent detail" style={{ minWidth: 0 }}>
+      <SectionLabel>AGENT DETAIL</SectionLabel>
+      <GroupCard style={{ marginTop: 9 }}>
+        <div style={{ padding: 16 }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+            <AgentAvatar name={agent.display_name} size={52} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
+                <h2
+                  style={{
+                    margin: 0,
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    font: `600 16px ${font.sans}`,
+                    color: color.dark,
+                  }}
+                >
+                  {agent.display_name}
+                </h2>
+                <StatusPill label="AGENT" tone={statusTone.agent} />
+                <StatusPill
+                  label={active ? "ACTIVE" : "PAUSED"}
+                  tone={active ? statusTone.success : statusTone.warning}
+                />
+              </div>
+              <div
+                translate="no"
+                style={{
+                  marginTop: 4,
+                  font: `400 11px ${font.mono}`,
+                  color: color.muted2,
+                  overflowWrap: "anywhere",
+                }}
+              >
+                {agent.agent_id}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
+              style={{
+                ...secondaryButton,
+                color: active ? color.amber : color.green,
+                flexShrink: 0,
+              }}
+            >
+              {active ? "Pause agent" : "Resume agent"}
+            </button>
+          </div>
+
+          <div
+            style={{
+              marginTop: 15,
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
+              gap: 8,
+            }}
+          >
+            <InfoRow label="model" value={agent.model_ref} />
+            <InfoRow label="owner" value={ownerText(agent.owner)} />
+            <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
+            <InfoRow label="updated" value={String(agent.updated_at)} />
+          </div>
+
+          <div style={{ marginTop: 15 }}>
+            <SectionLabel>CAPABILITIES</SectionLabel>
+            <div style={{ marginTop: 8, display: "flex", gap: 7, flexWrap: "wrap" }}>
+              {agent.allowed_actions.length === 0 ? (
+                <span style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+                  No write actions granted.
+                </span>
+              ) : (
+                agent.allowed_actions.map((action) => (
+                  <Chip
+                    key={action}
+                    text={ACTION_LABEL[action] ?? action}
+                    tone={statusTone.agent}
+                  />
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+        <RunRequestForm agent={agent} channels={channels} onRequestRun={onRequestRun} />
+      </GroupCard>
+    </section>
+  );
+}
+
+function RunRequestForm({
+  agent,
+  channels,
+  onRequestRun,
+}: {
+  agent: AgentRecord;
+  channels: Channel[];
+  onRequestRun: (params: { agentId: string; channelId: string; anchorSeq: number }) => void;
+}) {
+  const defaultChannelId = channels[0]?.id ?? "";
+  const [channelId, setChannelId] = useState(defaultChannelId);
+  const [anchorInput, setAnchorInput] = useState("");
+  const selectedChannel = channels.find((channel) => channel.id === channelId) ?? null;
+  const defaultAnchor = selectedChannel?.head_seq ?? 0;
+  const anchorSeq = anchorInput.trim() === "" ? defaultAnchor : Number(anchorInput);
+  const hasMessages = defaultAnchor > 0;
+  const ready = channelId !== "" && hasMessages && Number.isFinite(anchorSeq) && anchorSeq > 0;
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (!ready) return;
+    onRequestRun({ agentId: agent.agent_id, channelId, anchorSeq });
+  };
+
+  return (
+    <form
+      onSubmit={submit}
+      style={{
+        borderTop: `1px solid ${color.borderSoft}`,
+        background: color.sidebar,
+        padding: 14,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <SectionLabel>REQUEST RUN</SectionLabel>
+        {!hasMessages && (
+          <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>
+            no channel messages yet
+          </span>
+        )}
+      </div>
+      <div
+        style={{
+          marginTop: 9,
+          display: "grid",
+          gridTemplateColumns: "minmax(0, 1.3fr) minmax(110px, .7fr) auto",
+          gap: 8,
+          alignItems: "end",
+        }}
+      >
+        <div style={{ minWidth: 0 }}>
+          <FieldLabel htmlFor="agent-run-channel">Run channel</FieldLabel>
+          <select
+            id="agent-run-channel"
+            name="agent-run-channel"
+            value={channelId}
+            onChange={(event) => {
+              setChannelId(event.target.value);
+              setAnchorInput("");
+            }}
+            disabled={channels.length === 0}
+            style={{ ...inputStyle, cursor: channels.length > 0 ? "pointer" : "default" }}
+          >
+            {channels.length === 0 ? (
+              <option value="">No channels</option>
+            ) : (
+              channels.map((channel) => (
+                <option key={channel.id} value={channel.id}>
+                  {channel.name}
+                </option>
+              ))
+            )}
+          </select>
+        </div>
+        <div style={{ minWidth: 0 }}>
+          <FieldLabel htmlFor="agent-run-anchor">Anchor sequence</FieldLabel>
+          <input
+            id="agent-run-anchor"
+            name="agent-run-anchor"
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={selectedChannel?.head_seq || undefined}
+            value={anchorInput || (defaultAnchor > 0 ? String(defaultAnchor) : "")}
+            onChange={(event) => setAnchorInput(event.target.value)}
+            disabled={!hasMessages}
+            style={monoInputStyle}
+          />
+        </div>
+        <button type="submit" disabled={!ready} style={primaryButton(ready)}>
+          Request run
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// ── Register flow ───────────────────────────────────────
+
+function RegisterAgentForm({
   onRegister,
 }: {
   onRegister: (params: {
@@ -384,158 +697,252 @@ function NewAgentForm({
   }) => void;
 }) {
   const [displayName, setDisplayName] = useState("");
-  const [agentId, setAgentId] = useState("");
-  const [modelRef, setModelRef] = useState("gpt-5.3-codex-spark");
+  const [agentIdInput, setAgentIdInput] = useState("");
+  const [modelRef, setModelRef] = useState("gpt-5.5-codex");
   const [prompt, setPrompt] = useState("");
-  const [actions, setActions] = useState<string[]>(["chat.post"]);
+  const [allowedActions, setAllowedActions] = useState<string[]>(["chat.post"]);
 
-  const id = slug(agentId);
-  const ready = displayName.trim() !== "" && id !== "" && modelRef.trim() !== "";
+  const agentId = slug(agentIdInput || displayName);
+  const ready =
+    displayName.trim() !== "" &&
+    agentId !== "" &&
+    modelRef.trim() !== "" &&
+    prompt.trim() !== "" &&
+    allowedActions.length > 0;
 
   const toggle = (name: string) =>
-    setActions((prev) =>
-      prev.includes(name) ? prev.filter((a) => a !== name) : [...prev, name],
+    setAllowedActions((prev) =>
+      prev.includes(name) ? prev.filter((action) => action !== name) : [...prev, name],
     );
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!ready) return;
-    onRegister({ displayName, agentId: id, modelRef, prompt, allowedActions: actions });
+    onRegister({
+      displayName: displayName.trim(),
+      agentId,
+      modelRef: modelRef.trim(),
+      prompt,
+      allowedActions,
+    });
     setDisplayName("");
-    setAgentId("");
-    setModelRef("gpt-5.3-codex-spark");
+    setAgentIdInput("");
+    setModelRef("gpt-5.5-codex");
     setPrompt("");
-    setActions(["chat.post"]);
+    setAllowedActions(["chat.post"]);
   };
 
   return (
-    <GroupCard>
-      <form
-        onSubmit={submit}
-        style={{ padding: 15, display: "flex", flexDirection: "column", gap: 11 }}
-      >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 12,
-          }}
-        >
-          <div>
-            <div style={{ font: `600 13px ${font.sans}`, color: color.ink }}>
-              Register agent
-            </div>
-            <div style={{ marginTop: 2, font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
-              Prompt text is uploaded, then registered by its hash.
-            </div>
-          </div>
-          <AgentAvatar name={displayName || "AI"} size={30} />
-        </div>
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 160px), 1fr))",
-            gap: 8,
-          }}
-        >
-          <input
-            value={displayName}
-            onChange={(event) => setDisplayName(event.target.value)}
-            placeholder="Display name"
-            style={fieldStyle}
-          />
-          <input
-            value={agentId}
-            onChange={(event) => setAgentId(event.target.value)}
-            placeholder="agent-id"
-            style={{ ...fieldStyle, font: `400 12px ${font.mono}` }}
-          />
-          <input
-            value={modelRef}
-            onChange={(event) => setModelRef(event.target.value)}
-            placeholder="model"
-            style={{ ...fieldStyle, font: `400 12px ${font.mono}` }}
-          />
-        </div>
-
-        <textarea
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-          rows={4}
-          placeholder="System prompt"
-          style={{
-            ...fieldStyle,
-            resize: "vertical",
-            minHeight: 78,
-            lineHeight: 1.45,
-          }}
-        />
-
-        <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
-          {KNOWN_ACTIONS.map((name) => {
-            const on = actions.includes(name);
-            return (
-              <button
-                key={name}
-                type="button"
-                onClick={() => toggle(name)}
+    <section aria-label="Register agent" style={{ minWidth: 0 }}>
+      <SectionLabel>REGISTER AGENT</SectionLabel>
+      <GroupCard style={{ marginTop: 9 }}>
+        <form onSubmit={submit} style={{ padding: 16 }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+            <AgentAvatar name={displayName || "AI"} size={40} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>
+                New collaboration worker
+              </div>
+              <div
                 style={{
-                  all: "unset",
-                  cursor: "pointer",
-                  padding: "5px 9px",
-                  borderRadius: radius.sm,
-                  border: `1px solid ${on ? statusTone.agent.border : color.border}`,
-                  background: on ? statusTone.agent.bg : color.paper,
-                  color: on ? accentVar : color.muted3,
-                  font: `600 10.5px ${font.sans}`,
+                  marginTop: 3,
+                  font: `400 11.5px ${font.sans}`,
+                  color: color.muted2,
+                  lineHeight: 1.45,
                 }}
               >
-                {ACTION_LABEL[name]}
-              </button>
-            );
-          })}
-          <button
-            type="submit"
-            disabled={!ready}
+                Prompt text is stored by the node, then the registry records its hash.
+              </div>
+            </div>
+            <StatusPill label="AGENT" tone={statusTone.agent} />
+          </div>
+
+          <div
             style={{
-              all: "unset",
-              cursor: ready ? "pointer" : "default",
-              marginLeft: "auto",
-              padding: "8px 15px",
-              borderRadius: radius.sm,
-              background: ready ? color.dark : color.chip,
-              color: color.onDark,
-              font: `600 12px ${font.sans}`,
+              marginTop: 14,
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))",
+              gap: 9,
             }}
           >
-            Register
-          </button>
-        </div>
-      </form>
-    </GroupCard>
+            <div>
+              <FieldLabel htmlFor="agent-display-name">Agent display name</FieldLabel>
+              <input
+                id="agent-display-name"
+                name="agent-display-name"
+                type="text"
+                autoComplete="off"
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                placeholder="Triage Agent…"
+                style={inputStyle}
+              />
+            </div>
+            <div>
+              <FieldLabel htmlFor="agent-id">Agent ID</FieldLabel>
+              <input
+                id="agent-id"
+                name="agent-id"
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={agentIdInput}
+                onChange={(event) => setAgentIdInput(event.target.value)}
+                placeholder={agentId || "triage-agent…"}
+                style={monoInputStyle}
+              />
+            </div>
+            <div>
+              <FieldLabel htmlFor="agent-model-ref">Model reference</FieldLabel>
+              <input
+                id="agent-model-ref"
+                name="agent-model-ref"
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={modelRef}
+                onChange={(event) => setModelRef(event.target.value)}
+                placeholder="model…"
+                style={monoInputStyle}
+              />
+            </div>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <FieldLabel htmlFor="agent-system-prompt">System prompt</FieldLabel>
+            <textarea
+              id="agent-system-prompt"
+              name="agent-system-prompt"
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              rows={5}
+              placeholder="Describe what this agent may do…"
+              style={{
+                ...inputStyle,
+                resize: "vertical",
+                minHeight: 96,
+                lineHeight: 1.45,
+              }}
+            />
+          </div>
+
+          <fieldset
+            style={{
+              margin: "12px 0 0",
+              padding: 0,
+              border: 0,
+              display: "flex",
+              flexDirection: "column",
+              gap: 7,
+            }}
+          >
+            <legend
+              style={{
+                marginBottom: 2,
+                padding: 0,
+                font: `600 10px ${font.mono}`,
+                letterSpacing: ".05em",
+                color: color.muted2,
+              }}
+            >
+              CAPABILITIES
+            </legend>
+            <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+              {KNOWN_ACTIONS.map((name) => {
+                const checked = allowedActions.includes(name);
+                return (
+                  <label
+                    key={name}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 7,
+                      border: `1px solid ${checked ? statusTone.agent.border : color.border}`,
+                      borderRadius: radius.sm,
+                      background: checked ? statusTone.agent.bg : color.paper,
+                      padding: "6px 9px",
+                      cursor: "pointer",
+                      font: `600 10.5px ${font.sans}`,
+                      color: checked ? accentVar : color.muted3,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      name="agent-capability"
+                      checked={checked}
+                      onChange={() => toggle(name)}
+                      style={{ margin: 0 }}
+                    />
+                    <span>{ACTION_HINT[name] ?? ACTION_LABEL[name] ?? name}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </fieldset>
+
+          <div
+            style={{
+              marginTop: 14,
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              minWidth: 0,
+            }}
+          >
+            <span
+              translate="no"
+              style={{
+                flex: 1,
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                font: `400 11px ${font.mono}`,
+                color: color.muted2,
+              }}
+            >
+              id {agentId || "—"}
+            </span>
+            <button type="submit" disabled={!ready} style={primaryButton(ready)}>
+              Register agent
+            </button>
+          </div>
+        </form>
+      </GroupCard>
+    </section>
   );
 }
 
 // ── Watches ─────────────────────────────────────────────
 
-function WatchRow({ watch, onUnwatch }: { watch: WatchView; onUnwatch: (id: string) => void }) {
+function WatchRow({
+  watch,
+  channels,
+  agents,
+  onUnwatch,
+}: {
+  watch: WatchView;
+  channels: Channel[];
+  agents: AgentRecord[];
+  onUnwatch: (id: string) => void;
+}) {
+  const label = channelLabel(channels, watch.channel_id);
   return (
     <div
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 10,
+        gap: 11,
         padding: "12px 14px",
         borderBottom: `1px solid ${color.borderSoft}`,
       }}
     >
-      <div
+      <span
         style={{
-          width: 30,
-          height: 30,
-          borderRadius: 8,
+          width: 31,
+          height: 31,
+          borderRadius: radius.sm,
+          border: `1px solid ${color.border}`,
           background: color.sunken,
           display: "flex",
           alignItems: "center",
@@ -545,10 +952,11 @@ function WatchRow({ watch, onUnwatch }: { watch: WatchView; onUnwatch: (id: stri
         }}
       >
         <Icon name="hash" size={15} />
-      </div>
+      </span>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div
           title={watch.channel_id}
+          translate="no"
           style={{
             overflow: "hidden",
             textOverflow: "ellipsis",
@@ -557,17 +965,17 @@ function WatchRow({ watch, onUnwatch }: { watch: WatchView; onUnwatch: (id: stri
             color: color.ink,
           }}
         >
-          {watch.channel_id}
+          {label}
         </div>
-        <div style={{ marginTop: 2, font: `400 11px ${font.sans}`, color: color.muted2 }}>
-          {policyText(watch.policy)}
+        <div style={{ marginTop: 2, font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+          {policyText(watch.policy, agents)}
         </div>
       </div>
       <button
         type="button"
         onClick={() => onUnwatch(watch.channel_id)}
-        title="Unwatch"
-        style={{ ...ghostButton, padding: "6px 10px", color: color.muted3 }}
+        aria-label={`Stop watching ${label}`}
+        style={{ ...secondaryButton, minHeight: 30, color: color.red }}
       >
         Unwatch
       </button>
@@ -588,17 +996,13 @@ function WatchForm({
   const [kind, setKind] = useState<PolicyKind>("Mention");
   const [assigned, setAssigned] = useState("");
 
-  const buildPolicy = (): TurnPolicy | null => {
-    if (kind === "Assigned") return assigned ? { Assigned: assigned } : null;
-    return kind;
-  };
-
-  const policy = buildPolicy();
+  const policy: TurnPolicy | null =
+    kind === "Assigned" ? (assigned ? { Assigned: assigned } : null) : kind;
   const ready = channelId !== "" && policy !== null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!channelId || !policy) return;
+    if (!ready || !policy) return;
     onWatch({ channelId, policy });
     setChannelId("");
     setKind("Mention");
@@ -612,173 +1016,282 @@ function WatchForm({
         padding: 14,
         borderTop: `1px solid ${color.borderSoft}`,
         background: color.sidebar,
-        display: "flex",
-        flexDirection: "column",
-        gap: 9,
       }}
     >
-      <div style={{ display: "flex", gap: 8 }}>
-        <select
-          value={channelId}
-          onChange={(event) => setChannelId(event.target.value)}
-          style={{ ...fieldStyle, cursor: "pointer" }}
-        >
-          <option value="">Channel…</option>
-          {channels.map((channel) => (
-            <option key={channel.id} value={channel.id}>
-              {channel.name}
-            </option>
-          ))}
-        </select>
-        {kind === "Assigned" && (
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns:
+            kind === "Assigned"
+              ? "minmax(0, 1fr) minmax(0, 1fr) minmax(120px, .8fr) auto"
+              : "minmax(0, 1.1fr) minmax(130px, .8fr) auto",
+          gap: 8,
+          alignItems: "end",
+        }}
+      >
+        <div style={{ minWidth: 0 }}>
+          <FieldLabel htmlFor="agent-watch-channel">Channel to watch</FieldLabel>
           <select
-            value={assigned}
-            onChange={(event) => setAssigned(event.target.value)}
-            style={{ ...fieldStyle, cursor: "pointer" }}
+            id="agent-watch-channel"
+            name="agent-watch-channel"
+            value={channelId}
+            onChange={(event) => setChannelId(event.target.value)}
+            disabled={channels.length === 0}
+            style={{ ...inputStyle, cursor: channels.length > 0 ? "pointer" : "default" }}
           >
-            <option value="">Agent…</option>
-            {agents.map((agent) => (
-              <option key={agent.agent_id} value={agent.agent_id}>
-                {agent.display_name}
+            <option value="">{channels.length === 0 ? "No channels" : "Choose channel…"}</option>
+            {channels.map((channel) => (
+              <option key={channel.id} value={channel.id}>
+                {channel.name}
               </option>
             ))}
           </select>
-        )}
-      </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-        {POLICY_KINDS.map((option) => {
-          const on = option === kind;
-          return (
-            <button
-              key={option}
-              type="button"
-              onClick={() => setKind(option)}
-              style={{
-                all: "unset",
-                cursor: "pointer",
-                padding: "5px 9px",
-                borderRadius: radius.sm,
-                border: `1px solid ${on ? statusTone.agent.border : color.border}`,
-                background: on ? statusTone.agent.bg : color.paper,
-                color: on ? accentVar : color.muted3,
-                font: `600 10.5px ${font.sans}`,
-              }}
+        </div>
+        <div style={{ minWidth: 0 }}>
+          <FieldLabel htmlFor="agent-watch-policy">Turn policy</FieldLabel>
+          <select
+            id="agent-watch-policy"
+            name="agent-watch-policy"
+            value={kind}
+            onChange={(event) => setKind(event.target.value as PolicyKind)}
+            style={{ ...inputStyle, cursor: "pointer" }}
+          >
+            {POLICY_KINDS.map((option) => (
+              <option key={option} value={option}>
+                {POLICY_LABEL[option]}
+              </option>
+            ))}
+          </select>
+        </div>
+        {kind === "Assigned" && (
+          <div style={{ minWidth: 0 }}>
+            <FieldLabel htmlFor="agent-watch-assigned">Assigned agent</FieldLabel>
+            <select
+              id="agent-watch-assigned"
+              name="agent-watch-assigned"
+              value={assigned}
+              onChange={(event) => setAssigned(event.target.value)}
+              disabled={agents.length === 0}
+              style={{ ...inputStyle, cursor: agents.length > 0 ? "pointer" : "default" }}
             >
-              {POLICY_LABEL[option]}
-            </button>
-          );
-        })}
-        <button
-          type="submit"
-          disabled={!ready}
-          style={{
-            all: "unset",
-            cursor: ready ? "pointer" : "default",
-            marginLeft: "auto",
-            padding: "7px 12px",
-            borderRadius: radius.sm,
-            background: ready ? color.dark : color.chip,
-            color: color.onDark,
-            font: `600 11.5px ${font.sans}`,
-          }}
-        >
-          Watch
+              <option value="">{agents.length === 0 ? "No agents" : "Choose agent…"}</option>
+              {agents.map((agent) => (
+                <option key={agent.agent_id} value={agent.agent_id}>
+                  {agent.display_name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+        <button type="submit" disabled={!ready} style={primaryButton(ready)}>
+          Watch channel
         </button>
       </div>
     </form>
   );
 }
 
+function WatchesPanel({
+  channels,
+  agents,
+  watches,
+  onWatch,
+  onUnwatch,
+}: {
+  channels: Channel[];
+  agents: AgentRecord[];
+  watches: WatchView[];
+  onWatch: (params: { channelId: string; policy: TurnPolicy }) => void;
+  onUnwatch: (id: string) => void;
+}) {
+  return (
+    <section aria-label="Watches" style={{ minWidth: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <SectionLabel>WATCHES</SectionLabel>
+        <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+          {watches.length}
+        </span>
+      </div>
+      <GroupCard style={{ marginTop: 9 }}>
+        {watches.length === 0 ? (
+          <EmptyState
+            icon="hash"
+            title="No watched channels"
+            body="Add a real channel watch to let registered agents engage posts by policy."
+          />
+        ) : (
+          watches.map((watch) => (
+            <WatchRow
+              key={watch.channel_id}
+              watch={watch}
+              channels={channels}
+              agents={agents}
+              onUnwatch={onUnwatch}
+            />
+          ))
+        )}
+        <WatchForm channels={channels} agents={agents} onWatch={onWatch} />
+      </GroupCard>
+    </section>
+  );
+}
+
 // ── Runs timeline ───────────────────────────────────────
 
-function RunRow({ run, onCancel }: { run: RunView; onCancel: (id: string) => void }) {
+function RunRow({
+  run,
+  agents,
+  channels,
+  onCancel,
+}: {
+  run: RunView;
+  agents: AgentRecord[];
+  channels: Channel[];
+  onCancel: (id: string) => void;
+}) {
   const tone = runTone(run.status);
+  const awaiting = isAwaiting(run.status);
+  const agentName = agentLabel(agents, run.agent_id);
+  const label = channelLabel(channels, run.channel_id);
   return (
     <div
       style={{
         position: "relative",
-        display: "flex",
-        alignItems: "flex-start",
-        gap: 12,
-        padding: "0 0 18px",
-        animation: "ik-fade .16s ease-out",
+        padding: "0 0 16px 38px",
       }}
     >
-      <div
+      <span
         style={{
-          width: 10,
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: 28,
+          height: 28,
+          borderRadius: 8,
+          background: color.dark,
+          color: color.onDark,
           display: "flex",
-          flexDirection: "column",
           alignItems: "center",
-          alignSelf: "stretch",
-          paddingTop: 14,
+          justifyContent: "center",
+          font: `600 9.5px ${font.mono}`,
+          boxShadow: "0 0 0 3px #fcfcfc",
         }}
       >
-        <span
+        {initialsOf(agentName)}
+      </span>
+      <GroupCard>
+        <div
           style={{
-            width: 8,
-            height: 8,
-            borderRadius: "50%",
-            background: tone.text,
-            boxShadow: `0 0 0 4px ${tone.bg}`,
-            flexShrink: 0,
+            background: color.sidebar,
+            borderBottom: `1px solid ${color.borderSoft}`,
+            padding: "8px 12px",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
           }}
-        />
-        <span style={{ width: 1, flex: 1, marginTop: 8, background: color.borderSoft }} />
-      </div>
-
-      <GroupCard style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ padding: "13px 14px", display: "flex", gap: 12 }}>
-          <AgentAvatar name={run.agent_id} size={30} />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
-              <span style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>
-                {run.agent_id}
-              </span>
-              <StatusPill label={runLabel(run.status)} tone={tone} />
-              {run.job_id && <StatusPill label="JOB" tone={statusTone.agent} />}
-            </div>
-            <div
-              style={{
-                marginTop: 5,
-                display: "flex",
-                alignItems: "center",
-                gap: 7,
-                flexWrap: "wrap",
-              }}
-            >
-              <Chip text={run.run_id} />
-              <Chip text={`${run.channel_id} @${run.anchor_seq}`} tint={color.blue} />
-              {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
-              {run.job_id && <Chip text={run.job_id} tint={color.blue} />}
-            </div>
-            <div
-              title={runDetail(run.status)}
-              style={{
-                marginTop: 6,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-                font: `400 11px ${font.mono}`,
-                color: color.muted2,
-              }}
-            >
-              {runDetail(run.status)}
-            </div>
-          </div>
-          {isAwaiting(run.status) && (
+        >
+          <span
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              font: `600 12px ${font.sans}`,
+              color: color.dark,
+            }}
+          >
+            {agentName}
+          </span>
+          <StatusPill label={runLabel(run.status)} tone={tone} />
+          <StatusPill label={run.job_id ? "JOB" : "CHAT"} tone={run.job_id ? statusTone.agent : statusTone.blue} />
+          {awaiting && (
             <button
               type="button"
               onClick={() => onCancel(run.run_id)}
-              title="Cancel run"
-              style={{ ...ghostButton, color: color.red, padding: "6px 10px" }}
+              aria-label={`Cancel run ${run.run_id}`}
+              style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28, color: color.red }}
             >
               Cancel
             </button>
           )}
         </div>
+        <div style={{ padding: "11px 12px" }}>
+          <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+            <Chip text={shortText(run.run_id)} />
+            <Chip text={`${label} @${run.anchor_seq}`} tone={statusTone.blue} />
+            {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
+            {run.job_id && <Chip text={shortText(run.job_id)} tone={statusTone.agent} />}
+          </div>
+          <div
+            title={runDetail(run.status)}
+            style={{
+              marginTop: 7,
+              font: `400 11px ${font.mono}`,
+              color: color.muted2,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {runDetail(run.status)} · updated {run.updated_at}
+          </div>
+        </div>
       </GroupCard>
     </div>
+  );
+}
+
+function RunsTimeline({
+  runs,
+  agents,
+  channels,
+  onCancel,
+}: {
+  runs: RunView[];
+  agents: AgentRecord[];
+  channels: Channel[];
+  onCancel: (id: string) => void;
+}) {
+  return (
+    <section aria-label="Runs timeline" style={{ minWidth: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <SectionLabel>RUNS TIMELINE</SectionLabel>
+        <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+          {runs.length}
+        </span>
+      </div>
+      {runs.length === 0 ? (
+        <GroupCard style={{ marginTop: 9 }}>
+          <EmptyState
+            icon="agent"
+            title="No runs yet"
+            body="Watched channels and explicit requests will appear here newest-first."
+          />
+        </GroupCard>
+      ) : (
+        <div style={{ position: "relative", marginTop: 12 }}>
+          <div
+            style={{
+              position: "absolute",
+              left: 13,
+              top: 10,
+              bottom: 20,
+              width: 2,
+              background: color.border,
+            }}
+          />
+          {runs.map((run) => (
+            <RunRow
+              key={run.run_id}
+              run={run}
+              agents={agents}
+              channels={channels}
+              onCancel={onCancel}
+            />
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -786,6 +1299,12 @@ function RunRow({ run, onCancel }: { run: RunView; onCancel: (id: string) => voi
 
 export function AgentView() {
   const { state, actions } = useDucktape();
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const selectedAgent =
+    state.agents.find((agent) => agent.agent_id === selectedAgentId) ??
+    state.agents[0] ??
+    null;
+  const activeCount = state.agents.filter((agent) => agent.status === "Active").length;
 
   return (
     <div
@@ -808,109 +1327,134 @@ export function AgentView() {
           gap: 10,
           padding: "0 22px",
           borderBottom: `1px solid ${color.borderSoft}`,
+          background: color.paper,
         }}
       >
-        <Icon name="agent" size={17} color={color.muted} />
-        <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Agents</div>
-        <div style={{ font: `400 13px ${font.mono}`, color: color.muted2 }}>
+        <span
+          style={{
+            width: 30,
+            height: 30,
+            borderRadius: radius.sm,
+            background: color.dark,
+            color: color.onDark,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="agent" size={16} color="currentColor" strokeWidth={1.7} />
+        </span>
+        <h1 style={{ margin: 0, font: `600 16px ${font.sans}`, color: color.dark }}>
+          Agents
+        </h1>
+        <span style={{ font: `400 13px ${font.mono}`, color: color.muted2 }}>
           {state.agents.length}
-        </div>
+        </span>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          <StatusPill label={`${activeCount} ACTIVE`} tone={statusTone.success} />
           <StatusPill label={`${state.watches.length} WATCHES`} tone={statusTone.neutral} />
           <StatusPill label={`${state.runs.length} RUNS`} tone={statusTone.warning} />
         </div>
       </div>
 
-      <div
-        style={{
-          flex: 1,
-          minHeight: 0,
-          overflowY: "auto",
-          padding: 22,
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 360px), 1fr))",
-          gap: 18,
-          alignItems: "start",
-        }}
-      >
-        <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 18 }}>
-          <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+      <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+        <aside
+          aria-label="Agent roster"
+          style={{
+            width: "clamp(260px, 31%, 318px)",
+            minWidth: 250,
+            flexShrink: 0,
+            borderRight: `1px solid ${color.borderSoft}`,
+            background: color.sidebar,
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          <div
+            style={{
+              padding: "14px 14px 9px",
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+            }}
+          >
             <SectionLabel>ROSTER</SectionLabel>
-            <GroupCard>
-              {state.agents.length === 0 ? (
-                <div style={{ padding: 14 }}>
-                  <EmptyState
-                    icon="agent"
-                    title="No agents registered"
-                    body="Register one below to give the node a collaboration-loop worker."
-                  />
-                </div>
-              ) : (
-                state.agents.map((agent, index) => (
-                  <AgentRow
-                    key={agent.agent_id}
-                    agent={agent}
-                    last={index === state.agents.length - 1}
-                    onPause={actions.pauseAgent}
-                    onResume={actions.resumeAgent}
-                  />
-                ))
-              )}
-            </GroupCard>
-          </section>
-
-          <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-            <SectionLabel>NEW AGENT</SectionLabel>
-            <NewAgentForm onRegister={actions.registerAgent} />
-          </section>
-        </div>
-
-        <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 18 }}>
-          <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-            <SectionLabel>WATCHES</SectionLabel>
-            <GroupCard>
-              {state.watches.length === 0 ? (
-                <div style={{ padding: 14 }}>
-                  <EmptyState
-                    icon="hash"
-                    title="No watched channels"
-                    body="Watch a channel to let agents engage new posts by policy."
-                  />
-                </div>
-              ) : (
-                state.watches.map((watch) => (
-                  <WatchRow
-                    key={watch.channel_id}
-                    watch={watch}
-                    onUnwatch={actions.unwatchChannel}
-                  />
-                ))
-              )}
-              <WatchForm
-                channels={state.channels}
-                agents={state.agents}
-                onWatch={actions.watchChannel}
-              />
-            </GroupCard>
-          </section>
-
-          <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-            <SectionLabel>RUNS</SectionLabel>
-            {state.runs.length === 0 ? (
+            <span style={{ marginLeft: "auto", font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+              {state.agents.length} total
+            </span>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+            {state.agents.length === 0 ? (
               <EmptyState
                 icon="agent"
-                title="No runs yet"
-                body="Engaged posts and watched channels will appear here newest-first."
+                title="No agents registered"
+                body="Register an agent before configuring runs or assigned watches."
               />
             ) : (
-              <div style={{ display: "flex", flexDirection: "column" }}>
-                {state.runs.map((run) => (
-                  <RunRow key={run.run_id} run={run} onCancel={actions.cancelRun} />
-                ))}
-              </div>
+              state.agents.map((agent) => (
+                <AgentListButton
+                  key={agent.agent_id}
+                  agent={agent}
+                  selected={selectedAgent?.agent_id === agent.agent_id}
+                  onSelect={setSelectedAgentId}
+                />
+              ))
             )}
-          </section>
-        </div>
+          </div>
+        </aside>
+
+        <main
+          style={{
+            flex: 1,
+            minWidth: 0,
+            minHeight: 0,
+            overflowY: "auto",
+            padding: 22,
+          }}
+        >
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 360px), 1fr))",
+              gap: 18,
+              alignItems: "start",
+            }}
+          >
+            <AgentDetail
+              agent={selectedAgent}
+              channels={state.channels}
+              onPause={actions.pauseAgent}
+              onResume={actions.resumeAgent}
+              onRequestRun={actions.requestRun}
+            />
+            <RegisterAgentForm onRegister={actions.registerAgent} />
+          </div>
+
+          <div
+            style={{
+              marginTop: 18,
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 360px), 1fr))",
+              gap: 18,
+              alignItems: "start",
+            }}
+          >
+            <WatchesPanel
+              channels={state.channels}
+              agents={state.agents}
+              watches={state.watches}
+              onWatch={actions.watchChannel}
+              onUnwatch={actions.unwatchChannel}
+            />
+            <RunsTimeline
+              runs={state.runs}
+              agents={state.agents}
+              channels={state.channels}
+              onCancel={actions.cancelRun}
+            />
+          </div>
+        </main>
       </div>
     </div>
   );

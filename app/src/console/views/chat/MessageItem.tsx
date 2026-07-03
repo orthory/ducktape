@@ -118,6 +118,8 @@ function renderSpan(span: Span, names: AuthorNames, key: number): ReactNode {
     fontStyle: span.marks.includes("Italic") ? "italic" : "normal",
     color: linkMark ? accentVar : undefined,
     textDecoration: linkMark ? "underline" : undefined,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
   };
   // No real Mark::Mention crosses the wire from `postMessage` yet (it only
   // ever sends unmarked Paragraph spans) — fall back to sniffing @/# tokens
@@ -145,7 +147,16 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
     }
     if ("Paragraph" in block) {
       return (
-        <div key={i} style={{ whiteSpace: "pre-wrap", overflowWrap: "break-word" }}>
+        <div
+          key={i}
+          style={{
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+            wordBreak: "break-word",
+            maxWidth: "100%",
+            minWidth: 0,
+          }}
+        >
           {block.Paragraph.map((span, j) => renderSpan(span, names, j))}
         </div>
       );
@@ -160,6 +171,9 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
             margin: "3px 0",
             color: color.muted3,
             fontStyle: "italic",
+            overflowWrap: "anywhere",
+            wordBreak: "break-word",
+            maxWidth: "100%",
           }}
         >
           {block.Quote.map((span, j) => renderSpan(span, names, j))}
@@ -177,6 +191,10 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
           font: `400 12px ${font.mono}`,
           color: color.inkSoft,
           overflowX: "auto",
+          maxWidth: "100%",
+          minWidth: 0,
+          boxSizing: "border-box",
+          whiteSpace: "pre",
         }}
       >
         {block.Code.text}
@@ -198,7 +216,7 @@ function ReactionsRow({
 }) {
   if (message.reactions.length === 0) return null;
   return (
-    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 5 }}>
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 6, minWidth: 0, maxWidth: "100%" }}>
       {message.reactions.map((reaction) => {
         const mine = hasReacted(message, reaction.emoji, selfKey);
         return (
@@ -252,6 +270,8 @@ function ThreadIndicator({
         borderRadius: 8,
         border: `1px solid ${color.borderSoft}`,
         background: color.paper,
+        maxWidth: "100%",
+        minWidth: 0,
       }}
       hoverStyle={{ background: color.hover }}
     >
@@ -262,7 +282,18 @@ function ThreadIndicator({
         {replyCount} {replyCount === 1 ? "reply" : "replies"}
       </span>
       {replyHint && (
-        <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>· {replyHint}</span>
+        <span
+          style={{
+            font: `400 11px ${font.sans}`,
+            color: color.muted2,
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          · {replyHint}
+        </span>
       )}
     </HoverButton>
   );
@@ -523,9 +554,13 @@ export function MessageItem({
         display: "flex",
         gap: 11,
         borderRadius: 9,
-        padding: `${groupStart ? 6 : 1}px 7px`,
-        margin: `${groupStart ? 3 : 0}px -7px 0`,
-        background: hovered || menuOpen ? color.hover : "transparent",
+        padding: `${groupStart ? 7 : 1}px 8px`,
+        margin: `${groupStart ? 3 : 0}px -8px 0`,
+        width: "calc(100% + 16px)",
+        maxWidth: "calc(100% + 16px)",
+        boxSizing: "border-box",
+        minWidth: 0,
+        background: hovered || menuOpen ? color.sunken : "transparent",
       }}
     >
       <div style={{ width: 30, flexShrink: 0, display: "flex", justifyContent: "center", paddingTop: 1 }}>
@@ -537,10 +572,22 @@ export function MessageItem({
           </span>
         ) : null}
       </div>
-      <div style={{ minWidth: 0, flex: 1 }}>
+      <div style={{ minWidth: 0, flex: 1, maxWidth: "100%" }}>
         {groupStart && (
-          <div style={{ display: "flex", alignItems: "baseline", gap: 7 }}>
-            <span style={{ font: `600 13px ${font.sans}`, color: color.ink }}>{author}</span>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 7, minWidth: 0, flexWrap: "wrap", rowGap: 2 }}>
+            <span
+              style={{
+                font: `600 13px ${font.sans}`,
+                color: color.ink,
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                maxWidth: "min(360px, 70%)",
+              }}
+            >
+              {author}
+            </span>
             {isAgentAuthor(message.head.author) && <AgentPill />}
             <span style={{ font: `400 11px ${font.mono}`, color: color.muted2 }}>
               {timeOf(message.head.created_at)}
@@ -551,10 +598,16 @@ export function MessageItem({
           </div>
         )}
         <div
+          data-chat-body
           style={{
             font: `400 13.5px ${font.sans}`,
             lineHeight: 1.55,
+            marginTop: groupStart ? 2 : 0,
             color: deleted ? color.muted2 : color.inkSofter,
+            minWidth: 0,
+            maxWidth: "100%",
+            overflowWrap: "anywhere",
+            wordBreak: "break-word",
           }}
         >
           {deleted ? <span style={{ fontStyle: "italic" }}>message deleted</span> : renderBlocks(message.head.blocks, names)}

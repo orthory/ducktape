@@ -54,14 +54,26 @@ export function Composer({
   return (
     <div
       style={{
-        margin: 13,
-        borderRadius: radius.md,
-        border: `1px solid ${focused ? color.borderStrong : color.borderSoft}`,
+        padding: "12px 16px 14px",
+        borderTop: `1px solid ${color.borderSoft}`,
         background: color.paper,
-        transition: "border-color .12s ease",
+        flexShrink: 0,
+        minWidth: 0,
       }}
     >
-      <div style={{ display: "flex", alignItems: "flex-end", gap: 8, padding: "8px 8px 6px 13px" }}>
+      <div
+        style={{
+          borderRadius: radius.lg,
+          border: `1px solid ${focused ? color.borderStrong : color.border}`,
+          background: color.paper,
+          display: "flex",
+          flexDirection: "column",
+          gap: 7,
+          padding: "10px 12px 8px",
+          transition: "border-color .12s ease",
+          minWidth: 0,
+        }}
+      >
         <textarea
           ref={ref}
           autoFocus={autoFocus}
@@ -73,41 +85,58 @@ export function Composer({
           onBlur={() => setFocused(false)}
           placeholder={placeholder}
           style={{
-            flex: 1,
+            width: "100%",
             minWidth: 0,
             resize: "none",
-            font: `400 13px ${font.sans}`,
+            display: "block",
+            font: `400 13.5px ${font.sans}`,
             color: color.ink,
             lineHeight: 1.5,
-            padding: "3px 0",
+            padding: 0,
             maxHeight,
             overflowY: "auto",
+            overflowWrap: "break-word",
           }}
         />
-        <button
-          type="button"
-          onClick={() => canSend && onSend()}
-          disabled={!canSend}
-          title="Send"
-          style={{
-            all: "unset",
-            cursor: canSend ? "pointer" : "not-allowed",
-            width: 28,
-            height: 28,
-            borderRadius: 7,
-            flexShrink: 0,
-            background: canSend ? accentVar : color.chip,
-            color: canSend ? "#fff" : color.muted2,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <Icon name="chevronRight" size={15} />
-        </button>
-      </div>
-      <div style={{ padding: "0 13px 7px", font: `400 10px ${font.mono}`, color: color.muted2 }}>
-        Enter to send · Shift+Enter for a new line
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, minWidth: 0 }}>
+          <span
+            style={{
+              font: `500 10px ${font.mono}`,
+              color: color.muted2,
+              userSelect: "none",
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            <b style={{ fontWeight: 600, color: color.muted }}>Enter</b> to send ·{" "}
+            <b style={{ fontWeight: 600, color: color.muted }}>Shift+Enter</b> for a new line
+          </span>
+          <button
+            type="button"
+            onClick={() => canSend && onSend()}
+            title="Send"
+            aria-label="Send message"
+            aria-disabled={!canSend}
+            style={{
+              all: "unset",
+              cursor: canSend ? "pointer" : "not-allowed",
+              width: 31,
+              height: 31,
+              borderRadius: 8,
+              flexShrink: 0,
+              background: canSend ? accentVar : color.borderSoft,
+              color: canSend ? color.onDark : color.muted2,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              transition: "background .12s ease, color .12s ease",
+            }}
+          >
+            <Icon name="chevronRight" size={15} />
+          </button>
+        </div>
       </div>
     </div>
   );

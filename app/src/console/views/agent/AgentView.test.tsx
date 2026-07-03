@@ -1,0 +1,182 @@
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { useState } from "react";
+import { describe, expect, it, vi } from "vitest";
+
+import type { ConsoleActions } from "../../store/actions";
+import { ConsoleContext } from "../../store/context";
+import { createInitialState, type ConsoleState } from "../../store/state";
+import type { Channel } from "../../../domain/chat-client";
+import { AgentView } from "./AgentView";
+
+const bytes = (value: number) => Array.from({ length: 32 }, () => value);
+
+const channels: Channel[] = [
+  {
+    id: "general",
+    name: "General",
+    created_at: 1,
+    head_seq: 42,
+    post_policy: "Open",
+    hooks: [],
+    pinned: [],
+  },
+  {
+    id: "project",
+    name: "Project",
+    created_at: 2,
+    head_seq: 7,
+    post_policy: "Open",
+    hooks: [],
+    pinned: [],
+  },
+];
+
+const renderAgents = (patch: Partial<ConsoleState> = {}) => {
+  const initialState = {
+    ...createInitialState(),
+    connected: true,
+    channels,
+    activeChannel: "general",
+    agents: [
+      {
+        agent_id: "summarizer",
+        owner: "System" as const,
+        display_name: "Summary Agent",
+        model_ref: "gpt-5.5",
+        prompt_hash: bytes(0xab),
+        allowed_actions: ["chat.post", "tasks.create"],
+        status: "Active" as const,
+        created_at: 10,
+        updated_at: 20,
+      },
+      {
+        agent_id: "qa-agent",
+        owner: "System" as const,
+        display_name: "QA Agent",
+        model_ref: "gpt-5.5-codex",
+        prompt_hash: bytes(0xcd),
+        allowed_actions: ["chat.post"],
+        status: "Paused" as const,
+        created_at: 11,
+        updated_at: 21,
+      },
+    ],
+    watches: [{ channel_id: "general", policy: { Assigned: "summarizer" } }],
+    runs: [
+      {
+        run_id: "general/42/summarizer",
+        agent_id: "summarizer",
+        channel_id: "general",
+        anchor_seq: 42,
+        thread_root: null,
+        job_id: null,
+        job_claim_height: 0,
+        requester: "System" as const,
+        status: { AwaitingOracle: { saga_id: "saga-1" } },
+        context_hash: bytes(0xef),
+        created_at: 30,
+        updated_at: 40,
+      },
+    ],
+    ...patch,
+  };
+  const spies: Record<string, (...args: unknown[]) => void> = {};
+  const noop = vi.fn() as (...args: unknown[]) => void;
+
+  function Harness() {
+    const [state] = useState(initialState);
+    const actions = new Proxy(
+      {},
+      {
+        get: (_target, key: string) => {
+          spies[key] ??= vi.fn() as (...args: unknown[]) => void;
+          return spies[key] ?? noop;
+        },
+      },
+    ) as ConsoleActions;
+
+    return (
+      <ConsoleContext.Provider value={{ state, actions }}>
+        <AgentView />
+      </ConsoleContext.Provider>
+    );
+  }
+
+  render(<Harness />);
+  return { spies };
+};
+
+describe("AgentView", () => {
+  it("renders a complete agent operations surface over real store data", () => {
+    const { spies } = renderAgents();
+
+    expect(screen.getByRole("heading", { name: "Agents" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
+    expect(within(detail).getByText("summarizer")).toBeInTheDocument();
+    expect(within(detail).getByText("gpt-5.5")).toBeInTheDocument();
+    expect(within(detail).getByText("Post to chat")).toBeInTheDocument();
+    expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
+
+    fireEvent.click(within(detail).getByRole("button", { name: /pause agent/i }));
+    expect(spies.pauseAgent).toHaveBeenCalledWith("summarizer");
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for qa agent/i }));
+    fireEvent.click(screen.getByRole("button", { name: /resume agent/i }));
+    expect(spies.resumeAgent).toHaveBeenCalledWith("qa-agent");
+
+    fireEvent.change(screen.getByLabelText("Channel to watch"), {
+      target: { value: "project" },
+    });
+    fireEvent.change(screen.getByLabelText("Turn policy"), {
+      target: { value: "Mention" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /watch channel/i }));
+    expect(spies.watchChannel).toHaveBeenCalledWith({
+      channelId: "project",
+      policy: "Mention",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /stop watching general/i }));
+    expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
+
+    fireEvent.change(screen.getByLabelText("Run channel"), {
+      target: { value: "general" },
+    });
+    fireEvent.change(screen.getByLabelText("Anchor sequence"), {
+      target: { value: "42" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /request run/i }));
+    expect(spies.requestRun).toHaveBeenCalledWith({
+      agentId: "qa-agent",
+      channelId: "general",
+      anchorSeq: 42,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }));
+    expect(spies.cancelRun).toHaveBeenCalledWith("general/42/summarizer");
+
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Agent ID"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Model reference"), {
+      target: { value: "gpt-5.5-codex" },
+    });
+    fireEvent.change(screen.getByLabelText("System prompt"), {
+      target: { value: "Summarize incoming incidents." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith({
+      displayName: "Triage Agent",
+      agentId: "triage-agent",
+      modelRef: "gpt-5.5-codex",
+      prompt: "Summarize incoming incidents.",
+      allowedActions: ["chat.post"],
+    });
+  });
+});

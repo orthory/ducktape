@@ -41,6 +41,8 @@ function ChannelRail() {
         display: "flex",
         flexDirection: "column",
         padding: "13px 0",
+        boxSizing: "border-box",
+        overflow: "hidden",
       }}
     >
       <div
@@ -112,10 +114,11 @@ function ChannelRail() {
                 background: active ? color.hover : "transparent",
                 color: active ? color.ink : color.muted3,
                 font: `${active ? 600 : 400} 12.5px ${font.sans}`,
+                boxSizing: "border-box",
               }}
             >
               <Icon name="hash" size={13} color={active ? color.ink : color.muted2} />
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {channel.name}
               </span>
             </button>
@@ -212,6 +215,7 @@ export function ChatView() {
   const channel = state.channels.find((c) => c.id === state.activeChannel);
   const selfKey = selfAuthorKeyOf(state.author);
   const workspaceId = state.workspace?.id ?? null;
+  const rootMessageCount = state.messages.filter((message) => message.head.thread === null).length;
 
   const [draft, setDraft] = useState("");
   const [hoverMsg, setHoverMsg] = useState<number | null>(null);
@@ -248,25 +252,50 @@ export function ChatView() {
   };
 
   return (
-    <div style={{ display: "flex", flex: 1, minWidth: 0, minHeight: 0 }}>
+    <div style={{ display: "flex", flex: 1, minWidth: 0, minHeight: 0, overflow: "hidden" }}>
       <ChannelRail />
-      <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", background: color.paper }}>
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+          background: color.paper,
+          overflow: "hidden",
+        }}
+      >
         <div
           style={{
             display: "flex",
             alignItems: "center",
-            gap: 7,
-            padding: "11px 17px",
+            gap: 9,
+            padding: "0 18px",
             height: 50,
             boxSizing: "border-box",
             borderBottom: `1px solid ${color.borderSoft}`,
             flexShrink: 0,
+            minWidth: 0,
           }}
         >
           <Icon name="hash" size={15} color={color.muted} />
-          <span style={{ font: `600 13px ${font.sans}`, color: color.ink }}>
+          <span
+            style={{
+              font: `600 14px ${font.sans}`,
+              color: color.ink,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
             {channel?.name ?? "No channel"}
           </span>
+          {channel && (
+            <span style={{ font: `400 12px ${font.sans}`, color: color.muted2, whiteSpace: "nowrap" }}>
+              · {rootMessageCount} {rootMessageCount === 1 ? "message" : "messages"}
+            </span>
+          )}
         </div>
 
         {channel ? (

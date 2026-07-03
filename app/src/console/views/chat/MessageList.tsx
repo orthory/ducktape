@@ -13,7 +13,7 @@ import { color, font } from "../../theme/tokens";
 
 function DayDivider({ label }: { label: string }) {
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 11, padding: "13px 17px 9px" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 0 8px", minWidth: 0 }}>
       <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
       <span style={{ font: `500 10.5px ${font.mono}`, color: color.muted2, whiteSpace: "nowrap" }}>{label}</span>
       <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
@@ -58,38 +58,64 @@ export function MessageList({
   const bySeq = new Map(messages.map((m) => [m.seq, m]));
 
   return (
-    <div ref={listRef} onScroll={onScroll} style={{ flex: 1, overflowY: "auto", padding: "6px 0 9px" }}>
-      {rows.map(({ message, groupStart, dayDivider }) => {
-        const lastReply = message.head.last_reply_seq !== null ? bySeq.get(message.head.last_reply_seq) : undefined;
-        const replyHint = lastReply ? authorName(lastReply.head.author, names) : null;
-        const linkRef = `ducktape://${workspaceId ?? "local"}/${message.channel_id}/${message.head.message_id}`;
-        const refRef = `${message.channel_id}#${message.seq}:${message.head.message_id}`;
-        return (
-          <div key={message.seq}>
-            {dayDivider && <DayDivider label={dayDivider} />}
-            <MessageItem
-              message={message}
-              names={names}
-              groupStart={groupStart}
-              selfKey={selfKey}
-              hovered={hoverMsg === message.seq}
-              menuOpen={menuOpenId === message.seq}
-              replyHint={replyHint}
-              linkRef={linkRef}
-              refRef={refRef}
-              onHover={(over) => onHover(over ? message.seq : null)}
-              onMenuToggle={(open) => onMenuToggle(open ? message.seq : null)}
-              onOpenThread={() => onOpenThread(message.seq)}
-              onReact={(emoji) => onReact(message.seq, emoji)}
-            />
+    <div
+      ref={listRef}
+      role="log"
+      aria-label={`#${channelName} messages`}
+      onScroll={onScroll}
+      style={{
+        flex: 1,
+        minHeight: 0,
+        minWidth: 0,
+        overflowY: "auto",
+        overflowX: "hidden",
+        padding: "14px 18px 18px",
+        boxSizing: "border-box",
+      }}
+    >
+      <div
+        data-testid="chat-message-column"
+        style={{
+          width: "100%",
+          maxWidth: 880,
+          minWidth: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: 1,
+        }}
+      >
+        {rows.map(({ message, groupStart, dayDivider }) => {
+          const lastReply = message.head.last_reply_seq !== null ? bySeq.get(message.head.last_reply_seq) : undefined;
+          const replyHint = lastReply ? authorName(lastReply.head.author, names) : null;
+          const linkRef = `ducktape://${workspaceId ?? "local"}/${message.channel_id}/${message.head.message_id}`;
+          const refRef = `${message.channel_id}#${message.seq}:${message.head.message_id}`;
+          return (
+            <div key={message.seq} style={{ minWidth: 0 }}>
+              {dayDivider && <DayDivider label={dayDivider} />}
+              <MessageItem
+                message={message}
+                names={names}
+                groupStart={groupStart}
+                selfKey={selfKey}
+                hovered={hoverMsg === message.seq}
+                menuOpen={menuOpenId === message.seq}
+                replyHint={replyHint}
+                linkRef={linkRef}
+                refRef={refRef}
+                onHover={(over) => onHover(over ? message.seq : null)}
+                onMenuToggle={(open) => onMenuToggle(open ? message.seq : null)}
+                onOpenThread={() => onOpenThread(message.seq)}
+                onReact={(emoji) => onReact(message.seq, emoji)}
+              />
+            </div>
+          );
+        })}
+        {roots.length === 0 && (
+          <div style={{ padding: "22px 0", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
+            No messages in #{channelName} yet. Send the first one.
           </div>
-        );
-      })}
-      {roots.length === 0 && (
-        <div style={{ padding: "20px 17px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
-          No messages in #{channelName} yet — send the first one.
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }

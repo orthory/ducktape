@@ -6,11 +6,12 @@
 // lane, not an overlay, and only one can be open system-wide (`activeThread`
 // is a single slot).
 
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames, ChatThread } from "../../../domain/chat-client";
+import { Icon } from "../../components/Icon";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
 import { color, font } from "../../theme/tokens";
@@ -45,6 +46,12 @@ export function ThreadPanel({
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [thread.root.seq, thread.replies.length]);
 
   const send = () => {
     if (!draft.trim()) return;
@@ -67,8 +74,10 @@ export function ThreadPanel({
         borderLeft: `1px solid ${color.borderSoft}`,
         display: "flex",
         flexDirection: "column",
-        background: color.paper,
+        background: color.sidebar,
         minHeight: 0,
+        minWidth: 0,
+        overflow: "hidden",
       }}
     >
       <div
@@ -79,11 +88,22 @@ export function ThreadPanel({
           padding: "11px 15px",
           borderBottom: `1px solid ${color.borderSoft}`,
           flexShrink: 0,
+          minWidth: 0,
         }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 1, minWidth: 0 }}>
           <span style={{ font: `600 13px ${font.sans}`, color: color.ink }}>Thread</span>
-          <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>#{channelName}</span>
+          <span
+            style={{
+              font: `400 11px ${font.sans}`,
+              color: color.muted2,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            #{channelName}
+          </span>
         </div>
         <button
           onClick={onClose}
@@ -100,14 +120,23 @@ export function ThreadPanel({
             color: color.muted,
           }}
         >
-          <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round">
-            <path d="M6 6l12 12M18 6L6 18" />
-          </svg>
+          <Icon name="close" size={13} strokeWidth={1.8} />
         </button>
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "13px 0" }}>
-        <div style={{ padding: "0 7px 12px", margin: "0 10px 4px", borderBottom: `1px solid ${color.borderSoft}` }}>
+      <div
+        ref={scrollRef}
+        style={{
+          flex: 1,
+          minHeight: 0,
+          minWidth: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
+          padding: "14px 14px",
+          boxSizing: "border-box",
+        }}
+      >
+        <div style={{ padding: "0 0 13px", marginBottom: 11, borderBottom: `1px solid ${color.borderSoft}`, minWidth: 0 }}>
           <MessageItem
             message={thread.root}
             names={names}
@@ -126,13 +155,13 @@ export function ThreadPanel({
           />
         </div>
 
-        <div style={{ margin: "0 17px 4px", font: `500 10.5px ${font.mono}`, color: color.muted2 }}>
+        <div style={{ margin: "0 0 6px", font: `500 10.5px ${font.mono}`, color: color.muted2 }}>
           {thread.replies.length} {thread.replies.length === 1 ? "reply" : "replies"}
         </div>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 1, minWidth: 0 }}>
           {thread.replies.map((reply) => (
-            <div key={reply.seq} style={{ padding: "0 10px" }}>
+            <div key={reply.seq} style={{ minWidth: 0 }}>
               <MessageItem
                 message={reply}
                 names={names}
@@ -153,8 +182,8 @@ export function ThreadPanel({
           ))}
         </div>
         {thread.replies.length === 0 && (
-          <div style={{ margin: "6px 17px 0", font: `400 12px ${font.sans}`, color: color.muted2 }}>
-            No replies yet — start the thread below.
+          <div style={{ margin: "7px 0 0", font: `400 12px ${font.sans}`, color: color.muted2 }}>
+            No replies yet. Start the thread below.
           </div>
         )}
       </div>
