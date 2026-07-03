@@ -38,6 +38,10 @@ export interface ConsoleState {
   // ── Tasks ──
   tasks: Task[];
 
+  // ── Members / validator roster ──
+  /** Hex-encoded validator public keys from the `valset` module. */
+  members: string[];
+
   // ── Forge ──
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
@@ -94,6 +98,7 @@ export const createInitialState = (): ConsoleState => ({
   activeThread: null,
   authorNames: {},
   tasks: [],
+  members: [],
   forgeHead: null,
   docIds: [],
   activeDoc: null,
@@ -115,6 +120,7 @@ export interface ConsoleSnapshot {
   status: NodeStatus | null;
   channels: Channel[];
   tasks: Task[];
+  members: string[];
   forgeHead: string | null;
   activeChannel: string | null;
   messages: MessageView[];
@@ -133,6 +139,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   status: snapshot.status,
   channels: snapshot.channels,
   tasks: snapshot.tasks,
+  members: snapshot.members,
   forgeHead: snapshot.forgeHead,
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,

@@ -24,6 +24,7 @@ import {
 } from "../../domain/node-bootstrap";
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
+import * as valsetClient from "../../domain/valset-client";
 import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import {
@@ -82,6 +83,7 @@ export function DucktapeProvider({
           live.status(),
           chatClient.channels(live),
           tasksClient.listTasks(live),
+          valsetClient.validators(live),
           forgeClient.head(live),
           activeDoc
             ? documentClient.getDoc(live, activeDoc)
@@ -95,12 +97,24 @@ export function DucktapeProvider({
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
         ]),
       )
-      .then(([status, channels, tasks, forgeHead, docBlocks, agents, watches, runs, profiles]) => {
+      .then(([
+        status,
+        channels,
+        tasks,
+        validators,
+        forgeHead,
+        docBlocks,
+        agents,
+        watches,
+        runs,
+        profiles,
+      ]) => {
         // Profile.key is the origin bytes — the same bytes AuthorRef::User
         // carries — so hex(key) is exactly authorName's AuthorNames key.
         const authorNames = Object.fromEntries(
           profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
         );
+        const members = validators.map(valsetClient.validatorHex);
         const current = stateRef.current.activeChannel;
         const active =
           current && channels.some((c) => c.id === current)
@@ -116,6 +130,7 @@ export function DucktapeProvider({
                 status,
                 channels,
                 tasks,
+                members,
                 forgeHead,
                 activeChannel: active,
                 messages,

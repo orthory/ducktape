@@ -10,10 +10,26 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M9.2 11.7l2 2 3.6-3.8" />
     </>
   ),
+  members: (
+    <>
+      <circle cx="10" cy="8" r="3" />
+      <path d="M4.5 18c0-3 2.4-4.6 5.5-4.6 1 0 1.8.2 2.6.5" />
+      <path d="M16 6.3a2.8 2.8 0 0 1 .3 5.4" />
+      <path d="M17.6 13.7c1.9.5 2.9 1.9 2.9 3.9" />
+    </>
+  ),
   node: (
     <>
       <path d="M12 3.4l7.4 4.27v8.66L12 20.6l-7.4-4.27V7.67z" />
       <circle cx="12" cy="12" r="2.3" />
+    </>
+  ),
+  modules: (
+    <>
+      <rect x="4.5" y="4.5" width="6" height="6" rx="1.4" />
+      <rect x="13.5" y="4.5" width="6" height="6" rx="1.4" />
+      <rect x="4.5" y="13.5" width="6" height="6" rx="1.4" />
+      <rect x="13.5" y="13.5" width="6" height="6" rx="1.4" />
     </>
   ),
   settings: (
