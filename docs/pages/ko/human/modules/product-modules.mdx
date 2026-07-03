@@ -91,6 +91,12 @@ append한다. `(path, generation)` pair는 stable하고 hash-pinned된 reference
 `UnregisterWatch`로 간다. read는 progressive-disclosure verb인 `Ls`, `Stat`,
 `Read`, `Find`, `Grep`이고, grep hit는 인용 가능한
 `duck://memory/<path>@<generation>#L<line>` evidence URI를 담는다.
+큰 body는 files manifest reference로 publish할 수 있다. memory는 committed
+manifest를 probe한 뒤 digest와 size를 immutable generation에 복사하고, 그
+복사된 값을 generation의 truth로 삼는다. 나중에 manifest를 remove해도
+generation은 invalidate되지 않는다. bytes는 files chunk lane으로 fetch하고
+receiver가 `verify_chunk`로 검증한다. `Grep`은 inline body만 scan하고 file-backed
+body는 deterministic하게 skip한다.
 
 `Snapshot`은 namespace 전체의 현재 path-to-generation mapping을 pin한다 —
 mapping만이고 body 복사는 절대 아니다. `Delete`는 snapshot이 아직 pin한

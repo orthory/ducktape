@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 pub const MAX_PATH_BYTES: usize = 512;
 /// per-segment byte length bound.
 pub const MAX_SEGMENT_BYTES: usize = 128;
-/// published body byte length bound.
+/// inline published body byte length bound.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// entries per [`Meta`] map.
 pub const MAX_META_ENTRIES: usize = 16;
@@ -68,13 +68,38 @@ pub const SKILLS_PREFIX: &str = "/skills/";
 /// [`MAX_META_ENTRIES`] / [`MAX_META_KEY_BYTES`] / [`MAX_META_VALUE_BYTES`].
 pub type Meta = BTreeMap<String, String>;
 
+/// one immutable generation body. small bodies are kept directly in memory's
+/// consensus state; large bodies are pinned by reference to a files manifest.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum Body {
+    Inline(String),
+    File {
+        file_id: String,
+        /// the 64-character lowercase-hex digest copied from the files manifest
+        /// at publish time.
+        digest: String,
+        size: u64,
+    },
+}
+
+/// write-time body selector. file publishes probe the files module and copy the
+/// committed manifest digest/size into [`Body::File`], so later manifest removal
+/// does not change the generation's pinned truth.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PublishBody {
+    Inline(String),
+    File { file_id: String },
+}
+
 /// one immutable generation of a file: the write-once body plus its metadata and
 /// origin-derived provenance. `generation` starts at 1 and increases by 1 on
 /// every publish; a `(path, generation)` pair is a stable, hash-pinned reference.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Generation {
     pub generation: u64,
-    pub body: String,
+    pub body: Body,
     pub meta: Meta,
     /// derived from `Env.origin` — a module id verbatim, `"ext:"` + lowercase
     /// hex of the external submitter's bytes (domain-separated so a module id
@@ -112,11 +137,12 @@ pub enum LsEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum MemoryMsg {
     /// write-once publish: assigns `generation = latest + 1` (1 for a new file)
-    /// atomically and appends an immutable generation. body/meta caps are
-    /// enforced at execute time with rejection.
+    /// atomically and appends an immutable generation. inline body/meta caps are
+    /// enforced at execute time with rejection. file bodies require a committed
+    /// files manifest; memory copies its digest and size at publish time.
     Publish {
         path: String,
-        body: String,
+        body: PublishBody,
         meta: Meta,
     },
     /// remove a file (all its live generations). snapshots still pin whatever
@@ -174,9 +200,10 @@ pub enum MemoryQuery {
         meta_filter: BTreeMap<String, String>,
         limit: u64,
     },
-    /// case-sensitive substring scan (no regex — determinism) over the LATEST
-    /// generations of live files under `prefix`, paths in sorted order, up to
-    /// `limit` (clamped to [`MAX_QUERY_LIMIT`]) hits.
+    /// case-sensitive substring scan (no regex — determinism) over INLINE
+    /// latest generations of live files under `prefix`, paths in sorted order,
+    /// up to `limit` (clamped to [`MAX_QUERY_LIMIT`]) hits. file-backed bodies
+    /// are skipped silently and deterministically.
     Grep {
         prefix: String,
         pattern: String,

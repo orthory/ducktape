@@ -248,7 +248,7 @@ async fn genesis_host(
         Box::new(Files::new("files")),
         // the shared agent workspace: a filesystem-shaped namespace with
         // write-once publish, immutable generations, snapshots, and watches.
-        Box::new(Memory::new("memory")),
+        Box::new(Memory::new("memory", "files")),
         Box::new(Jobs::new("jobs")),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -330,7 +330,7 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("files install: {e}"))?;
 
-    let mut memory = Memory::new("memory");
+    let mut memory = Memory::new("memory", "files");
     let (bytes, root) = snapshot_of("memory")?;
     memory
         .install(bytes, root)
@@ -497,7 +497,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("files install: {e}"))?;
 
     let (bytes, root) = snapshot_of("memory").await?;
-    let mut memory = Memory::new("memory");
+    let mut memory = Memory::new("memory", "files");
     memory
         .install(&bytes, root)
         .map_err(|e| format!("memory install: {e}"))?;

@@ -93,6 +93,12 @@ still pins it. Writes go through `Publish`, `Delete`, `Snapshot`,
 `DropSnapshot`, `RegisterWatch`, and `UnregisterWatch`; reads are the
 progressive-disclosure verbs `Ls`, `Stat`, `Read`, `Find`, and `Grep`, and grep
 hits carry citable `duck://memory/<path>@<generation>#L<line>` evidence URIs.
+Large bodies can be published by reference to a files manifest: memory probes
+the committed manifest, copies its digest and size into the immutable
+generation, and treats those copied values as the generation's truth. Removing
+the manifest later does not invalidate the generation; bytes remain fetched over
+the files chunk lane and receiver-verified with `verify_chunk`. `Grep` scans
+inline bodies only and skips file-backed bodies deterministically.
 
 `Snapshot` pins the current path-to-generation mapping of the whole namespace —
 the mapping only, never a copy of the bodies. `Delete` retains any generation a
