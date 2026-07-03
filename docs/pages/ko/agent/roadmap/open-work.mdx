@@ -2,30 +2,54 @@
 
 이 page는 agent가 실수로 완료된 것처럼 말하면 안 되는 implementation gap을 기록한다.
 
-## Live Network State Sync
+## WireGuard Tunnel Runtime
 
-in-process module sync proof는 존재하고, `bin/demo/src/state_sync.rs`는
-membership validation을 갖춘 transport-neutral mesh frame을 test와 함께
-정의한다. running node에는 live validator path에서 이 frame을 serve하고
-fetch하는 network resolver가 아직 필요하다.
+`crates/system/wireguard-upgrade`는 아직 protocol leaf다. `bin/node`나
+`bin/noded`에서 검증된 `TunnelInstallPlan`을 defguard `WGApi`로 apply하는 consumer가
+없다. 다음 slice는 upgrade effect를 내보내는 mesh module, `WGApi`를 drive하는
+reactor worker, finalized admission commitment가 생기기 전에는 fail-closed로
+동작하는 `admission_root` producer, responder-side install-plan constructor다.
 
-## Dynamic Valset Orchestration
+두 mesh contract(`valset-mesh-interface`, `wireguard-upgrade`)는 하나의 shape로
+합쳐져야 한다. 실제 WireGuard interface를 Linux netns에서 올리는 privileged e2e는
+아직 deliberately descoped다.
 
-test는 epoch boundary 주변 respawn behavior를 cover하고, deterministic core는
-존재한다. test된 `ValsetOrchestrator` state machine
-(`crates/kernel/consensus/src/valset_orchestrator.rs`)이 finalized valset
-state를 watch하고 deterministic cutover point를 publish한다. live loop는 old
-orderer를 stop하고, new epoch instance를 start하고, transport/state-sync
-readiness를 맞추는 작업이 아직 필요하다.
+## Demotion And Promotion Edges
 
-## Snapshot Serving
+epoch cutover에서 validator set에서 빠진 validator는 아직 sync/observer로 남지 않고
+halt한다. joiner promotion 자체는 shipped 상태다. parked joiner는 admission boundary를
+sync하고 promotion checkpoint를 쓰고 reboot한 뒤 vote할 수 있다. 이것을 missing으로
+기록하면 안 된다.
 
-capstone joiner test는 rebuild math를 증명한다. running node에는 finalized height에서
-consistent all-module snapshot을 위한 pause/serve seam이 아직 필요하다.
+남은 promotion-adjacent operator work는 stale local-state story다. pre-recovery 또는
+damaged recovery directory는 migrate되지 않고 loud failure로 끝나며, demoted node도
+아직 자동으로 observer role로 degrade하지 않는다.
 
-## Product Depth
+## Replay Nonces
 
-chat과 agent module은 존재한다. agent path는 아직 reactor-backed LLM work가 필요하다.
-model output은 ordered data로 commit되어야 한다. 첫 tasks module은 이미 checked-in
-상태다(`crates/apps/tasks`와 `tasks-interface`, test 포함). qmdb backing, 더 풍부한
-task schema, binary로의 product wiring이 남아 있다.
+ordered frame은 `(origin, seq)`를 carry하지만 replicated state는 per-origin nonce
+monotonicity를 enforce하지 않는다. byte-identical frame의 cross-epoch replay는 현재
+per-engine finalization dedup에만 걸린다. durable replacement는 committed nonce
+state다.
+
+## Restart-Recovery Compatibility
+
+restart recovery는 live다. checkpoint, op-journal replay, cutover record, floor
+certificate로 current node를 recover한다. 남은 edge는 older/pre-recovery storage
+directory다. local state가 recovery checkpoint 없이 존재하면 boot는 in-place migrate가
+아니라 wipe/re-sync 안내와 함께 loud failure로 끝난다.
+
+## Agent/Reactor Product Path
+
+agent module은 존재하고 demo/test는 model output을 ordered op로 commit하는 pattern을
+보여준다. `bin/node`/`bin/noded`는 아직 agent LLM worker를 실행하지 않는다. node의
+worker set은 비어 있고, production genesis에는 `agent`가 없으며, live operator UX로
+tasks에 연결되어 있지 않다.
+
+## Module Integration Wave
+
+다음 module wave는 implementation 전에 design/spec work가 먼저다. automations가
+inbox `Deliver`를 emit하고, automations trigger source가 memory watch에서 오고, 64
+KiB를 넘는 memory body가 files manifest를 통해 이동하고, agent가 jobs를 claim하고,
+tasks가 deadline state, cure/escalation lineage, atomic cross-module creation을 갖춘
+obligation pattern이 되어야 한다.
