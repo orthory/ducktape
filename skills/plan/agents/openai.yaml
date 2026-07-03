@@ -1,4 +1,4 @@
 interface:
   display_name: "Plan"
-  short_description: "Fable plans; Opus 4.8 / GPT-5.5 xhigh implement."
-  default_prompt: "Use $plan before writing or changing code in Ducktape: Fable owns architecture, planning, and research, then dispatches coding and testing to the Opus 4.8 xhigh / GPT-5.5 xhigh implementer tiers."
+  short_description: "Fable 5 plans; Opus 4.8 / GPT-5.5 xhigh implement."
+  default_prompt: "Use $plan before writing or changing code in Ducktape: Fable 5 owns architecture, planning, research, and proving, then dispatches coding and testing to the Opus 4.8 xhigh / GPT-5.5 xhigh implementer tiers (Codex via the Sonnet driver chain inside workflows)."
