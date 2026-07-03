@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main-window IPC baseline: node_* commands plus the core event API the ducktape://block stream rides on.",
-  "windows": ["main"],
+  "description": "IPC baseline for the console (main) and the macOS menu-bar popover (tray): node_* commands plus the core event API the ducktape://block stream and ducktape://navigate ride on.",
+  "windows": ["main", "tray"],
   "permissions": ["core:default"]
 }

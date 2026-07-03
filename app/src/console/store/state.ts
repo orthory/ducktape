@@ -27,6 +27,14 @@ export interface ConsoleState {
   /** Messages of the active channel only (all sequences; views filter). */
   messages: MessageView[];
   activeThread: ChatThread | null;
+  /** The message (by seq) the pointer is currently over, or whose "⋯" menu is
+   *  pinned open — drives the Slack-style floating hover action bar. A single
+   *  slot is enough: only one row can be hovered/menu-open at a time. */
+  hoverMsg: number | null;
+  /** The message (by seq) whose overflow ("⋯") menu is open. Separate from
+   *  `hoverMsg` so the menu (and the hover bar beneath it) stays visible after
+   *  the pointer leaves the row. */
+  msgMenuId: number | null;
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
    *  into author rendering so messages show chosen names, not hex handles. */
   authorNames: Record<string, string>;
@@ -84,6 +92,8 @@ export const createInitialState = (): ConsoleState => ({
   activeChannel: null,
   messages: [],
   activeThread: null,
+  hoverMsg: null,
+  msgMenuId: null,
   authorNames: {},
   tasks: [],
   forgeHead: null,

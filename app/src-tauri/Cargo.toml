@@ -14,7 +14,9 @@ version.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
+# image-png: decode the bundled tray.png for the icon.
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"

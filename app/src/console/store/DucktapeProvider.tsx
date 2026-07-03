@@ -110,6 +110,14 @@ export interface ConsoleActions {
   openThread(rootSeq: number): void;
   closeThread(): void;
   replyInThread(body: string): void;
+  /** Toggle our own reaction on a message: adds it if we haven't reacted with
+   *  that emoji yet, removes it if we have. Refreshes the open thread panel
+   *  too, since its replies are a separate snapshot from `state.messages`. */
+  toggleReaction(seq: number, emoji: string): void;
+  /** Which message (by seq) the hover action bar is anchored to, or null. */
+  setHoverMsg(seq: number | null): void;
+  /** Which message's "⋯" overflow menu is open, or null. */
+  setMsgMenu(seq: number | null): void;
   addTask(title: string): void;
   advanceTask(taskId: string): void;
   commitForge(params: { path: string; content: string; message: string }): void;
@@ -415,6 +423,33 @@ export function DucktapeProvider({
     }));
   }, [state.nodeUrl]);
 
+  // 6. Menu-bar popover navigation (desktop/macOS): the tray popover is a
+  //    separate webview, so it asks the console to switch screens by having Rust
+  //    emit `ducktape://navigate` after showing this window. Inert on web.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<string>("ducktape://navigate", (event) => {
+          const screen = event.payload;
+          if (screen) setState((prev) => ({ ...prev, screen }));
+        }),
+      )
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {
+        // event API unavailable (non-tauri / permission) — navigation just no-ops.
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const actions = useMemo<ConsoleActions>(() => {
     const submitThenRefresh = (submit: (live: NodeTransport) => Promise<unknown>) => {
       const live = nodeRef.current;
@@ -434,6 +469,8 @@ export function DucktapeProvider({
         ...prev,
         activeChannel: channelId,
         activeThread: null,
+        hoverMsg: null,
+        msgMenuId: null,
       }));
       Promise.resolve()
         .then(() => chatClient.latestMessages(live, channelId))
@@ -523,32 +560,85 @@ export function DucktapeProvider({
           .catch(fail);
       },
 
-      closeThread: () => setState((prev) => ({ ...prev, activeThread: null })),
+      closeThread: () =>
+        setState((prev) => ({ ...prev, activeThread: null })),
 
+      // Re-queries just the open thread's replies after the write: `refresh()`
+      // already re-pulls `state.messages` (which carries every sequence,
+      // replies included) via `submitThenRefresh`, but the thread panel reads
+      // its own `ChatThread` snapshot, so that one extra cheap query keeps the
+      // panel in sync without repeating the old heavy-refresh-twice pattern.
       replyInThread: (body) => {
-        const live = nodeRef.current;
         const channelId = stateRef.current.activeChannel;
         const root = stateRef.current.activeThread?.root;
-        if (!live || !channelId || !root || !body.trim()) return;
-        Promise.resolve()
-          .then(() =>
-            chatClient.postMessage(live, {
-              channelId,
-              messageId: crypto.randomUUID(),
-              text: body.trim(),
-              origin: stateRef.current.author,
-              thread: root.seq,
-            }),
-          )
-          .then(() =>
-            chatClient.thread(live, { channelId, rootSeq: root.seq }),
-          )
-          .then((activeThread) => {
-            setState((prev) => ({ ...prev, activeThread }));
-            return refresh();
-          })
-          .catch(fail);
+        if (!channelId || !root || !body.trim()) return;
+        submitThenRefresh((live) =>
+          chatClient.postMessage(live, {
+            channelId,
+            messageId: crypto.randomUUID(),
+            text: body.trim(),
+            origin: stateRef.current.author,
+            thread: root.seq,
+          }),
+        ).then(() => {
+          const live = nodeRef.current;
+          if (!live) return;
+          return chatClient
+            .thread(live, { channelId, rootSeq: root.seq })
+            .then((activeThread) =>
+              setState((prev) =>
+                prev.activeThread?.root.seq === root.seq
+                  ? { ...prev, activeThread }
+                  : prev,
+              ),
+            )
+            .catch(fail);
+        });
       },
+
+      toggleReaction: (seq, emoji) => {
+        const channelId = stateRef.current.activeChannel;
+        if (!channelId) return;
+        const target =
+          stateRef.current.messages.find((m) => m.seq === seq) ??
+          (stateRef.current.activeThread?.root.seq === seq
+            ? stateRef.current.activeThread.root
+            : stateRef.current.activeThread?.replies.find((m) => m.seq === seq));
+        if (!target) return;
+        const origin = stateRef.current.author;
+        const selfBytes = Array.from(new TextEncoder().encode(origin));
+        const mine = target.reactions
+          .find((r) => r.emoji === emoji)
+          ?.reactors.some(
+            (author) =>
+              typeof author === "object" &&
+              "User" in author &&
+              author.User.length === selfBytes.length &&
+              author.User.every((byte, i) => byte === selfBytes[i]),
+          );
+        submitThenRefresh((live) =>
+          mine
+            ? chatClient.removeReaction(live, { channelId, seq, emoji, origin })
+            : chatClient.addReaction(live, { channelId, seq, emoji, origin }),
+        ).then(() => {
+          const live = nodeRef.current;
+          const root = stateRef.current.activeThread?.root;
+          if (!live || !root) return;
+          return chatClient
+            .thread(live, { channelId, rootSeq: root.seq })
+            .then((activeThread) =>
+              setState((prev) =>
+                prev.activeThread?.root.seq === root.seq
+                  ? { ...prev, activeThread }
+                  : prev,
+              ),
+            )
+            .catch(fail);
+        });
+      },
+
+      setHoverMsg: (seq) => setState((prev) => ({ ...prev, hoverMsg: seq })),
+      setMsgMenu: (seq) => setState((prev) => ({ ...prev, msgMenuId: seq })),
 
       addTask: (title) => {
         if (!title.trim()) return;
@@ -780,6 +870,8 @@ export function DucktapeProvider({
           messages: [],
           activeChannel: null,
           activeThread: null,
+          hoverMsg: null,
+          msgMenuId: null,
           authorNames: {},
           tasks: [],
           docIds: [],

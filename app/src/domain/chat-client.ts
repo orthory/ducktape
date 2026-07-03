@@ -181,6 +181,29 @@ export const postMessage = (
     params.origin,
   );
 
+/** Add a reaction (idempotent on the backend — reacting twice with the same
+ *  emoji is a no-op there, but the UI should still avoid the redundant submit;
+ *  see `hasReacted`). */
+export const addReaction = (
+  transport: NodeTransport,
+  params: { channelId: string; seq: number; emoji: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { AddReaction: { channel_id: params.channelId, seq: params.seq, emoji: params.emoji } },
+    params.origin,
+  );
+
+export const removeReaction = (
+  transport: NodeTransport,
+  params: { channelId: string; seq: number; emoji: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { RemoveReaction: { channel_id: params.channelId, seq: params.seq, emoji: params.emoji } },
+    params.origin,
+  );
+
 // ── Queries (reads over committed state) ────────────────
 
 export const channels = (transport: NodeTransport): Promise<Channel[]> =>
