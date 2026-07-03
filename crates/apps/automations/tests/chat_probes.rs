@@ -23,6 +23,8 @@ use tasks::Tasks;
 const AUTO: &str = "automations";
 const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
+const INBOX: &str = "inbox";
+const MEMORY: &str = "memory";
 
 fn as_user(byte: u8, height: u64) -> BlockContext {
     BlockContext {
@@ -105,7 +107,7 @@ async fn arena(context: deterministic::Context, rule_id: &str, action: Action) -
     let mut host = Host::genesis(vec![
         Box::new(chat),
         Box::new(Tasks::new(TASKS)),
-        Box::new(Automations::new(AUTO, CHAT, TASKS)),
+        Box::new(Automations::new(AUTO, CHAT, TASKS, INBOX, MEMORY)),
     ])
     .expect("genesis");
 

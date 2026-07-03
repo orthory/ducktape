@@ -111,15 +111,16 @@ fn run_node(
 
     executor.start(|context| async move {
         // genesis: the full product surface. chat/tasks/inbox as the core loop,
-        // automations bridging chat events into chat/tasks follow-ups, jobs for
-        // deferred work, document + forge for the substrate-backed stores, and
-        // files + memory for the content planes. files registers over the
+        // automations bridging chat/memory events into chat/tasks/inbox
+        // follow-ups, jobs for deferred work, document + forge for the
+        // substrate-backed stores, and files + memory for the content planes.
+        // files registers over the
         // http layer's blob handle so uploads land in the store `serve_sync`
         // reads — the bytes themselves never touch consensus.
         let chat = Chat::init(context.child("chat"), "chat").await;
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
-        let automations = Automations::new("automations", "chat", "tasks");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let jobs = Jobs::new("jobs");
         let document = Document::init(context.child("document"), "document").await;
         let forge = Forge::init("forge", forge_repo).expect("forge init");
