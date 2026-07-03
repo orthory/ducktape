@@ -495,6 +495,14 @@ where
         // re-proposal re-gossips — self-healing, never a fork. (sim `spawn`
         // shares ONE store, so every node always holds every digest and this
         // stays true — the in-process proof is unaffected.)
+        //
+        // RESIDUAL (tracked follow-up): this closes SIMPLE withholding, but the
+        // presence check is at vote time only — a peer-relayed payload is CACHED
+        // (FIFO-bounded, `ContentStore::put`), so a byzantine flooder could evict
+        // a just-verified digest before finalization and still strand it. the
+        // complete closure pins a voted-for digest until its view finalizes or is
+        // abandoned; that needs a nullification signal the Automaton seam does not
+        // expose yet, so it is a separate consensus-payload-lifecycle change.
         let (tx, rx) = oneshot::channel();
         tx.send_lossy(self.store.contains(&payload));
         rx
