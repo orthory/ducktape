@@ -5,7 +5,7 @@
 // MessageViews with block bodies; authorship comes back as AuthorRef (derived
 // from the submit origin), decoded to a display name here.
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import { Icon } from "../../components/Icon";
@@ -214,6 +214,8 @@ export function ChatView() {
   const workspaceId = state.workspace?.id ?? null;
 
   const [draft, setDraft] = useState("");
+  const [hoverMsg, setHoverMsg] = useState<number | null>(null);
+  const [msgMenuId, setMsgMenuId] = useState<number | null>(null);
 
   const listRef = useRef<HTMLDivElement>(null);
   // whether the reader is parked at the bottom. start pinned so the first paint
@@ -224,6 +226,11 @@ export function ChatView() {
   useLayoutEffect(() => {
     pinnedRef.current = true;
   }, [state.activeChannel]);
+
+  useEffect(() => {
+    setHoverMsg(null);
+    setMsgMenuId(null);
+  }, [state.activeChannel, workspaceId]);
 
   // follow new messages to the bottom ONLY when the reader is already there (or
   // just sent) — never yank them up from scrolled-back history when someone
@@ -270,15 +277,15 @@ export function ChatView() {
               names={state.authorNames}
               selfKey={selfKey}
               workspaceId={workspaceId}
-              hoverMsg={state.hoverMsg}
-              menuOpenId={state.msgMenuId}
+              hoverMsg={hoverMsg}
+              menuOpenId={msgMenuId}
               listRef={listRef}
               onScroll={(event) => {
                 const el = event.currentTarget;
                 pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
               }}
-              onHover={actions.setHoverMsg}
-              onMenuToggle={actions.setMsgMenu}
+              onHover={setHoverMsg}
+              onMenuToggle={setMsgMenuId}
               onOpenThread={actions.openThread}
               onReact={actions.toggleReaction}
             />
@@ -300,10 +307,10 @@ export function ChatView() {
           names={state.authorNames}
           selfKey={selfKey}
           workspaceId={workspaceId}
-          hoverMsg={state.hoverMsg}
-          menuOpenId={state.msgMenuId}
-          onHover={actions.setHoverMsg}
-          onMenuToggle={actions.setMsgMenu}
+          hoverMsg={hoverMsg}
+          menuOpenId={msgMenuId}
+          onHover={setHoverMsg}
+          onMenuToggle={setMsgMenuId}
           onReact={actions.toggleReaction}
           onReply={actions.replyInThread}
           onClose={actions.closeThread}
