@@ -9,11 +9,119 @@ that fits its job.
 - `document` stores block-based documents on QMDB and exposes QMDB state sync.
 - `forge` stores git-backed project state, with a root derived from the git head
   and pack install guarded by connectivity verification.
-- `messaging` provides root-backed shared message storage.
-- `chat` is a view over messaging storage.
-- `agent` stores agent sessions through the messaging-backed thread model.
-- `kv`, `valset`, `saga`, `directory`, and `greeter` support infrastructure,
-  examples, and tests.
+- `chat` is the storage-owning chat module: channels, threads, edits, reactions,
+  and membership as one QMDB record per entity, with hook fan-out to subscribed
+  modules.
+- `agent` is a pure state machine holding the agent registry, channel watches,
+  and run records.
+- `tasks` stores a small canonical task list with staged writes.
+- `vaults` replicates opaque secret ciphertext with owner-gated writes.
+- `inbox` stores per-member notification queues delivered as follow-up ops.
+- `automations` stores operator-defined rules that run over the chat hook seam.
+- `files` commits content-addressed file manifests; chunk bytes stay node-local.
+- `memory` is a filesystem-shaped shared agent workspace with immutable
+  generations.
+- `jobs` is a consensus-native work board with first-claim-wins claims.
+- `kv`, `valset`, `saga`, `governance`, `directory`, and `greeter` support
+  infrastructure, examples, and tests.
+
+## Inbox
+
+The inbox holds per-member notification queues as consensus state: a
+seq-numbered item list plus a read cursor per member. Writes go through
+`Deliver`, `MarkRead`, and `Clear`; reads through `List` and `Unread`. Caps are
+enforced at execute with rejection (a 64-byte `kind` cap, a 16 KiB `body` cap,
+bounded member count), with one deliberate exception: a delivery past the
+per-member item cap drops the oldest item deterministically — it is a
+notification queue, not a ledger.
+
+The distinctive mechanism is atomic-with-cause delivery. Other modules deliver
+notifications as follow-up ops, so a notification commits in the same block as
+the event that caused it (platform promise P2). There is no external push
+service — the queue is the delivery, which is also the air-gap-native
+notification story. Each item's `source` records the delivering origin — a
+module id, `ext:` plus lowercase hex for an external submitter, or `system` —
+derived by the module and never caller-supplied.
+
+## Automations
+
+Automations stores operator-defined rules — a trigger over chat post filters
+plus an action that posts a chat message or creates a task — alongside a bounded
+run-history ring. Rule administration goes through `CreateRule`, `SetEnabled`,
+and `DeleteRule`; reads through `ListRules`, `GetRule`, and `RunHistory`. Hook
+events are origin-gated: only `Origin::Module("chat")` reaches the hook arm, so
+a submitter cannot forge one.
+
+A rule fires only when the post author is a user. Posts authored by modules or
+agents — including this module's own follow-ups — never trigger rules, so an
+automation posting into a hooked channel cannot cascade. Each event has an
+action budget of eight, and every action is probed before it is emitted:
+host-routed queries verify that a target channel exists and that the composed
+message or task id is unused, closing the id-squatting move where a user
+pre-posts the composed id to wedge the rule. A failed probe or a failed
+message-text fetch downgrades to a run record with `action_ok = false` instead
+of aborting the posting user's block; whatever the probes cannot see still
+commits or aborts with the triggering post as one atomic unit (P2).
+
+## Files
+
+Files keeps two planes that never blur. The metadata control plane is consensus
+state: manifests keyed by `file_id`, each pinning the file name, size, ordered
+per-chunk sha256 digests, and a whole-file digest-of-digests. That is the only
+files state folded into the root and the only thing state sync transfers. The
+body store is node-local: chunk bytes keyed by their own sha256, never in the op
+stream and never in consensus. Writes go through `AddManifest` and
+`RemoveManifest`; reads through `Stat` and `List`; chunk bytes move peer-to-peer
+over a dedicated `serve_sync` lane. Size caps are enforced at execute with
+rejection, so an oversized value never enters the root preimage.
+
+The receiver contract makes a dishonest server harmless: every fetched chunk
+goes through `verify_chunk`, which checks both the sha256 digest and the exact
+length the manifest implies for that position. The length check is load-bearing,
+not belt-and-braces — digest equality alone would accept a zero-byte chunk whose
+digest matches and reconstruct the wrong file.
+
+## Memory
+
+Memory is a shared agent workspace shaped like a filesystem — the NoKV
+philosophy: agents want filesystems, not key-value stores. The namespace is a
+set of absolute paths with implicit directories; every file is a stack of
+immutable generations, and a publish is write-once — it appends the next
+generation rather than editing anything in place. A `(path, generation)` pair is
+a stable, hash-pinned reference that is never rebound or reused while anything
+still pins it. Writes go through `Publish`, `Delete`, `Snapshot`,
+`DropSnapshot`, `RegisterWatch`, and `UnregisterWatch`; reads are the
+progressive-disclosure verbs `Ls`, `Stat`, `Read`, `Find`, and `Grep`, and grep
+hits carry citable `duck://memory/<path>@<generation>#L<line>` evidence URIs.
+
+`Snapshot` pins the current path-to-generation mapping of the whole namespace —
+the mapping only, never a copy of the bodies. `Delete` retains any generation a
+snapshot still pins; a generation record is dropped exactly when neither a live
+file nor a snapshot references it. Watches subscribe a module to a canonical
+path prefix with segment-aware matching (`/a` matches `/a/b`, never `/ab`), and
+each successful publish emits one follow-up event per matching watcher in the
+same block (P2). Skills sharing rides the same namespace: a shared skill is a
+document under `/skills/<name>` with `kind=skill` meta, discovered with `Find`
+over `/skills/`.
+
+## Jobs
+
+Jobs is a consensus-native work board for on-platform actors: humans and agent
+fleets submitting ordinary signed ops. A submitter posts a job, any worker
+claims it, and exactly one claim wins by consensus order — the total order is
+the lock, and a losing claim fails its block loudly on every node; that
+rejection is the race-resolution signal. The lifecycle runs submit to pending,
+claim to processing under a view lease, then finalized as done or failed. Writes
+go through `Submit`, `Claim`, `Finalize`, `Release`, `Reclaim`, `Cancel`, and
+`Prune`; reads through `Get`, `List`, and `Counts`, answered from committed
+state only.
+
+Once a claim's view lease expires, anyone may `Reclaim` the job — the reclaim is
+permissionless — returning it to pending; attempts are capped at eight, and
+`Cancel` and `Prune` are submitter-only. Jobs is distinct from saga: jobs is the
+product work board for actors acting over signed RPC ops, while saga is the
+platform's reactor-effect ledger for off-consensus work the node's own worker
+loop performs. Jobs never touches saga or the reactor.
 
 ## Interface Shape
 
@@ -24,6 +132,8 @@ share typed messages and queries, not implementation APIs.
 ## Product Pressure
 
 The currently useful pressure points are clear from the checked-in modules:
-chat exercises live product reads over shared messaging storage, forge exercises
-authenticated project state, and agent sessions exercise the same storage and
-query boundaries that future worker-backed agents will need.
+chat exercises live product reads over QMDB-backed channel storage, forge
+exercises authenticated project state, and the module wave — inbox, automations,
+files, memory, jobs — exercises follow-up atomicity, hook fan-out, and the
+consensus-metadata/node-local-bytes split that fuller collaboration features
+will lean on.

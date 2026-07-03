@@ -19,15 +19,22 @@ The workspace is organized by platform layer.
 - `crates/system/kv`: QMDB byte-key value module.
 - `crates/system/valset`: ed25519 validator membership module.
 - `crates/system/saga`: deterministic continuation state for async workflows.
+- `crates/system/governance`: validator-set governance over valset.
 - `*-interface` crates: types-only payload and query surfaces.
 
 ## Apps
 
 - `crates/apps/forge`: git-backed project state.
 - `crates/apps/document`: block document state on QMDB.
-- `crates/apps/messaging`: root-backed shared message storage.
-- `crates/apps/chat`: chat view over messaging.
-- `crates/apps/agent`: agent sessions over the messaging-backed thread model.
+- `crates/apps/chat`: storage-owning chat module on QMDB, with hook fan-out.
+- `crates/apps/agent`: agent registry, channel watches, and run records.
+- `crates/apps/tasks`: small canonical task state.
+- `crates/apps/vaults`: replicated opaque secret ciphertext.
+- `crates/apps/inbox`: per-member notification queues delivered as follow-ups.
+- `crates/apps/automations`: operator rules over the chat hook seam.
+- `crates/apps/files`: consensus file manifests over node-local chunk bytes.
+- `crates/apps/memory`: filesystem-shaped shared agent workspace.
+- `crates/apps/jobs`: consensus-native work board.
 - app `*-interface` crates: legal cross-module payload surfaces.
 
 ## Examples and Binaries

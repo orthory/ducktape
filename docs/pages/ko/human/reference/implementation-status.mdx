@@ -14,17 +14,26 @@
 
 ## Module State
 
-- QMDB-backed module(`kv`, `document`)은 실제 authenticated root와 state-sync
-  target을 노출한다.
+- QMDB-backed module(`kv`, `document`, `chat`)은 실제 authenticated root와
+  state-sync target을 노출한다.
 - Forge는 git state에서 32바이트 state root를 계산하고 install 전에 object closure를
   verify한다.
-- Snapshot-style module(`valset`, `saga`, `tasks`, example `directory`)은 module에
-  맞는 canonical byte를 사용한다.
+- Snapshot-style module(`valset`, `saga`, `tasks`, `governance`, `vaults`,
+  `inbox`, `automations`, `files`, `memory`, `jobs`, example `directory`)은
+  module에 맞는 canonical byte를 사용한다.
 - system crate에는 validator-derived mesh control-plane type
   (`valset-mesh-interface`)과 WireGuard tunnel-upgrade protocol
   (`wireguard-upgrade`)도 있다.
 - chat(단일 storage-owning chat module; messaging/agent facade가 folded-in)은
-  workspace member지만 binary consumer는 아직 없다.
+  demo와 app daemon(`noded`)에 등록되어 있다.
+- module wave가 업무용 surface를 채운다: inbox는 notification을 원인과 같은
+  block에서 commit되는 follow-up op로 배달하고(P2), automations는
+  user-authored chat post를 operator rule로 평가하며 probe-before-emit
+  follow-up을 emit하고, files는 content-addressed manifest만 commit하며 chunk
+  byte는 digest-and-length verification 뒤 node-local에 남고, memory는 prefix
+  watch와 인용 가능한 `duck://` read를 갖춘 generation-pinned shared agent
+  workspace이고, jobs는 view lease와 permissionless reclaim을 가진
+  first-claim-wins work board다.
 
 ## Verification Surface
 

@@ -21,8 +21,9 @@ path therefore runs a full-closure connectivity walk before moving the ref.
 
 ## Snapshot Modules
 
-Valset, directory, saga, messaging-backed wrappers, and similar modules use
-canonical-byte snapshot/install paths where appropriate. The installer must
+Valset, directory, saga, and the state-based product modules (tasks, vaults,
+agent, inbox, automations, files, memory, jobs) use canonical-byte
+snapshot/install paths where appropriate. The installer must
 verify before mutating local state, so a malformed or incomplete snapshot cannot
 partially advance the root.
 

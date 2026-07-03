@@ -17,15 +17,22 @@ Use this map to find the authoritative surface before editing.
 - `crates/system/kv`: QMDB byte-key module.
 - `crates/system/valset`: validator membership state.
 - `crates/system/saga`: deterministic continuation state.
+- `crates/system/governance`: validator-set governance over valset.
 - `*-interface`: typed payload and query surfaces.
 
 ## Apps
 
 - `crates/apps/document`: QMDB document state.
 - `crates/apps/forge`: git-backed project state.
-- `crates/apps/messaging`: shared message storage.
-- `crates/apps/chat`: chat view.
-- `crates/apps/agent`: agent sessions over messaging-backed threads.
+- `crates/apps/chat`: storage-owning chat module with hook fan-out.
+- `crates/apps/agent`: agent registry, watches, run records.
+- `crates/apps/tasks`: small canonical task state.
+- `crates/apps/vaults`: replicated opaque secret ciphertext.
+- `crates/apps/inbox`: per-member notification queues.
+- `crates/apps/automations`: operator rules over the chat hook seam.
+- `crates/apps/files`: consensus manifests over node-local chunk bytes.
+- `crates/apps/memory`: filesystem-shaped shared agent workspace.
+- `crates/apps/jobs`: consensus-native work board.
 
 ## Docs
 
