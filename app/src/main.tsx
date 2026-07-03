@@ -14,6 +14,15 @@ import "@fontsource/ibm-plex-sans-kr/500.css";
 import "./console/theme/global.css";
 import { DucktapeConsole } from "./console/DucktapeConsole";
 
+// dev-only: connect the tauri-plugin-mcp guest bindings so the socket helper
+// (app/scripts/tauri-debug.mjs) can run JS / inspect the DOM in this webview.
+// screenshots work without it; the DOM/JS commands need it. never in release.
+if (import.meta.env.DEV) {
+  void import("tauri-plugin-mcp")
+    .then(({ setupPluginListeners }) => setupPluginListeners())
+    .catch(() => {});
+}
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <DucktapeConsole />

@@ -13,8 +13,27 @@
 mod daemon;
 
 fn main() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![daemon::daemon_spawn])
+    let mut builder = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![daemon::daemon_spawn]);
+
+    // dev-only debug bridge (tauri-plugin-mcp): opens a local unix socket so a
+    // helper can screenshot the window, run JS in the webview, and drive input —
+    // the way to see/verify the real native UI on a headless box. gated to
+    // debug + desktop; a release runtime never opens it. socket path overridable
+    // via DUCKTAPE_TAURI_MCP_SOCKET (default /tmp/tauri-mcp.sock).
+    #[cfg(all(debug_assertions, desktop))]
+    {
+        let socket_path = std::env::var_os("DUCKTAPE_TAURI_MCP_SOCKET")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/tauri-mcp.sock"));
+        builder = builder.plugin(tauri_plugin_mcp::init_with_config(
+            tauri_plugin_mcp::PluginConfig::new("ducktape".to_string())
+                .start_socket_server(true)
+                .socket_path(socket_path),
+        ));
+    }
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
