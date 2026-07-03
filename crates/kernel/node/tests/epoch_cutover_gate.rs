@@ -54,9 +54,11 @@ fn ceiling_discards_and_cutover_rebases_heights() {
         assert_eq!(get(&node, "k1").await.as_deref(), Some("v1"));
         assert_eq!(get(&node, "k2").await, None, "the past-ceiling frame is discarded");
         // the AGREED view still advances the engine clock (a node must be able
-        // to observe the views that carry it past its own cutover) — the
-        // boundary height moves while the app-hash records the discard.
-        assert_eq!(node.finalized().expect("boundary").height, 2);
+        // to observe the views that carry it past its own cutover), so
+        // last_engine_view moves to 2 — but the served BOUNDARY tracks the last
+        // NON-discarded frame (applied view 1), never the discarded view, so
+        // its height and app-hash stay consistent and never regress at cutover.
+        assert_eq!(node.finalized().expect("boundary").height, 1);
         assert_eq!(node.last_engine_view(), Some(2));
 
         // CUTOVER: fresh orderer (engine views restart at 0), app heights
