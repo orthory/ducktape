@@ -37,9 +37,14 @@ per worktree:  Xvfb :11x → tauri dev (isolated $HOME) → x11vnc 127.0.0.1:591
 
 - **One exposed port** (`:6090`). Every worktree's x11vnc binds `127.0.0.1`; the
   browser reaches them only through websockify's token router.
-- **Isolation**: each app runs with its own `$HOME`, so `~/.ducktape` (workspace
-  registry) and app-data don't collide. `CARGO_HOME`/`RUSTUP_HOME`/caches are
-  pinned to the real home so builds stay warm. Node ports auto-allocate.
+- **Isolation**: each app runs with its own `$HOME` AND `up_one` seeds a solo
+  workspace there (active, camelCase `registry.json`) + passes a stable
+  `DUCKTAPE_NODE_BIN` (staged outside `target/`, which `tauri dev`'s build.rs
+  clobbers to a 0-byte placeholder). The app then boots **LOCAL** on its own
+  node — not the shared `127.0.0.1:8844`. **Requires the worktree app to carry
+  PR #90** (StrictMode boot fix, on `dev`); worktrees behind `dev` boot REMOTE.
+  `CARGO_HOME`/`RUSTUP_HOME`/caches are pinned to the real home so builds stay
+  warm.
 - **Port bases** are offset from the single-instance `remote-tauri.sh`
   (`:99/5900/6080`) so both can run at once. Override with `FLEET_DISP_BASE`,
   `FLEET_VITE_BASE`, `FLEET_VNC_BASE`, `FLEET_WEB_PORT`, `FLEET_SCREEN`.

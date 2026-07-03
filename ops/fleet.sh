@@ -28,6 +28,7 @@ REAL_HOME="$HOME"
 PREFIX="$REAL_HOME/.local/opt/remote-tauri"
 STATE="$PREFIX/fleet"
 TOKENS="$STATE/tokens"
+NODE_BIN="$PREFIX/bin/ducktape-node"   # stable node bin, staged OUTSIDE any target/
 X11VNC="$PREFIX/root/usr/bin/x11vnc"
 XDO="$PREFIX/root/usr/bin/xdotool"
 NOVNC="$PREFIX/noVNC"
@@ -82,6 +83,47 @@ print(d[idv])
 PY
 }
 
+# ── isolation: stable node bin + a seeded solo workspace per instance ───
+# Without these the app boots REMOTE and every tile shares 127.0.0.1:8844. The
+# app must also carry PR #90 (StrictMode boot fix, on dev) to actually reach
+# LOCAL — worktrees behind dev boot REMOTE regardless.
+ensure_node_bin(){
+  [ -x "$NODE_BIN" ] && [ -s "$NODE_BIN" ] && return 0
+  mkdir -p "$(dirname "$NODE_BIN")"
+  log "staging ducktape-node (cargo build -p node-bin)…"
+  ( cd "$MAIN_ROOT" && cargo build -p node-bin >"$STATE/node-build.log" 2>&1 ) \
+    || { log "node-bin build FAILED — see $STATE/node-build.log"; return 1; }
+  # copy OUT of target/: tauri dev's build.rs overwrites target/debug/ducktape-node
+  # with a 0-byte placeholder, which spawns permission-denied.
+  cp "$MAIN_ROOT/target/debug/ducktape-node" "$NODE_BIN"
+  log "staged $NODE_BIN"
+}
+
+# Seed the isolated HOME's ~/.ducktape with a solo workspace, marked active, so
+# the app boots straight to LOCAL on its OWN node. registry.json is camelCase
+# (the Workspace/Registry structs are #[serde(rename_all="camelCase")]).
+seed_workspace(){
+  local id="$1" home="$2"
+  local reg="$home/.ducktape/registry.json" dir="$home/.ducktape/workspaces/$1"
+  [ -f "$reg" ] && return 0
+  mkdir -p "$dir"
+  local p1 p2 p3
+  read -r p1 p2 p3 < <(python3 -c "import socket
+s=[socket.socket() for _ in range(3)]
+[x.bind(('127.0.0.1',0)) for x in s]
+print(*[x.getsockname()[1] for x in s])
+[x.close() for x in s]")
+  local chain pub
+  chain="$("$NODE_BIN" init --name "$id" --dir "$dir" \
+    --listen 127.0.0.1:$p1 --advertised 127.0.0.1:$p1 --http 127.0.0.1:$p2 --rpc 127.0.0.1:$p3 \
+    2>/dev/null | tail -1)"
+  pub="$("$NODE_BIN" keygen --out "$dir/identity.key" 2>/dev/null | tail -1)"
+  cat >"$reg" <<JSON
+{"version":1,"active":"$id","workspaces":[{"id":"$id","name":"$id","chainId":"$chain","pubkey":"$pub","founder":true,"member":true,"ports":{"listen":$p1,"http":$p2,"rpc":$p3}}]}
+JSON
+  log "[$id] seeded solo workspace (own node http 127.0.0.1:$p2)"
+}
+
 # ── bring up ONE worktree instance ──────────────────────
 up_one(){
   local path="$1" branch="$2" id="$3"
@@ -91,6 +133,9 @@ up_one(){
   local app="$path/app"
   mkdir -p "$home" "$wsdir"
   log "[$id] slot $slot  disp $disp  vite $vite  vnc $vnc"
+
+  # real isolation: stage the node bin once + seed this instance's own workspace
+  ensure_node_bin && seed_workspace "$id" "$home"
 
   # Xvfb (setsid so it outlives the invoking shell / tool session)
   pgrep -f "Xvfb $disp " >/dev/null 2>&1 || \
@@ -124,6 +169,7 @@ JSON
       DISPLAY="$disp" WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
       LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11 \
       DUCKTAPE_TAURI_DEV_PORT="$vite" DUCKTAPE_TAURI_MCP_SOCKET="$mcp" \
+      DUCKTAPE_NODE_BIN="$NODE_BIN" \
       setsid dbus-run-session -- bunx tauri dev --config "$wsdir/no-before.json" --no-dev-server-wait \
       >"$wsdir/tauri.log" 2>&1 < /dev/null & )
     log "[$id] app starting (compiling if cold)…"
