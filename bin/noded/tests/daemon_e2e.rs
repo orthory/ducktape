@@ -166,6 +166,14 @@ impl Daemon {
         reply
     }
 
+    /// GET /metrics as raw OpenMetrics text (not json — the scrape body is a
+    /// text exposition, so reuse the byte lane and utf-8 decode it).
+    fn metrics(&self) -> String {
+        let (status, body) = self.request_bytes("GET", "/metrics", &[]);
+        assert_eq!(status, 200, "metrics failed");
+        String::from_utf8(body).expect("metrics body is utf-8")
+    }
+
     /// raw-byte request for the blob lane: returns status + the response body
     /// BYTES exactly as received. the json helpers above lossy-decode the
     /// whole response as utf-8, which would corrupt binary chunk bodies.
@@ -650,4 +658,52 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
         serde_json::from_value(reply["Stat"].clone()).expect("Stat carries the manifest");
     files_interface::verify_chunk(&manifest, 0, &fetched)
         .expect("fetched bytes verify against the committed manifest");
+}
+
+#[test]
+fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // at genesis the ducktape series are registered but a block-derived series
+    // like the height gauge has not been observed yet — commit one block first.
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "CreateChannel": { "channel_id": "general", "name": "General", "post_policy": "Open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    let text = daemon.metrics();
+    // the daemon's own series, registered into commonware's registry.
+    assert!(
+        text.contains("ducktape_blocks_total"),
+        "blocks counter present: {text}"
+    );
+    assert!(
+        text.contains("ducktape_block_height"),
+        "height gauge present"
+    );
+    assert!(
+        text.contains("ducktape_block_apply_latency_seconds"),
+        "latency histogram present",
+    );
+    // the per-dispatch counter carries the low-cardinality labels, and the
+    // block above dispatched chat as an external submit.
+    assert!(
+        text.contains("ducktape_dispatch_total") && text.contains("module=\"chat\""),
+        "labelled dispatch counter present: {text}",
+    );
+    // the same encode() also carries commonware's runtime metrics — proof the
+    // series share one registry — and closes with the OpenMetrics EOF sentinel.
+    assert!(
+        text.contains("runtime_"),
+        "commonware runtime metrics present too"
+    );
+    assert!(
+        text.trim_end().ends_with("# EOF"),
+        "OpenMetrics EOF terminator"
+    );
 }

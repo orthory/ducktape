@@ -101,6 +101,27 @@ are unchanged.
   onto `FleetNode`, render a `TelemetryFeed`). Deferred — each app is already
   visible live via VNC, and this keeps the PR a clean daemon↔console wire.
 
+## Phase 1.5 — Prometheus `/metrics` (shipped)
+
+A pull-based scrape surface for operators (Grafana/alerting), complementary to
+the live in-app view. commonware's runtime already keeps a `prometheus-client`
+registry and its `Metrics` trait exposes `register(...)` + `encode()`, so the
+daemon registers its own series **into that registry** and one `context.encode()`
+serves everything:
+
+- `GET /metrics` on `noded` (root path, scrape convention) → OpenMetrics text via
+  a `NodeCommand::Metrics` round-trip (the actor owns the commonware context that
+  holds the registry).
+- Ducktape series, folded per committed block in `submit_one`:
+  `ducktape_block_height` (gauge), `ducktape_blocks_total` (counter),
+  `ducktape_block_apply_latency_seconds` (histogram),
+  `ducktape_dispatch_total{module,origin}` (counter — `origin` is the
+  low-cardinality kind: external/module/system).
+- The same endpoint also serves commonware's runtime metrics (one shared
+  registry). `bin/node` (the validator) serves its runtime registry too, but the
+  block-derived `ducktape_*` series are the local daemon's surface only.
+- No new direct dependency — all via `commonware_runtime::telemetry::metrics`.
+
 ## Phase 2 — On-consensus telemetry module (deferred)
 
 New crates `crates/apps/telemetry` + `telemetry-interface`, modeled on `inbox`.
@@ -145,5 +166,6 @@ only in the consensus module.
 
 ## Explicitly not built (either phase)
 
-External OTel/Prometheus export, distributed tracing spans, cross-node
+OTLP push to an OpenTelemetry collector, distributed tracing spans, cross-node
 aggregation, governance-tuned retention, per-event cross-plane seq join.
+(Prometheus `/metrics` pull shipped in Phase 1.5.)

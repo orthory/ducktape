@@ -196,6 +196,13 @@ pub enum NodeCommand {
     Status {
         reply: oneshot::Sender<NodeStatus>,
     },
+    /// encode the runtime's Prometheus registry (commonware runtime metrics plus
+    /// the daemon's own `ducktape_*` series) to the OpenMetrics text exposition.
+    /// the actor owns the commonware context that holds the registry, so this,
+    /// like every other read, crosses the command lane.
+    Metrics {
+        reply: oneshot::Sender<String>,
+    },
 }
 
 /// the router's shared state: a command lane into the node actor, the
@@ -293,6 +300,8 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
         .route("/v1/telemetry", get(telemetry))
+        // Prometheus scrape convention: root `/metrics`, not under `/v1`.
+        .route("/metrics", get(metrics))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
         .route(
@@ -395,6 +404,28 @@ async fn telemetry(
 ) -> Response {
     let frames = handle.telemetry.recent(params.limit);
     Json(serde_json::json!({ "frames": frames })).into_response()
+}
+
+/// the OpenMetrics content type a Prometheus scraper negotiates for `/metrics`.
+const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+
+/// GET /metrics — the Prometheus scrape surface. the actor encodes the
+/// commonware runtime registry (which the daemon's `ducktape_*` series are
+/// registered into) to OpenMetrics text and hands it back over the command lane.
+async fn metrics(State(handle): State<NodeHandle>) -> Response {
+    let (reply, rx) = oneshot::channel();
+    if let Err(resp) = handle.send(NodeCommand::Metrics { reply }).await {
+        return resp;
+    }
+    match rx.await {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, OPENMETRICS_CONTENT_TYPE)],
+            body,
+        )
+            .into_response(),
+        Err(_) => actor_gone(),
+    }
 }
 
 async fn shutdown(State(handle): State<NodeHandle>) -> Response {
