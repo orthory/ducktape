@@ -1,4 +1,4 @@
 interface:
   display_name: "Plan"
-  short_description: "Plan judgment-heavy repo work before editing."
-  default_prompt: "Use $plan before writing or changing code in Ducktape, especially for multi-step work or delegation decisions."
+  short_description: "Fable plans; Opus 4.8 / GPT-5.5 xhigh implement."
+  default_prompt: "Use $plan before writing or changing code in Ducktape: Fable owns architecture, planning, and research, then dispatches coding and testing to the Opus 4.8 xhigh / GPT-5.5 xhigh implementer tiers."
