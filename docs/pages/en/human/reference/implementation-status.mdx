@@ -13,12 +13,16 @@ This status page is grounded in checked-in code, tests, and binaries.
 - `node` bridges host application to transport and ordered delivery. Op frames
   are ed25519-signed and verified on decode, so an applied op's origin is
   authenticated authorship. `OrderedNode` supports epoch cutover (engine
-  respawn with a deterministic discard ceiling and rebased app heights).
+  respawn with a deterministic discard ceiling and rebased app heights) and an
+  observation barrier: drain batches end at a watched module's root change, so
+  membership changes are observed at the same view on every validator.
 - `consensus` contains the commonware Simplex-backed orderer with bounded
   payload memory (pinned own submissions, FIFO-capped peer cache) and the
-  `ValsetOrchestrator` for epoch scheduling.
-- `statesync` defines the network state-sync wire protocol (manifest, chunked
-  snapshots, remote qmdb resolver) and the p2p transport binding.
+  `ValsetOrchestrator` for epoch scheduling — cutovers armed at the changing
+  block's view, the next participant set read from state at the boundary.
+- `statesync` defines the network state-sync wire protocol (manifest with the
+  boundary's consensus coordinates and finalization floor, chunked snapshots,
+  remote qmdb resolver) and the p2p transport binding.
 - `reactor` closes the non-deterministic worker boundary by submitting worker
   results as ordinary messages.
 
@@ -53,11 +57,16 @@ This status page is grounded in checked-in code, tests, and binaries.
   with SIGKILL and shuts it down gracefully; each respawn over the same storage
   dir recovers the byte-identical app-hash without re-running genesis and keeps
   finalizing over its reopened consensus journal.
+- `cargo test -p node-bin --test invite_e2e` proves invite-after-genesis over
+  real sockets: an uninvited key parks on the mesh, a member's `invite-accept`
+  passes governance, the epoch cutover re-tracks the mesh, and the joiner syncs
+  and promotes itself into a voting validator — both onto a stalled solo
+  network (epoch genesis floor) and onto a live 3-validator quorum (mid-epoch
+  boundary with its served finalization floor certificate).
 
 ## Still Open
 
-- A demoted validator degrading to a sync-server rather than halting, and a
-  synced joiner auto-promoting to a live validator at an epoch boundary.
+- A demoted validator degrading to a sync-server rather than halting.
 - Per-origin replay nonces in state (cross-epoch frame replay currently gated by
   the per-engine finalization dedup).
 - Origin-bound message authorship, the agent reactor-worker seam, and the

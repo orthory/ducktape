@@ -164,6 +164,84 @@ impl Cluster {
         self.nodes[idx] = None; // NodeProc::drop kills + waits
     }
 
+    /// the deterministic path of node `idx`'s config file (written by a prior
+    /// [`Self::spawn`] / [`Self::spawn_joiner`]) — for verbs that read it.
+    pub fn config_file(&self, idx: usize) -> PathBuf {
+        self.dir
+            .path()
+            .join(format!("node{}.toml", self.peer_ids[idx]))
+    }
+
+    /// spawn an UNINVITED joiner: identity seed `id`, deliberately absent
+    /// from every existing member's `peer_seeds` — the mesh refuses it until
+    /// governance admits it and the epoch cutover re-tracks. its own config
+    /// lists the CURRENT members as mesh + validators (the invite descriptor
+    /// a real joiner receives). rpc/http ports are allocated so the node can
+    /// be driven after it promotes itself. call this AFTER every member
+    /// spawn — it appends to the cluster index space.
+    ///
+    /// returns the joiner's cluster index.
+    pub fn spawn_joiner(&mut self, id: u64) -> usize {
+        let ports = alloc_ports(3);
+        let path = self.dir.path().join(format!("node{id}.toml"));
+        let mut cfg = String::new();
+        cfg.push_str(&format!("id = {id}\n"));
+        cfg.push_str(&format!("listen = \"127.0.0.1:{}\"\n", ports[0]));
+        cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
+        cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
+        cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
+        cfg.push_str(&format!(
+            "bootstrapper_addr = \"127.0.0.1:{}\"\n",
+            self.p2p_ports[0]
+        ));
+        cfg.push_str(&format!(
+            "storage_dir = {:?}\n",
+            self.dir
+                .path()
+                .join(format!("storage-{id}"))
+                .to_str()
+                .unwrap()
+        ));
+        cfg.push_str(&format!("rpc_listen = \"127.0.0.1:{}\"\n", ports[1]));
+        cfg.push_str(&format!("http_listen = \"127.0.0.1:{}\"\n", ports[2]));
+        std::fs::write(&path, cfg).expect("write joiner config");
+
+        let log = self.dir.path().join(format!("node{id}.log"));
+        let out = std::fs::File::create(&log).expect("create joiner log");
+        let err = out.try_clone().expect("clone joiner log handle");
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .arg("--config")
+            .arg(&path)
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("spawn joiner node");
+
+        self.peer_ids.push(id);
+        self.p2p_ports.push(ports[0]);
+        self.rpc_ports.push(ports[1]);
+        self.http_ports.push(ports[2]);
+        self.nodes.push(Some(NodeProc { id, child, log }));
+        self.peer_ids.len() - 1
+    }
+
+    /// run a ducktape-node VERB (invite-accept, admit, ...) to completion and
+    /// return (success, combined output).
+    pub fn run_verb(&self, args: &[&str]) -> (bool, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(args)
+            .output()
+            .expect("run ducktape-node verb");
+        (
+            out.status.success(),
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    }
+
     /// wait for node `idx` to exit ON ITS OWN (a graceful shutdown path) and
     /// reap it — the counterpart of [`Self::kill`] for restart tests.
     pub fn wait_exit(&mut self, idx: usize, timeout: Duration) {

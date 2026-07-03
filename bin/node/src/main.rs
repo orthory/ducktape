@@ -952,16 +952,16 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             .map(String::as_str)
             .unwrap_or("node.toml"),
     );
-    let (raw, base) = config::load_node_toml(&cfg_path)?;
-    let rpc_addr = raw
+    // full config resolution (network- or dev-shape) so the verb derives the
+    // SAME identity the running node signs with — the ballots this verb
+    // casts are signed by the NODE (the ordered lane signs every rpc
+    // submit), and that key must be the member.
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
         .rpc_listen
         .clone()
         .ok_or("invite-accept drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    // the ballots this verb casts are signed by the NODE's identity (the
-    // ordered lane signs every rpc submit with it) — that key must be the
-    // member, and it is: the node is the local operator's custodian.
-    let me = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
-    let me_bytes = me.public_key().as_ref().to_vec();
+    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
