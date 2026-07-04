@@ -520,6 +520,66 @@ pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Re
     .map(|_| ())
 }
 
+/// leave a network: drive this node's on-chain SELF-removal, stop its node, and
+/// forget the workspace locally. the honest self-departure counterpart to
+/// [`workspace_admit`]/[`workspace_demote`], in three best-effort steps:
+///   1. `member-leave` over the running node's rpc so the set learns we're
+///      going — it opens a RemoveValidator proposal for OUR OWN key and casts
+///      our yes-ballot (PENDING until a strict majority of the remaining
+///      members approve; see the `member-leave` node verb).
+///   2. stop the node (POST /v1/shutdown to its http surface) so it stops
+///      counting toward quorum and releases the storage dir.
+///   3. delete the workspace directory and drop its registry entry, repointing
+///      `active` to another workspace (or clearing it) when it pointed here.
+///
+/// steps 1–2 are best-effort: a node already down, an unreachable set, or an
+/// already-departed key must NOT strand the local teardown — forgetting the
+/// workspace is the whole point of leaving. returns the newly-active workspace
+/// (if the registry repointed to one) so the caller can connect to it; `None`
+/// means no workspaces remain.
+#[tauri::command]
+pub fn workspace_leave(app: tauri::AppHandle, id: String) -> Result<Option<Workspace>, String> {
+    let mut reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?.clone();
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+
+    // 1. best-effort self-removal so the remaining members learn we're leaving.
+    if let Ok(node_bin) = crate::daemon::resolve_node_bin() {
+        let cfg = node_toml(&dir);
+        if let Err(err) = run_verb(
+            &node_bin,
+            &["member-leave", "--config", &cfg.to_string_lossy()],
+        ) {
+            // a down node / unreachable set is expected here — log, don't fail.
+            eprintln!("workspace_leave: member-leave for {id:?} did not complete: {err}");
+        }
+    }
+
+    // 2. stop the node so nothing keeps running or holds the storage dir open.
+    stop_node(ws.ports.http);
+
+    // 3. delete the directory, then drop the registry entry and repoint active.
+    // a failed rmdir (e.g. a still-open file on windows) must not block
+    // forgetting the workspace — the registry entry removal is what matters.
+    if dir.exists() {
+        if let Err(err) = fs::remove_dir_all(&dir) {
+            eprintln!("workspace_leave: could not remove {dir:?}: {err}");
+        }
+    }
+    reg.workspaces.retain(|w| w.id != ws.id);
+    if reg.active.as_deref() == Some(&ws.id) {
+        reg.active = reg.workspaces.first().map(|w| w.id.clone());
+    }
+    save_registry(&app, &reg)?;
+
+    let next = reg
+        .active
+        .as_ref()
+        .and_then(|active| reg.workspaces.iter().find(|w| &w.id == active))
+        .cloned();
+    Ok(next)
+}
+
 /// make `id` active and ensure its node is running; return the http url the
 /// webview should dial. adopts an already-listening node (idempotent across
 /// re-selects and the promotion exec-reboot) instead of double-spawning.
@@ -650,6 +710,29 @@ fn port_listening(port: u16) -> bool {
     use std::time::Duration;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+/// best-effort "stop this node": POST /v1/shutdown to its http surface over a
+/// raw tcp write. the shell tracks no pid — the port IS the node's identity
+/// (mirroring the webview's `shutdownNode` in node-bootstrap.ts), and the node
+/// exits the whole process on this route. a node already down, or a parked
+/// joiner that serves no http, just fails the connect — which is fine, this is
+/// best-effort teardown.
+fn stop_node(http_port: u16) {
+    use std::io::Write as _;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let addr = SocketAddr::from(([127, 0, 0, 1], http_port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let req = format!(
+        "POST /v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let _ = stream.write_all(req.as_bytes());
+    let _ = stream.flush();
 }
 
 #[cfg(test)]
