@@ -14,7 +14,7 @@ pub mod simnat;
 pub mod wire;
 
 pub use client::{NatClient, run_coordinator};
-pub use coordinator::Coordinator;
+pub use coordinator::{Coordinator, Side};
 #[cfg(any(test, feature = "simnat"))]
 pub use punch::{PunchError, PunchPlan};
 pub use wire::{Msg, NodeKey, WireError};
