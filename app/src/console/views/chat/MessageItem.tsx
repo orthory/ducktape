@@ -11,6 +11,7 @@ import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../../../domain/chat-client";
 import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
 import { blocksToInput } from "./chat-input";
+import { EmojiPicker } from "./EmojiPicker";
 import { HoverButton } from "./HoverButton";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -76,6 +77,16 @@ function TrashGlyph({ size = 13 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
       <path d="M5 7h14M10 7V5.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V7M6.5 7l.8 11a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-11" />
+    </svg>
+  );
+}
+
+function AddReactGlyph({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M20 12a8 8 0 1 1-4.5-7.2" />
+      <path d="M9 10h.01M14.5 10h.01M8.5 14.5a4 4 0 0 0 5.2.6" />
+      <path d="M18 3.5v5M15.5 6h5" />
     </svg>
   );
 }
@@ -231,10 +242,12 @@ function ReactionsRow({
   message,
   selfKey,
   onReact,
+  onAddReaction,
 }: {
   message: MessageView;
   selfKey: string;
   onReact: (emoji: string) => void;
+  onAddReaction: () => void;
 }) {
   if (message.reactions.length === 0) return null;
   return (
@@ -264,6 +277,27 @@ function ReactionsRow({
           </HoverButton>
         );
       })}
+      <HoverButton
+        onClick={(event) => {
+          event.stopPropagation();
+          onAddReaction();
+        }}
+        title="Add a reaction"
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 26,
+          padding: "2px 0",
+          borderRadius: 999,
+          border: `1px solid ${color.borderSoft}`,
+          background: color.paper,
+          color: color.muted2,
+        }}
+        hoverStyle={{ background: color.hover, color: color.muted3 }}
+      >
+        <AddReactGlyph size={13} />
+      </HoverButton>
     </div>
   );
 }
@@ -647,11 +681,13 @@ function OverflowMenu({
 
 function HoverBar({
   onQuickReact,
+  onOpenPicker,
   onOpenThread,
   onMoreToggle,
   threadable,
 }: {
   onQuickReact: (emoji: string) => void;
+  onOpenPicker: () => void;
   onOpenThread: () => void;
   onMoreToggle: () => void;
   threadable: boolean;
@@ -693,6 +729,17 @@ function HoverBar({
           {emoji}
         </HoverButton>
       ))}
+      <HoverButton
+        title="Pick a reaction"
+        onClick={(event) => {
+          event.stopPropagation();
+          onOpenPicker();
+        }}
+        style={btnStyle}
+        hoverStyle={{ background: color.hover }}
+      >
+        <AddReactGlyph size={15} />
+      </HoverButton>
       <div style={{ width: 1, height: 16, background: color.borderSoft, margin: "0 2px" }} />
       {threadable && (
         <HoverButton
@@ -763,6 +810,7 @@ export function MessageItem({
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   const startEdit = () => {
     setConfirmingDelete(false);
@@ -775,8 +823,10 @@ export function MessageItem({
     setEditing(false);
   };
   // Hide the hover bar while editing/confirming so the row's action UI is the
-  // sole focus and the floating bar can't overlap the textarea.
-  const showBar = (hovered || menuOpen) && !deleted && !editing && !confirmingDelete;
+  // sole focus and the floating bar can't overlap the textarea. An open menu or
+  // emoji picker keeps the bar (and row highlight) up even as the pointer leaves.
+  const active = hovered || menuOpen || pickerOpen;
+  const showBar = active && !deleted && !editing && !confirmingDelete;
 
   return (
     <div
@@ -793,7 +843,7 @@ export function MessageItem({
         maxWidth: "calc(100% + 16px)",
         boxSizing: "border-box",
         minWidth: 0,
-        background: hovered || menuOpen ? color.sunken : "transparent",
+        background: active ? color.sunken : "transparent",
       }}
     >
       <div style={{ width: 30, flexShrink: 0, display: "flex", justifyContent: "center", paddingTop: 1 }}>
@@ -860,7 +910,14 @@ export function MessageItem({
             onCancel={() => setConfirmingDelete(false)}
           />
         )}
-        {!deleted && !editing && <ReactionsRow message={message} selfKey={selfKey} onReact={onReact} />}
+        {!deleted && !editing && (
+          <ReactionsRow
+            message={message}
+            selfKey={selfKey}
+            onReact={onReact}
+            onAddReaction={() => setPickerOpen(true)}
+          />
+        )}
         {!deleted && !editing && threadable && replyCount > 0 && (
           <ThreadIndicator replyCount={replyCount} replyHint={replyHint} onClick={onOpenThread} />
         )}
@@ -868,9 +925,19 @@ export function MessageItem({
       {showBar && (
         <HoverBar
           onQuickReact={onReact}
+          onOpenPicker={() => {
+            onMenuToggle(false);
+            setPickerOpen(true);
+          }}
           onOpenThread={onOpenThread}
           onMoreToggle={() => onMenuToggle(!menuOpen)}
           threadable={threadable}
+        />
+      )}
+      {pickerOpen && (
+        <EmojiPicker
+          onPick={(emoji) => onReact(emoji)}
+          onClose={() => setPickerOpen(false)}
         />
       )}
       {menuOpen && (
