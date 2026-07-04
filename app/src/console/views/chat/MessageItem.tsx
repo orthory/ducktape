@@ -802,6 +802,9 @@ export function MessageItem({
   threadable?: boolean;
 }) {
   const author = authorName(message.head.author, names);
+  // An unresolved key handle ("4c3a9460…") reads better in mono + muted so it
+  // isn't mistaken for a chosen display name; a real name stays sans + ink.
+  const unresolvedKey = /^[0-9a-f]{8}…$/.test(author);
   const deleted = message.head.deleted;
   const replyCount = message.head.reply_count;
   // A message we authored can be edited/deleted — the module rejects the write
@@ -859,9 +862,10 @@ export function MessageItem({
         {groupStart && (
           <div style={{ display: "flex", alignItems: "baseline", gap: 7, minWidth: 0, flexWrap: "wrap", rowGap: 2 }}>
             <span
+              title={unresolvedKey ? "Member without a display name yet" : undefined}
               style={{
-                font: `600 13px ${font.sans}`,
-                color: color.ink,
+                font: unresolvedKey ? `500 12px ${font.mono}` : `600 13px ${font.sans}`,
+                color: unresolvedKey ? color.muted3 : color.ink,
                 minWidth: 0,
                 overflow: "hidden",
                 textOverflow: "ellipsis",
