@@ -29,6 +29,7 @@ members = [
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
     "crates/apps/document", "crates/apps/document-interface",
+    "crates/apps/pages", "crates/apps/pages-interface",
     "crates/apps/chat", "crates/apps/chat-interface",
     "crates/apps/agent", "crates/apps/agent-interface", "crates/apps/agent-oracle",
     "crates/apps/tasks", "crates/apps/tasks-interface",
@@ -92,6 +93,7 @@ upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
+pages = { path = "crates/apps/pages" }
 chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }
 agent-oracle = { path = "crates/apps/agent-oracle" }
@@ -115,6 +117,7 @@ wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
+pages-interface = { path = "crates/apps/pages-interface" }
 chat-interface = { path = "crates/apps/chat-interface" }
 agent-interface = { path = "crates/apps/agent-interface" }
 tasks-interface = { path = "crates/apps/tasks-interface" }

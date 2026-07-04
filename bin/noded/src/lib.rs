@@ -167,7 +167,7 @@ impl ModuleCategory {
     /// or unknown module always groups sensibly rather than breaking the view.
     pub fn of(id: &str) -> Self {
         match id {
-            "chat" | "tasks" | "inbox" | "document" => Self::Workspace,
+            "chat" | "tasks" | "inbox" | "document" | "pages" => Self::Workspace,
             "forge" | "agent" => Self::Developer,
             "automations" | "jobs" => Self::Automation,
             _ => Self::System,
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn module_categories_group_the_genesis_set() {
         use ModuleCategory::*;
-        for id in ["chat", "tasks", "inbox", "document"] {
+        for id in ["chat", "tasks", "inbox", "document", "pages"] {
             assert_eq!(ModuleCategory::of(id), Workspace, "{id}");
         }
         for id in ["forge", "agent"] {

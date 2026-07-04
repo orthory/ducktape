@@ -118,9 +118,18 @@ export const requestLeaveWorkspace = (id: string): Promise<void> =>
  *  validator of a set of two-or-more (tearing it down would halt quorum and
  *  strand its pending removal). Safe once removed (no longer in the valset) or
  *  for a solo network only this node runs. Resolves to the newly-active
- *  workspace the registry repointed to, or null when none remain. */
-export const forgetWorkspace = (id: string): Promise<Workspace | null> =>
-  invoke<Workspace | null>("workspace_forget", { id });
+ *  workspace the registry repointed to, or null when none remain.
+ *
+ *  `force` is the escape hatch for a workspace whose node can NEVER come up (a
+ *  bricked recovery — the guard can't reach it to confirm anything, so it stays
+ *  un-removable). It overrides ONLY the "can't confirm the node left" refusal;
+ *  the backend still refuses to force-tear-down a node it can REACH and that
+ *  proves it is a live multi-member validator. */
+export const forgetWorkspace = (
+  id: string,
+  force = false,
+): Promise<Workspace | null> =>
+  invoke<Workspace | null>("workspace_forget", { id, force });
 
 /** Make a workspace active and ensure its node is running; returns the http
  *  url to dial. Idempotent — adopts an already-listening node. */

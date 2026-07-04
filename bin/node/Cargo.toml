@@ -37,6 +37,7 @@ upgrade-interface = { workspace = true }
 saga = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
+pages = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }

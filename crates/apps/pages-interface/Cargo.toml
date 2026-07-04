@@ -1,0 +1,9 @@
+[package]
+name = "pages-interface"
+edition.workspace = true
+version.workspace = true
+
+# types-only: the wire surface of the pages module. NO logic, NO sdk dep.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

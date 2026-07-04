@@ -58,6 +58,13 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M9.5 12h5M9.5 15.5h5" />
     </>
   ),
+  pages: (
+    <>
+      <path d="M8.5 3.5h6l3.5 3.5v10.5h-9.5z" />
+      <path d="M14.5 3.5V7H18" />
+      <path d="M5.5 7v11.5a2 2 0 0 0 2 2H15" />
+    </>
+  ),
   agent: (
     <>
       <rect x="5" y="8" width="14" height="11" rx="3" />

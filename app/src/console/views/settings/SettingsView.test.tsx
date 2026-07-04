@@ -150,6 +150,33 @@ describe("SettingsView", () => {
     confirm.mockRestore();
   });
 
+  it("hides force-forget until a guarded forget reveals it", () => {
+    // Default: the guarded forget hasn't failed, so no force override is offered.
+    renderSettings();
+    expect(
+      screen.queryByRole("button", { name: /force forget workspace/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("force-forgets when the guarded attempt couldn't confirm the node left", () => {
+    // forgetNeedsForce is set by the store when a guarded forget can't reach the
+    // node (bricked / won't start). The override then appears and forces past the
+    // liveness guard.
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { spies } = renderSettings({ forgetNeedsForce: true });
+
+    const force = screen.getByRole("button", {
+      name: /force forget workspace/i,
+    });
+    expect(force).toBeEnabled();
+    fireEvent.click(force);
+    expect(confirm).toHaveBeenCalledOnce();
+    // Forces past the guard: forgetWorkspace(true).
+    expect(spies.forgetWorkspace).toHaveBeenCalledWith(true);
+
+    confirm.mockRestore();
+  });
+
   it("does not lock a validator out of leaving during the cold-start window", () => {
     // Before the first roster query hydrates state.members it is []. A real
     // member must NOT be locked out of request-leave (or forget) just because

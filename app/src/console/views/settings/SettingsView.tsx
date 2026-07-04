@@ -710,6 +710,29 @@ function DangerZone() {
     actions.forgetWorkspace();
   };
 
+  // Revealed only after a guarded forget couldn't confirm the node left its
+  // valset — i.e. the node won't come up (a bricked recovery). Force skips that
+  // liveness check so a workspace whose node can never start is still removable.
+  // The backend still refuses to force-tear-down a node it CAN reach and that
+  // proves it's a live multi-member validator, so this can't silently halt a
+  // healthy network — but for a node that may still be one elsewhere, the honest
+  // warning puts the call in the user's hands.
+  const forceForget = (): void => {
+    const name = state.workspace?.name ?? "this workspace";
+    const ok = window.confirm(
+      `Force-forget "${name}"?\n\n` +
+        `The node couldn't confirm it has left its validator set — usually ` +
+        `because it can't start (a corrupt / bricked local state). Forcing ` +
+        `deletes the workspace WITHOUT that confirmation: its directory, ` +
+        `identity key, and registry entry are removed for good.\n\n` +
+        `Only do this for a network you know is solo or defunct. If this node ` +
+        `is still a validator of a network with OTHER live members, destroying ` +
+        `its identity can PERMANENTLY halt that network. This cannot be undone.`,
+    );
+    if (!ok) return;
+    actions.forgetWorkspace(true);
+  };
+
   return (
     <>
       <SectionLabel danger>DANGER ZONE</SectionLabel>
@@ -747,6 +770,24 @@ function DangerZone() {
           onClick={forget}
           disabled={base}
         />
+        {state.forgetNeedsForce && !base ? (
+          <DangerRow
+            title="Force-forget (node won’t start)"
+            detail={
+              <>
+                The guarded forget couldn’t confirm this node has left its
+                validator set — usually because it can’t start. Force skips that
+                check and deletes the workspace (directory, identity key, registry
+                entry). Only for a solo or defunct network — if this node is still
+                a live validator elsewhere, this can permanently halt it.
+              </>
+            }
+            buttonLabel="Force forget"
+            ariaLabel="Force forget workspace"
+            onClick={forceForget}
+            disabled={base}
+          />
+        ) : null}
       </div>
     </>
   );

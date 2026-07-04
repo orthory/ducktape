@@ -17,6 +17,7 @@ import type {
   GrepHit,
   LsEntry,
 } from "../../domain/memory-client";
+import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
@@ -80,6 +81,16 @@ export interface ConsoleState {
   /** Ordered blocks of the active doc (re-queried per block / on open). */
   activeDocBlocks: Block[];
 
+  // ── Pages (block-tree notebook over the `pages` module) ──
+  /** Every page (id + live title), from ListPages, re-queried per block.
+   *  Empty when the node predates the pages module. */
+  pages: PageMeta[];
+  /** The page whose block tree is loaded, or null when none is open. */
+  activePage: string | null;
+  /** Preorder blocks of the active page — root first — re-queried per block /
+   *  on open. The view derives depth/indent from the parent links. */
+  activePageBlocks: PageBlock[];
+
   // ── Agents ──
   /** Every registered agent, re-queried per block like tasks. */
   agents: AgentRecord[];
@@ -136,6 +147,10 @@ export interface ConsoleState {
   needsOnboarding: boolean;
   /** An onboarding step is running (create/join/select) — disables the gate. */
   onboardingBusy: boolean;
+  /** The last guarded forget couldn't confirm the node left its valset (node
+   *  down/bricked) — reveal the force-forget override so a workspace whose node
+   *  can never start is still removable. Cleared on any fresh forget attempt. */
+  forgetNeedsForce: boolean;
   /** A joiner's live park→promote phase while its node is not yet a ready
    *  validator; null on the founder/member path and once the node answers. */
   onboardingPhase: PhaseReport | null;
@@ -228,6 +243,9 @@ export const createInitialState = (): ConsoleState => {
     docIds: [],
     activeDoc: null,
     activeDocBlocks: [],
+    pages: [],
+    activePage: null,
+    activePageBlocks: [],
     agents: [],
     watches: [],
     runs: [],
@@ -247,6 +265,7 @@ export const createInitialState = (): ConsoleState => {
     workspace: null,
     needsOnboarding: false,
     onboardingBusy: false,
+    forgetNeedsForce: false,
     onboardingPhase: null,
     inviteBlob: null,
   };
@@ -265,6 +284,8 @@ export interface ConsoleSnapshot {
   authorNames: Record<string, string>;
   docIds: string[];
   activeDocBlocks: Block[];
+  pages: PageMeta[];
+  activePageBlocks: PageBlock[];
   agents: AgentRecord[];
   watches: WatchView[];
   runs: RunView[];
@@ -293,6 +314,8 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   authorNames: snapshot.authorNames,
   docIds: snapshot.docIds,
   activeDocBlocks: snapshot.activeDocBlocks,
+  pages: snapshot.pages,
+  activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
   watches: snapshot.watches,
   runs: snapshot.runs,
