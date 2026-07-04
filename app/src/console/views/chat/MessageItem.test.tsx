@@ -79,6 +79,16 @@ describe("MessageItem edit/delete", () => {
     expect(onEdit).toHaveBeenCalledWith("edited body");
   });
 
+  it("seeds the inline editor with re-editable source for a code-block message", () => {
+    const codeMessage = msg(ownAuthor, "", { blocks: [{ Code: { lang: "ts", text: "const a = 1;" } }] });
+    render(<MessageItem {...baseProps} message={codeMessage} />);
+
+    fireEvent.click(screen.getByText("Edit message"));
+    const editor = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(editor.value).toContain("```ts");
+    expect(editor.value).toContain("const a = 1;");
+  });
+
   it("requires a confirm step before deleting", () => {
     const onDelete = vi.fn();
     render(<MessageItem {...baseProps} onDelete={onDelete} message={msg(ownAuthor, "bye")} />);
