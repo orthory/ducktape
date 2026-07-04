@@ -2,6 +2,7 @@
 //! untrusted coordinator. No WireGuard, no consensus — the reachability
 //! primitive under the private-cutover epic.
 
+pub mod client;
 pub mod coordinator;
 // `punch` depends on `simnat::SimNat` directly in its (non-test) API, so it is
 // gated identically: available under test cfg or the `simnat` feature, never
@@ -12,6 +13,7 @@ pub mod punch;
 pub mod simnat;
 pub mod wire;
 
+pub use client::{NatClient, run_coordinator};
 pub use coordinator::Coordinator;
 #[cfg(any(test, feature = "simnat"))]
 pub use punch::{PunchError, PunchPlan};
