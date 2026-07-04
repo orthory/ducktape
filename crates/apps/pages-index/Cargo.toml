@@ -1,0 +1,16 @@
+# pages' materialized view on the derived tier: full-text block search over
+# the page tree. depends on the indexer contract and pages' types-only
+# interface — NEVER the module impl.
+[package]
+name = "pages-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexer = { workspace = true }
+pages-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

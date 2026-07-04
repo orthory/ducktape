@@ -35,6 +35,8 @@
 //! watermark's contiguity promise, and a derived tier's honest recovery is a
 //! rebuild, not a patch.
 
+pub mod search;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,6 +77,10 @@ pub enum Error {
     /// a view request the module's mapper could not parse or serve.
     #[error("indexer: view: {0}")]
     View(String),
+    /// a mapper failed folding an APPLIED op — interface drift or a damaged
+    /// row; poisons the store, because guessing would silently skew the view.
+    #[error("indexer: mapper: {0}")]
+    Mapper(String),
     /// a [`ModuleIndexer`] tried to write into a reserved key space.
     #[error("indexer: derived write into reserved key {key:?} for module {module:?}")]
     ReservedKey { module: String, key: String },
@@ -324,8 +330,11 @@ pub trait ModuleIndexer: Send + Sync {
 
     /// map one applied op to derived writes. `ctx` reads the module's index
     /// as of this op (committed state plus this block's earlier staged
-    /// writes); everything staged lands atomically with the op rows.
-    fn index_op(&self, ctx: &ApplyCtx, meta: &OpMeta, payload: &[u8], out: &mut Derived);
+    /// writes); everything staged lands atomically with the op rows. an error
+    /// poisons the store — the op WAS applied by the module, so a fold that
+    /// cannot mirror it has no honest fallback.
+    fn index_op(&self, ctx: &ApplyCtx, meta: &OpMeta, payload: &[u8], out: &mut Derived)
+    -> Result<()>;
 
     /// the module's materialized-view projection: a module-defined request
     /// (json by convention, like the sdk query surface) in, module-defined
@@ -476,7 +485,7 @@ impl IndexStore {
                         origin: &op.origin,
                     };
                     let ctx = ApplyCtx { db, overlay: &overlay };
-                    mapper.index_op(&ctx, &meta, &op.payload, &mut derived);
+                    mapper.index_op(&ctx, &meta, &op.payload, &mut derived)?;
                     derived.drain_into(module, &mut batch, &mut overlay)?;
                 }
             }
@@ -751,10 +760,16 @@ mod tests {
         fn module(&self) -> &str {
             "chat"
         }
-        fn index_op(&self, ctx: &ApplyCtx, meta: &OpMeta, payload: &[u8], out: &mut Derived) {
+        fn index_op(
+            &self,
+            ctx: &ApplyCtx,
+            meta: &OpMeta,
+            payload: &[u8],
+            out: &mut Derived,
+        ) -> Result<()> {
             if self.reserved {
                 out.put("meta/evil", b"nope".to_vec());
-                return;
+                return Ok(());
             }
             let who = meta.origin.id.clone().unwrap_or_default();
             out.put(
@@ -764,12 +779,12 @@ mod tests {
             // read-modify-write: sees writes staged earlier in this block.
             let count_key = format!("count/{who}");
             let count = ctx
-                .get(count_key.as_bytes())
-                .unwrap()
+                .get(count_key.as_bytes())?
                 .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
                 .map(u64::from_be_bytes)
                 .unwrap_or(0);
             out.put(count_key, (count + 1).to_be_bytes().to_vec());
+            Ok(())
         }
 
         fn serve_view(&self, reader: &ViewReader, req: &[u8]) -> Result<Vec<u8>> {

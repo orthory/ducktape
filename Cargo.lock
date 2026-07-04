@@ -871,6 +871,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-index"
+version = "0.1.0"
+dependencies = [
+ "chat-interface",
+ "indexer",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "chat-interface"
 version = "0.1.0"
 dependencies = [
@@ -2061,6 +2072,17 @@ dependencies = [
  "serde_json",
  "state",
  "statesync",
+]
+
+[[package]]
+name = "document-index"
+version = "0.1.0"
+dependencies = [
+ "document-interface",
+ "indexer",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -4646,6 +4668,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pages-index"
+version = "0.1.0"
+dependencies = [
+ "indexer",
+ "pages-interface",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pages-interface"
 version = "0.1.0"
 dependencies = [
@@ -6371,6 +6404,17 @@ dependencies = [
  "sdk",
  "sha2",
  "tasks-interface",
+]
+
+[[package]]
+name = "tasks-index"
+version = "0.1.0"
+dependencies = [
+ "indexer",
+ "serde",
+ "serde_json",
+ "tasks-interface",
+ "tempfile",
 ]
 
 [[package]]
