@@ -26,6 +26,8 @@ import * as inboxClient from "../../domain/inbox-client";
 import * as jobsClient from "../../domain/jobs-client";
 import type { BoardCounts } from "../../domain/jobs-client";
 import * as memoryClient from "../../domain/memory-client";
+import * as pagesClient from "../../domain/pages-client";
+import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
   isTauri,
   resolveNode,
@@ -88,8 +90,10 @@ export function DucktapeProvider({
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
     // enumerate the doc index (the browse tree) and re-query the open doc's
-    // blocks (null when none is open) alongside the other projections.
+    // blocks (null when none is open) alongside the other projections; the
+    // pages slice refreshes the same way (enumeration + the open page's tree).
     const activeDoc = stateRef.current.activeDoc;
+    const activePage = stateRef.current.activePage;
     // the inbox is per-member; the console keys "my" queue by the local author
     // identity, and memory browsing re-lists whatever dir is open.
     const member = stateRef.current.author;
@@ -110,6 +114,14 @@ export function DucktapeProvider({
           activeDoc
             ? documentClient.getDoc(live, activeDoc)
             : Promise.resolve<Block[] | null>(null),
+          // pages is newer than some reachable nodes: best-effort, so a node
+          // without the module reads as "no pages", never a failed refresh.
+          pagesClient.listPages(live).catch((): PageMeta[] => []),
+          activePage
+            ? pagesClient
+                .getPage(live, activePage)
+                .catch((): PageBlock[] | null => null)
+            : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
           agentClient.watches(live),
           // newest-first for the timeline; Runs is ascending on the wire.
@@ -138,6 +150,8 @@ export function DucktapeProvider({
         forgeHead,
         docIds,
         docBlocks,
+        pages,
+        pageBlocks,
         agents,
         watches,
         runs,
@@ -179,6 +193,8 @@ export function DucktapeProvider({
                 authorNames,
                 docIds,
                 activeDocBlocks: docBlocks ?? [],
+                pages,
+                activePageBlocks: pageBlocks ?? [],
                 agents,
                 watches,
                 runs,
@@ -363,6 +379,9 @@ export function DucktapeProvider({
         docIds: [],
         activeDoc: null,
         activeDocBlocks: [],
+        pages: [],
+        activePage: null,
+        activePageBlocks: [],
       },
     });
   }, [state.nodeUrl]);
