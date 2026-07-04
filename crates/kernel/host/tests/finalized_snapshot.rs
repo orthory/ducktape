@@ -94,7 +94,7 @@ fn block(height: u64, app_hash: StateRoot) -> FinalizedBlock {
 }
 
 fn ctx(height: u64) -> BlockContext {
-    BlockContext {
+    BlockContext { protocol_version: 0,
         height,
         consensus_time: height * 10,
         origin: Origin::System,

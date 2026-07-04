@@ -89,6 +89,9 @@ fn manifest_roundtrip_carries_pinned_resolver_target() {
         view_base: 70,
         participants: vec![vec![3u8; 32]],
         floor_cert: Some(vec![0xCC; 96]),
+        current_version: host::BASELINE_VERSION,
+        pending_upgrade: None,
+        required_min_version: host::BASELINE_VERSION,
         entries: vec![ManifestEntry {
             module_id: "kv".into(),
             root: StateRoot([7u8; 32]),

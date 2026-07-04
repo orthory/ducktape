@@ -70,7 +70,8 @@ use rand_core::SeedableRng as _;
 
 mod valset_orchestrator;
 pub use valset_orchestrator::{
-    EpochMembership, ObservationOutcome, RespawnPlan, ScheduledCutover, ValsetOrchestrator,
+    BoundaryUpgrade, EpochMembership, ObservationOutcome, PendingUpgrade, RespawnPlan,
+    ScheduledCutover, UpgradeVerdict, ValsetOrchestrator,
 };
 
 /// the concrete digest the consensus lane orders over: a sha256 of the frame

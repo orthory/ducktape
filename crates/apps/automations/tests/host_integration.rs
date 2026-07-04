@@ -53,7 +53,7 @@ impl Module for RelayChat {
 
 fn from_user(payload: Msg) -> (BlockContext, Msg) {
     (
-        BlockContext {
+        BlockContext { protocol_version: 0,
             height: 1,
             consensus_time: 100,
             origin: Origin::External(b"operator".to_vec()),
@@ -171,7 +171,7 @@ fn memory_publish_fires_rule_and_delivers_inbox_atomically() {
         host.submit_at(ctx, msg).await.expect("create rule");
 
         host.submit_at(
-            BlockContext {
+            BlockContext { protocol_version: 0,
                 height: 2,
                 consensus_time: 200,
                 origin: Origin::External(b"operator".to_vec()),
@@ -189,7 +189,7 @@ fn memory_publish_fires_rule_and_delivers_inbox_atomically() {
         meta.insert("kind".into(), "decision".into());
         let out = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 3,
                     consensus_time: 300,
                     origin: Origin::External(vec![0xaa]),
@@ -244,7 +244,7 @@ fn memory_event_authored_by_automations_does_not_fire() {
         host.submit_at(ctx, msg).await.expect("create rule");
 
         host.submit_at(
-            BlockContext {
+            BlockContext { protocol_version: 0,
                 height: 2,
                 consensus_time: 200,
                 origin: Origin::External(b"operator".to_vec()),
@@ -258,7 +258,7 @@ fn memory_event_authored_by_automations_does_not_fire() {
         .expect("register watch");
 
         host.submit_at(
-            BlockContext {
+            BlockContext { protocol_version: 0,
                 height: 3,
                 consensus_time: 300,
                 origin: Origin::Module(AUTO.into()),
@@ -307,7 +307,7 @@ fn user_post_fires_rule_and_creates_task_atomically() {
         let app_before = host.app_hash();
         let out = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 2,
                     consensus_time: 200,
                     origin: Origin::External(b"poster".to_vec()),
@@ -350,7 +350,7 @@ fn module_authored_post_does_not_fire() {
 
         // a module-authored post (loop-prevention target) must not fire.
         host.submit_at(
-            BlockContext {
+            BlockContext { protocol_version: 0,
                 height: 2,
                 consensus_time: 200,
                 origin: Origin::External(b"poster".to_vec()),
@@ -388,7 +388,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
         // squat the deterministic id the next fire will compose: without the
         // probe, tasks would reject the duplicate and abort the posting block.
         host.submit_at(
-            BlockContext {
+            BlockContext { protocol_version: 0,
                 height: 2,
                 consensus_time: 200,
                 origin: Origin::External(b"squatter".to_vec()),
@@ -406,7 +406,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
 
         // the fire is downgraded to a run record; the user's post commits.
         host.submit_at(
-            BlockContext {
+            BlockContext { protocol_version: 0,
                 height: 3,
                 consensus_time: 300,
                 origin: Origin::External(b"poster".to_vec()),
@@ -451,7 +451,7 @@ fn post_probe_collision_still_aborts_the_block() {
 
         let err = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 2,
                     consensus_time: 200,
                     origin: Origin::External(b"poster".to_vec()),

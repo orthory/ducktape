@@ -1,0 +1,23 @@
+[package]
+name = "upgrade"
+edition.workspace = true
+version.workspace = true
+
+# the height-gated no-downtime upgrade module: holds the agreed current_version,
+# the single pending Upgrade, and the per-validator readiness set — all folded
+# into the app-hash. depends only on `sdk` plus types-only interface crates (its
+# own, valset's — the boundary member set comes through host-routed queries), per
+# the module-isolation rule. state is a canonical-bytes snapshot module (like
+# governance): low-volume, fully replicated, root == sha256 of the encoded state.
+[dependencies]
+sdk = { workspace = true }
+upgrade-interface = { workspace = true }
+valset-interface = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }

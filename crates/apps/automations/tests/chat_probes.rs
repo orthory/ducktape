@@ -27,7 +27,7 @@ const INBOX: &str = "inbox";
 const MEMORY: &str = "memory";
 
 fn as_user(byte: u8, height: u64) -> BlockContext {
-    BlockContext {
+    BlockContext { protocol_version: 0,
         height,
         consensus_time: height * 100,
         origin: Origin::External(vec![byte; 32]),

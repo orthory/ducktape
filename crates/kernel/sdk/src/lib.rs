@@ -94,6 +94,81 @@ impl StateSyncHandle {
 pub type ModuleId = String;
 
 // ============================================================================
+// protocol-version preflight — a serializable mirror of the upgrade module's
+// pending coordinates plus the pure boot check. these types live here so the
+// recovery and state-sync manifest crates can carry a version HINT without
+// depending on the upgrade module: the authoritative version stays derivable
+// from the replayed/committed upgrade-module state and is confirmed by the
+// final app-hash compose, so a lying manifest can at worst mis-preflight a
+// node, never induce a fork.
+// ============================================================================
+
+/// the coordinates of a scheduled upgrade, mirrored for the manifests. shape
+/// matches `upgrade_interface::Upgrade` but carries no module dependency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradeCoords {
+    pub name: String,
+    pub activation_height: u64,
+    pub to_version: u32,
+}
+
+/// a boot-preflight refusal: the local build is too old to safely apply the
+/// blocks at or after a boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedVersion {
+    /// the highest protocol version any block at/after the boundary needs.
+    pub required_min: u32,
+    /// the highest protocol version the local build can apply
+    /// (`MAX_PROTOCOL_VERSION`).
+    pub max_supported: u32,
+}
+
+impl core::fmt::Display for UnsupportedVersion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "this boundary needs protocol v{}; binary supports up to v{} — install the newer node binary",
+            self.required_min, self.max_supported
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedVersion {}
+
+/// pure boot preflight: fail loud when the local build's `max_supported`
+/// protocol version cannot serve a boundary requiring `required_min`. the
+/// authority stays the app-hash; this only turns an opaque post-replay
+/// app-hash mismatch into an early "height needs binary vX" refusal.
+pub fn check_required_version(
+    required_min: u32,
+    max_supported: u32,
+) -> Result<(), UnsupportedVersion> {
+    if max_supported < required_min {
+        Err(UnsupportedVersion {
+            required_min,
+            max_supported,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// the highest protocol version any block at or after a boundary needs:
+/// `to_version` once the served height has reached a pending upgrade's
+/// activation, else the boundary's `current_version`. shared so the recovery
+/// capture and the state-sync server derive the same fence.
+pub fn required_min_version(
+    current_version: u32,
+    pending: Option<&UpgradeCoords>,
+    height: u64,
+) -> u32 {
+    match pending {
+        Some(u) if height >= u.activation_height => u.to_version,
+        _ => current_version,
+    }
+}
+
+// ============================================================================
 // the deterministic system api — envelopes, env, error, ctx, module seam.
 // ============================================================================
 
@@ -146,6 +221,13 @@ pub struct Env {
     pub origin: Origin,
     /// the module being dispatched.
     pub me: ModuleId,
+    /// the effective protocol version for this block — a verbatim copy of
+    /// `BlockContext.protocol_version`, stamped by the host drain and identical
+    /// across the root op and every FIFO follow-up in one `submit`. this is the
+    /// ONLY version signal a module may branch on inside `execute`/`query`; it is
+    /// a read-only dispatch input and is NEVER folded into any `root()` preimage
+    /// or op/wire encoding. defaults to the baseline version (`0`).
+    pub protocol_version: u32,
 }
 
 /// a resolver-backed module's committed sync target at one boundary.
@@ -318,5 +400,53 @@ pub trait Module {
     /// the default is a no-op.
     async fn abort_block(&mut self) -> Result<(), Error> {
         Ok(())
+    }
+
+    /// ACTIVATION HOOK. the host drives this across the whole registry at the
+    /// finalized activation boundary (from the orchestrator's agreed
+    /// `RespawnPlan::boundary_version`) so a `root()`-changing dual-path module
+    /// selects its NEW branch deterministically at `H` (design §4). `version` is
+    /// the effective boundary protocol version — an agreed, non-hashed DISPATCH
+    /// input: a module caches it as a branch selector but MUST NEVER fold it into
+    /// any `root()`/`snapshot()` preimage or op encoding. the default is a no-op:
+    /// version-invariant modules ignore it; only dual-path modules (forge)
+    /// override it. driven ONLY by the agreed boundary version, so every honest
+    /// node sets the identical value — never a wall-clock/IO/RNG input.
+    fn set_active_version(&mut self, _version: u32) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_required_version_boundary() {
+        // max == required passes (the boundary needs exactly what we support).
+        assert!(check_required_version(3, 3).is_ok());
+        // max > required passes.
+        assert!(check_required_version(3, 4).is_ok());
+        // max < required fails loud.
+        let err = check_required_version(4, 3).expect_err("under-versioned build");
+        assert_eq!(err.required_min, 4);
+        assert_eq!(err.max_supported, 3);
+        assert!(err.to_string().contains("v4"));
+        assert!(err.to_string().contains("v3"));
+    }
+
+    #[test]
+    fn required_min_version_fencepost() {
+        let pending = UpgradeCoords {
+            name: "v2".into(),
+            activation_height: 100,
+            to_version: 2,
+        };
+        // no pending upgrade: always the current version.
+        assert_eq!(required_min_version(1, None, 100), 1);
+        // below activation: current version.
+        assert_eq!(required_min_version(1, Some(&pending), 99), 1);
+        // exactly at activation: to_version.
+        assert_eq!(required_min_version(1, Some(&pending), 100), 2);
+        // past activation: to_version.
+        assert_eq!(required_min_version(1, Some(&pending), 250), 2);
     }
 }

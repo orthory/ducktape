@@ -2842,6 +2842,7 @@ dependencies = [
  "sdk",
  "serde_json",
  "sha2",
+ "upgrade-interface",
  "valset",
  "valset-interface",
 ]
@@ -3037,6 +3038,7 @@ name = "host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "commonware-cryptography",
  "commonware-runtime",
  "directory",
  "directory-interface",
@@ -3047,6 +3049,10 @@ dependencies = [
  "sdk",
  "serde_json",
  "state",
+ "upgrade",
+ "upgrade-interface",
+ "valset",
+ "valset-interface",
 ]
 
 [[package]]
@@ -4067,6 +4073,7 @@ dependencies = [
  "document",
  "files",
  "forge",
+ "forge-interface",
  "futures",
  "governance",
  "governance-interface",
@@ -4092,6 +4099,8 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing-subscriber 0.3.23",
+ "upgrade",
+ "upgrade-interface",
  "valset",
  "valset-interface",
  "vaults",
@@ -5255,6 +5264,7 @@ checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
 name = "recovery"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
@@ -5266,8 +5276,10 @@ dependencies = [
  "host",
  "node",
  "sdk",
+ "sha2",
  "state",
  "thiserror 2.0.18",
+ "upgrade-interface",
 ]
 
 [[package]]
@@ -7370,6 +7382,29 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "upgrade"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
+ "futures",
+ "sdk",
+ "serde_json",
+ "sha2",
+ "upgrade-interface",
+ "valset-interface",
+]
+
+[[package]]
+name = "upgrade-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "url"
