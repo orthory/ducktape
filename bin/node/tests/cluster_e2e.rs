@@ -261,6 +261,44 @@ fn cluster_lifecycle() {
         assert_eq!(value, "held", "node {reader} read a wrong value");
     }
 
+    // 8c. the explorer surface: the held submit finalized a NON-EMPTY block,
+    // so /v1/blocks must carry it — frame hash, per-block commit app-hash,
+    // the submitting validator's VERIFIED key as proposer, and the dispatch
+    // trace — while the heartbeat nops that tick the idle chain never appear.
+    let (code, body) = cluster.http(0, "GET", "/v1/blocks", None);
+    assert_eq!(code, 200, "explorer blocks fetch failed: {body}");
+    let records = body["blocks"].as_array().expect("blocks is an array");
+    assert!(
+        records.iter().all(|b| b["target"] != "consensus.nop"),
+        "heartbeat nops must never reach the explorer: {body}"
+    );
+    let submitted = records
+        .iter()
+        .find(|b| b["height"] == block["height"])
+        .unwrap_or_else(|| panic!("held submit's block missing from the explorer: {body}"));
+    assert_eq!(submitted["target"], "directory");
+    assert_eq!(submitted["disposition"], "applied");
+    assert_eq!(
+        submitted["commitHash"], block["appHash"],
+        "explorer commit hash must equal the held reply's app-hash"
+    );
+    assert_eq!(
+        submitted["proposer"].as_str().unwrap_or_default(),
+        common::hex(&Cluster::identity(0)),
+        "proposer is node 0's verified signer key"
+    );
+    assert_eq!(
+        submitted["hash"].as_str().map(str::len),
+        Some(64),
+        "the frame content hash is 64 hex chars"
+    );
+    assert!(
+        submitted["operations"]
+            .as_array()
+            .is_some_and(|ops| !ops.is_empty()),
+        "an applied block carries its dispatch trace: {submitted}"
+    );
+
     // 9. quiesce, then the boundary every joiner must rebuild: identical
     // status app-hashes across validators — and the app surface reports the
     // same hash as the rpc (one state, two wires). both node-2 reads happen
