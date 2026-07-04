@@ -4574,6 +4574,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "pages"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-storage",
+ "commonware-utils",
+ "pages-interface",
+ "sdk",
+ "serde_json",
+ "state",
+ "statesync",
+]
+
+[[package]]
+name = "pages-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pango"
 version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
