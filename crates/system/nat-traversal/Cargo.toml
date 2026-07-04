@@ -10,3 +10,6 @@ tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "rt-multi-thread"] }
+
+[features]
+simnat = []

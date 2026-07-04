@@ -3,6 +3,8 @@
 //! primitive under the private-cutover epic.
 
 pub mod coordinator;
+#[cfg(any(test, feature = "simnat"))]
+pub mod simnat;
 pub mod wire;
 
 pub use coordinator::Coordinator;
