@@ -820,8 +820,51 @@ impl TunnelInstallPlan {
     }
 }
 
+/// Which side of a validated handshake a [`TunnelInstallPlan`] is built for.
+/// [`validate_upgrade`] (unchanged, kept for existing callers) always builds
+/// the initiator's plan; [`validate_upgrade_as`] lets either party derive its
+/// OWN install plan from the identical signed triple.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Perspective {
+    Initiator,
+    Responder,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn validate_upgrade(
+    view: &MeshView,
+    policy: &PortPolicy,
+    overlay: &OverlayPolicy,
+    current_view: u64,
+    request: &TunnelUpgradeRequest,
+    response: &TunnelUpgradeResponse,
+    ack: &TunnelUpgradeAck,
+    replay: &mut ReplayCache,
+) -> Result<TunnelInstallPlan, UpgradeError> {
+    validate_upgrade_as(
+        Perspective::Initiator,
+        view,
+        policy,
+        overlay,
+        current_view,
+        request,
+        response,
+        ack,
+        replay,
+    )
+}
+
+/// Identical validation to [`validate_upgrade`], but returns the install plan
+/// for the requested `perspective`. The initiator and responder each hold a
+/// full copy of the same signed request/response/ack triple; each calls this
+/// ONCE, from its own `MeshView` and its own `ReplayCache`, with its own
+/// perspective, to derive its own `local_*`/`peer_*` install config. This is
+/// the responder-side counterpart the `tunnel_e2e` "PINNED GAP" test
+/// documents: before this function existed, only the initiator's plan was
+/// derivable.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_upgrade_as(
+    perspective: Perspective,
     view: &MeshView,
     policy: &PortPolicy,
     overlay: &OverlayPolicy,
@@ -943,23 +986,38 @@ pub fn validate_upgrade(
         replay.insert(identity, epoch, nonce);
     }
 
-    Ok(TunnelInstallPlan {
-        context: TunnelInstallContext {
-            namespace: view.active_set.namespace.clone(),
-            epoch: view.active_set.epoch,
-            valset_root: root,
-            admission_root,
-            mesh_version: view.mesh_version,
+    let context = TunnelInstallContext {
+        namespace: view.active_set.namespace.clone(),
+        epoch: view.active_set.epoch,
+        valset_root: root,
+        admission_root,
+        mesh_version: view.mesh_version,
+    };
+    Ok(match perspective {
+        Perspective::Initiator => TunnelInstallPlan {
+            context,
+            local_identity: rq.initiator_identity,
+            peer_identity: rq.responder_identity,
+            local_wireguard_public_key: rq.initiator_wireguard_public_key,
+            peer_wireguard_public_key: rs.responder_wireguard_public_key,
+            peer_endpoint: rs.responder_wireguard_endpoint,
+            local_interface_ips: rs.accepted_allowed_ips.clone(),
+            allowed_ips: rq.requested_allowed_ips.clone(),
+            relay_candidates: rs.relay_candidates.clone(),
+            keepalive_seconds: rs.keepalive_seconds,
         },
-        local_identity: rq.initiator_identity,
-        peer_identity: rq.responder_identity,
-        local_wireguard_public_key: rq.initiator_wireguard_public_key,
-        peer_wireguard_public_key: rs.responder_wireguard_public_key,
-        peer_endpoint: rs.responder_wireguard_endpoint,
-        local_interface_ips: rs.accepted_allowed_ips.clone(),
-        allowed_ips: rq.requested_allowed_ips.clone(),
-        relay_candidates: rs.relay_candidates.clone(),
-        keepalive_seconds: rs.keepalive_seconds,
+        Perspective::Responder => TunnelInstallPlan {
+            context,
+            local_identity: rq.responder_identity,
+            peer_identity: rq.initiator_identity,
+            local_wireguard_public_key: rs.responder_wireguard_public_key,
+            peer_wireguard_public_key: rq.initiator_wireguard_public_key,
+            peer_endpoint: rq.initiator_wireguard_endpoint,
+            local_interface_ips: rq.requested_allowed_ips.clone(),
+            allowed_ips: rs.accepted_allowed_ips.clone(),
+            relay_candidates: rs.relay_candidates.clone(),
+            keepalive_seconds: rs.keepalive_seconds,
+        },
     })
 }
 
