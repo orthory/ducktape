@@ -11,8 +11,13 @@ export function reducer(state: ConsoleState, action: Action): ConsoleState {
   switch (action.type) {
     case "patch":
       return { ...state, ...action.patch };
-    case "update":
-      return { ...state, ...action.fn(state) };
+    case "update": {
+      // An empty result is a deliberate no-op (e.g. a telemetry frame deduped on
+      // height) — keep the SAME reference so React bails out of the re-render
+      // instead of churning on an identical-content copy.
+      const next = action.fn(state);
+      return Object.keys(next).length > 0 ? { ...state, ...next } : state;
+    }
     default:
       return state;
   }
