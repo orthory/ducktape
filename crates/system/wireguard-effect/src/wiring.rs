@@ -37,7 +37,17 @@ pub fn apply_tunnel_plan<E: WireGuardEffect>(
         }
     }
     effect.create_interface()?;
-    effect.apply(&iface.config)
+    if let Err(err) = effect.apply(&iface.config) {
+        // `create_interface` already stood up the interface (a real socket
+        // at `/var/run/wireguard/<ifname>.sock` on the Defguard path); don't
+        // leave it behind just because this config was rejected (e.g. a
+        // malformed private key). The `remove_interface` outcome is
+        // secondary to the `apply` failure that's actually being reported,
+        // so it's intentionally dropped rather than allowed to shadow it.
+        let _ = effect.remove_interface();
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -196,6 +206,18 @@ mod tests {
         assert_eq!(fake.create_calls, 1);
         assert_eq!(fake.applied.len(), 1);
         let applied = &fake.applied[0];
+        // The interface's own addresses must come from the plan's local
+        // side (`local_interface_ips`), not the peer's allowed IPs — mixing
+        // these up would install the peer's /32 as this host's interface
+        // address and silently break the tunnel while `apply_tunnel_plan`
+        // still reports success.
+        assert_eq!(
+            applied.addresses,
+            plan.local_interface_ips()
+                .iter()
+                .map(|r| IpAddrMask::new(r.addr, r.cidr))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(applied.peers.len(), 1);
         let peer = &applied.peers[0];
         assert_eq!(peer.public_key.as_array(), plan.peer_wireguard_public_key().0);
@@ -207,6 +229,36 @@ mod tests {
                 .map(|r| IpAddrMask::new(r.addr, r.cidr))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn removes_the_interface_it_just_created_when_apply_is_rejected() {
+        // Mirrors a real `DefguardWireGuardEffect` run where
+        // `create_interface` succeeds (the userspace socket comes up) but
+        // `configure_interface` then rejects the config — e.g. Defguard's
+        // `InterfaceConfiguration.prvkey` failing to decode to a 32-byte
+        // key. `apply_tunnel_plan` must not leave that interface behind.
+        let (plan, listen) = two_party_plan();
+        let mut fake = crate::FakeWireGuardEffect::default();
+        fake.reject_next_apply = true;
+
+        let err = apply_tunnel_plan(
+            &mut fake,
+            "ducktape-wg0",
+            "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
+            listen,
+            &plan,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, crate::FakeWireGuardEffectError::Rejected);
+        assert_eq!(fake.create_calls, 1);
+        assert_eq!(
+            fake.remove_calls, 1,
+            "apply_tunnel_plan must tear down the interface it created when apply fails"
+        );
+        assert!(fake.applied.is_empty());
     }
 
     #[test]
