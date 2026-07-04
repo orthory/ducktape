@@ -2835,6 +2835,7 @@ dependencies = [
  "sdk",
  "serde_json",
  "sha2",
+ "upgrade-interface",
  "valset",
  "valset-interface",
 ]

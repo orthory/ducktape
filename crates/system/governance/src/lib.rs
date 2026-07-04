@@ -36,6 +36,7 @@ use governance_interface::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
+use upgrade_interface::{UpgradeMsg, encode_msg as upgrade_encode_msg};
 use valset_interface::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
@@ -61,6 +62,9 @@ pub struct Governance {
     /// the id of the valset module this governance instance gates. genesis
     /// wiring — identical on every node.
     valset_id: ModuleId,
+    /// the id of the upgrade module a passing `ScheduleUpgrade`/`CancelUpgrade`
+    /// authorizes. genesis wiring — identical on every node.
+    upgrade_id: ModuleId,
     /// committed proposals — what `root()` commits to.
     proposals: BTreeMap<String, Proposal>,
     /// this block's staged writes (whole-proposal overwrite granularity),
@@ -69,10 +73,15 @@ pub struct Governance {
 }
 
 impl Governance {
-    pub fn new(id: impl Into<ModuleId>, valset_id: impl Into<ModuleId>) -> Self {
+    pub fn new(
+        id: impl Into<ModuleId>,
+        valset_id: impl Into<ModuleId>,
+        upgrade_id: impl Into<ModuleId>,
+    ) -> Self {
         Self {
             id: id.into(),
             valset_id: valset_id.into(),
+            upgrade_id: upgrade_id.into(),
             proposals: BTreeMap::new(),
             pending: BTreeMap::new(),
         }
@@ -150,6 +159,20 @@ impl Governance {
                     out.push(2);
                     push_bytes(&mut out, text.as_bytes());
                 }
+                GovAction::ScheduleUpgrade {
+                    name,
+                    activation_height,
+                    to_version,
+                } => {
+                    out.push(3);
+                    push_bytes(&mut out, name.as_bytes());
+                    out.extend_from_slice(&activation_height.to_le_bytes());
+                    out.extend_from_slice(&to_version.to_le_bytes());
+                }
+                GovAction::CancelUpgrade { name } => {
+                    out.push(4);
+                    push_bytes(&mut out, name.as_bytes());
+                }
             }
             push_bytes(&mut out, &p.proposer);
             out.extend_from_slice(&p.created_at.to_le_bytes());
@@ -220,6 +243,15 @@ impl Governance {
                     "validator key must be a 32-byte ed25519 public key".into(),
                 ));
             }
+        }
+        // upgrade authorizations must name a non-empty upgrade — an unnamed
+        // proposal can never match a real pending, so reject it at the door.
+        // monotonicity / min-lead / at-most-one are NOT checked here: those are
+        // the upgrade module's sole authority at ingest (do not duplicate).
+        if let GovAction::ScheduleUpgrade { name, .. } | GovAction::CancelUpgrade { name } = &action
+            && name.is_empty()
+        {
+            return Err(Error::Module("upgrade name must not be empty".into()));
         }
         if self.get(&proposal_id).is_some() {
             return Err(Error::Module(format!(
@@ -318,6 +350,28 @@ impl Governance {
                     target: self.valset_id.clone(),
                     payload: valset_encode_msg(&ValsetMsg::Leave { key: key.clone() }),
                 }),
+                // a passing upgrade authorization is PERFORMED the same way: emit
+                // the upgrade op as a follow-up. the host drains it in this same
+                // block and the upgrade module accepts it because the origin is
+                // Module(governance). governance only authorizes; the upgrade
+                // module's deterministic gates (monotonicity, min-lead,
+                // at-most-one) and the R=n readiness quorum are what ARM it.
+                GovAction::ScheduleUpgrade {
+                    name,
+                    activation_height,
+                    to_version,
+                } => ctx.emit_msg(Msg {
+                    target: self.upgrade_id.clone(),
+                    payload: upgrade_encode_msg(&UpgradeMsg::Schedule {
+                        name: name.clone(),
+                        activation_height: *activation_height,
+                        to_version: *to_version,
+                    }),
+                }),
+                GovAction::CancelUpgrade { name } => ctx.emit_msg(Msg {
+                    target: self.upgrade_id.clone(),
+                    payload: upgrade_encode_msg(&UpgradeMsg::Cancel { name: name.clone() }),
+                }),
                 GovAction::Signal { .. } => {}
             }
         } else {
@@ -408,6 +462,14 @@ fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
     Ok(u64::from_le_bytes(*head))
 }
 
+fn take_u32(buf: &mut &[u8]) -> Result<u32, Error> {
+    let Some((head, rest)) = buf.split_first_chunk::<4>() else {
+        return Err(Error::Module("snapshot truncated".into()));
+    };
+    *buf = rest;
+    Ok(u32::from_le_bytes(*head))
+}
+
 fn take_u8(buf: &mut &[u8]) -> Result<u8, Error> {
     let Some((head, rest)) = buf.split_first() else {
         return Err(Error::Module("snapshot truncated".into()));
@@ -458,6 +520,14 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Proposal>, Error> {
             },
             2 => GovAction::Signal {
                 text: take_string(&mut buf)?,
+            },
+            3 => GovAction::ScheduleUpgrade {
+                name: take_string(&mut buf)?,
+                activation_height: take_u64(&mut buf)?,
+                to_version: take_u32(&mut buf)?,
+            },
+            4 => GovAction::CancelUpgrade {
+                name: take_string(&mut buf)?,
             },
             other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
         };

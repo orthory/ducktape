@@ -247,7 +247,7 @@ async fn genesis_host(
         Box::new(valset),
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
-        Box::new(Governance::new("governance", "valset")),
+        Box::new(Governance::new("governance", "valset", "upgrade")),
         Box::new(SagaModule::new("saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
@@ -316,7 +316,7 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut governance = Governance::new("governance", "valset");
+    let mut governance = Governance::new("governance", "valset", "upgrade");
     let (bytes, root) = snapshot_of("governance")?;
     governance
         .install(bytes, root)
@@ -508,7 +508,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("saga install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
-    let mut governance = Governance::new("governance", "valset");
+    let mut governance = Governance::new("governance", "valset", "upgrade");
     governance
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
