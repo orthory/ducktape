@@ -17,6 +17,14 @@ import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
 const QUICK_REACTS = ["👍", "✅", "👀"];
 
+// The message content (avatar + body + hover affordances) is capped to a
+// readable measure and left-aligned, while the row's hover highlight spans the
+// full pane. This keeps long lines legible on a wide pane AND anchors the hover
+// bar / menu / picker to the content's right edge instead of the far pane edge.
+// 880 is the width the console already used for the column — the earlier hover
+// complaint was the highlight stopping short of the edge, not the text measure.
+const CONTENT_MAX = 880;
+
 // `created_at` is UNIX SECONDS (the node's consensus_time) — multiply by 1000
 // to get a JS `Date`, or every message renders as "Jan 1, 1970".
 // Empty when the timestamp isn't real wall-clock (the node's consensus_time is
@@ -82,11 +90,14 @@ function TrashGlyph({ size = 13 }: { size?: number }) {
 }
 
 function AddReactGlyph({ size = 15 }: { size?: number }) {
+  // A smiley (open at the top-right for a "+") — the standard "add reaction"
+  // mark. Eyes are drawn as short thick strokes so they read at ~13-15px.
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
-      <path d="M20 12a8 8 0 1 1-4.5-7.2" />
-      <path d="M9 10h.01M14.5 10h.01M8.5 14.5a4 4 0 0 0 5.2.6" />
-      <path d="M18 3.5v5M15.5 6h5" />
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M20.4 11.3a8.5 8.5 0 1 1-7.7-7.7" />
+      <path d="M8.8 10.3v.6M14 10.3v.6" strokeWidth={2.1} />
+      <path d="M8.7 14.3a3.4 3.4 0 0 0 5.6 0" />
+      <path d="M19 2.8v4.6M16.7 5.1h4.6" />
     </svg>
   );
 }
@@ -836,9 +847,6 @@ export function MessageItem({
       onMouseEnter={() => onHover(true)}
       onMouseLeave={() => onHover(false)}
       style={{
-        position: "relative",
-        display: "flex",
-        gap: 11,
         borderRadius: 9,
         padding: `${groupStart ? 7 : 1}px 8px`,
         margin: `${groupStart ? 3 : 0}px -8px 0`,
@@ -849,6 +857,7 @@ export function MessageItem({
         background: active ? color.sunken : "transparent",
       }}
     >
+      <div style={{ position: "relative", display: "flex", gap: 11, maxWidth: CONTENT_MAX, minWidth: 0 }}>
       <div style={{ width: 30, flexShrink: 0, display: "flex", justifyContent: "center", paddingTop: 1 }}>
         {groupStart ? (
           <Avatar author={message.head.author} name={author} size={30} />
@@ -956,6 +965,7 @@ export function MessageItem({
           onStartDelete={() => setConfirmingDelete(true)}
         />
       )}
+      </div>
     </div>
   );
 }
