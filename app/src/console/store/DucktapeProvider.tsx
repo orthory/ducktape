@@ -41,6 +41,7 @@ import { reducer } from "./reducer";
 import {
   applySnapshot,
   createInitialState,
+  loadRemoteUrl,
 } from "./state";
 
 export type { ConsoleActions } from "./actions";
@@ -49,6 +50,9 @@ export type { ConsoleContextValue } from "./context";
 /** How many recent telemetry frames the console keeps in memory (the node's
  *  ring holds more; this bounds the live view's buffer). */
 const TELEMETRY_KEEP = 200;
+
+/** How often to re-poll a resolved-but-unanswering node until it comes back. */
+const RECONNECT_POLL_MS = 3_000;
 
 export function DucktapeProvider({
   transport,
@@ -238,6 +242,14 @@ export function DucktapeProvider({
       .then(([all, active]) => {
         if (cancelled) return;
         dispatch({ type: "patch", patch: { workspaces: all } });
+        // A remembered remote node supersedes the local active workspace — it
+        // was the user's last choice, so reconnect to it. An unreachable one
+        // just reads as disconnected rather than blocking boot.
+        const savedRemote = loadRemoteUrl();
+        if (savedRemote) {
+          actions.connectRemote(savedRemote);
+          return;
+        }
         if (!active) {
           dispatch({ type: "patch", patch: { needsOnboarding: true } });
           return;
@@ -302,6 +314,37 @@ export function DucktapeProvider({
       offTelemetry();
     };
   }, [node, refresh]);
+
+  // 2b. Liveness heartbeat — the "no running node" detection AND recovery. The
+  //     block stream can't do this alone: a node that silently goes away (crash,
+  //     stop, remote endpoint unplugged) just stops sending blocks, with no error
+  //     to flip `connected` off — and a healthy but idle node also sends none, so
+  //     silence isn't a reliable signal. Instead, ping `status()` on an interval
+  //     whenever a node is resolved: a failure marks it down (so the UI reflects
+  //     it and this same loop keeps retrying), and the first success after a drop
+  //     re-hydrates via refresh(). Reads live `connected` through the ref so the
+  //     interval isn't torn down and rebuilt on every block. Skipped during
+  //     onboarding / a joiner's park phase (which has its own poll).
+  useEffect(() => {
+    if (!node) return;
+    if (state.needsOnboarding || state.onboardingPhase) return;
+    const beat = () =>
+      node.status().then(
+        () => {
+          // up: only pay for a full refresh on the down→up edge; while already
+          //     connected the block stream keeps projections fresh.
+          if (!stateRef.current.connected) refresh();
+        },
+        () => {
+          // unreachable: surface it once; the next beats keep trying to recover.
+          if (stateRef.current.connected) {
+            dispatch({ type: "patch", patch: { connected: false } });
+          }
+        },
+      );
+    const timer = setInterval(beat, RECONNECT_POLL_MS);
+    return () => clearInterval(timer);
+  }, [node, state.needsOnboarding, state.onboardingPhase, refresh]);
 
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {

@@ -48,6 +48,8 @@ function Probe() {
       <span data-testid="gate">{String(state.needsOnboarding)}</span>
       <span data-testid="ws">{state.workspace?.name ?? "none"}</span>
       <span data-testid="phase">{state.onboardingPhase?.phase ?? "none"}</span>
+      <span data-testid="managed">{String(state.managed)}</span>
+      <span data-testid="url">{state.nodeUrl ?? "none"}</span>
     </div>
   );
 }
@@ -56,6 +58,9 @@ afterEach(() => {
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   vi.unstubAllGlobals();
   invokeMock.mockReset();
+  // connectRemote persists the dialed url — clear it so a saved remote from one
+  // test never leaks into the next test's boot.
+  localStorage.clear();
   actions = null;
 });
 
@@ -226,5 +231,93 @@ describe("onboarding gate — live join UI", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// Connecting to a node on another device over plain http/https. No workspace,
+// no Rust spawn — the app only dials the url, so the connection is unmanaged
+// (managed=false) and the url is remembered for next launch.
+describe("onboarding gate — remote node", () => {
+  it("connects to a remote node from the Remote tab", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "workspace_list" ? Promise.resolve([]) : Promise.resolve(null),
+    );
+    const fetchMock = vi.fn((url: string) =>
+      String(url).endsWith("/v1/status")
+        ? Promise.resolve(jsonResponse(200, status))
+        : Promise.resolve(jsonResponse(200, { Channels: [] })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <DucktapeProvider>
+        <OnboardingGate />
+        <Probe />
+      </DucktapeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
+
+    fireEvent.click(screen.getByText("Remote"));
+    fireEvent.change(screen.getByPlaceholderText("http://192.168.1.50:8844"), {
+      target: { value: "http://10.0.0.5:8844" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Connect"));
+    });
+
+    await waitFor(() => {
+      // unmanaged, dialed directly at the given url, gate closed, no workspace.
+      expect(screen.getByTestId("managed").textContent).toBe("false");
+      expect(screen.getByTestId("url").textContent).toBe("http://10.0.0.5:8844");
+      expect(screen.getByTestId("gate").textContent).toBe("false");
+      expect(screen.getByTestId("ws").textContent).toBe("none");
+    });
+    // it dialed the remote node's surface, and never spawned/selected a local one.
+    expect(fetchMock).toHaveBeenCalledWith("http://10.0.0.5:8844/v1/status");
+    expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
+    // remembered for next launch.
+    expect(localStorage.getItem("ducktape.remoteUrl")).toBe("http://10.0.0.5:8844");
+  });
+
+  it("boot reconnects a saved remote, superseding the local active workspace", async () => {
+    markTauri();
+    localStorage.setItem("ducktape.remoteUrl", "http://10.0.0.9:8844");
+    const team = workspace({});
+    // an active LOCAL workspace exists, but the remembered remote was the user's
+    // last choice, so boot must dial the remote and leave the workspace alone.
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "workspace_list":
+          return Promise.resolve([team]);
+        case "workspace_active":
+          return Promise.resolve(team);
+        default:
+          return Promise.resolve(null);
+      }
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url).endsWith("/v1/status")
+          ? Promise.resolve(jsonResponse(200, status))
+          : Promise.resolve(jsonResponse(200, { Channels: [] })),
+      ),
+    );
+
+    render(
+      <DucktapeProvider>
+        <Probe />
+      </DucktapeProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("managed").textContent).toBe("false");
+      expect(screen.getByTestId("url").textContent).toBe("http://10.0.0.9:8844");
+      expect(screen.getByTestId("gate").textContent).toBe("false");
+      expect(screen.getByTestId("ws").textContent).toBe("none");
+    });
+    // the local workspace was never spawned/adopted — the remote superseded it.
+    expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
   });
 });

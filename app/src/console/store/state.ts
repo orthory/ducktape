@@ -172,6 +172,39 @@ export const saveViewMode = (mode: ViewMode): void => {
   }
 };
 
+// ── Remote node persistence ─────────────────────────────
+//
+// The last remote node url the user dialed, so the desktop app reconnects to it
+// on launch instead of falling back to the onboarding gate. A remote choice
+// supersedes the local active-workspace pointer (which lives in the Rust
+// registry) — connecting a workspace clears this, connecting a remote sets it —
+// so whichever the user chose last is what we reconnect to.
+const REMOTE_URL_KEY = "ducktape.remoteUrl";
+
+export const loadRemoteUrl = (): string | null => {
+  try {
+    return localStorage.getItem(REMOTE_URL_KEY);
+  } catch {
+    return null; // storage unavailable — no remembered remote
+  }
+};
+
+export const saveRemoteUrl = (url: string): void => {
+  try {
+    localStorage.setItem(REMOTE_URL_KEY, url);
+  } catch {
+    // best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+export const clearRemoteUrl = (): void => {
+  try {
+    localStorage.removeItem(REMOTE_URL_KEY);
+  } catch {
+    // best-effort; nothing to clean up if storage is unavailable.
+  }
+};
+
 export const createInitialState = (): ConsoleState => {
   const viewMode = loadViewMode();
   return {

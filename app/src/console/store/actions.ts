@@ -18,11 +18,7 @@ import * as memoryClient from "../../domain/memory-client";
 import type { Meta } from "../../domain/memory-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
-import {
-  connectWorkspace,
-  shutdownNode,
-  waitUntilUp,
-} from "../../domain/node-bootstrap";
+import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
@@ -32,7 +28,14 @@ import {
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
-import { channelIdOf, docIdOf, nextTaskStatus, saveViewMode } from "./state";
+import {
+  channelIdOf,
+  clearRemoteUrl,
+  docIdOf,
+  nextTaskStatus,
+  saveRemoteUrl,
+  saveViewMode,
+} from "./state";
 import type { ConsoleState, ViewMode } from "./state";
 
 /** How often a parked joiner's phase is polled while it promotes. */
@@ -215,6 +218,9 @@ export interface ConsoleActions {
   joinWorkspace(name: string, blob: string): void;
   /** Switch the active workspace (spawns/adopts its node). */
   selectWorkspace(id: string): void;
+  /** Connect to a node running on another device over http/https. Unmanaged —
+   *  we only dial it; the url is remembered and reconnected on next launch. */
+  connectRemote(url: string): void;
   /** Fetch the active workspace's invite blob into state for sharing. */
   revealInvite(): void;
   /** Admit a joiner by pubkey through the active (member) workspace. */
@@ -335,6 +341,9 @@ export function createActions({
   const connectActive = (target: Workspace): Promise<void> => {
     const gen = nextBootGeneration();
     const stale = () => isBootGenerationStale(gen);
+    // Choosing a local workspace supersedes any remembered remote — it becomes
+    // what we reconnect to on next launch.
+    clearRemoteUrl();
     patch({
       workspace: target,
       needsOnboarding: false,
@@ -346,10 +355,10 @@ export function createActions({
       .then((sel) => {
         if (stale()) return;
         patch({ nodeUrl: sel.httpUrl, managed: true });
-        const transport = connectWorkspace(sel.httpUrl).transport;
+        const transport = bootstrap.connectWorkspace(sel.httpUrl).transport;
         if (target.member) {
           // founder / already-admitted member: the surface comes up promptly.
-          return waitUntilUp(transport).then(() => {
+          return bootstrap.waitUntilUp(transport).then(() => {
             if (stale()) return;
             patch({ onboardingPhase: null });
             setNode(transport);
@@ -1012,7 +1021,7 @@ export function createActions({
       const url = getState().nodeUrl;
       if (!url || !getState().managed) return;
       Promise.resolve()
-        .then(() => shutdownNode(url))
+        .then(() => bootstrap.shutdownNode(url))
         .then(() => patch({ connected: false }))
         .catch(fail);
     },
@@ -1095,6 +1104,59 @@ export function createActions({
         onboardingPhase: null,
       });
       connectActive(target).catch(fail);
+    },
+
+    connectRemote: (rawUrl) => {
+      const url = bootstrap.normalizeNodeUrl(rawUrl);
+      if (!url) return;
+      // Supersede any in-flight workspace connect/poll loop (joiner tick).
+      nextBootGeneration();
+      // Drop the old node + its projections so the switch shows no stale state
+      // (mirrors selectWorkspace's reset).
+      setNode(null);
+      patch({
+        workspace: null,
+        connected: false,
+        status: null,
+        channels: [],
+        messages: [],
+        activeChannel: null,
+        activeThread: null,
+        authorNames: {},
+        tasks: [],
+        members: [],
+        proposals: [],
+        forgeHead: null,
+        docIds: [],
+        activeDoc: null,
+        activeDocBlocks: [],
+        agents: [],
+        watches: [],
+        runs: [],
+        inbox: [],
+        inboxUnread: 0,
+        jobs: [],
+        jobCounts: null,
+        rules: [],
+        memoryPath: "/",
+        memoryEntries: [],
+        memoryOpen: null,
+        memoryMatches: null,
+        files: [],
+        onboardingPhase: null,
+        onboardingBusy: false,
+        inviteBlob: null,
+        // A remote node is unmanaged — dialed directly, never spawned here.
+        nodeUrl: url,
+        managed: false,
+        needsOnboarding: false,
+        error: null,
+      });
+      // Remember it for next launch, then dial. The hydrate effect (keyed on the
+      // node) runs refresh(); an unreachable remote simply reads as disconnected
+      // (the "no running node" surface) instead of throwing.
+      saveRemoteUrl(url);
+      setNode(bootstrap.connectRemote(url).transport);
     },
 
     revealInvite: () => {
@@ -1195,7 +1257,11 @@ export function createActions({
     newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null }),
 
     dismissOnboarding: () =>
-      update((prev) => (prev.workspace ? { needsOnboarding: false } : {})),
+      // Closable when there's a connection to return to — a local workspace or a
+      // remote node (nodeUrl set). Nothing to go back to on a cold first boot.
+      update((prev) =>
+        prev.workspace || prev.nodeUrl ? { needsOnboarding: false } : {},
+      ),
 
     connectActive,
   };

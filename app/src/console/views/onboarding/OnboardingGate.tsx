@@ -10,7 +10,7 @@ import { color, font, radius, shadow } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 
-type Mode = "create" | "join";
+type Mode = "create" | "join" | "remote";
 
 const inputStyle: React.CSSProperties = {
   width: "100%",
@@ -58,6 +58,7 @@ export function OnboardingGate() {
   const [mode, setMode] = useState<Mode>("create");
   const [name, setName] = useState("");
   const [blob, setBlob] = useState("");
+  const [url, setUrl] = useState("");
 
   const busy = state.onboardingBusy;
   // live join is enabled (LIVE_JOIN_SUPPORTED); joinGated is the kill-switch
@@ -67,13 +68,31 @@ export function OnboardingGate() {
     !joinGated &&
     (mode === "create"
       ? name.trim().length > 0
-      : name.trim().length > 0 && blob.trim().length > 0);
+      : mode === "join"
+        ? name.trim().length > 0 && blob.trim().length > 0
+        : url.trim().length > 0);
 
   const submit = () => {
     if (busy || !canSubmit) return;
     if (mode === "create") actions.createWorkspace(name);
-    else actions.joinWorkspace(name, blob);
+    else if (mode === "join") actions.joinWorkspace(name, blob);
+    else actions.connectRemote(url);
   };
+
+  const title =
+    mode === "create"
+      ? "Name your workspace"
+      : mode === "join"
+        ? "Join a workspace"
+        : "Connect to a remote node";
+  const subtitle =
+    mode === "create"
+      ? "Found a new network — you become its first member, with a fresh identity."
+      : mode === "join"
+        ? joinGated
+          ? "Joining an existing network is temporarily unavailable."
+          : "Paste an invite from a member to join their network with a new identity."
+        : "Enter the http address of a node running on another device. It stays running there — this app just connects to it.";
 
   return (
     <div
@@ -103,14 +122,10 @@ export function OnboardingGate() {
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
           <span style={{ font: `600 16px ${font.sans}`, color: color.ink }}>
-            {mode === "create" ? "Name your workspace" : "Join a workspace"}
+            {title}
           </span>
           <span style={{ font: `500 12px ${font.sans}`, color: color.muted }}>
-            {mode === "create"
-              ? "Found a new network — you become its first member, with a fresh identity."
-              : joinGated
-                ? "Joining an existing network is temporarily unavailable."
-                : "Paste an invite from a member to join their network with a new identity."}
+            {subtitle}
           </span>
         </div>
 
@@ -125,6 +140,7 @@ export function OnboardingGate() {
         >
           <Tab label="Create" active={mode === "create"} onClick={() => setMode("create")} />
           <Tab label="Join" active={mode === "join"} onClick={() => setMode("join")} />
+          <Tab label="Remote" active={mode === "remote"} onClick={() => setMode("remote")} />
         </div>
 
         {joinGated ? (
@@ -145,21 +161,36 @@ export function OnboardingGate() {
         ) : (
           <>
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              <input
-                value={name}
-                placeholder="Workspace name"
-                onChange={(event) => setName(event.target.value)}
-                onKeyDown={(event) => event.key === "Enter" && mode === "create" && submit()}
-                style={inputStyle}
-              />
-              {mode === "join" && (
-                <textarea
-                  value={blob}
-                  placeholder="Paste invite blob (ducktape-invite-v2:…)"
-                  onChange={(event) => setBlob(event.target.value)}
-                  rows={3}
-                  style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
+              {mode === "remote" ? (
+                <input
+                  value={url}
+                  placeholder="http://192.168.1.50:8844"
+                  onChange={(event) => setUrl(event.target.value)}
+                  onKeyDown={(event) => event.key === "Enter" && submit()}
+                  autoComplete="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  style={{ ...inputStyle, font: `500 11.5px ${font.mono}` }}
                 />
+              ) : (
+                <>
+                  <input
+                    value={name}
+                    placeholder="Workspace name"
+                    onChange={(event) => setName(event.target.value)}
+                    onKeyDown={(event) => event.key === "Enter" && mode === "create" && submit()}
+                    style={inputStyle}
+                  />
+                  {mode === "join" && (
+                    <textarea
+                      value={blob}
+                      placeholder="Paste invite blob (ducktape-invite-v2:…)"
+                      onChange={(event) => setBlob(event.target.value)}
+                      rows={3}
+                      style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
+                    />
+                  )}
+                </>
               )}
             </div>
 
@@ -187,7 +218,9 @@ export function OnboardingGate() {
                 ? "Setting up…"
                 : mode === "create"
                   ? "Create workspace"
-                  : "Join workspace"}
+                  : mode === "join"
+                    ? "Join workspace"
+                    : "Connect"}
             </button>
           </>
         )}
@@ -231,7 +264,7 @@ export function OnboardingGate() {
           </div>
         )}
 
-        {state.workspace && (
+        {(state.workspace || state.nodeUrl) && (
           <button
             onClick={actions.dismissOnboarding}
             style={{
@@ -242,7 +275,7 @@ export function OnboardingGate() {
               color: color.muted,
             }}
           >
-            ← back to {state.workspace.name}
+            ← back to {state.workspace ? state.workspace.name : "remote node"}
           </button>
         )}
       </div>

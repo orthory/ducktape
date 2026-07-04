@@ -135,6 +135,7 @@ function Probe() {
       <span data-testid="forge">{state.forgeHead ?? "unborn"}</span>
       <span data-testid="members">{state.members.length}</span>
       <span data-testid="member-keys">{state.members.join(",")}</span>
+      <span data-testid="connected">{String(state.connected)}</span>
     </div>
   );
 }
@@ -246,6 +247,53 @@ describe("DucktapeProvider", () => {
       expect(screen.getByTestId("messages").textContent).toBe("0");
       expect(screen.getByTestId("thread").textContent).toBe("closed");
     });
+  });
+
+  // Regression (found in headless QA): a node that goes silently unreachable —
+  // it stops answering with no error and stops sending blocks — must flip the UI
+  // to disconnected, and must auto-reconnect when it returns. The block stream
+  // alone can't do this (silence is ambiguous: a healthy idle node sends none
+  // either), so the liveness heartbeat polls status() and drives `connected`.
+  it("detects a node that goes silently unreachable, then auto-reconnects", async () => {
+    vi.useFakeTimers();
+    try {
+      const { transport } = makeFakeNode();
+      let nodeUp = true;
+      vi.mocked(transport.status).mockImplementation(() =>
+        nodeUp
+          ? Promise.resolve({
+              version: "0.1.0",
+              appHash: "aa".repeat(32),
+              height: 1,
+              modules: [],
+            })
+          : Promise.reject(new Error("connection refused")),
+      );
+
+      renderConsole(transport);
+      // initial hydrate → connected
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(screen.getByTestId("connected").textContent).toBe("true");
+
+      // node goes away: no error surfaces on the block stream, but the next
+      // heartbeat's status() rejects → the UI must reflect disconnected.
+      nodeUp = false;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3100);
+      });
+      expect(screen.getByTestId("connected").textContent).toBe("false");
+
+      // node returns: the heartbeat's status() succeeds again → re-hydrate.
+      nodeUp = true;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3100);
+      });
+      expect(screen.getByTestId("connected").textContent).toBe("true");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("commitForge submits a Commit msg and hydrates the new HEAD", async () => {
