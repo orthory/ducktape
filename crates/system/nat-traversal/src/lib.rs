@@ -22,4 +22,6 @@ pub use punch::{
     FallbackOutcome, PunchError, PunchPlan, RelayFallbackProof, drive_simulated,
     drive_with_relay_fallback,
 };
+#[cfg(any(test, feature = "simnat"))]
+pub use simnat::SimNat;
 pub use wire::{Msg, NodeKey, WireError};
