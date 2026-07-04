@@ -2369,6 +2369,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         .module_root(m)
                                         .map(|r| hex(&r))
                                         .unwrap_or_default(),
+                                    category: noded::ModuleCategory::of(m),
                                 })
                                 .collect();
                             let _ = reply.send(noded::NodeStatus {
