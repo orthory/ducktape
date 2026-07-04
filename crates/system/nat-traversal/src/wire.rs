@@ -1,0 +1,203 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NodeKey(pub [u8; 32]);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Msg {
+    BindRequest { from: NodeKey },
+    BindResponse { reflexive: SocketAddr },
+    Register { key: NodeKey },
+    Lookup { key: NodeKey },
+    LookupResponse { key: NodeKey, reflexive: Option<SocketAddr> },
+    PunchSync { peer: NodeKey, peer_reflexive: SocketAddr },
+    Punch { from: NodeKey },
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WireError {
+    #[error("buffer too short")]
+    Short,
+    #[error("bad tag {0}")]
+    BadTag(u8),
+    #[error("bad address encoding")]
+    BadAddr,
+}
+
+const TAG_BIND_REQ: u8 = 1;
+const TAG_BIND_RESP: u8 = 2;
+const TAG_REGISTER: u8 = 3;
+const TAG_LOOKUP: u8 = 4;
+const TAG_LOOKUP_RESP: u8 = 5;
+const TAG_PUNCH_SYNC: u8 = 6;
+const TAG_PUNCH: u8 = 7;
+
+fn put_key(out: &mut Vec<u8>, k: &NodeKey) {
+    out.extend_from_slice(&k.0);
+}
+
+fn put_addr(out: &mut Vec<u8>, a: &SocketAddr) {
+    match a.ip() {
+        IpAddr::V4(v4) => {
+            out.push(4);
+            out.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            out.push(6);
+            out.extend_from_slice(&v6.octets());
+        }
+    }
+    out.extend_from_slice(&a.port().to_be_bytes());
+}
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+        let end = self.pos.checked_add(n).ok_or(WireError::Short)?;
+        if end > self.buf.len() {
+            return Err(WireError::Short);
+        }
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(s)
+    }
+    fn key(&mut self) -> Result<NodeKey, WireError> {
+        let s = self.take(32)?;
+        let mut k = [0u8; 32];
+        k.copy_from_slice(s);
+        Ok(NodeKey(k))
+    }
+    fn addr(&mut self) -> Result<SocketAddr, WireError> {
+        let fam = self.take(1)?[0];
+        let ip = match fam {
+            4 => {
+                let o = self.take(4)?;
+                IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]))
+            }
+            6 => {
+                let o = self.take(16)?;
+                let mut b = [0u8; 16];
+                b.copy_from_slice(o);
+                IpAddr::V6(Ipv6Addr::from(b))
+            }
+            _ => return Err(WireError::BadAddr),
+        };
+        let p = self.take(2)?;
+        let port = u16::from_be_bytes([p[0], p[1]]);
+        Ok(SocketAddr::new(ip, port))
+    }
+}
+
+impl Msg {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(48);
+        match self {
+            Msg::BindRequest { from } => {
+                out.push(TAG_BIND_REQ);
+                put_key(&mut out, from);
+            }
+            Msg::BindResponse { reflexive } => {
+                out.push(TAG_BIND_RESP);
+                put_addr(&mut out, reflexive);
+            }
+            Msg::Register { key } => {
+                out.push(TAG_REGISTER);
+                put_key(&mut out, key);
+            }
+            Msg::Lookup { key } => {
+                out.push(TAG_LOOKUP);
+                put_key(&mut out, key);
+            }
+            Msg::LookupResponse { key, reflexive } => {
+                out.push(TAG_LOOKUP_RESP);
+                put_key(&mut out, key);
+                match reflexive {
+                    Some(a) => {
+                        out.push(1);
+                        put_addr(&mut out, a);
+                    }
+                    None => out.push(0),
+                }
+            }
+            Msg::PunchSync { peer, peer_reflexive } => {
+                out.push(TAG_PUNCH_SYNC);
+                put_key(&mut out, peer);
+                put_addr(&mut out, peer_reflexive);
+            }
+            Msg::Punch { from } => {
+                out.push(TAG_PUNCH);
+                put_key(&mut out, from);
+            }
+        }
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Msg, WireError> {
+        let mut r = Reader::new(buf);
+        let tag = r.take(1)?[0];
+        match tag {
+            TAG_BIND_REQ => Ok(Msg::BindRequest { from: r.key()? }),
+            TAG_BIND_RESP => Ok(Msg::BindResponse { reflexive: r.addr()? }),
+            TAG_REGISTER => Ok(Msg::Register { key: r.key()? }),
+            TAG_LOOKUP => Ok(Msg::Lookup { key: r.key()? }),
+            TAG_LOOKUP_RESP => {
+                let key = r.key()?;
+                let present = r.take(1)?[0];
+                let reflexive = match present {
+                    0 => None,
+                    1 => Some(r.addr()?),
+                    _ => return Err(WireError::BadAddr),
+                };
+                Ok(Msg::LookupResponse { key, reflexive })
+            }
+            TAG_PUNCH_SYNC => Ok(Msg::PunchSync {
+                peer: r.key()?,
+                peer_reflexive: r.addr()?,
+            }),
+            TAG_PUNCH => Ok(Msg::Punch { from: r.key()? }),
+            other => Err(WireError::BadTag(other)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn addr(o: u8, p: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, o)), p)
+    }
+
+    #[test]
+    fn every_variant_roundtrips() {
+        let cases = vec![
+            Msg::BindRequest { from: NodeKey([1u8; 32]) },
+            Msg::BindResponse { reflexive: addr(2, 51820) },
+            Msg::Register { key: NodeKey([3u8; 32]) },
+            Msg::Lookup { key: NodeKey([4u8; 32]) },
+            Msg::LookupResponse { key: NodeKey([5u8; 32]), reflexive: Some(addr(6, 443)) },
+            Msg::LookupResponse { key: NodeKey([7u8; 32]), reflexive: None },
+            Msg::PunchSync { peer: NodeKey([8u8; 32]), peer_reflexive: addr(9, 7000) },
+            Msg::Punch { from: NodeKey([10u8; 32]) },
+        ];
+        for m in cases {
+            let bytes = m.encode();
+            let back = Msg::decode(&bytes).expect("decode");
+            assert_eq!(m, back);
+        }
+    }
+
+    #[test]
+    fn short_buffer_is_error() {
+        assert_eq!(Msg::decode(&[]), Err(WireError::Short));
+        assert_eq!(Msg::decode(&[0xff]), Err(WireError::BadTag(0xff)));
+    }
+}
