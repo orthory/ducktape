@@ -46,12 +46,16 @@ impl Coordinator {
                 }
                 out
             }
-            // The coordinator never receives BindResponse/LookupResponse/PunchSync/Punch;
-            // those are node-directed. Ignore defensively.
+            // The coordinator never routes these through `handle`:
+            // BindResponse/LookupResponse/PunchSync/Punch are node-directed;
+            // RelayRequest is intercepted by the async loop (it must bind
+            // sockets); RelayGrant is node-directed. Ignore defensively.
             Msg::BindResponse { .. }
             | Msg::LookupResponse { .. }
             | Msg::PunchSync { .. }
-            | Msg::Punch { .. } => Vec::new(),
+            | Msg::Punch { .. }
+            | Msg::RelayRequest { .. }
+            | Msg::RelayGrant { .. } => Vec::new(),
         }
     }
 }
