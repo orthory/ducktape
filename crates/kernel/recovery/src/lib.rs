@@ -979,7 +979,21 @@ where
                             "seal height {height} does not match its block record {block_height}"
                         )));
                     }
-                    // the modules this block CHANGED: the replay unit.
+                    // VERSION-AWARE REPLAY (fork-critical): restore the boundary
+                    // version for THIS height BEFORE any `root()` read below — both
+                    // the at_pre/at_post branch decision AND the post-apply
+                    // verification branch a dual-path module's `root()` on
+                    // `active_version`, so it must equal what the live node held at
+                    // `height` or replay recomputes a different root across H.
+                    // derived the SAME pure way `Host::effective_version` does, from
+                    // the replayed committed upgrade state.
+                    // the block's OWN effective version — the value the live node
+                    // dispatched and sealed under. this is what `apply_block` stamps
+                    // and what the post-apply verification (and the at_post
+                    // already-applied check) must read `root()` under.
+                    let protocol_version = host.effective_version(height).await;
+                    // the modules this block CHANGED: the replay unit. a pure
+                    // comparison of RECORDED root values — version-independent.
                     let changed: Vec<(ModuleId, StateRoot)> = roots
                         .iter()
                         .filter(|(id, root)| expected.get(id) != Some(root))
@@ -991,16 +1005,29 @@ where
                         // root and fork us).
                         skipped += 1;
                     } else {
-                        let at_post = changed
-                            .iter()
-                            .all(|(id, root)| host.module_root(id) == Some(*root));
+                        // the PRE-apply state was sealed under the PREVIOUS height's
+                        // effective version — it differs from this block's version
+                        // ONLY at an activation boundary H, where a dual-path
+                        // `root()` switches algorithm. check "still at the pre-block
+                        // roots?" under it; check "already at the sealed post-roots?"
+                        // (a disk substrate that applied H before the crash) under
+                        // this block's version. at the boundary the two checks need
+                        // DIFFERENT selectors — evaluate each under its own.
+                        let pre_version =
+                            host.effective_version(height.saturating_sub(1)).await;
+                        host.set_active_version(pre_version);
                         let at_pre = changed
                             .iter()
                             .all(|(id, _)| host.module_root(id) == expected.get(id).copied());
+                        host.set_active_version(protocol_version);
+                        let at_post = changed
+                            .iter()
+                            .all(|(id, root)| host.module_root(id) == Some(*root));
                         if at_post {
                             skipped += 1; // a disk substrate already holds it.
                         } else if at_pre {
-                            apply_block(host, height, &frame, Some(disposition)).await?;
+                            apply_block(host, height, &frame, protocol_version, Some(disposition))
+                                .await?;
                             for (id, root) in &changed {
                                 let live = host.module_root(id);
                                 if live != Some(*root) {
@@ -1034,12 +1061,19 @@ where
         // seal it NOW from the observed outcome.
         let mut rolled_forward = false;
         if let Some((height, frame)) = pending {
+            // version-aware replay: same split-selector restore as the sealed path
+            // above — the at_pre comparison reads `root()` under the PREVIOUS
+            // height's version, the roll-forward + seal under this block's version.
+            let protocol_version = host.effective_version(height).await;
+            let pre_version = host.effective_version(height.saturating_sub(1)).await;
+            host.set_active_version(pre_version);
             let at_pre = host
                 .module_roots()
                 .iter()
                 .all(|(id, root)| expected.get(id) == Some(root));
+            host.set_active_version(protocol_version);
             let disposition = if at_pre {
-                apply_block(host, height, &frame, None).await?
+                apply_block(host, height, &frame, protocol_version, None).await?
             } else {
                 // the apply completed before the crash; the roots that moved
                 // are its outcome. (single-disk-substrate blocks make this
@@ -1062,6 +1096,15 @@ where
             rolled_forward = true;
         }
 
+        // final belt-and-suspenders: drive every dual-path module's branch
+        // selector to the TIP's effective version before the app-hash check, so a
+        // replay whose tail blocks were all skipped (disk substrates already held
+        // them) or a genesis boot with no journal suffix still evaluates `root()`
+        // at the correct boundary version. no-op below an activation boundary.
+        if let Some(h) = tip_height {
+            let v = host.effective_version(h).await;
+            host.set_active_version(v);
+        }
         // THE verification: the recomposed state must be byte-identical to
         // what consensus sealed at the tip. anything else means the recovered
         // node would fork — refuse to start.
@@ -1094,11 +1137,21 @@ async fn apply_block(
     host: &mut Host,
     height: u64,
     frame: &[u8],
+    protocol_version: u32,
     expect: Option<Disposition>,
 ) -> Result<Disposition, Error> {
     let outcome = match decode_frame(frame) {
         Ok((origin, msg)) => {
-            let ctx = BlockContext { protocol_version: 0,
+            // `protocol_version` is the PURE `effective_version(height)` over the
+            // REPLAYED committed upgrade state — the identical value the live node
+            // stamped for this block (never the old hardcoded baseline, which would
+            // fork a dual-path module's v2 `root()` at/after an activation boundary
+            // H). the caller has already driven every dual-path module's non-hashed
+            // `active_version` to this same version so `root()` recomputes the
+            // boundary's format. inert (baseline) until the upgrade module is
+            // registered and armed.
+            let ctx = BlockContext {
+                protocol_version,
                 height,
                 consensus_time: height,
                 origin,

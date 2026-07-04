@@ -5225,6 +5225,7 @@ checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
 name = "recovery"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
@@ -5236,8 +5237,10 @@ dependencies = [
  "host",
  "node",
  "sdk",
+ "sha2",
  "state",
  "thiserror 2.0.18",
+ "upgrade-interface",
 ]
 
 [[package]]

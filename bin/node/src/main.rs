@@ -69,6 +69,14 @@ use config::{Resolved, hex_bytes, unhex};
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
+/// the highest protocol version THIS binary's dual-path modules can execute — a
+/// per-node BUILD constant, NEVER consensus state (a lying value can only
+/// refuse-to-boot or halt this one node, never fork the network). the
+/// `ReadinessSignaller` truthfully signals readiness for a pending upgrade iff
+/// `MAX_PROTOCOL_VERSION >= to_version`, and the boot preflight refuses a boundary
+/// whose `required_min_version` exceeds it. bumped to 2 in Phase 9 when the forge v2
+/// dual path lands; baseline-only today.
+const MAX_PROTOCOL_VERSION: u32 = 1;
 use automations::Automations;
 use chat::Chat;
 use directory::Directory;
@@ -249,6 +257,117 @@ async fn read_upgrade_state(host: &Host) -> consensus::BoundaryUpgrade<ed25519::
     }
 }
 
+/// read the upgrade module's committed `current_version` + single pending upgrade
+/// as the manifest MIRROR the recovery/statesync captures carry (committed state —
+/// called between drains, outside any block). falls back to the baseline (version 0,
+/// no pending) when the module is absent (pre-retrofit) or the reply is unreadable,
+/// so a checkpoint is never mis-stamped into a decode slip. keeping this a pure
+/// committed read (not the raw orchestrator state) means a checkpoint captures the
+/// same fields a live node would derive at that height.
+async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCoords>) {
+    use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    let baseline = (host::BASELINE_VERSION, None);
+    let Ok(reply) = host
+        .query("upgrade", &encode_query(&UpgradeQuery::Status))
+        .await
+    else {
+        return baseline;
+    };
+    let reply = match decode_reply(&reply) {
+        Ok(r) => r,
+        Err(_) => return baseline,
+    };
+    let UpgradeReply::Status(status) = reply;
+    let pending = status.pending.map(|up| sdk::UpgradeCoords {
+        name: up.name,
+        activation_height: up.activation_height,
+        to_version: up.to_version,
+    });
+    (status.current_version, pending)
+}
+
+/// the node-local worker that self-emits a validator-origin `SignalReady` op
+/// ONCE per pending upgrade this binary can execute. deliberately NOT a
+/// `reactor::Worker`: readiness must survive restart/late-join, so it polls the
+/// COMMITTED upgrade state each pump tick and re-derives its decision idempotently
+/// rather than reacting to a one-shot block effect. "ready" is a truthful machine
+/// statement about the running binary — it signals iff `MAX_PROTOCOL_VERSION >=
+/// to_version` (never a version it cannot execute).
+struct ReadinessSignaller {
+    /// the highest protocol version this binary can execute (`MAX_PROTOCOL_VERSION`).
+    max_version: u32,
+    /// this node's own validator pubkey bytes — the readiness identity.
+    me: Vec<u8>,
+    /// the `(name, to_version)` we have already emitted a signal for, latched so a
+    /// signal in flight (not yet committed into the module's `ready` set, several
+    /// ticks out) is not re-emitted every pump tick (risk R10 — local dedupe atop
+    /// module idempotence).
+    signaled: Option<(String, u32)>,
+}
+
+impl ReadinessSignaller {
+    fn new(max_version: u32, me: Vec<u8>) -> Self {
+        Self {
+            max_version,
+            me,
+            signaled: None,
+        }
+    }
+
+    /// the PURE decision core: given the committed status, decide whether to emit a
+    /// `SignalReady` and latch it. returns the `(name, to_version)` to signal, or
+    /// `None`. truthful (binary can execute `to_version`), member-gated (self is a
+    /// current boundary member), and idempotent (module already holds our signal, or
+    /// one is already in flight).
+    fn decide(&mut self, status: &upgrade_interface::UpgradeStatus) -> Option<(String, u32)> {
+        let pending = status.pending.as_ref()?;
+        // never lie: a binary that cannot execute the target version stays silent so
+        // the boundary cleanly aborts rather than arming onto an under-versioned node.
+        if pending.to_version > self.max_version {
+            return None;
+        }
+        // only a CURRENT boundary member is in the readiness denominator (R = n).
+        if !status.members.iter().any(|m| m == &self.me) {
+            return None;
+        }
+        // the module already recorded our (committed) signal — nothing to do.
+        if status.ready.iter().any(|k| k == &self.me) {
+            return None;
+        }
+        // a signal for this exact upgrade is already in flight (submitted, awaiting
+        // finalization) — do not re-submit every tick.
+        if self.signaled.as_ref() == Some(&(pending.name.clone(), pending.to_version)) {
+            return None;
+        }
+        self.signaled = Some((pending.name.clone(), pending.to_version));
+        Some((pending.name.clone(), pending.to_version))
+    }
+
+    /// query committed upgrade state and, when a signal is due, build the
+    /// validator-origin `SignalReady` op. gracefully `None` when the module is
+    /// absent (pre-retrofit) or the reply is unreadable — no panic on a baseline net.
+    async fn maybe_signal(&mut self, host: &Host) -> Option<(Msg, String, u32)> {
+        use upgrade_interface::{
+            UpgradeMsg, UpgradeQuery, UpgradeReply, decode_reply, encode_msg, encode_query,
+        };
+        let reply = host
+            .query("upgrade", &encode_query(&UpgradeQuery::Status))
+            .await
+            .ok()?;
+        let UpgradeReply::Status(status) = decode_reply(&reply).ok()?;
+        let (name, to_version) = self.decide(&status)?;
+        let msg = Msg {
+            target: "upgrade".into(),
+            payload: encode_msg(&UpgradeMsg::SignalReady {
+                name: name.clone(),
+                to_version,
+                commitment: None,
+            }),
+        };
+        Some((msg, name, to_version))
+    }
+}
+
 /// hex-encode a state root for a stable, greppable log line.
 fn hex(root: &StateRoot) -> String {
     hex_bytes(&root.0)
@@ -337,8 +456,14 @@ async fn restore_host(
     let document = Document::init(context.child("document"), "document").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
     // forge shares the files body plane (see genesis_host) for Push materialization.
-    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
+    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
         .map_err(|e| format!("forge: {e}"))?;
+    // establish the checkpoint boundary's dual-path branch selector so the
+    // restored forge `root()` matches at any block the replay SKIPS (disk already
+    // held it) before the first replayed block re-derives it per height. the
+    // checkpoint is a settled boundary, so `current_version` IS its effective
+    // version. baseline no-op before Phase 9.
+    forge.set_active_version(manifest.current_version);
 
     let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
         let bytes = manifest
@@ -615,6 +740,14 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let (bytes, root) = snapshot_of("forge").await?;
     let mut forge =
         Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge init: {e}"))?;
+    // set the dual-path branch selector to the SERVED boundary version BEFORE
+    // install: `Forge::install` (and `root()`) branch on `active_version`, so a
+    // joiner installing a post-H snapshot must select the boundary's format or the
+    // install/root would mismatch. `manifest.current_version` IS the effective
+    // version at any settled boundary (the in-block `Advance` reconciles it before
+    // the boundary is captured, so a post-H manifest carries `to_version` with no
+    // pending). baseline/no-op before the forge v2 dual path lands (Phase 9).
+    forge.set_active_version(manifest.current_version);
     forge
         .install(&bytes, root)
         .map_err(|e| format!("forge install: {e}"))?;
@@ -642,6 +775,13 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(directory),
     ])
     .map_err(|e| format!("compose synced host: {e}"))?;
+    // realize the served boundary version into EVERY dual-path module's branch
+    // selector so `root()` (and with it the app-hash check below) recomputes over
+    // the boundary's format — the state-sync analogue of the activation hook the
+    // live/recovery paths run. NON-hashed; idempotent for forge (set pre-install
+    // above); baseline no-op before Phase 9.
+    let mut host = host;
+    host.set_active_version(manifest.current_version);
     if host.app_hash() != manifest.app_hash {
         return Err(format!(
             "composed {} != manifest {}",
@@ -788,6 +928,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
         Some("join") => return cmd_join(&args[1..]),
+        Some("upgrade-status") => return cmd_upgrade_status(&args[1..]),
         _ => {}
     }
 
@@ -1063,6 +1204,63 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     match decode_reply(&raw)? {
         ValsetReply::Validators(v) => Ok(v),
     }
+}
+
+/// `upgrade-status [--config node.toml]` — query the upgrade module Status over
+/// this node's local rpc and print `current_version`, the single pending upgrade,
+/// the readiness verdict (`ready_count` of `member_count`, `armed`), and the
+/// `max_supported` version this binary can execute. degrades gracefully on a net
+/// WITHOUT the module (pre-retrofit): the query errors and we report baseline.
+fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    let (_, flags) = parse_flags(args)?;
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
+    let resolved = config::resolve(&cfg_path)?;
+    let addr = resolved
+        .rpc_listen
+        .ok_or("upgrade-status drives the node's local rpc — set `rpc_listen` in node.toml")?;
+
+    let raw = match rpc_query(&addr, "upgrade", &encode_query(&UpgradeQuery::Status)) {
+        Ok(bytes) => bytes,
+        // module absent (pre-retrofit) or unreachable: report the binary baseline
+        // rather than failing — the CLI is inert on a net without the module.
+        Err(e) => {
+            println!(
+                "upgrade module not available ({e}) — this binary supports up to protocol v{MAX_PROTOCOL_VERSION}"
+            );
+            return Ok(());
+        }
+    };
+    let UpgradeReply::Status(status) = decode_reply(&raw)?;
+    println!("current_version: {}", status.current_version);
+    println!("max_supported (this binary): {MAX_PROTOCOL_VERSION}");
+    match &status.pending {
+        Some(up) => {
+            println!(
+                "pending: name={} activation_height={} to_version={}",
+                up.name, up.activation_height, up.to_version
+            );
+            println!(
+                "readiness: {} of {} boundary members ready",
+                status.ready_count, status.member_count
+            );
+            println!("armed (R == n): {}", status.armed);
+            if up.to_version > MAX_PROTOCOL_VERSION {
+                println!(
+                    "WARNING: this binary (v{MAX_PROTOCOL_VERSION}) cannot execute to_version {} \
+                     — install the newer node binary before H or this node aborts the upgrade",
+                    up.to_version
+                );
+            }
+        }
+        None => println!("pending: none"),
+    }
+    Ok(())
 }
 
 fn read_proposal(
@@ -1540,6 +1738,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 hex(&manifest.app_hash)
             );
 
+            // BOOT PREFLIGHT (design §5 / plan Task 7.3): refuse an under-versioned
+            // binary against the SERVED boundary before installing/composing, so a
+            // too-old joiner fails with a clear "install the newer binary" message
+            // rather than an opaque post-compose app-hash mismatch. the served
+            // `required_min_version` is an unauthenticated hint (untrusted-server
+            // model): a lying value can at worst refuse-to-boot this joiner, never
+            // fork. inert on a baseline manifest.
+            if let Err(e) = manifest.preflight(MAX_PROTOCOL_VERSION) {
+                eprintln!("[node {label}] SYNC REFUSED: {e}");
+                std::process::exit(1);
+            }
+
             // rebuild EVERY module in the manifest (a REAL joiner owns its
             // disk, so every store opens under its canonical module id) and
             // print the greppable line the demo script asserts on.
@@ -1699,6 +1909,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     m.height,
                     m.entries.len()
                 );
+                // BOOT PREFLIGHT (design §5 / plan Task 7.3): refuse an
+                // under-versioned binary against the served boundary before
+                // install/replay — a clear early refusal, not a post-sync app-hash
+                // mismatch. inert on a baseline manifest.
+                if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
+                    eprintln!("[node {label}] FATAL: cannot promote — {e}");
+                    std::process::exit(1);
+                }
                 match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
                     Ok(host) => break (m, host),
                     // a busy source moves its live qmdb targets past the
@@ -1762,6 +1980,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // payload) pair could be dropped by a peer's in-process digest
             // gate; accepted edge until submit sequences ride app state.)
             let pos = recovery.oplog_pos().await;
+            // stamp the real committed version fields so the fabricated checkpoint
+            // carries the same `required_min_version` a live checkpoint would; the
+            // promotion boot then preflights against them like any restart.
+            let (cv, pu) = read_upgrade_version_fields(&host).await;
             let ckpt = match Manifest::capture(
                 &host,
                 Some(boundary.height),
@@ -1769,9 +1991,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 boundary.view_base,
                 boundary.participants.clone(),
                 None,
-                // version fields land in a later phase; baseline for now.
-                0,
-                None,
+                cv,
+                pu,
                 pos,
                 1,
             ) {
@@ -1828,6 +2049,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let genesis_participants: Vec<Vec<u8>> =
                     validators.iter().map(|k| k.as_ref().to_vec()).collect();
                 // seq 0 is the dev demo op's; real submits start at 1.
+                let (cv, pu) = read_upgrade_version_fields(&host).await;
                 let genesis_manifest =
                     match Manifest::capture(
                         &host,
@@ -1836,8 +2058,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         0,
                         genesis_participants,
                         None,
-                        0,
-                        None,
+                        cv,
+                        pu,
                         pos,
                         1,
                     )
@@ -1855,6 +2077,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 (host, None, 1, (None, pos), None)
             }
             Some(manifest) => {
+                // BOOT PREFLIGHT (design §5 / plan Task 7.3): fail loud EARLY when
+                // this binary is too old to apply the blocks at/after the recovered
+                // boundary, instead of falling through to an opaque post-replay
+                // `AppHashMismatch`. inert on a baseline checkpoint (required_min ==
+                // baseline always passes).
+                if let Err(e) = manifest.preflight(MAX_PROTOCOL_VERSION) {
+                    eprintln!(
+                        "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
+                         protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
+                        manifest.required_min_version()
+                    );
+                    std::process::exit(1);
+                }
                 let restored = restore_host(&context, &forge_repo, &manifest, blobs.clone()).await;
                 let mut host = match restored {
                     Ok(h) => h,
@@ -1927,6 +2162,27 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                     armed
                 });
+                // a node that crashed mid-window and resumes must re-arm the SAME
+                // shared cutover slot from the recovered pending UPGRADE (design:
+                // one boundary carries both concerns), so it flips at the identical
+                // deterministic H as an uninterrupted peer. only when a membership
+                // cutover did NOT already claim the slot, and only for a boundary
+                // strictly ahead of the recovered tip (an already-crossed boundary
+                // reconciled in-block during replay). the shared-slot cutover_view is
+                // `activation_height - epoch_base` (see ValsetOrchestrator::resume /
+                // its `resume_rearms_pending_upgrade` test). inert before the module
+                // is registered — `read_upgrade_state` returns baseline/no-pending.
+                let pending_boot = match pending_boot {
+                    Some(view) => Some(view),
+                    None => read_upgrade_state(&host).await.pending.and_then(|p| {
+                        let crossed = rec.height.is_some_and(|h| h >= p.activation_height);
+                        if crossed {
+                            None
+                        } else {
+                            p.activation_height.checked_sub(rec.view_base)
+                        }
+                    }),
+                };
                 let prev = (manifest.height, manifest.oplog_pos);
                 (host, Some(rec), next_seq, prev, pending_boot)
             }
@@ -2303,6 +2559,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // model the account can serve; per-agent model_ref overrides this.
             "gpt-5.3-codex-spark".into(),
         ))];
+        // the readiness self-signaller: polls COMMITTED upgrade state between drains
+        // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
+        // this binary can execute. survives restart/late-join (state-driven, not a
+        // one-shot effect). inert before the module is registered.
+        let mut signaller =
+            ReadinessSignaller::new(MAX_PROTOCOL_VERSION, signer.public_key().as_ref().to_vec());
         loop {
             futures::select_biased! {
                 job = rpc_ingress.next() => {
@@ -2356,6 +2618,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // here is just the crash path, which also recovers.
                             if let Some(f) = node.finalized() {
                                 let pos = node.sink_mut().oplog_pos().await;
+                                let (cv, pu) =
+                                    read_upgrade_version_fields(node.host()).await;
                                 if let Ok(m) = Manifest::capture(
                                     node.host(),
                                     Some(f.height),
@@ -2363,9 +2627,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     orchestrator.epoch_base(),
                                     participant_bytes(&orchestrator),
                                     orchestrator.pending_cutover().map(|c| c.cutover_view()),
-                                    // version fields land in a later phase.
-                                    0,
-                                    None,
+                                    cv,
+                                    pu,
                                     pos,
                                     next_seq,
                                 ) {
@@ -2456,13 +2719,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // the floor certificate is served only when it certifies
                     // exactly the current boundary — a cert behind the
                     // boundary would make a joiner skip history it needs.
+                    // stamp the served boundary's committed version fields from
+                    // live upgrade state (like epoch/view_base). a joiner installs
+                    // its dual-path modules at `current_version` and preflights
+                    // against `required_min_version` — both derived from these.
+                    let (bc_current, bc_pending) =
+                        read_upgrade_version_fields(node.host()).await;
                     let coords = statesync::BoundaryCoords {
                         epoch: orchestrator.epoch(),
                         view_base: orchestrator.epoch_base(),
                         participants: participant_bytes(&orchestrator),
-                        // version fields land in a later phase; baseline for now.
-                        current_version: 0,
-                        pending_upgrade: None,
+                        current_version: bc_current,
+                        pending_upgrade: bc_pending,
                         floor_cert: latest_floor
                             .as_ref()
                             .filter(|fc| fc.epoch == orchestrator.epoch())
@@ -2587,6 +2855,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     if blocks_since_checkpoint >= checkpoint_blocks {
                         if let Some(f) = node.finalized() {
                             let pos = node.sink_mut().oplog_pos().await;
+                            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
                             let captured = Manifest::capture(
                                 node.host(),
                                 Some(f.height),
@@ -2594,9 +2863,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
                                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
-                                // version fields land in a later phase.
-                                0,
-                                None,
+                                cv,
+                                pu,
                                 pos,
                                 next_seq,
                             );
@@ -2751,6 +3019,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // cutover record alone covers only the crash
                             // window until this write lands).
                             let pos = node.sink_mut().oplog_pos().await;
+                            // post-boundary committed version fields: after an armed
+                            // Advance the module holds `current_version = to_version`
+                            // + no pending, so this checkpoint stamps the new baseline.
+                            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
                             let captured = Manifest::capture(
                                 node.host(),
                                 node.finalized().map(|f| f.height),
@@ -2758,9 +3030,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
                                 None,
-                                // version fields land in a later phase.
-                                0,
-                                None,
+                                cv,
+                                pu,
                                 pos,
                                 next_seq,
                             );
@@ -2810,6 +3081,32 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             .await
                         {
                             eprintln!("[node {label}] cutover nop submit failed: {e}");
+                        }
+                    }
+
+                    // READINESS SIGNAL (design §3 / plan Task 7.1): a current
+                    // boundary member whose binary can execute the pending upgrade
+                    // self-submits ONE `SignalReady`. gated to a current member (the
+                    // R = n readiness denominator); the signaller's own committed
+                    // read + local latch keep it idempotent. inert on a baseline net.
+                    if orchestrator
+                        .current_members()
+                        .contains(&signer.public_key())
+                        && let Some((msg, name, to_version)) =
+                            signaller.maybe_signal(node.host()).await
+                    {
+                        let seq = next_seq;
+                        next_seq += 1;
+                        match node.submit(&signer, seq, msg).await {
+                            Ok(_) => println!(
+                                "[node {label}] signaled ready name={name} to_version={to_version}"
+                            ),
+                            Err(e) => {
+                                // un-latch so a transient submit failure retries on
+                                // the next tick (the module stays idempotent).
+                                signaller.signaled = None;
+                                eprintln!("[node {label}] readiness signal submit failed: {e}");
+                            }
                         }
                     }
 
@@ -2871,4 +3168,98 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use upgrade_interface::{Upgrade, UpgradeStatus};
+
+    fn status(
+        pending: Option<(&str, u64, u32)>,
+        members: &[&[u8]],
+        ready: &[&[u8]],
+    ) -> UpgradeStatus {
+        let members: Vec<Vec<u8>> = members.iter().map(|m| m.to_vec()).collect();
+        let ready: Vec<Vec<u8>> = ready.iter().map(|m| m.to_vec()).collect();
+        UpgradeStatus {
+            current_version: 0,
+            pending: pending.map(|(name, activation_height, to_version)| Upgrade {
+                name: name.into(),
+                activation_height,
+                to_version,
+            }),
+            member_count: members.len() as u64,
+            ready_count: ready.len() as u64,
+            armed: false,
+            members,
+            ready,
+        }
+    }
+
+    // ReadinessSignaller emits EXACTLY ONCE for a pending upgrade this binary can
+    // execute when self is a current boundary member, and stays silent thereafter
+    // (the latch), matching the module's own idempotence.
+    #[test]
+    fn readiness_signaller_emits_exactly_once_when_member_and_supported() {
+        let me = vec![7u8; 32];
+        let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
+        // to_version == MAX (<= MAX): supported, self a member, not yet in ready.
+        let st = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&me], &[]);
+        assert_eq!(
+            s.decide(&st),
+            Some(("forge-v2".to_string(), MAX_PROTOCOL_VERSION)),
+            "the first tick signals"
+        );
+        // a second identical tick is a no-op (in-flight latch) — never spam.
+        assert_eq!(s.decide(&st), None, "the latch suppresses re-emission");
+        // once the module records our signal, still silent even if the latch reset.
+        s.signaled = None;
+        let st_ready = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&me], &[&me]);
+        assert_eq!(s.decide(&st_ready), None, "module already holds our signal");
+    }
+
+    #[test]
+    fn readiness_signaller_silent_when_under_versioned() {
+        let me = vec![7u8; 32];
+        let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
+        // to_version beyond what this binary can execute: never lie about readiness.
+        let st = status(Some(("forge-v3", 100, MAX_PROTOCOL_VERSION + 1)), &[&me], &[]);
+        assert_eq!(s.decide(&st), None);
+    }
+
+    #[test]
+    fn readiness_signaller_silent_when_not_a_member() {
+        let me = vec![7u8; 32];
+        let other = vec![9u8; 32];
+        let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me);
+        // self is not in the boundary member set (not in the R = n denominator).
+        let st = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&other], &[]);
+        assert_eq!(s.decide(&st), None);
+    }
+
+    #[test]
+    fn readiness_signaller_silent_when_no_pending() {
+        let me = vec![7u8; 32];
+        let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
+        assert_eq!(s.decide(&status(None, &[&me], &[])), None);
+    }
+
+    // the boot preflight gate: a boundary whose required_min_version exceeds this
+    // binary's MAX_PROTOCOL_VERSION is refused (both recovery-resume and
+    // state-sync-join call `Manifest::preflight`, which delegates here); an equal
+    // or lower requirement boots. this is the fail-loud-early contract Task 7.3
+    // wires onto both boot paths.
+    #[test]
+    fn boot_preflight_refuses_under_versioned_binary() {
+        // a boundary needing one version beyond this build must be refused.
+        assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION).is_err());
+        // exactly at the build ceiling, and below it, boots.
+        assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION).is_ok());
+        if MAX_PROTOCOL_VERSION > 0 {
+            assert!(
+                sdk::check_required_version(MAX_PROTOCOL_VERSION - 1, MAX_PROTOCOL_VERSION).is_ok()
+            );
+        }
+    }
 }
