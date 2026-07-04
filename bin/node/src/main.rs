@@ -1729,6 +1729,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 boundary.view_base,
                 boundary.participants.clone(),
                 None,
+                // version fields land in a later phase; baseline for now.
+                0,
+                None,
                 pos,
                 1,
             ) {
@@ -1786,7 +1789,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     validators.iter().map(|k| k.as_ref().to_vec()).collect();
                 // seq 0 is the dev demo op's; real submits start at 1.
                 let genesis_manifest =
-                    match Manifest::capture(&host, None, 0, 0, genesis_participants, None, pos, 1)
+                    match Manifest::capture(
+                        &host,
+                        None,
+                        0,
+                        0,
+                        genesis_participants,
+                        None,
+                        0,
+                        None,
+                        pos,
+                        1,
+                    )
                     {
                         Ok(m) => m,
                         Err(e) => {
@@ -2309,6 +2323,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     orchestrator.epoch_base(),
                                     participant_bytes(&orchestrator),
                                     orchestrator.pending_cutover().map(|c| c.cutover_view()),
+                                    // version fields land in a later phase.
+                                    0,
+                                    None,
                                     pos,
                                     next_seq,
                                 ) {
@@ -2403,6 +2420,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         epoch: orchestrator.epoch(),
                         view_base: orchestrator.epoch_base(),
                         participants: participant_bytes(&orchestrator),
+                        // version fields land in a later phase; baseline for now.
+                        current_version: 0,
+                        pending_upgrade: None,
                         floor_cert: latest_floor
                             .as_ref()
                             .filter(|fc| fc.epoch == orchestrator.epoch())
@@ -2534,6 +2554,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
                                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
+                                // version fields land in a later phase.
+                                0,
+                                None,
                                 pos,
                                 next_seq,
                             );
@@ -2646,6 +2669,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
+                                None,
+                                // version fields land in a later phase.
+                                0,
                                 None,
                                 pos,
                                 next_seq,

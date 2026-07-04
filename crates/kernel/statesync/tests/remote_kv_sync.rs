@@ -67,6 +67,7 @@ async fn serve_until_closed(
         view_base: 0,
         participants: vec![],
         floor_cert: None,
+        ..Default::default()
     };
     while let Some((frame, reply)) = rx.next().await {
         let resp = server

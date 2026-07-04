@@ -54,7 +54,7 @@ use futures::{StreamExt as _, pin_mut};
 
 use host::{BlockContext, Host, SubmitError};
 use node::{BlockSeal, BlockSink, Disposition, decode_frame};
-use sdk::{ModuleId, StateRoot};
+use sdk::{ModuleId, StateRoot, UpgradeCoords};
 
 /// runtime bounds every store here needs (same alias the storage crate uses:
 /// `Storage + Clock + Metrics`).
@@ -95,6 +95,10 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_u64(out, b.len() as u64);
     out.extend_from_slice(b);
@@ -128,6 +132,18 @@ impl<'a> Cursor<'a> {
     fn u64(&mut self) -> Result<u64, Error> {
         let b = self.take(8)?;
         Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+    }
+
+    fn u32(&mut self) -> Result<u32, Error> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    }
+
+    /// true once every byte has been consumed — the tolerant-tail probe: an
+    /// old-format checkpoint ends here, a new-format one still has its version
+    /// fields to read.
+    fn at_end(&self) -> bool {
+        self.at == self.buf.len()
     }
 
     fn bytes(&mut self) -> Result<Vec<u8>, Error> {
@@ -362,6 +378,19 @@ pub struct Manifest {
     /// framed (the exactly-once digest gate does not survive the process, so
     /// a reused (origin, seq, payload) triple would re-apply).
     pub next_seq: u64,
+    /// the agreed protocol version active at this boundary. an UNAUTHENTICATED
+    /// preflight hint — the authority stays the replayed upgrade-module state,
+    /// confirmed by the final app-hash compose. defaults to 0 on an on-disk
+    /// checkpoint written before this field existed (tolerant decode).
+    pub current_version: u32,
+    /// the single upgrade armed but not yet activated at checkpoint time, if
+    /// any — the version analogue of `pending_cutover_view`.
+    pub pending_upgrade: Option<UpgradeCoords>,
+    /// the highest protocol version any block at or after this boundary needs
+    /// (`pending.to_version` once `height >= pending.activation_height`, else
+    /// `current_version`). the boot preflight compares the local build's
+    /// `MAX_PROTOCOL_VERSION` against this and refuses EARLY when it is lower.
+    pub required_min_version: u32,
 }
 
 impl Manifest {
@@ -393,6 +422,18 @@ impl Manifest {
         }
         put_u64(&mut out, self.oplog_pos);
         put_u64(&mut out, self.next_seq);
+        // --- ADDITIVE version tail (see decode's tolerant read) ---
+        put_u32(&mut out, self.current_version);
+        match &self.pending_upgrade {
+            Some(u) => {
+                out.push(1);
+                put_bytes(&mut out, u.name.as_bytes());
+                put_u64(&mut out, u.activation_height);
+                put_u32(&mut out, u.to_version);
+            }
+            None => out.push(0),
+        }
+        put_u32(&mut out, self.required_min_version);
         out
     }
 
@@ -425,6 +466,32 @@ impl Manifest {
         }
         let oplog_pos = c.u64()?;
         let next_seq = c.u64()?;
+        // ADDITIVE version tail. a checkpoint written by an older binary ends
+        // here; map the missing tail to baseline defaults rather than tripping
+        // the no-trailing-bytes check, so a new binary boots an old on-disk
+        // checkpoint. a present-but-malformed tail still fails loud.
+        let (current_version, pending_upgrade, required_min_version) = if c.at_end() {
+            (0, None, 0)
+        } else {
+            let current_version = c.u32()?;
+            let pending_upgrade = match c.take(1)?[0] {
+                0 => None,
+                1 => {
+                    let name = String::from_utf8(c.bytes()?)
+                        .map_err(|_| Error::Corrupt("upgrade name is not utf-8".into()))?;
+                    let activation_height = c.u64()?;
+                    let to_version = c.u32()?;
+                    Some(UpgradeCoords {
+                        name,
+                        activation_height,
+                        to_version,
+                    })
+                }
+                t => return Err(Error::Corrupt(format!("bad pending-upgrade tag {t}"))),
+            };
+            let required_min_version = c.u32()?;
+            (current_version, pending_upgrade, required_min_version)
+        };
         c.done()?;
         Ok(Self {
             height,
@@ -437,6 +504,9 @@ impl Manifest {
             snapshots,
             oplog_pos,
             next_seq,
+            current_version,
+            pending_upgrade,
+            required_min_version,
         })
     }
 
@@ -459,6 +529,7 @@ impl Manifest {
     /// in-memory cohort); disk-backed modules recover themselves and
     /// contribute only their root. a local checkpoint IS a statesync capture
     /// of your past self.
+    #[allow(clippy::too_many_arguments)]
     pub fn capture(
         host: &Host,
         height: Option<u64>,
@@ -466,6 +537,8 @@ impl Manifest {
         view_base: u64,
         participants: Vec<Vec<u8>>,
         pending_cutover_view: Option<u64>,
+        current_version: u32,
+        pending_upgrade: Option<UpgradeCoords>,
         oplog_pos: u64,
         next_seq: u64,
     ) -> Result<Self, Error> {
@@ -490,6 +563,12 @@ impl Manifest {
                 _ => None,
             })
             .collect();
+        let required_min_version = sdk::required_min_version(
+            current_version,
+            pending_upgrade.as_ref(),
+            // genesis has no boundary yet; 0 is a placeholder height there.
+            height.unwrap_or(0),
+        );
         Ok(Self {
             height,
             epoch,
@@ -501,7 +580,25 @@ impl Manifest {
             snapshots,
             oplog_pos,
             next_seq,
+            current_version,
+            pending_upgrade,
+            required_min_version,
         })
+    }
+
+    /// this boundary's required minimum protocol version — the fence the boot
+    /// preflight checks the local build against.
+    pub fn required_min_version(&self) -> u32 {
+        self.required_min_version
+    }
+
+    /// boot preflight: fail loud when the local build's `max_supported`
+    /// protocol version is below this boundary's `required_min_version`,
+    /// turning an opaque post-replay app-hash mismatch into an early,
+    /// actionable "height needs binary vX" refusal. NOT yet wired into the
+    /// live resume path (that invocation is a later phase).
+    pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
+        sdk::check_required_version(self.required_min_version, max_supported)
     }
 }
 
@@ -1091,9 +1188,8 @@ mod tests {
         assert!(Record::decode(&bad).is_err());
     }
 
-    #[test]
-    fn manifest_roundtrip() {
-        let m = Manifest {
+    fn sample_manifest() -> Manifest {
+        Manifest {
             height: Some(42),
             epoch: 1,
             view_base: 30,
@@ -1107,11 +1203,89 @@ mod tests {
             ],
             oplog_pos: 17,
             next_seq: 5,
-        };
+            current_version: 0,
+            pending_upgrade: None,
+            required_min_version: 0,
+        }
+    }
+
+    #[test]
+    fn manifest_roundtrip() {
+        // defaults for the version tail.
+        let m = sample_manifest();
         let decoded = Manifest::decode(&m.encode()).expect("roundtrip");
         assert_eq!(decoded, m);
         assert_eq!(decoded.snapshot("directory"), Some(b"dir-bytes".as_ref()));
         assert_eq!(decoded.root("valset"), Some(StateRoot([3; 32])));
+
+        // non-default version tail, with a pending upgrade set.
+        let m = Manifest {
+            current_version: 3,
+            pending_upgrade: Some(UpgradeCoords {
+                name: "v4".into(),
+                activation_height: 100,
+                to_version: 4,
+            }),
+            required_min_version: 3,
+            ..sample_manifest()
+        };
+        assert_eq!(Manifest::decode(&m.encode()).expect("roundtrip"), m);
+    }
+
+    #[test]
+    fn manifest_decode_tolerates_old_format() {
+        // an on-disk checkpoint written before the version fields existed: the
+        // encoding with its version tail truncated at `next_seq`. a new binary
+        // must map the missing tail to baseline defaults, not reject it.
+        let m = sample_manifest();
+        let full = m.encode();
+        // the tail is `u32 current + 1-byte pending tag(None) + u32 required` =
+        // 9 bytes; drop them to simulate the prior format.
+        let old = &full[..full.len() - 9];
+        let decoded = Manifest::decode(old).expect("old format decodes");
+        assert_eq!(decoded.current_version, 0);
+        assert_eq!(decoded.pending_upgrade, None);
+        assert_eq!(decoded.required_min_version, 0);
+        // everything before the tail survives unchanged.
+        assert_eq!(decoded, m);
+    }
+
+    #[test]
+    fn manifest_decode_rejects_truncated_version_tail() {
+        // a present-but-malformed tail (one byte into the version fields) must
+        // fail loud, never silently default.
+        let full = sample_manifest().encode();
+        let torn = &full[..full.len() - 4]; // half of the required_min u32.
+        assert!(Manifest::decode(torn).is_err());
+    }
+
+    #[test]
+    fn required_min_version_fencepost_via_capture() {
+        // the derivation the capture path uses, exercised through the shared
+        // sdk fence: below activation -> current_version, at/after -> to_version.
+        let pending = UpgradeCoords {
+            name: "v2".into(),
+            activation_height: 50,
+            to_version: 2,
+        };
+        assert_eq!(sdk::required_min_version(1, Some(&pending), 49), 1);
+        assert_eq!(sdk::required_min_version(1, Some(&pending), 50), 2);
+        assert_eq!(sdk::required_min_version(1, None, 50), 1);
+    }
+
+    #[test]
+    fn preflight_gates_on_required_min() {
+        let m = Manifest {
+            required_min_version: 3,
+            ..sample_manifest()
+        };
+        // a build that supports >= the required min boots.
+        assert!(m.preflight(3).is_ok());
+        assert!(m.preflight(4).is_ok());
+        // an under-versioned build refuses loud.
+        let err = m.preflight(2).expect_err("under-versioned build");
+        assert_eq!(err.required_min, 3);
+        assert_eq!(err.max_supported, 2);
     }
 
     #[test]
