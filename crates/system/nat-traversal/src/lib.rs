@@ -18,5 +18,8 @@ pub use client::{NatClient, run_coordinator};
 pub use coordinator::{Coordinator, Side};
 pub use relay::{Forward, RelaySplice};
 #[cfg(any(test, feature = "simnat"))]
-pub use punch::{PunchError, PunchPlan};
+pub use punch::{
+    FallbackOutcome, PunchError, PunchPlan, RelayFallbackProof, drive_simulated,
+    drive_with_relay_fallback,
+};
 pub use wire::{Msg, NodeKey, WireError};
