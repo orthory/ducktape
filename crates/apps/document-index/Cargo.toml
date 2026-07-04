@@ -1,0 +1,16 @@
+# document's materialized view on the derived tier: full-text block search.
+# depends on the indexer contract and document's types-only interface — NEVER
+# the module impl.
+[package]
+name = "document-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexer = { workspace = true }
+document-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

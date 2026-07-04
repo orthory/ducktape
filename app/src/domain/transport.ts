@@ -81,6 +81,14 @@ export interface NodeTransport {
   /** Read committed state. The reply is the module's `*Reply` enum as json. */
   query(target: string, query: unknown): Promise<unknown>;
   /**
+   * Read the module's MATERIALIZED VIEW — its own endpoint on the node's
+   * derived index tier (POST /v1/index/{module}/view), serving read shapes
+   * canonical state can't (search, partitions). Request/reply are the
+   * module's `*-index` wire: camelCase throughout, unlike the snake_case
+   * canonical module wire. Rejects 404 for modules with no view (forge).
+   */
+  view(module: string, request: unknown): Promise<unknown>;
+  /**
    * Stage raw bytes in the node's content-addressed blob store and get their
    * sha256 digest back (64 lowercase hex). NOTHING is committed — a later
    * `submit` references the digest. The agent flow uses this to upload a
@@ -200,6 +208,8 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       postJson<BlockEvent>(`${base}/v1/submit`, { target, payload, origin }),
     query: (target, query) =>
       postJson<unknown>(`${base}/v1/query`, { target, query }),
+    view: (module, request) =>
+      postJson<unknown>(`${base}/v1/index/${module}/view`, request),
     // raw bytes in, `{"digest":"<64-hex>"}` out — not json in, so this bypasses
     // postJson; the error envelope is still the node's json `{error}` shape.
     putBlob: (bytes) =>

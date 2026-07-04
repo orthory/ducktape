@@ -101,6 +101,7 @@ const makeFakeNode = () => {
       }
       return Promise.resolve({ Tasks: [] });
     }),
+    view: vi.fn().mockResolvedValue({ hits: [] }),
     putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
     getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
     status: vi.fn().mockResolvedValue({

@@ -259,6 +259,13 @@ pub struct NodeHandle {
     /// that never serves the git lane (the router tests' fake actor), which
     /// makes upload-pack a clean 500 there rather than a panic.
     forge_repo: Option<PathBuf>,
+    /// the per-module derived index (fluent31-backed read models). node-local
+    /// like `blobs`/`telemetry`: the actor is the one WRITER as blocks commit;
+    /// the `/v1/index/*` handlers read it directly through MVCC snapshots, so
+    /// an index scan never crosses the actor command lane. `None` on a handle
+    /// whose embedder configured no index (the router tests' fake actor) —
+    /// index routes answer 503 there.
+    index: Option<Arc<indexer::IndexStore>>,
 }
 
 impl NodeHandle {
@@ -280,6 +287,7 @@ impl NodeHandle {
             blobs: files::BlobHandle::default(),
             telemetry: TelemetryRing::default(),
             forge_repo: None,
+            index: None,
         };
         (handle, cmd_rx, event_tx)
     }
@@ -290,6 +298,14 @@ impl NodeHandle {
     /// so the http fetch lane reads exactly the repos consensus materializes.
     pub fn with_forge_repo(mut self, base: impl Into<PathBuf>) -> Self {
         self.forge_repo = Some(base.into());
+        self
+    }
+
+    /// point this handle at the per-module derived index so the `/v1/index/*`
+    /// routes can serve snapshot reads. the daemon passes the SAME store its
+    /// actor feeds block-by-block.
+    pub fn with_index_store(mut self, index: Arc<indexer::IndexStore>) -> Self {
+        self.index = Some(index);
         self
     }
 
@@ -348,6 +364,14 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
         .route("/v1/telemetry", get(telemetry))
+        // the derived read-model tier: snapshot reads of the per-module
+        // fluent31 indexes the actor materializes as blocks commit.
+        .route("/v1/index/status", get(index_status))
+        .route("/v1/index/{module}/ops", get(index_ops))
+        .route("/v1/index/{module}/scan", get(index_scan))
+        // the module's OWN endpoint on the derived tier: an opaque
+        // module-defined view request, answered by its registered mapper.
+        .route("/v1/index/{module}/view", post(index_view))
         // Prometheus scrape convention: root `/metrics`, not under `/v1`.
         .route("/metrics", get(metrics))
         .route("/v1/shutdown", post(shutdown))
@@ -467,6 +491,215 @@ async fn telemetry(
 ) -> Response {
     let frames = handle.telemetry.recent(params.limit);
     Json(serde_json::json!({ "frames": frames })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// the derived-index read lane. like the blob and telemetry lanes these
+// handlers never cross the actor: the store is `Send + Sync` and every read
+// runs at its own MVCC snapshot, concurrent with the actor's block writes.
+// ---------------------------------------------------------------------------
+
+/// query params for `GET /v1/index/{module}/scan` and `…/ops`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexScanParams {
+    /// key prefix to scan under. ignored by `…/ops` (pinned to the op log).
+    pub prefix: Option<String>,
+    /// opaque page cursor: the `nextAfter` of the previous page.
+    pub after: Option<String>,
+    /// page size; the store clamps oversized asks.
+    pub limit: Option<usize>,
+}
+
+/// default page size when a client sends no `limit`.
+const INDEX_DEFAULT_LIMIT: usize = 100;
+
+/// one scanned entry. values written by this tier are json (`value`); a
+/// derived value that is not valid json ships as `valueHex` instead.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexEntry {
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Box<serde_json::value::RawValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_hex: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexScanResponse {
+    entries: Vec<IndexEntry>,
+    has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_after: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexOpsResponse {
+    /// stored op-row envelopes, verbatim (height/seq/time/origin + payload).
+    ops: Vec<Box<serde_json::value::RawValue>>,
+    has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_after: Option<String>,
+}
+
+fn index_store(handle: &NodeHandle) -> Result<&Arc<indexer::IndexStore>, Response> {
+    handle.index.as_ref().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no index store configured",
+        )
+    })
+}
+
+fn index_error(err: indexer::Error) -> Response {
+    let status = match err {
+        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => {
+            StatusCode::NOT_FOUND
+        }
+        indexer::Error::View(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, &err.to_string())
+}
+
+/// GET /v1/index/status — each module's applied watermark plus the poison
+/// flag. a poisoned index keeps serving (stale but consistent) reads; the
+/// remedy is a rebuild, which this surface makes visible.
+async fn index_status(State(handle): State<NodeHandle>) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let mut modules = serde_json::Map::new();
+    for id in store.module_ids() {
+        match store.applied_height(id) {
+            Ok(height) => {
+                modules.insert(id.to_string(), height.into());
+            }
+            Err(err) => return index_error(err),
+        }
+    }
+    Json(serde_json::json!({
+        "poisoned": store.is_poisoned(),
+        "modules": modules,
+    }))
+    .into_response()
+}
+
+/// GET /v1/index/{module}/ops?after=&limit= — one page of the module's op
+/// log, oldest-first. rows are the stored envelopes verbatim; page forward by
+/// echoing `nextAfter` as the next call's `after`.
+async fn index_ops(
+    State(handle): State<NodeHandle>,
+    Path(module): Path<String>,
+    Query(params): Query<IndexScanParams>,
+) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let page = match store.scan(
+        &module,
+        indexer::OP_PREFIX.as_bytes(),
+        params.after.as_deref().map(str::as_bytes),
+        params.limit.unwrap_or(INDEX_DEFAULT_LIMIT),
+    ) {
+        Ok(page) => page,
+        Err(err) => return index_error(err),
+    };
+    let mut ops = Vec::with_capacity(page.entries.len());
+    for (_key, value) in &page.entries {
+        match serde_json::from_slice(value) {
+            Ok(row) => ops.push(row),
+            // rows are written as json by construction; failing one means the
+            // store is damaged — say so instead of silently dropping it.
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "stored op row was not json — rebuild the index",
+                );
+            }
+        }
+    }
+    Json(IndexOpsResponse {
+        ops,
+        has_more: page.has_more,
+        next_after: page.next_after,
+    })
+    .into_response()
+}
+
+/// POST /v1/index/{module}/view — the module's materialized view, served by
+/// its registered mapper. request body and reply are module-defined json
+/// (chat: `{"search": {…}}` → `{"hits": […]}`), exactly as opaque to the
+/// daemon as `/v1/query` payloads are. modules with no view answer 404 —
+/// some never will (forge's substrate is already a queryable git repo).
+async fn index_view(
+    State(handle): State<NodeHandle>,
+    Path(module): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
+    match store.view(&module, &req_bytes) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "view reply was not json",
+            ),
+        },
+        Err(err) => index_error(err),
+    }
+}
+
+/// GET /v1/index/{module}/scan?prefix=&after=&limit= — one page of raw index
+/// keys, for a module's derived read models (everything a registered
+/// `ModuleIndexer` materialized outside the reserved op/meta spaces).
+async fn index_scan(
+    State(handle): State<NodeHandle>,
+    Path(module): Path<String>,
+    Query(params): Query<IndexScanParams>,
+) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let prefix = params.prefix.unwrap_or_default();
+    let page = match store.scan(
+        &module,
+        prefix.as_bytes(),
+        params.after.as_deref().map(str::as_bytes),
+        params.limit.unwrap_or(INDEX_DEFAULT_LIMIT),
+    ) {
+        Ok(page) => page,
+        Err(err) => return index_error(err),
+    };
+    let entries = page
+        .entries
+        .iter()
+        .map(|(key, value)| {
+            let json: Option<Box<serde_json::value::RawValue>> =
+                serde_json::from_slice(value).ok();
+            IndexEntry {
+                key: String::from_utf8_lossy(key).into_owned(),
+                value_hex: json.is_none().then(|| hex_bytes(value)),
+                value: json,
+            }
+        })
+        .collect();
+    Json(IndexScanResponse {
+        entries,
+        has_more: page.has_more,
+        next_after: page.next_after,
+    })
+    .into_response()
 }
 
 /// the OpenMetrics content type a Prometheus scraper negotiates for `/metrics`.

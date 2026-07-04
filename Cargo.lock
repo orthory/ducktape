@@ -871,6 +871,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-index"
+version = "0.1.0"
+dependencies = [
+ "chat-interface",
+ "indexer",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "chat-interface"
 version = "0.1.0"
 dependencies = [
@@ -1621,6 +1632,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-skiplist"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df29de440c58ca2cc6e587ec3d22347551a32435fbde9d2bff64e78a9ffa151b"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2054,6 +2075,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "document-index"
+version = "0.1.0"
+dependencies = [
+ "document-interface",
+ "indexer",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "document-interface"
 version = "0.1.0"
 dependencies = [
@@ -2355,6 +2387,19 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+]
+
+[[package]]
+name = "fluent31"
+version = "0.1.0"
+source = "git+https://github.com/orthory/fluent31#442aaecc0e2d9555ff4d67e0262d1207583f4c99"
+dependencies = [
+ "crc32fast",
+ "crossbeam-skiplist",
+ "io-uring",
+ "libc",
+ "lz4_flex",
+ "parking_lot",
 ]
 
 [[package]]
@@ -3365,6 +3410,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexer"
+version = "0.1.0"
+dependencies = [
+ "fluent31",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3418,6 +3474,17 @@ dependencies = [
  "tokio",
  "widestring 1.2.1",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -3793,6 +3860,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+
+[[package]]
 name = "markup5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4118,9 +4191,11 @@ dependencies = [
  "automations",
  "axum",
  "chat",
+ "chat-index",
  "chat-interface",
  "commonware-runtime",
  "document",
+ "document-index",
  "files",
  "files-interface",
  "flate2",
@@ -4131,9 +4206,11 @@ dependencies = [
  "host",
  "http-body-util",
  "inbox",
+ "indexer",
  "jobs",
  "memory",
  "pages",
+ "pages-index",
  "profiles",
  "reactor",
  "saga",
@@ -4142,6 +4219,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tasks",
+ "tasks-index",
  "tempfile",
  "tokio",
  "tower",
@@ -4591,6 +4669,17 @@ dependencies = [
  "serde_json",
  "state",
  "statesync",
+]
+
+[[package]]
+name = "pages-index"
+version = "0.1.0"
+dependencies = [
+ "indexer",
+ "pages-interface",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -6319,6 +6408,17 @@ dependencies = [
  "sdk",
  "sha2",
  "tasks-interface",
+]
+
+[[package]]
+name = "tasks-index"
+version = "0.1.0"
+dependencies = [
+ "indexer",
+ "serde",
+ "serde_json",
+ "tasks-interface",
+ "tempfile",
 ]
 
 [[package]]

@@ -550,10 +550,12 @@ fn state_persists_across_restart() {
         }
     }
 
-    // a fresh daemon over the SAME storage root: qmdb state must survive; the
-    // height counter is a local block counter and restarts at 0 by design.
+    // a fresh daemon over the SAME storage root: qmdb state must survive, and
+    // the local block counter resumes ABOVE the per-module index watermark
+    // (two blocks were indexed) — a counter restarting at 0 would re-use
+    // indexed heights and every new block would be silently skipped.
     let daemon = Daemon::spawn(storage.path());
-    assert_eq!(daemon.status()["height"], 0);
+    assert_eq!(daemon.status()["height"], 2);
     let reply = daemon.query(
         "chat",
         serde_json::json!({ "MessagesLatest": { "channel_id": "durable", "limit": 16 } }),
@@ -564,6 +566,123 @@ fn state_persists_across_restart() {
         messages[0]["head"]["blocks"][0]["Paragraph"][0]["text"],
         "written before restart"
     );
+}
+
+#[test]
+fn per_module_index_serves_ops_and_views() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let hits_of = |reply: &serde_json::Value| -> Vec<serde_json::Value> {
+        reply["hits"].as_array().expect("hits reply").clone()
+    };
+
+    let pre_restart_height;
+    {
+        let daemon = Daemon::spawn(storage.path());
+        let (code, _) = daemon.submit(
+            "chat",
+            serde_json::json!({
+                "CreateChannel": { "channel_id": "eng", "name": "Eng", "post_policy": "Open" }
+            }),
+            None,
+        );
+        assert_eq!(code, 200);
+        let (code, _) = daemon.submit("chat", post_message("eng", "m1", "fluent index demo"), Some("eddy"));
+        assert_eq!(code, 200);
+        let (code, _) = daemon.submit(
+            "tasks",
+            serde_json::json!({ "CreateTask": { "task_id": "t1", "title": "wire the indexer" } }),
+            None,
+        );
+        assert_eq!(code, 200);
+
+        // the raw op log: every applied chat op, oldest-first, json envelopes.
+        let (code, ops) = daemon.request("GET", "/v1/index/chat/ops?limit=10", None);
+        assert_eq!(code, 200, "ops failed: {ops}");
+        let rows = ops["ops"].as_array().expect("ops array");
+        assert_eq!(rows.len(), 2, "create-channel and post: {ops}");
+        // the payload is the module op VERBATIM (chat's wire is snake_case);
+        // the envelope itself (origin/height/seq) is the indexer's camelCase.
+        assert_eq!(rows[1]["payload"]["PostMessage"]["message_id"], "m1");
+        assert_eq!(rows[1]["origin"]["kind"], "external");
+        assert_eq!(rows[1]["height"], 2);
+
+        // chat's OWN endpoint: the materialized search view.
+        let (code, reply) = daemon.request(
+            "POST",
+            "/v1/index/chat/view",
+            Some(&serde_json::json!({ "search": { "text": "fluent" } })),
+        );
+        assert_eq!(code, 200, "chat view failed: {reply}");
+        let hits = hits_of(&reply);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["messageId"], "m1");
+        assert_eq!(hits[0]["author"], "user:eddy");
+
+        // tasks' endpoint: the by-status partition.
+        let (code, reply) = daemon.request(
+            "POST",
+            "/v1/index/tasks/view",
+            Some(&serde_json::json!({ "byStatus": { "status": "Open" } })),
+        );
+        assert_eq!(code, 200, "tasks view failed: {reply}");
+        let tasks = reply["tasks"]["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["title"], "wire the indexer");
+
+        // a module with no materialized view answers 404 — forge's substrate
+        // is already a queryable git repo; it never registers one.
+        let (code, _) = daemon.request(
+            "POST",
+            "/v1/index/forge/view",
+            Some(&serde_json::json!({ "anything": {} })),
+        );
+        assert_eq!(code, 404);
+
+        // the watermark surface: all three blocks indexed, nothing poisoned.
+        let (code, status) = daemon.request("GET", "/v1/index/status", None);
+        assert_eq!(code, 200);
+        assert_eq!(status["poisoned"], false);
+        assert_eq!(status["modules"]["chat"], 2);
+        assert_eq!(status["modules"]["tasks"], 3);
+
+        pre_restart_height = daemon.status()["height"].as_u64().expect("height");
+
+        let (code, _) = daemon.request("POST", "/v1/shutdown", None);
+        assert_eq!(code, 200);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut daemon = daemon;
+        while daemon.child.try_wait().expect("poll daemon").is_none() {
+            assert!(Instant::now() < deadline, "daemon ignored /v1/shutdown");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // restart over the same storage: the index survives, the block counter
+    // resumes above its watermark, and NEW blocks keep indexing.
+    let daemon = Daemon::spawn(storage.path());
+    assert_eq!(
+        daemon.status()["height"].as_u64().expect("height"),
+        pre_restart_height
+    );
+    let (code, reply) = daemon.request(
+        "POST",
+        "/v1/index/chat/view",
+        Some(&serde_json::json!({ "search": { "text": "fluent" } })),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(hits_of(&reply).len(), 1, "index survives a restart");
+
+    let (code, _) = daemon.submit("chat", post_message("eng", "m2", "fresh after restart"), Some("eddy"));
+    assert_eq!(code, 200);
+    let (code, reply) = daemon.request(
+        "POST",
+        "/v1/index/chat/view",
+        Some(&serde_json::json!({ "search": { "text": "fresh" } })),
+    );
+    assert_eq!(code, 200);
+    let hits = hits_of(&reply);
+    assert_eq!(hits.len(), 1, "post-restart blocks keep indexing");
+    assert_eq!(hits[0]["messageId"], "m2");
 }
 
 #[test]

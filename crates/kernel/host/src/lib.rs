@@ -98,6 +98,12 @@ pub struct DispatchRecord {
     /// what triggered this dispatch: the root op's real `origin`, or
     /// `Origin::Module(emitter)` for a follow-up.
     pub origin: Origin,
+    /// the op bytes this dispatch applied (`msg.payload`) — a consensus input,
+    /// so the trace stays deterministic. carrying it here makes the outcome the
+    /// block's complete per-module op stream (root op AND follow-ups), which is
+    /// what a derived read-model tier consumes; the payload of a follow-up is
+    /// otherwise visible to no one outside the drain.
+    pub payload: Vec<u8>,
     /// count of follow-up `Msg`s this dispatch emitted (the causal fan-out).
     pub emitted_msgs: usize,
     /// count of observability `Event`s this dispatch emitted.
@@ -811,6 +817,8 @@ impl Host {
             dispatches.push(DispatchRecord {
                 module: msg.target.clone(),
                 origin: trigger,
+                // partial move: only `msg.target` is read below.
+                payload: msg.payload,
                 emitted_msgs: out_msgs.len(),
                 emitted_events: out_events.len(),
             });
