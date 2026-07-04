@@ -142,6 +142,9 @@ export interface ConsoleActions {
   revealInvite(): void;
   /** Admit a joiner by pubkey through the active (member) workspace. */
   admitMember(pubkey: string): void;
+  /** Open a removal proposal for a validator by pubkey and cast this node's
+   *  yes-ballot; the removal takes effect only once a strict majority approve. */
+  demoteMember(pubkey: string): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -711,6 +714,15 @@ export function createActions({
       if (!target || !pubkey.trim()) return;
       Promise.resolve()
         .then(() => ws.admitMember(target.id, pubkey.trim()))
+        .then(() => refresh())
+        .catch(fail);
+    },
+
+    demoteMember: (pubkey) => {
+      const target = getState().workspace;
+      if (!target || !pubkey.trim()) return;
+      Promise.resolve()
+        .then(() => ws.demoteMember(target.id, pubkey.trim()))
         .then(() => refresh())
         .catch(fail);
     },
