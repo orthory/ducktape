@@ -120,6 +120,17 @@ impl Coordinator {
         Some((session, side))
     }
 
+    /// Reclaim a single relay session by id: drop it from both `relay_sessions`
+    /// and the `relay_by_pair` index. After this, a later `request_relay` for
+    /// the same unordered pair allocates a FRESH session id (so the async
+    /// coordinator re-binds live relay sockets) instead of handing back a
+    /// torn-down one. Idempotent: releasing an unknown id is a no-op.
+    pub fn release_relay(&mut self, session: u64) {
+        if let Some(s) = self.relay_sessions.remove(&session) {
+            self.relay_by_pair.remove(&(s.a, s.b));
+        }
+    }
+
     /// Drop relay sessions idle longer than `idle_ticks`. Keeps relay state
     /// bounded: a session with no traffic is torn down so the coordinator never
     /// accumulates unbounded `SocketAddr` pairs.
@@ -131,9 +142,7 @@ impl Coordinator {
             .map(|(&id, _)| id)
             .collect();
         for id in expired {
-            if let Some(s) = self.relay_sessions.remove(&id) {
-                self.relay_by_pair.remove(&(s.a, s.b));
-            }
+            self.release_relay(id);
         }
     }
 }
@@ -205,6 +214,26 @@ mod tests {
         let mut c = Coordinator::new();
         let stranger = addr(9, 9999);
         assert!(c.request_relay(stranger, NodeKey([0xbb; 32]), 0).is_none());
+    }
+
+    #[test]
+    fn release_relay_reclaims_session_so_re_request_allocates_a_fresh_id() {
+        let mut c = Coordinator::new();
+        let a_src = addr(1, 1111);
+        let a = NodeKey([0xaa; 32]);
+        let b = NodeKey([0xbb; 32]);
+        c.handle(a_src, Msg::Register { key: a });
+
+        let (s0, _) = c.request_relay(a_src, b, 0).expect("session");
+        // The torn-down splice's session is reclaimed by id.
+        c.release_relay(s0);
+        // Re-requesting the same unordered pair must NOT reuse the reclaimed id
+        // (which the async coordinator maps to a dead relay port); it allocates
+        // a fresh session so a live splice is bound.
+        let (s1, _) = c.request_relay(a_src, b, 0).expect("session");
+        assert_ne!(s0, s1);
+        // Releasing an unknown id is a harmless no-op.
+        c.release_relay(9_999);
     }
 
     #[test]

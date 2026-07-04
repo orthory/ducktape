@@ -153,33 +153,51 @@ impl NatClient {
 
 /// The real opaque splice for one relay session: forward datagrams between two
 /// UDP sockets (one per side), learning each side's source on its first
-/// datagram, and tear down after `idle` of total inactivity. Never decodes a
-/// payload — it holds only the two learned source addresses.
+/// datagram and PINNING it thereafter, and tear down after `idle` of total
+/// inactivity. Never decodes a payload — it holds only the two learned source
+/// addresses.
 pub async fn run_relay_pair(a_sock: UdpSocket, b_sock: UdpSocket, idle: std::time::Duration) {
     let mut a_src: Option<SocketAddr> = None;
     let mut b_src: Option<SocketAddr> = None;
     let mut a_buf = [0u8; 1500];
     let mut b_buf = [0u8; 1500];
+    // A single idle deadline, reset only when a datagram is ACCEPTED (passes
+    // source pinning). A spoofer spraying wrong-source datagrams is dropped
+    // without refreshing this, so it can neither hijack routing nor hold the
+    // session open past `idle`.
+    let deadline = tokio::time::sleep(idle);
+    tokio::pin!(deadline);
     loop {
         tokio::select! {
             r = a_sock.recv_from(&mut a_buf) => {
                 let (n, from) = match r { Ok(v) => v, Err(_) => continue };
-                a_src = Some(from);
+                // Learn A's source on the first datagram, then pin it: a
+                // datagram from any other source on A's socket is an injection
+                // attempt (session hijack) and is dropped without disturbing the
+                // learned source or the idle deadline.
+                match a_src {
+                    Some(pinned) if pinned != from => continue,
+                    _ => a_src = Some(from),
+                }
+                deadline.as_mut().reset(tokio::time::Instant::now() + idle);
                 if let Some(dst) = b_src {
                     let _ = b_sock.send_to(&a_buf[..n], dst).await;
                 }
             }
             r = b_sock.recv_from(&mut b_buf) => {
                 let (n, from) = match r { Ok(v) => v, Err(_) => continue };
-                b_src = Some(from);
+                match b_src {
+                    Some(pinned) if pinned != from => continue,
+                    _ => b_src = Some(from),
+                }
+                deadline.as_mut().reset(tokio::time::Instant::now() + idle);
                 if let Some(dst) = a_src {
                     let _ = a_sock.send_to(&b_buf[..n], dst).await;
                 }
             }
-            _ = tokio::time::sleep(idle) => {
-                // Idle timeout: no datagram on either side within `idle`. The
-                // sleep re-arms every loop iteration, so this fires only after
-                // `idle` of continuous inactivity. Bounded teardown.
+            _ = &mut deadline => {
+                // `idle` elapsed with no accepted datagram on either side.
+                // Bounded teardown: both sockets drop when this task returns.
                 return;
             }
         }
@@ -188,8 +206,15 @@ pub async fn run_relay_pair(a_sock: UdpSocket, b_sock: UdpSocket, idle: std::tim
 
 /// The coordinator event loop: decode control datagrams, feed the pure handler,
 /// send replies. `RelayRequest` is handled specially — it must bind real relay
-/// sockets, which the transport-free `Coordinator::handle` cannot do.
+/// sockets, which the transport-free `Coordinator::handle` cannot do. Relay
+/// sessions idle out after 30s.
 pub async fn run_coordinator(sock: UdpSocket) {
+    run_coordinator_with_idle(sock, std::time::Duration::from_secs(30)).await
+}
+
+/// As [`run_coordinator`], but with a caller-chosen relay idle timeout. Split
+/// out so tests can force fast teardown; production calls `run_coordinator`.
+pub async fn run_coordinator_with_idle(sock: UdpSocket, relay_idle: std::time::Duration) {
     use std::collections::HashMap;
 
     let mut coord = Coordinator::new();
@@ -200,16 +225,40 @@ pub async fn run_coordinator(sock: UdpSocket) {
         .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
     // session id -> (side-A relay addr, side-B relay addr)
     let mut relay_addrs: HashMap<u64, (SocketAddr, SocketAddr)> = HashMap::new();
+    // Each relay-pair task signals its session id here once it idles out and its
+    // sockets are gone. The coordinator can't observe data-plane relay activity
+    // (it flows through the spawned splice, not this control socket), so a
+    // wall-clock prune would be blind to live sessions or tear down active
+    // ones. Reclaiming exactly on task completion keeps `relay_addrs` and the
+    // coordinator's session table in lockstep with the live sockets, so a
+    // re-request after teardown allocates a FRESH session instead of handing
+    // back a dead relay port.
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<u64>(64);
     loop {
-        let (n, from) = match sock.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(_) => continue,
+        let (n, from) = tokio::select! {
+            r = sock.recv_from(&mut buf) => match r {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            Some(session) = done_rx.recv() => {
+                relay_addrs.remove(&session);
+                coord.release_relay(session);
+                continue;
+            }
         };
         let msg = match Msg::decode(&buf[..n]) {
             Ok(m) => m,
             Err(_) => continue,
         };
         if let Msg::RelayRequest { peer } = msg {
+            // Reclaim any sessions whose splice has already torn down before
+            // allocating, so a re-request can never be handed a dead relay port
+            // (closes the small window between task exit and the select branch
+            // above draining the signal).
+            while let Ok(session) = done_rx.try_recv() {
+                relay_addrs.remove(&session);
+                coord.release_relay(session);
+            }
             if let Some((session, side)) = coord.request_relay(from, peer, 0) {
                 let pair = match relay_addrs.get(&session) {
                     Some(&pair) => pair,
@@ -228,7 +277,13 @@ pub async fn run_coordinator(sock: UdpSocket) {
                             (Ok(x), Ok(y)) => (x, y),
                             _ => continue,
                         };
-                        tokio::spawn(run_relay_pair(a, b, std::time::Duration::from_secs(30)));
+                        // Spawn the opaque splice; when it idles out, signal its
+                        // session id so the coordinator reclaims the entry.
+                        let done = done_tx.clone();
+                        tokio::spawn(async move {
+                            run_relay_pair(a, b, relay_idle).await;
+                            let _ = done.send(session).await;
+                        });
                         relay_addrs.insert(session, (a_addr, b_addr));
                         (a_addr, b_addr)
                     }
@@ -414,5 +469,120 @@ mod tests {
             .await
             .expect("relay pair did not idle out")
             .expect("join");
+    }
+
+    #[tokio::test]
+    async fn run_relay_pair_pins_source_against_injection() {
+        // The relay's two per-side sockets.
+        let a_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_relay = a_sock.local_addr().unwrap();
+        let b_relay = b_sock.local_addr().unwrap();
+        tokio::spawn(run_relay_pair(a_sock, b_sock, Duration::from_secs(30)));
+
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // 1. A sends first so the relay learns and PINS a_src = A's address.
+        a.send_to(b"a", a_relay).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 2. The attacker sprays A's relay socket from its OWN address. With
+        //    source pinning this is dropped and a_src stays pinned to A;
+        //    without it, a_src would be hijacked to the attacker and B's return
+        //    traffic redirected there.
+        attacker.send_to(b"inject", a_relay).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 3. B sends toward A. It must reach the REAL A, never the attacker.
+        //    Retransmit to absorb scheduling nondeterminism (as WireGuard does).
+        const B_PAYLOAD: &[u8] = b"from-b-to-a";
+        let mut got_a = None;
+        for _ in 0..50 {
+            b.send_to(B_PAYLOAD, b_relay).await.unwrap();
+            let mut buf = [0u8; 1500];
+            if let Ok(Ok((n, _))) =
+                timeout(Duration::from_millis(100), a.recv_from(&mut buf)).await
+            {
+                got_a = Some(buf[..n].to_vec());
+                break;
+            }
+        }
+        assert_eq!(
+            got_a.as_deref(),
+            Some(B_PAYLOAD),
+            "B->A must reach the real A; a pinned relay ignores the injector"
+        );
+
+        // The attacker must never have received relayed traffic.
+        let mut buf = [0u8; 1500];
+        assert!(
+            timeout(Duration::from_millis(200), attacker.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the injector must not receive relayed traffic (no session hijack)"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_reclaims_idle_relay_and_regrants_fresh_session() {
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        // Short relay idle so the splice tears down quickly.
+        tokio::spawn(run_coordinator_with_idle(coord_sock, Duration::from_millis(150)));
+
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let a = NatClient::bind(a_key, coord_addr).await.unwrap();
+        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        // First allocation for the pair.
+        let (s0, _relay0) = timeout(Duration::from_secs(2), a.request_relay(b_key))
+            .await
+            .expect("no timeout")
+            .expect("grant");
+
+        // Let the relay pair idle out (no data-plane traffic) and the
+        // coordinator reclaim the session.
+        tokio::time::sleep(Duration::from_millis(450)).await;
+
+        // Re-request the SAME pair: the coordinator must allocate a fresh
+        // session and bind a live relay, not hand back the torn-down one.
+        let (s1, relay1) = timeout(Duration::from_secs(2), a.request_relay(b_key))
+            .await
+            .expect("no timeout")
+            .expect("regrant");
+        assert_ne!(
+            s0, s1,
+            "a re-request after teardown must allocate a new session, not reuse the dead one"
+        );
+
+        // The fresh relay must actually deliver: prove it end to end so the test
+        // fails if the grant points at a dead port. Both sides drive the new
+        // session and retransmit their own opaque payload until it arrives.
+        let (_s1b, relay1_b) = timeout(Duration::from_secs(2), b.request_relay(a_key))
+            .await
+            .expect("no timeout")
+            .expect("regrant b");
+        assert_ne!(relay1, relay1_b, "one relay port per side");
+        const PAYLOAD: &[u8] = b"post-reclaim-A";
+        a.relay_send(relay1, PAYLOAD).await.unwrap();
+        b.relay_send(relay1_b, b"post-reclaim-B").await.unwrap();
+        let mut got_b = None;
+        for _ in 0..50 {
+            a.relay_send(relay1, PAYLOAD).await.unwrap();
+            if let Ok(v) = timeout(Duration::from_millis(100), b.relay_recv()).await {
+                got_b = Some(v.expect("recv b"));
+                break;
+            }
+        }
+        assert_eq!(
+            got_b.expect("B received A's ciphertext on the fresh relay").as_slice(),
+            PAYLOAD,
+            "the re-granted relay must be live, not a stale dead port"
+        );
     }
 }

@@ -14,7 +14,7 @@ pub mod relay;
 pub mod simnat;
 pub mod wire;
 
-pub use client::{NatClient, run_coordinator, run_relay_pair};
+pub use client::{NatClient, run_coordinator, run_coordinator_with_idle, run_relay_pair};
 pub use coordinator::{Coordinator, Side};
 pub use relay::{Forward, RelaySplice};
 #[cfg(any(test, feature = "simnat"))]
