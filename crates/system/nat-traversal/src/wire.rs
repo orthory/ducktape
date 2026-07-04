@@ -8,6 +8,13 @@ pub enum Msg {
     BindRequest { from: NodeKey },
     BindResponse { reflexive: SocketAddr },
     Register { key: NodeKey },
+    /// Rebind re-advertisement: republish the sender's reflexive under a
+    /// strictly-monotonic `nonce`. Unlike `Register` (an unconditional nonce-0
+    /// boot baseline), the coordinator applies the `AdvertBook` staleness guard
+    /// so a replayed/reordered equal-or-lower nonce cannot roll a fresh mapping
+    /// back. The reflexive stored is still the coordinator-observed source, never
+    /// this datagram's self-report — the nonce only orders adverts.
+    Readvertise { key: NodeKey, nonce: u64 },
     Lookup { key: NodeKey },
     LookupResponse { key: NodeKey, reflexive: Option<SocketAddr> },
     PunchSync { peer: NodeKey, peer_reflexive: SocketAddr },
@@ -37,6 +44,7 @@ const TAG_PUNCH_SYNC: u8 = 6;
 const TAG_PUNCH: u8 = 7;
 const TAG_RELAY_REQ: u8 = 8;
 const TAG_RELAY_GRANT: u8 = 9;
+const TAG_READVERTISE: u8 = 10;
 
 fn put_key(out: &mut Vec<u8>, k: &NodeKey) {
     out.extend_from_slice(&k.0);
@@ -127,6 +135,11 @@ impl Msg {
                 out.push(TAG_REGISTER);
                 put_key(&mut out, key);
             }
+            Msg::Readvertise { key, nonce } => {
+                out.push(TAG_READVERTISE);
+                put_key(&mut out, key);
+                put_u64(&mut out, *nonce);
+            }
             Msg::Lookup { key } => {
                 out.push(TAG_LOOKUP);
                 put_key(&mut out, key);
@@ -171,6 +184,7 @@ impl Msg {
             TAG_BIND_REQ => Msg::BindRequest { from: r.key()? },
             TAG_BIND_RESP => Msg::BindResponse { reflexive: r.addr()? },
             TAG_REGISTER => Msg::Register { key: r.key()? },
+            TAG_READVERTISE => Msg::Readvertise { key: r.key()?, nonce: r.u64()? },
             TAG_LOOKUP => Msg::Lookup { key: r.key()? },
             TAG_LOOKUP_RESP => {
                 let key = r.key()?;
@@ -216,6 +230,7 @@ mod tests {
             Msg::BindRequest { from: NodeKey([1u8; 32]) },
             Msg::BindResponse { reflexive: addr(2, 51820) },
             Msg::Register { key: NodeKey([3u8; 32]) },
+            Msg::Readvertise { key: NodeKey([13u8; 32]), nonce: 0x0102_0304_dead_beef },
             Msg::Lookup { key: NodeKey([4u8; 32]) },
             Msg::LookupResponse { key: NodeKey([5u8; 32]), reflexive: Some(addr(6, 443)) },
             Msg::LookupResponse { key: NodeKey([7u8; 32]), reflexive: None },
@@ -249,6 +264,17 @@ mod tests {
         let mut bytes = Msg::PunchSync { peer: NodeKey([1u8; 32]), peer_reflexive: addr(2, 51820) }
             .encode();
         bytes.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
+    }
+
+    #[test]
+    fn readvertise_carries_key_and_nonce() {
+        let m = Msg::Readvertise { key: NodeKey([0xab; 32]), nonce: 0xffff_0000_ffff_0001 };
+        let back = Msg::decode(&m.encode()).expect("decode");
+        assert_eq!(m, back);
+        // Trailing garbage after a Readvertise is rejected like any other message.
+        let mut bytes = m.encode();
+        bytes.push(0xff);
         assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
     }
 
