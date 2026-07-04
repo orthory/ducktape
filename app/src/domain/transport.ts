@@ -70,6 +70,36 @@ export interface TelemetryFrame {
   events: TelemetryEvent[];
 }
 
+// ── Blocks (explorer) ───────────────────────────────────
+//
+// The explorer plane: one record per NON-EMPTY finalized block — heartbeat
+// nops never enter the node's ring, so this is real history, not idle ticks.
+// Node-local observability like telemetry: pulled from the ring via
+// GET /v1/blocks; a node without the surface reads as "no blocks".
+
+/** How a block's op landed: an applied op mutated state; a rejected op
+ *  finalized but rolled back — a failed tx. */
+export type BlockDisposition = "applied" | "rejected";
+
+export interface BlockRecord {
+  height: number;
+  /** Hex content hash of the block's frame — the block's hash. */
+  hash: string;
+  /** Hex app-hash after this block settled — the commit. */
+  commitHash: string;
+  /** Hex ed25519 key of the proposing validator — the frame's VERIFIED
+   *  signer, not a claimed identity. */
+  proposer: string;
+  disposition: BlockDisposition;
+  /** The root op's target module. */
+  target: string;
+  /** The dispatch trace, in drain order — the transactions inside the block.
+   *  Empty for a rejected op (a deterministic no-op leaves no trace). */
+  operations: TelemetryDispatch[];
+  /** Capped utf-8 preview of the root op's payload (module `*Msg` json). */
+  payload: string;
+}
+
 export interface NodeTransport {
   /**
    * Submit one module msg — one block. Resolves once the block is committed.
@@ -114,6 +144,11 @@ export interface NodeTransport {
    * `limit` caps the count (default: all buffered).
    */
   telemetry(limit?: number): Promise<TelemetryFrame[]>;
+  /**
+   * Recent non-empty blocks from the node's ring, oldest-first — the
+   * explorer's backing read. `limit` caps the count (default: all buffered).
+   */
+  blocks(limit?: number): Promise<BlockRecord[]>;
   /** Subscribe to finalized blocks. Returns the unsubscribe. */
   onBlock(listener: (block: BlockEvent) => void): () => void;
   /** Subscribe to live per-block telemetry frames. Returns the unsubscribe. */
@@ -265,6 +300,22 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
         // best-effort observability: a node without a telemetry surface (or a
         // malformed body) reads as "no telemetry", not an error.
         .then((body) => body.frames ?? []),
+    blocks: (limit) =>
+      Promise.resolve()
+        .then(() =>
+          fetch(
+            limit === undefined
+              ? `${base}/v1/blocks`
+              : `${base}/v1/blocks?limit=${limit}`,
+          ),
+        )
+        .then((res) => {
+          if (!res.ok) throw new Error(`node replied ${res.status}`);
+          return res.json() as Promise<{ blocks?: BlockRecord[] }>;
+        })
+        // same best-effort contract as telemetry: a node without a blocks
+        // surface (or a malformed body) reads as "no blocks", not an error.
+        .then((body) => body.blocks ?? []),
     onBlock: (listener) => {
       blockListeners.add(listener);
       connect();

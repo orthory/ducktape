@@ -593,13 +593,41 @@ pub enum Disposition {
 
 /// one frame the ordered lane finished with — how a caller correlates its own
 /// submits (by [`FrameId`]) with finalized outcomes, e.g. an app surface
-/// holding a reply open until the op lands.
-#[derive(Clone, Copy, Debug)]
+/// holding a reply open until the op lands. also the drain's observability
+/// record: the drain is the ONLY seam where a REMOTE validator's frame is
+/// decoded, so block contents (an explorer's rows) must be captured here.
+#[derive(Clone, Debug)]
 pub struct DrainedFrame {
     pub id: FrameId,
     /// the app height stamped for this frame's view (`view_base + view`).
     pub height: u64,
     pub disposition: Disposition,
+    /// the composed app-hash after this frame settled. a rejected frame rolls
+    /// back and a discarded one never runs (hash unchanged from the previous
+    /// block in both cases) — recorded regardless, so every outcome carries
+    /// the boundary it left behind.
+    pub app_hash: StateRoot,
+    /// the decoded op this frame carried. `None` when there was nothing to
+    /// decode: a frame discarded at the cutover ceiling (dropped before
+    /// decoding) or one whose decode/signature check failed.
+    pub op: Option<DrainedOp>,
+}
+
+/// the decoded contents of one drained frame: authenticated authorship, the
+/// root msg, and (for an applied frame) the host's deterministic dispatch
+/// trace.
+#[derive(Clone, Debug)]
+pub struct DrainedOp {
+    /// the frame's verified authorship — [`decode_frame`] yields
+    /// `Origin::External(pubkey)`, the submitting validator's ed25519 key.
+    pub origin: Origin,
+    /// the root msg's target module.
+    pub target: sdk::ModuleId,
+    /// the root msg's payload bytes.
+    pub payload: Vec<u8>,
+    /// the block's dispatch trace, in drain order — empty for a rejected
+    /// frame (a deterministic no-op leaves no trace).
+    pub dispatches: Vec<host::DispatchRecord>,
 }
 
 /// the durable outcome of one drained frame — everything a recovery journal
@@ -945,6 +973,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id,
                         height,
                         disposition: Disposition::Discarded,
+                        app_hash: self.host.app_hash(),
+                        op: None,
                     });
                     continue;
                 }
@@ -964,11 +994,18 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     id,
                     height,
                     disposition: Disposition::Rejected,
+                    app_hash: self.host.app_hash(),
+                    op: None,
                 });
                 self.seal(height, Disposition::Rejected).await?;
                 last_sealed_view = Some(view);
                 continue;
             };
+            // capture the op's identity for the drained record now — the msg
+            // is consumed by the dispatch below and never comes back.
+            let op_origin = origin.clone();
+            let op_target = msg.target.clone();
+            let op_payload = msg.payload.clone();
             // stamp the block's dispatch version as the PURE derivation
             // effective_version(height) — never the raw stored current_version —
             // so dispatch and hashing agree on the version for block `height`.
@@ -998,6 +1035,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id,
                         height,
                         disposition: Disposition::Applied,
+                        app_hash: self.host.app_hash(),
+                        op: Some(DrainedOp {
+                            origin: op_origin,
+                            target: op_target,
+                            payload: op_payload,
+                            dispatches: outcome.dispatches,
+                        }),
                     });
                     self.seal(height, Disposition::Applied).await?;
                     last_sealed_view = Some(view);
@@ -1020,6 +1064,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id,
                         height,
                         disposition: Disposition::Rejected,
+                        app_hash: self.host.app_hash(),
+                        op: Some(DrainedOp {
+                            origin: op_origin,
+                            target: op_target,
+                            payload: op_payload,
+                            dispatches: Vec::new(),
+                        }),
                     });
                     self.seal(height, Disposition::Rejected).await?;
                     last_sealed_view = Some(view);

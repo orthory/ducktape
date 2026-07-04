@@ -24,7 +24,7 @@ import type {
 } from "../../domain/memory-client";
 import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
-import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
 /** The two sidebar partitions the view-mode toggle switches between: the
@@ -157,6 +157,11 @@ export interface ConsoleState {
    *  backfilled from the node's ring on connect, then followed live over ws. */
   telemetry: TelemetryFrame[];
 
+  /** Recent NON-EMPTY blocks, oldest-first (the explorer renders newest
+   *  first). Node-local observability like telemetry — re-pulled from the
+   *  node's ring on every refresh; empty on a node without the surface. */
+  blocks: BlockRecord[];
+
   error: string | null;
 
   // ── Workspace / onboarding ──
@@ -283,6 +288,7 @@ export const createInitialState = (): ConsoleState => {
     searchPending: false,
     files: [],
     telemetry: [],
+    blocks: [],
     error: null,
     workspaces: [],
     workspace: null,
@@ -319,6 +325,7 @@ export interface ConsoleSnapshot {
   rules: Rule[];
   memoryEntries: LsEntry[];
   files: Manifest[];
+  blocks: BlockRecord[];
 }
 
 /** Project a committed node snapshot onto store data fields. Global UI,
@@ -349,6 +356,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   rules: snapshot.rules,
   memoryEntries: snapshot.memoryEntries,
   files: snapshot.files,
+  blocks: snapshot.blocks,
 });
 
 // ── Pure helpers ────────────────────────────────────────

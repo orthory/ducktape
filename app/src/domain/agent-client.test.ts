@@ -33,6 +33,7 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
   status: vi.fn(),
   telemetry: vi.fn(),
+  blocks: vi.fn(),
   onBlock: vi.fn(),
   onTelemetry: vi.fn(),
 });
