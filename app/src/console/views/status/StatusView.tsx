@@ -67,15 +67,15 @@ function workspaceRole(workspace: {
 } | null) {
   if (workspace?.founder) {
     return {
-      id: "founder",
-      pill: "admin · validator",
-      title: "Admin validator",
+      id: "genesis",
+      pill: "genesis · validator",
+      title: "Genesis validator",
       badge: "VALIDATOR",
       tint: color.dark,
       bg: "#f4f1ec",
       border: "#ded6ca",
       body:
-        "This workspace founded the network and is admitted to validate committed state.",
+        "This node created the network at genesis. That is provenance only: it validates committed state as an equal member and holds no special governance authority.",
       validator: true,
     } as const;
   }

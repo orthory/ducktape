@@ -207,7 +207,7 @@ function NodeDetail({ snap, connected, onOpen }: { snap: Snap; connected: boolea
   const { workspace, status } = snap;
   const role = workspace
     ? workspace.founder
-      ? "admin · validator"
+      ? "genesis · validator"
       : workspace.member
         ? "member · validator"
         : "guest"
