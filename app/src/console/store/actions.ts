@@ -7,6 +7,8 @@ import type { PostPolicy } from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
 import type { BlockKind } from "../../domain/document-client";
 import * as forgeClient from "../../domain/forge-client";
+import * as governanceClient from "../../domain/governance-client";
+import type { GovAction } from "../../domain/governance-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
 import {
@@ -18,9 +20,13 @@ import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
+import {
+  defaultScreenForSection,
+  sectionForScreen,
+} from "../modules/registry";
 import type { Action } from "./reducer";
-import { channelIdOf, docIdOf, nextTaskStatus } from "./state";
-import type { ConsoleState } from "./state";
+import { channelIdOf, docIdOf, nextTaskStatus, saveViewMode } from "./state";
+import type { ConsoleState, ViewMode } from "./state";
 
 /** How often a parked joiner's phase is polled while it promotes. */
 const JOIN_POLL_MS = 1500;
@@ -66,6 +72,10 @@ const saveDocIds = (nodeUrl: string, docIds: string[]): void => {
 
 export interface ConsoleActions {
   setScreen(screen: string): void;
+  /** Switch the sidebar rail (user apps vs operator surfaces) and persist it.
+   *  Jumps to the target rail's default surface when the current screen belongs
+   *  to the other rail, so the body always matches the rail. */
+  setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
   setAuthor(author: string): void;
   /** Set our own display name in the `profiles` module (origin-gated SetName)
@@ -124,6 +134,15 @@ export interface ConsoleActions {
   requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
+
+  // ── Governance (proposals + votes over the `governance` module) ──
+  /** Open a binding Signal proposal (no on-chain effect beyond its outcome).
+   *  Membership-gated by the module: only a current validator can propose. */
+  proposeSignal(text: string): void;
+  /** Cast (or change) this node's ballot on an open proposal. */
+  voteProposal(proposalId: string, approve: boolean): void;
+  /** Tally and settle a decidable proposal (anyone may trigger it). */
+  executeProposal(proposalId: string): void;
 
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;

@@ -18,6 +18,8 @@ import * as chatClient from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
 import type { Block } from "../../domain/document-client";
 import * as forgeClient from "../../domain/forge-client";
+import * as governanceClient from "../../domain/governance-client";
+import type { ProposalView } from "../../domain/governance-client";
 import {
   isTauri,
   resolveNode,
@@ -88,6 +90,10 @@ export function DucktapeProvider({
           chatClient.channels(live),
           tasksClient.listTasks(live),
           valsetClient.validators(live),
+          // governance is a first-class operator surface but best-effort in the
+          // snapshot: a node/build without it just reads as "no proposals"
+          // rather than failing the whole refresh.
+          governanceClient.proposals(live).catch((): ProposalView[] => []),
           forgeClient.head(live),
           activeDoc
             ? documentClient.getDoc(live, activeDoc)
@@ -106,6 +112,7 @@ export function DucktapeProvider({
         channels,
         tasks,
         validators,
+        proposals,
         forgeHead,
         docBlocks,
         agents,
@@ -135,6 +142,7 @@ export function DucktapeProvider({
                 channels,
                 tasks,
                 members,
+                proposals,
                 forgeHead,
                 activeChannel: active,
                 messages,

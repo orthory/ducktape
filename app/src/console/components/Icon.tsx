@@ -68,6 +68,12 @@ const PATHS: Record<string, ReactNode> = {
     </>
   ),
   telemetry: <path d="M3 12.5h3.5l2-5.5 3 12 2.5-8.5 1.5 2h4.5" />,
+  approvals: (
+    <>
+      <circle cx="12" cy="12" r="8" />
+      <path d="M8.5 12.2l2.4 2.4 4.6-4.8" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof PATHS;
