@@ -99,6 +99,7 @@ use statesync::p2p::P2pSyncClient;
 use statesync::qmdb::RemoteQmdbResolver;
 use statesync::{SyncServer, fetch_manifest, fetch_snapshot};
 use tasks::Tasks;
+use upgrade::Upgrade;
 use valset::Valset;
 use vaults::Vaults;
 
@@ -140,13 +141,14 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 17] = [
+const MODULE_IDS: [&str; 18] = [
     "kv",
     "document",
     "chat",
     "forge",
     "valset",
     "governance",
+    "upgrade",
     "saga",
     "tasks",
     "vaults",
@@ -407,6 +409,10 @@ async fn genesis_host(
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
         Box::new(Governance::new("governance", "valset", "upgrade")),
+        // the no-downtime upgrade coordinator: holds the at-most-one pending
+        // upgrade + per-validator readiness set (valset-gated). its mere
+        // presence in the registry is its genesis app-hash contribution.
+        Box::new(Upgrade::new("upgrade", "valset")),
         Box::new(SagaModule::new("saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
@@ -487,6 +493,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
 
+    let mut upgrade = Upgrade::new("upgrade", "valset");
+    let (bytes, root) = snapshot_of("upgrade")?;
+    upgrade
+        .install(bytes, root)
+        .map_err(|e| format!("upgrade install: {e}"))?;
+
     let mut saga = SagaModule::new("saga");
     let (bytes, root) = snapshot_of("saga")?;
     saga.install(bytes, root)
@@ -564,6 +576,7 @@ async fn restore_host(
         Box::new(forge),
         Box::new(valset),
         Box::new(governance),
+        Box::new(upgrade),
         Box::new(saga),
         Box::new(tasks),
         Box::new(vaults),
@@ -678,6 +691,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("upgrade").await?;
+    let mut upgrade = Upgrade::new("upgrade", "valset");
+    upgrade
+        .install(&bytes, root)
+        .map_err(|e| format!("upgrade install: {e}"))?;
+
     let (bytes, root) = snapshot_of("tasks").await?;
     let mut tasks = Tasks::new("tasks");
     tasks
@@ -762,6 +781,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(forge),
         Box::new(valset),
         Box::new(governance),
+        Box::new(upgrade),
         Box::new(saga),
         Box::new(tasks),
         Box::new(vaults),
