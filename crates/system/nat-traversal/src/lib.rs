@@ -2,6 +2,7 @@
 //! untrusted coordinator. No WireGuard, no consensus — the reachability
 //! primitive under the private-cutover epic.
 
+pub mod advert;
 pub mod client;
 pub mod coordinator;
 // `punch` depends on `simnat::SimNat` directly in its (non-test) API, so it is
@@ -14,6 +15,7 @@ pub mod relay;
 pub mod simnat;
 pub mod wire;
 
+pub use advert::{AdvertBook, AdvertOutcome, ReflexiveAdvert};
 pub use client::{NatClient, run_coordinator, run_coordinator_with_idle, run_relay_pair};
 pub use coordinator::{Coordinator, Side};
 pub use relay::{Forward, RelaySplice};
