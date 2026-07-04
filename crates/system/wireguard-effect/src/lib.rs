@@ -12,6 +12,9 @@ mod defguard_effect;
 #[cfg(unix)]
 pub use defguard_effect::DefguardWireGuardEffect;
 
+mod wiring;
+pub use wiring::apply_tunnel_plan;
+
 use defguard_wireguard_rs::InterfaceConfiguration;
 
 /// Effect boundary between a validated WireGuard install plan and the real
