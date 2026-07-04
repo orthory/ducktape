@@ -8,8 +8,9 @@ description: Start or resume a Ducktape task in a dedicated worktree from the cu
 Use this as the standard Ducktape task workflow.
 
 `work` starts or resumes an isolated worktree, keeps the task branch tied to the
-branch it forked from, does the work deliberately, then pushes and maintains one
-open PR. It never merges; use `done` for that.
+branch it forked from, does the work deliberately — proving every diagnosis by
+mule testing rather than theorizing, unless the cause is beyond doubt — then
+pushes and maintains one open PR. It never merges; use `done` for that.
 
 ## Inputs
 
@@ -91,29 +92,39 @@ directories to `WT_DIR`.
    summarize the crux, and resolve real ambiguity with the user before guessing.
    Do not open with an options funnel, solution pitch, or pros/cons list while
    the problem is still being understood.
-2. Plan before code. Name every file you expect to touch and why. Include build
+2. Never theorize a problem analysis; prove your theory by mule testing unless
+   you are absolutely sure about the cause. Don't skimp on the code: actually
+   read the implicated code paths end to end instead of skimming, then build a
+   mule test — a minimal runnable probe (failing test, scratch script,
+   instrumented run) that reproduces the problem through the exact mechanism
+   you claim — and show it firing. Demonstrate the fix the same way: a logical,
+   provable demonstration that the mule fails before the change and passes
+   after, rather than guessing. "Absolutely sure" means the mechanism is
+   directly visible in code you have read, not merely plausible; when in doubt,
+   mule-test.
+3. Plan before code. Name every file you expect to touch and why. Include build
    or deploy routine changes if the task shifts dependencies, assets, bundling,
    or config. Surface the plan for agreement before editing.
-3. Fix root causes, not symptoms. Keep the blast radius contained, but do not
+4. Fix root causes, not symptoms. Keep the blast radius contained, but do not
    shrink the problem to make the patch easier. If the real fix exposes
    misplaced code or would fan out across many files, stop and surface the
    architecture fork before coding.
-4. Do not hide broken invariants with unsafe fallbacks, swallowed errors,
+5. Do not hide broken invariants with unsafe fallbacks, swallowed errors,
    non-null assertions, `as any`, or default values unless the fallback is truly
    correct behavior. When it is correct, add a one-line comment explaining why.
-5. Keep controllers as orchestrators and work functions as pure as practical:
+6. Keep controllers as orchestrators and work functions as pure as practical:
    inputs in, results out, collaborators passed by dependency injection where it
    improves testability.
-6. Before TypeScript edits, use the repository's TypeScript style skill if one
+7. Before TypeScript edits, use the repository's TypeScript style skill if one
    is available. Prefer pure functions, expression-oriented code, `const` over
    `let` rebinding, result envelopes at boundaries, async composition over
    `try/catch` control flow, and exhaustive `switch` on discriminants.
-7. Surface real architectural forks before coding. Recommend the root-cause fix
+8. Surface real architectural forks before coding. Recommend the root-cause fix
    with the most contained blast radius, but let the user choose when the fork
    is meaningful.
-8. Drive open questions to zero up front. Skip heavy planning only when the task
+9. Drive open questions to zero up front. Skip heavy planning only when the task
    is clearly trivial.
-9. Name and get agreement on new files before creating them unless the user has
+10. Name and get agreement on new files before creating them unless the user has
    already explicitly requested those exact files.
 
 ## Finish To One PR
