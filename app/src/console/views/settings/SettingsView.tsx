@@ -663,9 +663,23 @@ function DangerZone() {
   // validator of a set of two-or-more (it would halt quorum). A solo node
   // (validators = 1) can't remove the last validator — it just forgets.
   const pubkey = state.workspace?.pubkey ?? null;
-  const inSet = state.members.some((m) => normalizeKey(m) === normalizeKey(pubkey));
-  const validatorCount = state.members.length;
-  const canRequestLeave = !base && inSet && validatorCount >= 2;
+  // Before the first roster query hydrates state.members it is []; deriving
+  // membership straight from it would read as "not in the set / 0 validators"
+  // and lock a real validator out of BOTH request-leave and forget during the
+  // cold-start window. Fall back to this node's own membership flag (mirrors
+  // NetworkSection's validatorCount fallback) so the enable-state is coherent
+  // before the roster arrives.
+  const hasRoster = state.members.length > 0;
+  const inSet = hasRoster
+    ? state.members.some((m) => normalizeKey(m) === normalizeKey(pubkey))
+    : Boolean(state.workspace?.member);
+  const validatorCount = state.members.length || (state.workspace?.member ? 1 : 0);
+  // With a known roster we still hide request-leave for a provably-solo set
+  // (forget instead). Before the roster hydrates we can't know the set size, so
+  // we enable it for a member and let the node's last-validator guard refuse a
+  // solo leave honestly — never a silent lock-out.
+  const soloKnown = hasRoster && validatorCount < 2;
+  const canRequestLeave = !base && inSet && !soloKnown;
 
   const requestLeave = (): void => {
     const name = state.workspace?.name ?? "this network";
@@ -709,7 +723,7 @@ function DangerZone() {
               Submits an on-chain self-removal (pending a strict majority of the
               remaining members). Your node keeps running until they approve;
               once removed you can forget the workspace.
-              {inSet && validatorCount < 2 ? (
+              {inSet && soloKnown ? (
                 <> A solo node can’t remove the last validator — forget it below.</>
               ) : null}
             </>

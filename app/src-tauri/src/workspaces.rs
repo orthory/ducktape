@@ -551,6 +551,59 @@ pub fn workspace_request_leave(app: tauri::AppHandle, id: String) -> Result<(), 
     .map(|_| ())
 }
 
+/// wrap a "couldn't reach/resolve the node" failure into the honest refusal we
+/// show when [`workspace_forget`] cannot confirm this node has left the valset.
+/// FAIL CLOSED: we would rather strand a user behind a startable node than
+/// destroy the identity a still-in-set validator needs to finalize its removal.
+fn unconfirmed_forget(detail: String) -> String {
+    format!(
+        "start the node and finish leaving — we can't confirm this workspace has left the \
+         validator set ({detail}), and destroying its identity now could permanently halt the \
+         network. bring the node up, request to leave, and wait until the other members approve \
+         (you drop out of the set) before forgetting this workspace."
+    )
+}
+
+/// decide, from a `member-status` stdout line (`in-set=<bool> validators=<n>`),
+/// whether this workspace is SAFE to tear down. FAILS CLOSED: teardown is
+/// permitted ONLY when the node is definitively OUT of the valset
+/// (`in-set=false`), or definitively a solo network (`in-set=true validators=1`,
+/// no peer to strand). a node still in a set of two-or-more is refused, and so
+/// is any line we cannot parse into both fields — an unreadable status is
+/// uncertainty, and uncertainty must never authorize destroying an identity.
+fn forget_guard(status_line: &str) -> Result<(), String> {
+    let in_set = if status_line.contains("in-set=true") {
+        Some(true)
+    } else if status_line.contains("in-set=false") {
+        Some(false)
+    } else {
+        None
+    };
+    let validators = status_line
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("validators="))
+        .and_then(|n| n.parse::<usize>().ok());
+    match (in_set, validators) {
+        // already left the set, or a provably solo network — safe to forget.
+        (Some(false), _) | (Some(true), Some(1)) => Ok(()),
+        // definitively still a current validator of a multi-member set.
+        (Some(true), Some(n)) => Err(format!(
+            "this node is still a current validator of {n} — forgetting it now would halt the \
+             network's quorum and strand your removal. request to leave first, then wait until \
+             the other members approve (you drop out of the set) before forgetting this \
+             workspace."
+        )),
+        // ambiguous/unparseable status — fail closed, do NOT destroy the identity.
+        _ => Err(
+            "couldn't confirm this workspace has left the validator set (the node's membership \
+             status was unreadable) — refusing to forget it, because destroying its identity \
+             while it may still be a validator could permanently halt the network. bring the \
+             node up and finish leaving first."
+                .to_string(),
+        ),
+    }
+}
+
 /// FORGET a workspace: stop its node, delete its directory, and drop its
 /// registry entry. the honest second half of departure — the destructive local
 /// teardown, GUARDED so it can never brick consensus.
@@ -565,52 +618,40 @@ pub fn workspace_request_leave(app: tauri::AppHandle, id: String) -> Result<(), 
 /// already-removed key (`in-set=false`) is safe — forgetting a solo network just
 /// destroys a network no one else is in.
 ///
-/// if the node is DOWN we cannot query it; we WARN and proceed (a stopped node
-/// is not holding quorum, and refusing would strand a user whose node crashed —
-/// the authoritative on-chain invariant is enforced by the valset guard
-/// regardless). returns the newly-active workspace the registry repointed to, or
-/// `None` when none remain.
+/// the guard FAILS CLOSED. destroying `identity.key` is irreversible, so we
+/// tear down ONLY when the running node DEFINITIVELY confirms it is not holding a
+/// multi-member set's quorum: it has already left the valset (`in-set=false`),
+/// or it is a provably solo network (`validators=1`, no peer to strand). on ANY
+/// uncertainty — node DOWN, rpc error, unresolvable node binary, or an
+/// unparseable status line — we REFUSE. a still-in-set validator whose
+/// self-removal is merely PENDING is a RECOVERABLE state (restart it and it can
+/// sign the Execute block that finalizes the removal); but forget its
+/// `identity.key` and that signature can never be produced, so the removal can
+/// never finalize and the remaining member(s) can never reach quorum
+/// (commonware `quorum(n)=n` for `n<=3`) — a PERMANENT HALT with a ghost
+/// validator. a down node is exactly this uncertain case, so we require it to be
+/// reachable and confirm it has left before its identity may be destroyed.
+/// returns the newly-active workspace the registry repointed to, or `None` when
+/// none remain.
 #[tauri::command]
 pub fn workspace_forget(app: tauri::AppHandle, id: String) -> Result<Option<Workspace>, String> {
     let mut reg = load_registry(&app)?;
     let ws = find(&reg, &id)?.clone();
     let dir = workspaces_dir(&app)?.join(&ws.id);
 
-    // guard: refuse to forget while this node is still a current validator of a
-    // multi-member set (its removal is pending and quorum needs its signature).
-    if let Ok(node_bin) = crate::daemon::resolve_node_bin() {
-        let cfg = node_toml(&dir);
-        match run_verb(
-            &node_bin,
-            &["member-status", "--config", &cfg.to_string_lossy()],
-        ) {
-            Ok(out) => {
-                let line = last_line(&out);
-                let in_set = line.contains("in-set=true");
-                let validators = line
-                    .split_whitespace()
-                    .find_map(|tok| tok.strip_prefix("validators="))
-                    .and_then(|n| n.parse::<usize>().ok())
-                    .unwrap_or(0);
-                if in_set && validators >= 2 {
-                    return Err(format!(
-                        "this node is still a current validator of {validators} — forgetting it \
-                         now would halt the network's quorum and strand your removal. request to \
-                         leave first, then wait until the other members approve (you drop out of \
-                         the set) before forgetting this workspace."
-                    ));
-                }
-            }
-            // node down / unreachable rpc: we cannot confirm membership. a
-            // stopped node holds no quorum, so proceed — but warn.
-            Err(err) => {
-                eprintln!(
-                    "workspace_forget: could not confirm {id:?} membership ({err}); the node \
-                     appears down — proceeding with local teardown."
-                );
-            }
-        }
-    }
+    // guard (FAIL CLOSED): confirm — via the RUNNING node's own membership — that
+    // tearing this workspace down cannot strand a peer or halt quorum. we proceed
+    // ONLY on a definitive safe verdict; every error/ambiguous case refuses so we
+    // never delete the identity.key a still-in-set validator needs to finalize
+    // its pending removal.
+    let node_bin = crate::daemon::resolve_node_bin().map_err(unconfirmed_forget)?;
+    let cfg = node_toml(&dir);
+    let status = run_verb(
+        &node_bin,
+        &["member-status", "--config", &cfg.to_string_lossy()],
+    )
+    .map_err(unconfirmed_forget)?;
+    forget_guard(&last_line(&status))?;
 
     // stop the node so nothing keeps running or holds the storage dir open.
     stop_node(ws.ports.http);
@@ -858,6 +899,43 @@ mod tests {
                    [node ab] parked: awaiting admission (epoch 0 has 1 validators)\n\
                    [node ab] promoted: validator at epoch 1 boundary 4 — rebooting\n";
         assert_eq!(classify(log).phase, "promoted");
+    }
+
+    #[test]
+    fn forget_guard_allows_a_departed_or_solo_node() {
+        // already removed from the set: safe regardless of the reported count.
+        assert!(forget_guard("in-set=false validators=3").is_ok());
+        assert!(forget_guard("in-set=false validators=1").is_ok());
+        // a provably solo network: no peer to strand, forgetting just drops it.
+        assert!(forget_guard("in-set=true validators=1").is_ok());
+    }
+
+    #[test]
+    fn forget_guard_refuses_a_still_in_set_validator() {
+        // in-set of a set of two-or-more: forgetting would strand the pending
+        // removal and halt quorum. must refuse and name the count.
+        let err = forget_guard("in-set=true validators=2").unwrap_err();
+        assert!(err.contains("still a current validator of 2"), "{err}");
+        assert!(forget_guard("in-set=true validators=3").is_err());
+    }
+
+    #[test]
+    fn forget_guard_fails_closed_on_an_unparseable_status() {
+        // FAIL CLOSED: any line we can't read into BOTH fields must refuse — an
+        // unknown membership can never authorize destroying the identity.
+        for line in [
+            "",
+            "in-set=true",             // count missing
+            "validators=2",            // membership missing
+            "in-set=true validators=", // count unparseable
+            "connection refused",      // not a status line at all
+            "in-set=maybe validators=two",
+        ] {
+            assert!(
+                forget_guard(line).is_err(),
+                "expected refusal for {line:?}"
+            );
+        }
     }
 
     #[test]

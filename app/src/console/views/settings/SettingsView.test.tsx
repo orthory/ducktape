@@ -150,6 +150,37 @@ describe("SettingsView", () => {
     confirm.mockRestore();
   });
 
+  it("does not lock a validator out of leaving during the cold-start window", () => {
+    // Before the first roster query hydrates state.members it is []. A real
+    // member must NOT be locked out of request-leave (or forget) just because
+    // the roster hasn't arrived yet — we fall back to workspace.member.
+    renderSettings({ members: [] });
+
+    expect(
+      screen.getByRole("button", { name: /request leave/i }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: /forget workspace/i }),
+    ).toBeEnabled();
+    // No confirmed-solo hint before the roster proves the set size.
+    expect(
+      screen.queryByText(/can’t remove the last validator/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps request-leave disabled for a non-member remote node", () => {
+    // A remote (non-managed) node, or one whose workspace.member is false, is
+    // not a validator: leaving is not its to request.
+    renderSettings({
+      workspace: { ...workspace, member: false },
+      members: [],
+    });
+
+    expect(
+      screen.getByRole("button", { name: /request leave/i }),
+    ).toBeDisabled();
+  });
+
   it("disables Request leave for a solo validator (can't remove the last one)", () => {
     // Only this node in the set -> leaving on-chain would empty it, which is
     // refused; the button is disabled and the user forgets instead.
