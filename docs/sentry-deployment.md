@@ -96,13 +96,19 @@ identical ("dial this address, expect this key").
   `discovery::Config::local` call, ~line 1595; see the inline comment there). A
   **forward** sentry that splices from a private source IP (recipe A over a VPC)
   depends on this. Switching to a preset with `allow_private_ips: false` would
-  make the validator's listener **reject the forwarded connection from a private
-  source IP** as an anti-DoS measure. If you change presets, front the validator
-  with a **public-IP** sentry or use a **reverse tunnel** (recipe B) instead.
+  make the validator's listener **reject any inbound whose observed source IP is
+  not globally routable** (`is_global`; the listener keys on the *accepted
+  socket's* remote IP). That rejects **every** fronting scheme that keeps
+  `listen` private — a private-network forward splice (recipe A over a VPC), a
+  **reverse tunnel** whose egress reaches the validator over loopback (recipe B),
+  and a public-IP sentry that still reaches a private `listen`. The only combos
+  that satisfy `allow_private_ips: false` are a **globally-routable (firewalled)
+  validator `listen`** or exposing a per-IP-gate override (future work). Today the
+  node hardcodes the `local` preset, so this does not bite yet.
 
 - **Handshake rate limit funnels through the sentry's IP.** commonware
-  rate-limits inbound handshakes **per source IP** and per /24 subnet
-  (`allowed_handshake_rate_per_ip` / `_per_subnet`; the listener keys on the
+  rate-limits inbound handshakes **per source IP** and per subnet (/24 for IPv4,
+  /48 for IPv6) (`allowed_handshake_rate_per_ip` / `_per_subnet`; the listener keys on the
   accepted socket's IP). A **forward** splice (recipe A) makes the validator see
   every joiner as coming from the sentry's single IP, so all inbound handshakes
   share one IP's budget — under a reconnect storm or many simultaneous joiners a
@@ -126,10 +132,21 @@ identical ("dial this address, expect this key").
   selected (`choose_sync_source` in `bin/node/src/config.rs`). State-sync flows
   *through* the sentry pipe but *terminates at* the validator behind it.
 
-- **Availability dependency.** Any entry helper is an availability/censorship
-  dependency **for new connections** only — established connections survive edge
-  downtime via keepalive. Mitigate with multiple independent sentries/edges (the
-  bootstrap set is a `Vec`), self-hosting, and falling back to a direct hint.
+- **Availability dependency — an in-path sentry is a SPOF, not just a
+  new-connection concern.** A forward splice (recipe A) or reverse tunnel (recipe
+  B) sits **in the data path**: the fronted validator advertises only the sentry
+  and keeps its real `listen` private, so the sentry carries *all* of that
+  validator's inbound mesh traffic for the process lifetime, not merely entry.
+  When the sentry/edge restarts, every inbound connection transiting it drops
+  (keepalive cannot preserve a session whose intermediary died); only sessions
+  the validator itself dialed **out** survive. So a single-sentry outage
+  **partitions that validator** from the mesh — and if it is quorum-critical
+  (e.g. a 2-of-2 set) that is a **liveness** failure (finalization stalls), not
+  merely degraded availability. Mitigate — as a liveness requirement, not an
+  optional nicety — with **multiple independent sentries on distinct IPs** (the
+  bootstrap set is a `Vec`) and/or a redundant advertised path; self-host; keep a
+  direct fallback hint. (An out-of-path *coordinator* — Phase 2 — is where the
+  "established connections survive; only new ones depend on it" framing holds.)
 
 ## Scope
 

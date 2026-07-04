@@ -14,10 +14,9 @@
 //! the sentry is pure `std::net`/`std::thread` (no new dependency, matching the
 //! harness idiom): a `TcpListener` accept loop that, per connection, dials the
 //! target and splices both directions with `std::io::copy`. it counts BRIDGED
-//! CONNECTIONS, not bytes: the mesh connection is long-lived (a byte tally on
-//! close races the assertion), and `std::io::copy` between two `TcpStream`s
-//! takes the kernel `splice(2)` fast path — a userspace read/write copy adds
-//! enough scheduling latency under load to trip commonware's handshake timeouts.
+//! CONNECTIONS, not bytes — the mesh connection is long-lived, so a byte tally
+//! taken at connection close would race the assertion, whereas a connection
+//! count is settled the moment a client is bridged.
 
 mod common;
 
@@ -61,8 +60,7 @@ fn hex(bytes: &[u8]) -> String {
 /// a transparent TCP forwarder in front of `target`. returns its public listen
 /// address and a counter of CLIENT CONNECTIONS bridged to `target` — a race-free
 /// proof that dialers reached node 0 through the forwarder. pure
-/// `std::net`/`std::thread`; each direction is spliced with `std::io::copy`
-/// (kernel `splice(2)` fast path, so the pipe stays low-latency under load).
+/// `std::net`/`std::thread`; each direction is spliced with `std::io::copy`.
 ///
 /// the upstream `connect` is lazy (per client connection): node 0 is already up
 /// by the time any client dials the sentry, but a transient connect error must
