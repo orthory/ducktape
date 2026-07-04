@@ -564,14 +564,32 @@ fn unconfirmed_forget(detail: String) -> String {
     )
 }
 
-/// decide, from a `member-status` stdout line (`in-set=<bool> validators=<n>`),
-/// whether this workspace is SAFE to tear down. FAILS CLOSED: teardown is
-/// permitted ONLY when the node is definitively OUT of the valset
-/// (`in-set=false`), or definitively a solo network (`in-set=true validators=1`,
-/// no peer to strand). a node still in a set of two-or-more is refused, and so
-/// is any line we cannot parse into both fields — an unreadable status is
-/// uncertainty, and uncertainty must never authorize destroying an identity.
-fn forget_guard(status_line: &str) -> Result<(), String> {
+/// the verdict of the pre-forget membership probe — drives whether teardown is
+/// allowed and, when refused, whether a FORCE forget may override the refusal.
+enum ForgetVerdict {
+    /// definitively safe to tear down: this node is out of the valset
+    /// (`in-set=false`), or a provably solo network (`in-set=true validators=1`,
+    /// no peer to strand).
+    Safe,
+    /// the running node CONFIRMS it is still a current validator of a set of
+    /// two-or-more. tearing it down halts quorum and strands the pending removal,
+    /// so this refusal is ABSOLUTE — a force forget cannot override a provably
+    /// live multi-member validator; request-leave-and-wait first.
+    ConfirmedInSet(String),
+    /// membership could NOT be confirmed — node down/bricked, rpc error, no node
+    /// binary, or a status line we cannot parse. refused by default (fail
+    /// closed), but this is the UNCERTAINTY a force forget overrides: a node that
+    /// can never start can never finalize a removal, so keeping it only strands
+    /// the user with a workspace they can never remove.
+    Unconfirmed(String),
+}
+
+/// classify a `member-status` stdout line (`in-set=<bool> validators=<n>`) into a
+/// [`ForgetVerdict`]. FAILS CLOSED: only a definitively out-of-set or provably
+/// solo line is `Safe`; a confirmed in-set set-of-two-or-more is `ConfirmedInSet`;
+/// anything we cannot parse into BOTH fields is `Unconfirmed` — an unreadable
+/// status is uncertainty, never an authorization to destroy an identity.
+fn classify_status(status_line: &str) -> ForgetVerdict {
     let in_set = if status_line.contains("in-set=true") {
         Some(true)
     } else if status_line.contains("in-set=false") {
@@ -585,22 +603,41 @@ fn forget_guard(status_line: &str) -> Result<(), String> {
         .and_then(|n| n.parse::<usize>().ok());
     match (in_set, validators) {
         // already left the set, or a provably solo network — safe to forget.
-        (Some(false), _) | (Some(true), Some(1)) => Ok(()),
+        (Some(false), _) | (Some(true), Some(1)) => ForgetVerdict::Safe,
         // definitively still a current validator of a multi-member set.
-        (Some(true), Some(n)) => Err(format!(
+        (Some(true), Some(n)) => ForgetVerdict::ConfirmedInSet(format!(
             "this node is still a current validator of {n} — forgetting it now would halt the \
              network's quorum and strand your removal. request to leave first, then wait until \
              the other members approve (you drop out of the set) before forgetting this \
              workspace."
         )),
         // ambiguous/unparseable status — fail closed, do NOT destroy the identity.
-        _ => Err(
+        _ => ForgetVerdict::Unconfirmed(
             "couldn't confirm this workspace has left the validator set (the node's membership \
              status was unreadable) — refusing to forget it, because destroying its identity \
              while it may still be a validator could permanently halt the network. bring the \
              node up and finish leaving first."
                 .to_string(),
         ),
+    }
+}
+
+/// probe the RUNNING node for whether tearing this workspace down is safe. any
+/// failure to reach, resolve, or read the node's membership collapses to
+/// `Unconfirmed` (fail closed) — exactly the uncertainty a force forget may
+/// override for a node that can no longer start.
+fn probe_forget(dir: &Path) -> ForgetVerdict {
+    let node_bin = match crate::daemon::resolve_node_bin() {
+        Ok(bin) => bin,
+        Err(err) => return ForgetVerdict::Unconfirmed(unconfirmed_forget(err)),
+    };
+    let cfg = node_toml(dir);
+    match run_verb(
+        &node_bin,
+        &["member-status", "--config", &cfg.to_string_lossy()],
+    ) {
+        Ok(status) => classify_status(&last_line(&status)),
+        Err(err) => ForgetVerdict::Unconfirmed(unconfirmed_forget(err)),
     }
 }
 
@@ -629,29 +666,45 @@ fn forget_guard(status_line: &str) -> Result<(), String> {
 /// `identity.key` and that signature can never be produced, so the removal can
 /// never finalize and the remaining member(s) can never reach quorum
 /// (commonware `quorum(n)=n` for `n<=3`) — a PERMANENT HALT with a ghost
-/// validator. a down node is exactly this uncertain case, so we require it to be
-/// reachable and confirm it has left before its identity may be destroyed.
+/// validator. a down node is exactly this uncertain case, so by default we
+/// require it to be reachable and confirm it has left before its identity may be
+/// destroyed.
+///
+/// `force` is the escape hatch for a node that can NEVER come up (a bricked
+/// recovery, corrupt state — its surface FATALs on every start, so the default
+/// guard can never confirm anything and the workspace becomes un-removable). it
+/// overrides ONLY the `Unconfirmed` verdict (node down/unreachable/unreadable);
+/// it can NOT override a `ConfirmedInSet` verdict — a reachable node that proves
+/// it is still a current validator of a multi-member set is never force-torn-down
+/// (that would halt a provably-live network). the caller gates `force` behind an
+/// explicit, honest confirmation.
+///
 /// returns the newly-active workspace the registry repointed to, or `None` when
 /// none remain.
 #[tauri::command]
-pub fn workspace_forget(app: tauri::AppHandle, id: String) -> Result<Option<Workspace>, String> {
+pub fn workspace_forget(
+    app: tauri::AppHandle,
+    id: String,
+    force: bool,
+) -> Result<Option<Workspace>, String> {
     let mut reg = load_registry(&app)?;
     let ws = find(&reg, &id)?.clone();
     let dir = workspaces_dir(&app)?.join(&ws.id);
 
     // guard (FAIL CLOSED): confirm — via the RUNNING node's own membership — that
-    // tearing this workspace down cannot strand a peer or halt quorum. we proceed
-    // ONLY on a definitive safe verdict; every error/ambiguous case refuses so we
-    // never delete the identity.key a still-in-set validator needs to finalize
-    // its pending removal.
-    let node_bin = crate::daemon::resolve_node_bin().map_err(unconfirmed_forget)?;
-    let cfg = node_toml(&dir);
-    let status = run_verb(
-        &node_bin,
-        &["member-status", "--config", &cfg.to_string_lossy()],
-    )
-    .map_err(unconfirmed_forget)?;
-    forget_guard(&last_line(&status))?;
+    // tearing this workspace down cannot strand a peer or halt quorum. teardown
+    // proceeds ONLY on a definitive `Safe` verdict. a `ConfirmedInSet` refusal is
+    // ABSOLUTE (force included): we never destroy the identity.key a provably-live
+    // multi-member validator needs to finalize its pending removal. an
+    // `Unconfirmed` refusal (node down/bricked/unreadable) is what `force`
+    // overrides — a node that can never start can never finalize a removal, so
+    // keeping it only strands the user with a workspace they can never remove.
+    match probe_forget(&dir) {
+        ForgetVerdict::Safe => {}
+        ForgetVerdict::Unconfirmed(_) if force => {}
+        ForgetVerdict::Unconfirmed(msg) => return Err(msg),
+        ForgetVerdict::ConfirmedInSet(msg) => return Err(msg),
+    }
 
     // stop the node so nothing keeps running or holds the storage dir open.
     stop_node(ws.ports.http);
@@ -902,27 +955,46 @@ mod tests {
     }
 
     #[test]
-    fn forget_guard_allows_a_departed_or_solo_node() {
+    fn classify_status_allows_a_departed_or_solo_node() {
         // already removed from the set: safe regardless of the reported count.
-        assert!(forget_guard("in-set=false validators=3").is_ok());
-        assert!(forget_guard("in-set=false validators=1").is_ok());
+        assert!(matches!(
+            classify_status("in-set=false validators=3"),
+            ForgetVerdict::Safe
+        ));
+        assert!(matches!(
+            classify_status("in-set=false validators=1"),
+            ForgetVerdict::Safe
+        ));
         // a provably solo network: no peer to strand, forgetting just drops it.
-        assert!(forget_guard("in-set=true validators=1").is_ok());
+        assert!(matches!(
+            classify_status("in-set=true validators=1"),
+            ForgetVerdict::Safe
+        ));
     }
 
     #[test]
-    fn forget_guard_refuses_a_still_in_set_validator() {
+    fn classify_status_confirms_a_still_in_set_validator() {
         // in-set of a set of two-or-more: forgetting would strand the pending
-        // removal and halt quorum. must refuse and name the count.
-        let err = forget_guard("in-set=true validators=2").unwrap_err();
-        assert!(err.contains("still a current validator of 2"), "{err}");
-        assert!(forget_guard("in-set=true validators=3").is_err());
+        // removal and halt quorum. must be ConfirmedInSet (never force-overridable)
+        // and name the count.
+        let verdict = classify_status("in-set=true validators=2");
+        match &verdict {
+            ForgetVerdict::ConfirmedInSet(msg) => {
+                assert!(msg.contains("still a current validator of 2"), "{msg}")
+            }
+            _ => panic!("expected ConfirmedInSet for a set of two"),
+        }
+        assert!(matches!(
+            classify_status("in-set=true validators=3"),
+            ForgetVerdict::ConfirmedInSet(_)
+        ));
     }
 
     #[test]
-    fn forget_guard_fails_closed_on_an_unparseable_status() {
-        // FAIL CLOSED: any line we can't read into BOTH fields must refuse — an
-        // unknown membership can never authorize destroying the identity.
+    fn classify_status_is_unconfirmed_on_an_unparseable_status() {
+        // FAIL CLOSED: any line we can't read into BOTH fields is Unconfirmed —
+        // an unknown membership can never authorize destroying the identity by
+        // itself (only an explicit force may override this uncertainty).
         for line in [
             "",
             "in-set=true",             // count missing
@@ -932,8 +1004,8 @@ mod tests {
             "in-set=maybe validators=two",
         ] {
             assert!(
-                forget_guard(line).is_err(),
-                "expected refusal for {line:?}"
+                matches!(classify_status(line), ForgetVerdict::Unconfirmed(_)),
+                "expected Unconfirmed for {line:?}"
             );
         }
     }

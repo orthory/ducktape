@@ -237,8 +237,11 @@ export interface ConsoleActions {
   /** Forget the active workspace: stop its node, delete its directory + registry
    *  entry, then switch to another workspace or open the onboarding gate. Guarded
    *  in the backend — refused while this node is still a current validator of a
-   *  set of two-or-more (that would halt quorum). */
-  forgetWorkspace(): void;
+   *  set of two-or-more (that would halt quorum). When the guarded attempt can't
+   *  confirm the node left (it's down/bricked), `state.forgetNeedsForce` flips on;
+   *  call again with `force` to override that uncertainty (the backend still
+   *  refuses to force-tear-down a reachable, provably-live multi-member node). */
+  forgetWorkspace(force?: boolean): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -348,6 +351,9 @@ export function createActions({
       workspace: target,
       needsOnboarding: false,
       onboardingBusy: false,
+      // a force-forget offer is scoped to the workspace it was raised for;
+      // switching targets clears it so it can never fire on the wrong one.
+      forgetNeedsForce: false,
       inviteBlob: null,
     });
     return Promise.resolve()
@@ -1200,16 +1206,16 @@ export function createActions({
         .catch(fail);
     },
 
-    forgetWorkspace: () => {
+    forgetWorkspace: (force = false) => {
       const target = getState().workspace;
       if (!target) return;
-      patch({ onboardingBusy: true, error: null });
+      patch({ onboardingBusy: true, error: null, forgetNeedsForce: false });
       // Call the GUARDED backend FIRST — it refuses while this node is still a
       // current validator of a set of two-or-more. Only tear down the local
       // node + projections once the backend has actually forgotten it, so a
       // refused forget leaves the live UI intact (still connected, error shown).
       Promise.resolve()
-        .then(() => ws.forgetWorkspace(target.id))
+        .then(() => ws.forgetWorkspace(target.id, force))
         .then((next) => {
           // Forgotten: drop the live node + its projections (mirrors
           // selectWorkspace's reset), then repoint the switcher.
@@ -1249,7 +1255,12 @@ export function createActions({
           });
         })
         .catch((err) => {
-          patch({ onboardingBusy: false });
+          // A GUARDED forget that couldn't confirm the node left (it's
+          // down/bricked) is exactly the case a force override exists for —
+          // reveal it so a workspace whose node can never start isn't stranded.
+          // A force attempt that still fails does NOT re-reveal (no loop): the
+          // backend only refuses force for a reachable, provably-live node.
+          patch({ onboardingBusy: false, forgetNeedsForce: !force });
           fail(err);
         });
     },
