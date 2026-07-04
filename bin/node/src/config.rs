@@ -833,6 +833,71 @@ pub fn choose_sync_source(
         .cloned()
 }
 
+// ============================================================================
+// the workspace registry — the desktop app materializes one directory per
+// network under `~/.ducktape/workspaces/<id>/` (node.toml + network.toml +
+// identity.key). `--network <chain id>` resolves through it, so the CLI can
+// address a node by the name humans actually know.
+// ============================================================================
+
+/// the registry root: `$DUCKTAPE_HOME/workspaces` when the override is set
+/// (tests, portable setups), else `~/.ducktape/workspaces`.
+pub fn workspaces_root() -> Result<PathBuf, String> {
+    if let Some(home) = std::env::var_os("DUCKTAPE_HOME") {
+        return Ok(PathBuf::from(home).join("workspaces"));
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or("cannot resolve $HOME — pass --config <node.toml> instead of --network")?;
+    Ok(PathBuf::from(home).join(".ducktape").join("workspaces"))
+}
+
+/// resolve `--network <chain id>` to a workspace's node.toml: scan the
+/// registry for descriptors whose chain-id matches `needle` — exact first,
+/// else a unique prefix (so `ducktape` finds `ducktape#a1b2c3d4`). ambiguity
+/// and absence are loud errors that name what WAS found.
+pub fn find_workspace_config(needle: &str) -> Result<PathBuf, String> {
+    find_workspace_config_in(&workspaces_root()?, needle)
+}
+
+fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String> {
+    let entries = std::fs::read_dir(root).map_err(|e| {
+        format!("no workspace registry at {root:?} ({e}) — pass --config <node.toml>")
+    })?;
+    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let descriptor_path = dir.join("network.toml");
+        if !descriptor_path.is_file() {
+            continue;
+        }
+        // an unreadable descriptor in one workspace must not break addressing
+        // the others — skip it.
+        let Ok(d) = NetworkDescriptor::load(&descriptor_path) else {
+            continue;
+        };
+        if d.chain_id == needle {
+            return Ok(dir.join("node.toml"));
+        }
+        if d.chain_id.starts_with(needle) {
+            matches.push((d.chain_id, dir.join("node.toml")));
+        }
+    }
+    match matches.len() {
+        0 => Err(format!(
+            "no workspace under {root:?} matches network {needle:?}"
+        )),
+        1 => Ok(matches.swap_remove(0).1),
+        _ => Err(format!(
+            "network {needle:?} is ambiguous — matches: {}",
+            matches
+                .iter()
+                .map(|(c, _)| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 /// everything `run_node` needs, shape-independent.
 #[derive(Debug)]
 pub struct Resolved {
@@ -1134,6 +1199,40 @@ mod tests {
         let token = mint_invite_token(&issuer, b"net#00000000@feedface");
         save_invite_token(&dir, &token).expect("save");
         assert_eq!(load_invite_token(&dir).expect("load"), Some(token));
+    }
+
+    #[test]
+    fn network_flag_resolves_workspaces_by_chain_id_prefix() {
+        let root = tmp("registry");
+        for (ws, chain) in [("a", "ducktape#a1b2c3d4"), ("b", "kitchen#99887766")] {
+            let dir = root.join(ws);
+            std::fs::create_dir_all(&dir).expect("mk workspace");
+            let d = NetworkDescriptor {
+                chain_id: chain.into(),
+                scheme: SCHEME_ED25519.into(),
+                validators: vec![hex_bytes(
+                    ed25519::PrivateKey::from_seed(40).public_key().as_ref(),
+                )],
+                bootstrap: vec![],
+            };
+            d.save(&dir.join("network.toml")).expect("save");
+        }
+        // stray non-workspace entries are skipped, not errors.
+        std::fs::create_dir_all(root.join("not-a-workspace")).expect("mk stray");
+
+        // exact and unique-prefix both land on the workspace's node.toml.
+        assert_eq!(
+            find_workspace_config_in(&root, "ducktape#a1b2c3d4").expect("exact"),
+            root.join("a").join("node.toml")
+        );
+        assert_eq!(
+            find_workspace_config_in(&root, "kitchen").expect("prefix"),
+            root.join("b").join("node.toml")
+        );
+        // absence and ambiguity are loud.
+        assert!(find_workspace_config_in(&root, "nope").is_err());
+        let err = find_workspace_config_in(&root, "").expect_err("ambiguous");
+        assert!(err.contains("ambiguous"), "{err}");
     }
 
     #[test]

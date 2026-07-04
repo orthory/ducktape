@@ -1729,26 +1729,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
-    // the run path: `--config <path> [--sync-only]`.
+    // the run path: `--config <path> | -n/--network <chain id> [--sync-only]`.
     let mut cfg_path: Option<PathBuf> = None;
+    let mut network: Option<String> = None;
     let mut sync_only = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" => cfg_path = it.next().map(PathBuf::from),
+            "-n" | "--network" => network = it.next().cloned(),
             "--sync-only" => sync_only = true,
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|member-remove|member-leave|\
-                     member-status|join — or \
-                     --config <path> [--sync-only])"
+                     keygen|init|invite|admit|invite-accept|join-requests|member-remove|\
+                     member-leave|member-status|join — or \
+                     --config <path> | -n/--network <chain id> [--sync-only])"
                 )
                 .into());
             }
         }
     }
-    let cfg_path = cfg_path.ok_or("missing --config <path>")?;
+    // `--network` addresses a workspace by its chain id through the registry;
+    // `--config` stays the explicit path. exactly one selects the node.
+    let cfg_path = match (network, cfg_path) {
+        (Some(needle), None) => config::find_workspace_config(&needle)?,
+        (None, Some(path)) => path,
+        (Some(_), Some(_)) => {
+            return Err("pass either --network <chain id> or --config <path>, not both".into());
+        }
+        (None, None) => {
+            return Err("missing --config <path> (or -n/--network <chain id>)".into());
+        }
+    };
 
     // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
     tracing_subscriber::fmt()
@@ -1763,7 +1776,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // onboarding verbs — keygen / init / invite / admit / join.
 // ============================================================================
 
-/// tiny flag parser: `--name value` pairs plus positionals; no deps.
+/// tiny flag parser: `--name value` pairs plus positionals; no deps. `-n` is
+/// the one short alias (for `--network`, the workspace selector every verb
+/// takes).
 fn parse_flags(
     args: &[String],
 ) -> Result<(Vec<String>, std::collections::BTreeMap<String, String>), String> {
@@ -1771,7 +1786,11 @@ fn parse_flags(
     let mut flags = std::collections::BTreeMap::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if let Some(name) = a.strip_prefix("--") {
+        let name = match a.as_str() {
+            "-n" => Some("network"),
+            other => other.strip_prefix("--"),
+        };
+        if let Some(name) = name {
             let v = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
             flags.insert(name.to_string(), v.clone());
         } else {
@@ -1779,6 +1798,22 @@ fn parse_flags(
         }
     }
     Ok((positional, flags))
+}
+
+/// the config a verb operates on: `-n`/`--network <chain id>` resolves through
+/// the workspace registry (`~/.ducktape/workspaces`), `--config <path>` is the
+/// explicit escape hatch, and the default is ./node.toml — the pre-registry
+/// behavior, unchanged.
+fn config_path(flags: &std::collections::BTreeMap<String, String>) -> Result<PathBuf, String> {
+    if let Some(needle) = flags.get("network") {
+        return config::find_workspace_config(needle);
+    }
+    Ok(PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    ))
 }
 
 /// `keygen [--out <path>]` — generate (or reuse) a persisted ed25519 identity.
@@ -1890,12 +1925,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
         .network
@@ -1932,12 +1962,7 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("admit needs exactly one <hex pubkey>".into());
     };
     let key = config::decode_key(pubkey_hex)?;
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
         .network
@@ -2033,12 +2058,7 @@ fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let resolved = config::resolve(&cfg_path)?;
     let addr = resolved
         .rpc_listen
@@ -2065,12 +2085,7 @@ fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
     let (_, flags) = parse_flags(args)?;
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let resolved = config::resolve(&cfg_path)?;
     let addr = resolved
         .rpc_listen
@@ -2169,12 +2184,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     };
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     // full config resolution (network- or dev-shape) so the verb derives the
     // SAME identity the running node signs with — the ballots this verb
     // casts are signed by the NODE (the ordered lane signs every rpc
@@ -2329,12 +2339,7 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     };
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     // full config resolution so the verb derives the SAME identity the running
     // node signs with — the ballots this verb casts are signed by the NODE, and
     // that key must be a current member.
@@ -2487,12 +2492,7 @@ fn cmd_member_leave(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !pos.is_empty() {
         return Err(format!("member-leave takes no positional args (got {pos:?})").into());
     }
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     // resolve the running node's identity — the key it signs ballots with, and
     // the one this verb submits for removal.
     let resolved = config::resolve(&cfg_path)?;
@@ -2530,12 +2530,7 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     if !pos.is_empty() {
         return Err(format!("member-status takes no positional args (got {pos:?})").into());
     }
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let resolved = config::resolve(&cfg_path)?;
     let rpc_addr = resolved
         .rpc_listen

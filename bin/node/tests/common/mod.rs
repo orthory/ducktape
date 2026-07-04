@@ -156,6 +156,41 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// the token-less invite: the joiner's pubkey travels out-of-band and no
+    /// lobby announce happens — the pre-token manual flow, kept working.
+    pub fn invite_manual(&self) -> String {
+        let cfg = self.config_file(0);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["invite", "--manual", "--config"])
+            .arg(cfg)
+            .output()
+            .expect("run invite --manual");
+        assert!(
+            out.status.success(),
+            "invite --manual failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// the founder's verified join-request queue, parsed from the
+    /// `join-requests` verb's JSON stdout.
+    pub fn join_requests(&self) -> serde_json::Value {
+        let cfg = self.config_file(0);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["join-requests", "--config"])
+            .arg(cfg)
+            .output()
+            .expect("run join-requests");
+        assert!(
+            out.status.success(),
+            "join-requests failed:\n{}",
+            command_output(&out)
+        );
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("join-requests prints json")
+    }
+
     pub fn join_friend(&self, invite: &str) -> String {
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .args([
