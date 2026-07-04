@@ -1767,6 +1767,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         scheme: config::SCHEME_ED25519.into(),
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
+        reach: Vec::new(),
     };
     if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -1788,9 +1789,12 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `invite [--config node.toml]` — emit the one-line paste blob: the network
-/// descriptor with THIS member's dial hint folded in (and persisted, so every
-/// future invite carries it).
+/// `invite [--config node.toml] [--ttl-days N]` — emit the one-line paste blob:
+/// a v3 invite carrying the network descriptor with THIS member's dial hint
+/// folded in (and persisted, so every future invite carries it), signed by this
+/// member's identity and stamped with an expiry `N` days out (default
+/// [`config::DEFAULT_INVITE_TTL_DAYS`]). the signer must be a genesis validator
+/// — which every member is — or `decode` on the far side fails closed.
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
@@ -1823,7 +1827,13 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     descriptor.save(&descriptor_path)?;
-    println!("{}", config::encode_invite(&descriptor)?);
+    let ttl_days: u64 = flags
+        .get("ttl-days")
+        .map(|s| s.parse::<u64>().map_err(|e| format!("--ttl-days: {e}")))
+        .transpose()?
+        .unwrap_or(config::DEFAULT_INVITE_TTL_DAYS);
+    let expires = config::invite_expiry(config::unix_now_secs()?, ttl_days)?;
+    println!("{}", config::encode_invite(&descriptor, &key, expires)?);
     Ok(())
 }
 
