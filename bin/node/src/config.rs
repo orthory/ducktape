@@ -147,6 +147,12 @@ pub struct NetworkDescriptor {
     /// first reachable entry that is not themselves.
     #[serde(default)]
     pub bootstrap: Vec<String>,
+    /// typed reach hints (v3), canonical strings like `direct:<hex>@host:port`.
+    /// advisory and EXCLUDED from the genesis fingerprint, exactly like
+    /// `bootstrap`. empty for v2/legacy descriptors — then [`NetworkDescriptor::reach_hints`]
+    /// synthesises all-`Direct` hints from `bootstrap`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<String>,
 }
 
 impl NetworkDescriptor {
@@ -275,6 +281,39 @@ impl NetworkDescriptor {
             .retain(|e| !e.starts_with(&format!("{hex}@")));
         self.bootstrap.push(format!("{hex}@{addr}"));
         self.bootstrap.sort();
+    }
+
+    /// the reach hints, typed. if the descriptor carries explicit v3 `reach`
+    /// entries they parse to those; otherwise every `bootstrap` entry is a
+    /// `Direct` hint (so a v2/legacy descriptor yields all-`Direct` hints with
+    /// no data duplicated and no double-dial).
+    pub fn reach_hints(&self) -> Result<Vec<ReachHint>, String> {
+        if !self.reach.is_empty() {
+            return self.reach.iter().map(|s| ReachHint::parse(s)).collect();
+        }
+        self.bootstrap
+            .iter()
+            .map(|entry| {
+                let (k, addr) = entry
+                    .split_once('@')
+                    .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
+                Ok(ReachHint { expected_key: decode_key(k)?, reach: Reach::Direct(addr.to_string()) })
+            })
+            .collect()
+    }
+
+    /// record a reach hint for a member, replacing any previous hint for the
+    /// same expected key (a member's reach can move/upgrade). keeps the list
+    /// sorted for stable file diffs — mirrors [`NetworkDescriptor::add_bootstrap`].
+    pub fn add_reach(&mut self, hint: &ReachHint) {
+        let ek = hex_bytes(hint.expected_key.as_ref());
+        self.reach.retain(|s| {
+            ReachHint::parse(s)
+                .map(|h| hex_bytes(h.expected_key.as_ref()) != ek)
+                .unwrap_or(true)
+        });
+        self.reach.push(hint.to_canonical());
+        self.reach.sort();
     }
 }
 
@@ -542,6 +581,7 @@ fn unpack_invite(bytes: &[u8]) -> Result<NetworkDescriptor, String> {
         scheme: SCHEME_ED25519.into(),
         validators,
         bootstrap,
+        reach: Vec::new(),
     })
 }
 
@@ -937,6 +977,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         let decoded = decode_invite(&encode_invite(&d).expect("encode")).expect("roundtrip");
@@ -965,6 +1006,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.admit(&a);
         d.admit(&b);
@@ -989,6 +1031,7 @@ mod tests {
                 hex_bytes(other.as_ref()),
             ],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -1022,6 +1065,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(other.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1054,6 +1098,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(a.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1070,6 +1115,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         let founder_only = d.genesis_namespace();
         assert!(founder_only.starts_with("net#00000000@"));
@@ -1137,6 +1183,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         // empty dir: anything goes.
         assert!(guard_join_descriptor(&dir, &ours).is_ok());
@@ -1183,6 +1230,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![lower, upper],
             bootstrap: vec![],
+            reach: vec![],
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1199,6 +1247,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(b.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         // a hand-edited twin: uppercase, whitespace, different order.
         let messy = NetworkDescriptor {
@@ -1209,6 +1258,7 @@ mod tests {
                 hex_bytes(a.as_ref()),
             ],
             bootstrap: vec![],
+            reach: vec![],
         };
         // identical decoded sets MUST run under the identical namespace.
         assert_eq!(messy.genesis_namespace(), canonical.genesis_namespace());
@@ -1238,6 +1288,7 @@ mod tests {
                 format!("{}@127.0.0.1:0", hex_bytes(a.as_ref())),
                 format!("{}@127.0.0.1:52200", hex_bytes(b.as_ref())),
             ],
+            reach: vec![],
         };
         let entries = d.bootstrap_entries().expect("well-formed hints parse");
         assert_eq!(
@@ -1384,5 +1435,63 @@ bootstrapper_addr = "127.0.0.1:52200"
         assert!(ReachHint::parse("direct:zz@host:1").is_err(), "bad hex key");
         // coordinated without the #coord_key delimiter:
         assert!(ReachHint::parse("coordinated:00@host:1").is_err(), "missing #coord_key");
+    }
+
+    #[test]
+    fn reach_field_defaults_empty_and_toml_roundtrips() {
+        let a = ed25519::PrivateKey::from_seed(21).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        // an existing network.toml without a [reach] array still parses (serde default),
+        // and an empty reach is not serialised (skip_serializing_if).
+        assert!(!d.to_toml().contains("reach"));
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("10.0.0.1:9000".into()) });
+        let back = NetworkDescriptor::from_toml(&d.to_toml()).expect("roundtrip");
+        assert_eq!(back.reach, d.reach);
+    }
+
+    #[test]
+    fn reach_hints_synthesizes_direct_from_bootstrap_when_reach_empty() {
+        let a = ed25519::PrivateKey::from_seed(22).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        d.add_bootstrap(&a, "127.0.0.1:52200");
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0], ReachHint { expected_key: a, reach: Reach::Direct("127.0.0.1:52200".into()) });
+    }
+
+    #[test]
+    fn add_reach_dedups_by_expected_key_and_sorts() {
+        let a = ed25519::PrivateKey::from_seed(23).public_key();
+        let coord = ed25519::PrivateKey::from_seed(24).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("1.1.1.1:1".into()) });
+        // same expected_key, different reach — replaces, never duplicates.
+        d.add_reach(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "c:2".into(), coord_key: coord }),
+        });
+        assert_eq!(d.reach.len(), 1);
+        assert!(matches!(d.reach_hints().unwrap()[0].reach, Reach::Coordinated(_)));
+        let mut sorted = d.reach.clone();
+        sorted.sort();
+        assert_eq!(d.reach, sorted);
     }
 }
