@@ -402,6 +402,52 @@ impl Host {
         }
     }
 
+    /// drive the agreed boundary protocol version into EVERY registered module at
+    /// the finalized activation boundary (design §4). the version is read from
+    /// frozen boundary state (the orchestrator's `RespawnPlan::boundary_version`),
+    /// identical on every honest node, so this is a deterministic self-transition —
+    /// never a wall-clock/IO/RNG input. a no-op for modules that don't override
+    /// [`Module::set_active_version`] (only dual-path modules like forge do), and
+    /// `version` is a NON-hashed branch selector — it never enters any `root()`
+    /// preimage, so `app_hash()` is unmoved by this call alone (the app-hashed
+    /// reconciliation of the upgrade module's own `current_version` rides the
+    /// in-block System `Advance` the drain injects at the same height).
+    pub fn set_active_version(&mut self, version: u32) {
+        for m in self.registry.values_mut() {
+            m.set_active_version(version);
+        }
+    }
+
+    /// the SYSTEM-ORIGIN `Advance` the drain injects in-block at a finalized
+    /// activation boundary, or `None` when there is nothing to reconcile.
+    ///
+    /// this is the replay-safe realization of the design's "arm/abort is a
+    /// deterministic self-transition evaluated exactly once at `H`": because it
+    /// rides the SAME [`Host::submit_at`] drain that recovery-replay and
+    /// state-sync-install also run, the `current_version` flip + pending clear
+    /// reconstruct byte-for-byte on every node (never a respawn side-effect,
+    /// invisible to replay). keyed purely on committed upgrade state + `height`:
+    /// injected iff the committed `upgrade` module holds a pending upgrade whose
+    /// `activation_height` has been reached. idempotent — the first block at/after
+    /// `H` clears the pending, so later blocks inject nothing. ABSENT until the
+    /// module is registered (the `Status` query errors → `None`), so the drain is
+    /// byte-identical on a pre-retrofit net.
+    async fn pending_advance(&self, height: u64) -> Option<Msg> {
+        let req = upgrade_interface::encode_query(&upgrade_interface::UpgradeQuery::Status);
+        let bytes = self.query(UPGRADE_MODULE_ID, &req).await.ok()?;
+        let upgrade_interface::UpgradeReply::Status(status) =
+            upgrade_interface::decode_reply(&bytes).ok()?;
+        let pending = status.pending?;
+        if height >= pending.activation_height {
+            Some(Msg {
+                target: UPGRADE_MODULE_ID.into(),
+                payload: upgrade_interface::encode_msg(&upgrade_interface::UpgradeMsg::Advance),
+            })
+        } else {
+            None
+        }
+    }
+
     /// the current app-hash: [`state::global_root`] over the registered modules.
     pub fn app_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();
@@ -588,6 +634,20 @@ impl Host {
 
         // the root op carries the real submitter's origin; follow-ups override.
         let mut queue: VecDeque<(Origin, Msg)> = VecDeque::from([(ctx.origin, msg)]);
+
+        // DETERMINISTIC ACTIVATION INJECTION (design §4 / plan Task 6.3). at a
+        // finalized boundary where the committed `upgrade` module holds a pending
+        // upgrade that has reached its activation height, append EXACTLY ONE
+        // System-origin `Advance` so the module reconciles its own app-hashed state
+        // in-block (ARM: `current_version = to_version` + clear pending/readiness;
+        // ABORT: clear only) at the SAME finalized view on every node. it rides this
+        // drain (not the respawn side-path), so live, recovery-replay, and
+        // state-sync nodes all reconstruct it byte-for-byte. this is what frees the
+        // at-most-one-pending slot after activation. INERT until the module is
+        // registered — `pending_advance` returns `None` when the module is absent.
+        if let Some(advance) = self.pending_advance(height).await {
+            queue.push_back((Origin::System, advance));
+        }
         let mut events: Vec<Event> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
         let mut dispatches: Vec<DispatchRecord> = Vec::new();

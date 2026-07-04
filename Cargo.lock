@@ -3031,6 +3031,7 @@ name = "host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "commonware-cryptography",
  "commonware-runtime",
  "directory",
  "directory-interface",
@@ -3041,7 +3042,10 @@ dependencies = [
  "sdk",
  "serde_json",
  "state",
+ "upgrade",
  "upgrade-interface",
+ "valset",
+ "valset-interface",
 ]
 
 [[package]]
@@ -4062,6 +4066,8 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing-subscriber 0.3.23",
+ "upgrade",
+ "upgrade-interface",
  "valset",
  "valset-interface",
  "vaults",

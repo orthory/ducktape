@@ -386,6 +386,18 @@ pub trait Module {
     async fn abort_block(&mut self) -> Result<(), Error> {
         Ok(())
     }
+
+    /// ACTIVATION HOOK. the host drives this across the whole registry at the
+    /// finalized activation boundary (from the orchestrator's agreed
+    /// `RespawnPlan::boundary_version`) so a `root()`-changing dual-path module
+    /// selects its NEW branch deterministically at `H` (design §4). `version` is
+    /// the effective boundary protocol version — an agreed, non-hashed DISPATCH
+    /// input: a module caches it as a branch selector but MUST NEVER fold it into
+    /// any `root()`/`snapshot()` preimage or op encoding. the default is a no-op:
+    /// version-invariant modules ignore it; only dual-path modules (forge)
+    /// override it. driven ONLY by the agreed boundary version, so every honest
+    /// node sets the identical value — never a wall-clock/IO/RNG input.
+    fn set_active_version(&mut self, _version: u32) {}
 }
 
 #[cfg(test)]

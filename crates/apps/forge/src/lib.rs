@@ -581,10 +581,11 @@ impl Forge {
     }
 
     /// deterministically set the dual-path branch selector. driven by the host
-    /// activation hook (a later phase) at the agreed height `H`, and by
-    /// restart/state-sync restoration. exposed on the concrete type (NOT the
-    /// `Module` trait) so only the host activation path moves it; it is NEVER
-    /// folded into the `root()`/`snapshot()` preimage.
+    /// activation hook at the agreed height `H` (via the [`Module::set_active_version`]
+    /// override below, which the host calls across the registry from the
+    /// orchestrator's agreed `RespawnPlan::boundary_version`), and by
+    /// restart/state-sync restoration. inherent counterpart kept for concrete-typed
+    /// callers (tests); it is NEVER folded into the `root()`/`snapshot()` preimage.
     pub fn set_active_version(&mut self, v: u32) {
         self.active_version = v;
     }
@@ -896,6 +897,15 @@ impl Forge {
 impl Module for Forge {
     fn id(&self) -> ModuleId {
         self.id.clone()
+    }
+
+    /// ACTIVATION HOOK (design §4). the host drives this across the registry at
+    /// the finalized boundary from the agreed `RespawnPlan::boundary_version`, so
+    /// forge selects its dual-path branch deterministically at `H`. `version` is a
+    /// non-hashed branch selector — NEVER part of the `root()`/`snapshot()`
+    /// preimage.
+    fn set_active_version(&mut self, version: u32) {
+        self.active_version = version;
     }
 
     /// the composed namespace root: `sha256` over `(name, committed head)` for

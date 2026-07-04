@@ -209,6 +209,46 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
+/// read the upgrade module's committed state as the boundary snapshot the
+/// orchestrator reads at a finalized boundary (committed state — called between
+/// drains, outside any block). the readiness keys are projected into decoded
+/// ed25519 pubkeys (an undecodable key is dropped — dead weight, exactly like the
+/// module). falls back to the baseline (no pending) when the module is absent
+/// (pre-retrofit) or the reply is unreadable, so this never forks on a decode slip
+/// — matching `Host::effective_version`'s graceful fallback.
+async fn read_upgrade_state(host: &Host) -> consensus::BoundaryUpgrade<ed25519::PublicKey> {
+    use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    let baseline = || consensus::BoundaryUpgrade::baseline(host::BASELINE_VERSION);
+    let Ok(reply) = host
+        .query("upgrade", &encode_query(&UpgradeQuery::Status))
+        .await
+    else {
+        return baseline();
+    };
+    let reply = match decode_reply(&reply) {
+        Ok(r) => r,
+        Err(_) => return baseline(),
+    };
+    let UpgradeReply::Status(status) = reply;
+    let pending = status.pending.map(|up| {
+        let ready: std::collections::BTreeSet<ed25519::PublicKey> = status
+            .ready
+            .iter()
+            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+            .collect();
+        consensus::PendingUpgrade {
+            name: up.name,
+            activation_height: up.activation_height,
+            to_version: up.to_version,
+            ready,
+        }
+    });
+    consensus::BoundaryUpgrade {
+        current_version: status.current_version,
+        pending,
+    }
+}
+
 /// hex-encode a state root for a stable, greppable log line.
 fn hex(root: &StateRoot) -> String {
     hex_bytes(&root.0)
@@ -2617,7 +2657,31 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             );
                             node.set_view_ceiling(cutover.cutover_view());
                         }
-                        if let Some(plan) = orchestrator.respawn_if_due(engine_view, observed) {
+                        // a pending upgrade arms the SAME single cutover slot at its
+                        // activation height (design §"One boundary carries both
+                        // concerns") — never a competing arm: when a membership
+                        // cutover already holds the slot `observe_upgrade` returns
+                        // Pending and the version flip rides that boundary via the
+                        // boundary read in `respawn_if_due`. inert until the module is
+                        // registered (`read_upgrade_state` returns baseline/no-pending).
+                        let boundary_upgrade = read_upgrade_state(node.host()).await;
+                        if let Some(pending) = &boundary_upgrade.pending {
+                            if let consensus::ObservationOutcome::Scheduled(cutover) =
+                                orchestrator.observe_upgrade(engine_view, pending.activation_height)
+                            {
+                                println!(
+                                    "[node {label}] upgrade '{}' armed — cutover to epoch {} at view {} (activation height {})",
+                                    pending.name,
+                                    cutover.next_epoch(),
+                                    cutover.cutover_view(),
+                                    pending.activation_height
+                                );
+                                node.set_view_ceiling(cutover.cutover_view());
+                            }
+                        }
+                        if let Some(plan) =
+                            orchestrator.respawn_if_due(engine_view, observed, boundary_upgrade)
+                        {
                             let members = plan.valset().consensus_members();
                             let member_bytes: Vec<Vec<u8>> =
                                 members.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -2657,6 +2721,30 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             {
                                 eprintln!("[node {label}] FATAL: {e} — halting");
                                 std::process::exit(1);
+                            }
+                            // ACTIVATION (design §4): realize the agreed boundary
+                            // protocol version into every dual-path module's
+                            // active_version (branch selector) at H. driven ONLY by
+                            // the agreed `plan.boundary_version()` — deterministic,
+                            // non-hashed. the upgrade module's OWN committed
+                            // reconciliation (current_version flip + pending clear on
+                            // ARM, clear-only on ABORT) is NOT done here: it rides the
+                            // single in-block System `Advance` the host drain injects
+                            // at the same finalized view (Task 6.3), so both concerns
+                            // land at ONE boundary and every node agrees. do NOT branch
+                            // a separate abort-only follow-up — the one Advance owns both.
+                            node.host_mut().set_active_version(plan.boundary_version());
+                            match plan.upgrade_verdict() {
+                                consensus::UpgradeVerdict::Armed { name, to_version } => println!(
+                                    "[node {label}] upgrade activated name={name} version={to_version} at height {}",
+                                    plan.cutover_app_height()
+                                ),
+                                consensus::UpgradeVerdict::Abort { name } => println!(
+                                    "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
+                                    plan.cutover_app_height(),
+                                    plan.boundary_version()
+                                ),
+                                consensus::UpgradeVerdict::None => {}
                             }
                             // checkpoint IMMEDIATELY: the manifest must record
                             // the new epoch's participant set (the journal's

@@ -25,6 +25,12 @@ directory = { workspace = true }
 greeter = { workspace = true }
 directory-interface = { workspace = true }
 kv-interface = { workspace = true }
+# the deterministic-activation drain-injection test stands the real upgrade +
+# valset modules on the host and drives a block across an activation boundary.
+upgrade = { workspace = true }
+valset = { workspace = true }
+valset-interface = { workspace = true }
+commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"
 # the boundary-fault tests drive stub modules on a plain futures executor.
