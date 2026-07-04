@@ -54,6 +54,18 @@ export interface PhaseReport {
   detail: string | null;
 }
 
+/** One pending join request a parked joiner delivered over the lobby channel.
+ *  Snake_case: these rows pass through verbatim from the NODE's
+ *  `join-requests` JSON (not the registry's camelCase structs). */
+export interface JoinRequest {
+  /** The key asking to join, hex. */
+  joiner: string;
+  /** The member whose invite token authorized the announce, hex. */
+  issuer: string;
+  first_seen_ms: number;
+  last_seen_ms: number;
+}
+
 // ── Guard ───────────────────────────────────────────────
 
 /** The registry is desktop-only; the web build never calls these. */
@@ -80,6 +92,12 @@ export const workspacePhase = (id: string): Promise<PhaseReport> =>
 
 export const inviteBlob = (id: string): Promise<string> =>
   invoke<string>("workspace_invite_blob", { id });
+
+/** The verified join requests parked joiners announced to this member's
+ *  running node — what the Members view renders with an Approve button.
+ *  Approving is admitMember (the normal governance ballot). */
+export const joinRequests = (id: string): Promise<JoinRequest[]> =>
+  invoke<JoinRequest[]>("workspace_join_requests", { id });
 
 // ── Writes ──────────────────────────────────────────────
 

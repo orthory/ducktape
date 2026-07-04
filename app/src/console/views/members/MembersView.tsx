@@ -2,8 +2,20 @@
 // validator keys plus profile display names; liveness/presence is intentionally
 // shown as unavailable until the backing data exists.
 
-import { useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 
+import {
+  isDesktop,
+  joinRequests as fetchJoinRequests,
+  type JoinRequest,
+} from "../../../domain/workspace-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
@@ -409,14 +421,90 @@ function EmptyState({ filter }: { filter: FilterId }) {
   );
 }
 
+/** One parked joiner's delivered request: who asks, who invited, one-click
+ *  approve. Approval routes through the SAME governance ballot as the manual
+ *  paste box — this list only removes the copy/paste. */
+function PendingJoinRequests({
+  requests,
+  onApprove,
+}: {
+  requests: JoinRequest[];
+  onApprove: (pubkey: string) => void;
+}) {
+  if (requests.length === 0) return null;
+  return (
+    <div
+      style={{
+        marginTop: 9,
+        border: `1px solid ${color.borderStrong}`,
+        borderRadius: radius.lg,
+        background: color.paper,
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          padding: "10px 13px 8px",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        <div style={{ font: `600 12.5px ${font.sans}`, color: color.inkSoft }}>
+          Pending Join Requests
+        </div>
+        <span style={{ font: `500 11px ${font.mono}`, color: color.muted2 }}>
+          {requests.length}
+        </span>
+        <span style={{ marginLeft: "auto", font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
+          Approving casts this node&apos;s governance ballot (majority admits).
+        </span>
+      </div>
+      {requests.map((request) => (
+        <div
+          key={request.joiner}
+          style={{
+            borderTop: `1px solid ${color.borderSoft}`,
+            padding: "9px 13px",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <div style={{ font: `500 11.5px ${font.mono}`, color: color.ink }}>
+              {shortKey(request.joiner)}
+            </div>
+            <div style={{ marginTop: 1, font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
+              invited by {shortKey(request.issuer)}
+            </div>
+          </div>
+          <div style={{ marginLeft: "auto", flexShrink: 0 }}>
+            <HoverButton
+              onClick={() => onApprove(request.joiner)}
+              variant="dark"
+              ariaLabel={`Approve join request ${request.joiner}`}
+            >
+              <Icon name="check" size={13} />
+              Approve
+            </HoverButton>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function AdminActions({
   canAdmin,
   inviteBlob,
+  pendingJoins,
   onRevealInvite,
   onAdmit,
 }: {
   canAdmin: boolean;
   inviteBlob: string | null;
+  pendingJoins: JoinRequest[];
   onRevealInvite: () => void;
   onAdmit: (pubkey: string) => void;
 }) {
@@ -443,6 +531,8 @@ function AdminActions({
         <Icon name="members" size={13} color={color.muted2} />
         ADMIN ACTIONS
       </div>
+
+      {canAdmin ? <PendingJoinRequests requests={pendingJoins} onApprove={onAdmit} /> : null}
 
       {canAdmin ? (
         <div
@@ -759,6 +849,34 @@ export function MembersView() {
     : null;
   const canAdmin = Boolean(state.workspace?.founder || state.workspace?.member);
 
+  // Pending join requests live on THIS member's node (delivered over the lobby
+  // channel), read via the desktop registry — poll while the admin surface is
+  // up. A dead node / web build degrades to an empty list, never an error.
+  const [pendingJoins, setPendingJoins] = useState<JoinRequest[]>([]);
+  const workspaceId = state.workspace?.id ?? null;
+  useEffect(() => {
+    if (!workspaceId || !canAdmin || !isDesktop()) {
+      setPendingJoins([]);
+      return;
+    }
+    let alive = true;
+    const pull = () =>
+      Promise.resolve()
+        .then(() => fetchJoinRequests(workspaceId))
+        .then((rows) => {
+          if (alive) setPendingJoins(rows);
+        })
+        .catch(() => {
+          if (alive) setPendingJoins([]);
+        });
+    void pull();
+    const timer = window.setInterval(pull, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [workspaceId, canAdmin]);
+
   const requestRemove = (member: MemberVM): void => {
     // Never remove your own node — that would drop this workspace out of the
     // set it is driving governance through.
@@ -873,6 +991,7 @@ export function MembersView() {
         <AdminActions
           canAdmin={canAdmin}
           inviteBlob={state.inviteBlob}
+          pendingJoins={pendingJoins}
           onRevealInvite={actions.revealInvite}
           onAdmit={actions.admitMember}
         />
