@@ -7,6 +7,11 @@
 //! real runs use `DefguardWireGuardEffect` (`defguard_wireguard_rs`
 //! `WGApi::<Userspace>`).
 
+#[cfg(unix)]
+mod defguard_effect;
+#[cfg(unix)]
+pub use defguard_effect::DefguardWireGuardEffect;
+
 use defguard_wireguard_rs::InterfaceConfiguration;
 
 /// Effect boundary between a validated WireGuard install plan and the real
