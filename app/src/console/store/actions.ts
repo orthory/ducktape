@@ -16,6 +16,8 @@ import * as inboxClient from "../../domain/inbox-client";
 import * as jobsClient from "../../domain/jobs-client";
 import * as memoryClient from "../../domain/memory-client";
 import type { Meta } from "../../domain/memory-client";
+import * as pagesClient from "../../domain/pages-client";
+import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
 import * as bootstrap from "../../domain/node-bootstrap";
@@ -97,6 +99,37 @@ export interface ConsoleActions {
   removeBlock(blockId: string): void;
   /** Move a block within the active doc (see the `after` rule). */
   moveBlock(params: { blockId: string; after: string | null }): void;
+
+  // ── Pages (block-tree notebook over the `pages` module) ──
+  /** Re-query the page enumeration into `state.pages`. */
+  listPages(): void;
+  /** Create a page (root block id minted here) and open it. */
+  createPage(title: string): void;
+  /** Open a page, loading its preorder block tree (like openDoc). */
+  openPage(pageId: string): void;
+  /** Insert a block into the active page. The VIEW mints the id (it drives
+   *  focus to the new block, so it must know the id before the round-trip). */
+  insertPageBlock(params: {
+    blockId: string;
+    parent: string;
+    after: string | null;
+    kind: PageBlockKind;
+    text: string;
+  }): void;
+  /** Replace a block's text; on the page root this renames the page. */
+  updatePageBlockText(params: { blockId: string; text: string }): void;
+  /** Convert a block to another kind (markdown shortcuts, slash menu). */
+  setPageBlockKind(params: { blockId: string; kind: PageBlockKind }): void;
+  /** Flip a Todo block's checked state. */
+  setPageBlockChecked(params: { blockId: string; checked: boolean }): void;
+  /** Move a block under a (possibly new) parent in the active page. */
+  movePageBlock(params: {
+    blockId: string;
+    parent: string;
+    after: string | null;
+  }): void;
+  /** Remove a block and its whole subtree. */
+  removePageBlock(blockId: string): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
   /** Upload the prompt text to the blob store, then RegisterAgent with the
@@ -335,6 +368,22 @@ export function createActions({
     Promise.resolve()
       .then(() => documentClient.getDoc(live, docId))
       .then((blocks) => patch({ activeDocBlocks: blocks ?? [] }))
+      .catch(fail);
+  };
+
+  // the single entry point into a page: make it active and load its preorder
+  // block tree — every path into a page (new-page, a rail click) goes here,
+  // mirroring enterDoc.
+  const enterPage = (pageId: string) => {
+    const live = getNode();
+    if (!live || !pageId) return;
+    patch({
+      activePage: pageId,
+      activePageBlocks: [],
+    });
+    Promise.resolve()
+      .then(() => pagesClient.getPage(live, pageId))
+      .then((blocks) => patch({ activePageBlocks: blocks ?? [] }))
       .catch(fail);
   };
 
@@ -675,6 +724,67 @@ export function createActions({
       submitThenRefresh((live) =>
         documentClient.moveBlock(live, { docId, blockId, after }),
       );
+    },
+
+    // ── Pages ──
+    listPages: () => {
+      const live = getNode();
+      if (!live) return;
+      Promise.resolve()
+        .then(() => pagesClient.listPages(live))
+        .then((pages) => patch({ pages }))
+        .catch(fail);
+    },
+
+    openPage: enterPage,
+
+    createPage: (title) => {
+      const clean = title.trim();
+      if (!clean) return;
+      // the page root's block id — minted here like task/job ids; the refresh
+      // re-enumerates ListPages so the rail shows it, then open it.
+      const pageId = crypto.randomUUID();
+      submitThenRefresh((live) =>
+        pagesClient.createPage(live, { pageId, title: clean }),
+      ).then(() => enterPage(pageId));
+    },
+
+    insertPageBlock: ({ blockId, parent, after, kind, text }) => {
+      if (!getState().activePage) return;
+      submitThenRefresh((live) =>
+        pagesClient.insertBlock(live, {
+          parent,
+          after,
+          block: { id: blockId, kind, text },
+        }),
+      );
+    },
+
+    updatePageBlockText: ({ blockId, text }) => {
+      submitThenRefresh((live) =>
+        pagesClient.updateText(live, { blockId, text }),
+      );
+    },
+
+    setPageBlockKind: ({ blockId, kind }) => {
+      submitThenRefresh((live) => pagesClient.setKind(live, { blockId, kind }));
+    },
+
+    setPageBlockChecked: ({ blockId, checked }) => {
+      submitThenRefresh((live) =>
+        pagesClient.setChecked(live, { blockId, checked }),
+      );
+    },
+
+    movePageBlock: ({ blockId, parent, after }) => {
+      submitThenRefresh((live) =>
+        pagesClient.moveBlock(live, { blockId, parent, after }),
+      );
+    },
+
+    removePageBlock: (blockId) => {
+      if (!blockId) return;
+      submitThenRefresh((live) => pagesClient.removeBlock(live, blockId));
     },
 
     // ── Agents ──
@@ -1094,6 +1204,9 @@ export function createActions({
         docIds: [],
         activeDoc: null,
         activeDocBlocks: [],
+        pages: [],
+        activePage: null,
+        activePageBlocks: [],
         agents: [],
         watches: [],
         runs: [],
@@ -1136,6 +1249,9 @@ export function createActions({
         docIds: [],
         activeDoc: null,
         activeDocBlocks: [],
+        pages: [],
+        activePage: null,
+        activePageBlocks: [],
         agents: [],
         watches: [],
         runs: [],
@@ -1232,6 +1348,9 @@ export function createActions({
             docIds: [],
             activeDoc: null,
             activeDocBlocks: [],
+            pages: [],
+            activePage: null,
+            activePageBlocks: [],
             agents: [],
             watches: [],
             runs: [],

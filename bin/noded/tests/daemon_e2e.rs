@@ -335,6 +335,7 @@ fn full_surface_blocks_authorship_and_ws() {
             "jobs",
             "agent",
             "document",
+            "pages",
             "forge",
             "files",
             "memory",

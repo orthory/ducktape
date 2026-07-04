@@ -40,6 +40,7 @@ use noded::{
     BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus,
     TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame, hex_root,
 };
+use pages::Pages;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
@@ -49,7 +50,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 12] = [
+const MODULE_IDS: [&str; 13] = [
     "chat",
     "saga",
     "tasks",
@@ -58,6 +59,7 @@ const MODULE_IDS: [&str; 12] = [
     "jobs",
     "agent",
     "document",
+    "pages",
     "forge",
     "files",
     "memory",
@@ -242,6 +244,7 @@ fn run_node(
             Some("jobs".into()),
         );
         let document = Document::init(context.child("document"), "document").await;
+        let pages = Pages::init(context.child("pages"), "pages").await;
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
         // pack bytes never enter consensus (root stays sha256(head oid)).
@@ -261,6 +264,7 @@ fn run_node(
             Box::new(jobs),
             Box::new(agent),
             Box::new(document),
+            Box::new(pages),
             Box::new(forge),
             Box::new(files),
             Box::new(memory),
