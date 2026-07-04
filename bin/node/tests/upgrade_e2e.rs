@@ -468,3 +468,156 @@ fn cluster_upgrade() {
     // (test ends here; the second upgrade never arms — MAX_PROTOCOL_VERSION=2 < 3,
     // so no node signals ready — proving a truthful binary refuses to lie.)
 }
+
+/// ADVERSARIAL cluster leg: an upgrade scheduled to a `to_version` STRICTLY ABOVE
+/// every node's `MAX_PROTOCOL_VERSION` must ABORT cleanly at `H` with ZERO network
+/// downtime, then a subsequent SUPPORTED upgrade must still arm and activate. one
+/// leg, four properties the happy path never exercises:
+///
+///   1. TRUTHFUL READINESS — no honest node ever emits `SignalReady` for a version
+///      it cannot execute (the `ReadinessSignaller.decide` `to_version > max` gate),
+///      so readiness stays `< n` and the arm verdict is never reached.
+///   2. CLEAN ABORT — at `H` the boundary `Advance` clears the pending slot
+///      (`upgrade cleared`) and the orchestrator cutover reads the ABORT verdict
+///      (`upgrade aborted … unmet readiness`); `current_version` is UNCHANGED.
+///   3. NO DOWNTIME THROUGH AN ABORT — the network keeps finalizing across `H`
+///      (a post-abort op applies on another node; height passes `H`) and every
+///      honest node still agrees on the app-hash (no halt, no fork).
+///   4. RESCHEDULE — with the slot freed and `current_version` still `0`, a
+///      SUPPORTED `to_version = 2` schedule arms (`R == n`) and ACTIVATES.
+#[test]
+fn cluster_upgrade_aborts_on_unmet_quorum() {
+    let _serial = serial();
+    // a 3-validator mesh — the abort proof needs no state-sync joiner.
+    let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
+
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+    cluster.spawn(1);
+    cluster.spawn(2);
+
+    let converged: Vec<String> = (0..3)
+        .map(|i| cluster.wait_marker(i, "converged app_hash=", CONVERGE))
+        .collect();
+    assert_eq!(converged[0], converged[1], "genesis/converge fork 0 vs 1");
+    assert_eq!(converged[0], converged[2], "genesis/converge fork 0 vs 2");
+
+    // 1. schedule an upgrade to a to_version STRICTLY ABOVE MAX_PROTOCOL_VERSION
+    //    (=2 in bin/node), so NO truthful node can ever signal ready for it. the
+    //    SCHEDULE itself is version-agnostic (only monotonicity/lead/at-most-one
+    //    gate it), so it arms a pending slot exactly like a supported one.
+    const OVER_MAX: u32 = 3; // > MAX_PROTOCOL_VERSION=2
+    let abort_height = schedule_upgrade(&cluster, "over-max", OVER_MAX, UPGRADE_LEAD);
+
+    // TRUTHFUL READINESS: the pending upgrade is live, but the module's armed
+    // verdict must stay false — a supported binary refuses to signal a version it
+    // cannot run. give the signaller several pump ticks to (not) fire, then assert
+    // zero readiness and an un-armed verdict on every node.
+    std::thread::sleep(Duration::from_secs(3));
+    for i in 0..3 {
+        let st = upgrade_status(&cluster, i).expect("upgrade status pre-abort");
+        assert_eq!(
+            st.ready_count, 0,
+            "node {i} recorded readiness for an over-max upgrade it cannot run"
+        );
+        assert!(
+            !st.armed,
+            "node {i} armed an over-max upgrade — a node signaled a version it cannot execute"
+        );
+        assert_eq!(st.current_version, 0, "current_version must be 0 pre-abort");
+    }
+
+    // baseline app-hash agreement before the boundary (the no-fork witness the
+    // abort must preserve).
+    let pre = app_hash(&cluster, 0);
+    assert_eq!(app_hash(&cluster, 1), pre, "app-hash fork 0 vs 1 pre-abort");
+    assert_eq!(app_hash(&cluster, 2), pre, "app-hash fork 0 vs 2 pre-abort");
+
+    // 2. CLEAN ABORT at H: the boundary Advance clears the pending slot on every
+    //    node (fillers advance finalized views across H).
+    push_until(&cluster, "the over-max upgrade to clear at H", || {
+        (0..3).all(|i| cluster.marker(i, "upgrade cleared name=over-max").is_some())
+    });
+    // the orchestrator cutover read the ABORT verdict (unmet readiness), NOT an arm.
+    for i in 0..3 {
+        cluster.wait_marker(i, "upgrade aborted name=over-max (unmet readiness)", CONVERGE);
+    }
+    // and NO node ever armed OR signaled it — the truthful-readiness proof bites.
+    for i in 0..3 {
+        assert!(
+            cluster.marker(i, "signaled ready name=over-max").is_none(),
+            "node {i} signaled ready for an over-max upgrade (untruthful readiness)"
+        );
+        assert!(
+            cluster.marker(i, "upgrade armed name=over-max").is_none(),
+            "node {i} armed an over-max upgrade that no node could signal for"
+        );
+    }
+    // current_version is UNCHANGED (abort never flips) and the slot is free.
+    for i in 0..3 {
+        let st = upgrade_status(&cluster, i).expect("upgrade status post-abort");
+        assert_eq!(st.current_version, 0, "abort must NOT flip current_version (node {i})");
+        assert!(st.pending.is_none(), "abort must clear the pending slot (node {i})");
+    }
+
+    // 3. NO DOWNTIME: the network keeps finalizing across the aborted boundary — a
+    //    fresh op applies on ANOTHER node and height advances past H.
+    poll_until("a post-abort op to finalize across H", CONVERGE, || {
+        let payload = directory_interface::encode_msg(&DirMsg::Set {
+            key: "post-abort-liveness".into(),
+            value: "alive".into(),
+        });
+        let _ = cluster.rpc(
+            0,
+            serde_json::json!({
+                "cmd": "submit",
+                "target": "directory",
+                "payload_hex": common::hex(&payload),
+            }),
+        );
+        dir_value(&cluster, 2, "post-abort-liveness")
+    });
+    let post = height(&cluster, 0).expect("finalized height after the aborted H");
+    assert!(
+        post >= abort_height,
+        "height {post} never reached the aborted activation height {abort_height} — the net stalled at H"
+    );
+    // quiesce, then confirm no honest node forked across the abort.
+    std::thread::sleep(Duration::from_secs(3));
+    let after = app_hash(&cluster, 0);
+    assert_eq!(app_hash(&cluster, 1), after, "cross-node app-hash fork across the abort (node 1)");
+    assert_eq!(app_hash(&cluster, 2), after, "cross-node app-hash fork across the abort (node 2)");
+
+    // 4. RESCHEDULE: the slot is free and current_version is still 0, so a
+    //    SUPPORTED to_version=2 upgrade now arms (R == n) and ACTIVATES — proving
+    //    the abort left the mechanism fully re-armable (no residual pending/readiness).
+    let arm_height = schedule_upgrade(&cluster, "recover-v2", 2, UPGRADE_LEAD);
+    for i in 0..3 {
+        cluster.wait_marker(i, "signaled ready name=recover-v2 to_version=2", CONVERGE);
+        cluster.wait_marker(i, "upgrade armed name=recover-v2 to_version=2", CONVERGE);
+    }
+    push_until(&cluster, "the supported reschedule to activate on every node", || {
+        (0..3).all(|i| cluster.marker(i, "upgrade activated name=recover-v2 version=2").is_some())
+    });
+    // the version-only cutover DISCARDS the frames at the boundary view, so the
+    // in-block Advance that flips current_version only fires once the respawned
+    // epoch finalizes a fresh block at/after H2. drive ops until the flip reconciles
+    // to v2 on every node (if it ABORTED instead, this would time out — the bite).
+    push_until(&cluster, "the reschedule flip to reconcile current_version=2", || {
+        (0..3).all(|i| {
+            upgrade_status(&cluster, i)
+                .map(|s| s.current_version == 2 && s.pending.is_none())
+                .unwrap_or(false)
+        })
+    });
+    for i in 0..3 {
+        let st = upgrade_status(&cluster, i).expect("upgrade status post-activation");
+        assert_eq!(st.current_version, 2, "reschedule must activate to v2 (node {i})");
+        assert!(st.pending.is_none(), "reschedule pending must clear on activation (node {i})");
+    }
+    let recovered = app_hash(&cluster, 0);
+    assert_eq!(app_hash(&cluster, 1), recovered, "post-reschedule app-hash fork (node 1)");
+    assert_eq!(app_hash(&cluster, 2), recovered, "post-reschedule app-hash fork (node 2)");
+    let post2 = height(&cluster, 0).expect("finalized height after the armed H");
+    assert!(post2 >= arm_height, "height {post2} never reached the armed activation height {arm_height}");
+}

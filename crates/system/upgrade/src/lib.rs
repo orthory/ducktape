@@ -15,8 +15,11 @@
 //!
 //! `effective_version(height, boundary_members)` is a pure, total function of the
 //! COMMITTED state — the ONE shared predicate in `upgrade_interface`. the module's
-//! `Advance` handler re-evaluates the byte-identical predicate against
-//! staged-over-committed state at the boundary block, so live, recovery-replay,
+//! `Advance` handler re-evaluates the byte-identical predicate against the FROZEN
+//! COMMITTED end-of-(H-1) state (NOT staged-over-committed) — the SAME snapshot the
+//! orchestrator `arm_verdict` and the host `effective_version(H)` stamp read — so a
+//! `SignalReady` finalized as block H's own op cannot flip committed state while
+//! the sealed forge root was composed under the old selector; live, recovery-replay,
 //! and state-sync nodes all reconstruct the activation identically. the per-node
 //! BUILD constant `MAX_PROTOCOL_VERSION` is deliberately NOT here — it varies per
 //! node and would fork consensus state; the module only records signals.
@@ -268,32 +271,47 @@ impl Upgrade {
     async fn handle_advance(&mut self, ctx: &mut dyn Ctx) -> Result<(), Error> {
         Self::require_system(ctx)?;
         let height = ctx.env().height;
-        let members = self.members(ctx).await?;
-        let mut next = self.read().clone();
-        // no pending, or below the activation boundary: idempotent no-op.
-        if let Some(up) = next.pending.clone()
+        // The arm/abort verdict MUST read the FROZEN COMMITTED end-of-(H-1) state,
+        // NOT staged-over-committed — the SAME snapshot the orchestrator arm_verdict
+        // and the host effective_version(H) stamp read (both query out-of-block,
+        // where staged is empty). Deciding over `self.read()` (staged) here would
+        // let a SignalReady finalized AS block H's own op — staged earlier in this
+        // very drain — flip committed current_version to to_version, while every
+        // other site, having frozen readiness at n-1 at the boundary, sealed forge
+        // under the OLD selector. That split (committed current_version = new, forge
+        // root sealed under old) is invisible live (all nodes agree) yet halts every
+        // node that later restarts / state-syncs across H, because they rebuild
+        // active_version from the flat committed current_version. So decide over
+        // `self.committed`; a late same-block signal then cleanly ABORTS (the
+        // boundary quorum was genuinely unmet at H-1) and the operator reschedules.
+        let pending = self.committed.pending.clone();
+        if let Some(up) = pending
             && height >= up.activation_height
         {
-            // ARM via the ONE shared predicate — no hand-copied logic (plan R4):
-            // effective_version returns to_version iff every boundary member
-            // signaled, else current_version (< to_version, monotonic), so
-            // equality with to_version IS the arm verdict.
-            let ready: BTreeMap<Vec<u8>, ()> =
-                next.readiness.keys().map(|k| (k.clone(), ())).collect();
+            let members = self.members(ctx).await?;
+            // the shared predicate over FROZEN committed readiness (plan R4): armed
+            // iff every boundary member had signaled by end-of-(H-1).
+            let ready: BTreeMap<Vec<u8>, ()> = self
+                .committed
+                .readiness
+                .keys()
+                .map(|k| (k.clone(), ()))
+                .collect();
             let armed = up.to_version
                 == upgrade_interface::effective_version(
                     height,
-                    next.current_version,
-                    next.pending.as_ref(),
+                    self.committed.current_version,
+                    Some(&up),
                     &members,
                     &ready,
                 );
+            // apply the reconciliation over staged-over-committed (published at
+            // commit_block): ARM flips current_version + clears the slot; ABORT
+            // clears the slot, leaving current_version unchanged.
+            let mut next = self.read().clone();
             if armed {
-                // flip the agreed version.
                 next.current_version = up.to_version;
             }
-            // ARM or ABORT both clear the slot so a second upgrade can be
-            // scheduled; ABORT leaves current_version unchanged.
             next.pending = None;
             next.readiness.clear();
             self.staged = Some(next);
@@ -926,6 +944,48 @@ mod tests {
         assert_eq!(u.root(), root_before);
         assert_eq!(u.committed.current_version, 0);
         assert!(u.committed.pending.is_some());
+    }
+
+    // The boundary race: the nth SignalReady is finalized AS block H's own op, so
+    // it stages readiness=n in the SAME drain the injected Advance runs in. The
+    // Advance MUST decide over FROZEN committed (H-1) readiness = n-1 and ABORT —
+    // matching the orchestrator arm_verdict and the host effective_version(H) stamp,
+    // which both froze at n-1 and sealed forge under the OLD selector. Deciding over
+    // the staged (n) readiness here would flip committed current_version to
+    // to_version while forge sealed under old — a split that halts every recovering
+    // node. (Regression for the hardening-audit CRITICAL finding.)
+    #[test]
+    fn a_same_block_late_signal_aborts_not_arms() {
+        let m0 = valid_key(1);
+        let m1 = valid_key(2);
+        let members = vec![m0.clone(), m1.clone()];
+        let mut u = up();
+
+        // schedule; only m0 signals and COMMITS before H (readiness incomplete).
+        let mut sys = TestCtx::new(Origin::System, 0, members.clone());
+        run(&mut u, &mut sys, &schedule("a", 10, 2)).unwrap();
+        commit(&mut u);
+        let mut c0 = TestCtx::new(Origin::External(m0.clone()), 1, members.clone());
+        run(&mut u, &mut c0, &signal("a", 2)).unwrap();
+        commit(&mut u);
+        assert_eq!(u.committed.readiness.len(), 1, "only m0 committed by end of H-1");
+
+        // block H (height 10): m1's SignalReady is THIS block's op — it stages
+        // readiness=n — and the injected Advance runs in the SAME drain, before any
+        // commit. (Two runs with no intervening commit = one block's staging.)
+        let mut c1 = TestCtx::new(Origin::External(m1.clone()), 10, members.clone());
+        run(&mut u, &mut c1, &signal("a", 2)).unwrap();
+        let mut sysh = TestCtx::new(Origin::System, 10, members);
+        run(&mut u, &mut sysh, &advance()).unwrap();
+        commit(&mut u);
+
+        // the Advance froze on committed (H-1) readiness {m0}=n-1 -> ABORT, not arm.
+        assert_eq!(
+            u.committed.current_version, 0,
+            "a same-block late nth signal must NOT flip: the boundary quorum was unmet at H-1"
+        );
+        assert!(u.committed.pending.is_none(), "the upgrade aborts cleanly");
+        assert!(u.committed.readiness.is_empty(), "readiness cleared on abort");
     }
 
     // ---- effective_version --------------------------------------------------
