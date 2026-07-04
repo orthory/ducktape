@@ -364,6 +364,9 @@ fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
     ))]
 }
 
+/// commit the caller's op, then drain worker follow-ups (each its own block).
+/// the returned summary is the block that INCLUDED the caller's op — follow-up
+/// blocks reach clients over the ws stream, not this reply.
 async fn submit_and_drain(
     host: &mut Host,
     workers: &[Box<dyn reactor::Worker>],
@@ -374,7 +377,7 @@ async fn submit_and_drain(
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
-    let (mut last, effects) =
+    let (included, effects) =
         match submit_one(host, height, events, telemetry, metrics, origin, msg).await {
             Ok(out) => out,
             Err(SubmitError::Fatal(err)) => {
@@ -404,8 +407,7 @@ async fn submit_and_drain(
         )
         .await
         {
-            Ok((block, effects)) => {
-                last = block;
+            Ok((_block, effects)) => {
                 offer_effects(workers, effects, &mut queue).await;
             }
             Err(SubmitError::Fatal(err)) => {
@@ -418,7 +420,7 @@ async fn submit_and_drain(
         }
     }
 
-    Ok(last)
+    Ok(included)
 }
 
 async fn submit_one(

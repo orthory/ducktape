@@ -51,6 +51,19 @@ pub struct BlockSummary {
     pub app_hash: String,
 }
 
+/// the `/v1/submit` reply: the block that INCLUDED the caller's op, plus the
+/// op's content address — sha256 of the exact payload bytes the host committed.
+/// the bytes are staged in the node-local blob store under that digest, so
+/// `GET /v1/files/blob/{op_hash}` serves them back: the hash is addressable,
+/// not just informational.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitReceipt {
+    pub height: u64,
+    pub app_hash: String,
+    pub op_hash: String,
+}
+
 /// how many recent telemetry frames the daemon retains for `GET /v1/telemetry`.
 /// a client connecting mid-stream pulls this backfill, then follows the ws.
 pub const TELEMETRY_RING_CAP: usize = 256;
@@ -396,7 +409,7 @@ async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>
     if let Err(resp) = handle
         .send(NodeCommand::Submit {
             target: req.target,
-            payload,
+            payload: payload.clone(),
             origin,
             reply,
         })
@@ -405,7 +418,18 @@ async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>
         return resp;
     }
     match rx.await {
-        Ok(Ok(block)) => Json(block).into_response(),
+        Ok(Ok(block)) => {
+            // stage the op's bytes only AFTER the commit so a rejected op leaves
+            // nothing behind. put_chunk keys by sha256, so the digest IS the
+            // op's content address (fetchable via /v1/files/blob/{op_hash}).
+            let op_hash = hex_bytes(&handle.blobs.put_chunk(payload));
+            Json(SubmitReceipt {
+                height: block.height,
+                app_hash: block.app_hash,
+                op_hash,
+            })
+            .into_response()
+        }
         Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
         Err(_) => actor_gone(),
     }

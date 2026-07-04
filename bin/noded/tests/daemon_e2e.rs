@@ -479,8 +479,15 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
         Some("eddy"),
     );
     assert_eq!(code, 200, "mention post failed: {block}");
+    // the receipt reports the block that INCLUDED the post, not the drain tail…
     assert_eq!(
-        block["height"], 5,
+        block["height"], 4,
+        "the receipt should carry the post's inclusion block"
+    );
+    // …while the oracle follow-up block still drains behind it.
+    assert_eq!(
+        daemon.status()["height"],
+        5,
         "the post block plus oracle follow-up block should both drain"
     );
 
