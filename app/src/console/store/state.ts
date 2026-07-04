@@ -20,6 +20,7 @@ import type {
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
 /** The two sidebar partitions the view-mode toggle switches between: the
@@ -135,6 +136,12 @@ export interface ConsoleState {
    *  first). Node-local observability — never re-queried from committed state;
    *  backfilled from the node's ring on connect, then followed live over ws. */
   telemetry: TelemetryFrame[];
+
+  /** Per-operation finalization ledger (entity key → newest op touching that
+   *  row): pending while a write is in flight, then finalized with the
+   *  inclusion height + addressable op hash from the submit receipt. Client
+   *  bookkeeping, never committed state — node switches reset it. */
+  ops: OpLedger;
 
   error: string | null;
 
@@ -260,6 +267,7 @@ export const createInitialState = (): ConsoleState => {
     memoryMatches: null,
     files: [],
     telemetry: [],
+    ops: {},
     error: null,
     workspaces: [],
     workspace: null,

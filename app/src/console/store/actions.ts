@@ -30,6 +30,8 @@ import {
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
+import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
+import * as optimistic from "./optimistic";
 import {
   channelIdOf,
   clearRemoteUrl,
@@ -311,13 +313,35 @@ export function createActions({
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
 
-  const submitThenRefresh = (submit: (live: NodeTransport) => Promise<unknown>) => {
+  // The one write path: apply the op's PRECONFIRMED render immediately (the
+  // optimistic projection plus a pending ledger record under the entity's
+  // key), submit, then settle the record from the node's receipt — finalized
+  // with the inclusion height + addressable op hash, or failed. Committed
+  // truth replaces the projection on the refresh that follows either way (a
+  // failed submit's refresh is the rollback).
+  const submitTracked = (
+    key: string,
+    submit: (live: NodeTransport) => Promise<unknown>,
+    preconfirm?: (prev: ConsoleState) => Partial<ConsoleState>,
+  ) => {
     const live = getNode();
     if (!live) return Promise.resolve();
+    const startedAt = Date.now();
+    update((prev) => ({
+      ...(preconfirm ? preconfirm(prev) : {}),
+      ops: beginOp(prev.ops, key, startedAt),
+    }));
     return Promise.resolve()
       .then(() => submit(live))
-      .then(() => refresh())
-      .catch(fail);
+      .then((result) => {
+        update((prev) => ({ ops: finalizeOp(prev.ops, key, receiptOf(result)) }));
+        return refresh();
+      })
+      .catch((err) => {
+        update((prev) => ({ ops: failOp(prev.ops, key, String(err)) }));
+        fail(err);
+        return refresh();
+      });
   };
 
   // switching channels means: new active channel, thread panel closed, and
@@ -336,7 +360,7 @@ export function createActions({
   };
 
   // Re-pull the open thread's own ChatThread snapshot after a write that may
-  // have touched the root or a reply. `submitThenRefresh` already refreshed the
+  // have touched the root or a reply. `submitTracked` already refreshed the
   // flat `state.messages` (every sequence, replies included), but the thread
   // panel reads a separate snapshot, so it needs this extra cheap re-query.
   const resyncOpenThread = (): Promise<void> => {
@@ -486,12 +510,11 @@ export function createActions({
     // SetName so the chosen name propagates: it's origin-gated, so passing our
     // origin sets our OWN profile only. Refresh re-reads authorNames.
     setDisplayName: (name) => {
-      patch({ author: name });
-      submitThenRefresh((live) =>
-        profilesClient.setName(live, {
-          displayName: name,
-          origin: getState().author,
-        }),
+      const origin = getState().author;
+      submitTracked(
+        opKey.profile(),
+        (live) => profilesClient.setName(live, { displayName: name, origin }),
+        () => ({ author: name }),
       );
     },
 
@@ -500,26 +523,44 @@ export function createActions({
     createChannel: (name, postPolicy) => {
       const channelId = channelIdOf(name);
       if (!channelId) return;
-      submitThenRefresh((live) =>
-        chatClient.createChannel(live, {
-          channelId,
-          name,
-          postPolicy,
-          origin: getState().author,
-        }),
+      submitTracked(
+        opKey.channel(channelId),
+        (live) =>
+          chatClient.createChannel(live, {
+            channelId,
+            name,
+            postPolicy,
+            origin: getState().author,
+          }),
+        (prev) =>
+          optimistic.channelCreated(prev, {
+            channelId,
+            name,
+            postPolicy,
+            at: Date.now(),
+          }),
       ).then(() => enterChannel(channelId));
     },
 
     sendMessage: (body) => {
       const channelId = getState().activeChannel;
       if (!channelId || !body.trim()) return;
-      submitThenRefresh((live) =>
-        chatClient.postMessage(live, {
-          channelId,
-          messageId: crypto.randomUUID(),
-          blocks: parseMessageInput(body),
-          origin: getState().author,
-        }),
+      const messageId = crypto.randomUUID();
+      const blocks = parseMessageInput(body);
+      const author = getState().author;
+      submitTracked(
+        opKey.message(channelId, messageId),
+        (live) =>
+          chatClient.postMessage(live, { channelId, messageId, blocks, origin: author }),
+        (prev) =>
+          optimistic.postedMessage(prev, {
+            channelId,
+            messageId,
+            blocks,
+            author,
+            at: Date.now(),
+            thread: null,
+          }),
       );
     },
 
@@ -537,21 +578,35 @@ export function createActions({
 
     // Re-queries just the open thread's replies after the write: `refresh()`
     // already re-pulls `state.messages` (which carries every sequence, replies
-    // included) via `submitThenRefresh`, but the thread panel reads its own
+    // included) via `submitTracked`, but the thread panel reads its own
     // `ChatThread` snapshot, so that one extra cheap query keeps the panel in
     // sync without repeating the old heavy-refresh-twice pattern.
     replyInThread: (body) => {
       const channelId = getState().activeChannel;
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
-      submitThenRefresh((live) =>
-        chatClient.postMessage(live, {
-          channelId,
-          messageId: crypto.randomUUID(),
-          blocks: parseMessageInput(body),
-          origin: getState().author,
-          thread: root.seq,
-        }),
+      const messageId = crypto.randomUUID();
+      const blocks = parseMessageInput(body);
+      const author = getState().author;
+      submitTracked(
+        opKey.message(channelId, messageId),
+        (live) =>
+          chatClient.postMessage(live, {
+            channelId,
+            messageId,
+            blocks,
+            origin: author,
+            thread: root.seq,
+          }),
+        (prev) =>
+          optimistic.postedMessage(prev, {
+            channelId,
+            messageId,
+            blocks,
+            author,
+            at: Date.now(),
+            thread: root.seq,
+          }),
       ).then(() => {
         const live = getNode();
         if (!live) return;
@@ -575,22 +630,29 @@ export function createActions({
         (activeThread?.root.seq === seq
           ? activeThread.root
           : activeThread?.replies.find((m) => m.seq === seq));
-      submitThenRefresh((live) =>
-        chatClient.editMessage(live, {
-          channelId,
-          seq,
-          blocks: parseMessageInput(body),
-          baseRev: target?.head.rev ?? null,
-          origin: getState().author,
-        }),
+      const blocks = parseMessageInput(body);
+      submitTracked(
+        opKey.messageSeq(channelId, seq),
+        (live) =>
+          chatClient.editMessage(live, {
+            channelId,
+            seq,
+            blocks,
+            baseRev: target?.head.rev ?? null,
+            origin: getState().author,
+          }),
+        (prev) => optimistic.editedMessage(prev, channelId, seq, blocks, Date.now()),
       ).then(resyncOpenThread);
     },
 
     deleteMessage: (seq) => {
       const channelId = getState().activeChannel;
       if (!channelId) return;
-      submitThenRefresh((live) =>
-        chatClient.deleteMessage(live, { channelId, seq, origin: getState().author }),
+      submitTracked(
+        opKey.messageSeq(channelId, seq),
+        (live) =>
+          chatClient.deleteMessage(live, { channelId, seq, origin: getState().author }),
+        (prev) => optimistic.deletedMessage(prev, channelId, seq),
       ).then(resyncOpenThread);
     },
 
@@ -615,10 +677,14 @@ export function createActions({
             author.User.length === selfBytes.length &&
             author.User.every((byte, i) => byte === selfBytes[i]),
         );
-      submitThenRefresh((live) =>
-        mine
-          ? chatClient.removeReaction(live, { channelId, seq, emoji, origin })
-          : chatClient.addReaction(live, { channelId, seq, emoji, origin }),
+      submitTracked(
+        opKey.messageSeq(channelId, seq),
+        (live) =>
+          mine
+            ? chatClient.removeReaction(live, { channelId, seq, emoji, origin })
+            : chatClient.addReaction(live, { channelId, seq, emoji, origin }),
+        (prev) =>
+          optimistic.reactionToggled(prev, channelId, seq, emoji, selfBytes, Boolean(mine)),
       ).then(() => {
         const live = getNode();
         const root = getState().activeThread?.root;
@@ -635,29 +701,30 @@ export function createActions({
     },
 
     addTask: (title) => {
-      if (!title.trim()) return;
-      submitThenRefresh((live) =>
-        tasksClient.createTask(live, {
-          taskId: crypto.randomUUID(),
-          title: title.trim(),
-        }),
+      const clean = title.trim();
+      if (!clean) return;
+      const taskId = crypto.randomUUID();
+      submitTracked(
+        opKey.task(taskId),
+        (live) => tasksClient.createTask(live, { taskId, title: clean }),
+        (prev) => optimistic.taskAdded(prev, { taskId, title: clean, at: Date.now() }),
       );
     },
 
     advanceTask: (taskId) => {
       const task = getState().tasks.find((t) => t.id === taskId);
       if (!task || task.status === "Done") return;
-      submitThenRefresh((live) =>
-        tasksClient.updateStatus(live, {
-          taskId,
-          status: nextTaskStatus(task.status),
-        }),
+      const status = nextTaskStatus(task.status);
+      submitTracked(
+        opKey.task(taskId),
+        (live) => tasksClient.updateStatus(live, { taskId, status }),
+        (prev) => optimistic.taskAdvanced(prev, taskId, status),
       );
     },
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
-      submitThenRefresh((live) =>
+      submitTracked(opKey.forgeHead(), (live) =>
         forgeClient.commit(live, {
           path: params.path.trim(),
           content: params.content,
@@ -685,44 +752,51 @@ export function createActions({
       // CreateDoc is idempotent and REQUIRED before any block op; the refresh
       // re-enumerates the index so the new path shows in the tree, then open
       // it (loads blocks), mirroring createChannel.
-      submitThenRefresh((live) => documentClient.createDoc(live, { docId })).then(
-        () => enterDoc(docId),
-      );
+      submitTracked(
+        opKey.doc(docId),
+        (live) => documentClient.createDoc(live, { docId }),
+        (prev) => optimistic.docCreated(prev, docId),
+      ).then(() => enterDoc(docId));
     },
 
     insertBlock: ({ after, kind, text }) => {
       const docId = getState().activeDoc;
       if (!docId) return;
-      submitThenRefresh((live) =>
-        documentClient.insertBlock(live, {
-          docId,
-          after,
-          block: { id: crypto.randomUUID(), kind, text },
-        }),
+      const block = { id: crypto.randomUUID(), kind, text };
+      submitTracked(
+        opKey.docBlock(docId, block.id),
+        (live) => documentClient.insertBlock(live, { docId, after, block }),
+        (prev) => optimistic.docBlockInserted(prev, { after, block }),
       );
     },
 
     updateBlock: ({ blockId, text }) => {
       const docId = getState().activeDoc;
       if (!docId) return;
-      submitThenRefresh((live) =>
-        documentClient.updateBlock(live, { docId, blockId, text }),
+      submitTracked(
+        opKey.docBlock(docId, blockId),
+        (live) => documentClient.updateBlock(live, { docId, blockId, text }),
+        (prev) => optimistic.docBlockUpdated(prev, blockId, text),
       );
     },
 
     removeBlock: (blockId) => {
       const docId = getState().activeDoc;
       if (!docId) return;
-      submitThenRefresh((live) =>
-        documentClient.removeBlock(live, { docId, blockId }),
+      submitTracked(
+        opKey.docBlock(docId, blockId),
+        (live) => documentClient.removeBlock(live, { docId, blockId }),
+        (prev) => optimistic.docBlockRemoved(prev, blockId),
       );
     },
 
     moveBlock: ({ blockId, after }) => {
       const docId = getState().activeDoc;
       if (!docId) return;
-      submitThenRefresh((live) =>
-        documentClient.moveBlock(live, { docId, blockId, after }),
+      submitTracked(
+        opKey.docBlock(docId, blockId),
+        (live) => documentClient.moveBlock(live, { docId, blockId, after }),
+        (prev) => optimistic.docBlockMoved(prev, { blockId, after }),
       );
     },
 
@@ -744,47 +818,70 @@ export function createActions({
       // the page root's block id — minted here like task/job ids; the refresh
       // re-enumerates ListPages so the rail shows it, then open it.
       const pageId = crypto.randomUUID();
-      submitThenRefresh((live) =>
-        pagesClient.createPage(live, { pageId, title: clean }),
+      submitTracked(
+        opKey.page(pageId),
+        (live) => pagesClient.createPage(live, { pageId, title: clean }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: clean }),
       ).then(() => enterPage(pageId));
     },
 
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
-      if (!getState().activePage) return;
-      submitThenRefresh((live) =>
-        pagesClient.insertBlock(live, {
-          parent,
-          after,
-          block: { id: blockId, kind, text },
-        }),
+      const page = getState().activePage;
+      if (!page) return;
+      submitTracked(
+        opKey.pageBlock(blockId),
+        (live) =>
+          pagesClient.insertBlock(live, {
+            parent,
+            after,
+            block: { id: blockId, kind, text },
+          }),
+        (prev) =>
+          optimistic.pageBlockInserted(prev, {
+            parent,
+            after,
+            block: { id: blockId, parent, page, kind, text, checked: false, children: [] },
+          }),
       );
     },
 
     updatePageBlockText: ({ blockId, text }) => {
-      submitThenRefresh((live) =>
-        pagesClient.updateText(live, { blockId, text }),
+      submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => pagesClient.updateText(live, { blockId, text }),
+        (prev) => optimistic.pageBlockPatched(prev, blockId, { text }),
       );
     },
 
     setPageBlockKind: ({ blockId, kind }) => {
-      submitThenRefresh((live) => pagesClient.setKind(live, { blockId, kind }));
+      submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => pagesClient.setKind(live, { blockId, kind }),
+        (prev) => optimistic.pageBlockPatched(prev, blockId, { kind }),
+      );
     },
 
     setPageBlockChecked: ({ blockId, checked }) => {
-      submitThenRefresh((live) =>
-        pagesClient.setChecked(live, { blockId, checked }),
+      submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => pagesClient.setChecked(live, { blockId, checked }),
+        (prev) => optimistic.pageBlockPatched(prev, blockId, { checked }),
       );
     },
 
     movePageBlock: ({ blockId, parent, after }) => {
-      submitThenRefresh((live) =>
+      submitTracked(opKey.pageBlock(blockId), (live) =>
         pagesClient.moveBlock(live, { blockId, parent, after }),
       );
     },
 
     removePageBlock: (blockId) => {
       if (!blockId) return;
-      submitThenRefresh((live) => pagesClient.removeBlock(live, blockId));
+      submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => pagesClient.removeBlock(live, blockId),
+        (prev) => optimistic.pageBlockRemoved(prev, blockId),
+      );
     },
 
     // ── Agents ──
@@ -793,7 +890,7 @@ export function createActions({
       const name = displayName.trim();
       const model = modelRef.trim();
       if (!id || !name || !model) return;
-      submitThenRefresh((live) =>
+      submitTracked(opKey.agent(id), (live) =>
         // stage the prompt in the node's blob store, then register with its
         // digest as prompt_hash — the blob is keyed by sha256(bytes), which
         // IS the hash the oracle worker fetches the prompt by.
@@ -814,42 +911,52 @@ export function createActions({
 
     pauseAgent: (agentId) => {
       if (!agentId) return;
-      submitThenRefresh((live) =>
-        agentClient.pauseAgent(live, { agentId, origin: getState().author }),
+      submitTracked(
+        opKey.agent(agentId),
+        (live) => agentClient.pauseAgent(live, { agentId, origin: getState().author }),
+        (prev) => optimistic.agentPatched(prev, agentId, { status: "Paused" }),
       );
     },
 
     resumeAgent: (agentId) => {
       if (!agentId) return;
-      submitThenRefresh((live) =>
-        agentClient.resumeAgent(live, { agentId, origin: getState().author }),
+      submitTracked(
+        opKey.agent(agentId),
+        (live) => agentClient.resumeAgent(live, { agentId, origin: getState().author }),
+        (prev) => optimistic.agentPatched(prev, agentId, { status: "Active" }),
       );
     },
 
     watchChannel: ({ channelId, policy }) => {
       if (!channelId) return;
-      submitThenRefresh((live) =>
-        agentClient.watchChannel(live, {
-          channelId,
-          policy,
-          origin: getState().author,
-        }),
+      submitTracked(
+        opKey.watch(channelId),
+        (live) =>
+          agentClient.watchChannel(live, {
+            channelId,
+            policy,
+            origin: getState().author,
+          }),
+        (prev) => optimistic.watchSet(prev, { channelId, policy }),
       );
     },
 
     unwatchChannel: (channelId) => {
       if (!channelId) return;
-      submitThenRefresh((live) =>
-        agentClient.unwatchChannel(live, {
-          channelId,
-          origin: getState().author,
-        }),
+      submitTracked(
+        opKey.watch(channelId),
+        (live) =>
+          agentClient.unwatchChannel(live, {
+            channelId,
+            origin: getState().author,
+          }),
+        (prev) => optimistic.watchRemoved(prev, channelId),
       );
     },
 
     requestRun: ({ agentId, channelId, anchorSeq }) => {
       if (!agentId || !channelId) return;
-      submitThenRefresh((live) =>
+      submitTracked(opKey.runRequest(agentId), (live) =>
         agentClient.requestRun(live, {
           agentId,
           channelId,
@@ -861,15 +968,19 @@ export function createActions({
 
     cancelRun: (runId) => {
       if (!runId) return;
-      submitThenRefresh((live) =>
-        agentClient.cancelRun(live, { runId, origin: getState().author }),
+      submitTracked(
+        opKey.run(runId),
+        (live) => agentClient.cancelRun(live, { runId, origin: getState().author }),
+        (prev) => optimistic.runCancelled(prev, runId),
       );
     },
 
     updateAgent: ({ agentId, displayName, modelRef, prompt, allowedActions }) => {
       const id = agentId.trim();
       if (!id) return;
-      submitThenRefresh((live) =>
+      submitTracked(
+        opKey.agent(id),
+        (live) =>
         Promise.resolve()
           // a provided prompt is re-staged in the blob store; its digest becomes
           // the new prompt_hash. An absent prompt leaves the hash untouched.
@@ -890,11 +1001,16 @@ export function createActions({
               origin: getState().author,
             }),
           ),
+        (prev) =>
+          optimistic.agentPatched(prev, id, {
+            ...(displayName?.trim() ? { display_name: displayName.trim() } : {}),
+            ...(modelRef?.trim() ? { model_ref: modelRef.trim() } : {}),
+          }),
       );
     },
 
     enableJobWorker: (enabled) => {
-      submitThenRefresh((live) =>
+      submitTracked(opKey.jobWorker(), (live) =>
         agentClient.enableJobWorker(live, { enabled, origin: getState().author }),
       );
     },
@@ -906,9 +1022,10 @@ export function createActions({
     proposeSignal: (text) => {
       const body = text.trim();
       if (!body) return;
-      submitThenRefresh((live) =>
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
         governanceClient.propose(live, {
-          proposalId: crypto.randomUUID(),
+          proposalId,
           action: { Signal: { text: body } },
         }),
       );
@@ -916,14 +1033,14 @@ export function createActions({
 
     voteProposal: (proposalId, approve) => {
       if (!proposalId) return;
-      submitThenRefresh((live) =>
+      submitTracked(opKey.proposal(proposalId), (live) =>
         governanceClient.vote(live, { proposalId, approve }),
       );
     },
 
     executeProposal: (proposalId) => {
       if (!proposalId) return;
-      submitThenRefresh((live) =>
+      submitTracked(opKey.proposal(proposalId), (live) =>
         governanceClient.execute(live, { proposalId }),
       );
     },
@@ -935,14 +1052,18 @@ export function createActions({
       const items = getState().inbox;
       if (items.length === 0) return;
       const upToSeq = items[items.length - 1].seq;
-      submitThenRefresh((live) =>
-        inboxClient.markRead(live, { member: getState().author, upToSeq }),
+      submitTracked(
+        opKey.inbox(),
+        (live) => inboxClient.markRead(live, { member: getState().author, upToSeq }),
+        (prev) => optimistic.inboxReadTo(prev, upToSeq),
       );
     },
 
     markInboxReadTo: (seq) => {
-      submitThenRefresh((live) =>
-        inboxClient.markRead(live, { member: getState().author, upToSeq: seq }),
+      submitTracked(
+        opKey.inbox(),
+        (live) => inboxClient.markRead(live, { member: getState().author, upToSeq: seq }),
+        (prev) => optimistic.inboxReadTo(prev, seq),
       );
     },
 
@@ -950,14 +1071,16 @@ export function createActions({
       const items = getState().inbox;
       if (items.length === 0) return;
       const upToSeq = items[items.length - 1].seq;
-      submitThenRefresh((live) =>
-        inboxClient.clear(live, { member: getState().author, upToSeq }),
+      submitTracked(
+        opKey.inbox(),
+        (live) => inboxClient.clear(live, { member: getState().author, upToSeq }),
+        (prev) => optimistic.inboxCleared(prev, upToSeq),
       );
     },
 
     deliverNotification: ({ member, kind, body }) => {
       if (!member.trim() || !kind.trim()) return;
-      submitThenRefresh((live) =>
+      submitTracked(opKey.inbox(), (live) =>
         inboxClient.deliver(live, { member: member.trim(), kind: kind.trim(), body }),
       );
     },
@@ -967,61 +1090,123 @@ export function createActions({
     // claimant) all ride the daemon's default identity — origin is omitted — so
     // submitter and claimant stay consistent for this node's own jobs.
     submitJob: ({ kind, spec }) => {
-      if (!kind.trim()) return;
-      submitThenRefresh((live) =>
-        jobsClient.submitJob(live, { jobId: crypto.randomUUID(), kind: kind.trim(), spec }),
+      const cleanKind = kind.trim();
+      if (!cleanKind) return;
+      const jobId = crypto.randomUUID();
+      submitTracked(
+        opKey.job(jobId),
+        (live) => jobsClient.submitJob(live, { jobId, kind: cleanKind, spec }),
+        (prev) =>
+          optimistic.jobAdded(prev, {
+            job_id: jobId,
+            kind: cleanKind,
+            spec,
+            // the module stamps the REAL submitter from the block origin; the
+            // refresh replaces these placeholders with committed truth.
+            submitter: prev.author,
+            status: "Pending",
+            attempt: 0,
+            claim: null,
+            result: null,
+            created_at_height: prev.status?.height ?? 0,
+            updated_at_height: prev.status?.height ?? 0,
+          }),
       );
     },
 
     claimJob: ({ jobId, leaseViews }) => {
       if (!jobId) return;
-      submitThenRefresh((live) => jobsClient.claimJob(live, { jobId, leaseViews }));
+      submitTracked(
+        opKey.job(jobId),
+        (live) => jobsClient.claimJob(live, { jobId, leaseViews }),
+        (prev) => optimistic.jobPatched(prev, jobId, { status: "Processing" }),
+      );
     },
 
     finalizeJob: ({ jobId, ok, payload }) => {
       if (!jobId) return;
-      submitThenRefresh((live) => jobsClient.finalizeJob(live, { jobId, ok, payload }));
+      submitTracked(
+        opKey.job(jobId),
+        (live) => jobsClient.finalizeJob(live, { jobId, ok, payload }),
+        (prev) =>
+          optimistic.jobPatched(prev, jobId, {
+            status: ok ? "Done" : "Failed",
+            result: { ok, payload },
+          }),
+      );
     },
 
     releaseJob: (jobId) => {
       if (!jobId) return;
-      submitThenRefresh((live) => jobsClient.releaseJob(live, { jobId }));
+      submitTracked(
+        opKey.job(jobId),
+        (live) => jobsClient.releaseJob(live, { jobId }),
+        (prev) => optimistic.jobPatched(prev, jobId, { status: "Pending", claim: null }),
+      );
     },
 
     reclaimJob: (jobId) => {
       if (!jobId) return;
-      submitThenRefresh((live) => jobsClient.reclaimJob(live, { jobId }));
+      submitTracked(
+        opKey.job(jobId),
+        (live) => jobsClient.reclaimJob(live, { jobId }),
+        (prev) => optimistic.jobPatched(prev, jobId, { status: "Pending", claim: null }),
+      );
     },
 
     cancelJob: (jobId) => {
       if (!jobId) return;
-      submitThenRefresh((live) => jobsClient.cancelJob(live, { jobId }));
+      submitTracked(
+        opKey.job(jobId),
+        (live) => jobsClient.cancelJob(live, { jobId }),
+        (prev) => optimistic.jobPatched(prev, jobId, { status: "Cancelled" }),
+      );
     },
 
     pruneJob: (jobId) => {
       if (!jobId) return;
-      submitThenRefresh((live) => jobsClient.pruneJob(live, { jobId }));
+      submitTracked(
+        opKey.job(jobId),
+        (live) => jobsClient.pruneJob(live, { jobId }),
+        (prev) => optimistic.jobRemoved(prev, jobId),
+      );
     },
 
     // ── Automations ──
     createRule: ({ ruleId, trigger, action }) => {
       const id = ruleId.trim();
       if (!id) return;
-      submitThenRefresh((live) =>
-        automationsClient.createRule(live, { ruleId: id, trigger, action }),
+      submitTracked(
+        opKey.rule(id),
+        (live) => automationsClient.createRule(live, { ruleId: id, trigger, action }),
+        (prev) =>
+          optimistic.ruleAdded(prev, {
+            rule_id: id,
+            enabled: true,
+            trigger,
+            action,
+            created_at: Date.now(),
+            fire_count: 0,
+          }),
       );
     },
 
     setRuleEnabled: (ruleId, enabled) => {
       if (!ruleId) return;
-      submitThenRefresh((live) =>
-        automationsClient.setEnabled(live, { ruleId, enabled }),
+      submitTracked(
+        opKey.rule(ruleId),
+        (live) => automationsClient.setEnabled(live, { ruleId, enabled }),
+        (prev) => optimistic.rulePatched(prev, ruleId, { enabled }),
       );
     },
 
     deleteRule: (ruleId) => {
       if (!ruleId) return;
-      submitThenRefresh((live) => automationsClient.deleteRule(live, ruleId));
+      submitTracked(
+        opKey.rule(ruleId),
+        (live) => automationsClient.deleteRule(live, ruleId),
+        (prev) => optimistic.ruleRemoved(prev, ruleId),
+      );
     },
 
     // ── Memory ──
@@ -1059,8 +1244,11 @@ export function createActions({
     publishMemory: ({ path, text, meta }) => {
       const p = path.trim();
       if (!p) return;
-      submitThenRefresh((live) =>
-        memoryClient.publish(live, { path: p, body: memoryClient.inlineBody(text), meta }),
+      submitTracked(
+        opKey.memory(p),
+        (live) =>
+          memoryClient.publish(live, { path: p, body: memoryClient.inlineBody(text), meta }),
+        (prev) => optimistic.memoryPublished(prev, { path: p, bodyLen: text.length, meta }),
       ).then(() => {
         const live = getNode();
         if (!live) return;
@@ -1080,7 +1268,11 @@ export function createActions({
 
     deleteMemory: (path) => {
       if (!path) return;
-      submitThenRefresh((live) => memoryClient.remove(live, path)).then(() => {
+      submitTracked(
+        opKey.memory(path),
+        (live) => memoryClient.remove(live, path),
+        (prev) => optimistic.memoryRemoved(prev, path),
+      ).then(() => {
         if (getState().memoryOpen?.stat.path === path) patch({ memoryOpen: null });
       });
     },
@@ -1100,9 +1292,10 @@ export function createActions({
     uploadFile: ({ name, mime, bytes }) => {
       const cleanName = name.trim();
       if (!cleanName) return;
-      submitThenRefresh((live) =>
+      const fileId = crypto.randomUUID();
+      submitTracked(opKey.file(fileId), (live) =>
         filesClient.uploadFile(live, {
-          fileId: crypto.randomUUID(),
+          fileId,
           name: cleanName,
           mime: mime || "application/octet-stream",
           bytes,
@@ -1112,7 +1305,11 @@ export function createActions({
 
     removeFile: (fileId) => {
       if (!fileId) return;
-      submitThenRefresh((live) => filesClient.removeManifest(live, fileId));
+      submitTracked(
+        opKey.file(fileId),
+        (live) => filesClient.removeManifest(live, fileId),
+        (prev) => optimistic.fileRemoved(prev, fileId),
+      );
     },
 
     downloadFile: (fileId) => {
@@ -1220,6 +1417,7 @@ export function createActions({
         memoryOpen: null,
         memoryMatches: null,
         files: [],
+        ops: {},
         onboardingPhase: null,
       });
       connectActive(target).catch(fail);
@@ -1265,6 +1463,7 @@ export function createActions({
         memoryOpen: null,
         memoryMatches: null,
         files: [],
+        ops: {},
         onboardingPhase: null,
         onboardingBusy: false,
         inviteBlob: null,
@@ -1354,6 +1553,7 @@ export function createActions({
             agents: [],
             watches: [],
             runs: [],
+            ops: {},
             onboardingPhase: null,
             inviteBlob: null,
           });
