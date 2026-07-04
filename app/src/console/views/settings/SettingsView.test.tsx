@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
@@ -27,8 +27,8 @@ const renderSettings = (patch: Partial<ConsoleState> = {}) => {
     connected: true,
     ...patch,
   };
-  const spies: Record<string, (...args: unknown[]) => void> = {};
-  const noop = vi.fn() as (...args: unknown[]) => void;
+  const spies: Record<string, Mock<(...args: unknown[]) => void>> = {};
+  const noop: Mock<(...args: unknown[]) => void> = vi.fn();
 
   function Harness() {
     const [state, setState] = useState(initialState);
@@ -36,16 +36,16 @@ const renderSettings = (patch: Partial<ConsoleState> = {}) => {
       {},
       {
         get: (_target, key: string) => {
-          spies[key] ??= vi.fn() as (...args: unknown[]) => void;
+          spies[key] ??= vi.fn();
           if (key === "setAuthor") {
             return (author: string) => {
-              spies[key](author);
+              spies[key]?.(author);
               setState((prev) => ({ ...prev, author }));
             };
           }
           if (key === "setAccent") {
             return (accent: string) => {
-              spies[key](accent);
+              spies[key]?.(accent);
               setState((prev) => ({ ...prev, accent }));
             };
           }
@@ -97,8 +97,37 @@ describe("SettingsView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /workspaces/i }));
     expect(spies.newWorkspace).toHaveBeenCalled();
+  });
+
+  it("leaves the network on a confirmed danger-zone click", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { spies } = renderSettings();
+
+    // The copy is honest: an on-chain self-removal, pending remaining members.
+    expect(screen.getByText(/on-chain self-removal/i)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/full workspace deletion is not wired/i),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /leave network/i }));
-    expect(spies.stopNode).toHaveBeenCalled();
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(spies.leaveWorkspace).toHaveBeenCalled();
+    // The old dishonest wiring is gone — stopNode is no longer the leave path.
+    expect(spies.stopNode?.mock.calls ?? []).toHaveLength(0);
+
+    confirm.mockRestore();
+  });
+
+  it("aborts the leave when the confirm is dismissed", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const { spies } = renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: /leave network/i }));
+    expect(confirm).toHaveBeenCalledOnce();
+    // Dismissed confirm -> leaveWorkspace is never referenced, so the proxy
+    // never even created a spy for it.
+    expect(spies.leaveWorkspace?.mock.calls ?? []).toHaveLength(0);
+
+    confirm.mockRestore();
   });
 });

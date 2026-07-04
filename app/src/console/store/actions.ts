@@ -137,6 +137,10 @@ export interface ConsoleActions {
   /** Open a removal proposal for a validator by pubkey and cast this node's
    *  yes-ballot; the removal takes effect only once a strict majority approve. */
   demoteMember(pubkey: string): void;
+  /** Leave the active network: drive this node's on-chain self-removal (pending
+   *  remaining-member approval), stop its node, and forget the workspace
+   *  locally — then switch to another workspace or open the onboarding gate. */
+  leaveWorkspace(): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -778,6 +782,57 @@ export function createActions({
         .then(() => ws.demoteMember(target.id, pubkey.trim()))
         .then(() => refresh())
         .catch(fail);
+    },
+
+    leaveWorkspace: () => {
+      const target = getState().workspace;
+      if (!target) return;
+      patch({ onboardingBusy: true, error: null });
+      // Drop the live node + its projections up front so no stale state lingers
+      // while the teardown runs (mirrors selectWorkspace's reset).
+      setNode(null);
+      patch({
+        connected: false,
+        status: null,
+        channels: [],
+        messages: [],
+        activeChannel: null,
+        activeThread: null,
+        authorNames: {},
+        tasks: [],
+        docIds: [],
+        activeDoc: null,
+        activeDocBlocks: [],
+        agents: [],
+        watches: [],
+        runs: [],
+        onboardingPhase: null,
+        inviteBlob: null,
+      });
+      Promise.resolve()
+        .then(() => ws.leaveWorkspace(target.id))
+        .then((next) => {
+          // Forget the left workspace in the switcher list.
+          update((prev) => ({
+            workspaces: prev.workspaces.filter((w) => w.id !== target.id),
+          }));
+          if (next) {
+            // The registry repointed to another workspace — connect to it.
+            return connectActive(next);
+          }
+          // None remain — fall back to the onboarding gate.
+          patch({
+            workspace: null,
+            needsOnboarding: true,
+            onboardingBusy: false,
+            managed: false,
+            nodeUrl: null,
+          });
+        })
+        .catch((err) => {
+          patch({ onboardingBusy: false });
+          fail(err);
+        });
     },
 
     newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null }),

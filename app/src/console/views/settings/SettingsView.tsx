@@ -588,6 +588,21 @@ function PreferencesSection() {
 function DangerZone() {
   const { state, actions } = useDucktape();
   const disabled = !state.workspace || !state.managed;
+
+  const requestLeave = (): void => {
+    const name = state.workspace?.name ?? "this network";
+    const ok = window.confirm(
+      `Leave "${name}"?\n\n` +
+        `This submits an ON-CHAIN self-removal of this node and casts its ` +
+        `yes-ballot. In a set of two or more members the removal stays PENDING ` +
+        `until a strict majority (n / 2 + 1) of the remaining members approve. ` +
+        `The node is then stopped and the workspace is forgotten locally — its ` +
+        `directory and registry entry are deleted.`,
+    );
+    if (!ok) return;
+    actions.leaveWorkspace();
+  };
+
   return (
     <>
       <SectionLabel danger>DANGER ZONE</SectionLabel>
@@ -605,7 +620,7 @@ function DangerZone() {
       >
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ font: `600 12.5px ${font.sans}`, color: color.inkSoft }}>
-            Leave & reset this node
+            Leave this network
           </div>
           <div
             style={{
@@ -615,12 +630,14 @@ function DangerZone() {
               lineHeight: 1.4,
             }}
           >
-            Stops the local node. Full workspace deletion is not wired in this build.
+            Submits an on-chain self-removal (pending a strict majority of the
+            remaining members), stops this node, and forgets the workspace
+            locally.
           </div>
         </div>
         <HoverButton
           ariaLabel="Leave network"
-          onClick={actions.stopNode}
+          onClick={requestLeave}
           hoverBg="#8f463d"
           disabled={disabled}
           style={{

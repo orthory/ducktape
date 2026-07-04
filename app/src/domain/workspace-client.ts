@@ -103,6 +103,14 @@ export const admitMember = (id: string, pubkey: string): Promise<void> =>
 export const demoteMember = (id: string, pubkey: string): Promise<void> =>
   invoke<void>("workspace_demote", { id, pubkey });
 
+/** Leave a network: drive this node's on-chain SELF-removal through the running
+ *  member node (a RemoveValidator proposal for our OWN key, pending a strict
+ *  majority of the remaining members), stop the node, and forget the workspace
+ *  locally (delete its directory + registry entry). Resolves to the newly-active
+ *  workspace the registry repointed to, or null when none remain. */
+export const leaveWorkspace = (id: string): Promise<Workspace | null> =>
+  invoke<Workspace | null>("workspace_leave", { id });
+
 /** Make a workspace active and ensure its node is running; returns the http
  *  url to dial. Idempotent — adopts an already-listening node. */
 export const selectWorkspace = (id: string): Promise<WorkspaceSelection> =>
