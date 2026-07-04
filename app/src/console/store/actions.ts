@@ -2,12 +2,20 @@ import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
 import type { TurnPolicy } from "../../domain/agent-client";
+import * as automationsClient from "../../domain/automations-client";
+import type { Action as RuleAction, Trigger } from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
 import type { BlockKind } from "../../domain/document-client";
+import * as filesClient from "../../domain/files-client";
+import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
+import * as inboxClient from "../../domain/inbox-client";
+import * as jobsClient from "../../domain/jobs-client";
+import * as memoryClient from "../../domain/memory-client";
+import type { Meta } from "../../domain/memory-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
 import {
@@ -107,6 +115,19 @@ export interface ConsoleActions {
   requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
+  /** Owner-gated edit of a registered agent. A provided `prompt` is staged in
+   *  the blob store and its digest committed as the new prompt_hash; every
+   *  omitted field keeps its current value. */
+  updateAgent(params: {
+    agentId: string;
+    displayName?: string;
+    modelRef?: string;
+    prompt?: string;
+    allowedActions?: string[];
+  }): void;
+  /** Opt the agent MODULE into (or out of) jobs-board work notifications, so it
+   *  can process job-backed runs. */
+  enableJobWorker(enabled: boolean): void;
 
   // ── Governance (proposals + votes over the `governance` module) ──
   /** Open a binding Signal proposal (no on-chain effect beyond its outcome).
@@ -116,6 +137,70 @@ export interface ConsoleActions {
   voteProposal(proposalId: string, approve: boolean): void;
   /** Tally and settle a decidable proposal (anyone may trigger it). */
   executeProposal(proposalId: string): void;
+
+  // ── Inbox (per-member notification queue over the `inbox` module) ──
+  /** Mark every notification in the local member's queue read (idempotent). */
+  markInboxRead(): void;
+  /** Mark every item up to and including `seq` read. */
+  markInboxReadTo(seq: number): void;
+  /** Delete every notification in the local member's queue (up to the latest). */
+  clearInbox(): void;
+  /** Enqueue a notification (module follow-ups are the primary writers, but the
+   *  console can self-deliver or notify another member). */
+  deliverNotification(params: { member: string; kind: string; body: string }): void;
+
+  // ── Jobs (consensus work board over the `jobs` module) ──
+  /** Post a new job (id generated here). */
+  submitJob(params: { kind: string; spec: string }): void;
+  /** Claim a Pending job under a view-count lease. */
+  claimJob(params: { jobId: string; leaseViews: number }): void;
+  /** Report a result on a job this node is processing. */
+  finalizeJob(params: { jobId: string; ok: boolean; payload: string }): void;
+  /** Hand a Processing job back to Pending. */
+  releaseJob(jobId: string): void;
+  /** Permissionless requeue of a Processing job whose lease expired. */
+  reclaimJob(jobId: string): void;
+  /** Cancel a still-Pending job (submitter only). */
+  cancelJob(jobId: string): void;
+  /** Remove a terminal job's record entirely (submitter only). */
+  pruneJob(jobId: string): void;
+
+  // ── Automations (event-triggered rules over the `automations` module) ──
+  /** Create a rule pairing a trigger with an action. */
+  createRule(params: { ruleId: string; trigger: Trigger; action: RuleAction }): void;
+  /** Enable or disable a rule without deleting it. */
+  setRuleEnabled(ruleId: string, enabled: boolean): void;
+  /** Delete a rule. */
+  deleteRule(ruleId: string): void;
+
+  // ── Memory (agent filesystem over the `memory` module) ──
+  /** Browse a directory: list its entries and make it the active path. */
+  browseMemory(path: string): void;
+  /** Open a file into the viewer, loading its latest (or a specific) generation. */
+  openMemoryFile(params: { path: string; generation?: number | null }): void;
+  /** Close the open file. */
+  closeMemoryFile(): void;
+  /** Write-once publish of an inline document at `path`, then refresh the tree. */
+  publishMemory(params: { path: string; text: string; meta?: Meta }): void;
+  /** Delete a memory file (all live generations). */
+  deleteMemory(path: string): void;
+  /** Run a case-sensitive substring search under `prefix`; results land in
+   *  `state.memoryMatches`. */
+  searchMemory(params: { prefix: string; pattern: string }): void;
+  /** Clear the active search. */
+  clearMemorySearch(): void;
+
+  // ── Files (content-addressed manifests over the `files` module) ──
+  /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
+  uploadFile(params: { name: string; mime: string; bytes: Uint8Array<ArrayBuffer> }): void;
+  /** Remove a manifest (owner-gated; rides the daemon identity that added it). */
+  removeFile(fileId: string): void;
+  /** Reassemble a file's bytes, verifying every chunk against the manifest.
+   *  Returns the manifest + bytes for the view to hand to a browser download,
+   *  or null when the file/node is unavailable. */
+  downloadFile(
+    fileId: string,
+  ): Promise<{ manifest: Manifest; bytes: Uint8Array<ArrayBuffer> } | null>;
 
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
@@ -656,6 +741,39 @@ export function createActions({
       );
     },
 
+    updateAgent: ({ agentId, displayName, modelRef, prompt, allowedActions }) => {
+      const id = agentId.trim();
+      if (!id) return;
+      submitThenRefresh((live) =>
+        Promise.resolve()
+          // a provided prompt is re-staged in the blob store; its digest becomes
+          // the new prompt_hash. An absent prompt leaves the hash untouched.
+          .then(() =>
+            prompt !== undefined && prompt.length > 0
+              ? live
+                  .putBlob(new TextEncoder().encode(prompt))
+                  .then((digest) => agentClient.hexToBytes(digest))
+              : null,
+          )
+          .then((promptHash) =>
+            agentClient.updateAgent(live, {
+              agentId: id,
+              displayName: displayName?.trim() || null,
+              modelRef: modelRef?.trim() || null,
+              promptHash,
+              allowedActions: allowedActions ?? null,
+              origin: getState().author,
+            }),
+          ),
+      );
+    },
+
+    enableJobWorker: (enabled) => {
+      submitThenRefresh((live) =>
+        agentClient.enableJobWorker(live, { enabled, origin: getState().author }),
+      );
+    },
+
     // ── Governance ──
     // Every submit is signed by THIS node's validator key (the daemon ignores the
     // claimed origin), so these carry no origin. `refresh()` re-reads the proposal
@@ -683,6 +801,211 @@ export function createActions({
       submitThenRefresh((live) =>
         governanceClient.execute(live, { proposalId }),
       );
+    },
+
+    // ── Inbox ──
+    // The local member's queue is keyed by the author identity; mark/clear act on
+    // the highest seq currently loaded, so "mark all read" needs no per-item loop.
+    markInboxRead: () => {
+      const items = getState().inbox;
+      if (items.length === 0) return;
+      const upToSeq = items[items.length - 1].seq;
+      submitThenRefresh((live) =>
+        inboxClient.markRead(live, { member: getState().author, upToSeq }),
+      );
+    },
+
+    markInboxReadTo: (seq) => {
+      submitThenRefresh((live) =>
+        inboxClient.markRead(live, { member: getState().author, upToSeq: seq }),
+      );
+    },
+
+    clearInbox: () => {
+      const items = getState().inbox;
+      if (items.length === 0) return;
+      const upToSeq = items[items.length - 1].seq;
+      submitThenRefresh((live) =>
+        inboxClient.clear(live, { member: getState().author, upToSeq }),
+      );
+    },
+
+    deliverNotification: ({ member, kind, body }) => {
+      if (!member.trim() || !kind.trim()) return;
+      submitThenRefresh((live) =>
+        inboxClient.deliver(live, { member: member.trim(), kind: kind.trim(), body }),
+      );
+    },
+
+    // ── Jobs ──
+    // Identity-gated ops (cancel/prune by submitter; finalize/release by
+    // claimant) all ride the daemon's default identity — origin is omitted — so
+    // submitter and claimant stay consistent for this node's own jobs.
+    submitJob: ({ kind, spec }) => {
+      if (!kind.trim()) return;
+      submitThenRefresh((live) =>
+        jobsClient.submitJob(live, { jobId: crypto.randomUUID(), kind: kind.trim(), spec }),
+      );
+    },
+
+    claimJob: ({ jobId, leaseViews }) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.claimJob(live, { jobId, leaseViews }));
+    },
+
+    finalizeJob: ({ jobId, ok, payload }) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.finalizeJob(live, { jobId, ok, payload }));
+    },
+
+    releaseJob: (jobId) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.releaseJob(live, { jobId }));
+    },
+
+    reclaimJob: (jobId) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.reclaimJob(live, { jobId }));
+    },
+
+    cancelJob: (jobId) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.cancelJob(live, { jobId }));
+    },
+
+    pruneJob: (jobId) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.pruneJob(live, { jobId }));
+    },
+
+    // ── Automations ──
+    createRule: ({ ruleId, trigger, action }) => {
+      const id = ruleId.trim();
+      if (!id) return;
+      submitThenRefresh((live) =>
+        automationsClient.createRule(live, { ruleId: id, trigger, action }),
+      );
+    },
+
+    setRuleEnabled: (ruleId, enabled) => {
+      if (!ruleId) return;
+      submitThenRefresh((live) =>
+        automationsClient.setEnabled(live, { ruleId, enabled }),
+      );
+    },
+
+    deleteRule: (ruleId) => {
+      if (!ruleId) return;
+      submitThenRefresh((live) => automationsClient.deleteRule(live, ruleId));
+    },
+
+    // ── Memory ──
+    browseMemory: (path) => {
+      const live = getNode();
+      const dir = path || "/";
+      if (!live) return;
+      // set the active dir immediately (so refresh re-lists it), clear the open
+      // file + any search, then list eagerly for a snappy transition.
+      patch({ memoryPath: dir, memoryOpen: null, memoryMatches: null });
+      Promise.resolve()
+        .then(() => memoryClient.ls(live, { path: dir }))
+        .then((memoryEntries) => patch({ memoryEntries }))
+        .catch(fail);
+    },
+
+    openMemoryFile: ({ path, generation }) => {
+      const live = getNode();
+      if (!live || !path) return;
+      Promise.resolve()
+        .then(() =>
+          Promise.all([
+            memoryClient.stat(live, path),
+            memoryClient.read(live, { path, generation: generation ?? null }),
+          ]),
+        )
+        .then(([stat, gen]) =>
+          patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
+        )
+        .catch(fail);
+    },
+
+    closeMemoryFile: () => patch({ memoryOpen: null }),
+
+    publishMemory: ({ path, text, meta }) => {
+      const p = path.trim();
+      if (!p) return;
+      submitThenRefresh((live) =>
+        memoryClient.publish(live, { path: p, body: memoryClient.inlineBody(text), meta }),
+      ).then(() => {
+        const live = getNode();
+        if (!live) return;
+        // reflect the new generation in the open viewer if it is this file.
+        if (getState().memoryOpen?.stat.path === p) {
+          return Promise.all([
+            memoryClient.stat(live, p),
+            memoryClient.read(live, { path: p, generation: null }),
+          ])
+            .then(([stat, gen]) =>
+              patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
+            )
+            .catch(fail);
+        }
+      });
+    },
+
+    deleteMemory: (path) => {
+      if (!path) return;
+      submitThenRefresh((live) => memoryClient.remove(live, path)).then(() => {
+        if (getState().memoryOpen?.stat.path === path) patch({ memoryOpen: null });
+      });
+    },
+
+    searchMemory: ({ prefix, pattern }) => {
+      const live = getNode();
+      if (!live || !pattern) return;
+      Promise.resolve()
+        .then(() => memoryClient.grep(live, { prefix: prefix || "/", pattern }))
+        .then((memoryMatches) => patch({ memoryMatches }))
+        .catch(fail);
+    },
+
+    clearMemorySearch: () => patch({ memoryMatches: null }),
+
+    // ── Files ──
+    uploadFile: ({ name, mime, bytes }) => {
+      const cleanName = name.trim();
+      if (!cleanName) return;
+      submitThenRefresh((live) =>
+        filesClient.uploadFile(live, {
+          fileId: crypto.randomUUID(),
+          name: cleanName,
+          mime: mime || "application/octet-stream",
+          bytes,
+        }),
+      );
+    },
+
+    removeFile: (fileId) => {
+      if (!fileId) return;
+      submitThenRefresh((live) => filesClient.removeManifest(live, fileId));
+    },
+
+    downloadFile: (fileId) => {
+      const live = getNode();
+      if (!live || !fileId) return Promise.resolve(null);
+      return Promise.resolve()
+        .then(() => filesClient.stat(live, fileId))
+        .then((manifest) =>
+          manifest
+            ? filesClient
+                .downloadFile(live, manifest)
+                .then((bytes) => ({ manifest, bytes }))
+            : null,
+        )
+        .catch((err) => {
+          fail(err);
+          return null;
+        });
     },
 
     stopNode: () => {
@@ -759,6 +1082,16 @@ export function createActions({
         agents: [],
         watches: [],
         runs: [],
+        inbox: [],
+        inboxUnread: 0,
+        jobs: [],
+        jobCounts: null,
+        rules: [],
+        memoryPath: "/",
+        memoryEntries: [],
+        memoryOpen: null,
+        memoryMatches: null,
+        files: [],
         onboardingPhase: null,
       });
       connectActive(target).catch(fail);
