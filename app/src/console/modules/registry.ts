@@ -14,6 +14,7 @@ import { MemoryView } from "../views/memory/MemoryView";
 import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { PagesView } from "../views/pages/PagesView";
+import { SearchView } from "../views/search/SearchView";
 import { StatusView } from "../views/status/StatusView";
 import { TasksView } from "../views/tasks/TasksView";
 import { TelemetryView } from "../views/telemetry/TelemetryView";
@@ -27,6 +28,7 @@ import type { AppModule, NavSection } from "./module-def";
 // independently.
 export const MODULES: AppModule[] = [
   // ── User apps ──
+  { id: "search", nav: { icon: "search", label: "Search", order: -1, section: "user" }, Screen: SearchView },
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
   { id: "inbox", nav: { icon: "inbox", label: "Inbox", order: 1, section: "user" }, Screen: InboxView },
   { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 2, section: "user" }, Screen: TasksView },
