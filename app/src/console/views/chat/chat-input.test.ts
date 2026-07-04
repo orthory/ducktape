@@ -40,6 +40,29 @@ describe("parseMessageInput", () => {
   it("never returns an empty body", () => {
     expect(parseMessageInput("   ")).toEqual([{ Paragraph: [{ text: "", marks: [] }] }]);
   });
+
+  it("leaves spaced asterisks (math / bullets) as plain text", () => {
+    expect(parseMessageInput("2 * 3 * 4")).toEqual([{ Paragraph: [{ text: "2 * 3 * 4", marks: [] }] }]);
+  });
+
+  it("marks bold text that contains internal spaces", () => {
+    expect(parseMessageInput("**bold text** ok")).toEqual([
+      {
+        Paragraph: [
+          { text: "bold text", marks: ["Bold"] },
+          { text: " ok", marks: [] },
+        ],
+      },
+    ]);
+  });
+
+  it("leaves a fence-only message untouched but marks around it", () => {
+    const blocks = parseMessageInput("use *this*:\n```\ncode\n```");
+    expect(blocks).toEqual([
+      { Paragraph: [{ text: "use ", marks: [] }, { text: "this", marks: ["Italic"] }, { text: ":", marks: [] }] },
+      { Code: { lang: null, text: "code" } },
+    ]);
+  });
 });
 
 describe("blocksToInput (edit round-trip)", () => {

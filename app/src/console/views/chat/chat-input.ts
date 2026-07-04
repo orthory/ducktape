@@ -11,7 +11,11 @@ import type { ChatBlock, Span } from "../../../domain/chat-client";
 
 // One pass over a paragraph's text: **bold** | *italic* | bare URL, else plain.
 // Ordered so `**` is tried before `*` (the bold arm consumes the double star).
-const INLINE = /(\*\*(?<b>[^*]+?)\*\*)|(\*(?<i>[^*\n]+?)\*)|(?<url>https?:\/\/[^\s<]+)/g;
+// The marker content must START and END with a non-space char, so "2 * 3 * 4"
+// (spaced asterisks used as math/bullets) is left as plain text rather than
+// being read as *italic*.
+const INLINE =
+  /(\*\*(?<b>[^*\s](?:[^*]*[^*\s])?)\*\*)|(\*(?<i>[^*\s](?:[^*\n]*[^*\s])?)\*)|(?<url>https?:\/\/[^\s<]+)/g;
 
 const parseInline = (text: string): Span[] => {
   const spans: Span[] = [];
