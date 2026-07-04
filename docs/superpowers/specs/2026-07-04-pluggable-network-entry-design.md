@@ -161,10 +161,23 @@ through the sentry pipe.
 
 Protections gained:
 
-- The validator has no public inbound port.
-- Sentries absorb scanning/DoS at the edge.
+- The validator has no public inbound port; the sentry absorbs scanning of the
+  validator's real IP.
 - Multiple sentries per validator give redundancy; sentries rotate without
   touching the validator's key.
+
+Phase-1 limitation — source-IP collapse. A transparent forward splice (or reverse
+tunnel) makes the validator's listener observe **every peer from one source IP**:
+the sentry's. commonware keys its private-IP gate and its per-IP / per-subnet
+handshake rate limits on that observed IP, so under fronting those defenses no
+longer discriminate per real peer — one abusive dialer through the sentry can
+exhaust the shared handshake budget, and a validator restart re-handshakes inbound
+peers through a single bucket. Handshake-layer DoS absorption therefore holds only
+for a **filtering** sentry, not a transparent splicer. Mitigations (later work):
+expose and relax the per-IP/subnet handshake quotas on fronted validators (the
+node currently hardcodes the `local` preset), and/or a PROXY-protocol-aware sentry
+plus commonware PROXY-header parsing to preserve the real source IP (neither
+exists today). See `docs/sentry-deployment.md`.
 
 Expected code delta (to be confirmed by the Phase 1 investigation):
 
@@ -259,7 +272,7 @@ reachability plane.
 | Phase | Deliverable | Consensus change | Deployable |
 |-------|-------------|------------------|------------|
 | P0 | This design of record | none | n/a |
-| P1 | Sentry: reachability hint + fronting guardrails + integration test + recipes | none (target) | now |
+| P1 | Sentry: configuration-only fronting confirmed + integration test + deployment recipes (typed reach hint / guardrails deferred — not needed; see the Phase 1 plan) | none | now |
 | P2 | Coordinator role: rendezvous + STUN reflexive service + coordinator relay | authorization-model addition (addressed, not tracked) | partial |
 | P3 | Private cutover: WGApi wiring + UDP hole-punch + relay fallback | data-plane wiring | staged |
 

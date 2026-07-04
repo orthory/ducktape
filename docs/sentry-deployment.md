@@ -52,6 +52,13 @@ The joiner dials the sentry, the sentry splices to the validator, and the
 encrypted mesh handshake terminates at the validator through the pipe — the
 joiner never learns (and never needs) the validator's private `listen`.
 
+Admission is orthogonal to the sentry and still required: until a member runs
+`invite-accept`, the validator's mesh bouncer rejects the not-yet-admitted key
+(the handshake bytes reach the validator *through* the pipe and are refused
+there, not at the sentry), so the joiner parks as `parked: mesh unreachable` —
+expected, not a sentry fault. Once admitted, the handshake succeeds and
+state-sync/votes flow through the pipe.
+
 Realizations of the splice, cheapest first:
 
 - **`nginx stream`** — `stream { server { listen 443; proxy_pass 10.0.0.7:52200; } }`
@@ -86,12 +93,26 @@ identical ("dial this address, expect this key").
 - **`allow_private_ips` coupling (forward sentry on a private network).** The
   node builds its mesh with the `local` discovery preset, which sets
   `allow_private_ips: true` (`bin/node/src/main.rs`, at the
-  `discovery::Config::local` call ~line 1430; see the inline comment there). A
+  `discovery::Config::local` call, ~line 1595; see the inline comment there). A
   **forward** sentry that splices from a private source IP (recipe A over a VPC)
   depends on this. Switching to a preset with `allow_private_ips: false` would
   make the validator's listener **reject the forwarded connection from a private
   source IP** as an anti-DoS measure. If you change presets, front the validator
   with a **public-IP** sentry or use a **reverse tunnel** (recipe B) instead.
+
+- **Handshake rate limit funnels through the sentry's IP.** commonware
+  rate-limits inbound handshakes **per source IP** and per /24 subnet
+  (`allowed_handshake_rate_per_ip` / `_per_subnet`; the listener keys on the
+  accepted socket's IP). A **forward** splice (recipe A) makes the validator see
+  every joiner as coming from the sentry's single IP, so all inbound handshakes
+  share one IP's budget — under a reconnect storm or many simultaneous joiners a
+  single sentry becomes a handshake bottleneck. Today's `local` preset is
+  generous (16/s + burst per IP); the `recommended` preset is ~1 per 5s per IP.
+  Mitigate by running multiple sentries on **distinct IPs** (and distinct /24
+  subnets) — a second, load-distribution reason for the "multiple sentries"
+  guidance above, beyond redundancy. (A transparent splicer does no filtering,
+  and commonware has no PROXY-protocol parsing to recover the real client IP, so
+  fronting *blinds* the validator's own per-IP defenses rather than adding them.)
 
 - **DNS pinning at boot.** A DNS-named edge (`advertised = "sentry.example.com:443"`)
   is resolved **once at startup** (`resolve_one` in `bin/node/src/config.rs`) and

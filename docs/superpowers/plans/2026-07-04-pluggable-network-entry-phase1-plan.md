@@ -32,7 +32,7 @@ Evidence (direct source reads of commonware `authenticated::discovery` 2026.5.0)
   topology.
 
 On the ducktape side, `listen`/`advertised` are already independent config
-(`config.rs:723-729` network, `802-808` dev; `main.rs:1433-1434`), no
+(`config.rs:723-729` network, `802-808` dev), no
 `advertised != listen` guardrail exists, and `choose_sync_source`
 (`config.rs:635-646`) selects the sync source by **key** only, so a sentry — which
 has no key in the descriptor — can never be picked as a state-sync source.
@@ -103,7 +103,7 @@ Both fields default to current behavior, so every existing test is untouched.
   `ssh -R` / cloudflared-style); the edge is the public face, no inbound port on
   the validator.
 - Caveats: forward-sentry-on-a-private-network relies on the `local` preset's
-  `allow_private_ips: true` (`main.rs:1430`); a switch to the `recommended`
+  `allow_private_ips: true` (`main.rs:1595`); a switch to the `recommended`
   preset (`allow_private_ips: false`) would reject a forwarded connection from a
   private source IP — use a public-IP sentry or reverse tunnel then. A DNS-named
   edge is pinned to one IP at boot (`resolve_one`), fine for a static A-record.
@@ -112,7 +112,7 @@ Both fields default to current behavior, so every existing test is untouched.
 
 ### 4. `bin/node/src/main.rs` — one-line comment only (no behavior change)
 
-At the `discovery::Config::local` call (~`1430`), add a comment noting that
+At the `discovery::Config::local` call (~`1595`), add a comment noting that
 forward-sentry deployments on a private network depend on this `local` preset's
 `allow_private_ips: true`; switching presets would require public-IP or
 reverse-tunnel sentries. This is the only production-file touch and it is a
@@ -131,7 +131,7 @@ comment.
 ## Risks (from investigation)
 
 - `allow_private_ips` coupling for forward sentries → documented; one-line
-  comment at `main.rs:1430`.
+  comment at `main.rs:1595`.
 - DNS-named edge pinned at boot → noted in docs, not built for.
 - 2-validator quorum teardown → keep the founder alive until cross-reads
   complete; use sibling timeouts.

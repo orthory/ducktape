@@ -83,11 +83,16 @@ fn spawn_sentry(target: SocketAddr) -> (SocketAddr, Arc<AtomicU64>) {
                 Ok(s) => s,
                 Err(_) => continue, // target transiently unreachable — drop this conn
             };
-            accept_conns.fetch_add(1, Ordering::SeqCst);
             // two handles per socket so each relay thread owns one read + one
-            // write half of the full-duplex pipe.
-            let client_rx = client.try_clone().expect("clone client stream");
-            let upstream_rx = upstream.try_clone().expect("clone upstream stream");
+            // write half of the full-duplex pipe. a dup(2) failure (fd pressure)
+            // drops just this connection — it must NEVER unwind the accept loop
+            // and take the listener down with it (per the doc invariant above).
+            let (client_rx, upstream_rx) = match (client.try_clone(), upstream.try_clone()) {
+                (Ok(c), Ok(u)) => (c, u),
+                _ => continue,
+            };
+            // count only connections that actually bridge (both halves cloned).
+            accept_conns.fetch_add(1, Ordering::SeqCst);
 
             // client -> upstream
             std::thread::spawn(move || {
@@ -169,15 +174,18 @@ fn joiner_enters_through_a_sentry() {
     cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
 
-    // PROOF: the joiner's entry traffic transited the sentry. it has NO
-    // non-sentry path (its config lists members by key only; its sole address
-    // for node 0 is the sentry), so the bootstrap + park + state-sync it just
-    // completed necessarily bridged through the forwarder.
+    // sanity check that node 0 was reachable through the forwarder at all — a
+    // corroboration, not the proof. the real proof is structural + functional:
+    // the joiner has NO non-sentry path (its config lists members by key only;
+    // its sole address for node 0 is the bootstrap hint = the sentry), and it
+    // just went parked -> admitted -> synced -> promoted with a live cross-read
+    // below. the counter also tallies pre-admission park dials, so `> 0` is not
+    // a standalone anti-bypass guard — it simply confirms the forwarder was
+    // exercised end-to-end rather than sitting idle.
     let bridged_conns = bridged.load(Ordering::SeqCst);
-    eprintln!("[sentry] client connections bridged to node 0: {bridged_conns}");
     assert!(
         bridged_conns > 0,
-        "no connection transited the sentry — the joiner did not enter through it"
+        "no connection transited the sentry (bridged={bridged_conns}) — the joiner did not enter through it"
     );
 
     // consensus is live again: a 2-of-2 simplex finalizes nothing without both
