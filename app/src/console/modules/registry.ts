@@ -5,6 +5,8 @@ import { AgentView } from "../views/agent/AgentView";
 import { ChatView } from "../views/chat/ChatView";
 import { DocumentView } from "../views/document/DocumentView";
 import { ForgeView } from "../views/forge/ForgeView";
+import { MembersView } from "../views/members/MembersView";
+import { ModulesView } from "../views/modules/ModulesView";
 import { StatusView } from "../views/status/StatusView";
 import { TasksView } from "../views/tasks/TasksView";
 import { TelemetryView } from "../views/telemetry/TelemetryView";
@@ -15,10 +17,12 @@ export const MODULES: AppModule[] = [
   { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 1 }, Screen: TasksView },
   { id: "forge", nav: { icon: "forge", label: "Forge", order: 2 }, Screen: ForgeView },
   { id: "document", nav: { icon: "document", label: "Docs", order: 3 }, Screen: DocumentView },
-  { id: "agent", nav: { icon: "agent", label: "Agents", order: 5 }, Screen: AgentView },
+  { id: "members", nav: { icon: "members", label: "Members", order: 4 }, Screen: MembersView },
+  { id: "modules", nav: { icon: "modules", label: "Modules", order: 5 }, Screen: ModulesView },
+  { id: "agent", nav: { icon: "agent", label: "Agents", order: 6 }, Screen: AgentView },
   // Node (status) + Telemetry are the ops surfaces — grouped at the rail's foot.
-  { id: "status", nav: { icon: "node", label: "Node", order: 6 }, Screen: StatusView },
-  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 7 }, Screen: TelemetryView },
+  { id: "status", nav: { icon: "node", label: "Node", order: 7 }, Screen: StatusView },
+  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 8 }, Screen: TelemetryView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

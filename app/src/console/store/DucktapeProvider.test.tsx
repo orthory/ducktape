@@ -90,6 +90,9 @@ const makeFakeNode = () => {
       if (target === "profiles") {
         return Promise.resolve({ Profiles: [] });
       }
+      if (target === "valset") {
+        return Promise.resolve({ Validators: [[0xde, 0xad, 0xbe, 0xef]] });
+      }
       return Promise.resolve({ Tasks: [] });
     }),
     putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
@@ -123,6 +126,8 @@ function Probe() {
       <span data-testid="messages">{state.messages.length}</span>
       <span data-testid="thread">{state.activeThread ? "open" : "closed"}</span>
       <span data-testid="forge">{state.forgeHead ?? "unborn"}</span>
+      <span data-testid="members">{state.members.length}</span>
+      <span data-testid="member-keys">{state.members.join(",")}</span>
     </div>
   );
 }
@@ -146,6 +151,17 @@ describe("DucktapeProvider", () => {
       expect(screen.getByTestId("channel").textContent).toBe("general");
       expect(screen.getByTestId("messages").textContent).toBe("1");
     });
+  });
+
+  it("hydrates validator members from valset", async () => {
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("members").textContent).toBe("1");
+      expect(screen.getByTestId("member-keys").textContent).toBe("deadbeef");
+    });
+    expect(transport.query).toHaveBeenCalledWith("valset", "Validators");
   });
 
   it("sendMessage posts a paragraph block with the author as submit origin", async () => {
@@ -214,7 +230,7 @@ describe("DucktapeProvider", () => {
     );
 
     await act(async () => {
-      capturedActions!.createChannel("Release Party");
+      capturedActions!.createChannel("Release Party", "Open");
     });
 
     await waitFor(() => {

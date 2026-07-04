@@ -1,6 +1,7 @@
 // Console state — a client-side projection of the node's committed state
-// (channels/messages/tasks/status re-queried per block) plus local ui state
-// (screen, accent, author identity, thread panel).
+// (channels/messages/tasks/status re-queried per block) plus the global ui
+// state that must survive screen boundaries (screen, accent, author identity,
+// thread panel).
 
 import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client";
 import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
@@ -12,6 +13,7 @@ import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 // ── State shape ─────────────────────────────────────────
 
 export interface ConsoleState {
+  // ── Session / node core ──
   screen: string;
   accent: string;
   author: string;
@@ -22,6 +24,8 @@ export interface ConsoleState {
   /** True when this app owns the daemon lifecycle (desktop build). */
   managed: boolean;
   status: NodeStatus | null;
+
+  // ── Chat ──
   channels: Channel[];
   activeChannel: string | null;
   /** Messages of the active channel only (all sequences; views filter). */
@@ -30,11 +34,19 @@ export interface ConsoleState {
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
    *  into author rendering so messages show chosen names, not hex handles. */
   authorNames: Record<string, string>;
+
+  // ── Tasks ──
   tasks: Task[];
+
+  // ── Members / validator roster ──
+  /** Hex-encoded validator public keys from the `valset` module. */
+  members: string[];
+
+  // ── Forge ──
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
 
-  // ── Documents (block store; see document-client) ──
+  // ── Documents ──
   /** Known doc-ids — a client-side registry, since the document module has no
    *  "list docs" query (its store is keyed by sha256(doc_id) and can't
    *  enumerate). Persisted per node url by the provider. */
@@ -44,7 +56,7 @@ export interface ConsoleState {
   /** Ordered blocks of the active doc (re-queried per block / on open). */
   activeDocBlocks: Block[];
 
-  // ── Agents (collaboration loop; see agent-client) ──
+  // ── Agents ──
   /** Every registered agent, re-queried per block like tasks. */
   agents: AgentRecord[];
   /** Every channel watch and its turn policy. */
@@ -59,7 +71,7 @@ export interface ConsoleState {
 
   error: string | null;
 
-  // ── Workspaces / onboarding (desktop only; inert on web) ──
+  // ── Workspace / onboarding ──
   /** Every registered workspace, for the switcher. Empty on web. */
   workspaces: Workspace[];
   /** The active workspace whose node we talk to. Null on web / pre-onboarding. */
@@ -91,6 +103,7 @@ export const createInitialState = (): ConsoleState => ({
   activeThread: null,
   authorNames: {},
   tasks: [],
+  members: [],
   forgeHead: null,
   docIds: [],
   activeDoc: null,
@@ -106,6 +119,41 @@ export const createInitialState = (): ConsoleState => ({
   onboardingBusy: false,
   onboardingPhase: null,
   inviteBlob: null,
+});
+
+export interface ConsoleSnapshot {
+  connected: boolean;
+  status: NodeStatus | null;
+  channels: Channel[];
+  tasks: Task[];
+  members: string[];
+  forgeHead: string | null;
+  activeChannel: string | null;
+  messages: MessageView[];
+  authorNames: Record<string, string>;
+  activeDocBlocks: Block[];
+  agents: AgentRecord[];
+  watches: WatchView[];
+  runs: RunView[];
+}
+
+/** Project a committed node snapshot onto store data fields. Global UI, doc
+ *  registry, workspace/onboarding, and error state are intentionally left
+ *  untouched. */
+export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> => ({
+  connected: snapshot.connected,
+  status: snapshot.status,
+  channels: snapshot.channels,
+  tasks: snapshot.tasks,
+  members: snapshot.members,
+  forgeHead: snapshot.forgeHead,
+  activeChannel: snapshot.activeChannel,
+  messages: snapshot.messages,
+  authorNames: snapshot.authorNames,
+  activeDocBlocks: snapshot.activeDocBlocks,
+  agents: snapshot.agents,
+  watches: snapshot.watches,
+  runs: snapshot.runs,
 });
 
 // ── Pure helpers ────────────────────────────────────────

@@ -4,14 +4,50 @@
 // phase the store polls off the node log. Once the promoted node's surface
 // answers, the store swaps this out for the console.
 
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import type { OnboardingPhase } from "../../../domain/workspace-client";
 
 // The ordered steps shown; the node's phase maps onto one of these.
-const STEPS = ["Parked", "Admitted", "Synced", "Promoted"] as const;
+const STEPS = [
+  {
+    label: "Parked on invite mesh",
+    detail: "Send this node identity to a member",
+  },
+  {
+    label: "Admitted by a member",
+    detail: "Admission is recorded in the network",
+  },
+  {
+    label: "Finalized history synced",
+    detail: "Projection catches up locally",
+  },
+  {
+    label: "Promoted to validator",
+    detail: "The console opens automatically",
+  },
+] as const;
+
+const rootStyle: CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  justifyContent: "center",
+  overflowY: "auto",
+  background: `radial-gradient(ellipse 90% 70% at 50% 0%, ${color.paper} 0%, ${color.sunken} 100%)`,
+  padding: 30,
+};
+
+const columnStyle: CSSProperties = {
+  width: 430,
+  maxWidth: "100%",
+  display: "flex",
+  flexDirection: "column",
+};
 
 const stepOf = (phase: OnboardingPhase): number => {
   switch (phase) {
@@ -29,6 +65,84 @@ const stepOf = (phase: OnboardingPhase): number => {
   }
 };
 
+function StepIcon({ state }: { state: "done" | "running" | "pending" | "failed" }) {
+  if (state === "done") {
+    return (
+      <span
+        style={{
+          width: 19,
+          height: 19,
+          borderRadius: "50%",
+          background: "#eef5f0",
+          border: "1px solid #cfe3d7",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          font: `600 10px ${font.mono}`,
+          color: "#5f9e74",
+          flexShrink: 0,
+        }}
+      >
+        ✓
+      </span>
+    );
+  }
+
+  if (state === "failed") {
+    return (
+      <span
+        style={{
+          width: 19,
+          height: 19,
+          borderRadius: "50%",
+          background: "#fbeeec",
+          border: "1px solid #eccfc9",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          font: `700 11px ${font.mono}`,
+          color: color.red,
+          flexShrink: 0,
+        }}
+      >
+        !
+      </span>
+    );
+  }
+
+  if (state === "running") {
+    return (
+      <span
+        style={{
+          width: 19,
+          height: 19,
+          borderRadius: "50%",
+          borderWidth: 2,
+          borderStyle: "solid",
+          borderRightColor: "#e3b443",
+          borderBottomColor: "#e3b443",
+          borderLeftColor: "#e3b443",
+          borderTopColor: "transparent",
+          animation: "ik-pulse 1s ease-in-out infinite",
+          flexShrink: 0,
+        }}
+      />
+    );
+  }
+
+  return (
+    <span
+      style={{
+        width: 19,
+        height: 19,
+        borderRadius: "50%",
+        border: "1px dashed #d5d5d5",
+        flexShrink: 0,
+      }}
+    />
+  );
+}
+
 export function JoinProgress() {
   const { state, actions } = useDucktape();
   const [copied, setCopied] = useState(false);
@@ -36,6 +150,9 @@ export function JoinProgress() {
   const current = stepOf(phase);
   const fatal = phase === "fatal";
   const pubkey = state.workspace?.pubkey ?? "";
+  const progress = fatal
+    ? "12%"
+    : `${Math.round(((Math.max(current, 0) + 1) / STEPS.length) * 100)}%`;
 
   const copy = () => {
     void navigator.clipboard?.writeText(pubkey).then(
@@ -48,117 +165,170 @@ export function JoinProgress() {
   };
 
   return (
-    <div
-      style={{
-        flex: 1,
-        minHeight: 0,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: color.paper,
-        padding: 24,
-      }}
-    >
-      <div
-        style={{
-          width: 460,
-          maxWidth: "100%",
-          background: color.sidebar,
-          border: `1px solid ${color.border}`,
-          borderRadius: radius.lg,
-          boxShadow: shadow.pop,
-          padding: 24,
-          display: "flex",
-          flexDirection: "column",
-          gap: 18,
-        }}
-      >
-        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-          <span style={{ font: `600 16px ${font.sans}`, color: color.ink }}>
-            Joining {state.workspace?.name ?? "workspace"}
-          </span>
-          <span style={{ font: `500 12px ${font.sans}`, color: color.muted }}>
-            Your node is on the mesh. A member must admit you before it can sync.
-          </span>
+    <div style={rootStyle}>
+      <div style={columnStyle}>
+        <div
+          style={{
+            font: `500 11px ${font.mono}`,
+            color: color.muted2,
+            letterSpacing: ".05em",
+          }}
+        >
+          STEP 2 / 3
+        </div>
+        <div
+          style={{
+            font: `600 20px ${font.sans}`,
+            color: color.dark,
+            marginTop: 13,
+          }}
+        >
+          {fatal ? "Join needs attention" : `Joining ${state.workspace?.name ?? "workspace"}`}
+        </div>
+        <div
+          style={{
+            font: `400 13px ${font.sans}`,
+            color: color.muted,
+            marginTop: 5,
+            lineHeight: 1.5,
+          }}
+        >
+          Parked nodes wait for admission, then sync finalized history and promote.
         </div>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-          <span style={{ font: `600 10.5px ${font.sans}`, color: color.muted2, letterSpacing: ".04em" }}>
-            SEND YOUR IDENTITY TO A MEMBER
-          </span>
+        <div
+          style={{
+            height: 5,
+            borderRadius: 3,
+            background: "#e9e9e9",
+            marginTop: 18,
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              height: "100%",
+              width: progress,
+              background: fatal ? color.red : color.dark,
+              borderRadius: 3,
+              transition: "width .5s ease",
+            }}
+          />
+        </div>
+
+        <div style={{ marginTop: 20 }}>
+          <div
+            style={{
+              font: `600 10px ${font.mono}`,
+              letterSpacing: ".1em",
+              color: "#b7b7b7",
+            }}
+          >
+            YOUR NODE IDENTITY
+          </div>
           <button
             onClick={copy}
-            title="Copy"
+            title="Copy identity"
             style={{
               all: "unset",
               cursor: "pointer",
+              marginTop: 8,
               display: "flex",
               alignItems: "center",
-              justifyContent: "space-between",
               gap: 10,
-              padding: "9px 11px",
-              borderRadius: radius.sm,
-              border: `1px solid ${color.borderStrong}`,
-              background: color.sunken,
+              width: "100%",
+              border: `1px solid ${color.border}`,
+              background: "#f4f4f4",
+              borderRadius: radius.md,
+              padding: "10px 12px",
             }}
           >
             <span
               style={{
-                font: `500 10.5px ${font.mono}`,
-                color: color.inkSoft,
+                flex: 1,
+                minWidth: 0,
                 overflow: "hidden",
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
+                font: `400 11px ${font.mono}`,
+                color: color.muted3,
               }}
             >
-              {pubkey}
+              {pubkey || "waiting for identity"}
             </span>
-            <span style={{ font: `600 10.5px ${font.sans}`, color: color.accent, flexShrink: 0 }}>
+            <span
+              style={{
+                font: `600 11px ${font.sans}`,
+                color: copied ? "#5f9e74" : color.accent,
+                flexShrink: 0,
+              }}
+            >
               {copied ? "copied" : "copy"}
             </span>
           </button>
         </div>
 
-        {fatal ? (
-          <span style={{ font: `500 11.5px ${font.mono}`, color: color.red }}>
-            {state.onboardingPhase?.detail ?? "the node failed to join"}
-          </span>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-            {STEPS.map((label, i) => {
-              const done = i < current;
-              const active = i === current;
-              const dot = done ? color.green : active ? color.accent : color.chip;
-              return (
-                <div key={label} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ marginTop: 22, display: "flex", flexDirection: "column", gap: 14 }}>
+          {STEPS.map((item, i) => {
+            const done = !fatal && i < current;
+            const running = !fatal && i === current;
+            const failed = fatal && i === 0;
+            const visualState = failed
+              ? "failed"
+              : done
+                ? "done"
+                : running
+                  ? "running"
+                  : "pending";
+            return (
+              <div
+                key={item.label}
+                style={{ display: "flex", alignItems: "flex-start", gap: 12 }}
+              >
+                <StepIcon state={visualState} />
+                <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
                   <span
                     style={{
-                      width: 9,
-                      height: 9,
-                      borderRadius: "50%",
-                      background: dot,
-                      flexShrink: 0,
-                      boxShadow: active ? `0 0 0 3px ${color.paper}, 0 0 0 5px ${color.accent}22` : "none",
-                    }}
-                  />
-                  <span
-                    style={{
-                      font: `${active || done ? 600 : 500} 12px ${font.sans}`,
-                      color: done ? color.muted : active ? color.ink : color.muted2,
+                      font: `400 13.5px ${font.sans}`,
+                      color: failed || done || running ? color.inkSoft : "#aeaeae",
                     }}
                   >
-                    {label}
+                    {item.label}
+                  </span>
+                  <span
+                    style={{
+                      font: `400 11px ${font.mono}`,
+                      color: failed ? color.red : running ? color.muted3 : color.muted2,
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    {failed
+                      ? state.onboardingPhase?.detail ?? "the node failed to join"
+                      : running && state.onboardingPhase?.detail
+                        ? state.onboardingPhase.detail
+                        : item.detail}
                   </span>
                 </div>
-              );
-            })}
-          </div>
-        )}
+              </div>
+            );
+          })}
+        </div>
 
-        {state.onboardingPhase?.detail && !fatal && (
-          <span style={{ font: `500 10.5px ${font.mono}`, color: color.muted2 }}>
-            {state.onboardingPhase.detail}
-          </span>
+        {fatal && (
+          <div
+            style={{
+              marginTop: 18,
+              border: "1px solid #eccfc9",
+              background: "#fbeeec",
+              borderRadius: radius.sm,
+              padding: "8px 10px",
+              font: `500 11px ${font.mono}`,
+              color: color.red,
+              lineHeight: 1.45,
+            }}
+          >
+            {state.onboardingPhase?.detail ?? "the node failed to join"}
+          </div>
         )}
 
         <button
@@ -167,11 +337,12 @@ export function JoinProgress() {
             all: "unset",
             cursor: "pointer",
             textAlign: "center",
+            marginTop: 28,
             font: `600 11px ${font.sans}`,
             color: color.muted,
           }}
         >
-          ← workspaces
+          workspaces
         </button>
       </div>
     </div>
