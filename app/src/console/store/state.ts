@@ -61,9 +61,9 @@ export interface ConsoleState {
   forgeHead: string | null;
 
   // ── Documents ──
-  /** Known doc-ids — a client-side registry, since the document module has no
-   *  "list docs" query (its store is keyed by sha256(doc_id) and can't
-   *  enumerate). Persisted per node url by the provider. */
+  /** Every known doc id, enumerated from the document module's index
+   *  (ListDocs) and re-queried per block. These are "/"-delimited PATHS; the
+   *  view derives a folder tree from them. */
   docIds: string[];
   /** The doc whose blocks are loaded, or null when none is open. */
   activeDoc: string | null;
@@ -178,15 +178,16 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
+  docIds: string[];
   activeDocBlocks: Block[];
   agents: AgentRecord[];
   watches: WatchView[];
   runs: RunView[];
 }
 
-/** Project a committed node snapshot onto store data fields. Global UI, doc
- *  registry, workspace/onboarding, and error state are intentionally left
- *  untouched. */
+/** Project a committed node snapshot onto store data fields. Global UI,
+ *  workspace/onboarding, and error state are intentionally left untouched.
+ *  `docIds` now comes from the node's enumeration index, so it IS projected. */
 export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> => ({
   connected: snapshot.connected,
   status: snapshot.status,
@@ -198,6 +199,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
+  docIds: snapshot.docIds,
   activeDocBlocks: snapshot.activeDocBlocks,
   agents: snapshot.agents,
   watches: snapshot.watches,
@@ -214,15 +216,23 @@ export const channelIdOf = (name: string): string =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
 
-/** A doc id from user input (new-doc or open-by-id): lowercase, dash-separated,
- *  wire-safe. Slugging both entry points keeps "My Notes" and "my-notes" the
- *  same document, mirroring channelIdOf. */
+/** A doc id from user input: a "/"-delimited PATH where each segment is slugged
+ *  (lowercase, dash-separated, wire-safe) and empty segments are dropped. So
+ *  "Projects / Launch Plan" and "projects/launch-plan" name the same document,
+ *  and the leading/trailing slashes never survive. Path structure is what the
+ *  view turns into a folder tree. */
 export const docIdOf = (raw: string): string =>
   raw
     .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "");
+    .split("/")
+    .map((segment) =>
+      segment
+        .trim()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, ""),
+    )
+    .filter((segment) => segment.length > 0)
+    .join("/");
 
 /** The task lifecycle is a one-way lane; Done stays Done. */
 export const nextTaskStatus = (status: TaskStatus): TaskStatus => {

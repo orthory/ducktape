@@ -69,6 +69,10 @@ pub enum DocQuery {
     GetDoc { doc_id: String },
     /// a single block by id (`None` == doc or block absent).
     GetBlock { doc_id: String, block_id: String },
+    /// enumerate every known `doc_id`, served from the module's reserved index
+    /// entry (sorted, deduplicated). the store CAN now list its doc ids: a
+    /// filesystem-like browser derives its folder tree from these paths.
+    ListDocs,
 }
 
 /// replies to a [`DocQuery`]. `Option` mirrors absence (doc/block not found).
@@ -76,6 +80,8 @@ pub enum DocQuery {
 pub enum DocReply {
     Doc(Option<Vec<Block>>),
     Block(Option<Block>),
+    /// every known `doc_id`, sorted. the answer to [`DocQuery::ListDocs`].
+    DocList(Vec<String>),
 }
 
 pub fn encode_query(q: &DocQuery) -> Vec<u8> {

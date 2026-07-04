@@ -3,6 +3,7 @@
 
 import { useState } from "react";
 
+import type { ModuleCategory, ModuleStatus } from "../../../domain/transport";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
@@ -38,22 +39,31 @@ const MODULE_INFO: Record<string, { label: string; desc: string }> = {
 const infoOf = (id: string): { label: string; desc: string } =>
   MODULE_INFO[id] ?? { label: id, desc: "A registered genesis module." };
 
-function CorePill() {
+// Presentation catalog for module categories: display order + the accent that
+// colors each group's section header. The category itself is authored by the
+// node (see ModuleCategory in domain/transport); this map only styles it.
+const CATEGORIES: Record<ModuleCategory, { label: string; order: number; accent: string }> = {
+  workspace: { label: "Workspace", order: 0, accent: color.blue },
+  developer: { label: "Developer", order: 1, accent: color.purple },
+  automation: { label: "Automation", order: 2, accent: color.amber },
+  system: { label: "System", order: 3, accent: color.muted3 },
+};
+
+// An absent (older node) or unrecognized category groups under System, so the
+// view always renders every module somewhere.
+const categoryOf = (mod: ModuleStatus): ModuleCategory =>
+  mod.category && mod.category in CATEGORIES ? mod.category : "system";
+
+function CategoryDivider({ category, count }: { category: ModuleCategory; count: number }) {
+  const cat = CATEGORIES[category];
   return (
-    <span
-      style={{
-        font: `700 9px ${font.mono}`,
-        letterSpacing: ".04em",
-        color: color.purple,
-        background: "#f1edf5",
-        border: "1px solid #ddd2e6",
-        borderRadius: 999,
-        padding: "3px 8px",
-        flexShrink: 0,
-      }}
-    >
-      CORE
-    </span>
+    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+      <div style={{ font: `600 10px ${font.mono}`, letterSpacing: ".13em", color: cat.accent }}>
+        {cat.label.toUpperCase()}
+      </div>
+      <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
+      <div style={{ font: `400 11px ${font.mono}`, color: color.muted2 }}>{count}</div>
+    </div>
   );
 }
 
@@ -156,7 +166,6 @@ function ModuleRow({
           <span style={{ font: `400 11px ${font.mono}`, color: color.muted2, flexShrink: 0 }}>
             {id}
           </span>
-          <CorePill />
         </div>
         <div
           style={{
@@ -180,6 +189,15 @@ export function ModulesView() {
   const { state } = useDucktape();
   const modules = state.status?.modules ?? [];
   const [copied, setCopied] = useState<string | null>(null);
+
+  // Group the module set by category, in catalog order, dropping empty groups.
+  const grouped = (Object.keys(CATEGORIES) as ModuleCategory[])
+    .sort((a, b) => CATEGORIES[a].order - CATEGORIES[b].order)
+    .map((category) => ({
+      category,
+      mods: modules.filter((mod) => categoryOf(mod) === category),
+    }))
+    .filter((group) => group.mods.length > 0);
 
   const copyRoot = (id: string, root: string) => {
     void navigator.clipboard?.writeText(root).then(
@@ -250,40 +268,29 @@ export function ModulesView() {
           </div>
         </div>
 
-        <div style={{ marginTop: 18, display: "flex", alignItems: "center", gap: 12 }}>
-          <div
-            style={{
-              font: `600 10px ${font.mono}`,
-              letterSpacing: ".13em",
-              color: color.muted2,
-            }}
-          >
-            INSTALLED
-          </div>
-          <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
-          <div style={{ font: `400 11px ${font.mono}`, color: color.muted2 }}>
-            {modules.length} core
-          </div>
-        </div>
-
-        <div
-          style={{
-            marginTop: 11,
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
-            gap: 10,
-          }}
-        >
-          {modules.map((mod) => (
-            <ModuleRow
-              key={mod.id}
-              id={mod.id}
-              root={mod.root}
-              copied={copied === mod.id}
-              onCopy={() => copyRoot(mod.id, mod.root)}
-            />
-          ))}
-        </div>
+        {grouped.map(({ category, mods }) => (
+          <section key={category} style={{ marginTop: 18 }}>
+            <CategoryDivider category={category} count={mods.length} />
+            <div
+              style={{
+                marginTop: 11,
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+                gap: 10,
+              }}
+            >
+              {mods.map((mod) => (
+                <ModuleRow
+                  key={mod.id}
+                  id={mod.id}
+                  root={mod.root}
+                  copied={copied === mod.id}
+                  onCopy={() => copyRoot(mod.id, mod.root)}
+                />
+              ))}
+            </div>
+          </section>
+        ))}
 
         {modules.length === 0 && (
           <div

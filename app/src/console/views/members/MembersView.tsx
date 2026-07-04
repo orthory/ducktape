@@ -271,90 +271,120 @@ function MemberRow({
   member,
   selected,
   onOpen,
+  canRemove,
+  onRemove,
 }: {
   member: MemberVM;
   selected: boolean;
   onOpen: () => void;
+  /** Show the removal control for this row (admin, and not this node itself). */
+  canRemove: boolean;
+  onRemove: () => void;
 }) {
   const [hover, setHover] = useState(false);
+  // A container div (not a button) so the removal control is a SIBLING of the
+  // open button — nesting interactive controls inside a button is invalid.
   return (
-    <button
-      type="button"
-      aria-label={`Open member ${member.displayName}`}
-      aria-pressed={selected}
-      onClick={onOpen}
+    <div
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
-        ...buttonBase,
-        width: "100%",
         display: "flex",
         alignItems: "center",
-        gap: 12,
-        padding: "12px 14px",
+        gap: 8,
         borderBottom: `1px solid ${color.borderSoft}`,
         borderRadius: radius.md,
         background: hover ? color.sidebar : selected ? color.sunken : "transparent",
-        textAlign: "left",
       }}
     >
-      <Avatar member={member} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 7,
-            minWidth: 0,
-          }}
-        >
-          <span
+      <button
+        type="button"
+        aria-label={`Open member ${member.displayName}`}
+        aria-pressed={selected}
+        onClick={onOpen}
+        style={{
+          ...buttonBase,
+          flex: 1,
+          minWidth: 0,
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "12px 14px",
+          borderRadius: radius.md,
+          background: "transparent",
+          textAlign: "left",
+        }}
+      >
+        <Avatar member={member} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
             style={{
-              font: `600 13.5px ${font.sans}`,
-              color: color.ink,
+              display: "flex",
+              alignItems: "center",
+              gap: 7,
+              minWidth: 0,
+            }}
+          >
+            <span
+              style={{
+                font: `600 13.5px ${font.sans}`,
+                color: color.ink,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {member.displayName}
+            </span>
+            {member.isLocal ? (
+              <span style={{ font: `500 9.5px ${font.sans}`, color: color.muted2 }}>
+                this node
+              </span>
+            ) : null}
+          </div>
+          <div
+            title={member.key}
+            style={{
+              marginTop: 3,
+              font: `400 10.5px ${font.mono}`,
+              color: color.muted2,
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
             }}
           >
-            {member.displayName}
-          </span>
-          {member.isLocal ? (
-            <span style={{ font: `500 9.5px ${font.sans}`, color: color.muted2 }}>
-              this node
-            </span>
-          ) : null}
+            {member.shortKey} · {member.status}
+          </div>
         </div>
         <div
-          title={member.key}
           style={{
-            marginTop: 3,
-            font: `400 10.5px ${font.mono}`,
-            color: color.muted2,
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
+            display: "flex",
+            alignItems: "center",
+            gap: 7,
+            flexShrink: 0,
+            flexWrap: "wrap",
+            justifyContent: "flex-end",
           }}
         >
-          {member.shortKey} · {member.status}
+          {member.isFounder ? (
+            <Pill label="Genesis" pill={STATUS_PILLS.genesis} mono title={GENESIS_TOOLTIP} />
+          ) : null}
+          <Pill label="Validator" pill={STATUS_PILLS.validator} />
         </div>
-      </div>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 7,
-          flexShrink: 0,
-          flexWrap: "wrap",
-          justifyContent: "flex-end",
-        }}
-      >
-        {member.isFounder ? (
-          <Pill label="Genesis" pill={STATUS_PILLS.genesis} mono title={GENESIS_TOOLTIP} />
-        ) : null}
-        <Pill label="Validator" pill={STATUS_PILLS.validator} />
-      </div>
-    </button>
+      </button>
+      {canRemove ? (
+        <div style={{ flexShrink: 0, paddingRight: 12 }}>
+          <HoverButton
+            variant="outline"
+            ariaLabel={`Remove ${member.displayName} from validator set`}
+            onClick={onRemove}
+          >
+            <Icon name="close" size={13} />
+            Remove
+          </HoverButton>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -729,6 +759,23 @@ export function MembersView() {
     : null;
   const canAdmin = Boolean(state.workspace?.founder || state.workspace?.member);
 
+  const requestRemove = (member: MemberVM): void => {
+    // Never remove your own node — that would drop this workspace out of the
+    // set it is driving governance through.
+    if (member.isLocal) return;
+    const ok = window.confirm(
+      `Remove ${member.displayName} from the validator set?\n\n` +
+        `This opens a removal proposal and casts THIS node's yes-ballot. ` +
+        `It only takes effect once a strict majority of members (n / 2 + 1) ` +
+        `approve — every other member must run the same removal.`,
+    );
+    if (!ok) return;
+    actions.demoteMember(member.key);
+    if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
+      setSelectedKey(null);
+    }
+  };
+
   return (
     <div
       data-screen-label="Members"
@@ -857,6 +904,8 @@ export function MembersView() {
                   member={member}
                   selected={selected?.keyNorm === member.keyNorm}
                   onOpen={() => setSelectedKey(member.key)}
+                  canRemove={canAdmin && !member.isLocal}
+                  onRemove={() => requestRemove(member)}
                 />
               ))}
             </div>

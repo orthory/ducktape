@@ -1,8 +1,9 @@
 // Typed client for the node's `document` module — the TS mirror of
 // `crates/apps/document-interface`. A document is exactly an ordered list of
-// blocks keyed by doc_id: there is NO authorship (submits take no origin) and
-// NO "list docs" query — the store is keyed by sha256(doc_id) and cannot
-// enumerate. Same contract as tasks-client/forge-client: camelCase params in,
+// blocks keyed by doc_id, and the module keeps a reserved INDEX entry so the
+// store CAN enumerate its ids (ListDocs) — the browsable tree is derived from
+// those "/"-delimited path ids. There is NO authorship (submits take no
+// origin). Same contract as tasks-client/forge-client: camelCase params in,
 // verbatim serde wire out, pure functions over an injected NodeTransport.
 
 import type { BlockEvent, NodeTransport } from "./transport";
@@ -99,3 +100,10 @@ export const getBlock = (
       }),
     )
     .then((reply) => replyVariant<Block | null>(reply, "Block"));
+
+/** Every known doc id, sorted — the module's enumeration index. The console
+ *  derives its folder tree from these "/"-delimited path ids. */
+export const listDocs = (transport: NodeTransport): Promise<string[]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, "ListDocs"))
+    .then((reply) => replyVariant<string[]>(reply, "DocList"));

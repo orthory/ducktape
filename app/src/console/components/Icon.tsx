@@ -74,6 +74,15 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M8.5 12.2l2.4 2.4 4.6-4.8" />
     </>
   ),
+  folder: <path d="M4 6.5a1.5 1.5 0 0 1 1.5-1.5h3.2l1.8 2h7A1.5 1.5 0 0 1 20 8.5v8a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 16.5z" />,
+  refresh: (
+    <>
+      <path d="M5.5 9.2A7 7 0 0 1 18 6.6l1.5 1.6" />
+      <path d="M19.5 4v4h-4" />
+      <path d="M18.5 14.8A7 7 0 0 1 6 17.4l-1.5-1.6" />
+      <path d="M4.5 20v-4h4" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof PATHS;

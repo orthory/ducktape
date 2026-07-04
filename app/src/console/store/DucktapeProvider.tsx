@@ -29,10 +29,7 @@ import * as tasksClient from "../../domain/tasks-client";
 import * as valsetClient from "../../domain/valset-client";
 import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
-import {
-  createActions,
-  loadDocIds,
-} from "./actions";
+import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
 import { reducer } from "./reducer";
 import {
@@ -80,8 +77,8 @@ export function DucktapeProvider({
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
-    // the document module has no bulk read, so re-query only the open doc
-    // (null when none is open) alongside the other projections.
+    // enumerate the doc index (the browse tree) and re-query the open doc's
+    // blocks (null when none is open) alongside the other projections.
     const activeDoc = stateRef.current.activeDoc;
     return Promise.resolve()
       .then(() =>
@@ -95,6 +92,7 @@ export function DucktapeProvider({
           // rather than failing the whole refresh.
           governanceClient.proposals(live).catch((): ProposalView[] => []),
           forgeClient.head(live),
+          documentClient.listDocs(live),
           activeDoc
             ? documentClient.getDoc(live, activeDoc)
             : Promise.resolve<Block[] | null>(null),
@@ -114,6 +112,7 @@ export function DucktapeProvider({
         validators,
         proposals,
         forgeHead,
+        docIds,
         docBlocks,
         agents,
         watches,
@@ -147,6 +146,7 @@ export function DucktapeProvider({
                 activeChannel: active,
                 messages,
                 authorNames,
+                docIds,
                 activeDocBlocks: docBlocks ?? [],
                 agents,
                 watches,
@@ -274,16 +274,16 @@ export function DucktapeProvider({
     document.documentElement.style.setProperty("--accent", state.accent);
   }, [state.accent]);
 
-  // 4. Load the per-node doc registry when the node url resolves or changes,
-  //    and drop any open doc — a different node has different documents.
-  //    Writes go the other way through openDoc (the only place docIds grows).
+  // 4. Drop any open doc when the node url resolves or changes — a different
+  //    node has different documents. `docIds` (the browse tree) is re-enumerated
+  //    from the new node's index by `refresh`, so it isn't seeded here.
   useEffect(() => {
     const url = state.nodeUrl;
     if (!url) return;
     dispatch({
       type: "patch",
       patch: {
-        docIds: loadDocIds(url),
+        docIds: [],
         activeDoc: null,
         activeDocBlocks: [],
       },

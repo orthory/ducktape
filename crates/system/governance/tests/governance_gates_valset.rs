@@ -182,6 +182,82 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
     });
 }
 
+#[test]
+fn a_passing_proposal_removes_the_validator_and_emits_leave() {
+    block_on(async {
+        let mut host = gov_host();
+        let (m1, m2) = (member_key(1), member_key(2));
+        assert_eq!(validators(&host).await.len(), 2, "seeded with two members");
+
+        // the `member-remove` verb's on-chain shape: a member opens a
+        // RemoveValidator proposal, members vote, and execution PERFORMS the
+        // membership change by emitting `ValsetMsg::Leave` as a
+        // governance-origin follow-up — the same path `invite-accept` drives
+        // for AddValidator/Join, inverted.
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "remove-2".into(),
+                action: GovAction::RemoveValidator { key: m2.clone() },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("propose removal");
+        // both current members vote yes -> early-decidable strict majority
+        // (2 of 2). a member may cast the deciding ballot to remove another.
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "remove-2".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote m1");
+        submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "remove-2".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote m2");
+
+        // execution tallies and rides the valset Leave on the SAME block.
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "remove-2".into(),
+            }),
+        )
+        .await
+        .expect("execute");
+
+        assert_eq!(
+            proposal_status(&host, "remove-2").await,
+            Some(ProposalStatus::Passed)
+        );
+        let members = validators(&host).await;
+        assert_eq!(members.len(), 1, "the removed validator is gone");
+        assert!(members.contains(&m1), "the remaining member stays");
+        assert!(!members.contains(&m2), "the removed key is dropped from the set");
+    });
+}
+
 /// the solo-network tally: with one member, majority = 1/2 + 1 = 1, so the
 /// founder's own ballot decides immediately — `invite-accept` on a network
 /// of one admits the friend in a single propose/vote/execute round, no

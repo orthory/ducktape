@@ -7,7 +7,7 @@ use axum::http::{Request, StatusCode, header};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use http_body_util::BodyExt as _;
-use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
+use noded::{BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
 use tower::ServiceExt as _;
 
 /// a scripted actor: answers every command the same way, like a module host
@@ -60,6 +60,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                         modules: vec![ModuleStatus {
                             id: "chat".into(),
                             root: "ef".repeat(32),
+                            category: ModuleCategory::of("chat"),
                         }],
                     });
                 }
@@ -192,6 +193,8 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(body["height"], 3);
     assert_eq!(body["modules"][0]["id"], "chat");
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
+    // the catalog category rides on the wire as a lowercase string.
+    assert_eq!(body["modules"][0]["category"], "workspace");
 }
 
 #[tokio::test]

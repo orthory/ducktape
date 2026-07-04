@@ -96,6 +96,13 @@ export const joinWorkspace = (name: string, blob: string): Promise<Workspace> =>
 export const admitMember = (id: string, pubkey: string): Promise<void> =>
   invoke<void>("workspace_admit", { id, pubkey });
 
+/** Remove a validator by pubkey through this running member node's governance.
+ *  Opens a RemoveValidator proposal and casts this node's yes-ballot; the
+ *  removal only takes effect once a strict majority of members (n/2 + 1)
+ *  approve, and the removed node drops out at the next epoch cutover. */
+export const demoteMember = (id: string, pubkey: string): Promise<void> =>
+  invoke<void>("workspace_demote", { id, pubkey });
+
 /** Make a workspace active and ensure its node is running; returns the http
  *  url to dial. Idempotent — adopts an already-listening node. */
 export const selectWorkspace = (id: string): Promise<WorkspaceSelection> =>

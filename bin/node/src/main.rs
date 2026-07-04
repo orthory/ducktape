@@ -747,6 +747,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
+        Some("member-remove") => return cmd_member_remove(&args[1..]),
         Some("join") => return cmd_join(&args[1..]),
         _ => {}
     }
@@ -762,7 +763,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|join — or \
+                     keygen|init|invite|admit|invite-accept|member-remove|join — or \
                      --config <path> [--sync-only])"
                 )
                 .into());
@@ -1214,6 +1215,165 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             eprintln!(
                 "admitted {pubkey_hex}: the validator set changes at the next epoch cutover, \
                  and the joiner's parked node will sync and promote itself"
+            );
+            Ok(())
+        }
+        status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
+    }
+}
+
+// ---- member-remove: post-genesis removal over the local rpc ----------------
+
+/// `member-remove <hex pubkey> [--config node.toml]` — post-genesis removal:
+/// drive a governance RemoveValidator proposal for `pubkey` through this
+/// member's own RUNNING node. the mirror of `invite-accept` with inverted
+/// guards — a no-op when the key is NOT a member, and only members may drive
+/// it. idempotent across members: each runs the same command (propose if
+/// absent, cast a yes ballot, execute once decidable); the run that lands the
+/// deciding ballot executes. the passing proposal's valset Leave schedules the
+/// epoch cutover that drops the key from the tracked set.
+fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use governance_interface::{GovAction, GovMsg, ProposalStatus, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    let [pubkey_hex] = pos.as_slice() else {
+        return Err("member-remove needs exactly one <hex pubkey>".into());
+    };
+    let key = config::decode_key(pubkey_hex)?;
+    let key_bytes = key.as_ref().to_vec();
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
+    // full config resolution so the verb derives the SAME identity the running
+    // node signs with — the ballots this verb casts are signed by the NODE, and
+    // that key must be a current member.
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("member-remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
+    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+
+    let members = read_members(&rpc_addr)?;
+    // inverted admission guards: nothing to remove if the key is not a member,
+    // and only current members may open/decide a removal.
+    if !members.contains(&key_bytes) {
+        eprintln!("{pubkey_hex} is not a validator — nothing to do");
+        return Ok(());
+    }
+    if !members.contains(&me_bytes) {
+        return Err(
+            "this node's identity is not a current member — only members remove \
+                    validators"
+                .into(),
+        );
+    }
+
+    // adopt an existing OPEN proposal for exactly this action, else mint an
+    // unused id (settled proposals keep their ids forever — a re-removed key
+    // gets a fresh suffix).
+    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
+    let proposals = match decode_reply(&rpc_query(
+        &rpc_addr,
+        "governance",
+        &encode_query(&GovQuery::Proposals),
+    )?)? {
+        GovReply::Proposals(views) => views,
+        other => return Err(format!("unexpected governance reply: {other:?}").into()),
+    };
+    let wanted = GovAction::RemoveValidator {
+        key: key_bytes.clone(),
+    };
+    let proposal_id = match proposals
+        .iter()
+        .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
+    {
+        Some(p) => {
+            eprintln!("joining open proposal {}", p.proposal_id);
+            p.proposal_id.clone()
+        }
+        None => {
+            let prefix: String = pubkey_hex.chars().take(16).collect();
+            let id = (0u64..)
+                .map(|n| format!("remove:{prefix}:{n}"))
+                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
+                .expect("the id space is unbounded");
+            rpc_submit(
+                &rpc_addr,
+                "governance",
+                &encode_msg(&GovMsg::Propose {
+                    proposal_id: id.clone(),
+                    action: wanted,
+                    // a far horizon in consensus-time units: removal must not
+                    // expire under a slow second ballot.
+                    voting_period: 1_000_000,
+                }),
+            )?;
+            poll_proposal(&rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
+            eprintln!("proposed {id}");
+            id
+        }
+    };
+
+    rpc_submit(
+        &rpc_addr,
+        "governance",
+        &encode_msg(&GovMsg::Vote {
+            proposal_id: proposal_id.clone(),
+            approve: true,
+        }),
+    )?;
+    let after_vote = poll_proposal(&rpc_addr, &proposal_id, "this ballot to finalize", |p| {
+        p.as_ref().is_some_and(|v| {
+            v.status != ProposalStatus::Open
+                || v.votes
+                    .iter()
+                    .any(|(voter, yes)| voter == &me_bytes && *yes)
+        })
+    })?
+    .expect("the poll only accepts a present proposal");
+    eprintln!("ballot cast as {}", hex_bytes(&me_bytes));
+
+    // execute only when decidable — a strict-majority shortfall is the normal
+    // n>=2 intermediate state, not an error.
+    let members = read_members(&rpc_addr)?;
+    let yes = members
+        .iter()
+        .filter(|m| {
+            after_vote
+                .votes
+                .iter()
+                .any(|(voter, approve)| voter == *m && *approve)
+        })
+        .count();
+    let majority = members.len() / 2 + 1;
+    if after_vote.status == ProposalStatus::Open && yes < majority {
+        eprintln!(
+            "{yes} of {majority} required ballots — waiting on other members. each runs:\n    \
+             ducktape-node member-remove {pubkey_hex} --config <their node.toml>"
+        );
+        return Ok(());
+    }
+    if after_vote.status == ProposalStatus::Open {
+        rpc_submit(
+            &rpc_addr,
+            "governance",
+            &encode_msg(&GovMsg::Execute {
+                proposal_id: proposal_id.clone(),
+            }),
+        )?;
+    }
+    let settled = poll_proposal(&rpc_addr, &proposal_id, "the tally to settle", |p| {
+        p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
+    })?
+    .expect("the poll only accepts a present proposal");
+    match settled.status {
+        ProposalStatus::Passed => {
+            eprintln!(
+                "removed {pubkey_hex}: the validator set changes at the next epoch cutover"
             );
             Ok(())
         }
@@ -2369,6 +2529,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         .module_root(m)
                                         .map(|r| hex(&r))
                                         .unwrap_or_default(),
+                                    category: noded::ModuleCategory::of(m),
                                 })
                                 .collect();
                             let _ = reply.send(noded::NodeStatus {

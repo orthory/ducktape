@@ -39,36 +39,6 @@ const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
     ? list.map((w) => (w.id === next.id ? next : w))
     : [...list, next];
 
-// ── Per-node document registry ──────────────────────────
-//
-// The document module has NO "list docs" query — its store is keyed by
-// sha256(doc_id) and cannot enumerate — so the set of known doc-ids is tracked
-// CLIENT-SIDE and persisted per resolved node url (i.e. per workspace). This is
-// a convenience registry, not a source of truth: a doc created on another
-// client won't appear here until its id is opened by hand.
-const docRegistryKey = (nodeUrl: string): string => `ducktape.docs.${nodeUrl}`;
-
-export const loadDocIds = (nodeUrl: string): string[] => {
-  try {
-    const raw = localStorage.getItem(docRegistryKey(nodeUrl));
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed)
-      ? parsed.filter((id): id is string => typeof id === "string")
-      : [];
-  } catch {
-    return []; // storage unavailable / corrupt entry — start from an empty list
-  }
-};
-
-const saveDocIds = (nodeUrl: string, docIds: string[]): void => {
-  try {
-    localStorage.setItem(docRegistryKey(nodeUrl), JSON.stringify(docIds));
-  } catch {
-    // storage may be unavailable (private mode / quota); the registry is a
-    // convenience, so a failed persist is non-fatal.
-  }
-};
-
 export interface ConsoleActions {
   setScreen(screen: string): void;
   /** Switch the sidebar rail (user apps vs operator surfaces) and persist it.
@@ -100,9 +70,13 @@ export interface ConsoleActions {
   commitForge(params: { path: string; content: string; message: string }): void;
 
   // ── Documents (block store over the `document` module) ──
-  /** Create a doc (CreateDoc, idempotent), register it, and open it. */
+  /** Re-query the module's enumeration index into `state.docIds` (the tree). */
+  listDocs(): void;
+  /** Create a doc at a "/"-delimited path (CreateDoc, idempotent) and open it.
+   *  The refresh after the write re-enumerates the index, so the new path
+   *  appears in the tree. */
   createDoc(docId: string): void;
-  /** Register + open a doc by id, loading its blocks (like selectChannel). */
+  /** Open a doc by path, loading its blocks (like selectChannel). */
   openDoc(docId: string): void;
   /** Append/insert a fresh block into the active doc (id generated here). */
   insertBlock(params: { after: string | null; kind: BlockKind; text: string }): void;
@@ -160,6 +134,9 @@ export interface ConsoleActions {
   revealInvite(): void;
   /** Admit a joiner by pubkey through the active (member) workspace. */
   admitMember(pubkey: string): void;
+  /** Open a removal proposal for a validator by pubkey and cast this node's
+   *  yes-ballot; the removal takes effect only once a strict majority approve. */
+  demoteMember(pubkey: string): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -237,19 +214,16 @@ export function createActions({
       .catch(fail);
   };
 
-  // the single entry point into a doc: record it in the per-node registry
-  // (persist), make it active, and load its blocks. Every path into a doc
-  // (new-doc, open-by-id, a registry click) goes here — like enterChannel.
+  // the single entry point into a doc: make it active and load its blocks.
+  // Every path into a doc (new-doc, a tree click) goes here — like
+  // enterChannel. The known-doc set is the node's index (state.docIds), not a
+  // local registry, so entering a doc no longer writes any list — it just
+  // focuses the reader on `docId`.
   const enterDoc = (rawId: string) => {
     const live = getNode();
     const docId = docIdOf(rawId);
     if (!live || !docId) return;
-    const known = getState().docIds;
-    const docIds = known.includes(docId) ? known : [...known, docId];
-    const url = getState().nodeUrl;
-    if (url) saveDocIds(url, docIds);
     patch({
-      docIds,
       activeDoc: docId,
       activeDocBlocks: [],
     });
@@ -534,13 +508,23 @@ export function createActions({
     },
 
     // ── Documents ──
+    listDocs: () => {
+      const live = getNode();
+      if (!live) return;
+      Promise.resolve()
+        .then(() => documentClient.listDocs(live))
+        .then((docIds) => patch({ docIds }))
+        .catch(fail);
+    },
+
     openDoc: enterDoc,
 
     createDoc: (rawId) => {
       const docId = docIdOf(rawId);
       if (!docId) return;
-      // CreateDoc is idempotent and REQUIRED before any block op; then open
-      // it (registers the id + loads blocks), mirroring createChannel.
+      // CreateDoc is idempotent and REQUIRED before any block op; the refresh
+      // re-enumerates the index so the new path shows in the tree, then open
+      // it (loads blocks), mirroring createChannel.
       submitThenRefresh((live) => documentClient.createDoc(live, { docId })).then(
         () => enterDoc(docId),
       );
@@ -783,6 +767,15 @@ export function createActions({
       if (!target || !pubkey.trim()) return;
       Promise.resolve()
         .then(() => ws.admitMember(target.id, pubkey.trim()))
+        .then(() => refresh())
+        .catch(fail);
+    },
+
+    demoteMember: (pubkey) => {
+      const target = getState().workspace;
+      if (!target || !pubkey.trim()) return;
+      Promise.resolve()
+        .then(() => ws.demoteMember(target.id, pubkey.trim()))
         .then(() => refresh())
         .catch(fail);
     },
