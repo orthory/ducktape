@@ -369,6 +369,9 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/index/status", get(index_status))
         .route("/v1/index/{module}/ops", get(index_ops))
         .route("/v1/index/{module}/scan", get(index_scan))
+        // the module's OWN endpoint on the derived tier: an opaque
+        // module-defined view request, answered by its registered mapper.
+        .route("/v1/index/{module}/view", post(index_view))
         // Prometheus scrape convention: root `/metrics`, not under `/v1`.
         .route("/metrics", get(metrics))
         .route("/v1/shutdown", post(shutdown))
@@ -553,7 +556,10 @@ fn index_store(handle: &NodeHandle) -> Result<&Arc<indexer::IndexStore>, Respons
 
 fn index_error(err: indexer::Error) -> Response {
     let status = match err {
-        indexer::Error::UnknownModule(_) => StatusCode::NOT_FOUND,
+        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => {
+            StatusCode::NOT_FOUND
+        }
+        indexer::Error::View(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     error_response(status, &err.to_string())
@@ -624,6 +630,33 @@ async fn index_ops(
         next_after: page.next_after,
     })
     .into_response()
+}
+
+/// POST /v1/index/{module}/view — the module's materialized view, served by
+/// its registered mapper. request body and reply are module-defined json
+/// (chat: `{"search": {…}}` → `{"hits": […]}`), exactly as opaque to the
+/// daemon as `/v1/query` payloads are. modules with no view answer 404 —
+/// some never will (forge's substrate is already a queryable git repo).
+async fn index_view(
+    State(handle): State<NodeHandle>,
+    Path(module): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
+    match store.view(&module, &req_bytes) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "view reply was not json",
+            ),
+        },
+        Err(err) => index_error(err),
+    }
 }
 
 /// GET /v1/index/{module}/scan?prefix=&after=&limit= — one page of raw index
