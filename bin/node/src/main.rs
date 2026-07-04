@@ -2580,6 +2580,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
     let http_handle = http_handle.with_forge_repo(storage.join("forge-repo"));
     let blobs = http_handle.blob_handle();
+    // the explorer's backing store: the pump below pushes each non-empty
+    // block as it drains; GET /v1/blocks reads it directly (never the actor).
+    let http_blocks = http_handle.block_ring();
     match http_listen.as_deref() {
         Some(addr) if !sync_only && !joiner => {
             let listener = std::net::TcpListener::bind(addr)?;
@@ -4220,7 +4223,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // resolve held app-surface submits against what this
                     // drain finished with; every disposition is deterministic,
                     // so the reply faithfully reports the op's consensus fate.
-                    let boundary_hash = hex(&node.app_hash());
                     let drained = node.take_drained();
                     // sealed = journaled: applied and rejected frames both got
                     // recovery seals; discarded frames were never journaled.
@@ -4228,12 +4230,49 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         .iter()
                         .filter(|d| d.disposition != node::Disposition::Discarded)
                         .count() as u64;
+                    // publish each NON-EMPTY block to the explorer ring: skip
+                    // the heartbeat nop (the deliberately-empty block that only
+                    // ticks an idle chain) and frames with no decoded op (a
+                    // ceiling discard or a failed decode — nothing to show).
+                    for d in &drained {
+                        let Some(op) = &d.op else { continue };
+                        if op.target == NOP_TARGET {
+                            continue;
+                        }
+                        let disposition = match d.disposition {
+                            node::Disposition::Applied => noded::BlockDisposition::Applied,
+                            node::Disposition::Rejected => noded::BlockDisposition::Rejected,
+                            // unreachable — a discard carries no op and was
+                            // skipped above — but stay total on this
+                            // observability lane rather than panic.
+                            node::Disposition::Discarded => continue,
+                        };
+                        http_blocks.push(noded::BlockRecord {
+                            height: d.height,
+                            hash: noded::hex_bytes(&d.id),
+                            commit_hash: hex(&d.app_hash),
+                            proposer: match &op.origin {
+                                sdk::Origin::External(key) => noded::hex_bytes(key),
+                                // frames only carry verified External
+                                // authorship; label the impossible rest.
+                                sdk::Origin::Module(id) => format!("module:{id}"),
+                                sdk::Origin::System => "system".into(),
+                            },
+                            disposition,
+                            target: op.target.clone(),
+                            operations: op.dispatches.iter().map(noded::DispatchInfo::from).collect(),
+                            payload: noded::payload_preview(&op.payload),
+                        });
+                    }
                     for d in drained {
                         let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
                         let _ = reply.send(match d.disposition {
                             node::Disposition::Applied => Ok(noded::BlockSummary {
                                 height: d.height,
-                                app_hash: boundary_hash.clone(),
+                                // the PER-BLOCK boundary this frame settled at
+                                // (not the end-of-drain hash — a drain can
+                                // apply several blocks).
+                                app_hash: hex(&d.app_hash),
                             }),
                             node::Disposition::Rejected => {
                                 Err("op finalized but rejected (deterministic no-op)".into())
