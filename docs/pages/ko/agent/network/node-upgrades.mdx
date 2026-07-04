@@ -1,0 +1,202 @@
+# 노드 업그레이드
+
+consensus-breaking change — 즉 모듈 `root()`, op/wire encoding, 혹은 module set에
+대한 모든 변경 — 를 network downtime 없이 live network에 올리는 것은, 미리 배포한
+dual-path binary를 height-gated activation으로 켜는 방식일 때만 안전하다. 이 페이지는
+그 업그레이드를 구동하기 위한 operational contract이며, agent가 그 과정에서 반드시
+지켜야 하는 invariant들을 정의한다. Scope: 이 절차는 모든 module id를 그대로 유지하는
+변경(`root()`/op-encoding 변경)을 다룬다. module id를 추가하거나 제거하는 것은 base
+no-downtime guarantee 밖의 더 어려운 class이며 — 아래 '실패 및 Abort 처리' 참고 — 평범한
+height-gated upgrade로 구동해서는 안 된다.
+
+이 mechanism은 design-of-record이며, 아직 Rust로 wired in되지 않았다. authoritative
+spec은 `docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`에 있다.
+업그레이드는 `upgrade` 모듈, `GovAction::ScheduleUpgrade`/`CancelUpgrade`, 그리고
+`SignalReady`를 이미 구현한 binary에 대해서만 구동한다. `upgrade` 모듈보다 앞선
+binary로 구성된 network에서는 이 절차를 사용 가능한 것처럼 제시하지 않는다.
+
+## 반드시 지켜야 하는 Invariant
+
+- **App-hash만이 유일한 authority다.** active protocol version은 `upgrade` 모듈의
+  agreed state이며, `state::global_root`
+  (`crates/kernel/host/src/lib.rs:341-344`)에 fold된다. operator의 주장, CLI flag,
+  manifest hint를 특정 height가 어떤 logic으로 실행되는지에 대한 source of truth로
+  절대 취급하지 않는다.
+- **Rolling upgrade 중에 network namespace를 절대 바꾸지 않는다.** commonware의 p2p
+  handshake는 version negotiation을 하지 않는다 — 유일한 compatibility gate는 공유된
+  `namespace`(`chain_id@genesis_fingerprint`, `bin/node/src/config.rs:202-233`)다.
+  `root()`/op-encoding upgrade는 `(chain_id, scheme, genesis validator)`를 건드리지
+  않으므로 namespace가 stable하게 유지되어 old/new binary가 roll 내내 handshake한다.
+  rollout 도중 namespace나 genesis fingerprint를 bump하면 mesh가 끊긴다 — 이는
+  stop-the-world 작업이며 결코 no-downtime이 아니다.
+- **Activation은 execute-time이며, respawn-time이나 control-flow가 아니다.** version
+  bump, pending-clear, 그리고 모든 state migration은 `Env.height`에 keyed된
+  deterministic in-block `execute()` transition이어야 한다. recovery는
+  `apply_block → host.submit_at`로 frame을 re-execute하며, `Cutover` record로부터
+  module migration을 절대 호출하지 않는다
+  (`crates/kernel/recovery/src/lib.rs:840-852,996-1017`). respawn path나 binary
+  control flow에만 놓인 activation effect는 replay에서 보이지 않으며, restart하는
+  node를 대량으로 halt시키거나 live node를 replay된 node에 대해 fork시킨다.
+- **Version은 pure derivation이다.** `effective_version(height)`는 `H`에서 한 번
+  뒤집히는 mutable boolean이 아니라, committed된 `upgrade`-module state로부터 계산된다.
+  stored flip을 추가하지 않는다.
+- **`protocol_version`은 read-only dispatch input이다.** 이는 `BlockContext`와 `Env`
+  (`crates/kernel/host/src/lib.rs:46-53`; `crates/kernel/sdk/src/lib.rs:140-149`)에
+  실려 이동하며, 변경된 모듈의 명시적 dual-path branch 안에서만 소비된다. 이를 어떤
+  module root preimage나 op encoding에도 절대 hash하지 않는다. 그렇지 않으면 변경되지
+  않은 모듈들의 root가 drift한다.
+- **`H` 아래에서 dual-path binary는 기존 binary와 byte-identical하다.** 변경된
+  surface 전체 — `execute`, `query`, `snapshot`, `install`, `root`, 그리고 op/wire
+  semantics — 를 gate하여, `H` 아래 모든 height의 모든 op에 대해 accept/reject 결정,
+  snapshot serialization, root가 기존 binary와 일치하게 한다. 그렇지 않으면 두 binary가
+  divergent state를 만들어 activation 전에 fork한다.
+- **Authorization은 activation이 아니다.** simple-majority governance vote는 SCHEDULE만
+  할 수 있다. activation은 추가로 readiness quorum을 요구하며, 그 arming policy는 절대
+  그 아래에서 arm하지 않는 `2f+1` safety floor 위의 `R = n`(모든 boundary validator)이다.
+  두 threshold를 하나의 check로 합치지 않는다.
+- **Version은 monotonic하고, recovery는 roll-forward 전용이다.**
+  `to_version <= current_version`을 reject한다. `H` 이상에서 committed state를 절대
+  rewind하지 않는다 — hashed history를 rewrite하고 `H` 너머로 sync한 누구와도 fork한다.
+  잘못된 upgrade는 `to_version + 1`로의 새로운 `ScheduleUpgrade`로 고친다.
+- **Halt하되, fork하지 않는다.** new logic 없이 `H`에 도달한 node는 stale rule로 `H`를
+  실행하는 대신 fail loud해야 한다 (pre-recovery boot posture). 그것은 한 node의
+  downtime이며, 경쟁하는 old-hash quorum이 되는 일은 결코 없다.
+
+## 순서가 정해진 절차
+
+이 step들을 순서대로 구동한다. `H` 전에 readiness 확인을 건너뛰지 않는다.
+
+1. **선행 조건을 확인한다.** target network에서 `upgrade` 모듈이 genesis-embedded되어
+   live인지 검증한다. binary가 이보다 앞선다면, 이것은 no-downtime path가 아니다 —
+   일회성 coordinated genesis bump이며 여기 scope 밖이다.
+2. **Dual-path binary를 미리 배포한다.** 새 binary를 node-by-node로 rollout한다. 이
+   binary는 old logic과 new logic을 모두 담으며 `MAX_PROTOCOL_VERSION >= to_version`을
+   가진다. `H` 아래에서 old logic으로 실행되는지 (behavior byte-identical) 확인한다.
+   scheduling 이후 admit된 모든 validator는 반드시 new-binary-first로 provision해야 한다.
+   최초 실행 height가 `>= H`인 node는 반드시 new binary로 실행해야 한다.
+3. **Governance를 통해 schedule한다.**
+   `GovAction::ScheduleUpgrade { name, activation_height: H, to_version }`
+   (`crates/system/governance-interface/src/lib.rs:19-26`)를 담은 member-gated
+   proposal을 작성한다. `H`는 모든 node의 미래로 엄격히 정한다 — `MIN_UPGRADE_LEAD`를
+   지나고, 최소한 orchestrator `cutover_delay` window
+   (`crates/kernel/consensus/src/valset_orchestrator.rs:225-232`)만큼 이후로. tally-pass
+   시 upgrade-module follow-up이 `pending`을 record한다. pending upgrade가 정확히 하나
+   존재하는지, 그리고 그 `name`/`H`/`to_version`이 의도한 값인지 확인한다.
+4. **Readiness를 수집한다.** new binary로 실행 중인 각 validator는
+   `SignalReady { name, to_version }`을 emit한다 (validator-origin, 실행 중인 binary의
+   `MAX_PROTOCOL_VERSION`으로부터 machine-generated, member pubkey당 idempotent). 각
+   accept된 signal이 pending upgrade identity와 일치하는지 확인한다. 다른
+   `name`/`to_version`에 대한 stale signal은 count되지 않는다.
+5. **`H` 전에 arming quorum을 확인한다.** readiness는 **`H` 시점의 boundary valset** —
+   respawn이 frozen state에서 읽는 `EpochMembership`
+   (`crates/kernel/consensus/src/valset_orchestrator.rs:237-256`) — 에 대해 측정하며,
+   proposal-time set이 아니다. **arming policy는 `R = n`이다: 모든 boundary validator가
+   ready를 signal했을 때만 진행한다.** 이것이 무조건적인 no-downtime posture다.
+   non-signaler는 하나라도 있으면 straggler-aborts-the-upgrade로 취급한다: 그것이
+   offline-honest든 withholding-Byzantine이든, flip은 fire하지 않으므로 clean
+   deterministic abort가 돌게 두고 — network는 OLD logic을 계속 실행한다 — 더 늦은 `H`로
+   reschedule한다. `R >= 2f+1`은 수학적 SAFETY FLOOR일 뿐 결코 policy가 아니다: `2f+1`
+   아래에서는 절대 arm해서는 안 되지만, 정확히 `2f+1`에서도 arm하지 않는다. `2f+1`에서는
+   budget 내의 adversary(`f`개 validator가 signal한 뒤 old logic을 실행)나
+   crash-after-signal이 new logic 위에 오직 `f+1`개의 honest node만 남길 수 있고, 그러면
+   new-app-hash block이 자신의 `2f+1` certificate를 모으지 못해 chain이 `H`에서 HALT한다
+   — liveness failure다. 그래서 `R = n`에서 arm한다: 이는 첫 new-version block을
+   finalize하는 LIVENESS margin을 벌어줄 뿐, 추가적인 safety를 주지 않는다. No-fork는
+   `R`의 어떤 값에서도 성립한다 — app-hash `2f+1` quorum certificate가 signal한 뒤
+   diverge하는 node를 out-vote하기 때문이다. `R = n`이 fork를 막는다고 절대 주장하지
+   않는다; 그것은 `H`에서의 halt라는 liveness failure를 막는 것이다. `n` 아래로 가는
+   유일하게 허용되는 조치는, `s`개의 known-offline straggler를 위한 DISCOURAGED이며
+   명시적으로 문서화된 downgrade `R = n - s`다: 모든 signaler가 실제로 new binary를 실행
+   중이라는 out-of-band attestation이 있을 때만 허용하고, schedule 시점에 (무조건이 아닌)
+   CONDITIONAL guarantee로 record한다. 이는 결코 default가 아니다. readiness가 `R = n`
+   궤도에 오르지 않았다면, 희망에 기대어 `H`를 지나가게 두지 않는다 — `CancelUpgrade`하고
+   reschedule한다.
+6. **`H`에서 activation을 지켜본다.** arming은 frozen teardown-respawn boundary에서
+   frozen readiness set과 boundary valset에 대해 정확히 한 번 평가되는 deterministic
+   self-transition이다. armed → finalized cutover view에서 모든 ready node가 stamp된
+   `BlockContext.protocol_version`과 각 변경된 모듈의 `active_version`을
+   `effective_version(H) = to_version`으로 설정한다(같은 transition에서 upgrade 모듈의
+   stored `current_version`을 reconcile). migration은 deterministic in-block
+   transition으로 실행된다. 하나의 respawn이 coincident membership change와 version
+   flip을 함께 수행한다.
+7. **`H`를 가로지르는 app-hash continuity를 검증한다.** block `H`가 `2f+1` quorum
+   certificate로 finalize되었는지, 그리고 ready supermajority가 new app-hash에
+   동의하는지 확인한다 — live `AppHashMismatch` guard
+   (`crates/kernel/host/src/lib.rs:375-379`)와 recovery compose check
+   (`crates/kernel/recovery/src/lib.rs:971-975`)가 divergent node를 reject한다. 그런
+   다음 `H`를 가로지르는 restart와 fresh state-sync join을 구동하고, 둘 다 `H`와 그
+   이후 모든 height에 대해 identical app-hash를 재구성하는지 확인한다.
+
+## 실패 및 Abort 처리
+
+- **`H`까지 quorum 미달 (clean abort).** boundary에서 한 번, deterministic하게 평가된다.
+  armed 아님 ⇒ 모듈이 clear-pending follow-up을 emit ⇒ 모든 node가 하나의 finalized
+  view에서 `pending`과 readiness를 discard하고 old logic으로 계속한다. clear 자체에는
+  timer도, local view도, operator step도 없다. 더 늦은 `H`로 reschedule한다.
+- **`H`에서 straggler halt.** `MAX_PROTOCOL_VERSION < to_version`인 node는 stale rule로
+  `H`를 실행하는 대신 fail-loud halt한다. `H-1`까지의 state는 valid하고 app-hash 아래에
+  있으므로, recovery는 wipe가 필요 없다. dual-path binary를 install하고, restart하고,
+  recovery가 new branch로 `H`까지 replay하게 한 뒤 rejoin한다.
+- **Set 안에 pre-`upgrade`-module binary.** 이 node는 더 일찍 diverge한다 —
+  `ScheduleUpgrade` follow-up이 in-hash `upgrade` 모듈을 처음 mutate하는 block에서이며,
+  `H`가 아니다. rollout gate가 "`ScheduleUpgrade`가 commit되기 전에 모든 node에
+  upgrade-module-aware dual-path binary"인 이유가 바로 이것이다.
+- **Mis-schedule되었으나 valid하게 armed된 upgrade.** `CancelUpgrade { name }`
+  (governance-gated, `current_height < H`일 때만 valid)가 boundary 전에 이를 멈추고
+  readiness set을 clear한다.
+- **Activation 이후 발견된 bug.** roll forward만 한다: 수정된 logic과, 필요하다면
+  corrective deterministic migration을 담아 새로운 `H'`에서 `to_version + 1`로의 새로운
+  `ScheduleUpgrade`. 절대 rewind하지 않는다. `H` 너머로는 rollback fallback이 없으므로,
+  모든 new-logic branch와 모든 migration은 execute purity contract (no wall-clock, IO,
+  RNG)를 지켜야 하며, 이는 pre-schedule determinism / replay-equivalence test로 증명한다.
+- **Module-set-changing upgrade (base guarantee 밖 — 더 어려운 class).** module id를
+  추가하거나 제거하는 것은 평범한 height-gated upgrade가 아니다. 순진한 '`H`
+  teardown-respawn에서 register/remove' recipe는 fork하고 halt한다. `H` 아래에서 새 모듈을
+  포함한 binary는 기존 binary와 다른 `global_root`를 구성하며(`global_root`가 registry를
+  fold, `crates/kernel/host/src/lib.rs:272-301`), 두 binary는 `H` 이전 rollout 도중
+  diverge한다. 그리고 recovery `Cutover` handler는 registry를 절대 mutate하지 않으므로
+  (`crates/kernel/recovery/src/lib.rs:840-852`), respawn-time registry 변경은 replay에서
+  보이지 않아 `H`를 가로질러 restart하거나 state-sync하는 모든 node가 network 전반에서
+  halt한다. module-set 변경은 registry composition 자체가 `effective_version(height)`의
+  height-gated pure function이 되어 live, recovery-replay, state-sync-install path에서
+  identical하게 재현되어야 한다 — 별도의 설계다. 그것이 존재하기 전에는 module-set 변경을
+  이 runbook으로 구동하지 않는다. 미루거나 coordinated genesis bump을 사용한다.
+
+## 검증 체크리스트
+
+Schedule 전:
+
+- dual-path binary가 `H` 아래에서 old logic으로 byte-for-byte 실행된다 (root, snapshot
+  byte, accept/reject 결정이 모든 op에 대해 old binary와 일치).
+- `protocol_version`이 어떤 root preimage나 op encoding에도 등장하지 않는다. 변경되지
+  않은 모듈들의 root가 `H` 아래와 위에서 identical하다.
+- determinism / replay-equivalence test가 모든 new-logic branch와 모든 migration을
+  cover한다 (no wall-clock, IO, RNG).
+- `to_version > current_version` 그리고 `H > current_height + MIN_UPGRADE_LEAD`.
+
+`H` 전:
+
+- pending upgrade가 정확히 하나이고, 그 `name`/`H`/`to_version`이 의도와 일치한다.
+- readiness가 proposal-time set이 아니라 boundary valset에 대해 측정된다.
+- `R = n` (arming policy): 모든 boundary validator가 ready를 signal했다. `R >= 2f+1`은
+  절대 그 아래에서 arm하지 않는 safety floor이지만, 정확히 `2f+1`에서 arm하는 것은
+  reject된다 (`H`에서 halt할 수 있다). 모든 `R = n - s`는 discouraged downgrade이며,
+  out-of-band attestation과 문서화된 conditional guarantee가 있을 때만 허용된다.
+- accept된 모든 `SignalReady`가 pending identity와 일치한다.
+
+`H` 후:
+
+- block `H`가 `2f+1` certificate 아래 finalize되었다. ready supermajority가 new
+  app-hash에 동의한다. 정직한 node 중 누구도 `AppHashMismatch`를 report하지 않는다.
+- `H`를 가로지르는 restart가 identical app-hash로 replay된다.
+- served range가 `H`를 가로지르는 fresh state-sync join이 자신의 binary를
+  `required_min_version`에 대해 preflight하고, `H`와 그 이후 모든 height에 대해
+  identical app-hash를 rebuild한다.
+
+이 페이지에 대한 docs-only 편집은 다음으로 verify한다:
+
+```sh
+cd docs
+bun run docs:check
+git diff --check origin/main...HEAD
+```
