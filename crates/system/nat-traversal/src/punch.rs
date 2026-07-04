@@ -475,6 +475,46 @@ mod tests {
     }
 
     #[test]
+    fn punched_direct_path_survives_coordinator_going_away() {
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let mut a_nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let mut b_nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
+        let mut coord = Coordinator::new();
+        let (a_plan, b_plan) =
+            drive_simulated(a_key, b_key, &mut a_nat, &mut b_nat, &mut coord).expect("punch");
+
+        // The coordinator is gone. A direct, punched path lives entirely in the
+        // two NAT filter states — nothing here consults the coordinator.
+        drop(coord);
+        assert!(a_nat.allow_inbound(a_plan.local_mapped, b_plan.local_mapped));
+        assert!(b_nat.allow_inbound(b_plan.local_mapped, a_plan.local_mapped));
+    }
+
+    #[test]
+    fn relayed_path_rides_the_coordinator_unlike_a_punched_one() {
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let mut a_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let mut b_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
+        let mut coord = Coordinator::new();
+        let outcome = drive_with_relay_fallback(
+            a_key, b_key, &mut a_nat, &mut b_nat, &mut coord, b"a", b"b",
+        )
+        .expect("relay");
+        let coord_ip = coord_addr().ip();
+        match outcome {
+            FallbackOutcome::Relayed(p) => {
+                // Both relay endpoints sit ON the coordinator: the data path
+                // traverses it, so coordinator death kills the relayed path.
+                assert_eq!(p.a_relay_endpoint.ip(), coord_ip);
+                assert_eq!(p.b_relay_endpoint.ip(), coord_ip);
+            }
+            FallbackOutcome::Punched { .. } => panic!("symmetric pair must relay"),
+        }
+    }
+
+    #[test]
     fn cone_pair_punches_and_never_touches_the_relay() {
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);

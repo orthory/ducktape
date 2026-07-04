@@ -133,6 +133,12 @@ impl Coordinator {
         }
     }
 
+    /// Number of live relay sessions. Lets tests assert the idle prune keeps
+    /// relay state bounded. (Public; not dead code in a plain build.)
+    pub fn relay_session_count(&self) -> usize {
+        self.relay_sessions.len()
+    }
+
     /// Drop relay sessions idle longer than `idle_ticks`. Keeps relay state
     /// bounded: a session with no traffic is torn down so the coordinator never
     /// accumulates unbounded `SocketAddr` pairs.
@@ -262,6 +268,19 @@ mod tests {
         assert_ne!(s0, s1);
         // Releasing an unknown id is a harmless no-op.
         c.release_relay(9_999);
+    }
+
+    #[test]
+    fn prune_relays_returns_state_to_zero_bounded() {
+        let mut c = Coordinator::new();
+        let a_src = addr(1, 1111);
+        let a = NodeKey([0xaa; 32]);
+        let b = NodeKey([0xbb; 32]);
+        c.handle(a_src, Msg::Register { key: a });
+        let _ = c.request_relay(a_src, b, 0).expect("session");
+        assert_eq!(c.relay_session_count(), 1);
+        c.prune_relays(100, 10);
+        assert_eq!(c.relay_session_count(), 0, "idle prune bounds relay state");
     }
 
     #[test]

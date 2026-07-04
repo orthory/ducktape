@@ -627,6 +627,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_path_survives_coordinator_shutdown() {
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        let coord = tokio::spawn(run_coordinator(coord_sock));
+
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let a = NatClient::bind(a_key, coord_addr).await.unwrap();
+        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        // Rendezvous via the coordinator to learn each other's addresses.
+        let _b_reflexive = timeout(Duration::from_secs(2), a.lookup(b_key))
+            .await
+            .expect("no timeout")
+            .expect("lookup");
+        let b_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            b.local_addr().await.unwrap().port(),
+        );
+        let a_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            a.local_addr().await.unwrap().port(),
+        );
+
+        // The coordinator dies.
+        coord.abort();
+
+        // The direct path still works: A sends straight to B, no coordinator.
+        // Retransmit to absorb any scheduling nondeterminism (as WireGuard does)
+        // and to prove the path survives regardless of send order.
+        let mut got = None;
+        for _ in 0..50 {
+            a.send_punch_to(b_addr).await.unwrap();
+            if let Ok(r) = timeout(Duration::from_millis(100), b.recv_punch_from(a_addr)).await {
+                got = Some(r.expect("recv"));
+                break;
+            }
+        }
+        assert_eq!(
+            got.expect("direct path must survive coordinator downtime"),
+            Msg::Punch { from: a_key }
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_setup_requires_a_live_coordinator() {
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        let coord = tokio::spawn(run_coordinator(coord_sock));
+
+        let a = NatClient::bind(NodeKey([0xaa; 32]), coord_addr).await.unwrap();
+        a.register().await.unwrap();
+
+        // Coordinator down -> a relayed path cannot even be established: the
+        // grant never comes. (Unlike a punched path, which needs nothing.)
+        coord.abort();
+        let res = timeout(Duration::from_millis(400), a.request_relay(NodeKey([0xbb; 32]))).await;
+        assert!(
+            res.is_err(),
+            "without a live coordinator a relay session cannot be allocated"
+        );
+    }
+
+    #[tokio::test]
     async fn coordinator_reclaims_idle_relay_and_regrants_fresh_session() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
