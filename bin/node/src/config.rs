@@ -1494,4 +1494,32 @@ bootstrapper_addr = "127.0.0.1:52200"
         sorted.sort();
         assert_eq!(d.reach, sorted);
     }
+
+    #[test]
+    fn reach_hints_are_excluded_from_the_genesis_fingerprint() {
+        let v = ed25519::PrivateKey::from_seed(31).public_key();
+        let coord = ed25519::PrivateKey::from_seed(32).public_key();
+        let base = NetworkDescriptor {
+            chain_id: "fp#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(v.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        let ns0 = base.genesis_namespace();
+
+        let mut with_reach = base.clone();
+        with_reach.add_bootstrap(&v, "127.0.0.1:52200");
+        with_reach.add_reach(&ReachHint {
+            expected_key: v.clone(),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "p2p:7777".into(), coord_key: coord }),
+        });
+
+        // advisory reach + bootstrap NEVER move the consensus identity.
+        assert_eq!(with_reach.genesis_namespace(), ns0);
+        // two descriptors differing ONLY in reach fingerprint identically.
+        let mut other_reach = base.clone();
+        other_reach.add_reach(&ReachHint { expected_key: v, reach: Reach::Direct("9.9.9.9:9".into()) });
+        assert_eq!(other_reach.genesis_namespace(), ns0);
+    }
 }
