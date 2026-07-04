@@ -103,13 +103,24 @@ export const admitMember = (id: string, pubkey: string): Promise<void> =>
 export const demoteMember = (id: string, pubkey: string): Promise<void> =>
   invoke<void>("workspace_demote", { id, pubkey });
 
-/** Leave a network: drive this node's on-chain SELF-removal through the running
- *  member node (a RemoveValidator proposal for our OWN key, pending a strict
- *  majority of the remaining members), stop the node, and forget the workspace
- *  locally (delete its directory + registry entry). Resolves to the newly-active
+/** Request to leave a network: drive this node's on-chain SELF-removal (a
+ *  RemoveValidator proposal for our OWN key, casting our yes-ballot) through the
+ *  running member node, and KEEP THE NODE RUNNING. In a set of two-or-more the
+ *  removal stays pending until a strict majority of the remaining members
+ *  approve — the node must stay up through its own pending removal or quorum
+ *  cannot finalize it. A solo (n=1) node is refused (you can't remove the last
+ *  validator); it forgets its workspace directly instead. Rejects on failure. */
+export const requestLeaveWorkspace = (id: string): Promise<void> =>
+  invoke<void>("workspace_request_leave", { id });
+
+/** Forget a workspace: stop its node, delete its directory, and drop its
+ *  registry entry. GUARDED — refused while this node is still a current
+ *  validator of a set of two-or-more (tearing it down would halt quorum and
+ *  strand its pending removal). Safe once removed (no longer in the valset) or
+ *  for a solo network only this node runs. Resolves to the newly-active
  *  workspace the registry repointed to, or null when none remain. */
-export const leaveWorkspace = (id: string): Promise<Workspace | null> =>
-  invoke<Workspace | null>("workspace_leave", { id });
+export const forgetWorkspace = (id: string): Promise<Workspace | null> =>
+  invoke<Workspace | null>("workspace_forget", { id });
 
 /** Make a workspace active and ensure its node is running; returns the http
  *  url to dial. Idempotent — adopts an already-listening node. */

@@ -99,35 +99,65 @@ describe("SettingsView", () => {
     expect(spies.newWorkspace).toHaveBeenCalled();
   });
 
-  it("leaves the network on a confirmed danger-zone click", () => {
+  it("requests an on-chain leave that keeps the node running, without tearing down", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
-    const { spies } = renderSettings();
+    // A member of a set of two -> Request leave is enabled (a real majority is
+    // needed, so the node must stay up through its own pending removal).
+    const { spies } = renderSettings({
+      members: [workspace.pubkey, "beefbeef".repeat(8)],
+    });
 
-    // The copy is honest: an on-chain self-removal, pending remaining members.
+    // The copy is honest: an on-chain self-removal, node keeps running.
     expect(screen.getByText(/on-chain self-removal/i)).toBeInTheDocument();
+    expect(screen.getByText(/keeps running until they approve/i)).toBeInTheDocument();
     expect(
       screen.queryByText(/full workspace deletion is not wired/i),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /leave network/i }));
+    fireEvent.click(screen.getByRole("button", { name: /request leave/i }));
     expect(confirm).toHaveBeenCalledOnce();
-    expect(spies.leaveWorkspace).toHaveBeenCalled();
-    // The old dishonest wiring is gone — stopNode is no longer the leave path.
+    expect(spies.requestLeaveWorkspace).toHaveBeenCalled();
+    // Requesting a leave never tears down: no node stop, no forget.
+    expect(spies.forgetWorkspace?.mock.calls ?? []).toHaveLength(0);
     expect(spies.stopNode?.mock.calls ?? []).toHaveLength(0);
 
     confirm.mockRestore();
   });
 
-  it("aborts the leave when the confirm is dismissed", () => {
+  it("aborts the request-leave when the confirm is dismissed", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    const { spies } = renderSettings();
+    const { spies } = renderSettings({
+      members: [workspace.pubkey, "beefbeef".repeat(8)],
+    });
 
-    fireEvent.click(screen.getByRole("button", { name: /leave network/i }));
+    fireEvent.click(screen.getByRole("button", { name: /request leave/i }));
     expect(confirm).toHaveBeenCalledOnce();
-    // Dismissed confirm -> leaveWorkspace is never referenced, so the proxy
-    // never even created a spy for it.
-    expect(spies.leaveWorkspace?.mock.calls ?? []).toHaveLength(0);
+    // Dismissed confirm -> requestLeaveWorkspace is never referenced, so the
+    // proxy never even created a spy for it.
+    expect(spies.requestLeaveWorkspace?.mock.calls ?? []).toHaveLength(0);
 
     confirm.mockRestore();
+  });
+
+  it("forgets the workspace on a confirmed forget click (guarded in the backend)", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { spies } = renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: /forget workspace/i }));
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(spies.forgetWorkspace).toHaveBeenCalled();
+
+    confirm.mockRestore();
+  });
+
+  it("disables Request leave for a solo validator (can't remove the last one)", () => {
+    // Only this node in the set -> leaving on-chain would empty it, which is
+    // refused; the button is disabled and the user forgets instead.
+    renderSettings({ members: [workspace.pubkey] });
+
+    const requestLeave = screen.getByRole("button", { name: /request leave/i });
+    expect(requestLeave).toBeDisabled();
+    // Forget is still available for a solo network.
+    expect(screen.getByRole("button", { name: /forget workspace/i })).toBeEnabled();
   });
 });

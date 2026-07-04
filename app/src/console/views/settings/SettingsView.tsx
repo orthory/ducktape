@@ -585,73 +585,154 @@ function PreferencesSection() {
   );
 }
 
+const normalizeKey = (key: string | null | undefined): string =>
+  (key ?? "").trim().replace(/^0x/i, "").toLowerCase();
+
+function DangerRow({
+  title,
+  detail,
+  buttonLabel,
+  ariaLabel,
+  onClick,
+  disabled,
+}: {
+  title: string;
+  detail: ReactNode;
+  buttonLabel: string;
+  ariaLabel: string;
+  onClick: () => void;
+  disabled: boolean;
+}) {
+  return (
+    <div
+      style={{
+        border: "1px solid #ecd6d0",
+        background: "#fdf6f4",
+        borderRadius: radius.lg,
+        padding: 15,
+        display: "flex",
+        alignItems: "center",
+        gap: 13,
+      }}
+    >
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ font: `600 12.5px ${font.sans}`, color: color.inkSoft }}>
+          {title}
+        </div>
+        <div
+          style={{
+            font: `400 10.5px ${font.sans}`,
+            color: color.muted2,
+            marginTop: 2,
+            lineHeight: 1.4,
+          }}
+        >
+          {detail}
+        </div>
+      </div>
+      <HoverButton
+        ariaLabel={ariaLabel}
+        onClick={onClick}
+        hoverBg="#8f463d"
+        disabled={disabled}
+        style={{
+          all: "unset",
+          cursor: disabled ? "not-allowed" : "pointer",
+          font: `600 11.5px ${font.sans}`,
+          color: color.onDark,
+          background: color.red,
+          borderRadius: 8,
+          padding: "8px 15px",
+          opacity: disabled ? 0.5 : 1,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {buttonLabel}
+      </HoverButton>
+    </div>
+  );
+}
+
 function DangerZone() {
   const { state, actions } = useDucktape();
-  const disabled = !state.workspace || !state.managed;
+  const base = !state.workspace || !state.managed;
+
+  // Is THIS node still a current validator, and how big is the set? Leaving is
+  // an on-chain self-removal that needs a strict majority of the OTHER members;
+  // forgetting is a local teardown that must not run while we're still a current
+  // validator of a set of two-or-more (it would halt quorum). A solo node
+  // (validators = 1) can't remove the last validator — it just forgets.
+  const pubkey = state.workspace?.pubkey ?? null;
+  const inSet = state.members.some((m) => normalizeKey(m) === normalizeKey(pubkey));
+  const validatorCount = state.members.length;
+  const canRequestLeave = !base && inSet && validatorCount >= 2;
 
   const requestLeave = (): void => {
     const name = state.workspace?.name ?? "this network";
     const ok = window.confirm(
-      `Leave "${name}"?\n\n` +
+      `Request to leave "${name}"?\n\n` +
         `This submits an ON-CHAIN self-removal of this node and casts its ` +
-        `yes-ballot. In a set of two or more members the removal stays PENDING ` +
-        `until a strict majority (n / 2 + 1) of the remaining members approve. ` +
-        `The node is then stopped and the workspace is forgotten locally — its ` +
-        `directory and registry entry are deleted.`,
+        `yes-ballot. Your node KEEPS RUNNING: in a set of two or more members ` +
+        `the removal stays PENDING until a strict majority (n / 2 + 1) of the ` +
+        `remaining members approve — the node must stay up through its own ` +
+        `pending removal or the network can't finalize it. Once you're removed ` +
+        `(you drop out of the validator set), you can forget the workspace.`,
     );
     if (!ok) return;
-    actions.leaveWorkspace();
+    actions.requestLeaveWorkspace();
+  };
+
+  const forget = (): void => {
+    const name = state.workspace?.name ?? "this workspace";
+    const ok = window.confirm(
+      `Forget "${name}"?\n\n` +
+        `This stops this node and deletes the workspace locally — its ` +
+        `directory and registry entry are removed. This is refused while this ` +
+        `node is still a current validator of a network with other members ` +
+        `(forgetting it then would halt the network's quorum). Safe once you've ` +
+        `been removed, or for a solo network only this node runs.`,
+    );
+    if (!ok) return;
+    actions.forgetWorkspace();
   };
 
   return (
     <>
       <SectionLabel danger>DANGER ZONE</SectionLabel>
       <div
-        style={{
-          marginTop: 9,
-          border: "1px solid #ecd6d0",
-          background: "#fdf6f4",
-          borderRadius: radius.lg,
-          padding: 15,
-          display: "flex",
-          alignItems: "center",
-          gap: 13,
-        }}
+        style={{ marginTop: 9, display: "flex", flexDirection: "column", gap: 9 }}
       >
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ font: `600 12.5px ${font.sans}`, color: color.inkSoft }}>
-            Leave this network
-          </div>
-          <div
-            style={{
-              font: `400 10.5px ${font.sans}`,
-              color: color.muted2,
-              marginTop: 2,
-              lineHeight: 1.4,
-            }}
-          >
-            Submits an on-chain self-removal (pending a strict majority of the
-            remaining members), stops this node, and forgets the workspace
-            locally.
-          </div>
-        </div>
-        <HoverButton
-          ariaLabel="Leave network"
+        <DangerRow
+          title="Leave this network"
+          detail={
+            <>
+              Submits an on-chain self-removal (pending a strict majority of the
+              remaining members). Your node keeps running until they approve;
+              once removed you can forget the workspace.
+              {inSet && validatorCount < 2 ? (
+                <> A solo node can’t remove the last validator — forget it below.</>
+              ) : null}
+            </>
+          }
+          buttonLabel="Request leave"
+          ariaLabel="Request leave"
           onClick={requestLeave}
-          hoverBg="#8f463d"
-          disabled={disabled}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            font: `600 11.5px ${font.sans}`,
-            color: color.onDark,
-            background: color.red,
-            borderRadius: 8,
-            padding: "8px 15px",
-          }}
-        >
-          Leave network
-        </HoverButton>
+          disabled={!canRequestLeave}
+        />
+        <DangerRow
+          title="Forget this workspace"
+          detail={
+            <>
+              Stops this node and deletes the workspace locally (directory +
+              registry entry). Guarded: refused while this node is still a
+              current validator of a network with other members.
+            </>
+          }
+          buttonLabel="Forget workspace"
+          ariaLabel="Forget workspace"
+          onClick={forget}
+          disabled={base}
+        />
       </div>
     </>
   );

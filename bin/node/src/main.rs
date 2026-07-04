@@ -749,6 +749,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
         Some("member-remove") => return cmd_member_remove(&args[1..]),
         Some("member-leave") => return cmd_member_leave(&args[1..]),
+        Some("member-status") => return cmd_member_status(&args[1..]),
         Some("join") => return cmd_join(&args[1..]),
         _ => {}
     }
@@ -764,7 +765,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|member-remove|member-leave|join — or \
+                     keygen|init|invite|admit|invite-accept|member-remove|member-leave|\
+                     member-status|join — or \
                      --config <path> [--sync-only])"
                 )
                 .into());
@@ -1420,6 +1422,45 @@ fn cmd_member_leave(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         forwarded.push(value.clone());
     }
     cmd_member_remove(&forwarded)
+}
+
+// ---- member-status: is THIS node still in the validator set? ----------------
+
+/// `member-status [--config node.toml]` — read this node's OWN membership off
+/// its RUNNING node's rpc and print one machine-parseable line to stdout:
+///
+/// ```text
+/// in-set=<true|false> validators=<count>
+/// ```
+///
+/// this is the read the desktop shell consults before FORGETTING a workspace
+/// (stop + delete): tearing a node down while it is still a current validator of
+/// a set of two-or-more strands its pending removal and halts quorum (a live
+/// network still needs its signature). the shell refuses a forget when
+/// `in-set=true` and `validators>=2`; a lone validator (`validators=1`) or an
+/// already-removed key (`in-set=false`) is safe to forget. requires the node to
+/// be up (it serves this over the same local rpc as `member-remove`).
+fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("member-status takes no positional args (got {pos:?})").into());
+    }
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("member-status reads the node's local rpc — set `rpc_listen` in node.toml")?;
+    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let members = read_members(&rpc_addr)?;
+    let in_set = members.contains(&me_bytes);
+    println!("in-set={in_set} validators={}", members.len());
+    Ok(())
 }
 
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]

@@ -137,10 +137,17 @@ export interface ConsoleActions {
   /** Open a removal proposal for a validator by pubkey and cast this node's
    *  yes-ballot; the removal takes effect only once a strict majority approve. */
   demoteMember(pubkey: string): void;
-  /** Leave the active network: drive this node's on-chain self-removal (pending
-   *  remaining-member approval), stop its node, and forget the workspace
-   *  locally — then switch to another workspace or open the onboarding gate. */
-  leaveWorkspace(): void;
+  /** Request to leave the active network: drive this node's on-chain
+   *  self-removal (pending remaining-member approval) and KEEP THE NODE RUNNING.
+   *  The node must stay up through its own pending removal or quorum can't
+   *  finalize it. On success the roster re-query shows the removal is pending;
+   *  once approved and this node drops out of the valset, use `forgetWorkspace`. */
+  requestLeaveWorkspace(): void;
+  /** Forget the active workspace: stop its node, delete its directory + registry
+   *  entry, then switch to another workspace or open the onboarding gate. Guarded
+   *  in the backend — refused while this node is still a current validator of a
+   *  set of two-or-more (that would halt quorum). */
+  forgetWorkspace(): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -784,35 +791,52 @@ export function createActions({
         .catch(fail);
     },
 
-    leaveWorkspace: () => {
+    requestLeaveWorkspace: () => {
+      const target = getState().workspace;
+      if (!target) return;
+      patch({ error: null });
+      // Submit the on-chain self-removal but KEEP the node running — it must
+      // stay up through its own pending removal or quorum can't finalize it.
+      // The per-block roster re-query surfaces the pending removal; nothing is
+      // torn down here.
+      Promise.resolve()
+        .then(() => ws.requestLeaveWorkspace(target.id))
+        .then(() => refresh())
+        .catch(fail);
+    },
+
+    forgetWorkspace: () => {
       const target = getState().workspace;
       if (!target) return;
       patch({ onboardingBusy: true, error: null });
-      // Drop the live node + its projections up front so no stale state lingers
-      // while the teardown runs (mirrors selectWorkspace's reset).
-      setNode(null);
-      patch({
-        connected: false,
-        status: null,
-        channels: [],
-        messages: [],
-        activeChannel: null,
-        activeThread: null,
-        authorNames: {},
-        tasks: [],
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
-        agents: [],
-        watches: [],
-        runs: [],
-        onboardingPhase: null,
-        inviteBlob: null,
-      });
+      // Call the GUARDED backend FIRST — it refuses while this node is still a
+      // current validator of a set of two-or-more. Only tear down the local
+      // node + projections once the backend has actually forgotten it, so a
+      // refused forget leaves the live UI intact (still connected, error shown).
       Promise.resolve()
-        .then(() => ws.leaveWorkspace(target.id))
+        .then(() => ws.forgetWorkspace(target.id))
         .then((next) => {
-          // Forget the left workspace in the switcher list.
+          // Forgotten: drop the live node + its projections (mirrors
+          // selectWorkspace's reset), then repoint the switcher.
+          setNode(null);
+          patch({
+            connected: false,
+            status: null,
+            channels: [],
+            messages: [],
+            activeChannel: null,
+            activeThread: null,
+            authorNames: {},
+            tasks: [],
+            docIds: [],
+            activeDoc: null,
+            activeDocBlocks: [],
+            agents: [],
+            watches: [],
+            runs: [],
+            onboardingPhase: null,
+            inviteBlob: null,
+          });
           update((prev) => ({
             workspaces: prev.workspaces.filter((w) => w.id !== target.id),
           }));
