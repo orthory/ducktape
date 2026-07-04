@@ -403,20 +403,46 @@ impl ConsensusHandle {
 /// is a no-op `true` — in this single-app sim every payload asked about is one we
 /// stored. generic over the public key `P` so `Context<Digest, P>` lines up with
 /// whatever scheme the engine runs.
-#[derive(Clone)]
-pub struct ConsensusAutomaton<P> {
+/// how long a leader holds an otherwise-idle view open, polling for an op or the
+/// node's heartbeat nop before declining. keeping a solo validator (no quorum to
+/// wait on) from spinning nullifications — and the height they stamp — at CPU
+/// speed. MUST exceed the node's heartbeat interval (`HEARTBEAT_INTERVAL`, 1s) so
+/// the beat always lands inside the window and the view advances by a single
+/// finalized block per beat (a clean ~1s block time), never a nullify + a
+/// finalize per beat.
+const IDLE_BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub struct ConsensusAutomaton<P, C> {
     pending: Arc<Mutex<VecDeque<Digest>>>,
     /// the SAME per-process store the paired handle `put`s into and the reporter
     /// `get`s from — `verify` gates a vote on holding the proposed payload here.
     store: ContentStore,
+    /// runtime clock, used only to pace idle proposals (see [`IDLE_BLOCK_TIME`]).
+    /// `Arc`-wrapped so the automaton stays cheaply `Clone` (the engine clones
+    /// it) WITHOUT demanding `C: Clone` — commonware's runtime `Context` is not.
+    clock: Arc<C>,
     _marker: std::marker::PhantomData<fn() -> P>,
 }
 
-impl<P> ConsensusAutomaton<P> {
-    pub fn new(store: ContentStore) -> Self {
+// hand-written (not derived): a derive would spuriously bound `C: Clone`, but the
+// clock is behind an `Arc` so cloning never touches `C`.
+impl<P, C> Clone for ConsensusAutomaton<P, C> {
+    fn clone(&self) -> Self {
+        Self {
+            pending: Arc::clone(&self.pending),
+            store: self.store.clone(),
+            clock: Arc::clone(&self.clock),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P, C> ConsensusAutomaton<P, C> {
+    pub fn new(store: ContentStore, clock: C) -> Self {
         Self {
             pending: Arc::new(Mutex::new(VecDeque::new())),
             store,
+            clock: Arc::new(clock),
             _marker: std::marker::PhantomData,
         }
     }
@@ -453,29 +479,46 @@ impl<P> ConsensusAutomaton<P> {
     }
 }
 
-impl<P> Automaton for ConsensusAutomaton<P>
+impl<P, C> Automaton for ConsensusAutomaton<P, C>
 where
     P: commonware_cryptography::PublicKey,
+    C: commonware_runtime::Clock + Send + Sync + 'static,
 {
     type Context = Context<Digest, P>;
     type Digest = Digest;
 
     async fn propose(&mut self, _context: Self::Context) -> oneshot::Receiver<Self::Digest> {
         let (tx, rx) = oneshot::channel();
-        // PEEK the front queued digest — do NOT remove it. if this view nullifies
-        // (routine while a peer mesh forms) the digest stays queued so we
-        // re-propose it next time we lead; popping here would lose it forever.
-        // removal happens at exactly one point — finalization, in
-        // `SimplexReporter::report`. if nothing is queued we drop `tx` (the trait
-        // reads that as "can't propose right now") and the engine moves on.
-        if let Some(digest) = self
-            .pending
-            .lock()
-            .expect("pending queue poisoned")
-            .front()
-            .copied()
-        {
-            tx.send_lossy(digest);
+        // PEEK the front queued digest — never remove it here. removal happens at
+        // exactly one point — finalization, in `SimplexReporter::report` — so a
+        // nullified view (routine while a peer mesh forms) keeps the frame
+        // proposable. with something queued, propose it at once.
+        //
+        // with NOTHING queued, do not decline INSTANTLY: a solo validator has no
+        // quorum to wait on, so an instant decline spins the view clock — and the
+        // block height it stamps — at CPU speed. hold the view open up to one
+        // block-time, polling so a freshly-submitted op or the node's heartbeat
+        // nop is proposed within a tick. still empty at the deadline → drop `tx`
+        // (the engine reads that as "can't propose" and nullifies), now paced to
+        // ~1 block per block-time.
+        let step = std::time::Duration::from_millis(100);
+        let mut waited = std::time::Duration::ZERO;
+        loop {
+            if let Some(digest) = self
+                .pending
+                .lock()
+                .expect("pending queue poisoned")
+                .front()
+                .copied()
+            {
+                tx.send_lossy(digest);
+                break;
+            }
+            if waited >= IDLE_BLOCK_TIME {
+                break;
+            }
+            self.clock.sleep(step).await;
+            waited += step;
         }
         rx
     }
@@ -509,7 +552,12 @@ where
     }
 }
 
-impl<P> CertifiableAutomaton for ConsensusAutomaton<P> where P: commonware_cryptography::PublicKey {}
+impl<P, C> CertifiableAutomaton for ConsensusAutomaton<P, C>
+where
+    P: commonware_cryptography::PublicKey,
+    C: commonware_runtime::Clock + Send + Sync + 'static,
+{
+}
 
 // ============================================================================
 // the no-op relay — a shared store makes payload dissemination unnecessary.
@@ -1133,7 +1181,10 @@ impl SimplexOrderer {
         // this validator's consensus triple over the ONE shared store: the
         // automaton peeks the FIFO, the submit handle pushes onto it, the reporter
         // removes on finalization and buffers into the inbox we return.
-        let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new(store.clone());
+        let automaton = ConsensusAutomaton::<ed25519::PublicKey, _>::new(
+            store.clone(),
+            context.child("automaton"),
+        );
         let handle = automaton.handle(store.clone());
         let inbox = FinalizedInbox::new();
         let latest_final = LatestFinalization::default();
@@ -1435,7 +1486,10 @@ impl SimplexOrderer {
         // the consensus triple; its ordered gate `inbox` is SHARED with the
         // resolver's consumer so a fetched payload FILLS the exact slot the reporter
         // logged for that digest.
-        let automaton = ConsensusAutomaton::<ed25519::PublicKey>::new(store.clone());
+        let automaton = ConsensusAutomaton::<ed25519::PublicKey, _>::new(
+            store.clone(),
+            context.child("automaton"),
+        );
         let handle = automaton.handle(store.clone());
         let inbox = FinalizedInbox::new();
 
@@ -1822,13 +1876,14 @@ mod tests {
         use commonware_runtime::{Runner, deterministic};
 
         let executor = deterministic::Runner::timed(std::time::Duration::from_secs(5));
-        executor.start(|_context| async move {
+        executor.start(|context| async move {
             let store = ContentStore::new();
             let digest = store.put(b"queued frame".to_vec());
 
             let mut automaton =
-                ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new(
+                ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey, _>::new(
                     store.clone(),
+                    context,
                 );
             automaton.enqueue(digest);
 
@@ -1869,11 +1924,12 @@ mod tests {
         use commonware_runtime::{Runner, deterministic};
 
         let executor = deterministic::Runner::timed(std::time::Duration::from_secs(5));
-        executor.start(|_context| async move {
+        executor.start(|context| async move {
             let store = ContentStore::new();
             let mut automaton =
-                ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey>::new(
+                ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey, _>::new(
                     store.clone(),
+                    context,
                 );
             let leader = PrivateKey::from_seed(0).public_key();
             let ctx = |payload| Context {

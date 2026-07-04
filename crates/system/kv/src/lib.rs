@@ -44,7 +44,7 @@ use commonware_storage::{
 };
 use commonware_utils::range::NonEmptyRange;
 
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, ResolverSyncTarget, StateRoot, StateSyncHandle};
 
 /// write-time cap on a LOGICAL key. the qmdb key is the 32-byte hash, so this is
 /// a hygiene bound at the interface seam (an unbounded key would still bloat the
@@ -312,15 +312,19 @@ where
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "serve_sync answers qmdb target + op-range requests (statesync wire)".into(),
+            detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
         })
     }
 
     /// the network state-sync serve lane: answers the shared qmdb wire requests
-    /// (current target, historical proof-carrying op ranges) from committed
-    /// state. read-only; the joiner's sync engine merkle-verifies every batch.
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         statesync::qmdb::serve_bytes(&self.db, req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        statesync::qmdb::resolver_sync_target(&self.db).await
     }
 
     /// interpret the payload as a json-encoded `(key, value)` write and apply it

@@ -31,7 +31,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sdk::{
-    Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
+    Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
+    StateSyncHandle,
 };
 
 /// hard cap on dispatches per `submit` (the root op plus all follow-ups). a
@@ -358,6 +359,14 @@ impl Host {
     pub async fn serve_sync(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
         match self.registry.get(target) {
             Some(m) => m.serve_sync(req).await,
+            None => Err(Error::UnknownModule(target.to_string())),
+        }
+    }
+
+    /// return a registered resolver-backed module's committed sync target.
+    pub async fn resolver_sync_target(&self, target: &str) -> Result<ResolverSyncTarget, Error> {
+        match self.registry.get(target) {
+            Some(m) => m.resolver_sync_target().await,
             None => Err(Error::UnknownModule(target.to_string())),
         }
     }

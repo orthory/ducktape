@@ -56,7 +56,7 @@ use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _};
+use commonware_p2p::{Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
@@ -95,10 +95,10 @@ use node::OrderedNode;
 use profiles::Profiles;
 use recovery::{Manifest, Recovery};
 use saga::SagaModule;
-use sdk::{Msg, StateRoot};
+use sdk::{ModuleId, Msg, StateRoot};
 use statesync::p2p::P2pSyncClient;
 use statesync::qmdb::RemoteQmdbResolver;
-use statesync::{SyncServer, fetch_manifest, fetch_snapshot};
+use statesync::{SyncServer, fetch_frames, fetch_manifest, fetch_snapshot};
 use tasks::Tasks;
 use upgrade::Upgrade;
 use valset::Valset;
@@ -113,12 +113,25 @@ use vaults::Vaults;
 /// node that tracks it (epoch participant sets are; instantaneous valset
 /// projections are not).
 const PEER_SET: u64 = 0;
-/// a deliberately-unregistered module target. while an epoch cutover is
-/// pending, validators submit empty frames against it: finalized views only
-/// advance with ops, so an idle network would otherwise park AT the armed
-/// boundary forever. the frame finalizes, rejects deterministically on every
-/// node (unknown module), advances the engine clock, and leaves no state.
+/// a deliberately-unregistered module target. validators submit empty frames
+/// against it to advance the chain when there are no user ops: finalized views
+/// only move with ops, so an idle network would otherwise freeze — parking AT an
+/// armed cutover boundary forever, and never ticking the height the console
+/// shows. the frame finalizes, rejects deterministically on every node (unknown
+/// module), advances the engine clock, and leaves no state.
 const NOP_TARGET: &str = "consensus.nop";
+/// heartbeat cadence: how often a node pushes a [`NOP_TARGET`] frame so an idle
+/// chain still finalizes blocks (its height keeps ticking) and any pending
+/// cutover still crosses. one block/sec while idle is the accepted cost of a
+/// visibly-live height.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// request timeout for the promoted-validator boot catch-up client. it is long
+/// enough to let discovery links warm, but bounded so boot cannot hang forever
+/// before the statesync server bridge is installed.
+const BOOT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+/// post-reboot catch-up should close the reboot gap, not chase a live chain
+/// forever. any tiny lag left after this cap is handled by the normal engine.
+const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
 /// max wire message size we accept on a channel (1 MiB) — generous for the small
 /// json frames + BFT metadata, and the statesync chunk size (256 KiB) plus
 /// framing stays far below it.
@@ -628,25 +641,33 @@ async fn sync_all_modules<C: statesync::SyncClient>(
             .ok_or_else(|| format!("module {module} missing from the manifest"))?
             .root)
     };
-    let child_label =
-        |name: &str| -> &'static str { Box::leak(format!("{name}_a{attempt}").into_boxed_str()) };
+    let scratch_context = context.child(Box::leak(
+        format!("sync_scratch_a{attempt}").into_boxed_str(),
+    ));
+    let child_label = |name: &str| -> &'static str {
+        Box::leak(format!("{name}_scratch_a{attempt}").into_boxed_str())
+    };
+    let pinned_target = |module: &'static str| -> Result<statesync::qmdb::SyncTarget, String> {
+        let entry = manifest
+            .entry(module)
+            .ok_or_else(|| format!("module {module} missing from the manifest"))?;
+        let pinned = entry
+            .resolver_target
+            .as_ref()
+            .ok_or_else(|| format!("module {module} missing pinned resolver target"))?;
+        pinned.to_sync_target().map_err(|e| format!("{module} {e}"))
+    };
 
-    // resolver lane: live target through the module lane, gated on the
-    // manifest root (a busy source has moved on -> Err -> the caller
-    // refetches the manifest at the new boundary), then merkle-verified op
-    // batches through the remote resolver.
+    // resolver lane: adopt the manifest's pinned target, then fetch only
+    // boundary-scoped op batches through the remote resolver.
     let fetch_target = |module: &'static str| {
-        let resolver = RemoteQmdbResolver::new(client.clone(), module);
-        let root = entry_root(module);
+        let resolver = RemoteQmdbResolver::new(client.clone(), manifest.boundary_id(), module);
         async move {
-            let root = root?;
-            let target = resolver
-                .fetch_target()
-                .await
-                .map_err(|e| format!("{module} target: {e}"))?;
+            let target = pinned_target(module)?;
+            let root = entry_root(module)?;
             if StateRoot(target.root.0) != root {
                 return Err(format!(
-                    "{module} live target moved past the captured boundary (busy source)"
+                    "{module} pinned target root does not match the manifest root"
                 ));
             }
             Ok::<_, String>((target, resolver))
@@ -654,11 +675,17 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     };
 
     let (target, resolver) = fetch_target("kv").await?;
-    let kv = Kv::sync_from(context.child(child_label("kv")), "kv", target, resolver).await;
+    let kv = Kv::sync_from(
+        scratch_context.child(child_label("kv")),
+        "kv",
+        target,
+        resolver,
+    )
+    .await;
 
     let (target, resolver) = fetch_target("document").await?;
     let document = Document::sync_from(
-        context.child(child_label("document")),
+        scratch_context.child(child_label("document")),
         "document",
         target,
         resolver,
@@ -666,17 +693,23 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     .await;
 
     let (target, resolver) = fetch_target("chat").await?;
-    let chat = Chat::sync_from(context.child(child_label("chat")), "chat", target, resolver).await;
+    let chat = Chat::sync_from(
+        scratch_context.child(child_label("chat")),
+        "chat",
+        target,
+        resolver,
+    )
+    .await;
 
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
         let client = client.clone();
-        let height = manifest.height;
+        let boundary = manifest.boundary_id();
         let root = entry_root(module);
         async move {
             let root = root?;
-            let bytes = fetch_snapshot(&client, height, module)
+            let bytes = fetch_snapshot(&client, boundary, module)
                 .await
                 .map_err(|e| format!("{module} snapshot: {e}"))?;
             Ok::<_, String>((bytes, root))
@@ -825,6 +858,654 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         ));
     }
     Ok(host)
+}
+
+fn assert_floor_binds_view(
+    view_base: u64,
+    boundary_height: u64,
+    cert_view: u64,
+) -> Result<(), String> {
+    let certified_height = view_base
+        .checked_add(cert_view)
+        .ok_or_else(|| format!("floor view {cert_view} overflows view_base {view_base}"))?;
+    if certified_height != boundary_height {
+        return Err(format!(
+            "floor certifies height {certified_height}, not boundary {boundary_height}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionBoundarySource {
+    Latest,
+}
+
+impl PromotionBoundarySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            PromotionBoundarySource::Latest => "latest",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionBoundary<'a> {
+    Promote {
+        boundary: &'a statesync::Manifest,
+        source: PromotionBoundarySource,
+    },
+    Retry,
+}
+
+fn latest_boundary_has_floor(latest: &statesync::Manifest) -> bool {
+    latest.height <= latest.view_base || latest.floor_cert.is_some()
+}
+
+fn choose_promotion_boundary<'a>(
+    synced_host_hash: StateRoot,
+    latest: &'a statesync::Manifest,
+    self_public_key: &[u8],
+) -> PromotionBoundary<'a> {
+    if !latest.participants.iter().any(|key| key == self_public_key) {
+        return PromotionBoundary::Retry;
+    }
+    if latest.app_hash == synced_host_hash {
+        return if latest_boundary_has_floor(latest) {
+            PromotionBoundary::Promote {
+                boundary: latest,
+                source: PromotionBoundarySource::Latest,
+            }
+        } else {
+            PromotionBoundary::Retry
+        };
+    }
+    PromotionBoundary::Retry
+}
+
+fn diag_log(line: impl AsRef<str>) {
+    let Ok(path) = std::env::var("DUCKTAPE_DIAG_LOG") else {
+        return;
+    };
+    let line = line.as_ref();
+    println!("{line}");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            if let Err(e) = writeln!(file, "{line}") {
+                eprintln!("DUCKTAPE_DIAG_LOG append failed for {path}: {e}");
+            }
+        }
+        Err(e) => eprintln!("DUCKTAPE_DIAG_LOG open failed for {path}: {e}"),
+    }
+}
+
+fn reopen_preflight_synced_host(host: &Host, expected: StateRoot) -> Result<(), String> {
+    let live = host.app_hash();
+    if live != expected {
+        return Err(format!(
+            "preflight app_hash {} != boundary {}",
+            hex(&live),
+            hex(&expected)
+        ));
+    }
+    Ok(())
+}
+
+fn verify_manifest_floor(
+    namespace: &[u8],
+    signer: &ed25519::PrivateKey,
+    boundary: &statesync::Manifest,
+) -> Result<Option<Vec<u8>>, String> {
+    if boundary.height <= boundary.view_base {
+        return Ok(None);
+    }
+    let cert = boundary
+        .floor_cert
+        .clone()
+        .ok_or_else(|| "boundary past its epoch base has no finalization floor".to_string())?;
+    let mut keys = Vec::with_capacity(boundary.participants.len());
+    for k in &boundary.participants {
+        let pk = ed25519::PublicKey::decode(k.as_slice())
+            .map_err(|e| format!("served participant set holds a non-ed25519 key: {e}"))?;
+        keys.push(pk);
+    }
+    let participants =
+        Set::try_from(keys).map_err(|_| "served participant set has duplicates".to_string())?;
+    let scheme = match CONSENSUS_SCHEME {
+        ConsensusScheme::V1Ed25519 => {
+            simplex_ed25519::Scheme::signer(namespace, participants, signer.clone())
+                .expect("our key is in the served participant set")
+        }
+        ConsensusScheme::V2Bls => {
+            unimplemented!("V2Bls joiner wiring lands with valset bls key registration")
+        }
+    };
+    let finalization = consensus::decode_finalization(&scheme, &cert).map_err(|e| {
+        format!(
+            "served finalization floor does not verify against the epoch's participant set: {e}"
+        )
+    })?;
+    assert_floor_binds_view(
+        boundary.view_base,
+        boundary.height,
+        finalization.proposal.round.view().get(),
+    )
+    .map_err(|e| format!("served finalization floor is stale: {e}"))?;
+    Ok(Some(cert))
+}
+
+fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
+    match disposition {
+        statesync::FrameDisposition::Applied => node::Disposition::Applied,
+        statesync::FrameDisposition::Rejected => node::Disposition::Rejected,
+    }
+}
+
+fn to_sync_disposition(
+    disposition: node::Disposition,
+) -> Result<statesync::FrameDisposition, String> {
+    match disposition {
+        node::Disposition::Applied => Ok(statesync::FrameDisposition::Applied),
+        node::Disposition::Rejected => Ok(statesync::FrameDisposition::Rejected),
+        node::Disposition::Discarded => Err("discarded frames are not recovery-journaled".into()),
+    }
+}
+
+fn recovery_frame_to_sync(
+    frame: recovery::JournalFrame,
+) -> Result<statesync::FinalizedFrame, String> {
+    Ok(statesync::FinalizedFrame {
+        height: frame.height,
+        frame: frame.frame,
+        disposition: to_sync_disposition(frame.disposition)?,
+        roots: frame.roots,
+        app_hash: frame.app_hash,
+    })
+}
+
+async fn apply_verified_suffix_frame(
+    host: &mut Host,
+    served: &statesync::FinalizedFrame,
+) -> Result<(), String> {
+    let expected = to_node_disposition(served.disposition);
+    let outcome = match node::decode_frame(&served.frame) {
+        Ok((origin, msg)) => {
+            let protocol_version = host.effective_version(served.height).await;
+            host.set_active_version(protocol_version);
+            let ctx = host::BlockContext {
+                protocol_version,
+                height: served.height,
+                consensus_time: served.height,
+                origin,
+            };
+            match host.submit_at(ctx, msg).await {
+                Ok(_) => node::Disposition::Applied,
+                Err(host::SubmitError::Rejected(_)) => node::Disposition::Rejected,
+                Err(host::SubmitError::Fatal(f)) => {
+                    return Err(format!("fatal host error applying suffix frame: {f}"));
+                }
+            }
+        }
+        Err(_) => node::Disposition::Rejected,
+    };
+    if outcome != expected {
+        return Err(format!(
+            "served seal mismatch at height {}: replay landed as {outcome:?}, \
+             served as {expected:?}",
+            served.height
+        ));
+    }
+    let roots = host.module_roots();
+    if roots != served.roots {
+        return Err(format!(
+            "served seal mismatch at height {}: roots changed to {:?}, served {:?}",
+            served.height, roots, served.roots
+        ));
+    }
+    let app_hash = host.app_hash();
+    if app_hash != served.app_hash {
+        return Err(format!(
+            "served seal mismatch at height {}: app_hash {} != served {}",
+            served.height,
+            hex(&app_hash),
+            hex(&served.app_hash)
+        ));
+    }
+    Ok(())
+}
+
+async fn apply_and_journal_verified_frame<E>(
+    recovery: &mut Recovery<E>,
+    host: &mut Host,
+    frame: &statesync::FinalizedFrame,
+) -> Result<(), String>
+where
+    E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
+{
+    node::BlockSink::pre_apply(recovery, frame.height, &frame.frame)
+        .await
+        .map_err(|e| format!("catch-up WAL write: {e}"))?;
+    apply_verified_suffix_frame(host, frame).await?;
+    let seal = node::BlockSeal {
+        height: frame.height,
+        disposition: to_node_disposition(frame.disposition),
+        roots: host.module_roots(),
+        app_hash: host.app_hash(),
+    };
+    node::BlockSink::seal(recovery, &seal)
+        .await
+        .map_err(|e| format!("catch-up seal write: {e}"))?;
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct PostRebootCatchupApply {
+    applied: usize,
+    frames: Vec<Vec<u8>>,
+    blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)>,
+}
+
+async fn apply_post_reboot_catchup_frames<E>(
+    recovery: &mut Recovery<E>,
+    host: &mut Host,
+    from_height: u64,
+    to_height: u64,
+    frames: Vec<statesync::FinalizedFrame>,
+) -> Result<PostRebootCatchupApply, String>
+where
+    E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
+{
+    if to_height < from_height {
+        return Err(format!(
+            "invalid catch-up range ({from_height}, {to_height}]"
+        ));
+    }
+    if from_height == to_height {
+        if !frames.is_empty() {
+            return Err(format!(
+                "no-gap catch-up received {} unexpected frames",
+                frames.len()
+            ));
+        }
+        return Ok(PostRebootCatchupApply::default());
+    }
+    if frames.last().map(|f| f.height) != Some(to_height) {
+        return Err(format!(
+            "catch-up frames stopped before target height {to_height}"
+        ));
+    }
+
+    let mut last = from_height;
+    let mut applied = PostRebootCatchupApply::default();
+    for frame in frames {
+        if frame.height <= last || frame.height > to_height {
+            return Err(format!(
+                "catch-up frame height {} outside ({last}, {to_height}]",
+                frame.height
+            ));
+        }
+        apply_and_journal_verified_frame(recovery, host, &frame).await?;
+        last = frame.height;
+        applied.applied += 1;
+        applied.frames.push(frame.frame.clone());
+        applied.blocks.push((frame.height, frame.roots.clone()));
+    }
+    Ok(applied)
+}
+
+fn catchup_pending_cutover_view(
+    base_manifest: Option<&Manifest>,
+    target: &statesync::Manifest,
+    blocks: &[(u64, Vec<(ModuleId, StateRoot)>)],
+) -> Result<Option<u64>, String> {
+    let Some(base) = base_manifest else {
+        return Ok(None);
+    };
+    if base.epoch == target.epoch && base.pending_cutover_view.is_some() {
+        return Ok(base.pending_cutover_view);
+    }
+    let Some(mut prev_root) = base.root("valset") else {
+        return Ok(None);
+    };
+    for (height, roots) in blocks {
+        let root = roots
+            .iter()
+            .find(|(id, _)| id == "valset")
+            .map(|(_, root)| *root)
+            .ok_or_else(|| format!("catch-up seal at height {height} has no valset root"))?;
+        if root != prev_root && *height > target.view_base {
+            return Ok(Some(*height - target.view_base + CUTOVER_DELAY));
+        }
+        prev_root = root;
+    }
+    Ok(None)
+}
+
+async fn write_post_reboot_catchup_checkpoint<E>(
+    recovery: &mut Recovery<E>,
+    host: &Host,
+    base_manifest: Option<&Manifest>,
+    target: &statesync::Manifest,
+    blocks: &[(u64, Vec<(ModuleId, StateRoot)>)],
+    next_seq: u64,
+) -> Result<Manifest, String>
+where
+    E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
+{
+    if host.app_hash() != target.app_hash {
+        return Err(format!(
+            "catch-up checkpoint host hash {} does not match target {}",
+            hex(&host.app_hash()),
+            hex(&target.app_hash)
+        ));
+    }
+    let pending_cutover_view = catchup_pending_cutover_view(base_manifest, target, blocks)?;
+    let pos = recovery.oplog_pos().await;
+    let ckpt = Manifest::capture(
+        host,
+        Some(target.height),
+        target.epoch,
+        target.view_base,
+        target.participants.clone(),
+        pending_cutover_view,
+        target.current_version,
+        target.pending_upgrade.clone(),
+        pos,
+        next_seq,
+    )
+    .map_err(|e| format!("catch-up checkpoint capture: {e}"))?;
+    recovery
+        .write_manifest(&ckpt)
+        .await
+        .map_err(|e| format!("catch-up checkpoint write: {e}"))?;
+    diag_log(format!("DIAG catchup_checkpoint height={}", target.height));
+    Ok(ckpt)
+}
+
+#[derive(Debug)]
+struct PostRebootCatchup {
+    from_height: u64,
+    to_height: u64,
+    frames: usize,
+    target: Option<statesync::Manifest>,
+    frame_bytes: Vec<Vec<u8>>,
+    blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)>,
+}
+
+#[derive(Debug)]
+enum PostRebootCatchupError {
+    Retry(String),
+    RangePruned {
+        target: statesync::Manifest,
+        requested_after: u64,
+        retained_from: u64,
+    },
+    Fatal(String),
+}
+
+async fn catch_up_post_reboot_frames<C, E>(
+    client: &C,
+    recovery: &mut Recovery<E>,
+    host: &mut Host,
+    recovered_height: u64,
+    max_iterations: usize,
+) -> Result<PostRebootCatchup, PostRebootCatchupError>
+where
+    C: statesync::SyncClient,
+    E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
+{
+    let mut current_height = recovered_height;
+    let mut total_frames = 0usize;
+    let mut target = None;
+    let mut frame_bytes = Vec::new();
+    let mut blocks = Vec::new();
+
+    for _ in 0..=max_iterations {
+        let tip = fetch_manifest(client).await.map_err(|e| {
+            PostRebootCatchupError::Retry(format!("catch-up manifest unavailable: {e}"))
+        })?;
+        if tip.height <= current_height {
+            if tip.height == current_height && host.app_hash() != tip.app_hash {
+                return Err(PostRebootCatchupError::Fatal(format!(
+                    "catch-up source hash {} at height {} does not match recovered host {}",
+                    hex(&tip.app_hash),
+                    tip.height,
+                    hex(&host.app_hash())
+                )));
+            }
+            diag_log(format!(
+                "DIAG post_reboot_catchup from={} to={} frames={}",
+                recovered_height, current_height, total_frames
+            ));
+            return Ok(PostRebootCatchup {
+                from_height: recovered_height,
+                to_height: current_height,
+                frames: total_frames,
+                target: target.or_else(|| {
+                    (tip.height == current_height && host.app_hash() == tip.app_hash).then_some(tip)
+                }),
+                frame_bytes,
+                blocks,
+            });
+        }
+
+        let frames = match fetch_frames(client, current_height, tip.height).await {
+            Ok(frames) => frames,
+            Err(statesync::SyncError::RangePruned {
+                requested_after,
+                retained_from,
+            }) => {
+                return Err(PostRebootCatchupError::RangePruned {
+                    target: tip,
+                    requested_after,
+                    retained_from,
+                });
+            }
+            Err(e) => {
+                return Err(PostRebootCatchupError::Retry(format!(
+                    "catch-up frame suffix unavailable: {e}"
+                )));
+            }
+        };
+        let applied =
+            apply_post_reboot_catchup_frames(recovery, host, current_height, tip.height, frames)
+                .await
+                .map_err(PostRebootCatchupError::Fatal)?;
+        if host.app_hash() != tip.app_hash {
+            return Err(PostRebootCatchupError::Fatal(format!(
+                "catch-up frames landed at {}, target manifest {}",
+                hex(&host.app_hash()),
+                hex(&tip.app_hash)
+            )));
+        }
+        current_height = tip.height;
+        total_frames += applied.applied;
+        frame_bytes.extend(applied.frames);
+        blocks.extend(applied.blocks);
+        target = Some(tip);
+    }
+
+    diag_log(format!(
+        "DIAG post_reboot_catchup from={} to={} frames={}",
+        recovered_height, current_height, total_frames
+    ));
+    Ok(PostRebootCatchup {
+        from_height: recovered_height,
+        to_height: current_height,
+        frames: total_frames,
+        target,
+        frame_bytes,
+        blocks,
+    })
+}
+
+struct BootP2pSyncClient<S, R>
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey>,
+    R: P2pReceiver<PublicKey = ed25519::PublicKey>,
+{
+    sender: S,
+    server: ed25519::PublicKey,
+    receiver: std::sync::Arc<tokio::sync::Mutex<Option<R>>>,
+    next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<S, R> Clone for BootP2pSyncClient<S, R>
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey>,
+    R: P2pReceiver<PublicKey = ed25519::PublicKey>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            server: self.server.clone(),
+            receiver: std::sync::Arc::clone(&self.receiver),
+            next_id: std::sync::Arc::clone(&self.next_id),
+        }
+    }
+}
+
+impl<S, R> BootP2pSyncClient<S, R>
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey>,
+    R: P2pReceiver<PublicKey = ed25519::PublicKey>,
+{
+    fn new(sender: S, receiver: R, server: ed25519::PublicKey) -> Self {
+        Self {
+            sender,
+            server,
+            receiver: std::sync::Arc::new(tokio::sync::Mutex::new(Some(receiver))),
+            next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn into_parts(self) -> Result<(S, R), String> {
+        let Self {
+            sender, receiver, ..
+        } = self;
+        let receiver = std::sync::Arc::try_unwrap(receiver)
+            .map_err(|_| "boot statesync client still has live clones".to_string())?
+            .into_inner()
+            .ok_or_else(|| "boot statesync receiver already taken".to_string())?;
+        Ok((sender, receiver))
+    }
+}
+
+impl<S, R> statesync::SyncClient for BootP2pSyncClient<S, R>
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey> + Send + Sync + 'static,
+    R: P2pReceiver<PublicKey = ed25519::PublicKey> + Send + 'static,
+{
+    fn request(
+        &self,
+        req: statesync::SyncRequest,
+    ) -> impl std::future::Future<Output = Result<statesync::SyncResponse, statesync::SyncError>> + Send
+    {
+        let mut sender = self.sender.clone();
+        let server = self.server.clone();
+        let receiver = std::sync::Arc::clone(&self.receiver);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        async move {
+            let mut guard = receiver.lock().await;
+            let receiver = guard.as_mut().ok_or_else(|| {
+                statesync::SyncError::Transport("boot statesync receiver closed".into())
+            })?;
+            let frame = statesync::encode_rpc(id, &statesync::encode_request(&req));
+            let attempted = sender.send(Recipients::One(server.clone()), IoBuf::from(frame), false);
+            if attempted.is_empty() {
+                return Err(statesync::SyncError::Transport(
+                    "server peer unreachable (send attempted no recipients)".into(),
+                ));
+            }
+            loop {
+                let delivered =
+                    tokio::time::timeout(BOOT_SYNC_REQUEST_TIMEOUT, receiver.recv()).await;
+                let (peer, msg) = match delivered {
+                    Ok(Ok(item)) => item,
+                    Ok(Err(_)) => {
+                        return Err(statesync::SyncError::Transport(
+                            "boot statesync channel closed".into(),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(statesync::SyncError::Transport(format!(
+                            "boot statesync request {id} timed out"
+                        )));
+                    }
+                };
+                if peer != server {
+                    continue;
+                }
+                let bytes: Vec<u8> = msg.into();
+                let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                    continue;
+                };
+                if rpc_id != id {
+                    continue;
+                }
+                return Ok(statesync::decode_response(body)?);
+            }
+        }
+    }
+}
+
+fn resume_member_keys(
+    resumed: Option<&recovery::Recovered>,
+    validators: &[ed25519::PublicKey],
+) -> Result<Vec<ed25519::PublicKey>, String> {
+    let raw: Vec<Vec<u8>> = match resumed {
+        Some(rec) => rec.participants.clone(),
+        None => validators.iter().map(|k| k.as_ref().to_vec()).collect(),
+    };
+    let mut keys = Vec::with_capacity(raw.len());
+    for k in &raw {
+        keys.push(
+            ed25519::PublicKey::decode(k.as_slice())
+                .map_err(|e| format!("recovered participant set holds a non-ed25519 key: {e}"))?,
+        );
+    }
+    Ok(keys)
+}
+
+fn advance_next_seq_from_frames(next_seq: &mut u64, frames: &[Vec<u8>], me: &[u8]) {
+    for frame in frames {
+        if let Some((origin, seq)) = node::frame_origin_seq(frame) {
+            if origin == me {
+                *next_seq = (*next_seq).max(seq + 1);
+            }
+        }
+    }
+}
+
+fn derive_pending_boot(manifest: &Manifest, rec: &recovery::Recovered) -> Option<u64> {
+    let checkpoint_pending = if rec.epoch == manifest.epoch {
+        manifest.pending_cutover_view
+    } else {
+        None
+    };
+    checkpoint_pending.or_else(|| {
+        let mut prev_root = manifest.root("valset").expect("valset is a genesis module");
+        let mut armed = None;
+        for (height, roots) in &rec.blocks {
+            let root = roots
+                .iter()
+                .find(|(id, _)| id == "valset")
+                .map(|(_, r)| *r)
+                .expect("every seal carries the full root vector");
+            if root != prev_root && *height > rec.view_base && armed.is_none() {
+                armed = Some(*height - rec.view_base + CUTOVER_DELAY);
+            }
+            prev_root = root;
+        }
+        armed
+    })
 }
 
 /// replace this process with a fresh invocation of itself (same argv): the
@@ -2118,7 +2799,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let me_bytes = signer.public_key().as_ref().to_vec();
             let mut last_tracked = PEER_SET;
             let mut attempt = 0usize;
-            let (boundary, host) = loop {
+            let (boundary, host, floor) = loop {
                 attempt += 1;
                 if attempt > 900 {
                     // ~30 minutes of 2s retries: parking forever is operator
@@ -2200,60 +2881,81 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     std::process::exit(1);
                 }
                 match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
-                    Ok(host) => break (m, host),
-                    // a busy source moves its live qmdb targets past the
-                    // captured boundary mid-sync; refetch and try again at
-                    // the new boundary.
+                    Ok(host) => {
+                        let latest = match fetch_manifest(&client).await {
+                            Ok(latest) => latest,
+                            Err(e) => {
+                                println!(
+                                    "[node {label}] synced boundary {} but could not revalidate \
+                                     latest manifest ({e}); retrying",
+                                    m.height
+                                );
+                                continue;
+                            }
+                        };
+                        let host_hash = host.app_hash();
+                        diag_log(format!(
+                            "DIAG admission_revalidate synced_height={} synced_hash={} \
+                             latest_height={} latest_hash={} host_hash={} latest_matches_host={} \
+                             latest_floor_present={}",
+                            m.height,
+                            hex(&m.app_hash),
+                            latest.height,
+                            hex(&latest.app_hash),
+                            hex(&host_hash),
+                            latest.app_hash == host_hash,
+                            latest.floor_cert.is_some()
+                        ));
+                        if let Err(e) = reopen_preflight_synced_host(&host, m.app_hash) {
+                            eprintln!("[node {label}] FATAL: promotion preflight failed: {e}");
+                            std::process::exit(1);
+                        }
+                        match choose_promotion_boundary(host_hash, &latest, &me_bytes) {
+                            PromotionBoundary::Promote { boundary, source } => {
+                                diag_log(format!(
+                                    "DIAG promotion_boundary chosen_height={} chosen_hash={} \
+                                     chosen_floor_present={} source={}",
+                                    boundary.height,
+                                    hex(&boundary.app_hash),
+                                    boundary.floor_cert.is_some(),
+                                    source.as_str()
+                                ));
+                                let boundary = boundary.clone();
+                                let boundary_floor =
+                                    match verify_manifest_floor(&namespace, &signer, &boundary) {
+                                        Ok(floor) => floor,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[node {label}] FATAL: promotion floor verify: {e}"
+                                            );
+                                            std::process::exit(1);
+                                        }
+                                    };
+                                diag_log(format!(
+                                    "DIAG suffix_install from={} to={} frames=0",
+                                    boundary.height, boundary.height
+                                ));
+                                let floor = boundary_floor.map(|cert| recovery::FloorCert {
+                                    epoch: boundary.epoch,
+                                    height: boundary.height,
+                                    cert,
+                                });
+                                break (boundary, host, floor);
+                            }
+                            PromotionBoundary::Retry => {}
+                        }
+                        println!(
+                            "[node {label}] boundary {} drifted during sync ({} -> latest {}); \
+                             discarding scratch and retrying",
+                            m.height,
+                            hex(&m.app_hash),
+                            hex(&latest.app_hash)
+                        );
+                    }
                     Err(e) => println!("[node {label}] sync at boundary {} failed: {e}", m.height),
                 }
             };
             println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
-
-            // validate the floor certificate against the epoch's scheme
-            // BEFORE persisting it — a lying source must fail the join here,
-            // not brick the validator boot after.
-            let floor = if boundary.height > boundary.view_base {
-                let cert = boundary
-                    .floor_cert
-                    .clone()
-                    .expect("the park loop only breaks past the base with a floor");
-                let mut keys = Vec::with_capacity(boundary.participants.len());
-                for k in &boundary.participants {
-                    match ed25519::PublicKey::decode(k.as_slice()) {
-                        Ok(pk) => keys.push(pk),
-                        Err(e) => {
-                            eprintln!(
-                                "[node {label}] FATAL: served participant set holds a \
-                                 non-ed25519 key: {e}"
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                let participants =
-                    Set::try_from(keys).expect("served participant set has no duplicates");
-                let scheme = match CONSENSUS_SCHEME {
-                    ConsensusScheme::V1Ed25519 => simplex_ed25519::Scheme::signer(
-                        &namespace,
-                        participants,
-                        signer.clone(),
-                    )
-                    .expect("our key is in the served participant set"),
-                    ConsensusScheme::V2Bls => unimplemented!(
-                        "V2Bls joiner wiring lands with valset bls key registration"
-                    ),
-                };
-                if let Err(e) = consensus::decode_finalization(&scheme, &cert) {
-                    eprintln!(
-                        "[node {label}] FATAL: served finalization floor does not verify \
-                         against the epoch's participant set: {e}"
-                    );
-                    std::process::exit(1);
-                }
-                Some(cert)
-            } else {
-                None
-            };
 
             // fabricate the checkpoint a restart would have left; the normal
             // recovery boot turns it into a live validator. next_seq starts
@@ -2262,6 +2964,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // payload) pair could be dropped by a peer's in-process digest
             // gate; accepted edge until submit sequences ride app state.)
             let pos = recovery.oplog_pos().await;
+            let floor_height = floor
+                .as_ref()
+                .map(|floor| floor.height.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            diag_log(format!(
+                "DIAG promotion_checkpoint checkpoint_height={} checkpoint_hash={} \
+                 floor_height={} floor_present={}",
+                boundary.height,
+                hex(&host.app_hash()),
+                floor_height,
+                floor.is_some()
+            ));
             // stamp the real committed version fields so the fabricated checkpoint
             // carries the same `required_min_version` a live checkpoint would; the
             // promotion boot then preflights against them like any restart.
@@ -2288,13 +3002,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 eprintln!("[node {label}] FATAL: promotion checkpoint write: {e}");
                 std::process::exit(1);
             }
-            if let Some(cert) = floor {
-                let fc = recovery::FloorCert {
-                    epoch: boundary.epoch,
-                    height: boundary.height,
-                    cert,
-                };
-                if let Err(e) = recovery.write_floor_cert(&fc).await {
+            if let Some(fc) = &floor {
+                if let Err(e) = recovery.write_floor_cert(fc).await {
                     eprintln!("[node {label}] FATAL: promotion floor-cert write: {e}");
                     std::process::exit(1);
                 }
@@ -2306,15 +3015,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             reboot_self();
         }
         // (host, recovered-state, next local submit seq, last checkpoint
-        // (height, oplog position) for the pump's prune bookkeeping, and a
-        // cutover the pre-crash process had armed but not crossed).
-        let (host, resumed, mut next_seq, mut prev_ckpt, pending_boot): (
+        // (height, oplog position) for the pump's prune bookkeeping, and the
+        // manifest that recovery used as its replay baseline).
+        let (
+            mut host,
+            mut resumed,
+            mut next_seq,
+            mut prev_ckpt,
+            mut recovery_manifest_for_resume,
+        ): (
             Host,
             Option<recovery::Recovered>,
             u64,
             (Option<u64>, u64),
-            Option<u64>,
-        ) = match manifest {
+            Option<Manifest>,
+        ) = match manifest.clone() {
             None => {
                 // a journal without a checkpoint is damage, not a fresh dir —
                 // booting genesis over it would silently fork this node.
@@ -2398,13 +3113,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // then any retained frame of ours above it.
                 let me_bytes = signer.public_key().as_ref().to_vec();
                 let mut next_seq = manifest.next_seq;
-                for frame in &rec.frames {
-                    if let Some((origin, seq)) = node::frame_origin_seq(frame) {
-                        if origin == me_bytes {
-                            next_seq = next_seq.max(seq + 1);
-                        }
-                    }
-                }
+                advance_next_seq_from_frames(&mut next_seq, &rec.frames, &me_bytes);
                 println!(
                     "[node {label}] recovered app_hash={} height={} epoch={} (replayed {}, \
                      already-on-disk {}{})",
@@ -2415,58 +3124,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     rec.skipped,
                     if rec.rolled_forward { ", rolled 1 forward" } else { "" },
                 );
-                // a cutover armed but not crossed before the crash: recorded
-                // in the checkpoint (valid only while no cutover happened
-                // since — a newer epoch means that boundary was crossed), or
-                // derived from the replayed seals: the first CURRENT-epoch
-                // block that moved the valset root armed the boundary at its
-                // view + the delay. deterministic — the same block arms the
-                // same boundary on every node.
-                let pending_boot = if rec.epoch == manifest.epoch {
-                    manifest.pending_cutover_view
-                } else {
-                    None
-                }
-                .or_else(|| {
-                    let mut prev_root =
-                        manifest.root("valset").expect("valset is a genesis module");
-                    let mut armed = None;
-                    for (height, roots) in &rec.blocks {
-                        let root = roots
-                            .iter()
-                            .find(|(id, _)| id == "valset")
-                            .map(|(_, r)| *r)
-                            .expect("every seal carries the full root vector");
-                        if root != prev_root && *height > rec.view_base && armed.is_none() {
-                            armed = Some(*height - rec.view_base + CUTOVER_DELAY);
-                        }
-                        prev_root = root;
-                    }
-                    armed
-                });
-                // a node that crashed mid-window and resumes must re-arm the SAME
-                // shared cutover slot from the recovered pending UPGRADE (design:
-                // one boundary carries both concerns), so it flips at the identical
-                // deterministic H as an uninterrupted peer. only when a membership
-                // cutover did NOT already claim the slot, and only for a boundary
-                // strictly ahead of the recovered tip (an already-crossed boundary
-                // reconciled in-block during replay). the shared-slot cutover_view is
-                // `activation_height - epoch_base` (see ValsetOrchestrator::resume /
-                // its `resume_rearms_pending_upgrade` test). inert before the module
-                // is registered — `read_upgrade_state` returns baseline/no-pending.
-                let pending_boot = match pending_boot {
-                    Some(view) => Some(view),
-                    None => read_upgrade_state(&host).await.pending.and_then(|p| {
-                        let crossed = rec.height.is_some_and(|h| h >= p.activation_height);
-                        if crossed {
-                            None
-                        } else {
-                            p.activation_height.checked_sub(rec.view_base)
-                        }
-                    }),
-                };
                 let prev = (manifest.height, manifest.oplog_pos);
-                (host, Some(rec), next_seq, prev, pending_boot)
+                (host, Some(rec), next_seq, prev, Some(manifest))
             }
         };
 
@@ -2475,36 +3134,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // recovered valset projection is NOT it — a restart inside a cutover
         // window would read a membership change whose boundary has not been
         // crossed and spawn a different scheme than its peers are running.
-        let member_keys: Vec<ed25519::PublicKey> = {
-            let raw: Vec<Vec<u8>> = match &resumed {
-                Some(rec) => rec.participants.clone(),
-                None => validators.iter().map(|k| k.as_ref().to_vec()).collect(),
-            };
-            let mut keys = Vec::with_capacity(raw.len());
-            for k in &raw {
-                match ed25519::PublicKey::decode(k.as_slice()) {
-                    Ok(pk) => keys.push(pk),
-                    Err(e) => {
-                        eprintln!(
-                            "[node {label}] FATAL: recovered participant set holds a \
-                             non-ed25519 key: {e}"
-                        );
-                        std::process::exit(1);
-                    }
-                }
+        let initial_member_keys = match resume_member_keys(resumed.as_ref(), &validators) {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("[node {label}] FATAL: {e}");
+                std::process::exit(1);
             }
-            keys
         };
-        if !member_keys.contains(&signer.public_key()) {
+        if !initial_member_keys.contains(&signer.public_key()) {
             println!(
                 "[node {label}] this identity is not in the recovered validator set — \
                  halting (restart with --sync-only to observe)"
             );
             std::process::exit(0);
         }
-        let participants: Set<ed25519::PublicKey> =
-            Set::try_from(member_keys.clone()).expect("valset membership has no duplicates");
-        let resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
+        let initial_resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
 
         // the validator-owned transport mesh, tracked at index = epoch: the
         // epoch's participants ∪ the descriptor mesh (genesis members + [dev]
@@ -2525,8 +3169,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         };
         let mut mesh_oracle = oracle.clone();
         mesh_oracle.track(
-            resume_epoch,
-            mesh_at(&member_keys.iter().cloned().collect()),
+            initial_resume_epoch,
+            mesh_at(&initial_member_keys.iter().cloned().collect()),
         );
 
         // lanes for epochs BELOW the resume epoch are registered and
@@ -2534,7 +3178,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // gossips there, and an unregistered channel is a protocol violation
         // that would kill its connection — cutting off the very fetch lane it
         // needs to catch up.
-        for epoch in 0..resume_epoch {
+        for epoch in 0..initial_resume_epoch {
             let (vote, cert, res, payload, fetch) = engine_channels(epoch);
             for ch in [vote, cert, res, payload, fetch] {
                 let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
@@ -2552,7 +3196,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // pairs until that epoch's engine consumes them. a restart therefore
         // re-arms the full window — EPOCH_CHANNEL_BANK bounds membership
         // changes per process RUN, not per network lifetime.
-        let bank_base = resume_epoch;
+        let bank_base = initial_resume_epoch;
         let mut channel_bank: Vec<Option<_>> = (0..EPOCH_CHANNEL_BANK)
             .map(|i| {
                 let (vote, cert, res, payload, fetch) = engine_channels(bank_base + i);
@@ -2565,11 +3209,357 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 ))
             })
             .collect();
-        let (mut sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+        let (mut sync_tx, mut sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
 
         // start the network actors (dialer/listener/router/tracker). registered
         // receivers buffer regardless, so starting before the engine is fine.
         network.start();
+
+        let promoted_validator_boot = promoted && !validators.contains(&signer.public_key());
+        if promoted_validator_boot {
+            let Some(server_peer) = sync_source else {
+                eprintln!(
+                    "[node {label}] FATAL: promoted validator has no statesync source for \
+                     post-reboot catch-up"
+                );
+                std::process::exit(1);
+            };
+            let client = BootP2pSyncClient::new(sync_tx, sync_rx, server_peer);
+            let mut attempts = 0usize;
+            loop {
+                attempts += 1;
+                let recovered_height = resumed.as_ref().and_then(|rec| rec.height).unwrap_or(0);
+                match catch_up_post_reboot_frames(
+                    &client,
+                    &mut recovery,
+                    &mut host,
+                    recovered_height,
+                    POST_REBOOT_CATCHUP_MAX_ITERS,
+                )
+                .await
+                {
+                    Ok(summary) => {
+                        println!(
+                            "[node {label}] post-reboot catch-up {} -> {} ({} frames)",
+                            summary.from_height, summary.to_height, summary.frames
+                        );
+                        let Some(target) = summary.target.as_ref() else {
+                            eprintln!(
+                                "[node {label}] FATAL: post-catch-up target manifest unavailable"
+                            );
+                            std::process::exit(1);
+                        };
+                        if !target
+                            .participants
+                            .iter()
+                            .any(|key| key.as_slice() == signer.public_key().as_ref())
+                        {
+                            eprintln!(
+                                "[node {label}] FATAL: catch-up target height {} no longer \
+                                 includes this validator",
+                                target.height
+                            );
+                            std::process::exit(1);
+                        }
+                        let floor = match verify_manifest_floor(&namespace, &signer, target) {
+                            Ok(floor) => floor,
+                            Err(e) => {
+                                eprintln!(
+                                    "[node {label}] FATAL: catch-up target floor verify: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+                        if target.epoch > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0) {
+                            if let Err(e) = node::BlockSink::cutover(
+                                &mut recovery,
+                                target.epoch,
+                                target.view_base,
+                                &target.participants,
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "[node {label}] FATAL: catch-up cutover journal write: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                        let me_bytes = signer.public_key().as_ref().to_vec();
+                        advance_next_seq_from_frames(
+                            &mut next_seq,
+                            &summary.frame_bytes,
+                            &me_bytes,
+                        );
+                        let ckpt = match write_post_reboot_catchup_checkpoint(
+                            &mut recovery,
+                            &host,
+                            recovery_manifest_for_resume.as_ref(),
+                            target,
+                            &summary.blocks,
+                            next_seq,
+                        )
+                        .await
+                        {
+                            Ok(ckpt) => ckpt,
+                            Err(e) => {
+                                eprintln!("[node {label}] FATAL: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        if let Some(cert) = floor {
+                            let floor = recovery::FloorCert {
+                                epoch: target.epoch,
+                                height: target.height,
+                                cert,
+                            };
+                            if let Err(e) = recovery.write_floor_cert(&floor).await {
+                                eprintln!("[node {label}] FATAL: catch-up floor-cert write: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                        prev_ckpt = (ckpt.height, ckpt.oplog_pos);
+                        let refreshed = match recovery.recover(&mut host, &ckpt).await {
+                            Ok(rec) => rec,
+                            Err(e) => {
+                                eprintln!(
+                                    "[node {label}] FATAL: post-catch-up checkpoint recovery: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+                        advance_next_seq_from_frames(&mut next_seq, &refreshed.frames, &me_bytes);
+                        resumed = Some(refreshed);
+                        recovery_manifest_for_resume = Some(ckpt);
+                        break;
+                    }
+                    Err(PostRebootCatchupError::RangePruned {
+                        target,
+                        requested_after,
+                        retained_from,
+                    }) => {
+                        println!(
+                            "[node {label}] post-reboot frame range pruned after \
+                             {requested_after} (retained from {retained_from}); full syncing \
+                             boundary {}",
+                            target.height
+                        );
+                        if !target
+                            .participants
+                            .iter()
+                            .any(|key| key.as_slice() == signer.public_key().as_ref())
+                        {
+                            eprintln!(
+                                "[node {label}] FATAL: full-sync target height {} no longer \
+                                 includes this validator",
+                                target.height
+                            );
+                            std::process::exit(1);
+                        }
+                        let floor = match verify_manifest_floor(&namespace, &signer, &target) {
+                            Ok(floor) => floor,
+                            Err(e) => {
+                                eprintln!(
+                                    "[node {label}] FATAL: full-sync target floor verify: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+                        let synced = match sync_all_modules(
+                            &context,
+                            &client,
+                            &target,
+                            &forge_repo,
+                            10_000 + attempts,
+                        )
+                        .await
+                        {
+                            Ok(host) => host,
+                            Err(e) => {
+                                eprintln!(
+                                    "[node {label}] FATAL: full state-sync fallback failed at \
+                                     boundary {}: {e}",
+                                    target.height
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+                        host = synced;
+                        if target.epoch
+                            > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0)
+                        {
+                            if let Err(e) = node::BlockSink::cutover(
+                                &mut recovery,
+                                target.epoch,
+                                target.view_base,
+                                &target.participants,
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "[node {label}] FATAL: full-sync cutover journal write: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                        let pos = recovery.oplog_pos().await;
+                        let ckpt = match Manifest::capture(
+                            &host,
+                            Some(target.height),
+                            target.epoch,
+                            target.view_base,
+                            target.participants.clone(),
+                            None,
+                            target.current_version,
+                            target.pending_upgrade.clone(),
+                            pos,
+                            next_seq,
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                eprintln!(
+                                    "[node {label}] FATAL: full-sync checkpoint capture: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+                        if let Err(e) = recovery.write_manifest(&ckpt).await {
+                            eprintln!(
+                                "[node {label}] FATAL: full-sync checkpoint write: {e}"
+                            );
+                            std::process::exit(1);
+                        }
+                        if let Some(cert) = floor {
+                            let floor = recovery::FloorCert {
+                                epoch: target.epoch,
+                                height: target.height,
+                                cert,
+                            };
+                            if let Err(e) = recovery.write_floor_cert(&floor).await {
+                                eprintln!(
+                                    "[node {label}] FATAL: full-sync floor-cert write: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                        prev_ckpt = (ckpt.height, ckpt.oplog_pos);
+                        let refreshed = match recovery.recover(&mut host, &ckpt).await {
+                            Ok(rec) => rec,
+                            Err(e) => {
+                                eprintln!(
+                                    "[node {label}] FATAL: full-sync recovery refresh: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+                        let me_bytes = signer.public_key().as_ref().to_vec();
+                        advance_next_seq_from_frames(&mut next_seq, &refreshed.frames, &me_bytes);
+                        resumed = Some(refreshed);
+                        recovery_manifest_for_resume = Some(ckpt);
+                        break;
+                    }
+                    Err(PostRebootCatchupError::Retry(e)) if attempts < 10 => {
+                        println!(
+                            "[node {label}] post-reboot catch-up unavailable ({e}); retrying"
+                        );
+                        context.sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(PostRebootCatchupError::Retry(e)) => {
+                        eprintln!(
+                            "[node {label}] FATAL: post-reboot catch-up unavailable after \
+                             {attempts} attempts: {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(PostRebootCatchupError::Fatal(e)) => {
+                        eprintln!("[node {label}] FATAL: post-reboot catch-up failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            match client.into_parts() {
+                Ok((tx, rx)) => {
+                    sync_tx = tx;
+                    sync_rx = rx;
+                }
+                Err(e) => {
+                    eprintln!("[node {label}] FATAL: cannot hand statesync channel to server: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        let member_keys = match resume_member_keys(resumed.as_ref(), &validators) {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("[node {label}] FATAL: {e}");
+                std::process::exit(1);
+            }
+        };
+        if !member_keys.contains(&signer.public_key()) {
+            println!(
+                "[node {label}] this identity is not in the recovered validator set — \
+                 halting (restart with --sync-only to observe)"
+            );
+            std::process::exit(0);
+        }
+        let participants: Set<ed25519::PublicKey> =
+            Set::try_from(member_keys.clone()).expect("valset membership has no duplicates");
+        let resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
+        mesh_oracle.track(
+            resume_epoch,
+            mesh_at(&member_keys.iter().cloned().collect()),
+        );
+        if resume_epoch < bank_base || resume_epoch >= bank_base + EPOCH_CHANNEL_BANK {
+            eprintln!(
+                "[node {label}] FATAL: recovered epoch {resume_epoch} outside the \
+                 pre-registered channel bank [{bank_base}, {})",
+                bank_base + EPOCH_CHANNEL_BANK
+            );
+            std::process::exit(1);
+        }
+        for epoch in bank_base..resume_epoch {
+            let Some(slot) = channel_bank
+                .get_mut((epoch - bank_base) as usize)
+                .and_then(|slot| slot.take())
+            else {
+                continue;
+            };
+            let ((_, vote_rx), (_, cert_rx), (_, res_rx), (_, payload_rx), (_, fetch_rx)) = slot;
+            for (suffix, mut rx) in [
+                ("vote", vote_rx),
+                ("cert", cert_rx),
+                ("resolver", res_rx),
+                ("payload", payload_rx),
+                ("fetch", fetch_rx),
+            ] {
+                let label: &'static str =
+                    Box::leak(format!("blackhole_e{epoch}_{suffix}").into_boxed_str());
+                context.child(label).spawn(move |_ctx| async move {
+                    while rx.recv().await.is_ok() {}
+                });
+            }
+        }
+        let mut pending_boot = recovery_manifest_for_resume
+            .as_ref()
+            .zip(resumed.as_ref())
+            .and_then(|(manifest, rec)| derive_pending_boot(manifest, rec));
+        // If no membership cutover already claimed the resume slot, re-arm a
+        // pending upgrade at the same deterministic activation boundary an
+        // uninterrupted node would use. This runs after post-reboot catch-up, so
+        // it reads the freshest recovered host/record.
+        if pending_boot.is_none() {
+            if let Some(rec) = resumed.as_ref() {
+                pending_boot = read_upgrade_state(&host).await.pending.and_then(|p| {
+                    let crossed = rec.height.is_some_and(|h| h >= p.activation_height);
+                    if crossed {
+                        None
+                    } else {
+                        p.activation_height.checked_sub(rec.view_base)
+                    }
+                });
+            }
+        }
 
         // the statesync INGRESS task: owns the channel receiver and loops a
         // clean `recv().await`, forwarding frames into a local bounded queue.
@@ -2706,6 +3696,25 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the newest persisted finalization floor, kept in memory so the
         // statesync service can serve it to joiners at a matching boundary.
         let mut latest_floor: Option<recovery::FloorCert> = boot_floor.clone();
+        let recovered_height = resumed
+            .as_ref()
+            .and_then(|rec| rec.height)
+            .map(|height| height.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let recovered_hash = resumed
+            .as_ref()
+            .map(|rec| hex(&rec.app_hash))
+            .unwrap_or_else(|| "none".to_string());
+        let replayed = resumed.as_ref().map(|rec| rec.applied).unwrap_or(0);
+        let boot_floor_height = latest_floor
+            .as_ref()
+            .map(|floor| floor.height.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        diag_log(format!(
+            "DIAG promotion_recovered recovered_height={} recovered_hash={} replayed={} \
+             boot_floor_height={}",
+            recovered_height, recovered_hash, replayed, boot_floor_height
+        ));
         let orderer = spawn_epoch(
             &mut channel_bank,
             resume_epoch,
@@ -3007,33 +4016,85 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
                         continue; // malformed rpc envelope: drop, never crash.
                     };
-                    // the boundary's consensus coordinates ride the manifest.
-                    // the floor certificate is served only when it certifies
-                    // exactly the current boundary — a cert behind the
-                    // boundary would make a joiner skip history it needs.
-                    // stamp the served boundary's committed version fields from
-                    // live upgrade state (like epoch/view_base). a joiner installs
-                    // its dual-path modules at `current_version` and preflights
-                    // against `required_min_version` — both derived from these.
-                    let (bc_current, bc_pending) =
-                        read_upgrade_version_fields(node.host()).await;
-                    let coords = statesync::BoundaryCoords {
-                        epoch: orchestrator.epoch(),
-                        view_base: orchestrator.epoch_base(),
-                        participants: participant_bytes(&orchestrator),
-                        current_version: bc_current,
-                        pending_upgrade: bc_pending,
-                        floor_cert: latest_floor
-                            .as_ref()
-                            .filter(|fc| fc.epoch == orchestrator.epoch())
-                            .filter(|fc| {
-                                node.finalized().is_some_and(|f| f.height == fc.height)
-                            })
-                            .map(|fc| fc.cert.clone()),
+                    let resp = match statesync::decode_request(body) {
+                        Ok(statesync::SyncRequest::Frames {
+                            after_height,
+                            up_to_height,
+                        }) => {
+                            let response = match node
+                                .sink_mut()
+                                .read_finalized_frames(after_height, up_to_height)
+                                .await
+                            {
+                                Ok(frames) => {
+                                    let mut out = Vec::new();
+                                    let mut err = None;
+                                    for frame in frames
+                                        .into_iter()
+                                        .take(statesync::FRAME_BATCH_LEN)
+                                    {
+                                        match recovery_frame_to_sync(frame) {
+                                            Ok(frame) => out.push(frame),
+                                            Err(e) => {
+                                                err = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    match err {
+                                        Some(e) => statesync::SyncResponse::Error(e),
+                                        None => statesync::SyncResponse::Frames { frames: out },
+                                    }
+                                }
+                                Err(recovery::Error::RangePruned {
+                                    after_height,
+                                    retained_start,
+                                }) => statesync::SyncResponse::RangePruned {
+                                    requested_after: after_height,
+                                    retained_from: retained_start,
+                                },
+                                Err(e) => statesync::SyncResponse::Error(format!(
+                                    "recovery frame range: {e}"
+                                )),
+                            };
+                            statesync::encode_response(&response)
+                        }
+                        Ok(req) => {
+                            // the boundary's consensus coordinates ride the manifest.
+                            // the floor certificate is served only when it certifies
+                            // exactly the current boundary — a cert behind the
+                            // boundary would make a joiner skip history it needs.
+                            // stamp the served boundary's committed version fields from
+                            // live upgrade state (like epoch/view_base). a joiner installs
+                            // its dual-path modules at `current_version` and preflights
+                            // against `required_min_version` — both derived from these.
+                            let (bc_current, bc_pending) =
+                                read_upgrade_version_fields(node.host()).await;
+                            let coords = statesync::BoundaryCoords {
+                                epoch: orchestrator.epoch(),
+                                view_base: orchestrator.epoch_base(),
+                                participants: participant_bytes(&orchestrator),
+                                current_version: bc_current,
+                                pending_upgrade: bc_pending,
+                                floor_cert: latest_floor
+                                    .as_ref()
+                                    .filter(|fc| fc.epoch == orchestrator.epoch())
+                                    .filter(|fc| {
+                                        node.finalized().is_some_and(|f| f.height == fc.height)
+                                    })
+                                    .map(|fc| fc.cert.clone()),
+                            };
+                            let finalized_for_sync = node.finalized().filter(|f| {
+                                f.height <= coords.view_base || coords.floor_cert.is_some()
+                            });
+                            let response =
+                                sync_server.handle(node.host(), finalized_for_sync, &coords, req).await;
+                            statesync::encode_response(&response)
+                        }
+                        Err(e) => statesync::encode_response(&statesync::SyncResponse::Error(
+                            format!("bad request frame: {e}"),
+                        )),
                     };
-                    let resp = sync_server
-                        .handle_frame(node.host(), node.finalized(), &coords, body)
-                        .await;
                     let _ = sync_tx.send(
                         Recipients::One(peer),
                         IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
@@ -3352,15 +4413,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
 
-                    // a pending cutover only crosses when finalized views
-                    // REACH it, and views only advance with ops — an idle
-                    // network would park at the armed boundary forever. push
-                    // a deterministically-rejected nop (unknown module
-                    // target: rejects identically on every node, leaves no
-                    // state) until the boundary is crossed.
-                    if orchestrator.pending_cutover().is_some()
-                        && last_nop.elapsed() >= Duration::from_secs(1)
-                    {
+                    // heartbeat: finalized views only advance with ops, so an
+                    // idle network freezes — its height never ticks, and a
+                    // pending cutover (which crosses only when finalized views
+                    // REACH it) would park at the armed boundary forever. push a
+                    // deterministically-rejected nop (unknown module target:
+                    // rejects identically on every node, leaves no state) once
+                    // per block-time so the chain — and the height the console
+                    // shows — keeps moving whether or not anyone is active.
+                    if last_nop.elapsed() >= HEARTBEAT_INTERVAL {
                         last_nop = std::time::Instant::now();
                         let seq = next_seq;
                         next_seq += 1;
@@ -3372,7 +4433,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             )
                             .await
                         {
-                            eprintln!("[node {label}] cutover nop submit failed: {e}");
+                            eprintln!("[node {label}] heartbeat nop submit failed: {e}");
                         }
                     }
 
@@ -3494,7 +4555,616 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdk::{Ctx, Error, Module, StateSyncHandle};
+    use std::sync::{Arc, Mutex};
     use upgrade_interface::{Upgrade, UpgradeStatus};
+
+    fn test_root(byte: u8) -> StateRoot {
+        StateRoot([byte; sdk::ROOT_LEN])
+    }
+
+    fn test_me() -> Vec<u8> {
+        vec![1u8; 32]
+    }
+
+    fn test_manifest(
+        height: u64,
+        app_hash: StateRoot,
+        floor_cert: Option<Vec<u8>>,
+    ) -> statesync::Manifest {
+        statesync::Manifest {
+            height,
+            app_hash,
+            epoch: 0,
+            view_base: 0,
+            participants: vec![test_me()],
+            floor_cert,
+            current_version: host::BASELINE_VERSION,
+            pending_upgrade: None,
+            required_min_version: host::BASELINE_VERSION,
+            entries: vec![],
+        }
+    }
+
+    fn test_manifest_with_participants(
+        height: u64,
+        app_hash: StateRoot,
+        floor_cert: Option<Vec<u8>>,
+        participants: Vec<Vec<u8>>,
+    ) -> statesync::Manifest {
+        statesync::Manifest {
+            participants,
+            ..test_manifest(height, app_hash, floor_cert)
+        }
+    }
+
+    fn test_manifest_with_base(
+        height: u64,
+        view_base: u64,
+        app_hash: StateRoot,
+        floor_cert: Option<Vec<u8>>,
+    ) -> statesync::Manifest {
+        statesync::Manifest {
+            view_base,
+            ..test_manifest(height, app_hash, floor_cert)
+        }
+    }
+
+    fn fresh_directory_host() -> Host {
+        Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis")
+    }
+
+    #[derive(Clone, Default)]
+    struct TestDiskStore(Arc<Mutex<u8>>);
+
+    impl TestDiskStore {
+        fn get(&self) -> u8 {
+            *self.0.lock().expect("test disk store lock")
+        }
+
+        fn set(&self, value: u8) {
+            *self.0.lock().expect("test disk store lock") = value;
+        }
+    }
+
+    struct TestDiskModule {
+        store: TestDiskStore,
+        staged: Option<u8>,
+    }
+
+    impl TestDiskModule {
+        fn new(store: TestDiskStore) -> Self {
+            Self {
+                store,
+                staged: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Module for TestDiskModule {
+        fn id(&self) -> String {
+            "disk".into()
+        }
+
+        fn root(&self) -> StateRoot {
+            test_root(self.store.get())
+        }
+
+        fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+            Ok(StateSyncHandle::ResolverBacked {
+                backend: "test-disk".into(),
+                detail: "test disk module reopens from shared durable state".into(),
+            })
+        }
+
+        async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+            let value = *msg
+                .payload
+                .first()
+                .ok_or_else(|| Error::Module("missing test value".into()))?;
+            self.staged = Some(value);
+            ctx.emit_msg(Msg {
+                target: "memory".into(),
+                payload: vec![value],
+            });
+            Ok(())
+        }
+
+        async fn commit_block(&mut self) -> Result<(), Error> {
+            if let Some(value) = self.staged.take() {
+                self.store.set(value);
+            }
+            Ok(())
+        }
+
+        async fn abort_block(&mut self) -> Result<(), Error> {
+            self.staged = None;
+            Ok(())
+        }
+    }
+
+    struct TestMemoryModule {
+        value: u8,
+        staged: Option<u8>,
+    }
+
+    impl TestMemoryModule {
+        fn new(value: u8) -> Self {
+            Self {
+                value,
+                staged: None,
+            }
+        }
+
+        fn install(&mut self, bytes: &[u8], root: StateRoot) -> Result<(), Error> {
+            let [value] = bytes else {
+                return Err(Error::Module("bad test memory snapshot".into()));
+            };
+            if test_root(*value) != root {
+                return Err(Error::Module("test memory root mismatch".into()));
+            }
+            self.value = *value;
+            self.staged = None;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Module for TestMemoryModule {
+        fn id(&self) -> String {
+            "memory".into()
+        }
+
+        fn root(&self) -> StateRoot {
+            test_root(self.value)
+        }
+
+        fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+            Ok(StateSyncHandle::SnapshotBytes(vec![self.value]))
+        }
+
+        async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+            let value = *msg
+                .payload
+                .first()
+                .ok_or_else(|| Error::Module("missing test value".into()))?;
+            self.staged = Some(value);
+            Ok(())
+        }
+
+        async fn commit_block(&mut self) -> Result<(), Error> {
+            if let Some(value) = self.staged.take() {
+                self.value = value;
+            }
+            Ok(())
+        }
+
+        async fn abort_block(&mut self) -> Result<(), Error> {
+            self.staged = None;
+            Ok(())
+        }
+    }
+
+    fn mixed_durability_host(store: TestDiskStore, memory_value: u8) -> Host {
+        Host::genesis(vec![
+            Box::new(TestDiskModule::new(store)),
+            Box::new(TestMemoryModule::new(memory_value)),
+        ])
+        .expect("mixed host")
+    }
+
+    fn restore_mixed_durability_host(store: TestDiskStore, manifest: &Manifest) -> Host {
+        let mut memory = TestMemoryModule::new(0);
+        memory
+            .install(
+                manifest.snapshot("memory").expect("memory snapshot"),
+                manifest.root("memory").expect("memory root"),
+            )
+            .expect("memory install");
+        Host::genesis(vec![Box::new(TestDiskModule::new(store)), Box::new(memory)])
+            .expect("restored mixed host")
+    }
+
+    fn dir_set(key: &str, value: &str) -> Msg {
+        Msg {
+            target: "directory".into(),
+            payload: encode_msg(&DirMsg::Set {
+                key: key.into(),
+                value: value.into(),
+            }),
+        }
+    }
+
+    async fn dir_value(host: &Host, key: &str) -> Option<String> {
+        let reply = host
+            .query(
+                "directory",
+                &encode_query(&DirQuery::Get { key: key.into() }),
+            )
+            .await
+            .expect("query");
+        match decode_reply(&reply).expect("decode") {
+            DirReply::Value(v) => v,
+        }
+    }
+
+    async fn served_directory_frame(
+        expected: &mut Host,
+        signer: &ed25519::PrivateKey,
+        height: u64,
+        seq: u64,
+        msg: Msg,
+    ) -> statesync::FinalizedFrame {
+        let frame = node::encode_frame(signer, seq, &msg);
+        let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
+        expected
+            .submit_at(
+                host::BlockContext {
+                    protocol_version: host::BASELINE_VERSION,
+                    height,
+                    consensus_time: height,
+                    origin,
+                },
+                msg,
+            )
+            .await
+            .expect("apply");
+        statesync::FinalizedFrame {
+            height,
+            frame,
+            disposition: statesync::FrameDisposition::Applied,
+            roots: expected.module_roots(),
+            app_hash: expected.app_hash(),
+        }
+    }
+
+    async fn served_mixed_frame(
+        expected: &mut Host,
+        signer: &ed25519::PrivateKey,
+        height: u64,
+        seq: u64,
+        value: u8,
+    ) -> statesync::FinalizedFrame {
+        let frame = node::encode_frame(
+            signer,
+            seq,
+            &Msg {
+                target: "disk".into(),
+                payload: vec![value],
+            },
+        );
+        let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
+        expected
+            .submit_at(
+                host::BlockContext {
+                    protocol_version: host::BASELINE_VERSION,
+                    height,
+                    consensus_time: height,
+                    origin,
+                },
+                msg,
+            )
+            .await
+            .expect("apply mixed frame");
+        statesync::FinalizedFrame {
+            height,
+            frame,
+            disposition: statesync::FrameDisposition::Applied,
+            roots: expected.module_roots(),
+            app_hash: expected.app_hash(),
+        }
+    }
+
+    #[test]
+    fn floor_cert_view_must_map_to_boundary_height() {
+        assert!(assert_floor_binds_view(30, 36, 6).is_ok());
+        assert!(assert_floor_binds_view(30, 36, 4).is_err());
+    }
+
+    #[test]
+    fn promotion_boundary_prefers_latest_same_state_height() {
+        let host_hash = test_root(7);
+        let latest = test_manifest(12, host_hash, Some(vec![2]));
+
+        match choose_promotion_boundary(host_hash, &latest, &test_me()) {
+            PromotionBoundary::Promote { boundary, source } => {
+                assert_eq!(boundary.height, 12);
+                assert_eq!(source, PromotionBoundarySource::Latest);
+            }
+            PromotionBoundary::Retry => panic!("same-state latest boundary should promote"),
+        }
+    }
+
+    #[test]
+    fn promotion_boundary_retries_when_latest_excludes_self() {
+        let host_hash = test_root(7);
+        let me = vec![1u8; 32];
+        let latest =
+            test_manifest_with_participants(12, host_hash, Some(vec![2]), vec![vec![9u8; 32]]);
+
+        match choose_promotion_boundary(host_hash, &latest, &me) {
+            PromotionBoundary::Retry => {}
+            PromotionBoundary::Promote { .. } => {
+                panic!("latest boundary excluding this node must not promote")
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_boundary_accepts_latest_at_view_base_without_floor() {
+        let host_hash = test_root(7);
+        let latest = test_manifest_with_base(12, 12, host_hash, None);
+
+        match choose_promotion_boundary(host_hash, &latest, &test_me()) {
+            PromotionBoundary::Promote { boundary, source } => {
+                assert_eq!(boundary.height, 12);
+                assert_eq!(source, PromotionBoundarySource::Latest);
+            }
+            PromotionBoundary::Retry => panic!("view-base latest boundary should promote"),
+        }
+    }
+
+    #[test]
+    fn promotion_boundary_requires_latest_floor_past_view_base() {
+        let host_hash = test_root(7);
+        let latest = test_manifest_with_base(12, 10, host_hash, None);
+
+        match choose_promotion_boundary(host_hash, &latest, &test_me()) {
+            PromotionBoundary::Retry => {}
+            PromotionBoundary::Promote { .. } => {
+                panic!("past-base latest boundary without a floor should retry")
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_boundary_retries_when_latest_changed() {
+        let host_hash = test_root(7);
+        let latest = test_manifest(12, test_root(9), Some(vec![2]));
+
+        match choose_promotion_boundary(host_hash, &latest, &test_me()) {
+            PromotionBoundary::Retry => {}
+            PromotionBoundary::Promote { .. } => {
+                panic!("changed latest boundary should retry")
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_boundary_retries_when_no_manifest_matches_host() {
+        let host_hash = test_root(7);
+        let latest = test_manifest(12, test_root(9), Some(vec![2]));
+
+        match choose_promotion_boundary(host_hash, &latest, &test_me()) {
+            PromotionBoundary::Retry => {}
+            PromotionBoundary::Promote { .. } => panic!("changed roots should retry"),
+        }
+    }
+
+    #[test]
+    fn suffix_installer_rejects_mismatched_served_seal() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|_| async move {
+            let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(77);
+            let msg = Msg {
+                target: "directory".into(),
+                payload: encode_msg(&DirMsg::Set {
+                    key: "k".into(),
+                    value: "v".into(),
+                }),
+            };
+            let frame = node::encode_frame(&signer, 0, &msg);
+
+            let mut expected_host =
+                Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
+            let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
+            expected_host
+                .submit_at(
+                    host::BlockContext {
+                        protocol_version: host::BASELINE_VERSION,
+                        height: 1,
+                        consensus_time: 1,
+                        origin,
+                    },
+                    msg,
+                )
+                .await
+                .expect("apply");
+
+            let served = statesync::FinalizedFrame {
+                height: 1,
+                frame,
+                disposition: statesync::FrameDisposition::Applied,
+                roots: expected_host.module_roots(),
+                app_hash: StateRoot([0xA5; sdk::ROOT_LEN]),
+            };
+            let mut host =
+                Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
+            let err = apply_verified_suffix_frame(&mut host, &served)
+                .await
+                .expect_err("served seal mismatch must abort");
+            assert!(
+                err.contains("served seal"),
+                "unexpected mismatch error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn post_reboot_catchup_applies_verifies_and_journals_served_suffix() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let signer = ed25519::PrivateKey::from_seed(78);
+            let mut expected = fresh_directory_host();
+            let frames = vec![
+                served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await,
+                served_directory_frame(&mut expected, &signer, 2, 1, dir_set("b", "2")).await,
+            ];
+
+            let mut host = fresh_directory_host();
+            let mut recovery = Recovery::open(context.child("post_catchup_ok"))
+                .await
+                .expect("open recovery");
+            let applied =
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone())
+                    .await
+                    .expect("catch up");
+
+            assert_eq!(applied.applied, 2);
+            assert_eq!(host.app_hash(), expected.app_hash());
+            assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
+            assert_eq!(dir_value(&host, "b").await.as_deref(), Some("2"));
+            let journaled = recovery
+                .read_finalized_frames(0, 2)
+                .await
+                .expect("read frames");
+            assert_eq!(journaled.len(), 2);
+            assert_eq!(journaled[0].height, 1);
+            assert_eq!(journaled[1].height, 2);
+        });
+    }
+
+    #[test]
+    fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let signer = ed25519::PrivateKey::from_seed(81);
+            let durable_store = TestDiskStore::default();
+            let base_host = mixed_durability_host(durable_store.clone(), 0);
+            let base_manifest = Manifest::capture(
+                &base_host,
+                None,
+                0,
+                0,
+                vec![test_me()],
+                None,
+                host::BASELINE_VERSION,
+                None,
+                0,
+                1,
+            )
+            .expect("base manifest");
+
+            let mut expected = mixed_durability_host(TestDiskStore::default(), 0);
+            let served = served_mixed_frame(&mut expected, &signer, 1, 0, 7).await;
+            let target = statesync::Manifest {
+                height: 1,
+                app_hash: served.app_hash,
+                epoch: 0,
+                view_base: 0,
+                participants: vec![test_me()],
+                floor_cert: Some(vec![1, 2, 3]),
+                current_version: host::BASELINE_VERSION,
+                pending_upgrade: None,
+                required_min_version: host::BASELINE_VERSION,
+                entries: vec![],
+            };
+
+            let mut host = mixed_durability_host(durable_store.clone(), 0);
+            let mut recovery = Recovery::open(context.child("post_catchup_mixed"))
+                .await
+                .expect("open recovery");
+            recovery
+                .write_manifest(&base_manifest)
+                .await
+                .expect("write base manifest");
+            let applied =
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served])
+                    .await
+                    .expect("catch up");
+
+            assert_eq!(applied.applied, 1);
+            assert_eq!(
+                durable_store.get(),
+                7,
+                "disk cohort committed the catch-up block durably"
+            );
+
+            let mut torn_host =
+                restore_mixed_durability_host(durable_store.clone(), &base_manifest);
+            let err = recovery
+                .recover(&mut torn_host, &base_manifest)
+                .await
+                .expect_err("old base replay should see torn mixed durability");
+            assert!(matches!(err, recovery::Error::Torn(_)));
+
+            let ckpt = write_post_reboot_catchup_checkpoint(
+                &mut recovery,
+                &host,
+                Some(&base_manifest),
+                &target,
+                &applied.blocks,
+                1,
+            )
+            .await
+            .expect("write catch-up checkpoint");
+            assert_eq!(ckpt.height, Some(1));
+            assert_eq!(ckpt.app_hash, target.app_hash);
+            assert_eq!(ckpt.snapshot("memory"), Some([7u8].as_slice()));
+
+            let mut restored = restore_mixed_durability_host(durable_store, &ckpt);
+            let recovered = recovery
+                .recover(&mut restored, &ckpt)
+                .await
+                .expect("T checkpoint must recover without replaying the torn suffix");
+            assert_eq!(recovered.height, Some(1));
+            assert_eq!(recovered.app_hash, target.app_hash);
+            assert_eq!(recovered.applied, 0);
+        });
+    }
+
+    #[test]
+    fn post_reboot_catchup_aborts_on_mismatched_served_seal() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let signer = ed25519::PrivateKey::from_seed(79);
+            let mut expected = fresh_directory_host();
+            let mut served =
+                served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await;
+            served.app_hash = test_root(0xA5);
+
+            let mut host = fresh_directory_host();
+            let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
+                .await
+                .expect("open recovery");
+            let err =
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served])
+                    .await
+                    .expect_err("seal mismatch must abort");
+
+            assert!(
+                err.contains("served seal"),
+                "unexpected mismatch error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn post_reboot_catchup_is_noop_when_there_is_no_gap() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut host = fresh_directory_host();
+            let before = host.app_hash();
+            let mut recovery = Recovery::open(context.child("post_catchup_noop"))
+                .await
+                .expect("open recovery");
+            let applied =
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 5, 5, Vec::new())
+                    .await
+                    .expect("noop catch up");
+
+            assert_eq!(applied.applied, 0);
+            assert_eq!(host.app_hash(), before);
+            assert!(
+                recovery
+                    .read_finalized_frames(5, 5)
+                    .await
+                    .expect("empty range")
+                    .is_empty()
+            );
+        });
+    }
 
     fn status(
         pending: Option<(&str, u64, u32)>,

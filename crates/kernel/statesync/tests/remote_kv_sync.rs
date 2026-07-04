@@ -1,6 +1,6 @@
 //! the network state-sync property at the crate level: a joiner rebuilds a
 //! REAL qmdb-backed module purely through the wire protocol — manifest fetch,
-//! live target fetch, proof-carrying op-range fetches through the remote
+//! manifest-pinned target adoption, proof-carrying op-range fetches through the remote
 //! resolver — and lands on the source's exact root, with byzantine responses
 //! rejected by verification rather than trust.
 //!
@@ -17,8 +17,8 @@ use kv_interface::{KvMsg, encode as kv_encode};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use statesync::qmdb::RemoteQmdbResolver;
 use statesync::{
-    CHUNK_LEN, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse, SyncServer,
-    decode_response, encode_request, fetch_manifest, fetch_snapshot,
+    CHUNK_LEN, ManifestEntry, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse,
+    SyncServer, decode_response, encode_request, fetch_manifest, fetch_snapshot,
 };
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -32,6 +32,15 @@ type RpcPair = (Vec<u8>, oneshot::Sender<Vec<u8>>);
 #[derive(Clone)]
 struct ChannelClient {
     tx: mpsc::Sender<RpcPair>,
+}
+
+fn pinned_target(entry: &ManifestEntry) -> statesync::qmdb::SyncTarget {
+    entry
+        .resolver_target
+        .as_ref()
+        .expect("resolver entry carries pinned target")
+        .to_sync_target()
+        .expect("pinned target range is non-empty")
 }
 
 impl SyncClient for ChannelClient {
@@ -161,13 +170,14 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
             assert_eq!(kv_entry.kind, PayloadKind::Resolver);
             assert_eq!(kv_entry.root, src_kv_root);
 
-            // live target through the module lane, gated on the manifest root.
-            let resolver = RemoteQmdbResolver::new(client_for_join.clone(), "kv");
-            let target = resolver.fetch_target().await.expect("target");
+            // pinned target from the manifest, gated on the manifest root.
+            let resolver =
+                RemoteQmdbResolver::new(client_for_join.clone(), manifest.boundary_id(), "kv");
+            let target = pinned_target(kv_entry);
             assert_eq!(
                 StateRoot(target.root.0),
                 kv_entry.root,
-                "quiescent source: live target root equals the manifest root"
+                "pinned target root equals the manifest root"
             );
 
             // rebuild ENTIRELY through the wire: every op batch crosses the
@@ -185,7 +195,7 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
             );
 
             // multi-chunk snapshot lane: bytes reassemble exactly.
-            let snap = fetch_snapshot(&client_for_join, manifest.height, "bigsnap")
+            let snap = fetch_snapshot(&client_for_join, manifest.boundary_id(), "bigsnap")
                 .await
                 .expect("big snapshot");
             assert_eq!(
@@ -230,15 +240,18 @@ fn stale_capture_requests_are_refused_not_mis_served() {
                 Some(finalized),
                 &statesync::BoundaryCoords::default(),
                 SyncRequest::Chunk {
-                    height: 999,
+                    boundary: statesync::BoundaryId {
+                        height: 999,
+                        app_hash: StateRoot([9u8; 32]),
+                    },
                     module_id: "kv".into(),
                     offset: 0,
                 },
             )
             .await;
         assert!(
-            matches!(resp, SyncResponse::Error(ref e) if e.contains("no capture")),
-            "unknown capture height must be a clean protocol error, got {resp:?}"
+            matches!(resp, SyncResponse::Error(ref e) if e.contains("not leased")),
+            "unknown boundary must be a clean protocol error, got {resp:?}"
         );
 
         // manifest against a WRONG finalized boundary (host has advanced past
@@ -287,19 +300,18 @@ fn byzantine_op_batches_fail_verification_not_installation() {
         // real op coordinates come from the store's own target — the log
         // carries commit-floor ops beyond the user writes, and serving below
         // the pruned floor is refused.
-        let target_bytes = host
-            .serve_sync("kv", &encode_qmdb_req(&QmdbSyncReq::Target))
+        let target = host
+            .resolver_sync_target("kv")
             .await
-            .expect("serve target");
-        let target = statesync::qmdb::decode_target(&target_bytes).expect("decode target");
+            .expect("resolver target");
 
         // an honest ops envelope straight off the serve lane...
         let body = host
             .serve_sync(
                 "kv",
                 &encode_qmdb_req(&QmdbSyncReq::Ops {
-                    op_count: target.range.end().as_u64(),
-                    start_loc: target.range.start().as_u64(),
+                    op_count: target.op_count,
+                    start_loc: target.start,
                     max_ops: 16,
                     include_pinned: true,
                 }),

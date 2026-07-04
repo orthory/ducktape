@@ -76,6 +76,13 @@ pub enum Error {
     /// sealed — the recovered node would fork, so it must not start.
     #[error("recovery verification failed: {0}")]
     Verify(String),
+    /// the caller asked for records below the retained checkpoint/journal
+    /// suffix boundary. a statesync joiner must refetch a fresher manifest.
+    #[error("recovery journal range pruned after {after_height}; retained from {retained_start}")]
+    RangePruned {
+        after_height: u64,
+        retained_start: u64,
+    },
 }
 
 impl From<Error> for node::Error {
@@ -662,6 +669,16 @@ fn storage_err(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())
 }
 
+/// one paired recovery-journal block and seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalFrame {
+    pub height: u64,
+    pub frame: Vec<u8>,
+    pub disposition: Disposition,
+    pub roots: Vec<(ModuleId, StateRoot)>,
+    pub app_hash: StateRoot,
+}
+
 impl<E> Recovery<E>
 where
     E: Context + BufferPooler + commonware_runtime::Supervisor,
@@ -775,6 +792,108 @@ where
             .await
             .map(|_| ())
             .map_err(storage_err)
+    }
+
+    /// read sealed recovery frames in `(after_height, up_to_height]`.
+    ///
+    /// This is the durable equivalent of a restart's replay suffix. The local
+    /// checkpoint height is the retained suffix boundary: asking below it is a
+    /// pruned-range condition, even if old journal bytes have not yet been
+    /// physically removed.
+    pub async fn read_finalized_frames(
+        &self,
+        after_height: u64,
+        up_to_height: u64,
+    ) -> Result<Vec<JournalFrame>, Error> {
+        if after_height > up_to_height {
+            return Err(Error::Corrupt(format!(
+                "invalid frame range ({after_height}, {up_to_height}]"
+            )));
+        }
+        if let Some(retained_start) = self.manifest()?.and_then(|m| m.height) {
+            if after_height < retained_start {
+                return Err(Error::RangePruned {
+                    after_height,
+                    retained_start,
+                });
+            }
+        }
+        if after_height == up_to_height {
+            return Ok(Vec::new());
+        }
+
+        let mut records: Vec<Record> = Vec::new();
+        {
+            let reader = self.journal.reader().await;
+            let bounds = reader.bounds();
+            let stream = reader
+                .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
+                .await
+                .map_err(storage_err)?;
+            pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                let (_pos, bytes) = item.map_err(storage_err)?;
+                records.push(Record::decode(&bytes)?);
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut pending: Option<(u64, Vec<u8>)> = None;
+        for record in records {
+            match record {
+                Record::Block { height, frame } => {
+                    if height <= after_height {
+                        continue;
+                    }
+                    if height > up_to_height {
+                        break;
+                    }
+                    if let Some((prev, _)) = pending {
+                        return Err(Error::Corrupt(format!(
+                            "block {height} appeared before block {prev} was sealed"
+                        )));
+                    }
+                    pending = Some((height, frame));
+                }
+                Record::Seal {
+                    height,
+                    disposition,
+                    roots,
+                    app_hash,
+                } => {
+                    if height <= after_height {
+                        continue;
+                    }
+                    if height > up_to_height {
+                        break;
+                    }
+                    let Some((block_height, frame)) = pending.take() else {
+                        return Err(Error::Corrupt(format!(
+                            "seal at height {height} without its block record"
+                        )));
+                    };
+                    if block_height != height {
+                        return Err(Error::Corrupt(format!(
+                            "seal height {height} does not match block {block_height}"
+                        )));
+                    }
+                    out.push(JournalFrame {
+                        height,
+                        frame,
+                        disposition,
+                        roots,
+                        app_hash,
+                    });
+                }
+                Record::Pinned { .. } | Record::Cutover { .. } => {}
+            }
+        }
+        if let Some((height, _)) = pending {
+            return Err(Error::Corrupt(format!(
+                "block {height} in requested range is missing its seal"
+            )));
+        }
+        Ok(out)
     }
 }
 

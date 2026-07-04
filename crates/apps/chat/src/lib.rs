@@ -39,7 +39,9 @@ use commonware_storage::{
     translator::TwoCap,
 };
 use commonware_utils::range::NonEmptyRange;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{
+    Ctx, Error, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot, StateSyncHandle,
+};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// the qmdb key: a fixed-width digest of a logical chat record key.
@@ -996,15 +998,19 @@ where
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "serve_sync answers qmdb target + op-range requests (statesync wire)".into(),
+            detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
         })
     }
 
     /// the network state-sync serve lane: answers the shared qmdb wire requests
-    /// (current target, historical proof-carrying op ranges) from committed
-    /// state. read-only; the joiner's sync engine merkle-verifies every batch.
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         statesync::qmdb::serve_bytes(&self.db, req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        statesync::qmdb::resolver_sync_target(&self.db).await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

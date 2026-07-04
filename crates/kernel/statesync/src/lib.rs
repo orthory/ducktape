@@ -2,7 +2,7 @@
 //!
 //! ## protocol
 //!
-//! three request shapes ride one request/response transport (any transport —
+//! four request shapes ride one request/response transport (any transport —
 //! a p2p channel, a socket, an in-process loopback — via [`SyncClient`]):
 //!
 //! 1. **Manifest** — the server captures a consistent view of its registry at
@@ -17,6 +17,9 @@
 //!    [`serve_sync`](sdk::Module::serve_sync): the qmdb op-range lane. served
 //!    with HISTORICAL proofs, so an in-flight joiner target stays servable
 //!    while the source keeps finalizing new blocks.
+//! 4. **Frames** — fetch a bounded recovery-journal suffix: finalized,
+//!    non-discarded frame bytes plus their seal roots/app-hash, so a promoted
+//!    joiner can persist the same replay suffix a restart would have.
 //!
 //! ## trust model
 //!
@@ -35,8 +38,10 @@
 //! json inflates raw bytes ~3.7x, which would silently shrink the usable
 //! chunk size under a transport frame cap.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use commonware_codec::DecodeExt as _;
 use host::{FinalizedBlock, Host};
 use sdk::{ModuleId, ROOT_LEN, StateRoot, StateSyncHandle, UpgradeCoords};
 
@@ -46,14 +51,68 @@ pub mod wire;
 
 use wire::WireError;
 
+/// a pinned qmdb sync target for a resolver-backed module at a boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolverTarget {
+    pub root: qmdb::SyncDigest,
+    pub start: u64,
+    pub op_count: u64,
+}
+
+impl ResolverTarget {
+    pub fn to_sync_target(&self) -> Result<qmdb::SyncTarget, String> {
+        let range = commonware_utils::range::NonEmptyRange::new(
+            commonware_storage::merkle::Location::new(self.start)
+                ..commonware_storage::merkle::Location::new(self.op_count),
+        )
+        .map_err(|_| {
+            format!(
+                "pinned resolver target has empty range {}..{}",
+                self.start, self.op_count
+            )
+        })?;
+        Ok(qmdb::SyncTarget {
+            root: self.root,
+            range,
+        })
+    }
+}
+
 /// max snapshot bytes per [`SyncResponse::Chunk`]. sized so a chunk plus
 /// framing stays far under the mesh's 1 MiB message cap.
 pub const CHUNK_LEN: usize = 256 * 1024;
+/// max recovery frames per [`SyncResponse::Frames`] batch. suffix install loops
+/// over batches; one response stays far below the mesh frame cap unless a
+/// single frame itself is already too large for the transport.
+pub const FRAME_BATCH_LEN: usize = 64;
 
 /// how many boundary captures a server retains. more than one lets a second
 /// joiner start syncing without invalidating the first joiner's in-flight
 /// capture when the boundary advances between their manifest fetches.
 pub const MAX_CAPTURES: usize = 4;
+const MAX_LEASED_BOUNDARIES: usize = MAX_CAPTURES;
+
+/// a deterministic state-sync boundary: both the app height and the module-root
+/// composition served at that height.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BoundaryId {
+    pub height: u64,
+    pub app_hash: StateRoot,
+}
+
+impl Ord for BoundaryId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.height
+            .cmp(&other.height)
+            .then_with(|| self.app_hash.0.cmp(&other.app_hash.0))
+    }
+}
+
+impl PartialOrd for BoundaryId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 // ============================================================================
 // errors
@@ -71,6 +130,13 @@ pub enum SyncError {
     UnexpectedResponse(&'static str),
     #[error("module {module}: {reason}")]
     Module { module: ModuleId, reason: String },
+    #[error("module {module}: pinned qmdb range pruned ({reason}); refetch manifest")]
+    Pruned { module: ModuleId, reason: String },
+    #[error("recovery frame range pruned after {requested_after}; retained from {retained_from}")]
+    RangePruned {
+        requested_after: u64,
+        retained_from: u64,
+    },
     #[error("app-hash mismatch after rebuild: manifest {expected}, composed {actual}")]
     AppHashMismatch { expected: String, actual: String },
 }
@@ -113,12 +179,48 @@ impl PayloadKind {
     }
 }
 
+/// recovery-equivalent disposition for a finalized, non-discarded frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameDisposition {
+    Applied,
+    Rejected,
+}
+
+impl FrameDisposition {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Applied => 0,
+            Self::Rejected => 1,
+        }
+    }
+
+    fn from_u8(v: u8) -> Result<Self, WireError> {
+        Ok(match v {
+            0 => Self::Applied,
+            1 => Self::Rejected,
+            other => return Err(WireError::BadTag("FrameDisposition", other)),
+        })
+    }
+}
+
+/// one finalized, non-discarded recovery frame and the seal that consensus
+/// served at that height.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedFrame {
+    pub height: u64,
+    pub frame: Vec<u8>,
+    pub disposition: FrameDisposition,
+    pub roots: Vec<(ModuleId, StateRoot)>,
+    pub app_hash: StateRoot,
+}
+
 /// one module's row in a manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestEntry {
     pub module_id: ModuleId,
     pub root: StateRoot,
     pub kind: PayloadKind,
+    pub resolver_target: Option<ResolverTarget>,
 }
 
 /// the joiner's picture of one captured boundary.
@@ -166,6 +268,13 @@ impl Manifest {
         self.entries.iter().find(|e| e.module_id == id)
     }
 
+    pub fn boundary_id(&self) -> BoundaryId {
+        BoundaryId {
+            height: self.height,
+            app_hash: self.app_hash,
+        }
+    }
+
     /// boot preflight: fail loud when the local build's `max_supported`
     /// protocol version is below this boundary's `required_min_version`. an
     /// early, actionable refusal instead of an opaque post-rebuild app-hash
@@ -182,20 +291,39 @@ pub enum SyncRequest {
     Manifest,
     /// fetch a chunk of a captured module's snapshot payload.
     Chunk {
-        height: u64,
+        boundary: BoundaryId,
         module_id: ModuleId,
         offset: u64,
     },
     /// route module-defined bytes to the live module's `serve_sync`.
-    Module { module_id: ModuleId, body: Vec<u8> },
+    Module {
+        boundary: BoundaryId,
+        module_id: ModuleId,
+        body: Vec<u8>,
+    },
+    /// fetch recovery-equivalent finalized frame records in `(after, up_to]`.
+    Frames {
+        after_height: u64,
+        up_to_height: u64,
+    },
 }
 
 /// a state-sync response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncResponse {
     Manifest(Manifest),
-    Chunk { total: u64, bytes: Vec<u8> },
+    Chunk {
+        total: u64,
+        bytes: Vec<u8>,
+    },
     Module(Vec<u8>),
+    Frames {
+        frames: Vec<FinalizedFrame>,
+    },
+    RangePruned {
+        requested_after: u64,
+        retained_from: u64,
+    },
     Error(String),
 }
 
@@ -205,6 +333,8 @@ impl SyncResponse {
             Self::Manifest(_) => "Manifest",
             Self::Chunk { .. } => "Chunk",
             Self::Module(_) => "Module",
+            Self::Frames { .. } => "Frames",
+            Self::RangePruned { .. } => "RangePruned",
             Self::Error(_) => "Error",
         }
     }
@@ -217,19 +347,34 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
     match req {
         SyncRequest::Manifest => out.push(0u8),
         SyncRequest::Chunk {
-            height,
+            boundary,
             module_id,
             offset,
         } => {
             out.push(1u8);
-            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(&boundary.height.to_le_bytes());
+            out.extend_from_slice(boundary.app_hash.as_bytes());
             wire::put_str(&mut out, module_id);
             out.extend_from_slice(&offset.to_le_bytes());
         }
-        SyncRequest::Module { module_id, body } => {
+        SyncRequest::Module {
+            boundary,
+            module_id,
+            body,
+        } => {
             out.push(2u8);
+            out.extend_from_slice(&boundary.height.to_le_bytes());
+            out.extend_from_slice(boundary.app_hash.as_bytes());
             wire::put_str(&mut out, module_id);
             wire::put_bytes(&mut out, body);
+        }
+        SyncRequest::Frames {
+            after_height,
+            up_to_height,
+        } => {
+            out.push(3u8);
+            out.extend_from_slice(&after_height.to_le_bytes());
+            out.extend_from_slice(&up_to_height.to_le_bytes());
         }
     }
     out
@@ -241,13 +386,24 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
     let req = match tag {
         0 => SyncRequest::Manifest,
         1 => SyncRequest::Chunk {
-            height: wire::take_u64(&mut buf)?,
+            boundary: BoundaryId {
+                height: wire::take_u64(&mut buf)?,
+                app_hash: StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?),
+            },
             module_id: wire::take_str(&mut buf)?,
             offset: wire::take_u64(&mut buf)?,
         },
         2 => SyncRequest::Module {
+            boundary: BoundaryId {
+                height: wire::take_u64(&mut buf)?,
+                app_hash: StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?),
+            },
             module_id: wire::take_str(&mut buf)?,
             body: wire::take_bytes(&mut buf)?.to_vec(),
+        },
+        3 => SyncRequest::Frames {
+            after_height: wire::take_u64(&mut buf)?,
+            up_to_height: wire::take_u64(&mut buf)?,
         },
         other => return Err(WireError::BadTag("SyncRequest", other)),
     };
@@ -294,6 +450,15 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 wire::put_str(&mut out, &e.module_id);
                 out.extend_from_slice(e.root.as_bytes());
                 out.push(e.kind.to_u8());
+                match &e.resolver_target {
+                    Some(target) => {
+                        out.push(1);
+                        out.extend_from_slice(target.root.as_ref());
+                        out.extend_from_slice(&target.start.to_le_bytes());
+                        out.extend_from_slice(&target.op_count.to_le_bytes());
+                    }
+                    None => out.push(0),
+                }
             }
         }
         SyncResponse::Chunk { total, bytes } => {
@@ -305,8 +470,31 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             out.push(2u8);
             wire::put_bytes(&mut out, bytes);
         }
-        SyncResponse::Error(msg) => {
+        SyncResponse::Frames { frames } => {
             out.push(3u8);
+            out.extend_from_slice(&(frames.len() as u64).to_le_bytes());
+            for frame in frames {
+                out.extend_from_slice(&frame.height.to_le_bytes());
+                wire::put_bytes(&mut out, &frame.frame);
+                out.push(frame.disposition.to_u8());
+                out.extend_from_slice(&(frame.roots.len() as u64).to_le_bytes());
+                for (module_id, root) in &frame.roots {
+                    wire::put_str(&mut out, module_id);
+                    out.extend_from_slice(root.as_bytes());
+                }
+                out.extend_from_slice(frame.app_hash.as_bytes());
+            }
+        }
+        SyncResponse::RangePruned {
+            requested_after,
+            retained_from,
+        } => {
+            out.push(4u8);
+            out.extend_from_slice(&requested_after.to_le_bytes());
+            out.extend_from_slice(&retained_from.to_le_bytes());
+        }
+        SyncResponse::Error(msg) => {
+            out.push(5u8);
             wire::put_str(&mut out, msg);
         }
     }
@@ -362,10 +550,28 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
             }
             let mut entries = Vec::with_capacity(n as usize);
             for _ in 0..n {
+                let module_id = wire::take_str(&mut buf)?;
+                let root = StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?);
+                let kind = PayloadKind::from_u8(wire::take_u8(&mut buf)?)?;
+                let resolver_target = match wire::take_u8(&mut buf)? {
+                    0 => None,
+                    1 => {
+                        let raw = wire::take_array::<ROOT_LEN>(&mut buf)?;
+                        let digest = qmdb::SyncDigest::decode(raw.as_ref())
+                            .map_err(|e| WireError::Codec(format!("resolver target root: {e}")))?;
+                        Some(ResolverTarget {
+                            root: digest,
+                            start: wire::take_u64(&mut buf)?,
+                            op_count: wire::take_u64(&mut buf)?,
+                        })
+                    }
+                    t => return Err(WireError::BadTag("resolver_target", t)),
+                };
                 entries.push(ManifestEntry {
-                    module_id: wire::take_str(&mut buf)?,
-                    root: StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?),
-                    kind: PayloadKind::from_u8(wire::take_u8(&mut buf)?)?,
+                    module_id,
+                    root,
+                    kind,
+                    resolver_target,
                 });
             }
             SyncResponse::Manifest(Manifest {
@@ -386,7 +592,48 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
             bytes: wire::take_bytes(&mut buf)?.to_vec(),
         },
         2 => SyncResponse::Module(wire::take_bytes(&mut buf)?.to_vec()),
-        3 => SyncResponse::Error(wire::take_str(&mut buf)?),
+        3 => {
+            let n = wire::take_u64(&mut buf)?;
+            if n > FRAME_BATCH_LEN as u64 {
+                return Err(WireError::Codec(format!(
+                    "frame batch count {n} exceeds cap {FRAME_BATCH_LEN}"
+                )));
+            }
+            let mut frames = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let height = wire::take_u64(&mut buf)?;
+                let frame = wire::take_bytes(&mut buf)?.to_vec();
+                let disposition = FrameDisposition::from_u8(wire::take_u8(&mut buf)?)?;
+                let roots_len = wire::take_u64(&mut buf)?;
+                if roots_len > (buf.len() / (8 + ROOT_LEN)) as u64 {
+                    return Err(WireError::Codec(format!(
+                        "root count {roots_len} exceeds the {} remaining bytes",
+                        buf.len()
+                    )));
+                }
+                let mut roots = Vec::with_capacity(roots_len as usize);
+                for _ in 0..roots_len {
+                    roots.push((
+                        wire::take_str(&mut buf)?,
+                        StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?),
+                    ));
+                }
+                let app_hash = StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?);
+                frames.push(FinalizedFrame {
+                    height,
+                    frame,
+                    disposition,
+                    roots,
+                    app_hash,
+                });
+            }
+            SyncResponse::Frames { frames }
+        }
+        4 => SyncResponse::RangePruned {
+            requested_after: wire::take_u64(&mut buf)?,
+            retained_from: wire::take_u64(&mut buf)?,
+        },
+        5 => SyncResponse::Error(wire::take_str(&mut buf)?),
         other => return Err(WireError::BadTag("SyncResponse", other)),
     };
     wire::expect_empty(buf)?;
@@ -422,7 +669,7 @@ enum CapturedPayload {
     Snapshot(Vec<u8>),
     /// the module serves its own resolver lane live; the capture only records
     /// that fact (and the boundary root, in the entry).
-    Resolver,
+    Resolver(ResolverTarget),
     Unsupported,
 }
 
@@ -431,7 +678,7 @@ impl CapturedPayload {
         match self {
             Self::Stateless => PayloadKind::Stateless,
             Self::Snapshot(_) => PayloadKind::Snapshot,
-            Self::Resolver => PayloadKind::Resolver,
+            Self::Resolver(_) => PayloadKind::Resolver,
             Self::Unsupported => PayloadKind::Unsupported,
         }
     }
@@ -477,12 +724,95 @@ struct Capture {
 /// consistent — no locks, no torn reads).
 #[derive(Default)]
 pub struct SyncServer {
-    captures: BTreeMap<u64, Capture>,
+    captures: BTreeMap<BoundaryId, Capture>,
+    leased: BTreeMap<BoundaryId, u64>,
+    lease_clock: u64,
 }
 
 impl SyncServer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn lease(&mut self, id: BoundaryId) {
+        self.touch_lease(id);
+        self.release_leased_overflow();
+        self.evict_unleased_overflow();
+    }
+
+    pub fn release(&mut self, id: BoundaryId) {
+        self.leased.remove(&id);
+        self.evict_unleased_overflow();
+    }
+
+    #[doc(hidden)]
+    pub fn insert_capture_for_test(&mut self, id: BoundaryId) {
+        self.captures.insert(
+            id,
+            Capture {
+                app_hash: id.app_hash,
+                coords: BoundaryCoords::default(),
+                modules: BTreeMap::new(),
+            },
+        );
+    }
+
+    #[doc(hidden)]
+    pub fn insert_resolver_capture_for_test(
+        &mut self,
+        id: BoundaryId,
+        module_id: impl Into<ModuleId>,
+        start: u64,
+    ) {
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            module_id.into(),
+            CapturedModule {
+                root: StateRoot([7u8; ROOT_LEN]),
+                payload: CapturedPayload::Resolver(ResolverTarget {
+                    root: commonware_cryptography::sha256::Digest([7u8; ROOT_LEN]),
+                    start,
+                    op_count: start + 1,
+                }),
+            },
+        );
+        self.captures.insert(
+            id,
+            Capture {
+                app_hash: id.app_hash,
+                coords: BoundaryCoords::default(),
+                modules,
+            },
+        );
+    }
+
+    #[doc(hidden)]
+    pub fn has_capture(&self, id: BoundaryId) -> bool {
+        self.captures.contains_key(&id)
+    }
+
+    #[doc(hidden)]
+    pub fn leased_count_for_test(&self) -> usize {
+        self.leased.len()
+    }
+
+    #[doc(hidden)]
+    pub fn is_leased_for_test(&self, id: BoundaryId) -> bool {
+        self.leased.contains_key(&id)
+    }
+
+    pub fn oldest_active_lease_start_for_module(&self, module_id: &str) -> Option<u64> {
+        self.leased
+            .keys()
+            .filter_map(|id| {
+                let capture = self.captures.get(id)?;
+                let module = capture.modules.get(module_id)?;
+                match &module.payload {
+                    CapturedPayload::Resolver(target) => Some(target.start),
+                    _ => None,
+                }
+            })
+            .min()
     }
 
     /// handle one decoded request. `finalized` is the node's latest applied
@@ -526,18 +856,19 @@ impl SyncServer {
         match req {
             SyncRequest::Manifest => {
                 let finalized = finalized.ok_or("no finalized boundary to serve yet")?;
-                self.ensure_capture(host, finalized, coords).await?;
+                let id = self.ensure_capture(host, finalized, coords).await?;
+                self.lease(id);
                 let capture = self
                     .captures
-                    .get(&finalized.height)
-                    .expect("ensure_capture inserted this height");
+                    .get(&id)
+                    .expect("ensure_capture inserted this boundary");
                 let required_min_version = sdk::required_min_version(
                     capture.coords.current_version,
                     capture.coords.pending_upgrade.as_ref(),
-                    finalized.height,
+                    id.height,
                 );
                 Ok(SyncResponse::Manifest(Manifest {
-                    height: finalized.height,
+                    height: id.height,
                     app_hash: capture.app_hash,
                     epoch: capture.coords.epoch,
                     view_base: capture.coords.view_base,
@@ -553,23 +884,23 @@ impl SyncServer {
                             module_id: id.clone(),
                             root: m.root,
                             kind: m.payload.kind(),
+                            resolver_target: match &m.payload {
+                                CapturedPayload::Resolver(target) => Some(target.clone()),
+                                _ => None,
+                            },
                         })
                         .collect(),
                 }))
             }
             SyncRequest::Chunk {
-                height,
+                boundary,
                 module_id,
                 offset,
             } => {
-                let capture = self
-                    .captures
-                    .get(&height)
-                    .ok_or_else(|| format!("no capture at height {height} (refetch manifest)"))?;
-                let module = capture
-                    .modules
-                    .get(&module_id)
-                    .ok_or_else(|| format!("no module {module_id} in capture {height}"))?;
+                let capture = self.leased_capture(boundary)?;
+                let module = capture.modules.get(&module_id).ok_or_else(|| {
+                    format!("no module {module_id} in capture {}", boundary.height)
+                })?;
                 let CapturedPayload::Snapshot(bytes) = &module.payload else {
                     return Err(format!("module {module_id} has no snapshot payload"));
                 };
@@ -586,12 +917,45 @@ impl SyncServer {
                     bytes: bytes[start..end].to_vec(),
                 })
             }
-            SyncRequest::Module { module_id, body } => host
-                .serve_sync(&module_id, &body)
-                .await
-                .map(SyncResponse::Module)
-                .map_err(|e| format!("module {module_id} serve_sync: {e}")),
+            SyncRequest::Module {
+                boundary,
+                module_id,
+                body,
+            } => {
+                let capture = self.leased_capture(boundary)?;
+                let module = capture.modules.get(&module_id).ok_or_else(|| {
+                    format!("no module {module_id} in capture {}", boundary.height)
+                })?;
+                if !matches!(module.payload, CapturedPayload::Resolver(_)) {
+                    return Err(format!("module {module_id} has no resolver payload"));
+                }
+                host.serve_sync(&module_id, &body)
+                    .await
+                    .map(SyncResponse::Module)
+                    .map_err(|e| format!("module {module_id} serve_sync: {e}"))
+            }
+            SyncRequest::Frames { .. } => {
+                Err("frame range requests require the recovery journal".into())
+            }
         }
+    }
+
+    fn leased_capture(&mut self, boundary: BoundaryId) -> Result<&Capture, String> {
+        if !self.leased.contains_key(&boundary) {
+            return Err(format!(
+                "boundary {} {} is not leased (refetch manifest)",
+                boundary.height,
+                hex_root(&boundary.app_hash)
+            ));
+        }
+        self.touch_lease(boundary);
+        self.captures.get(&boundary).ok_or_else(|| {
+            format!(
+                "no capture at boundary {} {} (refetch manifest)",
+                boundary.height,
+                hex_root(&boundary.app_hash)
+            )
+        })
     }
 
     /// capture the registry at `finalized` if not already cached; evict the
@@ -601,20 +965,40 @@ impl SyncServer {
         host: &Host,
         finalized: FinalizedBlock,
         coords: &BoundaryCoords,
-    ) -> Result<(), String> {
-        if self.captures.contains_key(&finalized.height) {
-            return Ok(());
-        }
+    ) -> Result<BoundaryId, String> {
         let snapshot = host
             .capture_finalized_snapshot(finalized)
             .map_err(|e| format!("capture failed: {e}"))?;
+        let id = BoundaryId {
+            height: finalized.height,
+            app_hash: snapshot.app_hash,
+        };
+        if self.captures.contains_key(&id) {
+            return Ok(id);
+        }
 
         let mut modules = BTreeMap::new();
         for m in snapshot.modules {
             let payload = match m.state_sync {
                 StateSyncHandle::Stateless => CapturedPayload::Stateless,
                 StateSyncHandle::SnapshotBytes(bytes) => CapturedPayload::Snapshot(bytes),
-                StateSyncHandle::ResolverBacked { .. } => CapturedPayload::Resolver,
+                StateSyncHandle::ResolverBacked { .. } => {
+                    let target = host
+                        .resolver_sync_target(&m.id)
+                        .await
+                        .map_err(|e| format!("module {} sync target: {e}", m.id))?;
+                    if target.root != m.root {
+                        return Err(format!(
+                            "module {} resolver target root does not match boundary root",
+                            m.id
+                        ));
+                    }
+                    CapturedPayload::Resolver(ResolverTarget {
+                        root: commonware_cryptography::sha256::Digest(target.root.0),
+                        start: target.start,
+                        op_count: target.op_count,
+                    })
+                }
                 StateSyncHandle::Unsupported { .. } => CapturedPayload::Unsupported,
             };
             modules.insert(
@@ -626,22 +1010,47 @@ impl SyncServer {
             );
         }
         self.captures.insert(
-            finalized.height,
+            id,
             Capture {
                 app_hash: snapshot.app_hash,
                 coords: coords.clone(),
                 modules,
             },
         );
+        Ok(id)
+    }
+
+    fn touch_lease(&mut self, id: BoundaryId) {
+        self.lease_clock = self.lease_clock.wrapping_add(1);
+        self.leased.insert(id, self.lease_clock);
+    }
+
+    fn release_leased_overflow(&mut self) {
+        while self.leased.len() > MAX_LEASED_BOUNDARIES {
+            let oldest = self
+                .leased
+                .iter()
+                .min_by_key(|(_, tick)| **tick)
+                .map(|(id, _)| *id)
+                .expect("leased len above cap implies at least one lease");
+            self.leased.remove(&oldest);
+        }
+    }
+
+    fn evict_unleased_overflow(&mut self) {
         while self.captures.len() > MAX_CAPTURES {
-            let oldest = *self
+            let Some(oldest) = self
                 .captures
                 .keys()
-                .next()
-                .expect("len > MAX_CAPTURES implies non-empty");
-            self.captures.remove(&oldest);
+                .copied()
+                .find(|id| !self.leased.contains_key(id))
+            else {
+                break;
+            };
+            self.captures
+                .remove(&oldest)
+                .expect("removed capture existed");
         }
-        Ok(())
     }
 }
 
@@ -671,14 +1080,14 @@ pub async fn fetch_manifest<C: SyncClient>(client: &C) -> Result<Manifest, SyncE
 /// fetch a captured module's full snapshot payload, chunk by chunk.
 pub async fn fetch_snapshot<C: SyncClient>(
     client: &C,
-    height: u64,
+    boundary: BoundaryId,
     module_id: &str,
 ) -> Result<Vec<u8>, SyncError> {
     let mut out: Vec<u8> = Vec::new();
     loop {
         let resp = client
             .request(SyncRequest::Chunk {
-                height,
+                boundary,
                 module_id: module_id.to_string(),
                 offset: out.len() as u64,
             })
@@ -706,6 +1115,68 @@ pub async fn fetch_snapshot<C: SyncClient>(
     }
 }
 
+/// fetch a finite, ordered recovery-frame suffix in bounded batches.
+pub async fn fetch_frames<C: SyncClient>(
+    client: &C,
+    after_height: u64,
+    up_to_height: u64,
+) -> Result<Vec<FinalizedFrame>, SyncError> {
+    if after_height > up_to_height {
+        return Err(SyncError::Server(format!(
+            "invalid frame range ({after_height}, {up_to_height}]"
+        )));
+    }
+    let mut out = Vec::new();
+    let mut after = after_height;
+    while after < up_to_height {
+        let resp = client
+            .request(SyncRequest::Frames {
+                after_height: after,
+                up_to_height,
+            })
+            .await?;
+        match resp {
+            SyncResponse::Frames { frames } => {
+                if frames.is_empty() {
+                    return Err(SyncError::Server(format!(
+                        "server returned empty frame batch for non-empty range \
+                         ({after}, {up_to_height}]"
+                    )));
+                }
+                let mut last = after;
+                for frame in frames {
+                    if frame.height <= last || frame.height > up_to_height {
+                        return Err(SyncError::Server(format!(
+                            "server returned out-of-range frame height {} for \
+                             ({after}, {up_to_height}]",
+                            frame.height
+                        )));
+                    }
+                    last = frame.height;
+                    out.push(frame);
+                }
+                after = last;
+            }
+            SyncResponse::RangePruned {
+                requested_after,
+                retained_from,
+            } => {
+                return Err(SyncError::RangePruned {
+                    requested_after,
+                    retained_from,
+                });
+            }
+            SyncResponse::Error(e) => return Err(SyncError::Server(e)),
+            other => return Err(SyncError::UnexpectedResponse(other.kind_name())),
+        }
+    }
+    Ok(out)
+}
+
+fn hex_root(root: &StateRoot) -> String {
+    root.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,13 +1186,24 @@ mod tests {
         for req in [
             SyncRequest::Manifest,
             SyncRequest::Chunk {
-                height: 42,
+                boundary: BoundaryId {
+                    height: 42,
+                    app_hash: StateRoot([4u8; ROOT_LEN]),
+                },
                 module_id: "forge".into(),
                 offset: 1 << 20,
             },
             SyncRequest::Module {
+                boundary: BoundaryId {
+                    height: 42,
+                    app_hash: StateRoot([4u8; ROOT_LEN]),
+                },
                 module_id: "kv".into(),
                 body: vec![1, 2, 3],
+            },
+            SyncRequest::Frames {
+                after_height: 42,
+                up_to_height: 48,
             },
         ] {
             let bytes = encode_request(&req);
@@ -752,11 +1234,17 @@ mod tests {
                         module_id: "kv".into(),
                         root: StateRoot([1u8; ROOT_LEN]),
                         kind: PayloadKind::Resolver,
+                        resolver_target: Some(ResolverTarget {
+                            root: commonware_cryptography::sha256::Digest([1u8; ROOT_LEN]),
+                            start: 1,
+                            op_count: 2,
+                        }),
                     },
                     ManifestEntry {
                         module_id: "valset".into(),
                         root: StateRoot([2u8; ROOT_LEN]),
                         kind: PayloadKind::Snapshot,
+                        resolver_target: None,
                     },
                 ],
             }),
@@ -780,6 +1268,19 @@ mod tests {
                 bytes: vec![0xAB; 10],
             },
             SyncResponse::Module(vec![4, 5]),
+            SyncResponse::Frames {
+                frames: vec![FinalizedFrame {
+                    height: 8,
+                    frame: vec![0xAB, 0xCD],
+                    disposition: FrameDisposition::Applied,
+                    roots: vec![("kv".into(), StateRoot([3u8; ROOT_LEN]))],
+                    app_hash: StateRoot([4u8; ROOT_LEN]),
+                }],
+            },
+            SyncResponse::RangePruned {
+                requested_after: 10,
+                retained_from: 12,
+            },
             SyncResponse::Error("nope".into()),
         ] {
             let bytes = encode_response(&resp);
@@ -790,7 +1291,10 @@ mod tests {
     #[test]
     fn truncated_and_trailing_frames_reject() {
         let bytes = encode_request(&SyncRequest::Chunk {
-            height: 1,
+            boundary: BoundaryId {
+                height: 1,
+                app_hash: StateRoot([1u8; ROOT_LEN]),
+            },
             module_id: "m".into(),
             offset: 0,
         });
