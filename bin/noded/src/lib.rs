@@ -128,6 +128,108 @@ impl TelemetryRing {
     }
 }
 
+/// how many recent non-empty blocks the node retains for `GET /v1/blocks`.
+/// heartbeat nops never enter the ring, so this is real history, not idle
+/// ticks.
+pub const BLOCK_RING_CAP: usize = 256;
+
+/// cap on the payload-preview characters a block record carries.
+pub const PAYLOAD_PREVIEW_MAX: usize = 1024;
+
+/// how a block's op landed, as the explorer surface reports it. only
+/// journaled outcomes appear (a frame discarded at an epoch cutover is
+/// dropped before decoding, so there are no contents to show): an applied op
+/// mutated state; a rejected op finalized but rolled back — a failed tx.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockDisposition {
+    Applied,
+    Rejected,
+}
+
+/// one non-empty finalized block, as the explorer reads it: the block's
+/// consensus coordinates (height, frame content hash, post-block app-hash),
+/// its authenticated proposer, and the op it carried with the deterministic
+/// dispatch trace. buffered in the [`BlockRing`] for `GET /v1/blocks`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockRecord {
+    pub height: u64,
+    /// hex of the frame's content address (sha256 over the exact bytes the
+    /// orderer carried) — the block's hash on this surface.
+    pub hash: String,
+    /// hex of the composed app-hash after this block settled — the commit.
+    pub commit_hash: String,
+    /// hex of the proposing validator's ed25519 public key — the frame's
+    /// VERIFIED signer, not a claimed identity.
+    pub proposer: String,
+    pub disposition: BlockDisposition,
+    /// the root op's target module.
+    pub target: String,
+    /// the dispatch trace, in drain order — the "transactions" inside the
+    /// block. empty for a rejected op (a deterministic no-op leaves no trace).
+    pub operations: Vec<DispatchInfo>,
+    /// best-effort utf-8 preview of the root op's payload (module `*Msg` json
+    /// on this lane), capped at [`PAYLOAD_PREVIEW_MAX`] chars.
+    pub payload: String,
+}
+
+/// the explorer's wire rendering of one dispatch. `Origin::External` renders
+/// as plain `"external"`: the block-level `proposer` field already carries
+/// the key, and raw ed25519 bytes are not utf-8 (telemetry's
+/// `external:<name>` convention assumes the embedded daemon's readable
+/// names).
+impl From<&host::DispatchRecord> for DispatchInfo {
+    fn from(record: &host::DispatchRecord) -> Self {
+        DispatchInfo {
+            module: record.module.clone(),
+            origin: match &record.origin {
+                sdk::Origin::External(_) => "external".to_string(),
+                sdk::Origin::Module(id) => format!("module:{id}"),
+                sdk::Origin::System => "system".to_string(),
+            },
+            emitted_msgs: record.emitted_msgs,
+            emitted_events: record.emitted_events,
+        }
+    }
+}
+
+/// best-effort utf-8 preview of an op payload, capped at
+/// [`PAYLOAD_PREVIEW_MAX`] chars. binary bytes render lossily — payloads on
+/// this lane are module `*Msg` json, so the common case is readable.
+pub fn payload_preview(payload: &[u8]) -> String {
+    let text = String::from_utf8_lossy(payload);
+    match text.char_indices().nth(PAYLOAD_PREVIEW_MAX) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.into_owned(),
+    }
+}
+
+/// a bounded, shared ring of the most recent non-empty blocks — the explorer's
+/// backing store. same discipline as [`TelemetryRing`]: the node actor pushes
+/// from its own thread as blocks drain, the http layer reads from the server
+/// runtime, so it is an `Arc<Mutex>`. drops oldest at [`BLOCK_RING_CAP`].
+#[derive(Clone, Default)]
+pub struct BlockRing(Arc<Mutex<VecDeque<BlockRecord>>>);
+
+impl BlockRing {
+    /// append a record, evicting the oldest once the cap is reached.
+    pub fn push(&self, record: BlockRecord) {
+        let mut ring = self.0.lock().expect("block ring poisoned");
+        if ring.len() == BLOCK_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(record);
+    }
+
+    /// the most recent `limit` blocks, oldest-first (`None` → all buffered).
+    pub fn recent(&self, limit: Option<usize>) -> Vec<BlockRecord> {
+        let ring = self.0.lock().expect("block ring poisoned");
+        let take = limit.map_or(ring.len(), |n| n.min(ring.len()));
+        ring.iter().skip(ring.len() - take).cloned().collect()
+    }
+}
+
 /// the status projection: daemon build version, global app-hash, and each
 /// registered module's root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -251,6 +353,10 @@ pub struct NodeHandle {
     /// crosses the actor command lane: the actor pushes into it as blocks
     /// commit, `GET /v1/telemetry` reads it directly.
     telemetry: TelemetryRing,
+    /// recent non-empty blocks — the explorer's backing store. same
+    /// node-local discipline as `telemetry`: the actor pushes as blocks
+    /// drain, `GET /v1/blocks` reads it directly.
+    blocks: BlockRing,
     /// the forge module's on-disk repo base dir (`<storage>/<forge subdir>`);
     /// each named repo lives at `<forge_repo>/<name>` as a real libgit2 repo.
     /// threaded in so the git upload-pack (clone/fetch) handler can open a repo
@@ -286,6 +392,7 @@ impl NodeHandle {
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             blobs: files::BlobHandle::default(),
             telemetry: TelemetryRing::default(),
+            blocks: BlockRing::default(),
             forge_repo: None,
             index: None,
         };
@@ -322,6 +429,13 @@ impl NodeHandle {
         self.telemetry.clone()
     }
 
+    /// the block ring this surface serves. the node actor pushes a record
+    /// into a clone of it as each non-empty block drains; `GET /v1/blocks`
+    /// reads here.
+    pub fn block_ring(&self) -> BlockRing {
+        self.blocks.clone()
+    }
+
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
     /// `Notify` stores the permit, so a request that lands before anyone awaits
     /// is not lost.
@@ -342,7 +456,8 @@ pub fn hex_root(root: &StateRoot) -> String {
     hex_bytes(&root.0)
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
+/// hex-encode arbitrary wire bytes (frame content hashes, proposer keys).
+pub fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -364,6 +479,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
         .route("/v1/telemetry", get(telemetry))
+        .route("/v1/blocks", get(blocks))
         // the derived read-model tier: snapshot reads of the per-module
         // fluent31 indexes the actor materializes as blocks commit.
         .route("/v1/index/status", get(index_status))
@@ -700,6 +816,27 @@ async fn index_scan(
         next_after: page.next_after,
     })
     .into_response()
+}
+
+/// query params for `GET /v1/blocks`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlocksParams {
+    /// cap the response to the most recent N blocks (default: all buffered).
+    pub limit: Option<usize>,
+}
+
+/// GET /v1/blocks — recent non-empty blocks, oldest-first: `{"blocks":[…]}`.
+///
+/// reads the node-local ring directly (no actor round-trip), the same
+/// discipline as `/v1/telemetry`. heartbeat nops never enter the ring, so an
+/// empty reply means no real ops have finalized, not an idle chain.
+async fn blocks(
+    State(handle): State<NodeHandle>,
+    Query(params): Query<BlocksParams>,
+) -> Response {
+    let blocks = handle.blocks.recent(params.limit);
+    Json(serde_json::json!({ "blocks": blocks })).into_response()
 }
 
 /// the OpenMetrics content type a Prometheus scraper negotiates for `/metrics`.
@@ -1433,6 +1570,52 @@ mod tests {
             ring.recent(Some(TELEMETRY_RING_CAP + 100)).len(),
             TELEMETRY_RING_CAP,
         );
+    }
+
+    fn record(height: u64) -> BlockRecord {
+        BlockRecord {
+            height,
+            hash: String::new(),
+            commit_hash: String::new(),
+            proposer: String::new(),
+            disposition: BlockDisposition::Applied,
+            target: "directory".into(),
+            operations: Vec::new(),
+            payload: String::new(),
+        }
+    }
+
+    #[test]
+    fn block_ring_evicts_oldest_at_cap_and_recent_returns_newest_tail() {
+        let ring = BlockRing::default();
+        for h in 0..(BLOCK_RING_CAP as u64 + 2) {
+            ring.push(record(h));
+        }
+        let all = ring.recent(None);
+        assert_eq!(all.len(), BLOCK_RING_CAP, "buffer holds exactly the cap");
+        assert_eq!(all.first().unwrap().height, 2, "oldest two evicted");
+        assert_eq!(
+            all.last().unwrap().height,
+            BLOCK_RING_CAP as u64 + 1,
+            "newest retained, oldest-first ordering"
+        );
+        let tail: Vec<u64> = ring.recent(Some(2)).iter().map(|r| r.height).collect();
+        assert_eq!(
+            tail,
+            vec![BLOCK_RING_CAP as u64, BLOCK_RING_CAP as u64 + 1],
+            "recent(limit) returns the newest tail, oldest-first"
+        );
+    }
+
+    #[test]
+    fn payload_preview_caps_and_marks_truncation() {
+        assert_eq!(payload_preview(b"{\"k\":\"v\"}"), "{\"k\":\"v\"}");
+        let long = "x".repeat(PAYLOAD_PREVIEW_MAX + 10);
+        let preview = payload_preview(long.as_bytes());
+        assert_eq!(preview.chars().count(), PAYLOAD_PREVIEW_MAX + 1);
+        assert!(preview.ends_with('…'), "truncation is visible");
+        // invalid utf-8 renders lossily rather than erroring.
+        assert_eq!(payload_preview(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
     }
 
     #[test]
