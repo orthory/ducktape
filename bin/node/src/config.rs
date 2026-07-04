@@ -361,6 +361,80 @@ fn resolve_one(host_port: &str) -> Result<SocketAddr, String> {
 }
 
 // ============================================================================
+// typed reachability — how to reach a member's REAL node.
+// ============================================================================
+
+/// how to reach a member's REAL node. advisory (never part of the genesis
+/// fingerprint); the mesh still authenticates the peer by its ed25519 key
+/// end-to-end regardless of which socket got dialed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Reach {
+    /// dial this `host:port` directly (today's bootstrap behaviour).
+    Direct(String),
+    /// dial a transport forwarder that splices to the target.
+    Fronted(String),
+    /// dial a coordinator (`coord_addr`) and ask it for a path to the target.
+    Coordinated(CoordRef),
+}
+
+/// how to reach a coordinator, plus the key it authenticates its channel with.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoordRef {
+    pub coord_addr: String,
+    pub coord_key: ed25519::PublicKey,
+}
+
+/// a signed-invite reach hint: the REAL node identity a joiner must end up
+/// authenticating, plus how to get a path to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReachHint {
+    pub expected_key: ed25519::PublicKey,
+    pub reach: Reach,
+}
+
+impl ReachHint {
+    /// canonical single-line form stored in `network.toml`'s `reach` array and
+    /// parsed by [`ReachHint::parse`]. `@` separates the expected key from the
+    /// address, `#` separates a coordinator address from its key; neither char
+    /// occurs in a host:port (IPv6 uses `[..]:port`), so the split is unambiguous.
+    pub fn to_canonical(&self) -> String {
+        let ek = hex_bytes(self.expected_key.as_ref());
+        match &self.reach {
+            Reach::Direct(a) => format!("direct:{ek}@{a}"),
+            Reach::Fronted(a) => format!("fronted:{ek}@{a}"),
+            Reach::Coordinated(c) => {
+                format!("coordinated:{ek}@{}#{}", c.coord_addr, hex_bytes(c.coord_key.as_ref()))
+            }
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (tag, rest) = s
+            .split_once(':')
+            .ok_or_else(|| format!("reach hint {s:?} missing a tag"))?;
+        let (ek_hex, addr_part) = rest
+            .split_once('@')
+            .ok_or_else(|| format!("reach hint {s:?} is not tag:key@addr"))?;
+        let expected_key = decode_key(ek_hex)?;
+        let reach = match tag {
+            "direct" => Reach::Direct(addr_part.to_string()),
+            "fronted" => Reach::Fronted(addr_part.to_string()),
+            "coordinated" => {
+                let (coord_addr, ck_hex) = addr_part
+                    .rsplit_once('#')
+                    .ok_or_else(|| format!("coordinated hint {s:?} missing #coord_key"))?;
+                Reach::Coordinated(CoordRef {
+                    coord_addr: coord_addr.to_string(),
+                    coord_key: decode_key(ck_hex)?,
+                })
+            }
+            other => return Err(format!("unknown reach tag {other:?} in {s:?}")),
+        };
+        Ok(Self { expected_key, reach })
+    }
+}
+
+// ============================================================================
 // the invite blob — the descriptor packed into a compact, single-line token.
 //
 // v1 hex-wrapped the whole `network.toml` (field names, quotes, and 64-char hex
@@ -1279,5 +1353,36 @@ bootstrapper_addr = "127.0.0.1:52200"
             r.signer.public_key(),
             ed25519::PrivateKey::from_seed(1).public_key()
         );
+    }
+
+    #[test]
+    fn reach_hint_canonical_roundtrips_every_kind() {
+        let ek = ed25519::PrivateKey::from_seed(11).public_key();
+        let ck = ed25519::PrivateKey::from_seed(12).public_key();
+        let cases = [
+            ReachHint { expected_key: ek.clone(), reach: Reach::Direct("127.0.0.1:9000".into()) },
+            ReachHint { expected_key: ek.clone(), reach: Reach::Fronted("front.example.com:443".into()) },
+            ReachHint {
+                expected_key: ek.clone(),
+                reach: Reach::Coordinated(CoordRef {
+                    coord_addr: "p2p.ducktape.industries:7777".into(),
+                    coord_key: ck.clone(),
+                }),
+            },
+        ];
+        for h in cases {
+            let s = h.to_canonical();
+            assert_eq!(ReachHint::parse(&s).expect("parse"), h, "roundtrip {s}");
+        }
+    }
+
+    #[test]
+    fn reach_hint_parse_rejects_malformed() {
+        assert!(ReachHint::parse("nope").is_err(), "no tag");
+        assert!(ReachHint::parse("direct:deadbeef").is_err(), "no @addr");
+        assert!(ReachHint::parse("bogus:00@host:1").is_err(), "unknown tag");
+        assert!(ReachHint::parse("direct:zz@host:1").is_err(), "bad hex key");
+        // coordinated without the #coord_key delimiter:
+        assert!(ReachHint::parse("coordinated:00@host:1").is_err(), "missing #coord_key");
     }
 }
