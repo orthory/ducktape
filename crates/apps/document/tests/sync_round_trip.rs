@@ -87,6 +87,17 @@ where
     }
 }
 
+async fn list_docs<E>(d: &Document<E>) -> Vec<String>
+where
+    E: commonware_storage::Context + commonware_runtime::BufferPooler,
+{
+    let reply = d.query(&encode_query(&DocQuery::ListDocs)).await.unwrap();
+    match decode_reply(&reply).unwrap() {
+        DocReply::DocList(ids) => ids,
+        _ => panic!("expected DocList"),
+    }
+}
+
 #[test]
 fn synced_store_reconstructs_source_root() {
     deterministic::Runner::default().start(|context| async move {
@@ -152,5 +163,54 @@ fn synced_store_reconstructs_source_root() {
         let ids: Vec<&str> = doc.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, ["b1", "b2"]);
         assert_eq!(doc[0].text, "final");
+    });
+}
+
+// the enumeration INDEX is ordinary qmdb state (a reserved sentinel key), so it
+// state-syncs like any doc: a joiner that rebuilds a byte-identical root MUST
+// reproduce the exact known-doc set — the browsable tree survives a sync.
+#[test]
+fn synced_store_reproduces_the_doc_index() {
+    deterministic::Runner::default().start(|context| async move {
+        // SOURCE: several docs across a couple of path folders, created out of
+        // order — the index is the sorted set, and it commits into the root.
+        let mut src = Document::init(context.child("src"), "src").await;
+        for id in ["projects/retro", "notes", "projects/launch-plan"] {
+            apply_commit(&mut src, &DocMsg::CreateDoc { doc_id: id.into() }).await;
+        }
+        // a block edit on one doc: proves edits don't disturb the synced index.
+        apply_commit(
+            &mut src,
+            &DocMsg::InsertBlock {
+                doc_id: "notes".into(),
+                after: None,
+                block: blk("b1", "hello"),
+            },
+        )
+        .await;
+        let src_index = list_docs(&src).await;
+        assert_eq!(
+            src_index,
+            ["notes", "projects/launch-plan", "projects/retro"],
+            "source index is the sorted doc set"
+        );
+
+        let target = src.sync_target().await;
+        let resolver = src.into_resolver();
+
+        // JOINER: reconstruct from the resolver — no ops replayed in app order.
+        let synced = Document::sync_from(context.child("dst"), "dst", target, resolver).await;
+
+        // the reserved index key rode through sync with every doc: enumeration
+        // on the synced store returns the identical known-doc set.
+        assert_eq!(
+            list_docs(&synced).await,
+            src_index,
+            "a synced store must reproduce the source's doc index"
+        );
+        // and the doc content synced too.
+        let doc = get_doc(&synced, "notes").await.unwrap();
+        assert_eq!(doc.len(), 1);
+        assert_eq!(doc[0].id, "b1");
     });
 }
