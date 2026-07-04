@@ -51,6 +51,7 @@ describe("chat msgs", () => {
     await createChannel(transport, {
       channelId: "general",
       name: "General",
+      postPolicy: "MembersOnly",
       origin: "jess",
     });
     expect(transport.submit).toHaveBeenCalledWith(
@@ -59,7 +60,7 @@ describe("chat msgs", () => {
         CreateChannel: {
           channel_id: "general",
           name: "General",
-          post_policy: "Open",
+          post_policy: "MembersOnly",
         },
       },
       "jess",

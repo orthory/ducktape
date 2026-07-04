@@ -8,6 +8,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
+import type { PostPolicy } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
@@ -17,17 +18,65 @@ import { HoverButton } from "./HoverButton";
 import { MessageList } from "./MessageList";
 import { ThreadPanel } from "./ThreadPanel";
 
+function LockGlyph({ size = 11 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="11" width="14" height="9" rx="2" />
+      <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+    </svg>
+  );
+}
+
+// A segmented Open / Members-only toggle for a channel's post policy.
+function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (policy: PostPolicy) => void }) {
+  const options: { key: PostPolicy; label: string; hint: string }[] = [
+    { key: "Open", label: "Open", hint: "Any member of the workspace can post" },
+    { key: "MembersOnly", label: "Members", hint: "Only channel members can post" },
+  ];
+  return (
+    <div style={{ display: "flex", gap: 3, background: color.sunken, borderRadius: radius.sm, padding: 3 }}>
+      {options.map((option) => {
+        const active = value === option.key;
+        return (
+          <button
+            key={option.key}
+            type="button"
+            title={option.hint}
+            onClick={() => onChange(option.key)}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              flex: 1,
+              textAlign: "center",
+              padding: "4px 8px",
+              borderRadius: 5,
+              font: `600 11px ${font.sans}`,
+              color: active ? color.ink : color.muted2,
+              background: active ? color.paper : "transparent",
+              boxShadow: active ? "0 1px 2px rgba(0,0,0,.05)" : "none",
+            }}
+          >
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Channel rail ────────────────────────────────────────
 
 function ChannelRail() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
+  const [policy, setPolicy] = useState<PostPolicy>("Open");
   const [creating, setCreating] = useState(false);
 
   const create = (event: FormEvent) => {
     event.preventDefault();
-    if (draft.trim()) actions.createChannel(draft);
+    if (draft.trim()) actions.createChannel(draft, policy);
     setDraft("");
+    setPolicy("Open");
     setCreating(false);
   };
 
@@ -75,7 +124,7 @@ function ChannelRail() {
       </div>
 
       {creating && (
-        <form onSubmit={create} style={{ padding: "0 11px 8px" }}>
+        <form onSubmit={create} style={{ padding: "0 11px 9px", display: "flex", flexDirection: "column", gap: 6 }}>
           <input
             autoFocus
             value={draft}
@@ -83,6 +132,7 @@ function ChannelRail() {
             placeholder="channel name"
             style={{
               width: "100%",
+              boxSizing: "border-box",
               padding: "6px 9px",
               borderRadius: radius.sm,
               border: `1px solid ${color.borderStrong}`,
@@ -91,6 +141,23 @@ function ChannelRail() {
               color: color.ink,
             }}
           />
+          <PolicyToggle value={policy} onChange={setPolicy} />
+          <button
+            type="submit"
+            disabled={!draft.trim()}
+            style={{
+              all: "unset",
+              cursor: draft.trim() ? "pointer" : "not-allowed",
+              textAlign: "center",
+              padding: "6px 0",
+              borderRadius: radius.sm,
+              background: draft.trim() ? color.dark : color.borderSoft,
+              color: draft.trim() ? color.onDark : color.muted2,
+              font: `600 12px ${font.sans}`,
+            }}
+          >
+            Create channel
+          </button>
         </form>
       )}
 
@@ -139,11 +206,12 @@ function ChannelRail() {
 function EmptyChannelState() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
+  const [policy, setPolicy] = useState<PostPolicy>("Open");
   const hasChannels = state.channels.length > 0;
 
   const create = (event: FormEvent) => {
     event.preventDefault();
-    if (draft.trim()) actions.createChannel(draft);
+    if (draft.trim()) actions.createChannel(draft, policy);
     setDraft("");
   };
 
@@ -172,14 +240,19 @@ function EmptyChannelState() {
             : "Create the first channel to start the conversation."}
         </div>
         {!hasChannels && (
-          <form onSubmit={create} style={{ display: "flex", gap: 7, marginTop: 4 }}>
+          <form
+            onSubmit={create}
+            style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 4, width: 240 }}
+          >
             <input
               autoFocus
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               placeholder="channel name"
               style={{
-                padding: "7px 10px",
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "8px 10px",
                 borderRadius: radius.sm,
                 border: `1px solid ${color.borderStrong}`,
                 background: color.paper,
@@ -187,15 +260,18 @@ function EmptyChannelState() {
                 color: color.ink,
               }}
             />
+            <PolicyToggle value={policy} onChange={setPolicy} />
             <button
               type="submit"
+              disabled={!draft.trim()}
               style={{
                 all: "unset",
-                cursor: "pointer",
-                padding: "7px 13px",
+                cursor: draft.trim() ? "pointer" : "not-allowed",
+                textAlign: "center",
+                padding: "8px 13px",
                 borderRadius: radius.sm,
-                background: color.dark,
-                color: color.onDark,
+                background: draft.trim() ? color.dark : color.borderSoft,
+                color: draft.trim() ? color.onDark : color.muted2,
                 font: `600 12.5px ${font.sans}`,
               }}
             >
@@ -294,6 +370,26 @@ export function ChatView() {
           {channel && (
             <span style={{ font: `400 12px ${font.sans}`, color: color.muted2, whiteSpace: "nowrap" }}>
               · {rootMessageCount} {rootMessageCount === 1 ? "message" : "messages"}
+            </span>
+          )}
+          {channel?.post_policy === "MembersOnly" && (
+            <span
+              title="Only channel members can post"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                marginLeft: 2,
+                padding: "2px 8px",
+                borderRadius: 999,
+                background: color.sunken,
+                border: `1px solid ${color.borderSoft}`,
+                font: `600 10px ${font.mono}`,
+                color: color.muted,
+                whiteSpace: "nowrap",
+              }}
+            >
+              <LockGlyph size={10} /> Members only
             </span>
           )}
         </div>

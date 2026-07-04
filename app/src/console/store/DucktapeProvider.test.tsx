@@ -228,7 +228,7 @@ describe("DucktapeProvider", () => {
     );
 
     await act(async () => {
-      capturedActions!.createChannel("Release Party");
+      capturedActions!.createChannel("Release Party", "Open");
     });
 
     await waitFor(() => {

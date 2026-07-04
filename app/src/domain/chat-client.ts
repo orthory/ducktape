@@ -142,7 +142,7 @@ export const blocksText = (blocks: ChatBlock[]): string =>
 
 export const createChannel = (
   transport: NodeTransport,
-  params: { channelId: string; name: string; origin: string },
+  params: { channelId: string; name: string; postPolicy: PostPolicy; origin: string },
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
@@ -150,7 +150,7 @@ export const createChannel = (
       CreateChannel: {
         channel_id: params.channelId,
         name: params.name,
-        post_policy: "Open",
+        post_policy: params.postPolicy,
       },
     },
     params.origin,

@@ -3,6 +3,7 @@ import type { Dispatch } from "react";
 import * as agentClient from "../../domain/agent-client";
 import type { TurnPolicy } from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
+import type { PostPolicy } from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
 import type { BlockKind } from "../../domain/document-client";
 import * as forgeClient from "../../domain/forge-client";
@@ -71,7 +72,7 @@ export interface ConsoleActions {
    *  and keep it as the local author identity, so it propagates to everyone. */
   setDisplayName(name: string): void;
   selectChannel(channelId: string): void;
-  createChannel(name: string): void;
+  createChannel(name: string, postPolicy: PostPolicy): void;
   sendMessage(body: string): void;
   openThread(rootSeq: number): void;
   closeThread(): void;
@@ -319,13 +320,14 @@ export function createActions({
 
     selectChannel: enterChannel,
 
-    createChannel: (name) => {
+    createChannel: (name, postPolicy) => {
       const channelId = channelIdOf(name);
       if (!channelId) return;
       submitThenRefresh((live) =>
         chatClient.createChannel(live, {
           channelId,
           name,
+          postPolicy,
           origin: getState().author,
         }),
       ).then(() => enterChannel(channelId));
