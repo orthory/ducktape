@@ -443,6 +443,120 @@ fn a_single_member_ballot_is_a_deciding_majority() {
     });
 }
 
+/// the last-validator guard at the governance layer: a solo member's ballot IS
+/// a deciding majority (1 of 1), but enacting its own removal would empty the
+/// validator set — a zero-validator orderer hits commonware `quorum(0)`, which
+/// panics. governance refuses: it does NOT emit the set-emptying valset Leave,
+/// marks the proposal Rejected instead, and the sole validator stays. this is
+/// the "solo can't leave on-chain" case — a solo node forgets its workspace
+/// locally rather than removing the last validator.
+#[test]
+fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
+    block_on(async {
+        let founder = member_key(1);
+        let mut valset = Valset::new("valset");
+        valset.insert(founder.clone());
+        let mut host = Host::genesis(vec![
+            Box::new(valset),
+            Box::new(Governance::new("governance", "valset")),
+        ])
+        .expect("genesis");
+        assert_eq!(validators(&host).await.len(), 1, "a solo network of one");
+
+        // the sole member opens a self-removal and casts its own yes-ballot —
+        // majority = 1/2 + 1 = 1, so this is early-decidable.
+        submit_as(
+            &mut host,
+            &founder,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "leave-solo".into(),
+                action: GovAction::RemoveValidator {
+                    key: founder.clone(),
+                },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("solo proposes its own removal");
+        submit_as(
+            &mut host,
+            &founder,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "leave-solo".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("solo votes to leave");
+
+        // executing is a CLEAN op (the block commits): governance pre-checks that
+        // the removal would empty the set and REJECTS the proposal rather than
+        // emitting the set-emptying valset Leave. no block-abort, no panic.
+        submit_as(
+            &mut host,
+            &founder,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "leave-solo".into(),
+            }),
+        )
+        .await
+        .expect("execute settles the proposal cleanly");
+
+        assert_eq!(
+            proposal_status(&host, "leave-solo").await,
+            Some(ProposalStatus::Rejected),
+            "a last-validator removal is refused, not passed"
+        );
+        let members = validators(&host).await;
+        assert_eq!(members.len(), 1, "the set never went empty");
+        assert!(members.contains(&founder), "the sole validator stays");
+    });
+}
+
+/// belt-and-suspenders: even if a set-emptying valset `Leave` reached the valset
+/// module directly (a module-origin write, bypassing governance's pre-check),
+/// the valset handler itself refuses it. this pins the AUTHORITATIVE guard —
+/// the invariant lives in the module that owns the set, not only in its caller.
+#[test]
+fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
+    block_on(async {
+        let founder = member_key(1);
+        let mut valset = Valset::new("valset");
+        valset.insert(founder.clone());
+        let mut host = Host::genesis(vec![Box::new(valset)]).expect("genesis");
+
+        // a System-origin op (genesis orchestration shape) that would empty the
+        // set is refused deterministically — the block is rejected, set intact.
+        let err = host
+            .submit_at(
+                BlockContext {
+                    height: 1,
+                    consensus_time: 1,
+                    origin: Origin::System,
+                },
+                Msg {
+                    target: "valset".into(),
+                    payload: valset_encode(&ValsetMsg::Leave {
+                        key: founder.clone(),
+                    }),
+                },
+            )
+            .await
+            .expect_err("emptying the set must be refused");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("last validator")),
+            "got {err:?}"
+        );
+        assert_eq!(validators(&host).await, vec![founder], "the set is untouched");
+    });
+}
+
 #[test]
 fn non_members_cannot_propose_or_vote_and_minority_rejects() {
     block_on(async {

@@ -314,10 +314,22 @@ impl Governance {
                     target: self.valset_id.clone(),
                     payload: valset_encode_msg(&ValsetMsg::Join { key: key.clone() }),
                 }),
-                GovAction::RemoveValidator { key } => ctx.emit_msg(Msg {
-                    target: self.valset_id.clone(),
-                    payload: valset_encode_msg(&ValsetMsg::Leave { key: key.clone() }),
-                }),
+                GovAction::RemoveValidator { key } => {
+                    // never enact a removal that would empty the validator set: a
+                    // zero-validator orderer hits commonware `quorum(0)`, which
+                    // panics. the valset Leave handler enforces this invariant
+                    // authoritatively (returning an Err that would abort the WHOLE
+                    // block), so we pre-check here and cleanly REJECT the proposal
+                    // instead — the happy path never emits a set-emptying Leave.
+                    if members.iter().all(|m| m == key) {
+                        proposal.status = ProposalStatus::Rejected;
+                    } else {
+                        ctx.emit_msg(Msg {
+                            target: self.valset_id.clone(),
+                            payload: valset_encode_msg(&ValsetMsg::Leave { key: key.clone() }),
+                        });
+                    }
+                }
                 GovAction::Signal { .. } => {}
             }
         } else {
