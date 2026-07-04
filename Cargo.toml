@@ -17,7 +17,7 @@ members = [
     # kernel — the platform (contract + dispatch + transport + BFT ordering)
     "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
-    "crates/kernel/statesync", "crates/kernel/recovery",
+    "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     # system — consensus infrastructure modules
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
@@ -76,6 +76,12 @@ commonware-utils = "2026.5.0"
 commonware-actor = "2026.5.0"
 defguard_wireguard_rs = "0.10.0"
 
+# fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
+# per-module indexer tier ONLY: nothing the app-hash commits to may live in it
+# (evaluated and rejected as a canonical substrate — see handoff/restart-recovery.md).
+# default-features = false drops the in-database WASM layer (wasmtime).
+fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
+
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
 state = { path = "crates/kernel/state" }
@@ -85,6 +91,7 @@ consensus = { path = "crates/kernel/consensus" }
 reactor = { path = "crates/kernel/reactor" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
+indexer = { path = "crates/kernel/indexer" }
 # internal — module impl crates
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
