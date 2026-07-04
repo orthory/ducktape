@@ -225,9 +225,18 @@ All three of the following must hold before the epic merges to `dev`:
    third box: they hole-punch a WireGuard tunnel; when hole-punch fails the
    coordinator relay carries ciphertext; real state-sync / app-hash flows over
    the tunnel. Extends the Ducktape-2 live-join rig.
+   *Procedure + honest status: `docs/deploy/cross-machine-zero-exposure-runbook.md`
+   (every step tagged). Blocked on node wiring — see
+   `docs/deploy/private-cutover-integration-gap.md`; the CI sim-NAT suite
+   (Slice 3) proves the logic.*
 3. **Real coordinator standing up.** `p2p.ducktape.industries` deployed on a
    VPS with a documented deployment recipe, with a test network's v3 invite
    pointing at it.
+   *Deployment recipe: `docs/deploy/coordinator.md` + `ops/coordinator/`
+   (systemd unit + Dockerfile); the `coordinator --listen` invocation is
+   regression-proven by `bin/coordinator/tests/deploy_smoke.rs`. Note: a v3
+   invite can point at the coordinator, but the node does not consume
+   `Coordinated` hints as a reachability path yet — see the gap doc.*
 
 ## Epic decomposition (thin-slice first)
 
@@ -247,6 +256,9 @@ branch off the epic branch, merged into the epic branch by PR.
   survival; complete the CI simulated-NAT suite.
 - **Slice 4.** Real `p2p.ducktape` deployment recipe + cross-machine acceptance
   runbook.
+  *Shipped as docs + config + a deploy proof (`docs/deploy/*`,
+  `ops/coordinator/*`, `deploy_smoke.rs`); node reachability wiring deferred to a
+  follow-on — see `docs/deploy/private-cutover-integration-gap.md`.*
 
 ## Epic branch topology
 
