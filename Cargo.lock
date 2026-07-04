@@ -4182,6 +4182,7 @@ dependencies = [
  "host",
  "http-body-util",
  "inbox",
+ "indexer",
  "jobs",
  "memory",
  "pages",

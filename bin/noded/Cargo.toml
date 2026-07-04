@@ -43,6 +43,9 @@ reactor = { workspace = true }
 # the blob lane shares the files wire constants (chunk cap) and, in tests, the
 # manifest verification helpers.
 files-interface = { workspace = true }
+# the derived read-model tier: the actor materializes per-module fluent31
+# indexes as blocks commit; /v1/index/* serves snapshot reads of them.
+indexer = { workspace = true }
 
 commonware-runtime = { workspace = true }
 

@@ -67,6 +67,14 @@ pub enum Error {
     /// the op stream named a module this store was not opened with.
     #[error("indexer: unknown module {0:?}")]
     UnknownModule(String),
+    /// the module registered no materialized view (or no mapper at all) — the
+    /// derived twin of the sdk's `QueryUnsupported`. some modules legitimately
+    /// never will: forge's substrate is already a queryable git repo.
+    #[error("indexer: module has no materialized view")]
+    ViewUnsupported,
+    /// a view request the module's mapper could not parse or serve.
+    #[error("indexer: view: {0}")]
+    View(String),
     /// a [`ModuleIndexer`] tried to write into a reserved key space.
     #[error("indexer: derived write into reserved key {key:?} for module {module:?}")]
     ReservedKey { module: String, key: String },
@@ -225,8 +233,15 @@ impl Derived {
         self.deletes.push(key.into());
     }
 
-    /// drain into the block batch, refusing reserved key spaces.
-    fn drain_into(self, module: &str, batch: &mut WriteBatch) -> Result<()> {
+    /// drain into the block batch AND the block's read overlay, refusing
+    /// reserved key spaces. the overlay is what lets a later op in the same
+    /// block read this op's staged writes.
+    fn drain_into(
+        self,
+        module: &str,
+        batch: &mut WriteBatch,
+        overlay: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> Result<()> {
         let check = |key: &str| -> Result<()> {
             if key.starts_with(OP_PREFIX) || key.starts_with(META_PREFIX) {
                 return Err(Error::ReservedKey {
@@ -238,34 +253,88 @@ impl Derived {
         };
         for (key, value) in self.puts {
             check(&key)?;
+            overlay.insert(key.clone().into_bytes(), Some(value.clone()));
             batch.put(key, value);
         }
         for key in self.deletes {
             check(&key)?;
+            overlay.insert(key.clone().into_bytes(), None);
             batch.delete(key);
         }
         Ok(())
     }
 }
 
-/// a per-module read-model mapper: turns one applied op into derived index
-/// writes. pure data-in/data-out — no IO, no clock; everything it may write
-/// goes through [`Derived`].
+/// the block-constant coordinates of one applied op, as handed to a mapper.
+/// `seq` is the block-wide dispatch index, matching the op's `op/…` row.
+#[derive(Clone, Debug)]
+pub struct OpMeta<'a> {
+    pub height: u64,
+    pub time: u64,
+    pub seq: u32,
+    pub origin: &'a OriginTag,
+}
+
+/// read access during the fold: the module's COMMITTED index overlaid with
+/// what this block staged so far, so an op can see the writes of ops earlier
+/// in the same block (a post then an edit of it, one block apart by seq).
+pub struct ApplyCtx<'a> {
+    db: &'a Db,
+    overlay: &'a BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl ApplyCtx<'_> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(staged) = self.overlay.get(key) {
+            return Ok(staged.clone());
+        }
+        Ok(self.db.get(key)?)
+    }
+}
+
+/// snapshot-consistent read access for a materialized view: every `get`/`scan`
+/// of one [`ModuleIndexer::serve_view`] call sees the same MVCC snapshot.
+pub struct ViewReader<'a> {
+    db: &'a Db,
+    snap: fluent31::Snapshot,
+}
+
+impl ViewReader<'_> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.db.get_at(key, &self.snap)?)
+    }
+
+    /// one page of keys under `prefix`, strictly after cursor `after` when
+    /// given, in key order. `limit` is clamped to [`MAX_SCAN_LIMIT`].
+    pub fn scan(&self, prefix: &[u8], after: Option<&[u8]>, limit: usize) -> Result<Page> {
+        let (lo, hi) = scan_bounds(prefix, after);
+        let iter = self.db.iter_at(Some(&lo), hi.as_deref(), false, &self.snap)?;
+        collect_page(iter, limit)
+    }
+}
+
+/// a per-module read-model mapper: it folds the module's applied ops into
+/// derived index keys (the WRITE side) and serves the module's materialized
+/// view over them (the READ side — the module's own endpoint on the derived
+/// tier). pure data-in/data-out — no IO of its own, no clock; writes go
+/// through [`Derived`], reads through the handed-in ctx/reader.
 pub trait ModuleIndexer: Send + Sync {
     /// the module whose ops this mapper consumes.
     fn module(&self) -> &str;
 
-    /// map one applied op to derived writes. `seq` is the block-wide dispatch
-    /// index of the op, matching its `op/…` row.
-    fn index_op(
-        &self,
-        height: u64,
-        time: u64,
-        seq: u32,
-        origin: &OriginTag,
-        payload: &[u8],
-        out: &mut Derived,
-    );
+    /// map one applied op to derived writes. `ctx` reads the module's index
+    /// as of this op (committed state plus this block's earlier staged
+    /// writes); everything staged lands atomically with the op rows.
+    fn index_op(&self, ctx: &ApplyCtx, meta: &OpMeta, payload: &[u8], out: &mut Derived);
+
+    /// the module's materialized-view projection: a module-defined request
+    /// (json by convention, like the sdk query surface) in, module-defined
+    /// response bytes out, at one MVCC snapshot. the default declares no
+    /// view — right for modules whose fold is write-only and for modules
+    /// that never register a mapper at all.
+    fn serve_view(&self, _reader: &ViewReader, _req: &[u8]) -> Result<Vec<u8>> {
+        Err(Error::ViewUnsupported)
+    }
 }
 
 // ============================================================================
@@ -392,6 +461,7 @@ impl IndexStore {
                 continue; // replay of an already-folded block — idempotent skip
             }
             let mut batch = WriteBatch::new();
+            let mut overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
             for (seq, op) in ops {
                 batch.put(
                     op_key(block.height, seq),
@@ -399,8 +469,15 @@ impl IndexStore {
                 );
                 if let Some(mapper) = self.mappers.get(module) {
                     let mut derived = Derived::default();
-                    mapper.index_op(block.height, block.time, seq, &op.origin, &op.payload, &mut derived);
-                    derived.drain_into(module, &mut batch)?;
+                    let meta = OpMeta {
+                        height: block.height,
+                        time: block.time,
+                        seq,
+                        origin: &op.origin,
+                    };
+                    let ctx = ApplyCtx { db, overlay: &overlay };
+                    mapper.index_op(&ctx, &meta, &op.payload, &mut derived);
+                    derived.drain_into(module, &mut batch, &mut overlay)?;
                 }
             }
             batch.put(META_HEIGHT, block.height.to_be_bytes());
@@ -425,42 +502,63 @@ impl IndexStore {
         limit: usize,
     ) -> Result<Page> {
         let db = self.db(module)?;
-        let limit = limit.clamp(1, MAX_SCAN_LIMIT);
-
-        // lo: the smallest key strictly above the cursor (append 0x00), else
-        // the prefix itself. hi: the prefix successor, or open-ended when the
-        // prefix is empty/all-0xff.
-        let lo: Vec<u8> = match after {
-            Some(a) if a >= prefix => {
-                let mut lo = a.to_vec();
-                lo.push(0);
-                lo
-            }
-            _ => prefix.to_vec(),
-        };
-        let hi = prefix_successor(prefix);
-
+        let (lo, hi) = scan_bounds(prefix, after);
         let snap = db.snapshot();
         let iter = db.iter_at(Some(&lo), hi.as_deref(), false, &snap)?;
-
-        let mut entries = Vec::new();
-        let mut has_more = false;
-        for kv in iter {
-            let (key, value) = kv?;
-            if entries.len() == limit {
-                has_more = true;
-                break;
-            }
-            entries.push((key, value));
-        }
-        let next_after = (has_more && !entries.is_empty())
-            .then(|| String::from_utf8_lossy(&entries[entries.len() - 1].0).into_owned());
-        Ok(Page {
-            entries,
-            has_more,
-            next_after,
-        })
+        collect_page(iter, limit)
     }
+
+    /// serve the module's materialized view: the module-defined request goes
+    /// to the registered mapper's [`ModuleIndexer::serve_view`] with a
+    /// snapshot reader over that module's index. modules without a mapper —
+    /// or whose mapper declares no view — answer [`Error::ViewUnsupported`].
+    /// a poisoned store still serves views: stale but consistent.
+    pub fn view(&self, module: &str, req: &[u8]) -> Result<Vec<u8>> {
+        let db = self.db(module)?;
+        let mapper = self.mappers.get(module).ok_or(Error::ViewUnsupported)?;
+        let reader = ViewReader {
+            db,
+            snap: db.snapshot(),
+        };
+        mapper.serve_view(&reader, req)
+    }
+}
+
+/// lo/hi iteration bounds for a prefix scan resuming strictly after `after`:
+/// lo is the cursor plus one 0x00 byte (the smallest strictly-greater key),
+/// else the prefix itself; hi is the prefix successor (`None` = open-ended).
+fn scan_bounds(prefix: &[u8], after: Option<&[u8]>) -> (Vec<u8>, Option<Vec<u8>>) {
+    let lo = match after {
+        Some(a) if a >= prefix => {
+            let mut lo = a.to_vec();
+            lo.push(0);
+            lo
+        }
+        _ => prefix.to_vec(),
+    };
+    (lo, prefix_successor(prefix))
+}
+
+/// drain up to `limit` (clamped) pairs out of an iterator into a [`Page`].
+fn collect_page(iter: fluent31::DbIterator, limit: usize) -> Result<Page> {
+    let limit = limit.clamp(1, MAX_SCAN_LIMIT);
+    let mut entries = Vec::new();
+    let mut has_more = false;
+    for kv in iter {
+        let (key, value) = kv?;
+        if entries.len() == limit {
+            has_more = true;
+            break;
+        }
+        entries.push((key, value));
+    }
+    let next_after = (has_more && !entries.is_empty())
+        .then(|| String::from_utf8_lossy(&entries[entries.len() - 1].0).into_owned());
+    Ok(Page {
+        entries,
+        has_more,
+        next_after,
+    })
 }
 
 fn read_height(db: &Db) -> fluent31::Result<u64> {
@@ -642,8 +740,9 @@ mod tests {
         assert!(store.scan("chat", b"", None, 10).is_ok());
     }
 
-    /// a mapper that writes one derived key per op and, on demand, misbehaves
-    /// into the reserved key space.
+    /// a mapper that counts ops per origin (a read-modify-write fold, so it
+    /// exercises the block overlay), serves a tiny view, and, on demand,
+    /// misbehaves into the reserved key space.
     struct TestMapper {
         reserved: bool,
     }
@@ -652,21 +751,36 @@ mod tests {
         fn module(&self) -> &str {
             "chat"
         }
-        fn index_op(
-            &self,
-            height: u64,
-            _time: u64,
-            _seq: u32,
-            origin: &OriginTag,
-            payload: &[u8],
-            out: &mut Derived,
-        ) {
+        fn index_op(&self, ctx: &ApplyCtx, meta: &OpMeta, payload: &[u8], out: &mut Derived) {
             if self.reserved {
                 out.put("meta/evil", b"nope".to_vec());
                 return;
             }
-            let who = origin.id.clone().unwrap_or_default();
-            out.put(format!("by-origin/{who}/{height:016x}"), payload.to_vec());
+            let who = meta.origin.id.clone().unwrap_or_default();
+            out.put(
+                format!("by-origin/{who}/{:016x}/{:04x}", meta.height, meta.seq),
+                payload.to_vec(),
+            );
+            // read-modify-write: sees writes staged earlier in this block.
+            let count_key = format!("count/{who}");
+            let count = ctx
+                .get(count_key.as_bytes())
+                .unwrap()
+                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+            out.put(count_key, (count + 1).to_be_bytes().to_vec());
+        }
+
+        fn serve_view(&self, reader: &ViewReader, req: &[u8]) -> Result<Vec<u8>> {
+            // request: an origin id; response: that origin's op count.
+            let who = std::str::from_utf8(req).map_err(|e| Error::View(e.to_string()))?;
+            let count = reader
+                .get(format!("count/{who}").as_bytes())?
+                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+            Ok(count.to_string().into_bytes())
         }
     }
 
@@ -681,6 +795,37 @@ mod tests {
         let page = store.scan("chat", b"by-origin/jess/", None, 10).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].1, br#"{"post":"hi"}"#.to_vec());
+    }
+
+    #[test]
+    fn same_block_ops_read_each_others_staged_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_indexer(Box::new(TestMapper { reserved: false }));
+        // two ops in ONE block: the second's read-modify-write must see the
+        // first's staged count, or the fold loses writes.
+        store
+            .apply_block(&block(1, vec![chat_op(b"{}"), chat_op(b"{}")]))
+            .unwrap();
+        assert_eq!(store.view("chat", b"jess").unwrap(), b"2".to_vec());
+    }
+
+    #[test]
+    fn view_routes_to_the_mapper_and_defaults_to_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_indexer(Box::new(TestMapper { reserved: false }));
+        store
+            .apply_block(&block(1, vec![chat_op(b"{}")]))
+            .unwrap();
+        assert_eq!(store.view("chat", b"jess").unwrap(), b"1".to_vec());
+        // no mapper registered for tasks → no materialized view.
+        assert!(matches!(
+            store.view("tasks", b"x"),
+            Err(Error::ViewUnsupported)
+        ));
+        assert!(matches!(
+            store.view("ghost", b"x"),
+            Err(Error::UnknownModule(_))
+        ));
     }
 
     #[test]
