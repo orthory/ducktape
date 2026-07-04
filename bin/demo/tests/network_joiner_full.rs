@@ -211,7 +211,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             // SYSTEM origin lane (trusted test orchestration), which valset and
             // every product module accept alike.
             host.submit_at(
-                host::BlockContext {
+                host::BlockContext { protocol_version: 0,
                     height: height + 1,
                     consensus_time: height + 1,
                     origin: sdk::Origin::System,

@@ -24,7 +24,7 @@ struct TestCtx {
 impl TestCtx {
     fn new() -> Self {
         Self {
-            env: sdk::Env {
+            env: sdk::Env { protocol_version: 0,
                 height: 0,
                 consensus_time: 0,
                 origin: sdk::Origin::System,

@@ -32,7 +32,7 @@ struct TestCtx {
 impl TestCtx {
     fn external(who: &[u8], consensus_time: u64) -> Self {
         Self {
-            env: Env {
+            env: Env { protocol_version: 0,
                 height: 0,
                 consensus_time,
                 origin: Origin::External(who.to_vec()),
@@ -43,7 +43,7 @@ impl TestCtx {
 
     fn with_origin(origin: Origin) -> Self {
         Self {
-            env: Env {
+            env: Env { protocol_version: 0,
                 height: 0,
                 consensus_time: 1,
                 origin,
@@ -354,7 +354,7 @@ async fn host_get(host: &Host, key: &[u8]) -> Option<Profile> {
 
 async fn submit_as(host: &mut Host, who: &[u8], at: u64, msg: Msg) -> Result<(), SubmitError> {
     host.submit_at(
-        BlockContext {
+        BlockContext { protocol_version: 0,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
@@ -391,7 +391,7 @@ fn host_binds_names_to_the_submit_origin_and_moves_the_app_hash() {
         let app2 = host.app_hash();
         let err = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 3,
                     consensus_time: 3,
                     origin: Origin::System,

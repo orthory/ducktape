@@ -26,7 +26,7 @@ async fn submit_as(
     payload: Vec<u8>,
 ) -> Result<(), SubmitError> {
     host.submit_at(
-        BlockContext {
+        BlockContext { protocol_version: 0,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),

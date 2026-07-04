@@ -1001,7 +1001,7 @@ async fn apply_block(
 ) -> Result<Disposition, Error> {
     let outcome = match decode_frame(frame) {
         Ok((origin, msg)) => {
-            let ctx = BlockContext {
+            let ctx = BlockContext { protocol_version: 0,
                 height,
                 consensus_time: height,
                 origin,

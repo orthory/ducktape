@@ -57,11 +57,15 @@ pub enum UpgradeQuery {
 pub struct UpgradeStatus {
     pub current_version: u32,
     pub pending: Option<Upgrade>,
+    /// the boundary member set the verdict was computed against, sorted. lets a
+    /// caller (e.g. the host stamping seam) re-run the shared `effective_version`.
+    pub members: Vec<Vec<u8>>,
     /// readiness keys, sorted.
     pub ready: Vec<Vec<u8>>,
     pub member_count: u64,
     pub ready_count: u64,
-    /// `pending.is_some() && members non-empty && every boundary member ∈ ready`.
+    /// `pending.is_some() && members non-empty && every boundary member ∈ ready`,
+    /// derived from the shared `effective_version` predicate (no hand-copied logic).
     pub armed: bool,
 }
 
@@ -156,6 +160,7 @@ mod tests {
                 activation_height: 9,
                 to_version: 2,
             }),
+            members: vec![vec![1u8; 32], vec![2u8; 32]],
             ready: vec![vec![1u8; 32], vec![2u8; 32]],
             member_count: 2,
             ready_count: 2,

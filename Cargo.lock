@@ -3040,6 +3040,7 @@ dependencies = [
  "sdk",
  "serde_json",
  "state",
+ "upgrade-interface",
 ]
 
 [[package]]

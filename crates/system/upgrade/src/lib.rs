@@ -404,17 +404,32 @@ impl Module for Upgrade {
                 let members = self.members(ctx).await?;
                 let state = self.read();
                 let ready: Vec<Vec<u8>> = state.readiness.keys().cloned().collect();
-                let member_count = members.len() as u64;
-                let ready_count = ready.len() as u64;
-                let armed = state.pending.is_some()
-                    && !members.is_empty()
-                    && members.iter().all(|m| state.readiness.contains_key(m));
+                let ready_map: BTreeMap<Vec<u8>, ()> =
+                    state.readiness.keys().map(|k| (k.clone(), ())).collect();
+                // `armed` (readiness complete) is derived from the ONE shared
+                // predicate evaluated AT the activation height (where the height
+                // gate always passes), so it can never drift from the arm check
+                // the Advance handler and the host stamp use (risk R4).
+                let armed = match &state.pending {
+                    Some(up) => {
+                        up.to_version
+                            == upgrade_interface::effective_version(
+                                up.activation_height,
+                                state.current_version,
+                                Some(up),
+                                &members,
+                                &ready_map,
+                            )
+                    }
+                    None => false,
+                };
                 Ok(encode_reply(&UpgradeReply::Status(UpgradeStatus {
                     current_version: state.current_version,
                     pending: state.pending.clone(),
+                    member_count: members.len() as u64,
+                    ready_count: state.readiness.len() as u64,
+                    members,
                     ready,
-                    member_count,
-                    ready_count,
                     armed,
                 })))
             }
@@ -554,7 +569,7 @@ mod tests {
     impl TestCtx {
         fn new(origin: Origin, height: u64, members: Vec<Vec<u8>>) -> Self {
             Self {
-                env: sdk::Env {
+                env: sdk::Env { protocol_version: 0,
                     height,
                     consensus_time: 0,
                     origin,

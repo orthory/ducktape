@@ -11,6 +11,11 @@ version.workspace = true
 sdk = { workspace = true }
 state = { workspace = true }
 async-trait = { workspace = true }
+# TYPES-ONLY interface dep: `Host::effective_version` decodes the upgrade module's
+# `Status` reply and applies the shared version derivation. host stays
+# module-agnostic — this is an interface crate, not a module impl (same shape as
+# governance depending on valset-interface).
+upgrade-interface = { workspace = true }
 
 [dev-dependencies]
 # the end-to-end test stands a real qmdb-backed module on the deterministic

@@ -969,10 +969,17 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 last_sealed_view = Some(view);
                 continue;
             };
+            // stamp the block's dispatch version as the PURE derivation
+            // effective_version(height) — never the raw stored current_version —
+            // so dispatch and hashing agree on the version for block `height`.
+            // baseline (unchanged behavior) until the upgrade module is registered
+            // and a pending upgrade arms at its activation height.
+            let protocol_version = self.host.effective_version(height).await;
             let ctx = BlockContext {
                 height,
                 consensus_time: height,
                 origin,
+                protocol_version,
             };
             // the observation barrier compares the watched root across the
             // apply — only an APPLIED block can move it (rejected blocks roll

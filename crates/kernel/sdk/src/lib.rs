@@ -146,6 +146,13 @@ pub struct Env {
     pub origin: Origin,
     /// the module being dispatched.
     pub me: ModuleId,
+    /// the effective protocol version for this block — a verbatim copy of
+    /// `BlockContext.protocol_version`, stamped by the host drain and identical
+    /// across the root op and every FIFO follow-up in one `submit`. this is the
+    /// ONLY version signal a module may branch on inside `execute`/`query`; it is
+    /// a read-only dispatch input and is NEVER folded into any `root()` preimage
+    /// or op/wire encoding. defaults to the baseline version (`0`).
+    pub protocol_version: u32,
 }
 
 /// errors surfaced through the system api.
