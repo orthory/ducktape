@@ -4,9 +4,19 @@
 // thread panel).
 
 import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client";
+import type { Rule } from "../../domain/automations-client";
 import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
 import type { Block } from "../../domain/document-client";
+import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
+import type { Notification } from "../../domain/inbox-client";
+import type { BoardCounts, Job } from "../../domain/jobs-client";
+import type {
+  FileStat,
+  Generation,
+  GrepHit,
+  LsEntry,
+} from "../../domain/memory-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
@@ -77,6 +87,38 @@ export interface ConsoleState {
   watches: WatchView[];
   /** Recent runs across all channels, newest-first for the timeline. */
   runs: RunView[];
+
+  // ── Inbox ──
+  /** This member's notification queue (List for the local author identity),
+   *  ascending by seq, re-queried per block. */
+  inbox: Notification[];
+  /** Unread count for the local member — feeds the nav badge. */
+  inboxUnread: number;
+
+  // ── Jobs (consensus work board) ──
+  /** Every job on the board, re-queried per block. */
+  jobs: Job[];
+  /** Per-status census of the board, or null when the module is absent. */
+  jobCounts: BoardCounts | null;
+
+  // ── Automations (event-triggered rules) ──
+  /** Every rule, re-queried per block; empty when the module is absent. */
+  rules: Rule[];
+
+  // ── Memory (agent filesystem workspace) ──
+  /** The directory being browsed (canonical absolute path; "/" is the root). */
+  memoryPath: string;
+  /** Entries directly under `memoryPath` (child dirs + files), re-queried per
+   *  block like the doc index. */
+  memoryEntries: LsEntry[];
+  /** The file opened in the viewer (its stat + a loaded generation), or null. */
+  memoryOpen: { stat: FileStat; generation: Generation } | null;
+  /** Active grep hits, or null when no search is running. */
+  memoryMatches: GrepHit[] | null;
+
+  // ── Files (content-addressed manifests) ──
+  /** Every file manifest (List, prefix ""), re-queried per block. */
+  files: Manifest[];
 
   /** Recent per-block node telemetry, oldest-first (the view renders newest
    *  first). Node-local observability — never re-queried from committed state;
@@ -156,6 +198,16 @@ export const createInitialState = (): ConsoleState => {
     agents: [],
     watches: [],
     runs: [],
+    inbox: [],
+    inboxUnread: 0,
+    jobs: [],
+    jobCounts: null,
+    rules: [],
+    memoryPath: "/",
+    memoryEntries: [],
+    memoryOpen: null,
+    memoryMatches: null,
+    files: [],
     telemetry: [],
     error: null,
     workspaces: [],
@@ -183,6 +235,13 @@ export interface ConsoleSnapshot {
   agents: AgentRecord[];
   watches: WatchView[];
   runs: RunView[];
+  inbox: Notification[];
+  inboxUnread: number;
+  jobs: Job[];
+  jobCounts: BoardCounts | null;
+  rules: Rule[];
+  memoryEntries: LsEntry[];
+  files: Manifest[];
 }
 
 /** Project a committed node snapshot onto store data fields. Global UI,
@@ -204,6 +263,13 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   agents: snapshot.agents,
   watches: snapshot.watches,
   runs: snapshot.runs,
+  inbox: snapshot.inbox,
+  inboxUnread: snapshot.inboxUnread,
+  jobs: snapshot.jobs,
+  jobCounts: snapshot.jobCounts,
+  rules: snapshot.rules,
+  memoryEntries: snapshot.memoryEntries,
+  files: snapshot.files,
 });
 
 // ── Pure helpers ────────────────────────────────────────

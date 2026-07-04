@@ -83,6 +83,37 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M4.5 20v-4h4" />
     </>
   ),
+  inbox: (
+    <>
+      <path d="M4 13.5l2.6-7A2 2 0 0 1 8.5 5h7a2 2 0 0 1 1.9 1.5l2.6 7" />
+      <path d="M4 13.5V17a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3.5h-5l-1.2 2h-3.6L9 13.5z" />
+    </>
+  ),
+  files: (
+    <>
+      <path d="M5 5.5A1.5 1.5 0 0 1 6.5 4H10l2 2.2h5.5A1.5 1.5 0 0 1 19 7.7V10" />
+      <path d="M3.7 12.2A1.2 1.2 0 0 1 4.9 11h14.2a1.2 1.2 0 0 1 1.18 1.46l-1.1 6A1.5 1.5 0 0 1 17.7 20H6.3a1.5 1.5 0 0 1-1.48-1.24z" />
+    </>
+  ),
+  memory: (
+    <>
+      <rect x="7" y="4.5" width="10" height="15" rx="2" />
+      <path d="M9.5 8.3h5M9.5 11.5h5M9.5 14.7h3" />
+      <path d="M5 7.5v3M5 13.5v3" />
+    </>
+  ),
+  jobs: (
+    <>
+      <rect x="4.5" y="7" width="15" height="12" rx="2" />
+      <path d="M9 7V5.6A1.6 1.6 0 0 1 10.6 4h2.8A1.6 1.6 0 0 1 15 5.6V7" />
+      <path d="M4.5 12h15M12 11v2" />
+    </>
+  ),
+  automations: (
+    <>
+      <path d="M13 3l-8 9.5h5l-1 8.5 8-9.5h-5z" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof PATHS;

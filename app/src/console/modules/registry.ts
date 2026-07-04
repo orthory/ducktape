@@ -2,10 +2,15 @@
 // views/ + one entry here.
 
 import { AgentView } from "../views/agent/AgentView";
+import { AutomationsView } from "../views/automations/AutomationsView";
 import { ChatView } from "../views/chat/ChatView";
 import { DocumentView } from "../views/document/DocumentView";
+import { FilesView } from "../views/files/FilesView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { GovernanceView } from "../views/governance/GovernanceView";
+import { InboxView } from "../views/inbox/InboxView";
+import { JobsView } from "../views/jobs/JobsView";
+import { MemoryView } from "../views/memory/MemoryView";
 import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { StatusView } from "../views/status/StatusView";
@@ -22,16 +27,21 @@ import type { AppModule, NavSection } from "./module-def";
 export const MODULES: AppModule[] = [
   // ── User apps ──
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
-  { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 1, section: "user" }, Screen: TasksView },
-  { id: "document", nav: { icon: "document", label: "Docs", order: 2, section: "user" }, Screen: DocumentView },
-  { id: "forge", nav: { icon: "forge", label: "Forge", order: 3, section: "user" }, Screen: ForgeView },
-  { id: "agent", nav: { icon: "agent", label: "Agents", order: 4, section: "user" }, Screen: AgentView },
+  { id: "inbox", nav: { icon: "inbox", label: "Inbox", order: 1, section: "user" }, Screen: InboxView },
+  { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 2, section: "user" }, Screen: TasksView },
+  { id: "document", nav: { icon: "document", label: "Docs", order: 3, section: "user" }, Screen: DocumentView },
+  { id: "files", nav: { icon: "files", label: "Files", order: 4, section: "user" }, Screen: FilesView },
+  { id: "memory", nav: { icon: "memory", label: "Memory", order: 5, section: "user" }, Screen: MemoryView },
+  { id: "forge", nav: { icon: "forge", label: "Forge", order: 6, section: "user" }, Screen: ForgeView },
+  { id: "agent", nav: { icon: "agent", label: "Agents", order: 7, section: "user" }, Screen: AgentView },
   // ── Node operator surfaces ──
   { id: "members", nav: { icon: "members", label: "Members", order: 0, section: "operator" }, Screen: MembersView },
   { id: "governance", nav: { icon: "approvals", label: "Approvals", order: 1, section: "operator" }, Screen: GovernanceView },
-  { id: "modules", nav: { icon: "modules", label: "Modules", order: 2, section: "operator" }, Screen: ModulesView },
-  { id: "status", nav: { icon: "node", label: "Node", order: 3, section: "operator" }, Screen: StatusView },
-  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 4, section: "operator" }, Screen: TelemetryView },
+  { id: "jobs", nav: { icon: "jobs", label: "Jobs", order: 2, section: "operator" }, Screen: JobsView },
+  { id: "automations", nav: { icon: "automations", label: "Autos", order: 3, section: "operator" }, Screen: AutomationsView },
+  { id: "modules", nav: { icon: "modules", label: "Modules", order: 4, section: "operator" }, Screen: ModulesView },
+  { id: "status", nav: { icon: "node", label: "Node", order: 5, section: "operator" }, Screen: StatusView },
+  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 6, section: "operator" }, Screen: TelemetryView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

@@ -470,14 +470,24 @@ function AgentDetail({
   channels,
   onPause,
   onResume,
+  onUpdate,
   onRequestRun,
 }: {
   agent: AgentRecord | null;
   channels: Channel[];
   onPause: (agentId: string) => void;
   onResume: (agentId: string) => void;
+  onUpdate: (params: {
+    agentId: string;
+    displayName?: string;
+    modelRef?: string;
+    prompt?: string;
+    allowedActions?: string[];
+  }) => void;
   onRequestRun: (params: { agentId: string; channelId: string; anchorSeq: number }) => void;
 }) {
+  const [editing, setEditing] = useState(false);
+
   if (!agent) {
     return (
       <section aria-label="Agent detail" style={{ minWidth: 0 }}>
@@ -534,17 +544,26 @@ function AgentDetail({
                 {agent.agent_id}
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
-              style={{
-                ...secondaryButton,
-                color: active ? color.amber : color.green,
-                flexShrink: 0,
-              }}
-            >
-              {active ? "Pause agent" : "Resume agent"}
-            </button>
+            <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+              <button
+                type="button"
+                onClick={() => setEditing((open) => !open)}
+                aria-expanded={editing}
+                style={secondaryButton}
+              >
+                {editing ? "Close edit" : "Edit"}
+              </button>
+              <button
+                type="button"
+                onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
+                style={{
+                  ...secondaryButton,
+                  color: active ? color.amber : color.green,
+                }}
+              >
+                {active ? "Pause agent" : "Resume agent"}
+              </button>
+            </div>
           </div>
 
           <div
@@ -579,10 +598,196 @@ function AgentDetail({
               )}
             </div>
           </div>
+
+          {editing && (
+            <AgentEditForm
+              key={agent.agent_id}
+              agent={agent}
+              onUpdate={onUpdate}
+              onClose={() => setEditing(false)}
+            />
+          )}
         </div>
         <RunRequestForm agent={agent} channels={channels} onRequestRun={onRequestRun} />
       </GroupCard>
     </section>
+  );
+}
+
+function AgentEditForm({
+  agent,
+  onUpdate,
+  onClose,
+}: {
+  agent: AgentRecord;
+  onUpdate: (params: {
+    agentId: string;
+    displayName?: string;
+    modelRef?: string;
+    prompt?: string;
+    allowedActions?: string[];
+  }) => void;
+  onClose: () => void;
+}) {
+  const [displayName, setDisplayName] = useState(agent.display_name);
+  const [modelRef, setModelRef] = useState(agent.model_ref);
+  const [prompt, setPrompt] = useState("");
+  const [allowedActions, setAllowedActions] = useState<string[]>(agent.allowed_actions);
+
+  const toggle = (name: string) =>
+    setAllowedActions((prev) =>
+      prev.includes(name) ? prev.filter((action) => action !== name) : [...prev, name],
+    );
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    onUpdate({
+      agentId: agent.agent_id,
+      displayName: displayName.trim(),
+      modelRef: modelRef.trim(),
+      allowedActions,
+      ...(prompt.trim() ? { prompt } : {}),
+    });
+    onClose();
+  };
+
+  return (
+    <form
+      onSubmit={submit}
+      aria-label="Edit agent"
+      style={{
+        marginTop: 15,
+        border: `1px solid ${color.border}`,
+        borderRadius: radius.md,
+        background: color.sidebar,
+        padding: 14,
+      }}
+    >
+      <SectionLabel>EDIT AGENT</SectionLabel>
+      <div
+        style={{
+          marginTop: 9,
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))",
+          gap: 9,
+        }}
+      >
+        <div>
+          <FieldLabel htmlFor="agent-edit-display-name">Edit display name</FieldLabel>
+          <input
+            id="agent-edit-display-name"
+            name="agent-edit-display-name"
+            type="text"
+            autoComplete="off"
+            value={displayName}
+            onChange={(event) => setDisplayName(event.target.value)}
+            style={inputStyle}
+          />
+        </div>
+        <div>
+          <FieldLabel htmlFor="agent-edit-model-ref">Edit model reference</FieldLabel>
+          <input
+            id="agent-edit-model-ref"
+            name="agent-edit-model-ref"
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            value={modelRef}
+            onChange={(event) => setModelRef(event.target.value)}
+            style={monoInputStyle}
+          />
+        </div>
+      </div>
+
+      <fieldset
+        style={{
+          margin: "12px 0 0",
+          padding: 0,
+          border: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: 7,
+        }}
+      >
+        <legend
+          style={{
+            marginBottom: 2,
+            padding: 0,
+            font: `600 10px ${font.mono}`,
+            letterSpacing: ".05em",
+            color: color.muted2,
+          }}
+        >
+          CAPABILITIES
+        </legend>
+        <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+          {KNOWN_ACTIONS.map((name) => {
+            const checked = allowedActions.includes(name);
+            return (
+              <label
+                key={name}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 7,
+                  border: `1px solid ${checked ? statusTone.agent.border : color.border}`,
+                  borderRadius: radius.sm,
+                  background: checked ? statusTone.agent.bg : color.paper,
+                  padding: "6px 9px",
+                  cursor: "pointer",
+                  font: `600 10.5px ${font.sans}`,
+                  color: checked ? accentVar : color.muted3,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  name="agent-edit-capability"
+                  checked={checked}
+                  onChange={() => toggle(name)}
+                  style={{ margin: 0 }}
+                />
+                <span>{ACTION_HINT[name] ?? ACTION_LABEL[name] ?? name}</span>
+              </label>
+            );
+          })}
+        </div>
+      </fieldset>
+
+      <div style={{ marginTop: 10 }}>
+        <FieldLabel htmlFor="agent-edit-prompt">New prompt</FieldLabel>
+        <textarea
+          id="agent-edit-prompt"
+          name="agent-edit-prompt"
+          value={prompt}
+          onChange={(event) => setPrompt(event.target.value)}
+          rows={4}
+          placeholder="Leave blank to keep the current prompt"
+          style={{
+            ...inputStyle,
+            resize: "vertical",
+            minHeight: 80,
+            lineHeight: 1.45,
+          }}
+        />
+      </div>
+
+      <div
+        style={{
+          marginTop: 12,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "flex-end",
+          gap: 8,
+        }}
+      >
+        <button type="button" onClick={onClose} style={secondaryButton}>
+          Cancel
+        </button>
+        <button type="submit" style={primaryButton(true)}>
+          Save changes
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -1300,11 +1505,18 @@ function RunsTimeline({
 export function AgentView() {
   const { state, actions } = useDucktape();
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [jobWorkerOn, setJobWorkerOn] = useState(false);
   const selectedAgent =
     state.agents.find((agent) => agent.agent_id === selectedAgentId) ??
     state.agents[0] ??
     null;
   const activeCount = state.agents.filter((agent) => agent.status === "Active").length;
+
+  const toggleJobWorker = () => {
+    const next = !jobWorkerOn;
+    setJobWorkerOn(next);
+    actions.enableJobWorker(next);
+  };
 
   return (
     <div
@@ -1351,10 +1563,62 @@ export function AgentView() {
         <span style={{ font: `400 13px ${font.mono}`, color: color.muted2 }}>
           {state.agents.length}
         </span>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          <StatusPill label={`${activeCount} ACTIVE`} tone={statusTone.success} />
-          <StatusPill label={`${state.watches.length} WATCHES`} tone={statusTone.neutral} />
-          <StatusPill label={`${state.runs.length} RUNS`} tone={statusTone.warning} />
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "flex-end",
+                lineHeight: 1.15,
+              }}
+            >
+              <span style={{ font: `600 11px ${font.sans}`, color: color.muted3 }}>
+                Jobs worker
+              </span>
+              <span style={{ font: `400 9px ${font.sans}`, color: color.muted2 }}>
+                opts the agent module into job-board work
+              </span>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={jobWorkerOn}
+              aria-label="Jobs worker"
+              onClick={toggleJobWorker}
+              style={{
+                appearance: "none",
+                cursor: "pointer",
+                width: 40,
+                height: 22,
+                flexShrink: 0,
+                padding: 2,
+                borderRadius: 999,
+                border: `1px solid ${jobWorkerOn ? color.dark : color.borderStrong}`,
+                background: jobWorkerOn ? color.dark : color.chip,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: jobWorkerOn ? "flex-end" : "flex-start",
+                transition: "background .12s, border-color .12s",
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  width: 16,
+                  height: 16,
+                  borderRadius: "50%",
+                  background: jobWorkerOn ? color.onDark : color.muted,
+                  boxShadow: shadow.card,
+                }}
+              />
+            </button>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <StatusPill label={`${activeCount} ACTIVE`} tone={statusTone.success} />
+            <StatusPill label={`${state.watches.length} WATCHES`} tone={statusTone.neutral} />
+            <StatusPill label={`${state.runs.length} RUNS`} tone={statusTone.warning} />
+          </div>
         </div>
       </div>
 
@@ -1426,6 +1690,7 @@ export function AgentView() {
               channels={state.channels}
               onPause={actions.pauseAgent}
               onResume={actions.resumeAgent}
+              onUpdate={actions.updateAgent}
               onRequestRun={actions.requestRun}
             />
             <RegisterAgentForm onRegister={actions.registerAgent} />
