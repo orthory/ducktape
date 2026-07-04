@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519};
+use commonware_p2p::Ingress;
+use commonware_utils::Hostname;
 use serde::{Deserialize, Serialize};
 
 /// the consensus scheme tag a descriptor must carry — a genesis-wide constant
@@ -235,27 +237,23 @@ impl NetworkDescriptor {
         format!("{}@{}", self.chain_id, hex_bytes(&digest.as_ref()[..16]))
     }
 
-    /// bootstrap entries RESOLVED to concrete socket addrs to dial. the host may
-    /// be a literal IP or a HOSTNAME — `to_socket_addrs` resolves either (DNS for
-    /// a name), so `pubkey@node.example.com:443` works the same as an ip. a
-    /// MALFORMED entry (no `@`, bad key) is a config error; a hint that does not
-    /// resolve, or resolves to an unspecified ip / port 0, is advisory and
-    /// skipped rather than failing startup.
-    pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, SocketAddr)>, String> {
-        use std::net::ToSocketAddrs as _;
+    /// bootstrap entries as dial INGRESSES. an IP literal becomes a socket
+    /// ingress; a HOSTNAME stays a hostname (`Ingress::Dns`) and is re-resolved
+    /// by the dialer at EVERY attempt — so `pubkey@node.example.com:443` keeps
+    /// working when the tunnel behind the name moves, and an offline name never
+    /// blocks startup. a MALFORMED entry (no `@`, bad key, not host:port) is a
+    /// config error; an unspecified ip / port 0 is advisory and skipped.
+    pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, Ingress)>, String> {
         let mut out = Vec::new();
         for entry in &self.bootstrap {
             let (key, host_port) = entry
                 .split_once('@')
                 .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
             let key = decode_key(key)?;
-            let Some(addr) = host_port.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
-                continue; // unresolvable (stale DNS, offline) — advisory, skip.
-            };
-            if addr.ip().is_unspecified() || addr.port() == 0 {
-                continue;
+            match ingress_of(host_port).map_err(|e| format!("bootstrap entry {entry:?}: {e}"))? {
+                Some(ingress) => out.push((key, ingress)),
+                None => continue, // unspecified ip / port 0 — advisory noise.
             }
-            out.push((key, addr));
         }
         Ok(out)
     }
@@ -508,15 +506,29 @@ fn is_host_port(s: &str) -> bool {
     }
 }
 
-/// resolve a `host:port` (IP literal or hostname via DNS) to a single socket
-/// addr, erroring if it does not resolve.
-fn resolve_one(host_port: &str) -> Result<SocketAddr, String> {
-    use std::net::ToSocketAddrs as _;
-    host_port
-        .to_socket_addrs()
-        .map_err(|e| format!("{host_port:?}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{host_port:?} did not resolve"))
+/// parse a `host:port` into a dial ingress WITHOUT resolving anything: an IP
+/// literal becomes `Ingress::Socket`; a host:port-shaped name stays a hostname
+/// (`Ingress::Dns`), re-resolved by dialing peers at each attempt. `Ok(None)`
+/// = syntactically fine but never dialable (unspecified ip / port 0); a shape
+/// that is neither an ip nor host:port is an error.
+fn ingress_of(host_port: &str) -> Result<Option<Ingress>, String> {
+    if let Ok(addr) = host_port.parse::<SocketAddr>() {
+        if addr.ip().is_unspecified() || addr.port() == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(Ingress::Socket(addr)));
+    }
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return Err(format!("{host_port:?} is not host:port"));
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("{host_port:?} has no valid port"))?;
+    if port == 0 {
+        return Ok(None);
+    }
+    let host = Hostname::new(host).map_err(|e| format!("{host_port:?}: bad hostname: {e:?}"))?;
+    Ok(Some(Ingress::Dns { host, port }))
 }
 
 // ============================================================================
@@ -820,8 +832,8 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
 /// key is in the validator set — otherwise a joiner pins a peer that can
 /// never answer and retries forever. preference: first validator bootstrap
 /// hint, else any validator that is not us. None = nobody can serve (solo).
-pub fn choose_sync_source(
-    bootstrappers: &[(ed25519::PublicKey, SocketAddr)],
+pub fn choose_sync_source<A>(
+    bootstrappers: &[(ed25519::PublicKey, A)],
     validators: &[ed25519::PublicKey],
     me: &ed25519::PublicKey,
 ) -> Option<ed25519::PublicKey> {
@@ -912,10 +924,15 @@ pub struct Resolved {
     pub mesh: Vec<ed25519::PublicKey>,
     /// the genesis consensus participant subset.
     pub validators: Vec<ed25519::PublicKey>,
-    /// (identity, addr) pairs to dial at startup; never contains self.
-    pub bootstrappers: Vec<(ed25519::PublicKey, SocketAddr)>,
+    /// (identity, dial ingress) pairs to dial at startup; never contains
+    /// self. hostname ingresses stay hostnames — dialers re-resolve them.
+    pub bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
     pub listen: SocketAddr,
-    pub advertised: SocketAddr,
+    /// this node's self-announced dial address. a HOSTNAME advertised stays a
+    /// hostname all the way into the signed peer record, so a node behind a
+    /// tunnel with a stable name never needs an address update — and it BOOTS
+    /// even while its own name does not resolve.
+    pub advertised: Ingress,
     pub storage_dir: PathBuf,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
@@ -987,11 +1004,13 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     }
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
-    let advertised: SocketAddr = match raw.advertised.as_deref() {
-        // resolve (DNS for a hostname) — the mesh wants a concrete socket addr
-        // for our self-announced dial address.
-        Some(a) => resolve_one(a).map_err(|e| format!("advertised: {e}"))?,
-        None => listen,
+    let advertised: Ingress = match raw.advertised.as_deref() {
+        // an explicitly-configured advertised that can never be dialed is a
+        // config error; a hostname is kept VERBATIM (no boot-time DNS).
+        Some(a) => ingress_of(a)
+            .map_err(|e| format!("advertised: {e}"))?
+            .ok_or_else(|| format!("advertised addr {a:?} is not dialable"))?,
+        None => Ingress::Socket(listen),
     };
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
 
@@ -1060,18 +1079,18 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
             .map_err(|e| format!("bootstrapper_addr: {e}"))?;
         // self-filter matches the Resolved.bootstrappers contract: a config
         // with peer_seeds[0] == id would otherwise dial (and statesync) itself.
-        vec![(key_of(boot_seed), boot_addr)]
+        vec![(key_of(boot_seed), Ingress::Socket(boot_addr))]
             .into_iter()
             .filter(|(k, _)| *k != ed25519::PrivateKey::from_seed(id).public_key())
             .collect()
     };
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
-    let advertised: SocketAddr = match raw.advertised.as_deref() {
-        // resolve (DNS for a hostname) — the mesh wants a concrete socket addr
-        // for our self-announced dial address.
-        Some(a) => resolve_one(a).map_err(|e| format!("advertised: {e}"))?,
-        None => listen,
+    let advertised: Ingress = match raw.advertised.as_deref() {
+        Some(a) => ingress_of(a)
+            .map_err(|e| format!("advertised: {e}"))?
+            .ok_or_else(|| format!("advertised addr {a:?} is not dialable"))?,
+        None => Ingress::Socket(listen),
     };
 
     Ok(Resolved {
@@ -1199,6 +1218,45 @@ mod tests {
         let token = mint_invite_token(&issuer, b"net#00000000@feedface");
         save_invite_token(&dir, &token).expect("save");
         assert_eq!(load_invite_token(&dir).expect("load"), Some(token));
+    }
+
+    #[test]
+    fn a_hostname_advertised_boots_without_dns_and_stays_a_hostname() {
+        // the tunnel case: a stable name whose IP moves (or does not resolve
+        // right now) must neither block boot nor be frozen to one lookup —
+        // it stays a DNS ingress that dialing peers re-resolve every attempt.
+        let dir = tmp("dnsadvertised");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        let d = NetworkDescriptor {
+            chain_id: "net#44444444".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.public_key().as_ref())],
+            bootstrap: vec![format!(
+                "{}@definitely-not-resolvable.ducktape.invalid:443",
+                hex_bytes(me.public_key().as_ref())
+            )],
+        };
+        d.save(&dir.join("network.toml")).expect("save");
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"127.0.0.1:52250\"\n\
+             advertised = \"my-tunnel.example.com:443\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("hostnames never block boot");
+        assert!(
+            matches!(&r.advertised, Ingress::Dns { port: 443, .. }),
+            "advertised stays a hostname: {:?}",
+            r.advertised
+        );
+        // the unresolvable bootstrap hint is KEPT as a hostname too (self is
+        // filtered from bootstrappers, so check via the descriptor directly).
+        let entries = d.bootstrap_entries().expect("hints parse");
+        assert!(
+            matches!(&entries[0].1, Ingress::Dns { port: 443, .. }),
+            "hint stays a hostname: {:?}",
+            entries[0].1
+        );
     }
 
     #[test]
@@ -1595,13 +1653,14 @@ mod tests {
         );
 
         // no usable hint: any validator that is not us.
+        let no_hints: &[(ed25519::PublicKey, SocketAddr)] = &[];
         assert_eq!(
-            choose_sync_source(&[], &validators, &me),
+            choose_sync_source(no_hints, &validators, &me),
             Some(validator.clone())
         );
 
         // solo network: nobody can serve.
-        assert_eq!(choose_sync_source(&[], &[me.clone()], &me), None);
+        assert_eq!(choose_sync_source(no_hints, &[me.clone()], &me), None);
     }
 
     #[test]
