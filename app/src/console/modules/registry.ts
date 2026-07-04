@@ -5,6 +5,7 @@ import { AgentView } from "../views/agent/AgentView";
 import { AutomationsView } from "../views/automations/AutomationsView";
 import { ChatView } from "../views/chat/ChatView";
 import { DocumentView } from "../views/document/DocumentView";
+import { ExplorerView } from "../views/explorer/ExplorerView";
 import { FilesView } from "../views/files/FilesView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { GovernanceView } from "../views/governance/GovernanceView";
@@ -46,6 +47,7 @@ export const MODULES: AppModule[] = [
   { id: "modules", nav: { icon: "modules", label: "Modules", order: 4, section: "operator" }, Screen: ModulesView },
   { id: "status", nav: { icon: "node", label: "Node", order: 5, section: "operator" }, Screen: StatusView },
   { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 6, section: "operator" }, Screen: TelemetryView },
+  { id: "explorer", nav: { icon: "hash", label: "Explorer", order: 7, section: "operator" }, Screen: ExplorerView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

@@ -25,6 +25,7 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   getBlob: vi.fn(),
   status: vi.fn(),
   telemetry: vi.fn(),
+  blocks: vi.fn(),
   onBlock: vi.fn(),
   onTelemetry: vi.fn(),
 });

@@ -115,6 +115,7 @@ const makeFakeNode = () => {
       return () => blockListeners.delete(listener);
     }),
     telemetry: vi.fn().mockResolvedValue([]),
+    blocks: vi.fn().mockResolvedValue([]),
     onTelemetry: vi.fn(() => () => {}),
   };
   const finalize = (block: BlockEvent) =>
