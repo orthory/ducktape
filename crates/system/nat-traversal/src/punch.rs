@@ -411,6 +411,43 @@ mod tests {
     }
 
     #[test]
+    fn adverse_interleave_first_datagram_drops_but_retry_delivers_both_directions() {
+        // The adverse case: A's punch is sent strictly BEFORE B has opened its
+        // filter toward A (fixed send order in `punch_once`). A final-state-only
+        // check would see both filters eventually open and wrongly call it a
+        // success on round 1; the real proof observes each datagram AT SEND TIME.
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let mut a_nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let mut b_nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
+        let mut coord = Coordinator::new();
+
+        let (a_mapped, b_mapped, a_peer, b_peer) =
+            rendezvous(a_key, b_key, &mut a_nat, &mut b_nat, &mut coord);
+        let a_side = PunchSide { key: a_key, mapped: a_mapped, peer: a_peer };
+        let b_side = PunchSide { key: b_key, mapped: b_mapped, peer: b_peer };
+
+        // Round 1 (adverse): A's datagram is DROPPED (B's filter not yet open);
+        // B's lands (A opened its filter first this round).
+        let (a1, b1) = punch_once(a_side, b_side, &mut a_nat, &mut b_nat);
+        assert!(!a1, "A's FIRST punch is dropped under the adverse order");
+        assert!(b1, "B's punch is delivered because A already opened its filter");
+
+        // Round 2 (retry): A's retransmit is now admitted — B opened its filter
+        // in round 1. BOTH directions have now had a datagram actually delivered,
+        // observed per-round, not inferred from final filter state.
+        let (a2, _b2) = punch_once(a_side, b_side, &mut a_nat, &mut b_nat);
+        assert!(a2, "A's retransmit is delivered on round 2: real bidirectional delivery");
+
+        // And the full driver reaches the same success on the same fresh pair.
+        let mut a_nat2 = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let mut b_nat2 = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
+        let mut coord2 = Coordinator::new();
+        drive_simulated(a_key, b_key, &mut a_nat2, &mut b_nat2, &mut coord2)
+            .expect("driver delivers both directions despite the adverse first-drop");
+    }
+
+    #[test]
     fn two_hidden_endpoints_punch_through_restricted_cone() {
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);
