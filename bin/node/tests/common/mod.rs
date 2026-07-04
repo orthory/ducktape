@@ -69,6 +69,15 @@ pub struct Cluster {
     /// http/ws app-surface port per `peer_ids` position (the noded wire
     /// contract served by the validator itself; off under `--sync-only`).
     pub http_ports: Vec<u16>,
+    /// per-node `advertised` override (test-only), index-aligned with
+    /// `peer_ids`. `Some(addr)` emits an `advertised = "<addr>"` line right
+    /// after `listen` in the generated config (e.g. a sentry/forwarder in
+    /// front of the node); `None` emits nothing — byte-for-byte the plain node.
+    pub advertised: Vec<Option<String>>,
+    /// override for the bootstrapper address every non-founder node dials.
+    /// `None` -> `127.0.0.1:p2p_ports[0]` (identical to today); `Some(addr)`
+    /// points bootstrap at a forwarder in front of node 0.
+    pub bootstrap_addr_override: Option<String>,
     /// declared BEFORE `dir` so drop order kills + reaps every child first —
     /// removing the tempdir under live processes races their qmdb/journal
     /// writes and silently leaks the subtree.
@@ -270,6 +279,8 @@ impl Cluster {
             p2p_ports: p2p_ports.to_vec(),
             rpc_ports: rpc_ports.to_vec(),
             http_ports: http_ports.to_vec(),
+            advertised: peer_ids.iter().map(|_| None).collect(),
+            bootstrap_addr_override: None,
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
         }
@@ -289,14 +300,18 @@ impl Cluster {
         let mut cfg = String::new();
         cfg.push_str(&format!("id = {id}\n"));
         cfg.push_str(&format!("listen = \"127.0.0.1:{}\"\n", self.p2p_ports[idx]));
+        if let Some(addr) = &self.advertised[idx] {
+            cfg.push_str(&format!("advertised = {addr:?}\n"));
+        }
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
         if idx != 0 {
-            cfg.push_str(&format!(
-                "bootstrapper_addr = \"127.0.0.1:{}\"\n",
-                self.p2p_ports[0]
-            ));
+            let bootstrap = self
+                .bootstrap_addr_override
+                .clone()
+                .unwrap_or_else(|| format!("127.0.0.1:{}", self.p2p_ports[0]));
+            cfg.push_str(&format!("bootstrapper_addr = \"{bootstrap}\"\n"));
         }
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
@@ -367,10 +382,11 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
-        cfg.push_str(&format!(
-            "bootstrapper_addr = \"127.0.0.1:{}\"\n",
-            self.p2p_ports[0]
-        ));
+        let bootstrap = self
+            .bootstrap_addr_override
+            .clone()
+            .unwrap_or_else(|| format!("127.0.0.1:{}", self.p2p_ports[0]));
+        cfg.push_str(&format!("bootstrapper_addr = \"{bootstrap}\"\n"));
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
             self.dir
@@ -398,6 +414,9 @@ impl Cluster {
         self.p2p_ports.push(ports[0]);
         self.rpc_ports.push(ports[1]);
         self.http_ports.push(ports[2]);
+        // keep `advertised` index-aligned with the extended index space so a
+        // later `config_path(joiner_idx)` (e.g. `run_sync_only`) never panics.
+        self.advertised.push(None);
         self.nodes.push(Some(NodeProc { id, child, log }));
         self.peer_ids.len() - 1
     }
