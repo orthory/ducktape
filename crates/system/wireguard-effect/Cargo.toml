@@ -1,0 +1,11 @@
+[package]
+name = "wireguard-effect"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+defguard_wireguard_rs.workspace = true
+wireguard-upgrade = { workspace = true }
+
+[dev-dependencies]
+commonware-cryptography = { workspace = true }

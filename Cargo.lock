@@ -8308,6 +8308,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wireguard-effect"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "defguard_wireguard_rs",
+ "wireguard-upgrade",
+]
+
+[[package]]
 name = "wireguard-nt"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
