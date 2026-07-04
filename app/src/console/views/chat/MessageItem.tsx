@@ -90,11 +90,14 @@ function TrashGlyph({ size = 13 }: { size?: number }) {
 }
 
 function AddReactGlyph({ size = 15 }: { size?: number }) {
+  // A smiley (open at the top-right for a "+") — the standard "add reaction"
+  // mark. Eyes are drawn as short thick strokes so they read at ~13-15px.
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
-      <path d="M20 12a8 8 0 1 1-4.5-7.2" />
-      <path d="M9 10h.01M14.5 10h.01M8.5 14.5a4 4 0 0 0 5.2.6" />
-      <path d="M18 3.5v5M15.5 6h5" />
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M20.4 11.3a8.5 8.5 0 1 1-7.7-7.7" />
+      <path d="M8.8 10.3v.6M14 10.3v.6" strokeWidth={2.1} />
+      <path d="M8.7 14.3a3.4 3.4 0 0 0 5.6 0" />
+      <path d="M19 2.8v4.6M16.7 5.1h4.6" />
     </svg>
   );
 }
