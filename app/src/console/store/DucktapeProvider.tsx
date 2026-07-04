@@ -1,190 +1,54 @@
-// The console's one stateful component: resolves the node (a ~/.ducktape
-// workspace on desktop, a dialed url on web), hydrates from it, re-queries
-// committed state on every finalized block, and hands views a stable actions
-// surface. Views stay render-only.
-//
-// Onboarding lives here too (desktop): with no active workspace the gate shows;
-// founding connects immediately, joining parks and this provider polls the
-// workspace phase (parked→admitted→promoted) until the promoted node's surface
-// answers — see connectActive.
-//
-// Writes follow the node's model: submit one msg (one block), then re-query —
-// there is no optimistic local state to reconcile. The post-submit refresh is
-// deliberately kept even though block events also refresh: it covers a dead
-// event stream, and a double refresh of cheap queries is harmless.
-//
-// Actions read live state through refs, never inside setState updaters —
-// updaters must stay pure (StrictMode double-invokes them, which would
-// double-submit blocks).
+// Store wiring for the console: resolves/adopts the node transport, hydrates
+// committed projections on boot and block events, and provides the stable
+// actions facade. Business logic lives in actions.ts; state projection lives in
+// state.ts.
 
 import {
-  createContext,
   useCallback,
   useEffect,
+  useMemo,
+  useReducer,
   useRef,
   useState,
-  useMemo,
 } from "react";
 import type { ReactNode } from "react";
 
 import * as agentClient from "../../domain/agent-client";
-import type { TurnPolicy } from "../../domain/agent-client";
+import * as automationsClient from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
-import type { Block, BlockKind } from "../../domain/document-client";
+import type { Block } from "../../domain/document-client";
+import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
-import * as profilesClient from "../../domain/profiles-client";
-import * as tasksClient from "../../domain/tasks-client";
+import * as governanceClient from "../../domain/governance-client";
+import type { ProposalView } from "../../domain/governance-client";
+import * as inboxClient from "../../domain/inbox-client";
+import * as jobsClient from "../../domain/jobs-client";
+import type { BoardCounts } from "../../domain/jobs-client";
+import * as memoryClient from "../../domain/memory-client";
 import {
-  connectWorkspace,
   isTauri,
   resolveNode,
-  shutdownNode,
-  waitUntilUp,
 } from "../../domain/node-bootstrap";
-import * as ws from "../../domain/workspace-client";
-import type { Workspace } from "../../domain/workspace-client";
+import * as profilesClient from "../../domain/profiles-client";
+import * as tasksClient from "../../domain/tasks-client";
+import * as valsetClient from "../../domain/valset-client";
 import type { NodeTransport } from "../../domain/transport";
+import * as ws from "../../domain/workspace-client";
+import { createActions } from "./actions";
+import { ConsoleContext, type ConsoleContextValue } from "./context";
+import { reducer } from "./reducer";
 import {
-  channelIdOf,
+  applySnapshot,
   createInitialState,
-  docIdOf,
-  nextTaskStatus,
 } from "./state";
-import type { ConsoleState } from "./state";
 
-/** How often a parked joiner's phase is polled while it promotes. */
-const JOIN_POLL_MS = 1500;
+export type { ConsoleActions } from "./actions";
+export type { ConsoleContextValue } from "./context";
 
 /** How many recent telemetry frames the console keeps in memory (the node's
  *  ring holds more; this bounds the live view's buffer). */
 const TELEMETRY_KEEP = 200;
-
-const wait = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-/** Replace a workspace by id, else append — keeps the registry list current. */
-const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
-  list.some((w) => w.id === next.id)
-    ? list.map((w) => (w.id === next.id ? next : w))
-    : [...list, next];
-
-// ── Per-node document registry ──────────────────────────
-//
-// The document module has NO "list docs" query — its store is keyed by
-// sha256(doc_id) and cannot enumerate — so the set of known doc-ids is tracked
-// CLIENT-SIDE and persisted per resolved node url (i.e. per workspace). This is
-// a convenience registry, not a source of truth: a doc created on another
-// client won't appear here until its id is opened by hand.
-const docRegistryKey = (nodeUrl: string): string => `ducktape.docs.${nodeUrl}`;
-
-const loadDocIds = (nodeUrl: string): string[] => {
-  try {
-    const raw = localStorage.getItem(docRegistryKey(nodeUrl));
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed)
-      ? parsed.filter((id): id is string => typeof id === "string")
-      : [];
-  } catch {
-    return []; // storage unavailable / corrupt entry — start from an empty list
-  }
-};
-
-const saveDocIds = (nodeUrl: string, docIds: string[]): void => {
-  try {
-    localStorage.setItem(docRegistryKey(nodeUrl), JSON.stringify(docIds));
-  } catch {
-    // storage may be unavailable (private mode / quota); the registry is a
-    // convenience, so a failed persist is non-fatal.
-  }
-};
-
-// ── Context ─────────────────────────────────────────────
-
-export interface ConsoleActions {
-  setScreen(screen: string): void;
-  setAccent(accent: string): void;
-  setAuthor(author: string): void;
-  /** Set our own display name in the `profiles` module (origin-gated SetName)
-   *  and keep it as the local author identity, so it propagates to everyone. */
-  setDisplayName(name: string): void;
-  selectChannel(channelId: string): void;
-  createChannel(name: string): void;
-  sendMessage(body: string): void;
-  openThread(rootSeq: number): void;
-  closeThread(): void;
-  replyInThread(body: string): void;
-  addTask(title: string): void;
-  advanceTask(taskId: string): void;
-  commitForge(params: { path: string; content: string; message: string }): void;
-
-  // ── Documents (block store over the `document` module) ──
-  /** Create a doc (CreateDoc, idempotent), register it, and open it. */
-  createDoc(docId: string): void;
-  /** Register + open a doc by id, loading its blocks (like selectChannel). */
-  openDoc(docId: string): void;
-  /** Append/insert a fresh block into the active doc (id generated here). */
-  insertBlock(params: { after: string | null; kind: BlockKind; text: string }): void;
-  /** Replace a block's text in the active doc. */
-  updateBlock(params: { blockId: string; text: string }): void;
-  /** Remove a block from the active doc. */
-  removeBlock(blockId: string): void;
-  /** Move a block within the active doc (see the `after` rule). */
-  moveBlock(params: { blockId: string; after: string | null }): void;
-
-  // ── Agents (collaboration loop over the `agent` module) ──
-  /** Upload the prompt text to the blob store, then RegisterAgent with the
-   *  resulting 32-byte digest as its prompt_hash. */
-  registerAgent(params: {
-    displayName: string;
-    agentId: string;
-    modelRef: string;
-    prompt: string;
-    allowedActions: string[];
-  }): void;
-  /** Pause / resume an agent (owner-gated). */
-  pauseAgent(agentId: string): void;
-  resumeAgent(agentId: string): void;
-  /** Watch a channel under a turn policy / drop the watch. */
-  watchChannel(params: { channelId: string; policy: TurnPolicy }): void;
-  unwatchChannel(channelId: string): void;
-  /** Explicitly run an agent against a channel anchor. */
-  requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
-  /** Cancel an awaiting run (run-creator or owner only). */
-  cancelRun(runId: string): void;
-
-  /** Ask the managed daemon to exit (desktop only). */
-  stopNode(): void;
-  /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
-  startNode(): void;
-  dismissError(): void;
-
-  // ── Onboarding / workspaces (desktop only) ──
-  /** Found a new network and connect to it. */
-  createWorkspace(name: string): void;
-  /** Join an existing network from an invite blob, then park until admitted. */
-  joinWorkspace(name: string, blob: string): void;
-  /** Switch the active workspace (spawns/adopts its node). */
-  selectWorkspace(id: string): void;
-  /** Fetch the active workspace's invite blob into state for sharing. */
-  revealInvite(): void;
-  /** Admit a joiner by pubkey through the active (member) workspace. */
-  admitMember(pubkey: string): void;
-  /** Open the onboarding gate to add or switch workspaces (keeps the active
-   *  one running underneath). */
-  newWorkspace(): void;
-  /** Close the gate without changing workspaces (only if one is active). */
-  dismissOnboarding(): void;
-}
-
-export interface ConsoleContextValue {
-  state: ConsoleState;
-  actions: ConsoleActions;
-}
-
-export const ConsoleContext = createContext<ConsoleContextValue | null>(null);
-
-// ── Provider ────────────────────────────────────────────
 
 export function DucktapeProvider({
   transport,
@@ -194,7 +58,7 @@ export function DucktapeProvider({
   transport?: NodeTransport;
   children: ReactNode;
 }) {
-  const [state, setState] = useState<ConsoleState>(createInitialState);
+  const [state, dispatch] = useReducer(reducer, undefined, createInitialState);
   const [node, setNode] = useState<NodeTransport | null>(transport ?? null);
 
   // actions and block-event callbacks read CURRENT values here, not the
@@ -211,71 +75,139 @@ export function DucktapeProvider({
   const bootStartedRef = useRef(false);
 
   const fail = useCallback(
-    (err: unknown) => setState((prev) => ({ ...prev, error: String(err) })),
+    (err: unknown) =>
+      dispatch({ type: "patch", patch: { error: String(err) } }),
     [],
   );
 
-  // Connect the app to a workspace's node: select it (Rust spawns/adopts),
-  // then either wait for a member's surface to answer, or poll a joiner's
-  // park→promote phase until its promoted validator surface comes up.
-  const connectActive = useCallback(
-    (target: Workspace): Promise<void> => {
-      const gen = (bootGenRef.current += 1);
-      const stale = () => bootGenRef.current !== gen;
-      setState((prev) => ({
-        ...prev,
-        workspace: target,
-        needsOnboarding: false,
-        onboardingBusy: false,
-        inviteBlob: null,
-      }));
-      return Promise.resolve()
-        .then(() => ws.selectWorkspace(target.id))
-        .then((sel) => {
-          if (stale()) return;
-          setState((prev) => ({ ...prev, nodeUrl: sel.httpUrl, managed: true }));
-          const transport = connectWorkspace(sel.httpUrl).transport;
-          if (target.member) {
-            // founder / already-admitted member: the surface comes up promptly.
-            return waitUntilUp(transport).then(() => {
-              if (stale()) return;
-              setState((prev) => ({ ...prev, onboardingPhase: null }));
-              setNode(transport);
-            });
-          }
-          // joiner: the node parks (no surface) until a member admits it and
-          // the epoch cuts over; it then promotes, reboots as a validator, and
-          // its surface starts answering. Poll the phase until that happens.
-          const tick = (): Promise<void> => {
-            if (stale()) return Promise.resolve();
-            return transport.status().then(
-              () => {
-                if (stale()) return;
-                setState((prev) => ({ ...prev, onboardingPhase: null }));
-                setNode(transport);
-              },
-              () =>
-                ws.workspacePhase(target.id).then((report) => {
-                  if (stale()) return;
-                  setState((prev) => ({ ...prev, onboardingPhase: report }));
-                  if (report.phase === "fatal") {
-                    fail(report.detail ?? "the node failed to join");
-                    return;
-                  }
-                  return wait(JOIN_POLL_MS).then(tick);
-                }),
-            );
-          };
-          return tick();
-        })
-        .catch((err) => {
-          if (!stale()) {
-            setState((prev) => ({ ...prev, onboardingBusy: false }));
-            fail(err);
-          }
-        });
-    },
-    [fail],
+  const refresh = useCallback(() => {
+    const live = nodeRef.current;
+    if (!live) return Promise.resolve();
+    // enumerate the doc index (the browse tree) and re-query the open doc's
+    // blocks (null when none is open) alongside the other projections.
+    const activeDoc = stateRef.current.activeDoc;
+    // the inbox is per-member; the console keys "my" queue by the local author
+    // identity, and memory browsing re-lists whatever dir is open.
+    const member = stateRef.current.author;
+    const memoryPath = stateRef.current.memoryPath;
+    return Promise.resolve()
+      .then(() =>
+        Promise.all([
+          live.status(),
+          chatClient.channels(live),
+          tasksClient.listTasks(live),
+          valsetClient.validators(live),
+          // governance is a first-class operator surface but best-effort in the
+          // snapshot: a node/build without it just reads as "no proposals"
+          // rather than failing the whole refresh.
+          governanceClient.proposals(live).catch((): ProposalView[] => []),
+          forgeClient.head(live),
+          documentClient.listDocs(live),
+          activeDoc
+            ? documentClient.getDoc(live, activeDoc)
+            : Promise.resolve<Block[] | null>(null),
+          agentClient.agents(live),
+          agentClient.watches(live),
+          // newest-first for the timeline; Runs is ascending on the wire.
+          agentClient
+            .runs(live, { channelId: null, limit: 50 })
+            .then((list) => [...list].reverse()),
+          profilesClient.allProfiles(live, { from: 0, limit: 256 }),
+          // ── unexposed-until-now modules — every one best-effort so a node
+          //    that does not register the module reads as "empty", never a
+          //    failed refresh (same contract as governance above). ──
+          inboxClient.list(live, { member }).catch(() => []),
+          inboxClient.unread(live, member).catch(() => 0),
+          jobsClient.listJobs(live, {}).catch(() => []),
+          jobsClient.counts(live).catch((): BoardCounts | null => null),
+          automationsClient.listRules(live).catch(() => []),
+          memoryClient.ls(live, { path: memoryPath }).catch(() => []),
+          filesClient.list(live, {}).catch(() => []),
+        ]),
+      )
+      .then(([
+        status,
+        channels,
+        tasks,
+        validators,
+        proposals,
+        forgeHead,
+        docIds,
+        docBlocks,
+        agents,
+        watches,
+        runs,
+        profiles,
+        inbox,
+        inboxUnread,
+        jobs,
+        jobCounts,
+        rules,
+        memoryEntries,
+        files,
+      ]) => {
+        // Profile.key is the origin bytes — the same bytes AuthorRef::User
+        // carries — so hex(key) is exactly authorName's AuthorNames key.
+        const authorNames = Object.fromEntries(
+          profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
+        );
+        const members = validators.map(valsetClient.validatorHex);
+        const current = stateRef.current.activeChannel;
+        const active =
+          current && channels.some((c) => c.id === current)
+            ? current
+            : (channels[0]?.id ?? null);
+        return Promise.resolve()
+          .then(() => (active ? chatClient.latestMessages(live, active) : []))
+          .then((messages) =>
+            dispatch({
+              type: "patch",
+              patch: applySnapshot({
+                connected: true,
+                status,
+                channels,
+                tasks,
+                members,
+                proposals,
+                forgeHead,
+                activeChannel: active,
+                messages,
+                authorNames,
+                docIds,
+                activeDocBlocks: docBlocks ?? [],
+                agents,
+                watches,
+                runs,
+                inbox,
+                inboxUnread,
+                jobs,
+                jobCounts,
+                rules,
+                memoryEntries,
+                files,
+              }),
+            }),
+          );
+      })
+      .catch((err) => {
+        dispatch({ type: "patch", patch: { connected: false } });
+        fail(err);
+      });
+  }, [fail]);
+
+  const actions = useMemo(
+    () =>
+      createActions({
+        dispatch,
+        getState: () => stateRef.current,
+        getNode: () => nodeRef.current,
+        setNode,
+        refresh,
+        fail,
+        nextBootGeneration: () => (bootGenRef.current += 1),
+        isBootGenerationStale: (generation) => bootGenRef.current !== generation,
+      }),
+    [],
   );
 
   // 1. Resolve the node once. Web: dial the configured url. Desktop: resolve
@@ -288,12 +220,14 @@ export function DucktapeProvider({
 
     if (!isTauri()) {
       const resolution = resolveNode();
-      setState((prev) => ({
-        ...prev,
-        nodeUrl: resolution.url,
-        managed: false,
-        needsOnboarding: false,
-      }));
+      dispatch({
+        type: "patch",
+        patch: {
+          nodeUrl: resolution.url,
+          managed: false,
+          needsOnboarding: false,
+        },
+      });
       setNode(resolution.transport);
       return;
     }
@@ -303,12 +237,12 @@ export function DucktapeProvider({
       .then(() => Promise.all([ws.listWorkspaces(), ws.activeWorkspace()]))
       .then(([all, active]) => {
         if (cancelled) return;
-        setState((prev) => ({ ...prev, workspaces: all }));
+        dispatch({ type: "patch", patch: { workspaces: all } });
         if (!active) {
-          setState((prev) => ({ ...prev, needsOnboarding: true }));
+          dispatch({ type: "patch", patch: { needsOnboarding: true } });
           return;
         }
-        return connectActive(active);
+        return actions.connectActive(active);
       })
       .catch((err) => {
         if (!cancelled) fail(err);
@@ -322,78 +256,11 @@ export function DucktapeProvider({
       cancelled = true;
       bootStartedRef.current = false;
     };
-  }, [transport, fail, connectActive]);
+  }, [transport, actions, fail]);
 
-  // 2. Pull every committed projection; adopt the first channel when none is
-  //    active yet (or the active one vanished from a fresh node).
-  const refresh = useCallback(
-    () => {
-      const live = nodeRef.current;
-      if (!live) return Promise.resolve();
-      // the document module has no bulk read, so re-query only the open doc
-      // (null when none is open) alongside the other projections.
-      const activeDoc = stateRef.current.activeDoc;
-      return Promise.resolve()
-        .then(() =>
-          Promise.all([
-            live.status(),
-            chatClient.channels(live),
-            tasksClient.listTasks(live),
-            forgeClient.head(live),
-            activeDoc
-              ? documentClient.getDoc(live, activeDoc)
-              : Promise.resolve<Block[] | null>(null),
-            agentClient.agents(live),
-            agentClient.watches(live),
-            // newest-first for the timeline; Runs is ascending on the wire.
-            agentClient
-              .runs(live, { channelId: null, limit: 50 })
-              .then((list) => [...list].reverse()),
-            profilesClient.allProfiles(live, { from: 0, limit: 256 }),
-          ]),
-        )
-        .then(([status, channels, tasks, forgeHead, docBlocks, agents, watches, runs, profiles]) => {
-          // Profile.key is the origin bytes — the same bytes AuthorRef::User
-          // carries — so hex(key) is exactly authorName's AuthorNames key.
-          const authorNames = Object.fromEntries(
-            profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
-          );
-          const current = stateRef.current.activeChannel;
-          const active =
-            current && channels.some((c) => c.id === current)
-              ? current
-              : (channels[0]?.id ?? null);
-          return Promise.resolve()
-            .then(() => (active ? chatClient.latestMessages(live, active) : []))
-            .then((messages) =>
-              setState((prev) => ({
-                ...prev,
-                connected: true,
-                status,
-                channels,
-                tasks,
-                forgeHead,
-                activeChannel: active,
-                messages,
-                authorNames,
-                activeDocBlocks: docBlocks ?? [],
-                agents,
-                watches,
-                runs,
-              })),
-            );
-        })
-        .catch((err) => {
-          setState((prev) => ({ ...prev, connected: false }));
-          fail(err);
-        });
-    },
-    [fail],
-  );
-
-  // 3. Hydrate once the node is resolved, then follow the block stream and the
-  //    node-local telemetry stream (backfilled from the ring, then live). Both
-  //    updaters stay pure (StrictMode double-invokes them), so they append
+  // 2. Hydrate once the node is resolved, then follow the block stream and the
+  //    node-local telemetry stream (backfilled from the ring, then live). The
+  //    telemetry updaters stay pure (StrictMode double-invokes them): they append
   //    idempotently and dedupe on the strictly-increasing block height.
   useEffect(() => {
     if (!node) return;
@@ -403,10 +270,13 @@ export function DucktapeProvider({
     node
       .telemetry(TELEMETRY_KEEP)
       .then((frames) =>
-        setState((prev) => {
-          const cutoff = frames.length ? frames[frames.length - 1].height : -1;
-          const newer = prev.telemetry.filter((f) => f.height > cutoff);
-          return { ...prev, telemetry: [...frames, ...newer].slice(-TELEMETRY_KEEP) };
+        dispatch({
+          type: "update",
+          fn: (prev) => {
+            const cutoff = frames.length ? frames[frames.length - 1].height : -1;
+            const newer = prev.telemetry.filter((f) => f.height > cutoff);
+            return { telemetry: [...frames, ...newer].slice(-TELEMETRY_KEEP) };
+          },
         }),
       )
       .catch(() => {
@@ -417,11 +287,14 @@ export function DucktapeProvider({
       refresh();
     });
     const offTelemetry = node.onTelemetry((frame) => {
-      setState((prev) => {
-        const last = prev.telemetry[prev.telemetry.length - 1];
-        // Heights strictly increase; drop a seam duplicate or a reconnect replay.
-        if (last && frame.height <= last.height) return prev;
-        return { ...prev, telemetry: [...prev.telemetry, frame].slice(-TELEMETRY_KEEP) };
+      dispatch({
+        type: "update",
+        fn: (prev) => {
+          const last = prev.telemetry[prev.telemetry.length - 1];
+          // Heights strictly increase; drop a seam duplicate or a reconnect replay.
+          if (last && frame.height <= last.height) return {};
+          return { telemetry: [...prev.telemetry, frame].slice(-TELEMETRY_KEEP) };
+        },
       });
     });
     return () => {
@@ -430,431 +303,57 @@ export function DucktapeProvider({
     };
   }, [node, refresh]);
 
-  // 4. Reflect the accent into the css var the theme reads.
+  // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {
     document.documentElement.style.setProperty("--accent", state.accent);
   }, [state.accent]);
 
-  // 5. Load the per-node doc registry when the node url resolves or changes,
-  //    and drop any open doc — a different node has different documents.
-  //    Writes go the other way through openDoc (the only place docIds grows).
+  // 4. Drop any open doc when the node url resolves or changes — a different
+  //    node has different documents. `docIds` (the browse tree) is re-enumerated
+  //    from the new node's index by `refresh`, so it isn't seeded here.
   useEffect(() => {
     const url = state.nodeUrl;
     if (!url) return;
-    setState((prev) => ({
-      ...prev,
-      docIds: loadDocIds(url),
-      activeDoc: null,
-      activeDocBlocks: [],
-    }));
+    dispatch({
+      type: "patch",
+      patch: {
+        docIds: [],
+        activeDoc: null,
+        activeDocBlocks: [],
+      },
+    });
   }, [state.nodeUrl]);
 
-  const actions = useMemo<ConsoleActions>(() => {
-    const submitThenRefresh = (submit: (live: NodeTransport) => Promise<unknown>) => {
-      const live = nodeRef.current;
-      if (!live) return Promise.resolve();
-      return Promise.resolve()
-        .then(() => submit(live))
-        .then(() => refresh())
-        .catch(fail);
+  // 5. Menu-bar popover navigation (desktop/macOS): the tray popover is a
+  //    separate webview, so it asks the console to switch screens by having Rust
+  //    emit `ducktape://navigate` after showing this window. Inert on web.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<string>("ducktape://navigate", (event) => {
+          const screen = event.payload;
+          if (screen) dispatch({ type: "patch", patch: { screen } });
+        }),
+      )
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {
+        // event API unavailable (non-tauri / permission) — navigation just no-ops.
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
+  }, []);
 
-    // switching channels means: new active channel, thread panel closed, and
-    // THAT channel's messages loaded — every path into a channel goes here
-    const enterChannel = (channelId: string) => {
-      const live = nodeRef.current;
-      if (!live) return;
-      setState((prev) => ({
-        ...prev,
-        activeChannel: channelId,
-        activeThread: null,
-      }));
-      Promise.resolve()
-        .then(() => chatClient.latestMessages(live, channelId))
-        .then((messages) => setState((prev) => ({ ...prev, messages })))
-        .catch(fail);
-    };
-
-    // the single entry point into a doc: record it in the per-node registry
-    // (persist), make it active, and load its blocks. Every path into a doc
-    // (new-doc, open-by-id, a registry click) goes here — like enterChannel.
-    const enterDoc = (rawId: string) => {
-      const live = nodeRef.current;
-      const docId = docIdOf(rawId);
-      if (!live || !docId) return;
-      const known = stateRef.current.docIds;
-      const docIds = known.includes(docId) ? known : [...known, docId];
-      const url = stateRef.current.nodeUrl;
-      if (url) saveDocIds(url, docIds);
-      setState((prev) => ({
-        ...prev,
-        docIds,
-        activeDoc: docId,
-        activeDocBlocks: [],
-      }));
-      Promise.resolve()
-        .then(() => documentClient.getDoc(live, docId))
-        .then((blocks) =>
-          setState((prev) => ({ ...prev, activeDocBlocks: blocks ?? [] })),
-        )
-        .catch(fail);
-    };
-
-    return {
-      setScreen: (screen) => setState((prev) => ({ ...prev, screen })),
-      setAccent: (accent) => setState((prev) => ({ ...prev, accent })),
-      setAuthor: (author) => setState((prev) => ({ ...prev, author })),
-
-      // Keep the local author identity (still the web-origin string) AND submit
-      // SetName so the chosen name propagates: it's origin-gated, so passing our
-      // origin sets our OWN profile only. Refresh re-reads authorNames.
-      setDisplayName: (name) => {
-        setState((prev) => ({ ...prev, author: name }));
-        submitThenRefresh((live) =>
-          profilesClient.setName(live, {
-            displayName: name,
-            origin: stateRef.current.author,
-          }),
-        );
-      },
-
-      selectChannel: enterChannel,
-
-      createChannel: (name) => {
-        const channelId = channelIdOf(name);
-        if (!channelId) return;
-        submitThenRefresh((live) =>
-          chatClient.createChannel(live, {
-            channelId,
-            name,
-            origin: stateRef.current.author,
-          }),
-        ).then(() => enterChannel(channelId));
-      },
-
-      sendMessage: (body) => {
-        const channelId = stateRef.current.activeChannel;
-        if (!channelId || !body.trim()) return;
-        submitThenRefresh((live) =>
-          chatClient.postMessage(live, {
-            channelId,
-            messageId: crypto.randomUUID(),
-            text: body.trim(),
-            origin: stateRef.current.author,
-          }),
-        );
-      },
-
-      openThread: (rootSeq) => {
-        const live = nodeRef.current;
-        const channelId = stateRef.current.activeChannel;
-        if (!live || !channelId) return;
-        Promise.resolve()
-          .then(() => chatClient.thread(live, { channelId, rootSeq }))
-          .then((activeThread) =>
-            setState((prev) => ({ ...prev, activeThread })),
-          )
-          .catch(fail);
-      },
-
-      closeThread: () => setState((prev) => ({ ...prev, activeThread: null })),
-
-      replyInThread: (body) => {
-        const live = nodeRef.current;
-        const channelId = stateRef.current.activeChannel;
-        const root = stateRef.current.activeThread?.root;
-        if (!live || !channelId || !root || !body.trim()) return;
-        Promise.resolve()
-          .then(() =>
-            chatClient.postMessage(live, {
-              channelId,
-              messageId: crypto.randomUUID(),
-              text: body.trim(),
-              origin: stateRef.current.author,
-              thread: root.seq,
-            }),
-          )
-          .then(() =>
-            chatClient.thread(live, { channelId, rootSeq: root.seq }),
-          )
-          .then((activeThread) => {
-            setState((prev) => ({ ...prev, activeThread }));
-            return refresh();
-          })
-          .catch(fail);
-      },
-
-      addTask: (title) => {
-        if (!title.trim()) return;
-        submitThenRefresh((live) =>
-          tasksClient.createTask(live, {
-            taskId: crypto.randomUUID(),
-            title: title.trim(),
-          }),
-        );
-      },
-
-      advanceTask: (taskId) => {
-        const task = stateRef.current.tasks.find((t) => t.id === taskId);
-        if (!task || task.status === "Done") return;
-        submitThenRefresh((live) =>
-          tasksClient.updateStatus(live, {
-            taskId,
-            status: nextTaskStatus(task.status),
-          }),
-        );
-      },
-
-      commitForge: (params) => {
-        if (!params.path.trim() || params.content.length === 0) return;
-        submitThenRefresh((live) =>
-          forgeClient.commit(live, {
-            path: params.path.trim(),
-            content: params.content,
-            message: params.message.trim() || `commit ${params.path.trim()}`,
-            origin: stateRef.current.author,
-          }),
-        );
-      },
-
-      // ── Documents ──
-      openDoc: enterDoc,
-
-      createDoc: (rawId) => {
-        const docId = docIdOf(rawId);
-        if (!docId) return;
-        // CreateDoc is idempotent and REQUIRED before any block op; then open
-        // it (registers the id + loads blocks), mirroring createChannel.
-        submitThenRefresh((live) => documentClient.createDoc(live, { docId })).then(
-          () => enterDoc(docId),
-        );
-      },
-
-      insertBlock: ({ after, kind, text }) => {
-        const docId = stateRef.current.activeDoc;
-        if (!docId) return;
-        submitThenRefresh((live) =>
-          documentClient.insertBlock(live, {
-            docId,
-            after,
-            block: { id: crypto.randomUUID(), kind, text },
-          }),
-        );
-      },
-
-      updateBlock: ({ blockId, text }) => {
-        const docId = stateRef.current.activeDoc;
-        if (!docId) return;
-        submitThenRefresh((live) =>
-          documentClient.updateBlock(live, { docId, blockId, text }),
-        );
-      },
-
-      removeBlock: (blockId) => {
-        const docId = stateRef.current.activeDoc;
-        if (!docId) return;
-        submitThenRefresh((live) =>
-          documentClient.removeBlock(live, { docId, blockId }),
-        );
-      },
-
-      moveBlock: ({ blockId, after }) => {
-        const docId = stateRef.current.activeDoc;
-        if (!docId) return;
-        submitThenRefresh((live) =>
-          documentClient.moveBlock(live, { docId, blockId, after }),
-        );
-      },
-
-      // ── Agents ──
-      registerAgent: ({ displayName, agentId, modelRef, prompt, allowedActions }) => {
-        const id = agentId.trim();
-        const name = displayName.trim();
-        const model = modelRef.trim();
-        if (!id || !name || !model) return;
-        submitThenRefresh((live) =>
-          // stage the prompt in the node's blob store, then register with its
-          // digest as prompt_hash — the blob is keyed by sha256(bytes), which
-          // IS the hash the oracle worker fetches the prompt by.
-          Promise.resolve()
-            .then(() => live.putBlob(new TextEncoder().encode(prompt)))
-            .then((digest) =>
-              agentClient.registerAgent(live, {
-                agentId: id,
-                displayName: name,
-                modelRef: model,
-                promptHash: agentClient.hexToBytes(digest),
-                allowedActions,
-                origin: stateRef.current.author,
-              }),
-            ),
-        );
-      },
-
-      pauseAgent: (agentId) => {
-        if (!agentId) return;
-        submitThenRefresh((live) =>
-          agentClient.pauseAgent(live, { agentId, origin: stateRef.current.author }),
-        );
-      },
-
-      resumeAgent: (agentId) => {
-        if (!agentId) return;
-        submitThenRefresh((live) =>
-          agentClient.resumeAgent(live, { agentId, origin: stateRef.current.author }),
-        );
-      },
-
-      watchChannel: ({ channelId, policy }) => {
-        if (!channelId) return;
-        submitThenRefresh((live) =>
-          agentClient.watchChannel(live, {
-            channelId,
-            policy,
-            origin: stateRef.current.author,
-          }),
-        );
-      },
-
-      unwatchChannel: (channelId) => {
-        if (!channelId) return;
-        submitThenRefresh((live) =>
-          agentClient.unwatchChannel(live, {
-            channelId,
-            origin: stateRef.current.author,
-          }),
-        );
-      },
-
-      requestRun: ({ agentId, channelId, anchorSeq }) => {
-        if (!agentId || !channelId) return;
-        submitThenRefresh((live) =>
-          agentClient.requestRun(live, {
-            agentId,
-            channelId,
-            anchorSeq,
-            origin: stateRef.current.author,
-          }),
-        );
-      },
-
-      cancelRun: (runId) => {
-        if (!runId) return;
-        submitThenRefresh((live) =>
-          agentClient.cancelRun(live, { runId, origin: stateRef.current.author }),
-        );
-      },
-
-      stopNode: () => {
-        const url = stateRef.current.nodeUrl;
-        if (!url || !stateRef.current.managed) return;
-        Promise.resolve()
-          .then(() => shutdownNode(url))
-          .then(() => setState((prev) => ({ ...prev, connected: false })))
-          .catch(fail);
-      },
-
-      startNode: () => {
-        const target = stateRef.current.workspace;
-        if (!stateRef.current.managed || !target) return;
-        // re-select the active workspace: Rust adopts a live node or respawns
-        // one, then connectActive reconnects and re-hydrates.
-        connectActive(target).catch(fail);
-      },
-
-      dismissError: () => setState((prev) => ({ ...prev, error: null })),
-
-      // ── Onboarding / workspaces ──
-      createWorkspace: (name) => {
-        if (!name.trim()) return;
-        setState((prev) => ({ ...prev, onboardingBusy: true, error: null }));
-        Promise.resolve()
-          .then(() => ws.createWorkspace(name.trim()))
-          .then((created) => {
-            setState((prev) => ({
-              ...prev,
-              workspaces: mergeWorkspace(prev.workspaces, created),
-            }));
-            return connectActive(created);
-          })
-          .catch((err) => {
-            setState((prev) => ({ ...prev, onboardingBusy: false }));
-            fail(err);
-          });
-      },
-
-      joinWorkspace: (name, blob) => {
-        if (!name.trim() || !blob.trim()) return;
-        setState((prev) => ({ ...prev, onboardingBusy: true, error: null }));
-        Promise.resolve()
-          .then(() => ws.joinWorkspace(name.trim(), blob.trim()))
-          .then((joined) => {
-            setState((prev) => ({
-              ...prev,
-              workspaces: mergeWorkspace(prev.workspaces, joined),
-            }));
-            return connectActive(joined);
-          })
-          .catch((err) => {
-            setState((prev) => ({ ...prev, onboardingBusy: false }));
-            fail(err);
-          });
-      },
-
-      selectWorkspace: (id) => {
-        const target = stateRef.current.workspaces.find((w) => w.id === id);
-        if (!target || target.id === stateRef.current.workspace?.id) return;
-        // drop the old node + its projections so the switch shows no stale state.
-        setNode(null);
-        setState((prev) => ({
-          ...prev,
-          connected: false,
-          status: null,
-          channels: [],
-          messages: [],
-          activeChannel: null,
-          activeThread: null,
-          authorNames: {},
-          tasks: [],
-          docIds: [],
-          activeDoc: null,
-          activeDocBlocks: [],
-          agents: [],
-          watches: [],
-          runs: [],
-          onboardingPhase: null,
-        }));
-        connectActive(target).catch(fail);
-      },
-
-      revealInvite: () => {
-        const target = stateRef.current.workspace;
-        if (!target) return;
-        Promise.resolve()
-          .then(() => ws.inviteBlob(target.id))
-          .then((blob) => setState((prev) => ({ ...prev, inviteBlob: blob })))
-          .catch(fail);
-      },
-
-      admitMember: (pubkey) => {
-        const target = stateRef.current.workspace;
-        if (!target || !pubkey.trim()) return;
-        Promise.resolve()
-          .then(() => ws.admitMember(target.id, pubkey.trim()))
-          .then(() => refresh())
-          .catch(fail);
-      },
-
-      newWorkspace: () =>
-        setState((prev) => ({ ...prev, needsOnboarding: true, inviteBlob: null })),
-
-      dismissOnboarding: () =>
-        setState((prev) =>
-          prev.workspace ? { ...prev, needsOnboarding: false } : prev,
-        ),
-    };
-  }, [refresh, fail, connectActive]);
-
-  const value = useMemo(() => ({ state, actions }), [state, actions]);
+  const value = useMemo<ConsoleContextValue>(
+    () => ({ state, actions }),
+    [state, actions],
+  );
   return <ConsoleContext.Provider value={value}>{children}</ConsoleContext.Provider>;
 }

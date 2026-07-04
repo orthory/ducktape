@@ -250,7 +250,24 @@ impl Module for Valset {
                 Self::validate_key(&key)?;
                 self.stage_add(key);
             }
-            ValsetMsg::Leave { key } => self.stage_remove(key),
+            ValsetMsg::Leave { key } => {
+                // the validator set must NEVER go empty. a downstream orderer
+                // reconfigured to zero validators hits commonware `quorum(0)`,
+                // which panics ("n must not be zero") and halts the node. refuse
+                // a removal that would drop the LAST validator. authoritative
+                // here: every membership removal (a governance-passed
+                // RemoveValidator or genesis orchestration) funnels through this
+                // arm, so the invariant holds no matter who staged it — the set
+                // is closed under this rule regardless of the caller.
+                let mut after: BTreeSet<Vec<u8>> = self.effective().into_iter().collect();
+                after.remove(&key);
+                if after.is_empty() {
+                    return Err(Error::Module(
+                        "refusing to remove the last validator: the set must never be empty".into(),
+                    ));
+                }
+                self.stage_remove(key);
+            }
         }
         Ok(())
     }
@@ -377,18 +394,66 @@ mod tests {
 
     #[test]
     fn leave_removes_a_validator() {
+        // remove ONE of two validators — the set stays non-empty, so the
+        // last-validator guard never fires. (removing the last validator is a
+        // refused no-op; see `leaving_the_last_validator_is_refused`.)
         let mut v = Valset::new("valset");
         let mut ctx = TestCtx::new();
-        let k = valid_key(2);
-        futures::executor::block_on(v.execute(&mut ctx, &join(&k))).unwrap();
+        let (keep, drop) = (valid_key(2), valid_key(3));
+        futures::executor::block_on(v.execute(&mut ctx, &join(&keep))).unwrap();
+        futures::executor::block_on(v.execute(&mut ctx, &join(&drop))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
         let joined_root = v.root();
 
-        futures::executor::block_on(v.execute(&mut ctx, &leave(&k))).unwrap();
+        futures::executor::block_on(v.execute(&mut ctx, &leave(&drop))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert!(validators(&v).is_empty(), "leave removes the validator");
-        assert_eq!(v.root(), StateRoot::ZERO, "an empty set is back to ZERO");
-        assert_ne!(v.root(), joined_root);
+        assert_eq!(validators(&v), vec![keep], "leave removes exactly that key");
+        assert_ne!(v.root(), joined_root, "the committed root moved");
+        assert_ne!(v.root(), StateRoot::ZERO, "a non-empty set is not ZERO");
+    }
+
+    #[test]
+    fn leaving_the_last_validator_is_refused() {
+        // the set must never go empty: an orderer reconfigured to zero
+        // validators hits commonware `quorum(0)`, which panics. removing the
+        // SOLE validator is refused deterministically, and the set is untouched.
+        let mut v = Valset::new("valset");
+        let mut ctx = TestCtx::new();
+        let solo = valid_key(7);
+        futures::executor::block_on(v.execute(&mut ctx, &join(&solo))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        let before = v.root();
+
+        let err = futures::executor::block_on(v.execute(&mut ctx, &leave(&solo))).unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("last validator")),
+            "got {err:?}"
+        );
+        // read-your-writes: nothing was staged, so the sole validator remains.
+        assert_eq!(validators(&v), vec![solo], "the last validator stays");
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert_eq!(v.root(), before, "committed set is byte-identical");
+        assert_ne!(v.root(), StateRoot::ZERO, "the set never went empty");
+    }
+
+    #[test]
+    fn leaving_the_last_of_a_shrinking_set_is_refused() {
+        // stage two leaves in one block: the first (of two) is fine, the second
+        // would empty the set within the same block's read-your-writes view and
+        // is refused — the guard reads the EFFECTIVE (staged-over-committed) set.
+        let mut v = Valset::new("valset");
+        let mut ctx = TestCtx::new();
+        let (a, b) = (valid_key(4), valid_key(5));
+        futures::executor::block_on(v.execute(&mut ctx, &join(&a))).unwrap();
+        futures::executor::block_on(v.execute(&mut ctx, &join(&b))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+
+        futures::executor::block_on(v.execute(&mut ctx, &leave(&a))).unwrap();
+        let err = futures::executor::block_on(v.execute(&mut ctx, &leave(&b))).unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("last validator")),
+            "got {err:?}"
+        );
     }
 
     #[test]

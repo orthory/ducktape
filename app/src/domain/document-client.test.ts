@@ -20,6 +20,7 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
   query: vi.fn().mockResolvedValue(reply),
   putBlob: vi.fn(),
+  getBlob: vi.fn(),
   status: vi.fn(),
   telemetry: vi.fn(),
   onBlock: vi.fn(),

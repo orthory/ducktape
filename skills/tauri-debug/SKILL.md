@@ -7,7 +7,7 @@ description: Use when verifying a UI/design change in the real Ducktape desktop 
 
 The desktop shell ships a **dev-only** debug bridge: `tauri-plugin-mcp`,
 registered under `#[cfg(all(debug_assertions, desktop))]` in
-`app/src-tauri/src/main.rs`, opens a local unix socket (`/tmp/tauri-mcp.sock`,
+`app/src-tauri/src/main.rs`, opens a local unix socket (`/tmp/ducktape-tauri-mcp.sock`,
 or `DUCKTAPE_TAURI_MCP_SOCKET`) implementing the native ops — screenshot the
 window, run JS in the webview, inspect the DOM, simulate input. Drive it with
 the dependency-free helper `app/scripts/tauri-debug.mjs` (newline-delimited JSON
@@ -23,7 +23,7 @@ onboarding/workspace commands throw).
 
 | Layer | Where |
 |---|---|
-| Rust plugin | `app/src-tauri/src/main.rs` — `tauri_plugin_mcp::init_with_config(...)` under `cfg(all(debug_assertions, desktop))`; socket from `DUCKTAPE_TAURI_MCP_SOCKET`, default `/tmp/tauri-mcp.sock` |
+| Rust plugin | `app/src-tauri/src/main.rs` — `tauri_plugin_mcp::init_with_config(...)` under `cfg(all(debug_assertions, desktop))`; socket from `DUCKTAPE_TAURI_MCP_SOCKET`, default `/tmp/ducktape-tauri-mcp.sock` |
 | Rust dep | `app/src-tauri/Cargo.toml` — `tauri-plugin-mcp` (git) |
 | Guest JS | `app/src/main.tsx` — `setupPluginListeners()` dynamically imported under `import.meta.env.DEV` (needed for the DOM/JS commands; screenshots work without it) |
 | npm dep | `app/package.json` (devDependencies) — `tauri-plugin-mcp` (guest binding only) |
@@ -64,8 +64,8 @@ To skip the slow `beforeDevCommand` (release `node-bin` build) on a smoke run,
 start vite yourself and pass a config override that nulls it:
 
 ```bash
-DUCKTAPE_TAURI_DEV_PORT=1420 bun run dev &        # vite on :1420 (strict)
-# tauri config override: {"build":{"beforeDevCommand":null,"devUrl":"http://localhost:1420"}}
+DUCKTAPE_TAURI_DEV_PORT=1430 bun run dev &        # vite on :1430 (strict)
+# tauri config override: {"build":{"beforeDevCommand":null,"devUrl":"http://localhost:1430"}}
 bunx tauri dev --config /tmp/no-before.json --no-dev-server-wait
 ```
 
@@ -98,7 +98,7 @@ looks wrong.
   by driving that daemon over `/v1/submit` — the app re-queries and re-renders on
   each finalized block, so a curl write shows up in the live window.
 - After Rust / `tauri.conf.json` changes, `tauri dev` rebuilds + restarts; the
-  socket drops and reappears — wait for a fresh `/tmp/tauri-mcp.sock` before
+  socket drops and reappears — wait for a fresh `/tmp/ducktape-tauri-mcp.sock` before
   re-driving. Frontend edits hot-reload, no restart.
 - **Teardown.** Kill the `tauri` CLI before the app (it respawns a crashed app),
   then the app, `Xvfb`, and the detached `ducktape-noded` (or `POST /v1/shutdown`).

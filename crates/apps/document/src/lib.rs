@@ -13,9 +13,23 @@
 //! the logical key is the `doc_id` string at the interface seam, but the qmdb
 //! key is `sha256(doc_id)` — a fixed 32-byte [`commonware_utils`] `Array`. this
 //! mirrors the kv module and is load-bearing: commonware's state-sync resolvers
-//! for the overwriteable variable db are bounded on `K: Array`. the cost is that
-//! the store commits to `hash(doc_id) -> doc` and cannot enumerate doc ids — a
-//! by-id document store never needs to.
+//! for the overwriteable variable db are bounded on `K: Array`. a hashed key
+//! commits to `hash(doc_id) -> doc` and so can't be walked to recover the doc
+//! ids themselves.
+//!
+//! ## enumeration via a reserved index entry
+//!
+//! to make the store BROWSABLE (a filesystem-like reader over `/`-delimited
+//! path ids) without breaking the fixed-width-key contract, one extra qmdb entry
+//! is reserved: a sentinel logical key [`DOC_INDEX_KEY`] whose value is the
+//! serialized SORTED set of every known `doc_id`. its qmdb key is still
+//! `sha256(sentinel)` — a 32-byte digest, indistinguishable in width from any
+//! doc slot — so it rides through state-sync exactly like a document. a real
+//! `doc_id` can never collide with the sentinel (it carries a leading NUL that
+//! the id slugger can't produce) and every doc op that names the sentinel is
+//! rejected. [`DocMsg::CreateDoc`] adds the id to the index (idempotent);
+//! [`DocQuery::ListDocs`] reads it back. block edits never touch the index —
+//! only doc creation grows it — so per-edit cost is unchanged.
 //!
 //! ## host-lent staging (mirrors the `kv` module)
 //!
@@ -67,6 +81,23 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 /// whole serialized operation (hashed key, varint length prefix, framing) — and
 /// the NEXT small edit to an at-cap doc — stays comfortably under 1 MiB.
 pub const MAX_DOC_LEN: usize = 768 * 1024;
+
+/// the reserved logical key under which the enumeration INDEX rides in the same
+/// qmdb. its value is a serialized sorted `Vec<String>` of every known `doc_id`.
+///
+/// the leading NUL makes it UNCOLLIDABLE with a real `doc_id`: the client id
+/// slugger emits only `[a-z0-9/-]`, and every doc op that names this key is
+/// rejected ([`DocError::ReservedDocId`]) before it can reach storage — so the
+/// index can never be clobbered by a document write, on any validator.
+///
+/// GROWTH BOUND: the index value is capped by [`MAX_DOC_LEN`] like any doc
+/// value (it stages through the same [`Document::stage`] guard). a `doc_id`
+/// costs its own bytes plus json framing (two quotes + a comma ≈ 3 bytes), so a
+/// 768 KiB index holds on the order of ten-thousand-plus ids before a
+/// `CreateDoc` starts failing with [`DocError::DocTooLarge`]. a store that needs
+/// more would shard the index across several sentinel keys — out of scope for
+/// the whole-doc-per-key MVP.
+const DOC_INDEX_KEY: &str = "\u{0}doc-index";
 
 /// the qmdb key: a fixed 32-byte sha256 digest of the `doc_id`. fixed width is
 /// what lets a store be state-synced (commonware's resolvers require `K: Array`).
@@ -160,6 +191,9 @@ enum DocError {
     /// a stored doc failed to decode. distinct from [`DocError::DocNotFound`]:
     /// corruption must surface loudly, never masquerade as an absent doc.
     DocCorrupt,
+    /// a doc op named the reserved [`DOC_INDEX_KEY`] sentinel. rejected so the
+    /// enumeration index can never be overwritten by a document write.
+    ReservedDocId,
 }
 
 impl core::fmt::Display for DocError {
@@ -171,6 +205,7 @@ impl core::fmt::Display for DocError {
             DocError::AnchorNotFound => "after-anchor not found",
             DocError::DocTooLarge => "doc too large",
             DocError::DocCorrupt => "stored doc is corrupt",
+            DocError::ReservedDocId => "reserved doc id",
         };
         f.write_str(s)
     }
@@ -245,24 +280,81 @@ where
         }
     }
 
-    /// stage a document's serialized blocks for this block WITHOUT committing.
-    /// visible to `get`/`load` at once; folded into qmdb (and `root()`) only when
-    /// the host calls `commit_block`. rejects a doc whose serialized form exceeds
-    /// [`MAX_DOC_LEN`] BEFORE staging, so a failed op leaves no overlay entry.
-    fn store(&mut self, doc_id: &str, blocks: &[Block]) -> Result<(), DocError> {
-        let bytes = serde_json::to_vec(blocks).expect("Vec<Block> is always serializable");
+    /// stage arbitrary serialized `bytes` under logical `key` for this block
+    /// WITHOUT committing. visible to `get`/`load` at once; folded into qmdb (and
+    /// `root()`) only when the host calls `commit_block`. rejects a value over
+    /// [`MAX_DOC_LEN`] BEFORE staging — the shared poison-pill guard for BOTH
+    /// whole-doc values and the enumeration index value (the codec bound is
+    /// decode-only, so an oversized value must never reach the panicking
+    /// commit/read paths).
+    fn stage(&mut self, key: &str, bytes: Vec<u8>) -> Result<(), DocError> {
         if bytes.len() > MAX_DOC_LEN {
             return Err(DocError::DocTooLarge);
         }
-        self.pending.insert(doc_id.as_bytes().to_vec(), bytes);
+        self.pending.insert(key.as_bytes().to_vec(), bytes);
+        Ok(())
+    }
+
+    /// stage a document's serialized blocks for this block. rejects a doc whose
+    /// serialized form exceeds [`MAX_DOC_LEN`] BEFORE staging, so a failed op
+    /// leaves no overlay entry.
+    fn store(&mut self, doc_id: &str, blocks: &[Block]) -> Result<(), DocError> {
+        let bytes = serde_json::to_vec(blocks).expect("Vec<Block> is always serializable");
+        self.stage(doc_id, bytes)
+    }
+
+    /// load the enumeration index — the sorted set of known `doc_id`s — through
+    /// the staged-over-committed overlay. an absent index (never written yet)
+    /// reads as the empty set. a decode failure is corruption, surfaced by the
+    /// caller, never masqueraded as "no docs".
+    async fn load_index(&self) -> Result<Vec<String>, Error> {
+        match self.get(DOC_INDEX_KEY.as_bytes()).await {
+            Some(b) => serde_json::from_slice(&b).map_err(|e| Error::Module(e.to_string())),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// add `doc_id` to the enumeration index if absent, re-staging it as a sorted
+    /// set. idempotent: re-creating a known id restages an IDENTICAL value (a
+    /// benign no-op write). the SORT makes the serialized bytes canonical, so
+    /// every validator commits the same index bytes and lands on the same qmdb
+    /// root. capped by [`MAX_DOC_LEN`] through [`Document::stage`] (see the
+    /// growth bound on [`DOC_INDEX_KEY`]).
+    async fn index_add(&mut self, doc_id: &str) -> Result<(), DocError> {
+        let mut ids = self.load_index().await.map_err(to_doc_err)?;
+        if !ids.iter().any(|id| id == doc_id) {
+            ids.push(doc_id.to_string());
+            ids.sort();
+            let bytes = serde_json::to_vec(&ids).expect("Vec<String> is always serializable");
+            self.stage(DOC_INDEX_KEY, bytes)?;
+        }
         Ok(())
     }
 
     /// apply one decoded [`DocMsg`] to the staged overlay. pure list surgery over
     /// the loaded `Vec<Block>`, re-staged on success. errors abort the block.
     async fn apply(&mut self, msg: DocMsg) -> Result<(), DocError> {
+        // every op carries a doc_id; none may target the reserved index sentinel.
+        // reject deterministically on every validator BEFORE any storage touch,
+        // so a document write can never clobber the enumeration index.
+        let doc_id = match &msg {
+            DocMsg::CreateDoc { doc_id }
+            | DocMsg::InsertBlock { doc_id, .. }
+            | DocMsg::UpdateBlock { doc_id, .. }
+            | DocMsg::RemoveBlock { doc_id, .. }
+            | DocMsg::MoveBlock { doc_id, .. } => doc_id,
+        };
+        if doc_id == DOC_INDEX_KEY {
+            return Err(DocError::ReservedDocId);
+        }
+
         match msg {
             DocMsg::CreateDoc { doc_id } => {
+                // record the id in the enumeration index (idempotent) so the doc
+                // becomes browsable. block ops require CreateDoc first, so every
+                // doc that can hold blocks is already indexed by the time they run
+                // — the index only ever grows on creation, never on an edit.
+                self.index_add(&doc_id).await?;
                 // idempotent: only seed an empty doc if absent. an empty doc is a
                 // stored `[]`; ABSENT is `None` — that distinction is why CreateDoc
                 // is its own op and why block ops require it first.
@@ -484,6 +576,11 @@ where
                     .and_then(|d| d.into_iter().find(|b| b.id == block_id));
                 Ok(encode_reply(&DocReply::Block(block)))
             }
+            DocQuery::ListDocs => {
+                // served straight from the reserved index entry — the sorted set
+                // of every known doc_id. absent index reads as an empty list.
+                Ok(encode_reply(&DocReply::DocList(self.load_index().await?)))
+            }
         }
     }
 
@@ -592,6 +689,14 @@ mod tests {
         match decode_reply(&reply).unwrap() {
             DocReply::Doc(v) => v,
             _ => panic!("expected Doc"),
+        }
+    }
+
+    async fn list_docs<E: Context + BufferPooler>(d: &Document<E>) -> Vec<String> {
+        let reply = d.query(&encode_query(&DocQuery::ListDocs)).await.unwrap();
+        match decode_reply(&reply).unwrap() {
+            DocReply::DocList(ids) => ids,
+            _ => panic!("expected DocList"),
         }
     }
 
@@ -1140,6 +1245,136 @@ mod tests {
             let doc = get_doc(&d, "doc1").await.unwrap();
             assert_eq!(doc.len(), 1);
             assert_eq!(doc[0].id, "b1");
+        });
+    }
+
+    // enumeration: ListDocs starts empty, then reflects every CreateDoc, sorted
+    // and deduplicated. this is the browsable-store property the index adds.
+    #[test]
+    fn list_docs_enumerates_created_docs_sorted() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            assert!(list_docs(&d).await.is_empty(), "a fresh store lists nothing");
+
+            // create out of order; the index must come back sorted.
+            for id in ["projects/retro", "notes", "projects/launch-plan"] {
+                apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: id.into() }).await;
+            }
+            assert_eq!(
+                list_docs(&d).await,
+                ["notes", "projects/launch-plan", "projects/retro"],
+                "ListDocs is the sorted set of known doc ids"
+            );
+
+            // re-creating a known id is idempotent — no duplicate entry.
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "notes".into(),
+                },
+            )
+            .await;
+            assert_eq!(
+                list_docs(&d).await,
+                ["notes", "projects/launch-plan", "projects/retro"],
+                "re-creating a doc must not duplicate its index entry"
+            );
+        });
+    }
+
+    // block edits (insert/update/remove/move) must NOT touch the index — only
+    // CreateDoc grows it. the index stays exactly the set of created docs.
+    #[test]
+    fn block_edits_leave_the_index_untouched() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            for op in [
+                DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "one"),
+                },
+                DocMsg::UpdateBlock {
+                    doc_id: "doc1".into(),
+                    block_id: "b1".into(),
+                    text: "two".into(),
+                },
+                DocMsg::RemoveBlock {
+                    doc_id: "doc1".into(),
+                    block_id: "b1".into(),
+                },
+            ] {
+                apply_commit(&mut d, &op).await;
+            }
+            assert_eq!(
+                list_docs(&d).await,
+                ["doc1"],
+                "block edits must not add or drop index entries"
+            );
+        });
+    }
+
+    // the reserved sentinel is UNREACHABLE by any doc op: a CreateDoc (or block
+    // op) that names it is rejected, so a document write can never overwrite the
+    // enumeration index. the rejected op stages nothing and moves no root.
+    #[test]
+    fn reserved_index_id_is_rejected() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "real".into(),
+                },
+            )
+            .await;
+            let r_before = d.root();
+
+            let err = d
+                .execute(
+                    &mut TestCtx::new(),
+                    &msg(&DocMsg::CreateDoc {
+                        doc_id: DOC_INDEX_KEY.into(),
+                    }),
+                )
+                .await
+                .expect_err("a doc op on the reserved id must be rejected");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("reserved doc id")),
+                "unexpected error: {err:?}"
+            );
+            assert!(d.pending.is_empty(), "a rejected op must stage nothing");
+            d.abort_block().await.unwrap();
+
+            assert_eq!(d.root(), r_before, "a rejected op must not move the root");
+            // the index is intact — still exactly the real doc.
+            assert_eq!(list_docs(&d).await, ["real"]);
+        });
+    }
+
+    // the index is committed state: a write that adds a doc to the index MOVES
+    // the qmdb root, and the whole index survives a re-open (it IS qmdb state).
+    #[test]
+    fn create_moves_root_via_the_index() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            let r0 = d.root();
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            assert_ne!(r0, d.root(), "creating a doc (index + empty doc) moves root");
+            assert_eq!(list_docs(&d).await, ["doc1"]);
         });
     }
 }

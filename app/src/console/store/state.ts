@@ -1,18 +1,39 @@
 // Console state — a client-side projection of the node's committed state
-// (channels/messages/tasks/status re-queried per block) plus local ui state
-// (screen, accent, author identity, thread panel).
+// (channels/messages/tasks/status re-queried per block) plus the global ui
+// state that must survive screen boundaries (screen, accent, author identity,
+// thread panel).
 
 import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client";
+import type { Rule } from "../../domain/automations-client";
 import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
 import type { Block } from "../../domain/document-client";
+import type { Manifest } from "../../domain/files-client";
+import type { ProposalView } from "../../domain/governance-client";
+import type { Notification } from "../../domain/inbox-client";
+import type { BoardCounts, Job } from "../../domain/jobs-client";
+import type {
+  FileStat,
+  Generation,
+  GrepHit,
+  LsEntry,
+} from "../../domain/memory-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
+/** The two sidebar partitions the view-mode toggle switches between: the
+ *  participant "user" apps and the "operator" node/network surfaces. Neither
+ *  side confers authority — it is purely which surfaces the rail shows. */
+export type ViewMode = "user" | "operator";
+
 // ── State shape ─────────────────────────────────────────
 
 export interface ConsoleState {
+  // ── Session / node core ──
   screen: string;
+  /** Which sidebar rail is shown. Persisted across sessions (see loadViewMode).
+   *  Kept in sync with `screen`: navigating to a surface adopts its section. */
+  viewMode: ViewMode;
   accent: string;
   author: string;
   /** The node answered the last status query. */
@@ -22,6 +43,8 @@ export interface ConsoleState {
   /** True when this app owns the daemon lifecycle (desktop build). */
   managed: boolean;
   status: NodeStatus | null;
+
+  // ── Chat ──
   channels: Channel[];
   activeChannel: string | null;
   /** Messages of the active channel only (all sequences; views filter). */
@@ -30,27 +53,72 @@ export interface ConsoleState {
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
    *  into author rendering so messages show chosen names, not hex handles. */
   authorNames: Record<string, string>;
+
+  // ── Tasks ──
   tasks: Task[];
+
+  // ── Members / validator roster ──
+  /** Hex-encoded validator public keys from the `valset` module. */
+  members: string[];
+
+  // ── Governance ──
+  /** Every proposal from the `governance` module, sorted by id. Re-queried per
+   *  block like the roster; empty when the node exposes no governance surface. */
+  proposals: ProposalView[];
+
+  // ── Forge ──
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
 
-  // ── Documents (block store; see document-client) ──
-  /** Known doc-ids — a client-side registry, since the document module has no
-   *  "list docs" query (its store is keyed by sha256(doc_id) and can't
-   *  enumerate). Persisted per node url by the provider. */
+  // ── Documents ──
+  /** Every known doc id, enumerated from the document module's index
+   *  (ListDocs) and re-queried per block. These are "/"-delimited PATHS; the
+   *  view derives a folder tree from them. */
   docIds: string[];
   /** The doc whose blocks are loaded, or null when none is open. */
   activeDoc: string | null;
   /** Ordered blocks of the active doc (re-queried per block / on open). */
   activeDocBlocks: Block[];
 
-  // ── Agents (collaboration loop; see agent-client) ──
+  // ── Agents ──
   /** Every registered agent, re-queried per block like tasks. */
   agents: AgentRecord[];
   /** Every channel watch and its turn policy. */
   watches: WatchView[];
   /** Recent runs across all channels, newest-first for the timeline. */
   runs: RunView[];
+
+  // ── Inbox ──
+  /** This member's notification queue (List for the local author identity),
+   *  ascending by seq, re-queried per block. */
+  inbox: Notification[];
+  /** Unread count for the local member — feeds the nav badge. */
+  inboxUnread: number;
+
+  // ── Jobs (consensus work board) ──
+  /** Every job on the board, re-queried per block. */
+  jobs: Job[];
+  /** Per-status census of the board, or null when the module is absent. */
+  jobCounts: BoardCounts | null;
+
+  // ── Automations (event-triggered rules) ──
+  /** Every rule, re-queried per block; empty when the module is absent. */
+  rules: Rule[];
+
+  // ── Memory (agent filesystem workspace) ──
+  /** The directory being browsed (canonical absolute path; "/" is the root). */
+  memoryPath: string;
+  /** Entries directly under `memoryPath` (child dirs + files), re-queried per
+   *  block like the doc index. */
+  memoryEntries: LsEntry[];
+  /** The file opened in the viewer (its stat + a loaded generation), or null. */
+  memoryOpen: { stat: FileStat; generation: Generation } | null;
+  /** Active grep hits, or null when no search is running. */
+  memoryMatches: GrepHit[] | null;
+
+  // ── Files (content-addressed manifests) ──
+  /** Every file manifest (List, prefix ""), re-queried per block. */
+  files: Manifest[];
 
   /** Recent per-block node telemetry, oldest-first (the view renders newest
    *  first). Node-local observability — never re-queried from committed state;
@@ -59,7 +127,7 @@ export interface ConsoleState {
 
   error: string | null;
 
-  // ── Workspaces / onboarding (desktop only; inert on web) ──
+  // ── Workspace / onboarding ──
   /** Every registered workspace, for the switcher. Empty on web. */
   workspaces: Workspace[];
   /** The active workspace whose node we talk to. Null on web / pre-onboarding. */
@@ -77,35 +145,131 @@ export interface ConsoleState {
 
 export const DEFAULT_ACCENT = "#a05a3c";
 
-export const createInitialState = (): ConsoleState => ({
-  screen: "chat",
-  accent: DEFAULT_ACCENT,
-  author: "operator",
-  connected: false,
-  nodeUrl: null,
-  managed: false,
-  status: null,
-  channels: [],
-  activeChannel: null,
-  messages: [],
-  activeThread: null,
-  authorNames: {},
-  tasks: [],
-  forgeHead: null,
-  docIds: [],
-  activeDoc: null,
-  activeDocBlocks: [],
-  agents: [],
-  watches: [],
-  runs: [],
-  telemetry: [],
-  error: null,
-  workspaces: [],
-  workspace: null,
-  needsOnboarding: false,
-  onboardingBusy: false,
-  onboardingPhase: null,
-  inviteBlob: null,
+// ── View-mode persistence ───────────────────────────────
+//
+// The chosen rail survives restarts. The screen itself is NOT persisted, so on
+// boot we land on the persisted rail's default surface. These two ids duplicate
+// the registry's first-in-section screens (chat / members) rather than import
+// the registry into this low-level state module, keeping the store free of the
+// views graph.
+const VIEW_MODE_KEY = "ducktape.viewMode";
+export const DEFAULT_USER_SCREEN = "chat";
+export const DEFAULT_OPERATOR_SCREEN = "members";
+
+export const loadViewMode = (): ViewMode => {
+  try {
+    return localStorage.getItem(VIEW_MODE_KEY) === "operator" ? "operator" : "user";
+  } catch {
+    return "user"; // storage unavailable (private mode / quota) — default rail
+  }
+};
+
+export const saveViewMode = (mode: ViewMode): void => {
+  try {
+    localStorage.setItem(VIEW_MODE_KEY, mode);
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+export const createInitialState = (): ConsoleState => {
+  const viewMode = loadViewMode();
+  return {
+    screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
+    viewMode,
+    accent: DEFAULT_ACCENT,
+    author: "operator",
+    connected: false,
+    nodeUrl: null,
+    managed: false,
+    status: null,
+    channels: [],
+    activeChannel: null,
+    messages: [],
+    activeThread: null,
+    authorNames: {},
+    tasks: [],
+    members: [],
+    proposals: [],
+    forgeHead: null,
+    docIds: [],
+    activeDoc: null,
+    activeDocBlocks: [],
+    agents: [],
+    watches: [],
+    runs: [],
+    inbox: [],
+    inboxUnread: 0,
+    jobs: [],
+    jobCounts: null,
+    rules: [],
+    memoryPath: "/",
+    memoryEntries: [],
+    memoryOpen: null,
+    memoryMatches: null,
+    files: [],
+    telemetry: [],
+    error: null,
+    workspaces: [],
+    workspace: null,
+    needsOnboarding: false,
+    onboardingBusy: false,
+    onboardingPhase: null,
+    inviteBlob: null,
+  };
+};
+
+export interface ConsoleSnapshot {
+  connected: boolean;
+  status: NodeStatus | null;
+  channels: Channel[];
+  tasks: Task[];
+  members: string[];
+  proposals: ProposalView[];
+  forgeHead: string | null;
+  activeChannel: string | null;
+  messages: MessageView[];
+  authorNames: Record<string, string>;
+  docIds: string[];
+  activeDocBlocks: Block[];
+  agents: AgentRecord[];
+  watches: WatchView[];
+  runs: RunView[];
+  inbox: Notification[];
+  inboxUnread: number;
+  jobs: Job[];
+  jobCounts: BoardCounts | null;
+  rules: Rule[];
+  memoryEntries: LsEntry[];
+  files: Manifest[];
+}
+
+/** Project a committed node snapshot onto store data fields. Global UI,
+ *  workspace/onboarding, and error state are intentionally left untouched.
+ *  `docIds` now comes from the node's enumeration index, so it IS projected. */
+export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> => ({
+  connected: snapshot.connected,
+  status: snapshot.status,
+  channels: snapshot.channels,
+  tasks: snapshot.tasks,
+  members: snapshot.members,
+  proposals: snapshot.proposals,
+  forgeHead: snapshot.forgeHead,
+  activeChannel: snapshot.activeChannel,
+  messages: snapshot.messages,
+  authorNames: snapshot.authorNames,
+  docIds: snapshot.docIds,
+  activeDocBlocks: snapshot.activeDocBlocks,
+  agents: snapshot.agents,
+  watches: snapshot.watches,
+  runs: snapshot.runs,
+  inbox: snapshot.inbox,
+  inboxUnread: snapshot.inboxUnread,
+  jobs: snapshot.jobs,
+  jobCounts: snapshot.jobCounts,
+  rules: snapshot.rules,
+  memoryEntries: snapshot.memoryEntries,
+  files: snapshot.files,
 });
 
 // ── Pure helpers ────────────────────────────────────────
@@ -118,15 +282,23 @@ export const channelIdOf = (name: string): string =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
 
-/** A doc id from user input (new-doc or open-by-id): lowercase, dash-separated,
- *  wire-safe. Slugging both entry points keeps "My Notes" and "my-notes" the
- *  same document, mirroring channelIdOf. */
+/** A doc id from user input: a "/"-delimited PATH where each segment is slugged
+ *  (lowercase, dash-separated, wire-safe) and empty segments are dropped. So
+ *  "Projects / Launch Plan" and "projects/launch-plan" name the same document,
+ *  and the leading/trailing slashes never survive. Path structure is what the
+ *  view turns into a folder tree. */
 export const docIdOf = (raw: string): string =>
   raw
     .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "");
+    .split("/")
+    .map((segment) =>
+      segment
+        .trim()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, ""),
+    )
+    .filter((segment) => segment.length > 0)
+    .join("/");
 
 /** The task lifecycle is a one-way lane; Done stays Done. */
 export const nextTaskStatus = (status: TaskStatus): TaskStatus => {

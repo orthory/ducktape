@@ -37,8 +37,8 @@ use inbox::Inbox;
 use jobs::Jobs;
 use memory::Memory;
 use noded::{
-    BlockSummary, DispatchInfo, ModuleStatus, NodeCommand, NodeHandle, NodeStatus, TelemetryEvent,
-    TelemetryFrame, TelemetryRing, WsFrame, hex_root,
+    BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus,
+    TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame, hex_root,
 };
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
@@ -314,6 +314,7 @@ fn run_node(
                                 .module_root(id)
                                 .map(|root| hex_root(&root))
                                 .unwrap_or_default(),
+                            category: ModuleCategory::of(id),
                         })
                         .collect();
                     let _ = reply.send(NodeStatus {

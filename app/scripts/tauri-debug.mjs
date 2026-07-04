@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Self-contained driver for the live Ducktape window. Talks DIRECTLY to the Rust
- * plugin's Unix socket (/tmp/tauri-mcp.sock by default, or
+ * plugin's Unix socket (/tmp/ducktape-tauri-mcp.sock by default, or
  * DUCKTAPE_TAURI_MCP_SOCKET for worktree dev runs) with its newline-delimited JSON
  * protocol — NO tauri-plugin-mcp-server, no MCP layer, no npm dependency beyond
  * node's built-in `net`. The Rust `tauri-plugin-mcp` plugin (src-tauri, dev-only)
@@ -30,7 +30,7 @@ import { writeFileSync, existsSync, statSync, rmSync } from "node:fs";
 
 const SOCKET =
   process.env.DUCKTAPE_TAURI_MCP_SOCKET ||
-  (os.platform() === "win32" ? "\\\\.\\pipe\\tmp\\tauri-mcp.sock" : "/tmp/tauri-mcp.sock");
+  (os.platform() === "win32" ? "\\\\.\\pipe\\tmp\\ducktape-tauri-mcp.sock" : "/tmp/ducktape-tauri-mcp.sock");
 
 const USAGE = `tauri-debug — drive the live Ducktape window over its Unix socket (no MCP, no deps)
   node scripts/tauri-debug.mjs eval "<js>"
