@@ -19,7 +19,10 @@ import {
   type RepoInfo,
   type TreeEntry,
 } from "../../../domain/forge-git-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 
@@ -262,7 +265,7 @@ export function ForgeView() {
   return (
     <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", background: color.paper }}>
       {!desktop ? (
-        <WebFallback head={state.forgeHead} />
+        <WebFallback head={state.forgeHead} op={state.ops[opKey.forgeHead()]} />
       ) : selectedRepoId ? (
         selectedRepo ? (
           <RepoListing
@@ -1034,7 +1037,7 @@ function RepoUnavailable() {
   );
 }
 
-function WebFallback({ head }: { head: string | null }) {
+function WebFallback({ head, op }: { head: string | null; op: OpRecord | undefined }) {
   return (
     <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "22px 26px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -1073,7 +1076,7 @@ function WebFallback({ head }: { head: string | null }) {
             only available through the desktop Tauri reader.
           </div>
           <div style={{ marginTop: 13 }}>
-            <HeadCard head={head} />
+            <HeadCard head={head} op={op} />
           </div>
         </div>
       </div>
@@ -1081,7 +1084,7 @@ function WebFallback({ head }: { head: string | null }) {
   );
 }
 
-function HeadCard({ head }: { head: string | null }) {
+function HeadCard({ head, op }: { head: string | null; op: OpRecord | undefined }) {
   return (
     <div
       title={head ?? "unborn repo"}
@@ -1096,7 +1099,10 @@ function HeadCard({ head }: { head: string | null }) {
         fontStyle: head ? "normal" : "italic",
       }}
     >
-      {head ?? "no commits yet"}
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 6, maxWidth: "100%" }}>
+        {head ?? "no commits yet"}
+        <FinalizationMark op={op} />
+      </span>
     </div>
   );
 }

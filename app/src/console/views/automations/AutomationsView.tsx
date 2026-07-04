@@ -13,7 +13,10 @@ import type {
   Trigger,
   TriggerKind,
 } from "../../../domain/automations-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 import { Toggle } from "../settings/Toggle";
@@ -503,11 +506,14 @@ function RuleBuilder({ backed }: { backed: boolean }) {
 function RuleRow({
   rule,
   disabled,
+  op,
   onToggle,
   onDelete,
 }: {
   rule: Rule;
   disabled: boolean;
+  /** The rule's finalization record — the meta line draws the inline mark. */
+  op: OpRecord | undefined;
   onToggle: (enabled: boolean) => void;
   onDelete: () => void;
 }) {
@@ -551,7 +557,10 @@ function RuleRow({
             whiteSpace: "nowrap",
           }}
         >
-          fired {rule.fire_count}× · {shortId(rule.rule_id)}
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            fired {rule.fire_count}× · {shortId(rule.rule_id)}
+            <FinalizationMark op={op} />
+          </span>
         </div>
       </div>
 
@@ -762,6 +771,7 @@ export function AutomationsView() {
                 key={rule.rule_id}
                 rule={rule}
                 disabled={!backed}
+                op={state.ops[opKey.rule(rule.rule_id)]}
                 onToggle={(enabled) => actions.setRuleEnabled(rule.rule_id, enabled)}
                 onDelete={() => actions.deleteRule(rule.rule_id)}
               />

@@ -5,6 +5,8 @@
 import { useState, type CSSProperties, type ReactNode } from "react";
 
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
+import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { Toggle } from "./Toggle";
@@ -373,6 +375,7 @@ function IdentityCard() {
           >
             {role.tier}
           </span>
+          <FinalizationMark op={state.ops[opKey.profile()]} />
         </div>
         <div style={{ ...smallMono, marginTop: 3 }} title={keyLine}>
           {keyLine}

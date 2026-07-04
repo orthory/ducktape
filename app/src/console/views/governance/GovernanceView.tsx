@@ -8,7 +8,10 @@
 
 import { useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpRecord } from "../../store/finalization";
 import {
   actionKeyHex,
   actionLabel,
@@ -286,11 +289,15 @@ function TallyBar({ proposal }: { proposal: ProposalVM }) {
 
 function ProposalCard({
   proposal,
+  op,
   canVote,
   onVote,
   onExecute,
 }: {
   proposal: ProposalVM;
+  /** The proposal row's finalization record — propose, this node's ballots,
+   *  and settles all key here, so the row shows its latest write's state. */
+  op: OpRecord | undefined;
   canVote: boolean;
   onVote: (approve: boolean) => void;
   onExecute: () => void;
@@ -343,6 +350,7 @@ function ProposalCard({
           <span style={{ color: color.muted3 }}>· this node</span>
         ) : null}
         <span title={proposal.id}>· {shortKey(proposal.id)}</span>
+        <FinalizationMark op={op} />
       </div>
 
       <TallyBar proposal={proposal} />
@@ -626,6 +634,7 @@ export function GovernanceView() {
               <ProposalCard
                 key={proposal.id}
                 proposal={proposal}
+                op={state.ops[opKey.proposal(proposal.id)]}
                 canVote={canVote}
                 onVote={(approve) => actions.voteProposal(proposal.id, approve)}
                 onExecute={() => actions.executeProposal(proposal.id)}

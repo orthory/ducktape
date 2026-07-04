@@ -7,6 +7,8 @@ import type { RefObject, UIEventHandler } from "react";
 
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames, MessageView } from "../../../domain/chat-client";
+import { opForMessage } from "../../store/finalization";
+import type { OpLedger } from "../../store/finalization";
 import { buildStreamRows } from "./chat-helpers";
 import { MessageItem } from "./MessageItem";
 import { color, font } from "../../theme/tokens";
@@ -25,6 +27,7 @@ export function MessageList({
   channelName,
   messages,
   names,
+  ops,
   selfKey,
   workspaceId,
   hoverMsg,
@@ -44,6 +47,8 @@ export function MessageList({
    *  up a thread's last-reply author for the inline pill's "· name" hint. */
   messages: MessageView[];
   names: AuthorNames;
+  /** The store's finalization ledger — each row draws its own inline mark. */
+  ops: OpLedger;
   selfKey: string;
   workspaceId: string | null;
   hoverMsg: number | null;
@@ -111,6 +116,7 @@ export function MessageList({
                 onReact={(emoji) => onReact(message.seq, emoji)}
                 onEdit={(text) => onEdit(message.seq, text)}
                 onDelete={() => onDelete(message.seq)}
+                op={opForMessage(ops, message)}
               />
             </div>
           );

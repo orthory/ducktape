@@ -10,7 +10,10 @@ import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type { FileStat, Generation, GrepHit, LsEntry } from "../../../domain/memory-client";
 import { isDir } from "../../../domain/memory-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpLedger, OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -120,6 +123,7 @@ function EntryRow({
   badge,
   ariaLabel,
   active,
+  op,
   onClick,
 }: {
   icon: "folder" | "document";
@@ -127,6 +131,8 @@ function EntryRow({
   badge?: string;
   ariaLabel: string;
   active?: boolean;
+  /** A file row's finalization record (publishes key by path). */
+  op?: OpRecord;
   onClick: () => void;
 }) {
   return (
@@ -173,6 +179,7 @@ function EntryRow({
           {badge}
         </span>
       ) : null}
+      <FinalizationMark op={op} />
     </button>
   );
 }
@@ -241,6 +248,7 @@ function Rail({
   entries,
   matches,
   openPath,
+  ops,
   onBrowse,
   onOpen,
   onOpenHit,
@@ -252,6 +260,8 @@ function Rail({
   entries: LsEntry[];
   matches: GrepHit[] | null;
   openPath: string | null;
+  /** The store's finalization ledger — file rows draw their marks. */
+  ops: OpLedger;
   onBrowse: (path: string) => void;
   onOpen: (path: string) => void;
   onOpenHit: (hit: GrepHit) => void;
@@ -590,6 +600,7 @@ function Rail({
                 badge={`g${entry.File.latest_generation}`}
                 ariaLabel={`Open ${entry.File.path}`}
                 active={openPath === entry.File.path}
+                op={ops[opKey.memory(entry.File.path)]}
                 onClick={() => onOpen(entry.File.path)}
               />
             ))}
@@ -619,11 +630,14 @@ function Rail({
 
 function OpenFilePane({
   open,
+  op,
   onPublish,
   onDelete,
   onClose,
 }: {
   open: { stat: FileStat; generation: Generation };
+  /** The open path's finalization record — the meta line draws the mark. */
+  op: OpRecord | undefined;
   onPublish: (text: string) => void;
   onDelete: () => void;
   onClose: () => void;
@@ -695,6 +709,7 @@ function OpenFilePane({
               </span>
               <span style={{ width: 3, height: 3, borderRadius: "50%", background: color.chip }} />
               <span>h{generation.published_at_height}</span>
+              <FinalizationMark op={op} />
             </div>
           </div>
           <button
@@ -1049,6 +1064,7 @@ export function MemoryView() {
             entries={state.memoryEntries}
             matches={state.memoryMatches}
             openPath={state.memoryOpen?.stat.path ?? null}
+            ops={state.ops}
             onBrowse={browse}
             onOpen={openFile}
             onOpenHit={openHit}
@@ -1107,6 +1123,7 @@ export function MemoryView() {
                 <OpenFilePane
                   key={`${state.memoryOpen.stat.path}@${state.memoryOpen.generation.generation}`}
                   open={state.memoryOpen}
+                  op={state.ops[opKey.memory(state.memoryOpen.stat.path)]}
                   onPublish={(text) =>
                     actions.publishMemory({ path: state.memoryOpen!.stat.path, text })
                   }

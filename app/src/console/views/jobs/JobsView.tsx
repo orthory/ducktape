@@ -9,7 +9,10 @@ import type { CSSProperties, FormEvent } from "react";
 
 import type { BoardCounts, Job, JobStatus } from "../../../domain/jobs-client";
 import { isTerminal } from "../../../domain/jobs-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -212,6 +215,7 @@ function ActionButton({
 
 function JobCard({
   job,
+  op,
   onClaim,
   onFinalize,
   onRelease,
@@ -220,6 +224,8 @@ function JobCard({
   onPrune,
 }: {
   job: Job;
+  /** The job's finalization record — the meta line draws the inline mark. */
+  op: OpRecord | undefined;
   onClaim: (jobId: string, leaseViews: number) => void;
   onFinalize: (jobId: string, ok: boolean, payload: string) => void;
   onRelease: (jobId: string) => void;
@@ -265,8 +271,11 @@ function JobCard({
           whiteSpace: "nowrap",
         }}
       >
-        #{shortId(job.job_id)} · from {shortId(job.submitter)} · attempt {job.attempt} · h
-        {job.created_at_height}
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          #{shortId(job.job_id)} · from {shortId(job.submitter)} · attempt {job.attempt} · h
+          {job.created_at_height}
+          <FinalizationMark op={op} />
+        </span>
       </div>
 
       <div
@@ -598,6 +607,7 @@ export function JobsView() {
               <JobCard
                 key={job.job_id}
                 job={job}
+                op={state.ops[opKey.job(job.job_id)]}
                 onClaim={(jobId, leaseViews) => actions.claimJob({ jobId, leaseViews })}
                 onFinalize={(jobId, ok, payload) => actions.finalizeJob({ jobId, ok, payload })}
                 onRelease={(jobId) => actions.releaseJob(jobId)}
