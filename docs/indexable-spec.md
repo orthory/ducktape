@@ -146,3 +146,30 @@ The first shipped mappers and why they exist:
   observable.
 - Durability is `SyncMode::Periodic` (bounded loss window, torn tails
   truncate on recovery) — correct for a tier whose worst case is a rebuild.
+
+## 7. State-sync (the next slice — design fixed, implementation pending)
+
+A joiner state-syncs **state**, not op history, so the fold has nothing to
+consume — and a synced node with empty views renders its modules poorly. The
+index must come together with the sync. Two lanes, in preference order:
+
+1. **State backfill (the contract extension).** The mapper trait grows an
+   optional `rebuild_from_state`: after canonical state installs and verifies
+   at a boundary, each mapper re-derives its rows from its module's committed
+   state (the same read surface `Module::query`/`serve_sync` already exposes),
+   stamped at the boundary height. This keeps the derivation local and rooted
+   in *verified* state, works identically for a wiped index on a live node,
+   and stays per-module: a mapper that can rebuild from state declares it; one
+   that cannot (chat's per-height rows lose their original heights) documents
+   the degradation — rows backfill at the boundary height, op history starts
+   there.
+2. **Index checkpoint shipping (the optimization).** fluent31 checkpoints are
+   complete database directories; a source node can ship them alongside
+   state-sync for instant warm views. Contents are NOT root-verifiable (the
+   derived tier has no root by design), so this lane trusts the serving node
+   and must stay optional — a verifying joiner backfills via lane 1 and
+   compares nothing.
+
+Until that slice ships: a state-synced node serves empty views (canonical
+queries still answer everything they answered before this tier existed), and
+`GET /v1/index/status` makes the gap visible rather than papered over.
