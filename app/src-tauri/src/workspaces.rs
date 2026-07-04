@@ -498,6 +498,28 @@ pub fn workspace_admit(app: tauri::AppHandle, id: String, pubkey: String) -> Res
     .map(|_| ())
 }
 
+/// remove a validator by pubkey: drive the governance RemoveValidator through
+/// THIS running member node's local rpc. the removal counterpart of
+/// [`workspace_admit`] — it opens a removal proposal and casts this node's
+/// yes-ballot; the change only takes effect once a strict majority of members
+/// approve, and the removed node drops out at the next epoch cutover.
+#[tauri::command]
+pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
+    let pubkey = pubkey.trim().to_string();
+    if pubkey.is_empty() {
+        return Err("provide the validator's public key to remove".into());
+    }
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
+    run_verb(
+        &node_bin,
+        &["member-remove", &pubkey, "--config", &cfg.to_string_lossy()],
+    )
+    .map(|_| ())
+}
+
 /// make `id` active and ensure its node is running; return the http url the
 /// webview should dial. adopts an already-listening node (idempotent across
 /// re-selects and the promotion exec-reboot) instead of double-spawning.

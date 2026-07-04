@@ -26,6 +26,7 @@ fn main() {
             workspaces::workspace_join,
             workspaces::workspace_invite_blob,
             workspaces::workspace_admit,
+            workspaces::workspace_demote,
             workspaces::workspace_select,
             workspaces::workspace_phase,
             forge_git::forge_head,
