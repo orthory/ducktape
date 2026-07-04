@@ -42,6 +42,18 @@ impl SimNat {
         }
     }
 
+    /// Model a NAT rebinding: the device drops its current mappings and holes
+    /// (lease expiry, reboot, or mapping timeout). The next outbound datagram
+    /// from an internal socket allocates a FRESH public port — `next_port` never
+    /// rewinds, so the new reflexive is guaranteed distinct — and the old
+    /// mapping admits nobody, so a peer still aimed at the stale reflexive fails.
+    /// This is the trigger for STUN re-run + higher-nonce re-advertisement.
+    pub fn rebind(&mut self) {
+        self.cone.clear();
+        self.sym.clear();
+        self.holes.clear();
+    }
+
     fn alloc_port(&mut self) -> u16 {
         let port = self.next_port;
         self.next_port = self.next_port.wrapping_add(1).max(1024);
@@ -110,6 +122,37 @@ mod tests {
         assert!(!nat.allow_inbound(mapped, peer), "unsolicited inbound is dropped");
         let _ = nat.send(internal, peer); // now punch toward peer
         assert!(nat.allow_inbound(mapped, peer), "hole toward peer now open");
+    }
+
+    #[test]
+    fn rebind_moves_the_reflexive_and_invalidates_the_old_mapping() {
+        let mut nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let internal = a([192, 168, 1, 5], 51820);
+        let peer = a([198, 51, 100, 2], 51820);
+
+        let old = nat.send(internal, a([192, 0, 2, 1], 3478)); // reflexive toward coordinator
+        let _ = nat.send(internal, peer); // punch a hole toward the peer
+        assert!(nat.allow_inbound(old, peer), "hole toward peer is open pre-rebind");
+
+        // The NAT rebinds: mapping + holes are dropped.
+        nat.rebind();
+
+        // The next STUN send yields a DIFFERENT reflexive (the stale mapping is
+        // superseded), and the old mapping admits nobody anymore.
+        let new = nat.send(internal, a([192, 0, 2, 1], 3478));
+        assert_ne!(old, new, "rebind must move the reflexive to a fresh port");
+        assert!(!nat.allow_inbound(old, peer), "the old mapping no longer admits the peer");
+    }
+
+    #[test]
+    fn rebind_moves_the_reflexive_for_symmetric_too() {
+        let mut nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let internal = a([192, 168, 1, 5], 51820);
+        let coord = a([192, 0, 2, 1], 3478);
+        let old = nat.send(internal, coord);
+        nat.rebind();
+        let new = nat.send(internal, coord);
+        assert_ne!(old, new, "symmetric rebind also moves the coordinator-facing mapping");
     }
 
     #[test]
