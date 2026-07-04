@@ -1,6 +1,6 @@
 //! the network state-sync property at the crate level: a joiner rebuilds a
 //! REAL qmdb-backed module purely through the wire protocol — manifest fetch,
-//! live target fetch, proof-carrying op-range fetches through the remote
+//! manifest-pinned target adoption, proof-carrying op-range fetches through the remote
 //! resolver — and lands on the source's exact root, with byzantine responses
 //! rejected by verification rather than trust.
 //!
@@ -13,15 +13,15 @@ use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};
 use host::{FinalizedBlock, Host};
 use kv::Kv;
-use kv_interface::{encode as kv_encode, KvMsg};
+use kv_interface::{KvMsg, encode as kv_encode};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use statesync::qmdb::RemoteQmdbResolver;
 use statesync::{
-    decode_response, encode_request, fetch_manifest, fetch_snapshot, PayloadKind, SyncClient,
-    SyncError, SyncRequest, SyncResponse, SyncServer, CHUNK_LEN,
+    CHUNK_LEN, ManifestEntry, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse,
+    SyncServer, decode_response, encode_request, fetch_manifest, fetch_snapshot,
 };
 
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 
 // ============================================================================
 // the in-process transport: Send client futures, local server loop.
@@ -32,6 +32,15 @@ type RpcPair = (Vec<u8>, oneshot::Sender<Vec<u8>>);
 #[derive(Clone)]
 struct ChannelClient {
     tx: mpsc::Sender<RpcPair>,
+}
+
+fn pinned_target(entry: &ManifestEntry) -> statesync::qmdb::SyncTarget {
+    entry
+        .resolver_target
+        .as_ref()
+        .expect("resolver entry carries pinned target")
+        .to_sync_target()
+        .expect("pinned target range is non-empty")
 }
 
 impl SyncClient for ChannelClient {
@@ -60,8 +69,19 @@ async fn serve_until_closed(
     finalized: FinalizedBlock,
     mut rx: mpsc::Receiver<RpcPair>,
 ) {
+    // fixed coordinates: these tests exercise the module payload lanes; the
+    // epoch fields just have to round-trip through the manifest.
+    let coords = statesync::BoundaryCoords {
+        epoch: 0,
+        view_base: 0,
+        participants: vec![],
+        floor_cert: None,
+        ..Default::default()
+    };
     while let Some((frame, reply)) = rx.next().await {
-        let resp = server.handle_frame(host, Some(finalized), &frame).await;
+        let resp = server
+            .handle_frame(host, Some(finalized), &coords, &frame)
+            .await;
         // a dropped reply receiver just means the client gave up — server-side
         // that is not an error.
         let _ = reply.send(resp);
@@ -111,19 +131,27 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
     deterministic::Runner::default().start(|context| async move {
         // ---- SOURCE: real committed kv content through the host op path ----
         let kv = Kv::init(context.child("source_kv"), "kv").await;
-        let mut host = Host::genesis(vec![Box::new(kv), Box::new(BigSnapshot::new())])
-            .expect("genesis");
+        let mut host =
+            Host::genesis(vec![Box::new(kv), Box::new(BigSnapshot::new())]).expect("genesis");
 
         let set = |k: &[u8], v: &[u8]| Msg {
             target: "kv".into(),
-            payload: kv_encode(&KvMsg::Set { key: k.to_vec(), value: v.to_vec() }),
+            payload: kv_encode(&KvMsg::Set {
+                key: k.to_vec(),
+                value: v.to_vec(),
+            }),
         };
-        host.submit(set(b"greeting", b"hello world")).await.expect("op 1");
+        host.submit(set(b"greeting", b"hello world"))
+            .await
+            .expect("op 1");
         host.submit(set(b"motd", b"draft")).await.expect("op 2");
         // overwrite: op-log order matters — only real sync reproduces the root.
         host.submit(set(b"motd", b"final")).await.expect("op 3");
 
-        let finalized = FinalizedBlock { height: 3, app_hash: host.app_hash() };
+        let finalized = FinalizedBlock {
+            height: 3,
+            app_hash: host.app_hash(),
+        };
         let src_kv_root = host.module_root("kv").expect("kv registered");
 
         // ---- the wire: server loop + channel client -------------------------
@@ -142,13 +170,14 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
             assert_eq!(kv_entry.kind, PayloadKind::Resolver);
             assert_eq!(kv_entry.root, src_kv_root);
 
-            // live target through the module lane, gated on the manifest root.
-            let resolver = RemoteQmdbResolver::new(client_for_join.clone(), "kv");
-            let target = resolver.fetch_target().await.expect("target");
+            // pinned target from the manifest, gated on the manifest root.
+            let resolver =
+                RemoteQmdbResolver::new(client_for_join.clone(), manifest.boundary_id(), "kv");
+            let target = pinned_target(kv_entry);
             assert_eq!(
                 StateRoot(target.root.0),
                 kv_entry.root,
-                "quiescent source: live target root equals the manifest root"
+                "pinned target root equals the manifest root"
             );
 
             // rebuild ENTIRELY through the wire: every op batch crosses the
@@ -166,10 +195,14 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
             );
 
             // multi-chunk snapshot lane: bytes reassemble exactly.
-            let snap = fetch_snapshot(&client_for_join, manifest.height, "bigsnap")
+            let snap = fetch_snapshot(&client_for_join, manifest.boundary_id(), "bigsnap")
                 .await
                 .expect("big snapshot");
-            assert_eq!(snap, BigSnapshot::new().bytes, "chunked payload reassembles");
+            assert_eq!(
+                snap,
+                BigSnapshot::new().bytes,
+                "chunked payload reassembles"
+            );
             drop(client_for_join); // close the channel so the server loop ends.
         };
 
@@ -187,11 +220,17 @@ fn stale_capture_requests_are_refused_not_mis_served() {
         let mut host = Host::genesis(vec![Box::new(kv)]).expect("genesis");
         host.submit(Msg {
             target: "kv".into(),
-            payload: kv_encode(&KvMsg::Set { key: b"k".to_vec(), value: b"v".to_vec() }),
+            payload: kv_encode(&KvMsg::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }),
         })
         .await
         .expect("op");
-        let finalized = FinalizedBlock { height: 1, app_hash: host.app_hash() };
+        let finalized = FinalizedBlock {
+            height: 1,
+            app_hash: host.app_hash(),
+        };
 
         let mut server = SyncServer::new();
         // a chunk request against a height never captured must error cleanly.
@@ -199,18 +238,36 @@ fn stale_capture_requests_are_refused_not_mis_served() {
             .handle(
                 &host,
                 Some(finalized),
-                SyncRequest::Chunk { height: 999, module_id: "kv".into(), offset: 0 },
+                &statesync::BoundaryCoords::default(),
+                SyncRequest::Chunk {
+                    boundary: statesync::BoundaryId {
+                        height: 999,
+                        app_hash: StateRoot([9u8; 32]),
+                    },
+                    module_id: "kv".into(),
+                    offset: 0,
+                },
             )
             .await;
         assert!(
-            matches!(resp, SyncResponse::Error(ref e) if e.contains("no capture")),
-            "unknown capture height must be a clean protocol error, got {resp:?}"
+            matches!(resp, SyncResponse::Error(ref e) if e.contains("not leased")),
+            "unknown boundary must be a clean protocol error, got {resp:?}"
         );
 
         // manifest against a WRONG finalized boundary (host has advanced past
         // it) is refused by the host's app-hash gate, not served stale.
-        let wrong = FinalizedBlock { height: 0, app_hash: StateRoot([1u8; 32]) };
-        let resp = server.handle(&host, Some(wrong), SyncRequest::Manifest).await;
+        let wrong = FinalizedBlock {
+            height: 0,
+            app_hash: StateRoot([1u8; 32]),
+        };
+        let resp = server
+            .handle(
+                &host,
+                Some(wrong),
+                &statesync::BoundaryCoords::default(),
+                SyncRequest::Manifest,
+            )
+            .await;
         assert!(
             matches!(resp, SyncResponse::Error(ref e) if e.contains("capture failed")),
             "a mismatched boundary must refuse, got {resp:?}"
@@ -225,14 +282,17 @@ fn byzantine_op_batches_fail_verification_not_installation() {
     // reject at the wire layer; this pins the decode side. (proof-level lies —
     // valid encoding, wrong ops — are rejected by the sync engine's merkle
     // verification against the target root, proven by commonware's own suite.)
-    use statesync::qmdb::{decode_ops_envelope, encode_qmdb_req, QmdbSyncReq};
+    use statesync::qmdb::{QmdbSyncReq, decode_ops_envelope, encode_qmdb_req};
 
     deterministic::Runner::default().start(|context| async move {
         let kv = Kv::init(context.child("kv"), "kv").await;
         let mut host = Host::genesis(vec![Box::new(kv)]).expect("genesis");
         host.submit(Msg {
             target: "kv".into(),
-            payload: kv_encode(&KvMsg::Set { key: b"k".to_vec(), value: b"v".to_vec() }),
+            payload: kv_encode(&KvMsg::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }),
         })
         .await
         .expect("op");
@@ -240,26 +300,28 @@ fn byzantine_op_batches_fail_verification_not_installation() {
         // real op coordinates come from the store's own target — the log
         // carries commit-floor ops beyond the user writes, and serving below
         // the pruned floor is refused.
-        let target_bytes = host
-            .serve_sync("kv", &encode_qmdb_req(&QmdbSyncReq::Target))
+        let target = host
+            .resolver_sync_target("kv")
             .await
-            .expect("serve target");
-        let target = statesync::qmdb::decode_target(&target_bytes).expect("decode target");
+            .expect("resolver target");
 
         // an honest ops envelope straight off the serve lane...
         let body = host
             .serve_sync(
                 "kv",
                 &encode_qmdb_req(&QmdbSyncReq::Ops {
-                    op_count: target.range.end().as_u64(),
-                    start_loc: target.range.start().as_u64(),
+                    op_count: target.op_count,
+                    start_loc: target.start,
                     max_ops: 16,
                     include_pinned: true,
                 }),
             )
             .await
             .expect("serve ops");
-        assert!(decode_ops_envelope(&body).is_ok(), "honest envelope decodes");
+        assert!(
+            decode_ops_envelope(&body).is_ok(),
+            "honest envelope decodes"
+        );
 
         // ...rejects when truncated,
         assert!(decode_ops_envelope(&body[..body.len() - 1]).is_err());

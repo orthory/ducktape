@@ -873,7 +873,7 @@ mod tests {
     impl CaptureCtx {
         fn new() -> Self {
             Self {
-                env: Env {
+                env: Env { protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: Origin::System,

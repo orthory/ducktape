@@ -23,6 +23,19 @@ pub enum GovAction {
     RemoveValidator { key: Vec<u8> },
     /// a binding signal with no on-chain effect beyond its recorded outcome.
     Signal { text: String },
+    /// AUTHORIZE a pending node upgrade: emits `UpgradeMsg::Schedule { name,
+    /// activation_height, to_version }` on execution. governance only SCHEDULES
+    /// (authorizes) — it never ARMS: arming additionally requires the `R = n`
+    /// readiness quorum evaluated by the upgrade module, and the upgrade module
+    /// is the sole authority for the monotonicity / min-lead / at-most-one gates.
+    ScheduleUpgrade {
+        name: String,
+        activation_height: u64,
+        to_version: u32,
+    },
+    /// AUTHORIZE clearing a pending upgrade before its boundary: emits
+    /// `UpgradeMsg::Cancel { name }` on execution.
+    CancelUpgrade { name: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

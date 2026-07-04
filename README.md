@@ -25,7 +25,7 @@ emitted as messages that the host drains as follow-up ops.
 | --- | --- |
 | `crates/kernel/` | The platform: `sdk` (module contract), `state` (app-hash composition), `host` (registry + dispatch + block lifecycle), `node` (transport seam), `consensus` (commonware Simplex BFT orderer), `reactor` (worker loop for non-deterministic effects) |
 | `crates/system/` | Consensus-infrastructure modules: `kv` (QMDB byte-KV), `valset` (ed25519 validator membership), `saga` (deterministic async continuations), `wireguard-upgrade` |
-| `crates/apps/` | Product modules: `forge` (git-backed project state), `document`, `chat`, `agent` (LLM-run orchestrator: registry, watches, runs), `tasks` |
+| `crates/apps/` | Product modules: `forge` (git-backed project state), `document`, `chat`, `agent` (LLM-run orchestrator: registry, watches, runs), `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes), `memory` (generation-pinned shared agent workspace), `jobs` (first-claim-wins work board) |
 | `crates/examples/` | Demo and test scaffolding modules: `directory`, `greeter` |
 | `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (real-socket validator process) |
 | `docs/` | Vocs documentation site (human/agent tracks, English/Korean) |
@@ -106,10 +106,14 @@ bun install
 bun run tauri dev
 ```
 
-On launch the app adopts a daemon already listening on `127.0.0.1:8844`, or
-spawns one (state under the OS app-data dir, log at `node/daemon.log`). The
-Node screen has the stop/start control; `POST /v1/shutdown` retires a daemon
-from anywhere else.
+On first launch the desktop app opens the onboarding gate: found a new network
+or join one from an invite blob. Each becomes a **workspace** under
+`~/.ducktape/workspaces/<id>/` (its own descriptor, ed25519 identity, storage,
+and `daemon.log`), tracked in `~/.ducktape/registry.json`. Selecting a workspace
+spawns/adopts its `ducktape-node` on the workspace's own port and dials it; a
+joiner parks until a member admits it (Settings → Admit a joiner) and then
+promotes itself, with the park→admitted→promoted phase shown live. The web build
+has no registry — it dials a single configured node (`VITE_DUCKTAPE_NODE_URL`).
 
 `make app` builds the distributable desktop bundle (`.app`/`.dmg` under
 `target/release/bundle`); `make web` builds the static web bundle to

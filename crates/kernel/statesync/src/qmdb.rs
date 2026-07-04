@@ -1,5 +1,5 @@
-//! the qmdb half of the state-sync wire: serve a live store's sync surface
-//! (target + proof-carrying op ranges) as opaque bytes, and resolve those bytes
+//! the qmdb half of the state-sync wire: serve a live store's proof-carrying op
+//! ranges as opaque bytes, and resolve those bytes
 //! back on the joiner — including a [`RemoteQmdbResolver`] that plugs straight
 //! into commonware's qmdb sync engine as its network
 //! [`Resolver`](commonware_storage::qmdb::sync::Resolver).
@@ -22,18 +22,18 @@ use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::Sequential;
 use commonware_runtime::BufferPooler;
 use commonware_storage::{
+    Context,
     merkle::{self, Location, Proof},
     qmdb::{
         any::unordered::variable::{Db, Operation},
         sync::{self, Target},
     },
     translator::TwoCap,
-    Context,
 };
 use commonware_utils::channel::oneshot;
 
 use crate::wire::{self, WireError};
-use crate::{SyncClient, SyncError, SyncRequest, SyncResponse};
+use crate::{BoundaryId, SyncClient, SyncError, SyncRequest, SyncResponse};
 
 /// the shared digest type: sha256, used as both the hashed key and the proof
 /// digest by every qmdb module in the workspace.
@@ -73,8 +73,6 @@ const MAX_OPS_PER_BATCH: u64 = 4096;
 /// a byte-level request against one qmdb-backed module's sync surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QmdbSyncReq {
-    /// the store's CURRENT sync target (root + live op range).
-    Target,
     /// a proof-carrying op range, anchored at `op_count` (historical — valid
     /// for an older target even after the store advanced).
     Ops {
@@ -88,14 +86,13 @@ pub enum QmdbSyncReq {
 pub fn encode_qmdb_req(req: &QmdbSyncReq) -> Vec<u8> {
     let mut out = Vec::new();
     match req {
-        QmdbSyncReq::Target => out.push(0u8),
         QmdbSyncReq::Ops {
             op_count,
             start_loc,
             max_ops,
             include_pinned,
         } => {
-            out.push(1u8);
+            out.push(0u8);
             out.extend_from_slice(&op_count.to_le_bytes());
             out.extend_from_slice(&start_loc.to_le_bytes());
             out.extend_from_slice(&max_ops.to_le_bytes());
@@ -109,8 +106,7 @@ pub fn decode_qmdb_req(bytes: &[u8]) -> Result<QmdbSyncReq, WireError> {
     let mut buf = bytes;
     let tag = wire::take_u8(&mut buf)?;
     let req = match tag {
-        0 => QmdbSyncReq::Target,
-        1 => QmdbSyncReq::Ops {
+        0 => QmdbSyncReq::Ops {
             op_count: wire::take_u64(&mut buf)?,
             start_loc: wire::take_u64(&mut buf)?,
             max_ops: wire::take_u64(&mut buf)?,
@@ -206,25 +202,13 @@ pub fn decode_ops_envelope(bytes: &[u8]) -> Result<OpsEnvelope, WireError> {
 // ============================================================================
 
 /// serve one [`QmdbSyncReq`] from a live store. read-only; historical proofs
-/// keep older targets servable while the store keeps advancing. this is what a
-/// qmdb-backed module's [`sdk::Module::serve_sync`] delegates to.
+/// keep older manifest-pinned targets servable while the store keeps advancing.
+/// this is what a qmdb-backed module's [`sdk::Module::serve_sync`] delegates to.
 pub async fn serve<E>(db: &SyncDb<E>, req: &QmdbSyncReq) -> Result<Vec<u8>, sdk::Error>
 where
     E: Context + BufferPooler,
 {
     match req {
-        QmdbSyncReq::Target => {
-            let end = db.bounds().await.end;
-            let start = db.sync_boundary();
-            let range = commonware_utils::range::NonEmptyRange::new(start..end).map_err(|_| {
-                sdk::Error::Module("store has no committed operations to sync".into())
-            })?;
-            let target = SyncTarget {
-                root: db.root(),
-                range,
-            };
-            Ok(target.encode().to_vec())
-        }
         QmdbSyncReq::Ops {
             op_count,
             start_loc,
@@ -255,6 +239,24 @@ where
     }
 }
 
+/// describe the store's current sync target for manifest capture. this is not a
+/// wire request; callers pin the returned target into the manifest before a
+/// joiner starts fetching operation ranges.
+pub async fn resolver_sync_target<E>(db: &SyncDb<E>) -> Result<sdk::ResolverSyncTarget, sdk::Error>
+where
+    E: Context + BufferPooler,
+{
+    let end = db.bounds().await.end;
+    let start = db.sync_boundary();
+    let range = commonware_utils::range::NonEmptyRange::new(start..end)
+        .map_err(|_| sdk::Error::Module("store has no committed operations to sync".into()))?;
+    Ok(sdk::ResolverSyncTarget {
+        root: sdk::StateRoot(db.root().0),
+        start: range.start().as_u64(),
+        op_count: range.end().as_u64(),
+    })
+}
+
 /// convenience for module `serve_sync` impls: decode + serve in one call.
 pub async fn serve_bytes<E>(db: &SyncDb<E>, req: &[u8]) -> Result<Vec<u8>, sdk::Error>
 where
@@ -264,9 +266,23 @@ where
     serve(db, &req).await
 }
 
-/// decode a served target payload back into a typed [`SyncTarget`].
-pub fn decode_target(bytes: &[u8]) -> Result<SyncTarget, WireError> {
-    SyncTarget::decode_cfg(bytes, &()).map_err(|e| WireError::Codec(format!("target: {e}")))
+pub fn module_lane_error(module_id: &str, error: String) -> SyncError {
+    if is_pruned_range_error(&error) {
+        SyncError::Pruned {
+            module: module_id.to_string(),
+            reason: error,
+        }
+    } else {
+        SyncError::Server(error)
+    }
+}
+
+fn is_pruned_range_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("operation pruned")
+        || lower.contains("itempruned")
+        || lower.contains("item pruned")
+        || lower.contains("historical range pruned")
 }
 
 // ============================================================================
@@ -282,36 +298,16 @@ pub fn decode_target(bytes: &[u8]) -> Result<SyncTarget, WireError> {
 #[derive(Clone)]
 pub struct RemoteQmdbResolver<C> {
     client: C,
+    boundary: BoundaryId,
     module_id: String,
 }
 
 impl<C> RemoteQmdbResolver<C> {
-    pub fn new(client: C, module_id: impl Into<String>) -> Self {
+    pub fn new(client: C, boundary: BoundaryId, module_id: impl Into<String>) -> Self {
         Self {
             client,
+            boundary,
             module_id: module_id.into(),
-        }
-    }
-}
-
-impl<C> RemoteQmdbResolver<C>
-where
-    C: SyncClient,
-{
-    /// fetch the module's CURRENT sync target from the serving peer.
-    pub async fn fetch_target(&self) -> Result<SyncTarget, SyncError> {
-        let body = encode_qmdb_req(&QmdbSyncReq::Target);
-        let resp = self
-            .client
-            .request(SyncRequest::Module {
-                module_id: self.module_id.clone(),
-                body,
-            })
-            .await?;
-        match resp {
-            SyncResponse::Module(bytes) => Ok(decode_target(&bytes)?),
-            SyncResponse::Error(e) => Err(SyncError::Server(e)),
-            other => Err(SyncError::UnexpectedResponse(other.kind_name())),
         }
     }
 }
@@ -343,13 +339,14 @@ where
         let resp = self
             .client
             .request(SyncRequest::Module {
+                boundary: self.boundary,
                 module_id: self.module_id.clone(),
                 body,
             })
             .await?;
         let bytes = match resp {
             SyncResponse::Module(bytes) => bytes,
-            SyncResponse::Error(e) => return Err(SyncError::Server(e)),
+            SyncResponse::Error(e) => return Err(module_lane_error(&self.module_id, e)),
             other => return Err(SyncError::UnexpectedResponse(other.kind_name())),
         };
         let env = decode_ops_envelope(&bytes)?;

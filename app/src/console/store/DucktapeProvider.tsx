@@ -1,67 +1,58 @@
-// The console's one stateful component: resolves the node (adopt-or-spawn on
-// desktop, dial on web), hydrates from it, re-queries committed state on every
-// finalized block, and hands views a stable actions surface. Views stay
-// render-only.
-//
-// Writes follow the node's model: submit one msg (one block), then re-query —
-// there is no optimistic local state to reconcile. The post-submit refresh is
-// deliberately kept even though block events also refresh: it covers a dead
-// event stream, and a double refresh of cheap queries is harmless.
-//
-// Actions read live state through refs, never inside setState updaters —
-// updaters must stay pure (StrictMode double-invokes them, which would
-// double-submit blocks).
+// Store wiring for the console: resolves/adopts the node transport, hydrates
+// committed projections on boot and block events, and provides the stable
+// actions facade. Business logic lives in actions.ts; state projection lives in
+// state.ts.
 
 import {
-  createContext,
   useCallback,
   useEffect,
+  useMemo,
+  useReducer,
   useRef,
   useState,
-  useMemo,
 } from "react";
 import type { ReactNode } from "react";
 
+import * as agentClient from "../../domain/agent-client";
+import * as automationsClient from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
-import * as tasksClient from "../../domain/tasks-client";
-import { ensureDaemon, resolveNode, shutdownNode } from "../../domain/node-bootstrap";
-import type { NodeTransport } from "../../domain/transport";
+import * as documentClient from "../../domain/document-client";
+import type { Block } from "../../domain/document-client";
+import * as filesClient from "../../domain/files-client";
+import * as forgeClient from "../../domain/forge-client";
+import * as governanceClient from "../../domain/governance-client";
+import type { ProposalView } from "../../domain/governance-client";
+import * as inboxClient from "../../domain/inbox-client";
+import * as jobsClient from "../../domain/jobs-client";
+import type { BoardCounts } from "../../domain/jobs-client";
+import * as memoryClient from "../../domain/memory-client";
 import {
-  channelIdOf,
+  isTauri,
+  resolveNode,
+} from "../../domain/node-bootstrap";
+import * as profilesClient from "../../domain/profiles-client";
+import * as tasksClient from "../../domain/tasks-client";
+import * as valsetClient from "../../domain/valset-client";
+import type { NodeTransport } from "../../domain/transport";
+import * as ws from "../../domain/workspace-client";
+import { createActions } from "./actions";
+import { ConsoleContext, type ConsoleContextValue } from "./context";
+import { reducer } from "./reducer";
+import {
+  applySnapshot,
   createInitialState,
-  nextTaskStatus,
+  loadRemoteUrl,
 } from "./state";
-import type { ConsoleState } from "./state";
 
-// ── Context ─────────────────────────────────────────────
+export type { ConsoleActions } from "./actions";
+export type { ConsoleContextValue } from "./context";
 
-export interface ConsoleActions {
-  setScreen(screen: string): void;
-  setAccent(accent: string): void;
-  setAuthor(author: string): void;
-  selectChannel(channelId: string): void;
-  createChannel(name: string): void;
-  sendMessage(body: string): void;
-  openThread(rootSeq: number): void;
-  closeThread(): void;
-  replyInThread(body: string): void;
-  addTask(title: string): void;
-  advanceTask(taskId: string): void;
-  /** Ask the managed daemon to exit (desktop only). */
-  stopNode(): void;
-  /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
-  startNode(): void;
-  dismissError(): void;
-}
+/** How many recent telemetry frames the console keeps in memory (the node's
+ *  ring holds more; this bounds the live view's buffer). */
+const TELEMETRY_KEEP = 200;
 
-export interface ConsoleContextValue {
-  state: ConsoleState;
-  actions: ConsoleActions;
-}
-
-export const ConsoleContext = createContext<ConsoleContextValue | null>(null);
-
-// ── Provider ────────────────────────────────────────────
+/** How often to re-poll a resolved-but-unanswering node until it comes back. */
+const RECONNECT_POLL_MS = 3_000;
 
 export function DucktapeProvider({
   transport,
@@ -71,7 +62,7 @@ export function DucktapeProvider({
   transport?: NodeTransport;
   children: ReactNode;
 }) {
-  const [state, setState] = useState<ConsoleState>(createInitialState);
+  const [state, dispatch] = useReducer(reducer, undefined, createInitialState);
   const [node, setNode] = useState<NodeTransport | null>(transport ?? null);
 
   // actions and block-event callbacks read CURRENT values here, not the
@@ -81,230 +72,331 @@ export function DucktapeProvider({
   const nodeRef = useRef(node);
   nodeRef.current = node;
 
+  // stale-guards async boot/connect loops: each connectActive bumps the
+  // generation, so a superseded loop (workspace switch, re-select) sees its gen
+  // change and stops touching state.
+  const bootGenRef = useRef(0);
+  const bootStartedRef = useRef(false);
+
   const fail = useCallback(
-    (err: unknown) => setState((prev) => ({ ...prev, error: String(err) })),
+    (err: unknown) =>
+      dispatch({ type: "patch", patch: { error: String(err) } }),
     [],
   );
 
-  // 1. Resolve the node once: adopt-or-spawn the daemon on desktop, dial the
-  //    configured url on web. Injected transports (tests) skip this.
-  useEffect(() => {
-    if (node) return;
-    let cancelled = false;
-    resolveNode()
-      .then((resolution) => {
-        if (cancelled) return;
-        setState((prev) => ({
-          ...prev,
-          nodeUrl: resolution.url,
-          managed: resolution.managed,
-        }));
-        setNode(resolution.transport);
-      })
-      .catch((err) => {
-        if (!cancelled) fail(err);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [node, fail]);
-
-  // 2. Pull every committed projection; adopt the first channel when none is
-  //    active yet (or the active one vanished from a fresh node).
-  const refresh = useCallback(
-    () => {
-      const live = nodeRef.current;
-      if (!live) return Promise.resolve();
-      return Promise.resolve()
-        .then(() =>
-          Promise.all([
-            live.status(),
-            chatClient.channels(live),
-            tasksClient.listTasks(live),
-          ]),
-        )
-        .then(([status, channels, tasks]) => {
-          const current = stateRef.current.activeChannel;
-          const active =
-            current && channels.some((c) => c.id === current)
-              ? current
-              : (channels[0]?.id ?? null);
-          return Promise.resolve()
-            .then(() => (active ? chatClient.latestMessages(live, active) : []))
-            .then((messages) =>
-              setState((prev) => ({
-                ...prev,
+  const refresh = useCallback(() => {
+    const live = nodeRef.current;
+    if (!live) return Promise.resolve();
+    // enumerate the doc index (the browse tree) and re-query the open doc's
+    // blocks (null when none is open) alongside the other projections.
+    const activeDoc = stateRef.current.activeDoc;
+    // the inbox is per-member; the console keys "my" queue by the local author
+    // identity, and memory browsing re-lists whatever dir is open.
+    const member = stateRef.current.author;
+    const memoryPath = stateRef.current.memoryPath;
+    return Promise.resolve()
+      .then(() =>
+        Promise.all([
+          live.status(),
+          chatClient.channels(live),
+          tasksClient.listTasks(live),
+          valsetClient.validators(live),
+          // governance is a first-class operator surface but best-effort in the
+          // snapshot: a node/build without it just reads as "no proposals"
+          // rather than failing the whole refresh.
+          governanceClient.proposals(live).catch((): ProposalView[] => []),
+          forgeClient.head(live),
+          documentClient.listDocs(live),
+          activeDoc
+            ? documentClient.getDoc(live, activeDoc)
+            : Promise.resolve<Block[] | null>(null),
+          agentClient.agents(live),
+          agentClient.watches(live),
+          // newest-first for the timeline; Runs is ascending on the wire.
+          agentClient
+            .runs(live, { channelId: null, limit: 50 })
+            .then((list) => [...list].reverse()),
+          profilesClient.allProfiles(live, { from: 0, limit: 256 }),
+          // ── unexposed-until-now modules — every one best-effort so a node
+          //    that does not register the module reads as "empty", never a
+          //    failed refresh (same contract as governance above). ──
+          inboxClient.list(live, { member }).catch(() => []),
+          inboxClient.unread(live, member).catch(() => 0),
+          jobsClient.listJobs(live, {}).catch(() => []),
+          jobsClient.counts(live).catch((): BoardCounts | null => null),
+          automationsClient.listRules(live).catch(() => []),
+          memoryClient.ls(live, { path: memoryPath }).catch(() => []),
+          filesClient.list(live, {}).catch(() => []),
+        ]),
+      )
+      .then(([
+        status,
+        channels,
+        tasks,
+        validators,
+        proposals,
+        forgeHead,
+        docIds,
+        docBlocks,
+        agents,
+        watches,
+        runs,
+        profiles,
+        inbox,
+        inboxUnread,
+        jobs,
+        jobCounts,
+        rules,
+        memoryEntries,
+        files,
+      ]) => {
+        // Profile.key is the origin bytes — the same bytes AuthorRef::User
+        // carries — so hex(key) is exactly authorName's AuthorNames key.
+        const authorNames = Object.fromEntries(
+          profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
+        );
+        const members = validators.map(valsetClient.validatorHex);
+        const current = stateRef.current.activeChannel;
+        const active =
+          current && channels.some((c) => c.id === current)
+            ? current
+            : (channels[0]?.id ?? null);
+        return Promise.resolve()
+          .then(() => (active ? chatClient.latestMessages(live, active) : []))
+          .then((messages) =>
+            dispatch({
+              type: "patch",
+              patch: applySnapshot({
                 connected: true,
                 status,
                 channels,
                 tasks,
+                members,
+                proposals,
+                forgeHead,
                 activeChannel: active,
                 messages,
-              })),
-            );
-        })
-        .catch((err) => {
-          setState((prev) => ({ ...prev, connected: false }));
-          fail(err);
-        });
-    },
-    [fail],
+                authorNames,
+                docIds,
+                activeDocBlocks: docBlocks ?? [],
+                agents,
+                watches,
+                runs,
+                inbox,
+                inboxUnread,
+                jobs,
+                jobCounts,
+                rules,
+                memoryEntries,
+                files,
+              }),
+            }),
+          );
+      })
+      .catch((err) => {
+        dispatch({ type: "patch", patch: { connected: false } });
+        fail(err);
+      });
+  }, [fail]);
+
+  const actions = useMemo(
+    () =>
+      createActions({
+        dispatch,
+        getState: () => stateRef.current,
+        getNode: () => nodeRef.current,
+        setNode,
+        refresh,
+        fail,
+        nextBootGeneration: () => (bootGenRef.current += 1),
+        isBootGenerationStale: (generation) => bootGenRef.current !== generation,
+      }),
+    [],
   );
 
-  // 3. Hydrate once the node is resolved, then follow the block stream.
+  // 1. Resolve the node once. Web: dial the configured url. Desktop: resolve
+  //    via the ~/.ducktape registry — connect the active workspace, or raise
+  //    the onboarding gate when there is none. Injected transports (tests) and
+  //    a re-run under StrictMode are both skipped.
+  useEffect(() => {
+    if (transport || bootStartedRef.current) return;
+    bootStartedRef.current = true;
+
+    if (!isTauri()) {
+      const resolution = resolveNode();
+      dispatch({
+        type: "patch",
+        patch: {
+          nodeUrl: resolution.url,
+          managed: false,
+          needsOnboarding: false,
+        },
+      });
+      setNode(resolution.transport);
+      return;
+    }
+
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => Promise.all([ws.listWorkspaces(), ws.activeWorkspace()]))
+      .then(([all, active]) => {
+        if (cancelled) return;
+        dispatch({ type: "patch", patch: { workspaces: all } });
+        // A remembered remote node supersedes the local active workspace — it
+        // was the user's last choice, so reconnect to it. An unreachable one
+        // just reads as disconnected rather than blocking boot.
+        const savedRemote = loadRemoteUrl();
+        if (savedRemote) {
+          actions.connectRemote(savedRemote);
+          return;
+        }
+        if (!active) {
+          dispatch({ type: "patch", patch: { needsOnboarding: true } });
+          return;
+        }
+        return actions.connectActive(active);
+      })
+      .catch((err) => {
+        if (!cancelled) fail(err);
+      });
+    // Reset the guard on cleanup so StrictMode's mount→unmount→remount re-runs
+    // the boot: without this the first mount's async resolve is cancelled while
+    // the guard blocks the remount, so connectActive never fires and the app is
+    // stuck unmanaged. (The remount's connectActive is idempotent — it adopts an
+    // already-listening node rather than double-spawning.)
+    return () => {
+      cancelled = true;
+      bootStartedRef.current = false;
+    };
+  }, [transport, actions, fail]);
+
+  // 2. Hydrate once the node is resolved, then follow the block stream and the
+  //    node-local telemetry stream (backfilled from the ring, then live). The
+  //    telemetry updaters stay pure (StrictMode double-invokes them): they append
+  //    idempotently and dedupe on the strictly-increasing block height.
   useEffect(() => {
     if (!node) return;
     refresh();
-    return node.onBlock(() => {
+
+    // Backfill recent telemetry, then keep any newer live frames layered on top.
+    node
+      .telemetry(TELEMETRY_KEEP)
+      .then((frames) =>
+        dispatch({
+          type: "update",
+          fn: (prev) => {
+            const cutoff = frames.length ? frames[frames.length - 1].height : -1;
+            const newer = prev.telemetry.filter((f) => f.height > cutoff);
+            return { telemetry: [...frames, ...newer].slice(-TELEMETRY_KEEP) };
+          },
+        }),
+      )
+      .catch(() => {
+        /* telemetry is best-effort observability; a miss just leaves it empty */
+      });
+
+    const offBlock = node.onBlock(() => {
       refresh();
     });
+    const offTelemetry = node.onTelemetry((frame) => {
+      dispatch({
+        type: "update",
+        fn: (prev) => {
+          const last = prev.telemetry[prev.telemetry.length - 1];
+          // Heights strictly increase; drop a seam duplicate or a reconnect replay.
+          if (last && frame.height <= last.height) return {};
+          return { telemetry: [...prev.telemetry, frame].slice(-TELEMETRY_KEEP) };
+        },
+      });
+    });
+    return () => {
+      offBlock();
+      offTelemetry();
+    };
   }, [node, refresh]);
 
-  // 4. Reflect the accent into the css var the theme reads.
+  // 2b. Liveness heartbeat — the "no running node" detection AND recovery. The
+  //     block stream can't do this alone: a node that silently goes away (crash,
+  //     stop, remote endpoint unplugged) just stops sending blocks, with no error
+  //     to flip `connected` off — and a healthy but idle node also sends none, so
+  //     silence isn't a reliable signal. Instead, ping `status()` on an interval
+  //     whenever a node is resolved: a failure marks it down (so the UI reflects
+  //     it and this same loop keeps retrying), and the first success after a drop
+  //     re-hydrates via refresh(). Reads live `connected` through the ref so the
+  //     interval isn't torn down and rebuilt on every block. Skipped during
+  //     onboarding / a joiner's park phase (which has its own poll).
+  useEffect(() => {
+    if (!node) return;
+    if (state.needsOnboarding || state.onboardingPhase) return;
+    const beat = () =>
+      node.status().then(
+        () => {
+          // up: only pay for a full refresh on the down→up edge; while already
+          //     connected the block stream keeps projections fresh.
+          if (!stateRef.current.connected) refresh();
+        },
+        () => {
+          // unreachable: surface it once; the next beats keep trying to recover.
+          if (stateRef.current.connected) {
+            dispatch({ type: "patch", patch: { connected: false } });
+          }
+        },
+      );
+    const timer = setInterval(beat, RECONNECT_POLL_MS);
+    return () => clearInterval(timer);
+  }, [node, state.needsOnboarding, state.onboardingPhase, refresh]);
+
+  // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {
     document.documentElement.style.setProperty("--accent", state.accent);
   }, [state.accent]);
 
-  const actions = useMemo<ConsoleActions>(() => {
-    const submitThenRefresh = (submit: (live: NodeTransport) => Promise<unknown>) => {
-      const live = nodeRef.current;
-      if (!live) return Promise.resolve();
-      return Promise.resolve()
-        .then(() => submit(live))
-        .then(() => refresh())
-        .catch(fail);
+  // 4. Drop any open doc when the node url resolves or changes — a different
+  //    node has different documents. `docIds` (the browse tree) is re-enumerated
+  //    from the new node's index by `refresh`, so it isn't seeded here.
+  useEffect(() => {
+    const url = state.nodeUrl;
+    if (!url) return;
+    dispatch({
+      type: "patch",
+      patch: {
+        docIds: [],
+        activeDoc: null,
+        activeDocBlocks: [],
+      },
+    });
+  }, [state.nodeUrl]);
+
+  // 5. Menu-bar popover navigation (desktop/macOS): the tray popover is a
+  //    separate webview, so it asks the console to switch screens by having Rust
+  //    emit `ducktape://navigate` after showing this window. Inert on web.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<string>("ducktape://navigate", (event) => {
+          const screen = event.payload;
+          if (screen) dispatch({ type: "patch", patch: { screen } });
+        }),
+      )
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {
+        // event API unavailable (non-tauri / permission) — navigation just no-ops.
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
+  }, []);
 
-    // switching channels means: new active channel, thread panel closed, and
-    // THAT channel's messages loaded — every path into a channel goes here
-    const enterChannel = (channelId: string) => {
-      const live = nodeRef.current;
-      if (!live) return;
-      setState((prev) => ({
-        ...prev,
-        activeChannel: channelId,
-        activeThread: null,
-      }));
-      Promise.resolve()
-        .then(() => chatClient.latestMessages(live, channelId))
-        .then((messages) => setState((prev) => ({ ...prev, messages })))
-        .catch(fail);
-    };
-
-    return {
-      setScreen: (screen) => setState((prev) => ({ ...prev, screen })),
-      setAccent: (accent) => setState((prev) => ({ ...prev, accent })),
-      setAuthor: (author) => setState((prev) => ({ ...prev, author })),
-
-      selectChannel: enterChannel,
-
-      createChannel: (name) => {
-        const channelId = channelIdOf(name);
-        if (!channelId) return;
-        submitThenRefresh((live) =>
-          chatClient.createChannel(live, {
-            channelId,
-            name,
-            origin: stateRef.current.author,
-          }),
-        ).then(() => enterChannel(channelId));
-      },
-
-      sendMessage: (body) => {
-        const channelId = stateRef.current.activeChannel;
-        if (!channelId || !body.trim()) return;
-        submitThenRefresh((live) =>
-          chatClient.postMessage(live, {
-            channelId,
-            messageId: crypto.randomUUID(),
-            text: body.trim(),
-            origin: stateRef.current.author,
-          }),
-        );
-      },
-
-      openThread: (rootSeq) => {
-        const live = nodeRef.current;
-        const channelId = stateRef.current.activeChannel;
-        if (!live || !channelId) return;
-        Promise.resolve()
-          .then(() => chatClient.thread(live, { channelId, rootSeq }))
-          .then((activeThread) =>
-            setState((prev) => ({ ...prev, activeThread })),
-          )
-          .catch(fail);
-      },
-
-      closeThread: () => setState((prev) => ({ ...prev, activeThread: null })),
-
-      replyInThread: (body) => {
-        const live = nodeRef.current;
-        const channelId = stateRef.current.activeChannel;
-        const root = stateRef.current.activeThread?.root;
-        if (!live || !channelId || !root || !body.trim()) return;
-        Promise.resolve()
-          .then(() =>
-            chatClient.postMessage(live, {
-              channelId,
-              messageId: crypto.randomUUID(),
-              text: body.trim(),
-              origin: stateRef.current.author,
-              thread: root.seq,
-            }),
-          )
-          .then(() =>
-            chatClient.thread(live, { channelId, rootSeq: root.seq }),
-          )
-          .then((activeThread) => {
-            setState((prev) => ({ ...prev, activeThread }));
-            return refresh();
-          })
-          .catch(fail);
-      },
-
-      addTask: (title) => {
-        if (!title.trim()) return;
-        submitThenRefresh((live) =>
-          tasksClient.createTask(live, {
-            taskId: crypto.randomUUID(),
-            title: title.trim(),
-          }),
-        );
-      },
-
-      advanceTask: (taskId) => {
-        const task = stateRef.current.tasks.find((t) => t.id === taskId);
-        if (!task || task.status === "Done") return;
-        submitThenRefresh((live) =>
-          tasksClient.updateStatus(live, {
-            taskId,
-            status: nextTaskStatus(task.status),
-          }),
-        );
-      },
-
-      stopNode: () => {
-        const url = stateRef.current.nodeUrl;
-        if (!url || !stateRef.current.managed) return;
-        Promise.resolve()
-          .then(() => shutdownNode(url))
-          .then(() => setState((prev) => ({ ...prev, connected: false })))
-          .catch(fail);
-      },
-
-      startNode: () => {
-        const live = nodeRef.current;
-        if (!live || !stateRef.current.managed) return;
-        Promise.resolve()
-          .then(() => ensureDaemon(live))
-          .then(() => refresh())
-          .catch(fail);
-      },
-
-      dismissError: () => setState((prev) => ({ ...prev, error: null })),
-    };
-  }, [refresh, fail]);
-
-  const value = useMemo(() => ({ state, actions }), [state, actions]);
+  const value = useMemo<ConsoleContextValue>(
+    () => ({ state, actions }),
+    [state, actions],
+  );
   return <ConsoleContext.Provider value={value}>{children}</ConsoleContext.Provider>;
 }

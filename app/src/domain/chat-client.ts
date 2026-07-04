@@ -90,11 +90,22 @@ export const MAX_QUERY_LIMIT = 256;
 
 // ── Rendering helpers (wire → display) ──────────────────
 
+/** hex(User key bytes) → display name — the resolved `profiles` registry, keyed
+ *  so `authorName` can look a User author up by its origin bytes. */
+export type AuthorNames = Record<string, string>;
+
+/** Lowercase hex of a User author's key bytes — the map key into AuthorNames
+ *  (and the `profiles` Profile.key, which IS these same origin bytes). */
+export const keyHex = (bytes: number[]): string =>
+  bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+
 /** A display name for an author. A User author's bytes are the submitter
- *  identity the daemon stamped — for this app, the utf-8 display name. */
-export const authorName = (author: AuthorRef): string => {
+ *  identity the daemon stamped; when the `profiles` registry (`names`) resolves
+ *  those bytes it wins, else we fall back to the utf-8/hex handle. */
+export const authorName = (author: AuthorRef, names?: AuthorNames): string => {
   if (author === "System") return "system";
-  if ("User" in author) return displayUserBytes(author.User);
+  if ("User" in author)
+    return names?.[keyHex(author.User)] ?? displayUserBytes(author.User);
   if ("Agent" in author) return `${author.Agent.module}/${author.Agent.agent_id}`;
   return author.Module;
 };
@@ -111,8 +122,7 @@ const displayUserBytes = (bytes: number[]): string => {
   } catch {
     // fall through to the hex handle
   }
-  const hex = bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}…`;
+  return `${keyHex(bytes).slice(0, 8)}…`;
 };
 
 const spanText = (spans: Span[]): string => spans.map((span) => span.text).join("");
@@ -132,7 +142,7 @@ export const blocksText = (blocks: ChatBlock[]): string =>
 
 export const createChannel = (
   transport: NodeTransport,
-  params: { channelId: string; name: string; origin: string },
+  params: { channelId: string; name: string; postPolicy: PostPolicy; origin: string },
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
@@ -140,7 +150,7 @@ export const createChannel = (
       CreateChannel: {
         channel_id: params.channelId,
         name: params.name,
-        post_policy: "Open",
+        post_policy: params.postPolicy,
       },
     },
     params.origin,
@@ -151,7 +161,7 @@ export const postMessage = (
   params: {
     channelId: string;
     messageId: string;
-    text: string;
+    blocks: ChatBlock[];
     origin: string;
     /** Root seq — set to post a thread reply. */
     thread?: number;
@@ -163,11 +173,68 @@ export const postMessage = (
       PostMessage: {
         channel_id: params.channelId,
         message_id: params.messageId,
-        blocks: [{ Paragraph: [{ text: params.text, marks: [] }] }],
+        blocks: params.blocks,
         thread: params.thread ?? null,
         as_agent: null,
       },
     },
+    params.origin,
+  );
+
+/** Add a reaction (idempotent on the backend — reacting twice with the same
+ *  emoji is a no-op there, but the UI should still avoid the redundant submit;
+ *  see `hasReacted`). */
+export const addReaction = (
+  transport: NodeTransport,
+  params: { channelId: string; seq: number; emoji: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { AddReaction: { channel_id: params.channelId, seq: params.seq, emoji: params.emoji } },
+    params.origin,
+  );
+
+export const removeReaction = (
+  transport: NodeTransport,
+  params: { channelId: string; seq: number; emoji: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { RemoveReaction: { channel_id: params.channelId, seq: params.seq, emoji: params.emoji } },
+    params.origin,
+  );
+
+/** Replace a message's blocks. Only the stored author may edit (the module
+ *  checks the submit origin); `baseRev` records the revision the edit claims to
+ *  build on — a stale base is recorded, never rejected (head is last-write-wins
+ *  under the consensus order). Like `postMessage`, this sends a single plain
+ *  Paragraph; rich blocks/marks are a later increment. */
+export const editMessage = (
+  transport: NodeTransport,
+  params: { channelId: string; seq: number; blocks: ChatBlock[]; baseRev: number | null; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    {
+      EditMessage: {
+        channel_id: params.channelId,
+        seq: params.seq,
+        blocks: params.blocks,
+        base_rev: params.baseRev,
+      },
+    },
+    params.origin,
+  );
+
+/** Tombstone a message: content and reactions are cleared, the skeleton (and
+ *  thread linkage) kept. Only the stored author may delete. */
+export const deleteMessage = (
+  transport: NodeTransport,
+  params: { channelId: string; seq: number; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { DeleteMessage: { channel_id: params.channelId, seq: params.seq } },
     params.origin,
   );
 

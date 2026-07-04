@@ -8,14 +8,16 @@ version.workspace = true
 # publish events (not polls), progressive-disclosure read verbs, and citable
 # `duck://` evidence URIs. a canonical-bytes snapshot module like tasks: root ==
 # sha256 of the encoded committed state, verify-then-adopt install. depends only
-# on `sdk` + its own types-only interface crate, per the module-isolation rule.
+# on `sdk` + types-only interface crates, per the module-isolation rule.
 [dependencies]
 sdk = { workspace = true }
 memory-interface = { workspace = true }
+files-interface = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+files = { workspace = true }
 host = { workspace = true }
 futures = "0.3"
 # the strict-decode tests hand-craft evil snapshot bytes and need the matching

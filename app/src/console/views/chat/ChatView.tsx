@@ -1,153 +1,65 @@
-// The chat surface over the node's `chat` module: a channel rail, the message
-// list, a composer, and a thread side panel. Messages are sequence-addressed
+// The chat surface over the node's `chat` module: a channel rail, a
+// Slack-style message stream (grouped by author, divided by day, with a
+// floating hover action bar), a composer, and a side thread panel that opens
+// in place of pushing the lane around. Messages are sequence-addressed
 // MessageViews with block bodies; authorship comes back as AuthorRef (derived
 // from the submit origin), decoded to a display name here.
 
-import { useState } from "react";
-import type { CSSProperties, FormEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
 
-import { authorName, blocksText } from "../../../domain/chat-client";
-import type { MessageView } from "../../../domain/chat-client";
+import type { PostPolicy } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { accentVar, color, font, radius } from "../../theme/tokens";
+import { color, font, radius } from "../../theme/tokens";
+import { selfAuthorKeyOf } from "./chat-helpers";
+import { Composer } from "./Composer";
+import { HoverButton } from "./HoverButton";
+import { MessageList } from "./MessageList";
+import { ThreadPanel } from "./ThreadPanel";
 
-// ── Shared bits ─────────────────────────────────────────
-
-const timeOf = (millis: number): string =>
-  new Date(millis).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
-const avatarStyle: CSSProperties = {
-  width: 28,
-  height: 28,
-  borderRadius: "50%",
-  background: color.chip,
-  color: color.muted3,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  font: `600 11px ${font.sans}`,
-  flexShrink: 0,
-};
-
-function Composer({
-  placeholder,
-  onSubmit,
-}: {
-  placeholder: string;
-  onSubmit: (body: string) => void;
-}) {
-  const [draft, setDraft] = useState("");
-
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    onSubmit(draft);
-    setDraft("");
-  };
-
+function LockGlyph({ size = 11 }: { size?: number }) {
   return (
-    <form
-      onSubmit={submit}
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        margin: 13,
-        padding: "9px 13px",
-        borderRadius: radius.md,
-        border: `1px solid ${color.borderStrong}`,
-        background: color.paper,
-      }}
-    >
-      <input
-        value={draft}
-        onChange={(event) => setDraft(event.target.value)}
-        placeholder={placeholder}
-        style={{ flex: 1, font: `400 13px ${font.sans}`, color: color.ink }}
-      />
-      <button
-        type="submit"
-        title="Send"
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          width: 26,
-          height: 26,
-          borderRadius: 7,
-          background: draft.trim() ? accentVar : color.chip,
-          color: "#fff",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        <Icon name="chevronRight" size={15} />
-      </button>
-    </form>
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="11" width="14" height="9" rx="2" />
+      <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+    </svg>
   );
 }
 
-function MessageRow({
-  message,
-  onOpenThread,
-}: {
-  message: MessageView;
-  onOpenThread?: (rootSeq: number) => void;
-}) {
-  const author = authorName(message.head.author);
-  const replyCount = message.head.reply_count;
+// A segmented Open / Members-only toggle for a channel's post policy.
+function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (policy: PostPolicy) => void }) {
+  const options: { key: PostPolicy; label: string; hint: string }[] = [
+    { key: "Open", label: "Open", hint: "Any member of the workspace can post" },
+    { key: "MembersOnly", label: "Members", hint: "Only channel members can post" },
+  ];
   return (
-    <div
-      style={{
-        display: "flex",
-        gap: 10,
-        padding: "7px 17px",
-        animation: "msgIn .16s ease-out",
-      }}
-    >
-      <span style={avatarStyle}>{author.slice(0, 2).toUpperCase()}</span>
-      <div style={{ minWidth: 0, flex: 1 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-          <span style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>
-            {author}
-          </span>
-          <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
-            {timeOf(message.head.created_at)}
-          </span>
-          {message.head.edited_at !== null && (
-            <span style={{ font: `400 10px ${font.sans}`, color: color.muted2 }}>
-              (edited)
-            </span>
-          )}
-        </div>
-        <div
-          style={{
-            font: `400 13px ${font.sans}`,
-            color: message.head.deleted ? color.muted2 : color.inkSofter,
-            fontStyle: message.head.deleted ? "italic" : "normal",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-          }}
-        >
-          {message.head.deleted ? "message deleted" : blocksText(message.head.blocks)}
-        </div>
-        {onOpenThread && !message.head.deleted && (
+    <div style={{ display: "flex", gap: 3, background: color.sunken, borderRadius: radius.sm, padding: 3 }}>
+      {options.map((option) => {
+        const active = value === option.key;
+        return (
           <button
-            onClick={() => onOpenThread(message.seq)}
+            key={option.key}
+            type="button"
+            title={option.hint}
+            onClick={() => onChange(option.key)}
             style={{
               all: "unset",
               cursor: "pointer",
-              marginTop: 3,
-              font: `500 11px ${font.sans}`,
-              color: replyCount > 0 ? accentVar : color.muted2,
+              flex: 1,
+              textAlign: "center",
+              padding: "4px 8px",
+              borderRadius: 5,
+              font: `600 11px ${font.sans}`,
+              color: active ? color.ink : color.muted2,
+              background: active ? color.paper : "transparent",
+              boxShadow: active ? "0 1px 2px rgba(0,0,0,.05)" : "none",
             }}
           >
-            {replyCount > 0
-              ? `${replyCount} ${replyCount === 1 ? "reply" : "replies"}`
-              : "reply in thread"}
+            {option.label}
           </button>
-        )}
-      </div>
+        );
+      })}
     </div>
   );
 }
@@ -157,12 +69,14 @@ function MessageRow({
 function ChannelRail() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
+  const [policy, setPolicy] = useState<PostPolicy>("Open");
   const [creating, setCreating] = useState(false);
 
   const create = (event: FormEvent) => {
     event.preventDefault();
-    if (draft.trim()) actions.createChannel(draft);
+    if (draft.trim()) actions.createChannel(draft, policy);
     setDraft("");
+    setPolicy("Open");
     setCreating(false);
   };
 
@@ -176,6 +90,8 @@ function ChannelRail() {
         display: "flex",
         flexDirection: "column",
         padding: "13px 0",
+        boxSizing: "border-box",
+        overflow: "hidden",
       }}
     >
       <div
@@ -189,17 +105,26 @@ function ChannelRail() {
         <span style={{ font: `600 11px ${font.sans}`, color: color.muted, letterSpacing: ".04em" }}>
           CHANNELS
         </span>
-        <button
+        <HoverButton
           onClick={() => setCreating((open) => !open)}
           title="New channel"
-          style={{ all: "unset", cursor: "pointer", color: color.muted }}
+          style={{
+            color: color.muted,
+            width: 20,
+            height: 20,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            borderRadius: 5,
+          }}
+          hoverStyle={{ background: color.hover, color: color.ink }}
         >
           <Icon name="plus" size={14} />
-        </button>
+        </HoverButton>
       </div>
 
       {creating && (
-        <form onSubmit={create} style={{ padding: "0 11px 8px" }}>
+        <form onSubmit={create} style={{ padding: "0 11px 9px", display: "flex", flexDirection: "column", gap: 6 }}>
           <input
             autoFocus
             value={draft}
@@ -207,6 +132,7 @@ function ChannelRail() {
             placeholder="channel name"
             style={{
               width: "100%",
+              boxSizing: "border-box",
               padding: "6px 9px",
               borderRadius: radius.sm,
               border: `1px solid ${color.borderStrong}`,
@@ -215,6 +141,23 @@ function ChannelRail() {
               color: color.ink,
             }}
           />
+          <PolicyToggle value={policy} onChange={setPolicy} />
+          <button
+            type="submit"
+            disabled={!draft.trim()}
+            style={{
+              all: "unset",
+              cursor: draft.trim() ? "pointer" : "not-allowed",
+              textAlign: "center",
+              padding: "6px 0",
+              borderRadius: radius.sm,
+              background: draft.trim() ? color.dark : color.borderSoft,
+              color: draft.trim() ? color.onDark : color.muted2,
+              font: `600 12px ${font.sans}`,
+            }}
+          >
+            Create channel
+          </button>
         </form>
       )}
 
@@ -238,10 +181,11 @@ function ChannelRail() {
                 background: active ? color.hover : "transparent",
                 color: active ? color.ink : color.muted3,
                 font: `${active ? 600 : 400} 12.5px ${font.sans}`,
+                boxSizing: "border-box",
               }}
             >
               <Icon name="hash" size={13} color={active ? color.ink : color.muted2} />
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {channel.name}
               </span>
             </button>
@@ -257,57 +201,85 @@ function ChannelRail() {
   );
 }
 
-// ── Thread panel ────────────────────────────────────────
+// ── Empty states ─────────────────────────────────────────
 
-function ThreadPanel() {
+function EmptyChannelState() {
   const { state, actions } = useDucktape();
-  const thread = state.activeThread;
-  if (!thread) return null;
+  const [draft, setDraft] = useState("");
+  const [policy, setPolicy] = useState<PostPolicy>("Open");
+  const hasChannels = state.channels.length > 0;
+
+  const create = (event: FormEvent) => {
+    event.preventDefault();
+    if (draft.trim()) actions.createChannel(draft, policy);
+    setDraft("");
+  };
 
   return (
-    <div
-      style={{
-        width: 320,
-        flexShrink: 0,
-        borderLeft: `1px solid ${color.borderSoft}`,
-        display: "flex",
-        flexDirection: "column",
-        background: color.paper,
-      }}
-    >
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          padding: "11px 15px",
-          borderBottom: `1px solid ${color.borderSoft}`,
-        }}
-      >
-        <span style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>Thread</span>
-        <button
-          onClick={actions.closeThread}
-          title="Close thread"
-          style={{ all: "unset", cursor: "pointer", color: color.muted }}
+    <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, maxWidth: 260 }}>
+        <div
+          style={{
+            width: 48,
+            height: 48,
+            borderRadius: radius.lg,
+            background: color.sunken,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
         >
-          <Icon name="close" size={14} />
-        </button>
-      </div>
-      <div style={{ flex: 1, overflowY: "auto", padding: "9px 0" }}>
-        <MessageRow message={thread.root} />
-        {thread.replies.length > 0 && (
-          <div
-            style={{
-              margin: "4px 17px",
-              borderTop: `1px solid ${color.borderSoft}`,
-            }}
-          />
+          <Icon name="hash" size={22} color={color.muted2} />
+        </div>
+        <div style={{ font: `600 14px ${font.sans}`, color: color.ink, textAlign: "center" }}>
+          {hasChannels ? "Pick a channel" : "No channels yet"}
+        </div>
+        <div style={{ font: `400 12.5px ${font.sans}`, color: color.muted2, textAlign: "center" }}>
+          {hasChannels
+            ? "Choose a channel from the list to start reading and posting."
+            : "Create the first channel to start the conversation."}
+        </div>
+        {!hasChannels && (
+          <form
+            onSubmit={create}
+            style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 4, width: 240 }}
+          >
+            <input
+              autoFocus
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="channel name"
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "8px 10px",
+                borderRadius: radius.sm,
+                border: `1px solid ${color.borderStrong}`,
+                background: color.paper,
+                font: `400 12.5px ${font.sans}`,
+                color: color.ink,
+              }}
+            />
+            <PolicyToggle value={policy} onChange={setPolicy} />
+            <button
+              type="submit"
+              disabled={!draft.trim()}
+              style={{
+                all: "unset",
+                cursor: draft.trim() ? "pointer" : "not-allowed",
+                textAlign: "center",
+                padding: "8px 13px",
+                borderRadius: radius.sm,
+                background: draft.trim() ? color.dark : color.borderSoft,
+                color: draft.trim() ? color.onDark : color.muted2,
+                font: `600 12.5px ${font.sans}`,
+              }}
+            >
+              Create channel
+            </button>
+          </form>
         )}
-        {thread.replies.map((reply) => (
-          <MessageRow key={reply.seq} message={reply} />
-        ))}
       </div>
-      <Composer placeholder="Reply in thread" onSubmit={actions.replyInThread} />
     </div>
   );
 }
@@ -317,44 +289,162 @@ function ThreadPanel() {
 export function ChatView() {
   const { state, actions } = useDucktape();
   const channel = state.channels.find((c) => c.id === state.activeChannel);
-  // thread replies render in the panel; the main lane shows roots only
-  const roots = state.messages.filter((message) => message.head.thread === null);
+  const selfKey = selfAuthorKeyOf(state.author);
+  const workspaceId = state.workspace?.id ?? null;
+  const rootMessageCount = state.messages.filter((message) => message.head.thread === null).length;
+
+  const [draft, setDraft] = useState("");
+  const [hoverMsg, setHoverMsg] = useState<number | null>(null);
+  const [msgMenuId, setMsgMenuId] = useState<number | null>(null);
+
+  const listRef = useRef<HTMLDivElement>(null);
+  // whether the reader is parked at the bottom. start pinned so the first paint
+  // and every channel switch land on the newest message.
+  const pinnedRef = useRef(true);
+
+  // a channel switch is a fresh read — treat it as pinned to that channel's tail.
+  useLayoutEffect(() => {
+    pinnedRef.current = true;
+  }, [state.activeChannel]);
+
+  useEffect(() => {
+    setHoverMsg(null);
+    setMsgMenuId(null);
+  }, [state.activeChannel, workspaceId]);
+
+  // follow new messages to the bottom ONLY when the reader is already there (or
+  // just sent) — never yank them up from scrolled-back history when someone
+  // else's message lands.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
+  }, [state.messages.length, state.activeChannel]);
+
+  const handleSend = () => {
+    if (!draft.trim()) return;
+    pinnedRef.current = true;
+    actions.sendMessage(draft);
+    setDraft("");
+  };
 
   return (
-    <div style={{ display: "flex", flex: 1, minWidth: 0 }}>
+    <div style={{ display: "flex", flex: 1, minWidth: 0, minHeight: 0, overflow: "hidden" }}>
       <ChannelRail />
-      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+          background: color.paper,
+          overflow: "hidden",
+        }}
+      >
         <div
           style={{
             display: "flex",
             alignItems: "center",
-            gap: 7,
-            padding: "11px 17px",
+            gap: 9,
+            padding: "0 18px",
+            height: 50,
+            boxSizing: "border-box",
             borderBottom: `1px solid ${color.borderSoft}`,
+            flexShrink: 0,
+            minWidth: 0,
           }}
         >
           <Icon name="hash" size={15} color={color.muted} />
-          <span style={{ font: `600 13px ${font.sans}`, color: color.ink }}>
+          <span
+            style={{
+              font: `600 14px ${font.sans}`,
+              color: color.ink,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
             {channel?.name ?? "No channel"}
           </span>
-        </div>
-
-        <div style={{ flex: 1, overflowY: "auto", padding: "9px 0" }}>
-          {roots.map((message) => (
-            <MessageRow key={message.seq} message={message} onOpenThread={actions.openThread} />
-          ))}
-          {channel && roots.length === 0 && (
-            <div style={{ padding: "13px 17px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
-              No messages in #{channel.name} yet.
-            </div>
+          {channel && (
+            <span style={{ font: `400 12px ${font.sans}`, color: color.muted2, whiteSpace: "nowrap" }}>
+              · {rootMessageCount} {rootMessageCount === 1 ? "message" : "messages"}
+            </span>
+          )}
+          {channel?.post_policy === "MembersOnly" && (
+            <span
+              title="Only channel members can post"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                marginLeft: 2,
+                padding: "2px 8px",
+                borderRadius: 999,
+                background: color.sunken,
+                border: `1px solid ${color.borderSoft}`,
+                font: `600 10px ${font.mono}`,
+                color: color.muted,
+                whiteSpace: "nowrap",
+              }}
+            >
+              <LockGlyph size={10} /> Members only
+            </span>
           )}
         </div>
 
-        {channel && (
-          <Composer placeholder={`Message #${channel.name}`} onSubmit={actions.sendMessage} />
+        {channel ? (
+          <>
+            <MessageList
+              channelName={channel.name}
+              messages={state.messages}
+              names={state.authorNames}
+              selfKey={selfKey}
+              workspaceId={workspaceId}
+              hoverMsg={hoverMsg}
+              menuOpenId={msgMenuId}
+              listRef={listRef}
+              onScroll={(event) => {
+                const el = event.currentTarget;
+                pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+              }}
+              onHover={setHoverMsg}
+              onMenuToggle={setMsgMenuId}
+              onOpenThread={actions.openThread}
+              onReact={actions.toggleReaction}
+              onEdit={actions.editMessage}
+              onDelete={actions.deleteMessage}
+            />
+            <Composer
+              value={draft}
+              onChange={setDraft}
+              onSend={handleSend}
+              placeholder={`Message #${channel.name}`}
+            />
+          </>
+        ) : (
+          <EmptyChannelState />
         )}
       </div>
-      <ThreadPanel />
+      {state.activeThread && channel && (
+        <ThreadPanel
+          thread={state.activeThread}
+          channelName={channel.name}
+          names={state.authorNames}
+          selfKey={selfKey}
+          workspaceId={workspaceId}
+          hoverMsg={hoverMsg}
+          menuOpenId={msgMenuId}
+          onHover={setHoverMsg}
+          onMenuToggle={setMsgMenuId}
+          onReact={actions.toggleReaction}
+          onEdit={actions.editMessage}
+          onDelete={actions.deleteMessage}
+          onReply={actions.replyInThread}
+          onClose={actions.closeThread}
+        />
+      )}
     </div>
   );
 }

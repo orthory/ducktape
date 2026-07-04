@@ -14,6 +14,7 @@ const humanEn = [
     ],
   },
   { text: 'Network and Membership', link: '/en/human/network/network-and-membership' },
+  { text: 'Node Upgrades', link: '/en/human/network/node-upgrades' },
   { text: 'Product Modules', link: '/en/human/modules/product-modules' },
   { text: 'What Is Left', link: '/en/human/roadmap/what-is-left' },
   {
@@ -40,6 +41,7 @@ const humanKo = [
     ],
   },
   { text: 'Network and Membership', link: '/ko/human/network/network-and-membership' },
+  { text: 'Node Upgrades', link: '/ko/human/network/node-upgrades' },
   { text: 'Product Modules', link: '/ko/human/modules/product-modules' },
   { text: 'What Is Left', link: '/ko/human/roadmap/what-is-left' },
   {
@@ -61,6 +63,7 @@ const agentEn = [
       { text: 'Determinism Contract', link: '/en/agent/architecture/determinism-contract' },
       { text: 'State Sync Contract', link: '/en/agent/architecture/state-sync-contract' },
       { text: 'Validator Operations', link: '/en/agent/network/validator-operations' },
+      { text: 'Node Upgrades', link: '/en/agent/network/node-upgrades' },
     ],
   },
   { text: 'Open Work', link: '/en/agent/roadmap/open-work' },
@@ -83,6 +86,7 @@ const agentKo = [
       { text: 'Determinism Contract', link: '/ko/agent/architecture/determinism-contract' },
       { text: 'State Sync Contract', link: '/ko/agent/architecture/state-sync-contract' },
       { text: 'Validator Operations', link: '/ko/agent/network/validator-operations' },
+      { text: 'Node Upgrades', link: '/ko/agent/network/node-upgrades' },
     ],
   },
   { text: 'Open Work', link: '/ko/agent/roadmap/open-work' },

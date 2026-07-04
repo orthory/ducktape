@@ -32,8 +32,10 @@ cargo fmt --all -- --check
 ```sh
 cargo run -p demo
 cargo test -p demo --test joiner_rebuilds_global_app_hash
-cd bin/node && ./examples/demo-2node.sh
+cargo test -p node-bin --test cluster_e2e
 ```
 
 multi-module convergence, joiner rebuild, real-socket ordered node behavior를 claim할
-때 이 command를 사용한다.
+때 이 command를 사용한다. `bin/node/examples/demo-invite.sh`는 human-runnable
+invite/join/admit ceremony이고, `cluster_e2e`는 기존 bash assertion spec의
+automated gate다.

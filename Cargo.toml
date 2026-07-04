@@ -23,15 +23,17 @@ members = [
     "crates/system/valset", "crates/system/valset-interface",
     "crates/system/valset-mesh-interface",
     "crates/system/governance", "crates/system/governance-interface",
+    "crates/system/upgrade", "crates/system/upgrade-interface",
     "crates/system/wireguard-upgrade",
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
     "crates/apps/document", "crates/apps/document-interface",
     "crates/apps/chat", "crates/apps/chat-interface",
-    "crates/apps/agent", "crates/apps/agent-interface",
+    "crates/apps/agent", "crates/apps/agent-interface", "crates/apps/agent-oracle",
     "crates/apps/tasks", "crates/apps/tasks-interface",
     "crates/apps/vaults", "crates/apps/vaults-interface",
+    "crates/apps/profiles", "crates/apps/profiles-interface",
     "crates/apps/automations", "crates/apps/automations-interface",
     "crates/apps/inbox", "crates/apps/inbox-interface",
     "crates/apps/files", "crates/apps/files-interface",
@@ -55,6 +57,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
 commonware-storage = "2026.5.0"
@@ -84,13 +88,16 @@ recovery = { path = "crates/kernel/recovery" }
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
 governance = { path = "crates/system/governance" }
+upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
 chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }
+agent-oracle = { path = "crates/apps/agent-oracle" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
+profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
@@ -102,6 +109,7 @@ greeter = { path = "crates/examples/greeter" }
 kv-interface = { path = "crates/system/kv-interface" }
 valset-interface = { path = "crates/system/valset-interface" }
 governance-interface = { path = "crates/system/governance-interface" }
+upgrade-interface = { path = "crates/system/upgrade-interface" }
 valset-mesh-interface = { path = "crates/system/valset-mesh-interface" }
 wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 saga-interface = { path = "crates/system/saga-interface" }
@@ -111,6 +119,7 @@ chat-interface = { path = "crates/apps/chat-interface" }
 agent-interface = { path = "crates/apps/agent-interface" }
 tasks-interface = { path = "crates/apps/tasks-interface" }
 vaults-interface = { path = "crates/apps/vaults-interface" }
+profiles-interface = { path = "crates/apps/profiles-interface" }
 automations-interface = { path = "crates/apps/automations-interface" }
 inbox-interface = { path = "crates/apps/inbox-interface" }
 files-interface = { path = "crates/apps/files-interface" }

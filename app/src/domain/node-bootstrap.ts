@@ -1,15 +1,16 @@
 // Resolve the node this build talks to — the lifecycle side of the seam.
 //
 // Web build: the node URL comes from VITE_DUCKTAPE_NODE_URL (or the daemon's
-// dev default); there is nothing to manage, we only connect.
+// dev default); there is nothing to manage, we only connect. No onboarding —
+// the web user's node is provisioned out of band.
 //
-// Desktop build (tauri webview marker present): the daemon is OURS to manage.
-// Probe /v1/status to adopt an already-running orphan; if nothing answers,
-// invoke daemon_spawn (the shell launches `ducktape-noded` detached) and poll
-// until it comes up. Stopping is plain http — POST /v1/shutdown — because the
-// daemon's port is its identity; no pid crosses this boundary.
-
-import { invoke } from "@tauri-apps/api/core";
+// Desktop build: the node is one of the user's ~/.ducktape WORKSPACES. Which
+// workspace (and thus which http url) is the registry's call — see
+// workspace-client.ts; the Rust `workspace_select` command spawns/adopts that
+// workspace's node detached and hands back its url. This module only turns a
+// url into a transport and polls it up; workspace selection lives in the store.
+// Stopping is plain http — POST /v1/shutdown — because the node's port is its
+// identity; no pid crosses this boundary.
 
 import { remoteTransport } from "./transport";
 import type { NodeTransport } from "./transport";
@@ -19,7 +20,7 @@ import type { NodeTransport } from "./transport";
 export interface NodeResolution {
   transport: NodeTransport;
   url: string;
-  /** True when this app owns the daemon lifecycle (desktop build). */
+  /** True when this app owns the node lifecycle (desktop workspaces). */
   managed: boolean;
 }
 
@@ -35,31 +36,54 @@ export const isTauri = (): boolean =>
 const webUrl = (): string =>
   import.meta.env.VITE_DUCKTAPE_NODE_URL || `http://${DEFAULT_LISTEN}`;
 
-export const resolveNode = (): Promise<NodeResolution> => {
-  if (!isTauri()) {
-    const url = webUrl();
-    return Promise.resolve({ transport: remoteTransport(url), url, managed: false });
-  }
-  const url = `http://${DEFAULT_LISTEN}`;
-  const transport = remoteTransport(url);
-  return Promise.resolve()
-    .then(() => ensureDaemon(transport))
-    .then(() => ({ transport, url, managed: true }));
+/** Web build: dial the configured node url. Nothing to manage. */
+export const resolveNode = (): NodeResolution => {
+  const url = webUrl();
+  return { transport: remoteTransport(url), url, managed: false };
 };
 
-/** Adopt a live daemon, or spawn one detached and wait for it to answer. */
-export const ensureDaemon = (transport: NodeTransport): Promise<void> =>
-  Promise.resolve()
-    .then(() => transport.status())
-    .then(
-      () => undefined, // already up — adopt it
-      () =>
-        Promise.resolve()
-          .then(() => invoke("daemon_spawn", { listen: DEFAULT_LISTEN }))
-          .then(() => pollUntilUp(transport, POLL_ATTEMPTS)),
-    );
+/** Desktop build: wrap a selected workspace's node url as a managed
+ *  resolution. The Rust side already spawned/adopted the process. */
+export const connectWorkspace = (httpUrl: string): NodeResolution => ({
+  transport: remoteTransport(httpUrl),
+  url: httpUrl,
+  managed: true,
+});
 
-/** Ask the daemon to exit gracefully. */
+/** Connect to a node running on ANOTHER device, reachable over plain
+ *  http/https. Unmanaged: this app only dials the url the user gave — it never
+ *  spawns, adopts, or stops the process (so the daemon controls stay hidden,
+ *  same as the web build). The transport is already url-agnostic; this is just
+ *  the lifecycle label. */
+export const connectRemote = (httpUrl: string): NodeResolution => ({
+  transport: remoteTransport(httpUrl),
+  url: httpUrl,
+  managed: false,
+});
+
+/** Coerce user input into a dial-able node url: accept a full `http(s)://…`
+ *  verbatim, and default a bare `host` / `host:port` to `http://`. Trailing
+ *  slashes are the transport's to strip. Empty in → empty out (caller guards). */
+export const normalizeNodeUrl = (raw: string): string => {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+};
+
+/** Poll /v1/status until the node answers, or reject after `attempts`. */
+export const waitUntilUp = (
+  transport: NodeTransport,
+  attempts: number = POLL_ATTEMPTS,
+): Promise<void> =>
+  transport.status().then(
+    () => undefined,
+    (err) =>
+      attempts <= 1
+        ? Promise.reject(new Error(`the node did not come up: ${err}`))
+        : wait(POLL_DELAY_MS).then(() => waitUntilUp(transport, attempts - 1)),
+  );
+
+/** Ask a node to exit gracefully (POST /v1/shutdown). */
 export const shutdownNode = (url: string): Promise<void> =>
   Promise.resolve()
     .then(() => fetch(`${url.replace(/\/$/, "")}/v1/shutdown`, { method: "POST" }))
@@ -71,12 +95,3 @@ export const shutdownNode = (url: string): Promise<void> =>
 
 const wait = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
-
-const pollUntilUp = (transport: NodeTransport, attempts: number): Promise<void> =>
-  transport.status().then(
-    () => undefined,
-    (err) =>
-      attempts <= 1
-        ? Promise.reject(new Error(`the node daemon did not come up: ${err}`))
-        : wait(POLL_DELAY_MS).then(() => pollUntilUp(transport, attempts - 1)),
-  );

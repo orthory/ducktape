@@ -49,6 +49,7 @@ const makeFakeNode = () => {
   const messagesByChannel: Record<string, (typeof GENERAL_MESSAGE)[]> = {
     general: [GENERAL_MESSAGE],
   };
+  let forgeHead: string | null = null;
   const transport: NodeTransport = {
     submit: vi.fn((target: string, payload: unknown) => {
       const create = (payload as { CreateChannel?: { channel_id: string; name: string } })
@@ -56,6 +57,9 @@ const makeFakeNode = () => {
       if (target === "chat" && create) {
         channels.push(wireChannel(create.channel_id, create.name, 2));
         messagesByChannel[create.channel_id] = [];
+      }
+      if (target === "forge" && (payload as { Commit?: unknown }).Commit) {
+        forgeHead = "a".repeat(40);
       }
       return Promise.resolve({ height: 2, appHash: "bb".repeat(32) });
     }),
@@ -75,8 +79,30 @@ const makeFakeNode = () => {
           Thread: { root: GENERAL_MESSAGE, replies: [] },
         });
       }
+      if (target === "forge") {
+        return Promise.resolve({ Head: forgeHead });
+      }
+      if (target === "agent") {
+        if (query === "Agents") return Promise.resolve({ Agents: [] });
+        if (query === "Watches") return Promise.resolve({ Watches: [] });
+        return Promise.resolve({ Runs: [] });
+      }
+      if (target === "profiles") {
+        return Promise.resolve({ Profiles: [] });
+      }
+      if (target === "valset") {
+        return Promise.resolve({ Validators: [[0xde, 0xad, 0xbe, 0xef]] });
+      }
+      if (target === "document") {
+        // refresh now enumerates the doc index (ListDocs) and, when a doc is
+        // open, re-reads its blocks (GetDoc) — answer both so refresh resolves.
+        if (query === "ListDocs") return Promise.resolve({ DocList: [] });
+        return Promise.resolve({ Doc: null });
+      }
       return Promise.resolve({ Tasks: [] });
     }),
+    putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
+    getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
     status: vi.fn().mockResolvedValue({
       version: "0.1.0",
       appHash: "aa".repeat(32),
@@ -87,6 +113,8 @@ const makeFakeNode = () => {
       blockListeners.add(listener);
       return () => blockListeners.delete(listener);
     }),
+    telemetry: vi.fn().mockResolvedValue([]),
+    onTelemetry: vi.fn(() => () => {}),
   };
   const finalize = (block: BlockEvent) =>
     blockListeners.forEach((notify) => notify(block));
@@ -104,6 +132,10 @@ function Probe() {
       <span data-testid="channel">{state.activeChannel ?? "none"}</span>
       <span data-testid="messages">{state.messages.length}</span>
       <span data-testid="thread">{state.activeThread ? "open" : "closed"}</span>
+      <span data-testid="forge">{state.forgeHead ?? "unborn"}</span>
+      <span data-testid="members">{state.members.length}</span>
+      <span data-testid="member-keys">{state.members.join(",")}</span>
+      <span data-testid="connected">{String(state.connected)}</span>
     </div>
   );
 }
@@ -127,6 +159,17 @@ describe("DucktapeProvider", () => {
       expect(screen.getByTestId("channel").textContent).toBe("general");
       expect(screen.getByTestId("messages").textContent).toBe("1");
     });
+  });
+
+  it("hydrates validator members from valset", async () => {
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("members").textContent).toBe("1");
+      expect(screen.getByTestId("member-keys").textContent).toBe("deadbeef");
+    });
+    expect(transport.query).toHaveBeenCalledWith("valset", "Validators");
   });
 
   it("sendMessage posts a paragraph block with the author as submit origin", async () => {
@@ -195,7 +238,7 @@ describe("DucktapeProvider", () => {
     );
 
     await act(async () => {
-      capturedActions!.createChannel("Release Party");
+      capturedActions!.createChannel("Release Party", "Open");
     });
 
     await waitFor(() => {
@@ -203,6 +246,80 @@ describe("DucktapeProvider", () => {
       // the stale-pane bug left #general's message list (1) showing here
       expect(screen.getByTestId("messages").textContent).toBe("0");
       expect(screen.getByTestId("thread").textContent).toBe("closed");
+    });
+  });
+
+  // Regression (found in headless QA): a node that goes silently unreachable —
+  // it stops answering with no error and stops sending blocks — must flip the UI
+  // to disconnected, and must auto-reconnect when it returns. The block stream
+  // alone can't do this (silence is ambiguous: a healthy idle node sends none
+  // either), so the liveness heartbeat polls status() and drives `connected`.
+  it("detects a node that goes silently unreachable, then auto-reconnects", async () => {
+    vi.useFakeTimers();
+    try {
+      const { transport } = makeFakeNode();
+      let nodeUp = true;
+      vi.mocked(transport.status).mockImplementation(() =>
+        nodeUp
+          ? Promise.resolve({
+              version: "0.1.0",
+              appHash: "aa".repeat(32),
+              height: 1,
+              modules: [],
+            })
+          : Promise.reject(new Error("connection refused")),
+      );
+
+      renderConsole(transport);
+      // initial hydrate → connected
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(screen.getByTestId("connected").textContent).toBe("true");
+
+      // node goes away: no error surfaces on the block stream, but the next
+      // heartbeat's status() rejects → the UI must reflect disconnected.
+      nodeUp = false;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3100);
+      });
+      expect(screen.getByTestId("connected").textContent).toBe("false");
+
+      // node returns: the heartbeat's status() succeeds again → re-hydrate.
+      nodeUp = true;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3100);
+      });
+      expect(screen.getByTestId("connected").textContent).toBe("true");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("commitForge submits a Commit msg and hydrates the new HEAD", async () => {
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("forge").textContent).toBe("unborn"),
+    );
+
+    await act(async () => {
+      capturedActions!.commitForge({
+        path: "README.md",
+        content: "hello forge",
+        message: "init",
+      });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("forge").textContent).toBe("a".repeat(40)),
+    );
+    const forgeCall = vi
+      .mocked(transport.submit)
+      .mock.calls.find((call) => call[0] === "forge");
+    expect(forgeCall).toBeTruthy();
+    expect(forgeCall![1]).toEqual({
+      Commit: { path: "README.md", content: "hello forge", message: "init" },
     });
   });
 });

@@ -1,10 +1,11 @@
-//! a runnable super-app demo: fifteen registered modules — a qmdb-backed kv, a
+//! a runnable super-app demo: sixteen registered modules — a qmdb-backed kv, a
 //! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
 //! qmdb-backed block DOCUMENT module, a qmdb-backed block-based CHAT module, an
 //! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
-//! orchestrator, a TASKS ledger, the AUTOMATIONS rule engine, the INBOX
-//! notification queues, a content-addressed FILES module, the MEMORY shared
-//! agent workspace, and the JOBS work board — dispatched over ONE host, showing
+//! orchestrator, a TASKS ledger, the origin-gated PROFILES name registry, the
+//! AUTOMATIONS rule engine, the INBOX notification queues, a content-addressed
+//! FILES module, the MEMORY shared agent workspace, and the JOBS work board —
+//! dispatched over ONE host, showing
 //! the app-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
 //! block.
@@ -12,7 +13,7 @@
 //!
 //! run: `cargo run -p demo`
 
-use agent::AgentModule;
+use agent::{AgentModule, run_id_for, saga_id_for};
 use agent_interface::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, TurnPolicy,
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
@@ -48,8 +49,9 @@ use inbox_interface::{
     InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
-use memory::Memory;
 use jobs::Jobs;
+use memory::Memory;
+use profiles::Profiles;
 use saga::SagaModule;
 use saga_interface::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
@@ -79,12 +81,19 @@ fn main() {
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");
         let tasks = Tasks::new("tasks");
+        let profiles = Profiles::new("profiles");
         let inbox = Inbox::new("inbox");
         let files = Files::new("files");
-        let memory = Memory::new("memory");
+        let memory = Memory::new("memory", "files");
         let jobs = Jobs::new("jobs");
-        let agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
-        let automations = Automations::new("automations", "chat", "tasks");
+        let agent = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        );
+        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
@@ -95,6 +104,7 @@ fn main() {
             Box::new(valset),
             Box::new(saga),
             Box::new(tasks),
+            Box::new(profiles),
             Box::new(inbox),
             Box::new(files),
             Box::new(memory),
@@ -104,7 +114,7 @@ fn main() {
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 15 registered modules over one host ===");
+        println!("=== super-app demo — 16 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -157,6 +167,8 @@ fn main() {
             .submit(Msg {
                 target: "forge".into(),
                 payload: forge_encode_msg(&ForgeMsg::Commit {
+                    // empty repo -> the default repo (back-compat wire).
+                    repo: String::new(),
                     path: "README.md".into(),
                     content: "# hello from a git-backed module\n".into(),
                     message: "forge: initial commit".into(),
@@ -226,7 +238,7 @@ fn main() {
             .public_key()
             .as_ref()
             .to_vec();
-        let as_demo_user = || BlockContext {
+        let as_demo_user = || BlockContext { protocol_version: 0,
             height: 0,
             consensus_time: 0,
             origin: Origin::External(demo_user.clone()),
@@ -341,7 +353,7 @@ fn main() {
         // orchestration lane genesis seeding uses.
         let out = host
             .submit_at(
-                host::BlockContext {
+                host::BlockContext { protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: sdk::Origin::System,
@@ -446,7 +458,8 @@ fn main() {
         // block 8: the agent-collaboration loop (design §3). register an agent
         // (which model+prompt it runs is committed into the app-hash), watch
         // the chat channel under a Mention policy — the watch and chat's hook
-        // registration commit atomically — then post a message MENTIONING the
+        // registration commit atomically — enable the agent module as the
+        // jobs-board worker by agent admin op (not genesis config), then post a message MENTIONING the
         // agent: the very same block carries the post, the hook delivery, the
         // run record, and the saga trigger. the emitted WorkerRequest effect
         // is the off-consensus LLM seam a reactor driver answers as an
@@ -466,6 +479,15 @@ fn main() {
         )
         .await
         .expect("submit block 8 register");
+        host.submit_at(
+            as_demo_user(),
+            Msg {
+                target: "agent".into(),
+                payload: agent_encode_msg(&AgentMsg::EnableJobWorker { enabled: true }),
+            },
+        )
+        .await
+        .expect("submit block 8 enable jobs worker");
         host.submit_at(
             as_demo_user(),
             Msg {
@@ -506,16 +528,19 @@ fn main() {
             )
             .await
             .expect("submit block 8 mention");
-        println!("\n[block 8] agent <- Register + Watch(Mention); chat <- PostMessage(@quackbot)");
+        println!(
+            "\n[block 8] agent <- Register; agent <- EnableJobWorker(true); agent <- Watch(Mention); chat <- PostMessage(@quackbot)"
+        );
         println!(
             "  effects        : {} WorkerRequest (the off-consensus LLM seam)",
             out.effects.len()
         );
+        let run_id = run_id_for("general", 3, "quackbot");
         let reply = host
             .query(
                 "agent",
                 &agent_encode_query(&AgentQuery::Run {
-                    run_id: "general/3/quackbot".into(),
+                    run_id: run_id.clone(),
                 }),
             )
             .await
@@ -526,11 +551,12 @@ fn main() {
                 run.run_id, run.status, run.anchor_seq
             );
         }
+        let saga_id = saga_id_for(&run_id);
         let reply = host
             .query(
                 "saga",
                 &saga_encode_query(&SagaQuery::Get {
-                    saga_id: "agent/general/3/quackbot".into(),
+                    saga_id: saga_id.clone(),
                 }),
             )
             .await
@@ -539,8 +565,8 @@ fn main() {
             panic!("the run's saga must exist");
         };
         println!(
-            "  saga           : agent/general/3/quackbot {:?} (deadline view {:?})",
-            saga_view.status, saga_view.deadline
+            "  saga           : {} {:?} (deadline view {:?})",
+            saga_id, saga_view.status, saga_view.deadline
         );
         println!("  (post + hook + run + trigger: ONE block — the P2 atomic cascade)");
         println!("  app-hash       : {:?}", out.app_hash);
@@ -551,7 +577,7 @@ fn main() {
         // path (no external push service). the queue holds it as consensus state.
         let out = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 0,
                     consensus_time: 9,
                     // the submitter's id — the inbox derives `source` from this
@@ -604,6 +630,7 @@ fn main() {
             "inbox",
             "jobs",
             "kv",
+            "profiles",
             "saga",
             "tasks",
             "valset",

@@ -28,7 +28,9 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use valset_interface::{decode_msg, decode_query, encode_reply, ValsetMsg, ValsetQuery, ValsetReply};
+use valset_interface::{
+    ValsetMsg, ValsetQuery, ValsetReply, decode_msg, decode_query, encode_reply,
+};
 
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
@@ -45,7 +47,11 @@ pub struct Valset {
 
 impl Valset {
     pub fn new(id: impl Into<ModuleId>) -> Self {
-        Self { id: id.into(), validators: BTreeSet::new(), pending: BTreeMap::new() }
+        Self {
+            id: id.into(),
+            validators: BTreeSet::new(),
+            pending: BTreeMap::new(),
+        }
     }
 
     /// direct sync add (handy for genesis seeding / tests). does NOT validate —
@@ -106,9 +112,8 @@ impl Valset {
     /// deliberately excluded — a snapshot ships what consensus committed to, and
     /// staged-but-uncommitted changes are not that.
     pub fn snapshot(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            8 + self.validators.iter().map(|k| 8 + k.len()).sum::<usize>(),
-        );
+        let mut out =
+            Vec::with_capacity(8 + self.validators.iter().map(|k| 8 + k.len()).sum::<usize>());
         out.extend_from_slice(&(self.validators.len() as u64).to_le_bytes());
         for k in &self.validators {
             out.extend_from_slice(&(k.len() as u64).to_le_bytes());
@@ -245,7 +250,24 @@ impl Module for Valset {
                 Self::validate_key(&key)?;
                 self.stage_add(key);
             }
-            ValsetMsg::Leave { key } => self.stage_remove(key),
+            ValsetMsg::Leave { key } => {
+                // the validator set must NEVER go empty. a downstream orderer
+                // reconfigured to zero validators hits commonware `quorum(0)`,
+                // which panics ("n must not be zero") and halts the node. refuse
+                // a removal that would drop the LAST validator. authoritative
+                // here: every membership removal (a governance-passed
+                // RemoveValidator or genesis orchestration) funnels through this
+                // arm, so the invariant holds no matter who staged it — the set
+                // is closed under this rule regardless of the caller.
+                let mut after: BTreeSet<Vec<u8>> = self.effective().into_iter().collect();
+                after.remove(&key);
+                if after.is_empty() {
+                    return Err(Error::Module(
+                        "refusing to remove the last validator: the set must never be empty".into(),
+                    ));
+                }
+                self.stage_remove(key);
+            }
         }
         Ok(())
     }
@@ -253,9 +275,7 @@ impl Module for Valset {
     /// read projection — the committed set plus this block's staged changes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            ValsetQuery::Validators => {
-                Ok(encode_reply(&ValsetReply::Validators(self.effective())))
-            }
+            ValsetQuery::Validators => Ok(encode_reply(&ValsetReply::Validators(self.effective()))),
         }
     }
 
@@ -294,7 +314,7 @@ mod tests {
     impl TestCtx {
         fn new() -> Self {
             Self {
-                env: sdk::Env {
+                env: sdk::Env { protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: sdk::Origin::System,
@@ -305,9 +325,15 @@ mod tests {
     }
     #[async_trait::async_trait(?Send)]
     impl Ctx for TestCtx {
-        fn env(&self) -> &sdk::Env { &self.env }
-        fn module_root(&self, _t: &str) -> Option<StateRoot> { None }
-        async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> { Err(Error::QueryUnsupported) }
+        fn env(&self) -> &sdk::Env {
+            &self.env
+        }
+        fn module_root(&self, _t: &str) -> Option<StateRoot> {
+            None
+        }
+        async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
+            Err(Error::QueryUnsupported)
+        }
         fn emit_msg(&mut self, _m: Msg) {}
         fn emit_event(&mut self, _e: sdk::Event) {}
         fn request_effect(&mut self, _e: sdk::Effect) {}
@@ -322,13 +348,20 @@ mod tests {
     }
 
     fn join(key: &[u8]) -> Msg {
-        Msg { target: "valset".into(), payload: encode_msg(&ValsetMsg::Join { key: key.to_vec() }) }
+        Msg {
+            target: "valset".into(),
+            payload: encode_msg(&ValsetMsg::Join { key: key.to_vec() }),
+        }
     }
     fn leave(key: &[u8]) -> Msg {
-        Msg { target: "valset".into(), payload: encode_msg(&ValsetMsg::Leave { key: key.to_vec() }) }
+        Msg {
+            target: "valset".into(),
+            payload: encode_msg(&ValsetMsg::Leave { key: key.to_vec() }),
+        }
     }
     fn validators(v: &Valset) -> Vec<Vec<u8>> {
-        let reply = futures::executor::block_on(v.query(&encode_query(&ValsetQuery::Validators))).unwrap();
+        let reply =
+            futures::executor::block_on(v.query(&encode_query(&ValsetQuery::Validators))).unwrap();
         match valset_interface::decode_reply(&reply).unwrap() {
             ValsetReply::Validators(list) => list,
         }
@@ -344,27 +377,83 @@ mod tests {
         futures::executor::block_on(v.execute(&mut ctx, &join(&k))).unwrap();
         // staged, not yet committed: root still ZERO, but read-your-writes sees it.
         assert_eq!(v.root(), StateRoot::ZERO, "root reflects committed only");
-        assert_eq!(validators(&v), vec![k.clone()], "read-your-writes sees the stage");
+        assert_eq!(
+            validators(&v),
+            vec![k.clone()],
+            "read-your-writes sees the stage"
+        );
 
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert_ne!(v.root(), StateRoot::ZERO, "a committed join moves the root off ZERO");
+        assert_ne!(
+            v.root(),
+            StateRoot::ZERO,
+            "a committed join moves the root off ZERO"
+        );
         assert_eq!(validators(&v), vec![k]);
     }
 
     #[test]
     fn leave_removes_a_validator() {
+        // remove ONE of two validators — the set stays non-empty, so the
+        // last-validator guard never fires. (removing the last validator is a
+        // refused no-op; see `leaving_the_last_validator_is_refused`.)
         let mut v = Valset::new("valset");
         let mut ctx = TestCtx::new();
-        let k = valid_key(2);
-        futures::executor::block_on(v.execute(&mut ctx, &join(&k))).unwrap();
+        let (keep, drop) = (valid_key(2), valid_key(3));
+        futures::executor::block_on(v.execute(&mut ctx, &join(&keep))).unwrap();
+        futures::executor::block_on(v.execute(&mut ctx, &join(&drop))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
         let joined_root = v.root();
 
-        futures::executor::block_on(v.execute(&mut ctx, &leave(&k))).unwrap();
+        futures::executor::block_on(v.execute(&mut ctx, &leave(&drop))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert!(validators(&v).is_empty(), "leave removes the validator");
-        assert_eq!(v.root(), StateRoot::ZERO, "an empty set is back to ZERO");
-        assert_ne!(v.root(), joined_root);
+        assert_eq!(validators(&v), vec![keep], "leave removes exactly that key");
+        assert_ne!(v.root(), joined_root, "the committed root moved");
+        assert_ne!(v.root(), StateRoot::ZERO, "a non-empty set is not ZERO");
+    }
+
+    #[test]
+    fn leaving_the_last_validator_is_refused() {
+        // the set must never go empty: an orderer reconfigured to zero
+        // validators hits commonware `quorum(0)`, which panics. removing the
+        // SOLE validator is refused deterministically, and the set is untouched.
+        let mut v = Valset::new("valset");
+        let mut ctx = TestCtx::new();
+        let solo = valid_key(7);
+        futures::executor::block_on(v.execute(&mut ctx, &join(&solo))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        let before = v.root();
+
+        let err = futures::executor::block_on(v.execute(&mut ctx, &leave(&solo))).unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("last validator")),
+            "got {err:?}"
+        );
+        // read-your-writes: nothing was staged, so the sole validator remains.
+        assert_eq!(validators(&v), vec![solo], "the last validator stays");
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert_eq!(v.root(), before, "committed set is byte-identical");
+        assert_ne!(v.root(), StateRoot::ZERO, "the set never went empty");
+    }
+
+    #[test]
+    fn leaving_the_last_of_a_shrinking_set_is_refused() {
+        // stage two leaves in one block: the first (of two) is fine, the second
+        // would empty the set within the same block's read-your-writes view and
+        // is refused — the guard reads the EFFECTIVE (staged-over-committed) set.
+        let mut v = Valset::new("valset");
+        let mut ctx = TestCtx::new();
+        let (a, b) = (valid_key(4), valid_key(5));
+        futures::executor::block_on(v.execute(&mut ctx, &join(&a))).unwrap();
+        futures::executor::block_on(v.execute(&mut ctx, &join(&b))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+
+        futures::executor::block_on(v.execute(&mut ctx, &leave(&a))).unwrap();
+        let err = futures::executor::block_on(v.execute(&mut ctx, &leave(&b))).unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("last validator")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -376,7 +465,10 @@ mod tests {
         // wrong-LENGTH key is the reliable reject path.
         let bad = vec![0u8; 16];
         let err = futures::executor::block_on(v.execute(&mut ctx, &join(&bad))).unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "malformed key errs with Module");
+        assert!(
+            matches!(err, Error::Module(_)),
+            "malformed key errs with Module"
+        );
         futures::executor::block_on(v.commit_block()).unwrap();
         assert!(validators(&v).is_empty(), "a rejected join adds nothing");
         assert_eq!(v.root(), StateRoot::ZERO);
@@ -391,7 +483,11 @@ mod tests {
             futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
         }
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert_eq!(validators(&v).len(), 3, "any valid key joins, permissionlessly");
+        assert_eq!(
+            validators(&v).len(),
+            3,
+            "any valid key joins, permissionlessly"
+        );
     }
 
     #[test]
@@ -429,7 +525,11 @@ mod tests {
         futures::executor::block_on(v.abort_block()).unwrap();
 
         assert!(validators(&v).is_empty(), "aborted join added no validator");
-        assert_eq!(v.root(), before, "root is unchanged after a rolled-back block");
+        assert_eq!(
+            v.root(),
+            before,
+            "root is unchanged after a rolled-back block"
+        );
     }
 
     #[test]
@@ -458,8 +558,16 @@ mod tests {
         futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
 
         dst.install(&bytes, src_root).unwrap();
-        assert_eq!(dst.root(), src_root, "installed root equals the source root");
-        assert_eq!(validators(&dst), validators(&src), "query parity after install");
+        assert_eq!(
+            dst.root(),
+            src_root,
+            "installed root equals the source root"
+        );
+        assert_eq!(
+            validators(&dst),
+            validators(&src),
+            "query parity after install"
+        );
     }
 
     #[test]
@@ -491,9 +599,20 @@ mod tests {
         let pre_view = validators(&dst);
 
         let err = dst.install(&bytes, src_root).unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "tampered snapshot errs with Module");
-        assert_eq!(dst.root(), pre_root, "failed install leaves the committed root untouched");
-        assert_eq!(validators(&dst), pre_view, "failed install leaves membership and stage untouched");
+        assert!(
+            matches!(err, Error::Module(_)),
+            "tampered snapshot errs with Module"
+        );
+        assert_eq!(
+            dst.root(),
+            pre_root,
+            "failed install leaves the committed root untouched"
+        );
+        assert_eq!(
+            validators(&dst),
+            pre_view,
+            "failed install leaves membership and stage untouched"
+        );
     }
 
     #[test]
@@ -543,7 +662,11 @@ mod tests {
         let src = Valset::new("valset");
         assert_eq!(src.root(), StateRoot::ZERO);
         let bytes = src.snapshot();
-        assert_eq!(bytes, 0u64.to_le_bytes().to_vec(), "an empty set is a lone zero count");
+        assert_eq!(
+            bytes,
+            0u64.to_le_bytes().to_vec(),
+            "an empty set is a lone zero count"
+        );
 
         let mut dst = Valset::new("valset");
         dst.install(&bytes, StateRoot::ZERO).unwrap();

@@ -1,7 +1,6 @@
 import { useContext } from "react";
 
-import { ConsoleContext } from "./DucktapeProvider";
-import type { ConsoleContextValue } from "./DucktapeProvider";
+import { ConsoleContext, type ConsoleContextValue } from "./context";
 
 export function useDucktape(): ConsoleContextValue {
   const value = useContext(ConsoleContext);

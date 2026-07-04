@@ -10,6 +10,8 @@ sdk = { workspace = true }
 automations-interface = { workspace = true }
 chat-interface = { workspace = true }
 tasks-interface = { workspace = true }
+inbox-interface = { workspace = true }
+memory-interface = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 
@@ -18,4 +20,6 @@ futures = "0.3"
 host = { workspace = true }
 tasks = { workspace = true }
 chat = { workspace = true }
+inbox = { workspace = true }
+memory = { workspace = true }
 commonware-runtime = { workspace = true }

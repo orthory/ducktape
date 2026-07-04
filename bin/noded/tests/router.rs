@@ -7,7 +7,7 @@ use axum::http::{Request, StatusCode, header};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use http_body_util::BodyExt as _;
-use noded::{BlockSummary, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
+use noded::{BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
 use tower::ServiceExt as _;
 
 /// a scripted actor: answers every command the same way, like a module host
@@ -60,8 +60,15 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                         modules: vec![ModuleStatus {
                             id: "chat".into(),
                             root: "ef".repeat(32),
+                            category: ModuleCategory::of("chat"),
                         }],
                     });
+                }
+                NodeCommand::Metrics { reply } => {
+                    let _ = reply.send(
+                        "# HELP ducktape_blocks_total blocks\nducktape_blocks_total 3\n# EOF\n"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -186,6 +193,42 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(body["height"], 3);
     assert_eq!(body["modules"][0]["id"], "chat");
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
+    // the catalog category rides on the wire as a lowercase string.
+    assert_eq!(body["modules"][0]["category"], "workspace");
+}
+
+#[tokio::test]
+async fn metrics_forwards_the_encoded_registry_as_openmetrics_text() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.contains("openmetrics-text"),
+        "scrape content type, got {content_type:?}",
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).expect("metrics body is utf-8");
+    assert!(
+        text.contains("ducktape_blocks_total 3"),
+        "actor body passed through: {text:?}"
+    );
 }
 
 #[tokio::test]

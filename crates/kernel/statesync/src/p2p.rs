@@ -24,8 +24,10 @@ use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{Clock, IoBuf, Spawner};
 use futures::channel::oneshot;
 
-use crate::{decode_response, decode_rpc, encode_request, encode_rpc, SyncClient, SyncError,
-    SyncRequest, SyncResponse};
+use crate::{
+    SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, decode_rpc, encode_request,
+    encode_rpc,
+};
 
 /// the reaper's sweep interval. a request survives at most two sweeps, so the
 /// effective request timeout is between one and two intervals (3–6s).
@@ -119,7 +121,11 @@ where
             }
             // channel closed: drop every waiter so requests fail instead of
             // hanging forever.
-            task_shared.pending.lock().expect("pending poisoned").clear();
+            task_shared
+                .pending
+                .lock()
+                .expect("pending poisoned")
+                .clear();
         });
         Self {
             sender,

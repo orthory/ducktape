@@ -36,6 +36,15 @@ pub fn take_u64(buf: &mut &[u8]) -> Result<u64, WireError> {
     Ok(v)
 }
 
+pub fn take_u32(buf: &mut &[u8]) -> Result<u32, WireError> {
+    let Some((head, rest)) = buf.split_first_chunk::<4>() else {
+        return Err(WireError::Truncated);
+    };
+    let v = u32::from_le_bytes(*head);
+    *buf = rest;
+    Ok(v)
+}
+
 pub fn take_array<const N: usize>(buf: &mut &[u8]) -> Result<[u8; N], WireError> {
     let Some((head, rest)) = buf.split_first_chunk::<N>() else {
         return Err(WireError::Truncated);

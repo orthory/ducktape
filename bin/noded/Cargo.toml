@@ -20,17 +20,44 @@ host = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
+profiles = { workspace = true }
 inbox = { workspace = true }
+automations = { workspace = true }
+jobs = { workspace = true }
+agent = { workspace = true }
+agent-interface = { workspace = true }
+agent-oracle = { workspace = true }
+saga = { workspace = true }
+saga-interface = { workspace = true }
 document = { workspace = true }
 forge = { workspace = true }
+# the forge module's wire types — the git smart-HTTP receive-pack bridge encodes
+# ForgeMsg::Push / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
+# route pair; every other route stays module-agnostic opaque json).
+forge-interface = { workspace = true }
+files = { workspace = true }
+memory = { workspace = true }
+chat-interface = { workspace = true }
+reactor = { workspace = true }
+# the blob lane shares the files wire constants (chunk cap) and, in tests, the
+# manifest verification helpers.
+files-interface = { workspace = true }
 
 commonware-runtime = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
+# inflate a gzip-compressed git receive-pack request body (Content-Encoding: gzip).
+flate2 = "1"
+# the git upload-pack (clone/fetch) lane opens a forge repo READ-ONLY and builds
+# the wanted oids' closure into a packfile. same vendored libgit2 forge builds,
+# so the node stays self-contained (no host `git`); default-features drops the
+# ssh/https transport forge doesn't use either.
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 
 [dev-dependencies]

@@ -80,7 +80,7 @@ impl Module for ResolverBackedModule {
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "requires a module-specific sync target plus DbResolver".into(),
+            detail: "requires a manifest-pinned sync target plus DbResolver".into(),
         })
     }
 
@@ -94,7 +94,7 @@ fn block(height: u64, app_hash: StateRoot) -> FinalizedBlock {
 }
 
 fn ctx(height: u64) -> BlockContext {
-    BlockContext {
+    BlockContext { protocol_version: 0,
         height,
         consensus_time: height * 10,
         origin: Origin::System,
@@ -161,7 +161,7 @@ fn snapshot_capture_uses_the_finalized_app_hash_boundary() {
             resolver.state_sync,
             StateSyncHandle::ResolverBacked {
                 backend: "qmdb".into(),
-                detail: "requires a module-specific sync target plus DbResolver".into(),
+                detail: "requires a manifest-pinned sync target plus DbResolver".into(),
             },
         );
         assert!(

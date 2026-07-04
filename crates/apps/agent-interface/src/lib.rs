@@ -16,7 +16,7 @@
 //!   deterministically validates it against the agent's allowed-action set.
 //! - [`AgentQuery`] -> [`AgentReply`] — reads over agents, watches, and runs.
 
-use chat_interface::Block;
+use chat_interface::{Block, MessageView};
 use saga_interface::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -141,8 +141,9 @@ impl RunStatus {
 /// a run's observable state — the full read projection.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RunView {
-    /// `"{channel_id}/{anchor_seq}/{agent_id}"` — the turn-claim key: the
-    /// first creation in consensus order wins, duplicates are no-ops.
+    /// `"chat\x1f{channel_id}\x1f{anchor_seq}\x1f{agent_id}"` for chat runs
+    /// and `"job\x1f{job_id}\x1f{agent_id}\x1f{job_claim_height}"` for job runs:
+    /// the first creation in consensus order wins, duplicates are no-ops.
     pub run_id: String,
     pub agent_id: String,
     pub channel_id: String,
@@ -152,6 +153,10 @@ pub struct RunView {
     /// the anchor's thread root, if the anchor was a thread reply — the reply
     /// posts into the same thread.
     pub thread_root: Option<u64>,
+    /// present for jobs-board runs. chat-triggered runs leave this `None`.
+    pub job_id: Option<String>,
+    /// the jobs claim height for job-backed runs. chat-triggered runs use 0.
+    pub job_claim_height: u64,
     /// the run-creating origin (the hook's chat module, or the explicit
     /// `RequestRun` submitter) — a cancel capability alongside the owner.
     pub requester: SagaOrigin,
@@ -177,7 +182,14 @@ pub struct LlmRequest {
     pub prompt_hash: Vec<u8>,
     pub channel_id: String,
     pub anchor_seq: u64,
+    /// present for jobs-board runs. for those runs `context_hash` pins the
+    /// submitted job spec bytes instead of a chat transcript prefix.
+    pub job_id: Option<String>,
     pub context_hash: Vec<u8>,
+    /// the pinned chat transcript window the run was staged from. older specs
+    /// decode with an empty transcript; job-backed runs also leave this empty.
+    #[serde(default)]
+    pub transcript: Vec<MessageView>,
 }
 
 /// one validated cross-module write an agent's output may request.
@@ -249,6 +261,9 @@ pub enum AgentMsg {
     },
     /// drop the watch and unregister the hook, atomically.
     UnwatchChannel { channel_id: String },
+    /// opt the agent module into or out of jobs-board submit notifications.
+    /// the jobs module derives the worker id from this module's follow-up origin.
+    EnableJobWorker { enabled: bool },
     /// explicitly run `agent_id` against `channel_id`/`anchor_seq` without a
     /// hook. the duplicate of an existing run is a deterministic no-op — the
     /// turn claim: first creation in consensus order wins.

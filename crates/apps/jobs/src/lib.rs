@@ -44,17 +44,25 @@
 //! staged overlay; transition guards keep an overlay-aware view internally so
 //! in-block effects (a first claim) are visible to later ops in the same block.
 //!
+//! registered workers are consensus state. every successful `Submit` emits one
+//! `JobsEvent::Submitted` follow-up per worker in the submitter's block; that
+//! fan-out counts toward the host dispatch budget. THIS SLICE supports one
+//! claiming worker for a given kind: if two workers claim the same job in that
+//! submit cascade, the second claim rejects against the first staged claim and
+//! the whole submit block aborts atomically (P2). `MAX_WORKERS` is reserved for
+//! later off-cascade strategies, not multiple in-cascade claimants per kind.
+//!
 //! # the board is a queue, not an archive
 //!
 //! terminal jobs stay on the board until their submitter `Prune`s them. this is
 //! deliberate: the alternative (auto-retaining every finalized job forever) is
 //! unbounded state growth. pruning is the submitter's explicit opt-in to forget.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jobs_interface::{
-    BoardCounts, Claim, Job, JobResult, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_msg,
-    decode_query, encode_reply,
+    BoardCounts, Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
+    decode_msg, decode_query, encode_event, encode_reply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
@@ -77,13 +85,21 @@ pub const MAX_LEASE_VIEWS: u64 = 10_000;
 pub const MAX_ATTEMPTS: u64 = 8;
 /// hard clamp on a `List` query's `limit`.
 pub const MAX_LIST_LIMIT: u64 = 256;
+/// max registered worker modules notified on each successful submit.
+pub const MAX_WORKERS: usize = 16;
+/// max bytes of a worker module id.
+pub const MAX_WORKER_MODULE_ID: usize = 256;
 
 pub struct Jobs {
     id: ModuleId,
     /// committed board; `root()` hashes exactly this map.
     jobs: BTreeMap<String, Job>,
+    /// committed worker set; every successful submit fans out to these modules.
+    workers: BTreeSet<ModuleId>,
     /// staged overlay: `Some` upserts, `None` is a tombstone (staged delete).
     overlay: BTreeMap<String, Option<Job>>,
+    /// staged worker overlay: `true` = present, `false` = absent.
+    worker_overlay: BTreeMap<ModuleId, bool>,
 }
 
 impl Jobs {
@@ -91,7 +107,9 @@ impl Jobs {
         Self {
             id: id.into(),
             jobs: BTreeMap::new(),
+            workers: BTreeSet::new(),
             overlay: BTreeMap::new(),
+            worker_overlay: BTreeMap::new(),
         }
     }
 
@@ -132,6 +150,36 @@ impl Jobs {
         count
     }
 
+    fn has_worker(&self, module_id: &str) -> bool {
+        match self.worker_overlay.get(module_id) {
+            Some(present) => *present,
+            None => self.workers.contains(module_id),
+        }
+    }
+
+    fn worker_count(&self) -> usize {
+        let mut count = self.workers.len();
+        for (module_id, present) in &self.worker_overlay {
+            match (*present, self.workers.contains(module_id)) {
+                (true, false) => count += 1,
+                (false, true) => count -= 1,
+                _ => {}
+            }
+        }
+        count
+    }
+
+    fn live_workers(&self) -> Vec<ModuleId> {
+        self.worker_overlay
+            .keys()
+            .chain(self.workers.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|module_id| self.has_worker(module_id))
+            .collect()
+    }
+
     // ---- overlay-aware writes ------------------------------------------------
 
     fn stage_upsert(&mut self, job: Job) {
@@ -140,6 +188,49 @@ impl Jobs {
 
     fn stage_remove(&mut self, job_id: &str) {
         self.overlay.insert(job_id.to_owned(), None);
+    }
+
+    fn worker_module_from_origin(&self, origin: &Origin) -> Result<ModuleId, Error> {
+        let Origin::Module(module_id) = origin else {
+            return Err(Error::Module(
+                "worker registration requires a module origin".into(),
+            ));
+        };
+        if module_id.is_empty() {
+            return Err(Error::Module("worker module_id must not be empty".into()));
+        }
+        if module_id.len() > MAX_WORKER_MODULE_ID {
+            return Err(Error::Module(format!(
+                "worker module_id exceeds {MAX_WORKER_MODULE_ID} bytes"
+            )));
+        }
+        if module_id == &self.id {
+            return Err(Error::Module(
+                "jobs cannot register itself as a worker".into(),
+            ));
+        }
+        Ok(module_id.clone())
+    }
+
+    fn register_worker(&mut self, origin: &Origin) -> Result<(), Error> {
+        let module_id = self.worker_module_from_origin(origin)?;
+        if self.has_worker(&module_id) {
+            return Ok(());
+        }
+        if self.worker_count() >= MAX_WORKERS {
+            return Err(Error::Module("worker cap reached".into()));
+        }
+        self.worker_overlay.insert(module_id, true);
+        Ok(())
+    }
+
+    fn unregister_worker(&mut self, origin: &Origin) -> Result<(), Error> {
+        let module_id = self.worker_module_from_origin(origin)?;
+        if !self.has_worker(&module_id) {
+            return Ok(());
+        }
+        self.worker_overlay.insert(module_id, false);
+        Ok(())
     }
 
     // ---- transitions (each fails the block on any guard violation) -----------
@@ -151,7 +242,7 @@ impl Jobs {
         spec: String,
         origin: &Origin,
         height: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<JobsEvent, Error> {
         // enforce every size cap HERE, at execute time, with rejection -- so
         // oversized bytes never reach the committed map and never enter the
         // root preimage (the repo's poison-value lesson).
@@ -180,11 +271,12 @@ impl Jobs {
         }
 
         let submitter = actor_from_origin(origin)?;
+        let spec_hash = Sha256::digest(spec.as_bytes()).to_vec();
         self.stage_upsert(Job {
-            job_id,
-            kind,
+            job_id: job_id.clone(),
+            kind: kind.clone(),
             spec,
-            submitter,
+            submitter: submitter.clone(),
             status: JobStatus::Pending,
             attempt: 0,
             claim: None,
@@ -192,7 +284,12 @@ impl Jobs {
             created_at_height: height,
             updated_at_height: height,
         });
-        Ok(())
+        Ok(JobsEvent::Submitted {
+            job_id,
+            kind,
+            submitter,
+            spec_hash,
+        })
     }
 
     fn claim(
@@ -363,13 +460,13 @@ impl Jobs {
 
     // ---- canonical encoding / root / snapshot / install ----------------------
 
-    fn root_of(jobs: &BTreeMap<String, Job>) -> StateRoot {
+    fn root_of(jobs: &BTreeMap<String, Job>, workers: &BTreeSet<ModuleId>) -> StateRoot {
         let mut h = Sha256::new();
-        h.update(Self::encode_jobs(jobs));
+        h.update(Self::encode_state(jobs, workers));
         StateRoot(h.finalize().into())
     }
 
-    fn encode_jobs(jobs: &BTreeMap<String, Job>) -> Vec<u8> {
+    fn encode_state(jobs: &BTreeMap<String, Job>, workers: &BTreeSet<ModuleId>) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(jobs.len() as u64).to_le_bytes());
         for job in jobs.values() {
@@ -399,20 +496,26 @@ impl Jobs {
             out.extend_from_slice(&job.created_at_height.to_le_bytes());
             out.extend_from_slice(&job.updated_at_height.to_le_bytes());
         }
+        out.extend_from_slice(&(workers.len() as u64).to_le_bytes());
+        for worker in workers {
+            push_string(&mut out, worker);
+        }
         out
     }
 
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_jobs(&self.jobs)
+        Self::encode_state(&self.jobs, &self.workers)
     }
 
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let jobs = decode_snapshot(bytes)?;
-        if Self::root_of(&jobs) != expected {
+        let (jobs, workers) = decode_snapshot(bytes)?;
+        if Self::root_of(&jobs, &workers) != expected {
             return Err(Error::Module("snapshot root mismatch".into()));
         }
         self.jobs = jobs;
+        self.workers = workers;
         self.overlay.clear();
+        self.worker_overlay.clear();
         Ok(())
     }
 }
@@ -472,7 +575,7 @@ fn status_from_byte(value: u8) -> Result<JobStatus, Error> {
     }
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, Job>, Error> {
+fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeMap<String, Job>, BTreeSet<ModuleId>), Error> {
     let mut off = 0usize;
     let count = read_u64(bytes, &mut off)?;
 
@@ -565,10 +668,32 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, Job>, Error> {
             },
         );
     }
+    let worker_count = read_u64(bytes, &mut off)?;
+    let worker_count = usize::try_from(worker_count)
+        .map_err(|_| Error::Module("snapshot worker cap exceeded".into()))?;
+    if worker_count > MAX_WORKERS {
+        return Err(Error::Module("snapshot worker cap exceeded".into()));
+    }
+    let mut workers = BTreeSet::new();
+    for _ in 0..worker_count {
+        let worker = read_string(bytes, &mut off)?;
+        if worker.is_empty() || worker.len() > MAX_WORKER_MODULE_ID {
+            return Err(Error::Module("snapshot worker module id is invalid".into()));
+        }
+        if workers
+            .last()
+            .is_some_and(|last: &String| last.as_str() >= worker.as_str())
+        {
+            return Err(Error::Module(
+                "snapshot worker ids not strictly ascending".into(),
+            ));
+        }
+        workers.insert(worker);
+    }
     if off != bytes.len() {
         return Err(Error::Module("snapshot has trailing bytes".into()));
     }
-    Ok(jobs)
+    Ok((jobs, workers))
 }
 
 fn read_u8(bytes: &[u8], off: &mut usize) -> Result<u8, Error> {
@@ -619,7 +744,7 @@ impl Module for Jobs {
     }
 
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.jobs)
+        Self::root_of(&self.jobs, &self.workers)
     }
 
     /// advertise the snapshot lane: [`Jobs::snapshot`] is the exact preimage of
@@ -634,7 +759,14 @@ impl Module for Jobs {
         let (origin, height) = (env.origin.clone(), env.height);
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             JobsMsg::Submit { job_id, kind, spec } => {
-                self.submit(job_id, kind, spec, &origin, height)
+                let event = self.submit(job_id, kind, spec, &origin, height)?;
+                for worker in self.live_workers() {
+                    ctx.emit_msg(Msg {
+                        target: worker,
+                        payload: encode_event(&event),
+                    });
+                }
+                Ok(())
             }
             JobsMsg::Claim {
                 job_id,
@@ -649,6 +781,8 @@ impl Module for Jobs {
             JobsMsg::Reclaim { job_id } => self.reclaim(job_id, height),
             JobsMsg::Cancel { job_id } => self.cancel(job_id, &origin, height),
             JobsMsg::Prune { job_id } => self.prune(job_id, &origin),
+            JobsMsg::RegisterWorker {} => self.register_worker(&origin),
+            JobsMsg::UnregisterWorker {} => self.unregister_worker(&origin),
         }
     }
 
@@ -706,11 +840,19 @@ impl Module for Jobs {
                 }
             }
         }
+        for (module_id, present) in std::mem::take(&mut self.worker_overlay) {
+            if present {
+                self.workers.insert(module_id);
+            } else {
+                self.workers.remove(&module_id);
+            }
+        }
         Ok(())
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.overlay.clear();
+        self.worker_overlay.clear();
         Ok(())
     }
 }

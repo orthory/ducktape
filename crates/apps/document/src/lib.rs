@@ -13,9 +13,23 @@
 //! the logical key is the `doc_id` string at the interface seam, but the qmdb
 //! key is `sha256(doc_id)` — a fixed 32-byte [`commonware_utils`] `Array`. this
 //! mirrors the kv module and is load-bearing: commonware's state-sync resolvers
-//! for the overwriteable variable db are bounded on `K: Array`. the cost is that
-//! the store commits to `hash(doc_id) -> doc` and cannot enumerate doc ids — a
-//! by-id document store never needs to.
+//! for the overwriteable variable db are bounded on `K: Array`. a hashed key
+//! commits to `hash(doc_id) -> doc` and so can't be walked to recover the doc
+//! ids themselves.
+//!
+//! ## enumeration via a reserved index entry
+//!
+//! to make the store BROWSABLE (a filesystem-like reader over `/`-delimited
+//! path ids) without breaking the fixed-width-key contract, one extra qmdb entry
+//! is reserved: a sentinel logical key [`DOC_INDEX_KEY`] whose value is the
+//! serialized SORTED set of every known `doc_id`. its qmdb key is still
+//! `sha256(sentinel)` — a 32-byte digest, indistinguishable in width from any
+//! doc slot — so it rides through state-sync exactly like a document. a real
+//! `doc_id` can never collide with the sentinel (it carries a leading NUL that
+//! the id slugger can't produce) and every doc op that names the sentinel is
+//! rejected. [`DocMsg::CreateDoc`] adds the id to the index (idempotent);
+//! [`DocQuery::ListDocs`] reads it back. block edits never touch the index —
+//! only doc creation grows it — so per-edit cost is unchanged.
 //!
 //! ## host-lent staging (mirrors the `kv` module)
 //!
@@ -42,22 +56,21 @@ use std::sync::Arc;
 use commonware_codec::RangeCfg;
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::Sequential;
-use commonware_runtime::{buffer::paged::CacheRef, BufferPooler};
+use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
 use commonware_storage::{
-    journal, mmr,
+    Context, journal, mmr,
     qmdb::{
-        any::{unordered::variable::Db, VariableConfig},
-        sync::{self, engine::Config as SyncConfig, DbResolver, Target},
+        any::{VariableConfig, unordered::variable::Db},
+        sync::{self, DbResolver, Target, engine::Config as SyncConfig},
     },
     translator::TwoCap,
-    Context,
 };
 use commonware_utils::range::NonEmptyRange;
 
 use document_interface::{
-    decode_msg, decode_query, encode_reply, Block, DocMsg, DocQuery, DocReply,
+    Block, DocMsg, DocQuery, DocReply, decode_msg, decode_query, encode_reply,
 };
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, ResolverSyncTarget, StateRoot, StateSyncHandle};
 
 /// write-time cap on a SERIALIZED document. [`doc_config`]'s codec [`RangeCfg`]
 /// bounds a stored value at 1 MiB AT DECODE TIME only — an oversized doc would
@@ -68,6 +81,23 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 /// whole serialized operation (hashed key, varint length prefix, framing) — and
 /// the NEXT small edit to an at-cap doc — stays comfortably under 1 MiB.
 pub const MAX_DOC_LEN: usize = 768 * 1024;
+
+/// the reserved logical key under which the enumeration INDEX rides in the same
+/// qmdb. its value is a serialized sorted `Vec<String>` of every known `doc_id`.
+///
+/// the leading NUL makes it UNCOLLIDABLE with a real `doc_id`: the client id
+/// slugger emits only `[a-z0-9/-]`, and every doc op that names this key is
+/// rejected ([`DocError::ReservedDocId`]) before it can reach storage — so the
+/// index can never be clobbered by a document write, on any validator.
+///
+/// GROWTH BOUND: the index value is capped by [`MAX_DOC_LEN`] like any doc
+/// value (it stages through the same [`Document::stage`] guard). a `doc_id`
+/// costs its own bytes plus json framing (two quotes + a comma ≈ 3 bytes), so a
+/// 768 KiB index holds on the order of ten-thousand-plus ids before a
+/// `CreateDoc` starts failing with [`DocError::DocTooLarge`]. a store that needs
+/// more would shard the index across several sentinel keys — out of scope for
+/// the whole-doc-per-key MVP.
+const DOC_INDEX_KEY: &str = "\u{0}doc-index";
 
 /// the qmdb key: a fixed 32-byte sha256 digest of the `doc_id`. fixed width is
 /// what lets a store be state-synced (commonware's resolvers require `K: Array`).
@@ -161,6 +191,9 @@ enum DocError {
     /// a stored doc failed to decode. distinct from [`DocError::DocNotFound`]:
     /// corruption must surface loudly, never masquerade as an absent doc.
     DocCorrupt,
+    /// a doc op named the reserved [`DOC_INDEX_KEY`] sentinel. rejected so the
+    /// enumeration index can never be overwritten by a document write.
+    ReservedDocId,
 }
 
 impl core::fmt::Display for DocError {
@@ -172,6 +205,7 @@ impl core::fmt::Display for DocError {
             DocError::AnchorNotFound => "after-anchor not found",
             DocError::DocTooLarge => "doc too large",
             DocError::DocCorrupt => "stored doc is corrupt",
+            DocError::ReservedDocId => "reserved doc id",
         };
         f.write_str(s)
     }
@@ -218,7 +252,11 @@ where
         let db = DocDb::<E>::init(context, cfg)
             .await
             .expect("qmdb init failed");
-        Self { id, db, pending: BTreeMap::new() }
+        Self {
+            id,
+            db,
+            pending: BTreeMap::new(),
+        }
     }
 
     /// read raw bytes for `key`: a STAGED (this-block) write shadows committed
@@ -242,24 +280,81 @@ where
         }
     }
 
-    /// stage a document's serialized blocks for this block WITHOUT committing.
-    /// visible to `get`/`load` at once; folded into qmdb (and `root()`) only when
-    /// the host calls `commit_block`. rejects a doc whose serialized form exceeds
-    /// [`MAX_DOC_LEN`] BEFORE staging, so a failed op leaves no overlay entry.
-    fn store(&mut self, doc_id: &str, blocks: &[Block]) -> Result<(), DocError> {
-        let bytes = serde_json::to_vec(blocks).expect("Vec<Block> is always serializable");
+    /// stage arbitrary serialized `bytes` under logical `key` for this block
+    /// WITHOUT committing. visible to `get`/`load` at once; folded into qmdb (and
+    /// `root()`) only when the host calls `commit_block`. rejects a value over
+    /// [`MAX_DOC_LEN`] BEFORE staging — the shared poison-pill guard for BOTH
+    /// whole-doc values and the enumeration index value (the codec bound is
+    /// decode-only, so an oversized value must never reach the panicking
+    /// commit/read paths).
+    fn stage(&mut self, key: &str, bytes: Vec<u8>) -> Result<(), DocError> {
         if bytes.len() > MAX_DOC_LEN {
             return Err(DocError::DocTooLarge);
         }
-        self.pending.insert(doc_id.as_bytes().to_vec(), bytes);
+        self.pending.insert(key.as_bytes().to_vec(), bytes);
+        Ok(())
+    }
+
+    /// stage a document's serialized blocks for this block. rejects a doc whose
+    /// serialized form exceeds [`MAX_DOC_LEN`] BEFORE staging, so a failed op
+    /// leaves no overlay entry.
+    fn store(&mut self, doc_id: &str, blocks: &[Block]) -> Result<(), DocError> {
+        let bytes = serde_json::to_vec(blocks).expect("Vec<Block> is always serializable");
+        self.stage(doc_id, bytes)
+    }
+
+    /// load the enumeration index — the sorted set of known `doc_id`s — through
+    /// the staged-over-committed overlay. an absent index (never written yet)
+    /// reads as the empty set. a decode failure is corruption, surfaced by the
+    /// caller, never masqueraded as "no docs".
+    async fn load_index(&self) -> Result<Vec<String>, Error> {
+        match self.get(DOC_INDEX_KEY.as_bytes()).await {
+            Some(b) => serde_json::from_slice(&b).map_err(|e| Error::Module(e.to_string())),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// add `doc_id` to the enumeration index if absent, re-staging it as a sorted
+    /// set. idempotent: re-creating a known id restages an IDENTICAL value (a
+    /// benign no-op write). the SORT makes the serialized bytes canonical, so
+    /// every validator commits the same index bytes and lands on the same qmdb
+    /// root. capped by [`MAX_DOC_LEN`] through [`Document::stage`] (see the
+    /// growth bound on [`DOC_INDEX_KEY`]).
+    async fn index_add(&mut self, doc_id: &str) -> Result<(), DocError> {
+        let mut ids = self.load_index().await.map_err(to_doc_err)?;
+        if !ids.iter().any(|id| id == doc_id) {
+            ids.push(doc_id.to_string());
+            ids.sort();
+            let bytes = serde_json::to_vec(&ids).expect("Vec<String> is always serializable");
+            self.stage(DOC_INDEX_KEY, bytes)?;
+        }
         Ok(())
     }
 
     /// apply one decoded [`DocMsg`] to the staged overlay. pure list surgery over
     /// the loaded `Vec<Block>`, re-staged on success. errors abort the block.
     async fn apply(&mut self, msg: DocMsg) -> Result<(), DocError> {
+        // every op carries a doc_id; none may target the reserved index sentinel.
+        // reject deterministically on every validator BEFORE any storage touch,
+        // so a document write can never clobber the enumeration index.
+        let doc_id = match &msg {
+            DocMsg::CreateDoc { doc_id }
+            | DocMsg::InsertBlock { doc_id, .. }
+            | DocMsg::UpdateBlock { doc_id, .. }
+            | DocMsg::RemoveBlock { doc_id, .. }
+            | DocMsg::MoveBlock { doc_id, .. } => doc_id,
+        };
+        if doc_id == DOC_INDEX_KEY {
+            return Err(DocError::ReservedDocId);
+        }
+
         match msg {
             DocMsg::CreateDoc { doc_id } => {
+                // record the id in the enumeration index (idempotent) so the doc
+                // becomes browsable. block ops require CreateDoc first, so every
+                // doc that can hold blocks is already indexed by the time they run
+                // — the index only ever grows on creation, never on an edit.
+                self.index_add(&doc_id).await?;
                 // idempotent: only seed an empty doc if absent. an empty doc is a
                 // stored `[]`; ABSENT is `None` — that distinction is why CreateDoc
                 // is its own op and why block ops require it first.
@@ -268,8 +363,16 @@ where
                 }
                 Ok(())
             }
-            DocMsg::InsertBlock { doc_id, after, block } => {
-                let mut d = self.load(&doc_id).await.map_err(to_doc_err)?.ok_or(DocError::DocNotFound)?;
+            DocMsg::InsertBlock {
+                doc_id,
+                after,
+                block,
+            } => {
+                let mut d = self
+                    .load(&doc_id)
+                    .await
+                    .map_err(to_doc_err)?
+                    .ok_or(DocError::DocNotFound)?;
                 if d.iter().any(|b| b.id == block.id) {
                     return Err(DocError::DuplicateBlock);
                 }
@@ -278,28 +381,57 @@ where
                 self.store(&doc_id, &d)?;
                 Ok(())
             }
-            DocMsg::UpdateBlock { doc_id, block_id, text } => {
-                let mut d = self.load(&doc_id).await.map_err(to_doc_err)?.ok_or(DocError::DocNotFound)?;
-                let b = d.iter_mut().find(|b| b.id == block_id).ok_or(DocError::BlockNotFound)?;
+            DocMsg::UpdateBlock {
+                doc_id,
+                block_id,
+                text,
+            } => {
+                let mut d = self
+                    .load(&doc_id)
+                    .await
+                    .map_err(to_doc_err)?
+                    .ok_or(DocError::DocNotFound)?;
+                let b = d
+                    .iter_mut()
+                    .find(|b| b.id == block_id)
+                    .ok_or(DocError::BlockNotFound)?;
                 b.text = text;
                 self.store(&doc_id, &d)?;
                 Ok(())
             }
             DocMsg::RemoveBlock { doc_id, block_id } => {
-                let mut d = self.load(&doc_id).await.map_err(to_doc_err)?.ok_or(DocError::DocNotFound)?;
-                let pos = d.iter().position(|b| b.id == block_id).ok_or(DocError::BlockNotFound)?;
+                let mut d = self
+                    .load(&doc_id)
+                    .await
+                    .map_err(to_doc_err)?
+                    .ok_or(DocError::DocNotFound)?;
+                let pos = d
+                    .iter()
+                    .position(|b| b.id == block_id)
+                    .ok_or(DocError::BlockNotFound)?;
                 d.remove(pos);
                 self.store(&doc_id, &d)?;
                 Ok(())
             }
-            DocMsg::MoveBlock { doc_id, block_id, after } => {
+            DocMsg::MoveBlock {
+                doc_id,
+                block_id,
+                after,
+            } => {
                 // self-anchor is a no-op — resolve it BEFORE removal, else the
                 // remove-then-lookup would fail with a bogus AnchorNotFound.
                 if after.as_deref() == Some(block_id.as_str()) {
                     return Ok(());
                 }
-                let mut d = self.load(&doc_id).await.map_err(to_doc_err)?.ok_or(DocError::DocNotFound)?;
-                let pos = d.iter().position(|b| b.id == block_id).ok_or(DocError::BlockNotFound)?;
+                let mut d = self
+                    .load(&doc_id)
+                    .await
+                    .map_err(to_doc_err)?
+                    .ok_or(DocError::DocNotFound)?;
+                let pos = d
+                    .iter()
+                    .position(|b| b.id == block_id)
+                    .ok_or(DocError::BlockNotFound)?;
                 let blk = d.remove(pos);
                 // anchor index is computed in the now-shortened list.
                 let i = idx_after(&d, &after)?;
@@ -374,7 +506,11 @@ where
             max_retained_roots: 8,
         };
         let db = sync::sync(config).await.expect("qmdb sync failed");
-        Self { id, db, pending: BTreeMap::new() }
+        Self {
+            id,
+            db,
+            pending: BTreeMap::new(),
+        }
     }
 }
 
@@ -406,22 +542,28 @@ where
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "serve_sync answers qmdb target + op-range requests (statesync wire)".into(),
+            detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
         })
     }
 
     /// the network state-sync serve lane: answers the shared qmdb wire requests
-    /// (current target, historical proof-carrying op ranges) from committed
-    /// state. read-only; the joiner's sync engine merkle-verifies every batch.
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         statesync::qmdb::serve_bytes(&self.db, req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        statesync::qmdb::resolver_sync_target(&self.db).await
     }
 
     /// decode a [`DocMsg`] and apply it to the staged overlay. the only `.await`
     /// is on own qmdb state — deterministic, so replay-safe across validators.
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let m = decode_msg(&msg.payload).map_err(Error::Module)?;
-        self.apply(m).await.map_err(|e| Error::Module(e.to_string()))
+        self.apply(m)
+            .await
+            .map_err(|e| Error::Module(e.to_string()))
     }
 
     /// real async read of own qmdb state, serving STAGED-over-committed via
@@ -437,6 +579,11 @@ where
                     .await?
                     .and_then(|d| d.into_iter().find(|b| b.id == block_id));
                 Ok(encode_reply(&DocReply::Block(block)))
+            }
+            DocQuery::ListDocs => {
+                // served straight from the reserved index entry — the sorted set
+                // of every known doc_id. absent index reads as an empty list.
+                Ok(encode_reply(&DocReply::DocList(self.load_index().await?)))
             }
         }
     }
@@ -456,7 +603,10 @@ where
             .merkleize(&self.db, None::<Vec<u8>>)
             .await
             .expect("merkleize failed");
-        self.db.apply_batch(batch).await.expect("apply_batch failed");
+        self.db
+            .apply_batch(batch)
+            .await
+            .expect("apply_batch failed");
         self.db.commit().await.expect("commit failed");
         self.pending.clear();
         Ok(())
@@ -473,16 +623,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_runtime::{deterministic, Runner as _};
-    use document_interface::{decode_reply, encode_msg, encode_query, BlockKind};
+    use commonware_runtime::{Runner as _, deterministic};
+    use document_interface::{BlockKind, decode_reply, encode_msg, encode_query};
     use state::global_root;
 
     fn blk(id: &str, text: &str) -> Block {
-        Block { id: id.into(), kind: BlockKind::Paragraph, text: text.into() }
+        Block {
+            id: id.into(),
+            kind: BlockKind::Paragraph,
+            text: text.into(),
+        }
     }
 
     fn msg(m: &DocMsg) -> Msg {
-        Msg { target: "document".into(), payload: encode_msg(m) }
+        Msg {
+            target: "document".into(),
+            payload: encode_msg(m),
+        }
     }
 
     // a minimal Ctx so execute can be driven without a full host.
@@ -492,7 +649,7 @@ mod tests {
     impl TestCtx {
         fn new() -> Self {
             Self {
-                env: sdk::Env {
+                env: sdk::Env { protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: sdk::Origin::System,
@@ -503,8 +660,12 @@ mod tests {
     }
     #[async_trait::async_trait(?Send)]
     impl Ctx for TestCtx {
-        fn env(&self) -> &sdk::Env { &self.env }
-        fn module_root(&self, _t: &str) -> Option<StateRoot> { None }
+        fn env(&self) -> &sdk::Env {
+            &self.env
+        }
+        fn module_root(&self, _t: &str) -> Option<StateRoot> {
+            None
+        }
         async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
             Err(Error::QueryUnsupported)
         }
@@ -519,11 +680,27 @@ mod tests {
         d.commit_block().await.unwrap();
     }
 
-    async fn get_doc<E: Context + BufferPooler>(d: &Document<E>, doc_id: &str) -> Option<Vec<Block>> {
-        let reply = d.query(&encode_query(&DocQuery::GetDoc { doc_id: doc_id.into() })).await.unwrap();
+    async fn get_doc<E: Context + BufferPooler>(
+        d: &Document<E>,
+        doc_id: &str,
+    ) -> Option<Vec<Block>> {
+        let reply = d
+            .query(&encode_query(&DocQuery::GetDoc {
+                doc_id: doc_id.into(),
+            }))
+            .await
+            .unwrap();
         match decode_reply(&reply).unwrap() {
             DocReply::Doc(v) => v,
             _ => panic!("expected Doc"),
+        }
+    }
+
+    async fn list_docs<E: Context + BufferPooler>(d: &Document<E>) -> Vec<String> {
+        let reply = d.query(&encode_query(&DocQuery::ListDocs)).await.unwrap();
+        match decode_reply(&reply).unwrap() {
+            DocReply::DocList(ids) => ids,
+            _ => panic!("expected DocList"),
         }
     }
 
@@ -531,12 +708,42 @@ mod tests {
     fn create_insert_returns_blocks_in_order() {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: None, block: blk("b1", "first") }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "first"),
+                },
+            )
+            .await;
             // after b1 -> b2 lands at the end.
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: Some("b1".into()), block: blk("b2", "second") }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: Some("b1".into()),
+                    block: blk("b2", "second"),
+                },
+            )
+            .await;
             // after None -> front, so b0 goes before b1.
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: None, block: blk("b0", "zero") }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b0", "zero"),
+                },
+            )
+            .await;
 
             let doc = get_doc(&d, "doc1").await.unwrap();
             let ids: Vec<&str> = doc.iter().map(|b| b.id.as_str()).collect();
@@ -549,9 +756,31 @@ mod tests {
     fn update_changes_a_block() {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: None, block: blk("b1", "old") }).await;
-            apply_commit(&mut d, &DocMsg::UpdateBlock { doc_id: "doc1".into(), block_id: "b1".into(), text: "new".into() }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "old"),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::UpdateBlock {
+                    doc_id: "doc1".into(),
+                    block_id: "b1".into(),
+                    text: "new".into(),
+                },
+            )
+            .await;
             let doc = get_doc(&d, "doc1").await.unwrap();
             assert_eq!(doc[0].text, "new");
         });
@@ -561,10 +790,39 @@ mod tests {
     fn remove_drops_a_block() {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: None, block: blk("b1", "one") }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: Some("b1".into()), block: blk("b2", "two") }).await;
-            apply_commit(&mut d, &DocMsg::RemoveBlock { doc_id: "doc1".into(), block_id: "b1".into() }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "one"),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: Some("b1".into()),
+                    block: blk("b2", "two"),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::RemoveBlock {
+                    doc_id: "doc1".into(),
+                    block_id: "b1".into(),
+                },
+            )
+            .await;
             let doc = get_doc(&d, "doc1").await.unwrap();
             let ids: Vec<&str> = doc.iter().map(|b| b.id.as_str()).collect();
             assert_eq!(ids, ["b2"]);
@@ -575,19 +833,56 @@ mod tests {
     fn move_reorders_blocks() {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
             for (id, t) in [("b1", "one"), ("b2", "two"), ("b3", "three")] {
-                let after = if id == "b1" { None } else { Some(format!("b{}", id.chars().last().unwrap().to_digit(10).unwrap() - 1)) };
-                apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after, block: blk(id, t) }).await;
+                let after = if id == "b1" {
+                    None
+                } else {
+                    Some(format!(
+                        "b{}",
+                        id.chars().last().unwrap().to_digit(10).unwrap() - 1
+                    ))
+                };
+                apply_commit(
+                    &mut d,
+                    &DocMsg::InsertBlock {
+                        doc_id: "doc1".into(),
+                        after,
+                        block: blk(id, t),
+                    },
+                )
+                .await;
             }
             // start: b1,b2,b3. move b1 after b3 -> b2,b3,b1.
-            apply_commit(&mut d, &DocMsg::MoveBlock { doc_id: "doc1".into(), block_id: "b1".into(), after: Some("b3".into()) }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::MoveBlock {
+                    doc_id: "doc1".into(),
+                    block_id: "b1".into(),
+                    after: Some("b3".into()),
+                },
+            )
+            .await;
             let doc = get_doc(&d, "doc1").await.unwrap();
             let ids: Vec<&str> = doc.iter().map(|b| b.id.as_str()).collect();
             assert_eq!(ids, ["b2", "b3", "b1"]);
 
             // move b1 to the front (after None) -> b1,b2,b3.
-            apply_commit(&mut d, &DocMsg::MoveBlock { doc_id: "doc1".into(), block_id: "b1".into(), after: None }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::MoveBlock {
+                    doc_id: "doc1".into(),
+                    block_id: "b1".into(),
+                    after: None,
+                },
+            )
+            .await;
             let doc = get_doc(&d, "doc1").await.unwrap();
             let ids: Vec<&str> = doc.iter().map(|b| b.id.as_str()).collect();
             assert_eq!(ids, ["b1", "b2", "b3"]);
@@ -600,8 +895,24 @@ mod tests {
             let mut d = Document::init(context, "document").await;
             apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "a".into() }).await;
             apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "b".into() }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "a".into(), after: None, block: blk("x", "in-a") }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "b".into(), after: None, block: blk("y", "in-b") }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "a".into(),
+                    after: None,
+                    block: blk("x", "in-a"),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "b".into(),
+                    after: None,
+                    block: blk("y", "in-b"),
+                },
+            )
+            .await;
             let da = get_doc(&d, "a").await.unwrap();
             let db = get_doc(&d, "b").await.unwrap();
             assert_eq!(da.len(), 1);
@@ -616,8 +927,22 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
             let r0 = d.root();
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: None, block: blk("b1", "hi") }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "hi"),
+                },
+            )
+            .await;
             let r1 = d.root();
             assert_ne!(r0, r1, "a write must move the root");
             assert_ne!(r1, StateRoot::ZERO, "root after write must be non-zero");
@@ -626,12 +951,21 @@ mod tests {
             struct Stub;
             #[async_trait::async_trait(?Send)]
             impl Module for Stub {
-                fn id(&self) -> ModuleId { "stub".into() }
-                fn root(&self) -> StateRoot { StateRoot([9u8; sdk::ROOT_LEN]) }
-                async fn execute(&mut self, _c: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> { Ok(()) }
+                fn id(&self) -> ModuleId {
+                    "stub".into()
+                }
+                fn root(&self) -> StateRoot {
+                    StateRoot([9u8; sdk::ROOT_LEN])
+                }
+                async fn execute(&mut self, _c: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> {
+                    Ok(())
+                }
             }
             let stub = Stub;
-            let g = { let mods: [&dyn Module; 2] = [&d, &stub]; global_root(&mods) };
+            let g = {
+                let mods: [&dyn Module; 2] = [&d, &stub];
+                global_root(&mods)
+            };
             assert_ne!(g, state::global_root(&[&stub as &dyn Module]));
         });
     }
@@ -642,14 +976,27 @@ mod tests {
     fn staged_write_in_failing_block_rolls_back() {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
             let r_before = d.root();
 
             // stage an insert, then abort instead of commit (as the host does when a
             // later op in the block errors).
-            d.execute(&mut TestCtx::new(), &msg(&DocMsg::InsertBlock {
-                doc_id: "doc1".into(), after: None, block: blk("ghost", "should vanish"),
-            })).await.unwrap();
+            d.execute(
+                &mut TestCtx::new(),
+                &msg(&DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("ghost", "should vanish"),
+                }),
+            )
+            .await
+            .unwrap();
             d.abort_block().await.unwrap();
 
             assert_eq!(d.root(), r_before, "aborted block must not move the root");
@@ -665,24 +1012,59 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
             // insert before create -> DocNotFound.
-            let e = d.execute(&mut TestCtx::new(), &msg(&DocMsg::InsertBlock {
-                doc_id: "nope".into(), after: None, block: blk("b1", "x"),
-            })).await;
+            let e = d
+                .execute(
+                    &mut TestCtx::new(),
+                    &msg(&DocMsg::InsertBlock {
+                        doc_id: "nope".into(),
+                        after: None,
+                        block: blk("b1", "x"),
+                    }),
+                )
+                .await;
             assert!(e.is_err());
             d.abort_block().await.unwrap();
 
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: None, block: blk("b1", "x") }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "x"),
+                },
+            )
+            .await;
             // duplicate id.
-            let e = d.execute(&mut TestCtx::new(), &msg(&DocMsg::InsertBlock {
-                doc_id: "doc1".into(), after: None, block: blk("b1", "dup"),
-            })).await;
+            let e = d
+                .execute(
+                    &mut TestCtx::new(),
+                    &msg(&DocMsg::InsertBlock {
+                        doc_id: "doc1".into(),
+                        after: None,
+                        block: blk("b1", "dup"),
+                    }),
+                )
+                .await;
             assert!(e.is_err());
             d.abort_block().await.unwrap();
             // bad anchor.
-            let e = d.execute(&mut TestCtx::new(), &msg(&DocMsg::InsertBlock {
-                doc_id: "doc1".into(), after: Some("ghost".into()), block: blk("b2", "x"),
-            })).await;
+            let e = d
+                .execute(
+                    &mut TestCtx::new(),
+                    &msg(&DocMsg::InsertBlock {
+                        doc_id: "doc1".into(),
+                        after: Some("ghost".into()),
+                        block: blk("b2", "x"),
+                    }),
+                )
+                .await;
             assert!(e.is_err());
             d.abort_block().await.unwrap();
         });
@@ -695,15 +1077,35 @@ mod tests {
     fn staged_writes_are_visible_within_one_block() {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
             // two inserts, NO commit between them: op2 anchors on b1, which only
             // exists in op1's staged (uncommitted) write.
-            d.execute(&mut TestCtx::new(), &msg(&DocMsg::InsertBlock {
-                doc_id: "doc1".into(), after: None, block: blk("b1", "one"),
-            })).await.unwrap();
-            d.execute(&mut TestCtx::new(), &msg(&DocMsg::InsertBlock {
-                doc_id: "doc1".into(), after: Some("b1".into()), block: blk("b2", "two"),
-            })).await.unwrap();
+            d.execute(
+                &mut TestCtx::new(),
+                &msg(&DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "one"),
+                }),
+            )
+            .await
+            .unwrap();
+            d.execute(
+                &mut TestCtx::new(),
+                &msg(&DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: Some("b1".into()),
+                    block: blk("b2", "two"),
+                }),
+            )
+            .await
+            .unwrap();
             d.commit_block().await.unwrap();
             let doc = get_doc(&d, "doc1").await.unwrap();
             let ids: Vec<&str> = doc.iter().map(|b| b.id.as_str()).collect();
@@ -820,13 +1222,163 @@ mod tests {
     fn create_is_idempotent() {
         deterministic::Runner::default().start(|context| async move {
             let mut d = Document::init(context, "document").await;
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
-            apply_commit(&mut d, &DocMsg::InsertBlock { doc_id: "doc1".into(), after: None, block: blk("b1", "keep") }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut d,
+                &DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "keep"),
+                },
+            )
+            .await;
             // re-create must NOT wipe the existing block.
-            apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: "doc1".into() }).await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
             let doc = get_doc(&d, "doc1").await.unwrap();
             assert_eq!(doc.len(), 1);
             assert_eq!(doc[0].id, "b1");
+        });
+    }
+
+    // enumeration: ListDocs starts empty, then reflects every CreateDoc, sorted
+    // and deduplicated. this is the browsable-store property the index adds.
+    #[test]
+    fn list_docs_enumerates_created_docs_sorted() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            assert!(list_docs(&d).await.is_empty(), "a fresh store lists nothing");
+
+            // create out of order; the index must come back sorted.
+            for id in ["projects/retro", "notes", "projects/launch-plan"] {
+                apply_commit(&mut d, &DocMsg::CreateDoc { doc_id: id.into() }).await;
+            }
+            assert_eq!(
+                list_docs(&d).await,
+                ["notes", "projects/launch-plan", "projects/retro"],
+                "ListDocs is the sorted set of known doc ids"
+            );
+
+            // re-creating a known id is idempotent — no duplicate entry.
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "notes".into(),
+                },
+            )
+            .await;
+            assert_eq!(
+                list_docs(&d).await,
+                ["notes", "projects/launch-plan", "projects/retro"],
+                "re-creating a doc must not duplicate its index entry"
+            );
+        });
+    }
+
+    // block edits (insert/update/remove/move) must NOT touch the index — only
+    // CreateDoc grows it. the index stays exactly the set of created docs.
+    #[test]
+    fn block_edits_leave_the_index_untouched() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            for op in [
+                DocMsg::InsertBlock {
+                    doc_id: "doc1".into(),
+                    after: None,
+                    block: blk("b1", "one"),
+                },
+                DocMsg::UpdateBlock {
+                    doc_id: "doc1".into(),
+                    block_id: "b1".into(),
+                    text: "two".into(),
+                },
+                DocMsg::RemoveBlock {
+                    doc_id: "doc1".into(),
+                    block_id: "b1".into(),
+                },
+            ] {
+                apply_commit(&mut d, &op).await;
+            }
+            assert_eq!(
+                list_docs(&d).await,
+                ["doc1"],
+                "block edits must not add or drop index entries"
+            );
+        });
+    }
+
+    // the reserved sentinel is UNREACHABLE by any doc op: a CreateDoc (or block
+    // op) that names it is rejected, so a document write can never overwrite the
+    // enumeration index. the rejected op stages nothing and moves no root.
+    #[test]
+    fn reserved_index_id_is_rejected() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "real".into(),
+                },
+            )
+            .await;
+            let r_before = d.root();
+
+            let err = d
+                .execute(
+                    &mut TestCtx::new(),
+                    &msg(&DocMsg::CreateDoc {
+                        doc_id: DOC_INDEX_KEY.into(),
+                    }),
+                )
+                .await
+                .expect_err("a doc op on the reserved id must be rejected");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("reserved doc id")),
+                "unexpected error: {err:?}"
+            );
+            assert!(d.pending.is_empty(), "a rejected op must stage nothing");
+            d.abort_block().await.unwrap();
+
+            assert_eq!(d.root(), r_before, "a rejected op must not move the root");
+            // the index is intact — still exactly the real doc.
+            assert_eq!(list_docs(&d).await, ["real"]);
+        });
+    }
+
+    // the index is committed state: a write that adds a doc to the index MOVES
+    // the qmdb root, and the whole index survives a re-open (it IS qmdb state).
+    #[test]
+    fn create_moves_root_via_the_index() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut d = Document::init(context, "document").await;
+            let r0 = d.root();
+            apply_commit(
+                &mut d,
+                &DocMsg::CreateDoc {
+                    doc_id: "doc1".into(),
+                },
+            )
+            .await;
+            assert_ne!(r0, d.root(), "creating a doc (index + empty doc) moves root");
+            assert_eq!(list_docs(&d).await, ["doc1"]);
         });
     }
 }

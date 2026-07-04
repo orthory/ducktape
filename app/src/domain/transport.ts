@@ -17,9 +17,16 @@ export interface BlockEvent {
   appHash: string;
 }
 
+/** How the app groups a module in the Modules view. The node attaches this by
+ *  id in its status catalog; it is presentation metadata only, never consensus
+ *  identity. Optional: a node built before categories shipped omits it, and the
+ *  view treats an absent/unknown value as `system`. */
+export type ModuleCategory = "workspace" | "developer" | "automation" | "system";
+
 export interface ModuleStatus {
   id: string;
   root: string;
+  category?: ModuleCategory;
 }
 
 export interface NodeStatus {
@@ -27,6 +34,40 @@ export interface NodeStatus {
   appHash: string;
   height: number;
   modules: ModuleStatus[];
+}
+
+// ── Telemetry ───────────────────────────────────────────
+//
+// The node-local observability plane: one frame per finalized block, carrying
+// the host's deterministic dispatch trace decorated with this node's wall-clock
+// apply latency. Delivered live over the ws stream and pullable (recent ring)
+// via GET /v1/telemetry. Keyed by (height, source) — the same space the future
+// on-consensus telemetry module uses.
+
+/** One dispatch in a block's drain — a module ran, triggered by `origin`. */
+export interface TelemetryDispatch {
+  module: string;
+  /** `"external"`, `"external:<name>"`, `"system"`, or `"module:<id>"`. */
+  origin: string;
+  emittedMsgs: number;
+  emittedEvents: number;
+}
+
+/** One observability event a module emitted during the block. */
+export interface TelemetryEvent {
+  source: string;
+  /** Best-effort utf-8 preview of the module-defined payload. */
+  payload: string;
+}
+
+export interface TelemetryFrame {
+  height: number;
+  /** The block's agreed logical clock — NOT this node's wall clock. */
+  consensusTime: number;
+  /** Node-local cost of applying the block, microseconds (non-deterministic). */
+  latencyUs: number;
+  dispatches: TelemetryDispatch[];
+  events: TelemetryEvent[];
 }
 
 export interface NodeTransport {
@@ -39,9 +80,36 @@ export interface NodeTransport {
   submit(target: string, payload: unknown, origin?: string): Promise<BlockEvent>;
   /** Read committed state. The reply is the module's `*Reply` enum as json. */
   query(target: string, query: unknown): Promise<unknown>;
+  /**
+   * Stage raw bytes in the node's content-addressed blob store and get their
+   * sha256 digest back (64 lowercase hex). NOTHING is committed — a later
+   * `submit` references the digest. The agent flow uses this to upload a
+   * prompt's text so the oracle worker can fetch it by the registered
+   * `prompt_hash` (which IS this digest, since the store keys by sha256).
+   *
+   * The bytes must be backed by a plain ArrayBuffer (what `TextEncoder.encode`
+   * returns) so they go straight into the fetch body.
+   */
+  putBlob(bytes: Uint8Array<ArrayBuffer>): Promise<string>;
+  /**
+   * Read raw bytes back out of the node's content-addressed blob store by their
+   * sha256 `digest` (64 lowercase hex) — the GET counterpart to `putBlob`. This
+   * is how the files module's chunks are fetched for reassembly; the caller MUST
+   * still `verifyChunk` the bytes against a committed manifest before trusting
+   * them. Rejects when the digest is absent (the node replies 404).
+   */
+  getBlob(digest: string): Promise<Uint8Array<ArrayBuffer>>;
   status(): Promise<NodeStatus>;
+  /**
+   * Recent per-block telemetry from the node's ring, oldest-first — the
+   * backfill a client pulls on connect before following the live stream.
+   * `limit` caps the count (default: all buffered).
+   */
+  telemetry(limit?: number): Promise<TelemetryFrame[]>;
   /** Subscribe to finalized blocks. Returns the unsubscribe. */
   onBlock(listener: (block: BlockEvent) => void): () => void;
+  /** Subscribe to live per-block telemetry frames. Returns the unsubscribe. */
+  onTelemetry(listener: (frame: TelemetryFrame) => void): () => void;
 }
 
 // ── The transport ───────────────────────────────────────
@@ -51,6 +119,12 @@ interface WsBlockFrame {
   height: number;
   appHash: string;
 }
+
+interface WsTelemetryFrame extends TelemetryFrame {
+  type: "telemetry";
+}
+
+type WsFrame = WsBlockFrame | WsTelemetryFrame;
 
 const RECONNECT_DELAY_MS = 2_000;
 
@@ -76,20 +150,28 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
   const wsUrl = `${base.replace(/^http/, "ws")}/v1/ws`;
 
-  // One shared socket for every block subscriber; reconnects while any remain.
-  const listeners = new Set<(block: BlockEvent) => void>();
+  // One shared socket for every subscriber (blocks + telemetry); reconnects
+  // while any remain, closes once all unsubscribe.
+  const blockListeners = new Set<(block: BlockEvent) => void>();
+  const telemetryListeners = new Set<(frame: TelemetryFrame) => void>();
+  const hasSubscribers = (): boolean =>
+    blockListeners.size > 0 || telemetryListeners.size > 0;
   let socket: WebSocket | null = null;
 
   const connect = (): void => {
-    if (socket || listeners.size === 0) return;
+    if (socket || !hasSubscribers()) return;
     const ws = new WebSocket(wsUrl);
     socket = ws;
     ws.onmessage = (event) => {
-      const frame = JSON.parse(String(event.data)) as WsBlockFrame;
+      const frame = JSON.parse(String(event.data)) as WsFrame;
       switch (frame.type) {
         case "block": {
           const block = { height: frame.height, appHash: frame.appHash };
-          listeners.forEach((notify) => notify(block));
+          blockListeners.forEach((notify) => notify(block));
+          break;
+        }
+        case "telemetry": {
+          telemetryListeners.forEach((notify) => notify(frame));
           break;
         }
         default:
@@ -98,9 +180,17 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
     };
     ws.onclose = () => {
       socket = null;
-      if (listeners.size > 0) setTimeout(connect, RECONNECT_DELAY_MS);
+      if (hasSubscribers()) setTimeout(connect, RECONNECT_DELAY_MS);
     };
     ws.onerror = () => ws.close();
+  };
+
+  /** Drop the socket once nothing is subscribed. */
+  const closeIfIdle = (): void => {
+    if (!hasSubscribers()) {
+      socket?.close();
+      socket = null;
+    }
   };
 
   return {
@@ -110,6 +200,38 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       postJson<BlockEvent>(`${base}/v1/submit`, { target, payload, origin }),
     query: (target, query) =>
       postJson<unknown>(`${base}/v1/query`, { target, query }),
+    // raw bytes in, `{"digest":"<64-hex>"}` out — not json in, so this bypasses
+    // postJson; the error envelope is still the node's json `{error}` shape.
+    putBlob: (bytes) =>
+      Promise.resolve()
+        .then(() =>
+          fetch(`${base}/v1/files/blob`, {
+            method: "POST",
+            headers: { "content-type": "application/octet-stream" },
+            body: bytes,
+          }),
+        )
+        .then(async (res) => {
+          if (res.ok) return ((await res.json()) as { digest: string }).digest;
+          const detail = await res
+            .json()
+            .then((payload) => String((payload as { error?: string }).error ?? ""))
+            .catch(() => "");
+          throw new Error(detail || `node replied ${res.status}`);
+        }),
+    // GET the raw chunk bytes back; the error envelope is the node's json
+    // `{error}` shape, matching putBlob.
+    getBlob: (digest) =>
+      Promise.resolve()
+        .then(() => fetch(`${base}/v1/files/blob/${digest}`))
+        .then(async (res) => {
+          if (res.ok) return new Uint8Array(await res.arrayBuffer());
+          const detail = await res
+            .json()
+            .then((payload) => String((payload as { error?: string }).error ?? ""))
+            .catch(() => "");
+          throw new Error(detail || `node replied ${res.status}`);
+        }),
     status: () =>
       Promise.resolve()
         .then(() => fetch(`${base}/v1/status`))
@@ -117,15 +239,36 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
           if (!res.ok) throw new Error(`node replied ${res.status}`);
           return res.json() as Promise<NodeStatus>;
         }),
+    telemetry: (limit) =>
+      Promise.resolve()
+        .then(() =>
+          fetch(
+            limit === undefined
+              ? `${base}/v1/telemetry`
+              : `${base}/v1/telemetry?limit=${limit}`,
+          ),
+        )
+        .then((res) => {
+          if (!res.ok) throw new Error(`node replied ${res.status}`);
+          return res.json() as Promise<{ frames?: TelemetryFrame[] }>;
+        })
+        // best-effort observability: a node without a telemetry surface (or a
+        // malformed body) reads as "no telemetry", not an error.
+        .then((body) => body.frames ?? []),
     onBlock: (listener) => {
-      listeners.add(listener);
+      blockListeners.add(listener);
       connect();
       return () => {
-        listeners.delete(listener);
-        if (listeners.size === 0) {
-          socket?.close();
-          socket = null;
-        }
+        blockListeners.delete(listener);
+        closeIfIdle();
+      };
+    },
+    onTelemetry: (listener) => {
+      telemetryListeners.add(listener);
+      connect();
+      return () => {
+        telemetryListeners.delete(listener);
+        closeIfIdle();
       };
     },
   };

@@ -69,11 +69,197 @@ pub struct Cluster {
     /// http/ws app-surface port per `peer_ids` position (the noded wire
     /// contract served by the validator itself; off under `--sync-only`).
     pub http_ports: Vec<u16>,
+    /// per-node `advertised` override (test-only), index-aligned with
+    /// `peer_ids`. `Some(addr)` emits an `advertised = "<addr>"` line right
+    /// after `listen` in the generated config (e.g. a sentry/forwarder in
+    /// front of the node); `None` emits nothing — byte-for-byte the plain node.
+    pub advertised: Vec<Option<String>>,
+    /// override for the bootstrapper address every non-founder node dials.
+    /// `None` -> `127.0.0.1:p2p_ports[0]` (identical to today); `Some(addr)`
+    /// points bootstrap at a forwarder in front of node 0.
+    pub bootstrap_addr_override: Option<String>,
     /// declared BEFORE `dir` so drop order kills + reaps every child first —
     /// removing the tempdir under live processes races their qmdb/journal
     /// writes and silently leaks the subtree.
     nodes: Vec<Option<NodeProc>>,
     dir: tempfile::TempDir,
+}
+
+/// a two-person network-shape ceremony: real `init`/`invite`/`join` verbs,
+/// key files, network.toml descriptors, and node.toml configs.
+pub struct NetworkShapeCluster {
+    pub p2p_ports: Vec<u16>,
+    pub rpc_ports: Vec<u16>,
+    pub http_ports: Vec<u16>,
+    pub founder_dir: PathBuf,
+    pub friend_dir: PathBuf,
+    nodes: Vec<Option<NodeProc>>,
+    dir: tempfile::TempDir,
+}
+
+impl NetworkShapeCluster {
+    pub fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("network-shape tempdir");
+        let ports = alloc_ports(6);
+        let (p2p_ports, rest) = ports.split_at(2);
+        let (rpc_ports, http_ports) = rest.split_at(2);
+        Self {
+            p2p_ports: p2p_ports.to_vec(),
+            rpc_ports: rpc_ports.to_vec(),
+            http_ports: http_ports.to_vec(),
+            founder_dir: dir.path().join("founder"),
+            friend_dir: dir.path().join("friend"),
+            nodes: vec![None, None],
+            dir,
+        }
+    }
+
+    pub fn init_founder(&self, name: &str) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args([
+                "init",
+                "--name",
+                name,
+                "--dir",
+                self.founder_dir.to_str().expect("utf-8 founder dir"),
+                "--listen",
+                &format!("127.0.0.1:{}", self.p2p_ports[0]),
+                "--advertised",
+                &format!("127.0.0.1:{}", self.p2p_ports[0]),
+                "--http",
+                &format!("127.0.0.1:{}", self.http_ports[0]),
+                "--rpc",
+                &format!("127.0.0.1:{}", self.rpc_ports[0]),
+            ])
+            .output()
+            .expect("run init");
+        assert!(
+            out.status.success(),
+            "init failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    pub fn invite(&self) -> String {
+        let cfg = self.config_file(0);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["invite", "--config"])
+            .arg(cfg)
+            .output()
+            .expect("run invite");
+        assert!(
+            out.status.success(),
+            "invite failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    pub fn join_friend(&self, invite: &str) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args([
+                "join",
+                invite,
+                "--dir",
+                self.friend_dir.to_str().expect("utf-8 friend dir"),
+                "--listen",
+                &format!("127.0.0.1:{}", self.p2p_ports[1]),
+                "--advertised",
+                &format!("127.0.0.1:{}", self.p2p_ports[1]),
+                "--http",
+                &format!("127.0.0.1:{}", self.http_ports[1]),
+                "--rpc",
+                &format!("127.0.0.1:{}", self.rpc_ports[1]),
+            ])
+            .output()
+            .expect("run join");
+        assert!(
+            out.status.success(),
+            "join failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    pub fn config_file(&self, idx: usize) -> PathBuf {
+        match idx {
+            0 => self.founder_dir.join("node.toml"),
+            1 => self.friend_dir.join("node.toml"),
+            _ => panic!("unknown network-shape node idx {idx}"),
+        }
+    }
+
+    pub fn spawn(&mut self, idx: usize) {
+        let cfg = self.config_file(idx);
+        let label = match idx {
+            0 => "founder",
+            1 => "friend",
+            _ => panic!("unknown network-shape node idx {idx}"),
+        };
+        let log = self.dir.path().join(format!("{label}.log"));
+        let out = std::fs::File::create(&log).expect("create node log");
+        let err = out.try_clone().expect("clone node log handle");
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .arg("--config")
+            .arg(&cfg)
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("spawn network-shape node");
+        self.nodes[idx] = Some(NodeProc {
+            id: idx as u64,
+            child,
+            log,
+        });
+    }
+
+    pub fn run_invite_accept(&self, pubkey_hex: &str) -> (bool, String) {
+        let cfg = self.config_file(0);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["invite-accept", pubkey_hex, "--config"])
+            .arg(cfg)
+            .output()
+            .expect("run invite-accept");
+        (out.status.success(), command_output(&out))
+    }
+
+    pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let node = self.nodes[idx].as_mut().expect("node is running");
+            let text = std::fs::read_to_string(&node.log).unwrap_or_default();
+            if let Some(rest) = find_marker(&text, marker) {
+                return rest;
+            }
+            let exited = node.child.try_wait().expect("poll node").is_some();
+            if exited || Instant::now() >= deadline {
+                let verb = if exited { "exited" } else { "timed out" };
+                panic!(
+                    "network-shape node idx {idx} {verb} without printing {marker:?};\n{}",
+                    self.all_log_tails(60),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    fn all_log_tails(&self, lines: usize) -> String {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, n)| {
+                n.as_ref().map(|n| {
+                    let text = std::fs::read_to_string(&n.log).unwrap_or_default();
+                    format!(
+                        "--- network-shape node idx {idx} log tail ---\n{}",
+                        log_tail(&text, lines)
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl Cluster {
@@ -93,6 +279,8 @@ impl Cluster {
             p2p_ports: p2p_ports.to_vec(),
             rpc_ports: rpc_ports.to_vec(),
             http_ports: http_ports.to_vec(),
+            advertised: peer_ids.iter().map(|_| None).collect(),
+            bootstrap_addr_override: None,
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
         }
@@ -112,14 +300,14 @@ impl Cluster {
         let mut cfg = String::new();
         cfg.push_str(&format!("id = {id}\n"));
         cfg.push_str(&format!("listen = \"127.0.0.1:{}\"\n", self.p2p_ports[idx]));
+        if let Some(addr) = &self.advertised[idx] {
+            cfg.push_str(&format!("advertised = {addr:?}\n"));
+        }
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
         if idx != 0 {
-            cfg.push_str(&format!(
-                "bootstrapper_addr = \"127.0.0.1:{}\"\n",
-                self.p2p_ports[0]
-            ));
+            cfg.push_str(&format!("bootstrapper_addr = \"{}\"\n", self.bootstrap_addr()));
         }
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
@@ -162,6 +350,109 @@ impl Cluster {
     /// kill the node at `idx` (crash-fault injection) and reap it.
     pub fn kill(&mut self, idx: usize) {
         self.nodes[idx] = None; // NodeProc::drop kills + waits
+    }
+
+    /// send SIGTERM to node `idx` WITHOUT reaping it — the graceful-quit fault
+    /// the desktop shell injects when it SIGTERMs the daemon on app quit. the
+    /// node's own signal arm should run its final checkpoint and exit 0; the
+    /// caller then reaps via [`Self::wait_exit`]. dependency-free: shells out to
+    /// `kill(1)` on the child pid rather than pulling in libc/nix for one call.
+    pub fn term(&self, idx: usize) {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        let pid = node.child.id();
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success(), "kill -TERM {pid} failed");
+    }
+
+    /// the deterministic path of node `idx`'s config file (written by a prior
+    /// [`Self::spawn`] / [`Self::spawn_joiner`]) — for verbs that read it.
+    pub fn config_file(&self, idx: usize) -> PathBuf {
+        self.dir
+            .path()
+            .join(format!("node{}.toml", self.peer_ids[idx]))
+    }
+
+    /// the bootstrapper address every non-founder / joiner dials: the override
+    /// when set (e.g. a sentry/forwarder in front of node 0), else node 0's own
+    /// p2p port — today's default behavior.
+    fn bootstrap_addr(&self) -> String {
+        self.bootstrap_addr_override
+            .clone()
+            .unwrap_or_else(|| format!("127.0.0.1:{}", self.p2p_ports[0]))
+    }
+
+    /// spawn an UNINVITED joiner: identity seed `id`, deliberately absent
+    /// from every existing member's `peer_seeds` — the mesh refuses it until
+    /// governance admits it and the epoch cutover re-tracks. its own config
+    /// lists the CURRENT members as mesh + validators (the invite descriptor
+    /// a real joiner receives). rpc/http ports are allocated so the node can
+    /// be driven after it promotes itself. call this AFTER every member
+    /// spawn — it appends to the cluster index space.
+    ///
+    /// returns the joiner's cluster index.
+    pub fn spawn_joiner(&mut self, id: u64) -> usize {
+        let ports = alloc_ports(3);
+        let path = self.dir.path().join(format!("node{id}.toml"));
+        let mut cfg = String::new();
+        cfg.push_str(&format!("id = {id}\n"));
+        cfg.push_str(&format!("listen = \"127.0.0.1:{}\"\n", ports[0]));
+        cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
+        cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
+        cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
+        cfg.push_str(&format!("bootstrapper_addr = \"{}\"\n", self.bootstrap_addr()));
+        cfg.push_str(&format!(
+            "storage_dir = {:?}\n",
+            self.dir
+                .path()
+                .join(format!("storage-{id}"))
+                .to_str()
+                .unwrap()
+        ));
+        cfg.push_str(&format!("rpc_listen = \"127.0.0.1:{}\"\n", ports[1]));
+        cfg.push_str(&format!("http_listen = \"127.0.0.1:{}\"\n", ports[2]));
+        std::fs::write(&path, cfg).expect("write joiner config");
+
+        let log = self.dir.path().join(format!("node{id}.log"));
+        let out = std::fs::File::create(&log).expect("create joiner log");
+        let err = out.try_clone().expect("clone joiner log handle");
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .arg("--config")
+            .arg(&path)
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("spawn joiner node");
+
+        self.peer_ids.push(id);
+        self.p2p_ports.push(ports[0]);
+        self.rpc_ports.push(ports[1]);
+        self.http_ports.push(ports[2]);
+        // keep `advertised` index-aligned with the extended index space so a
+        // later `config_path(joiner_idx)` (e.g. `run_sync_only`) never panics.
+        self.advertised.push(None);
+        self.nodes.push(Some(NodeProc { id, child, log }));
+        self.peer_ids.len() - 1
+    }
+
+    /// run a ducktape-node VERB (invite-accept, admit, ...) to completion and
+    /// return (success, combined output).
+    pub fn run_verb(&self, args: &[&str]) -> (bool, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(args)
+            .output()
+            .expect("run ducktape-node verb");
+        (
+            out.status.success(),
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
     }
 
     /// wait for node `idx` to exit ON ITS OWN (a graceful shutdown path) and
@@ -399,6 +690,14 @@ impl Cluster {
         );
         reply["status"].clone()
     }
+}
+
+fn command_output(out: &std::process::Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// poll `probe` every 300ms until it returns `Some`, or panic with `what`

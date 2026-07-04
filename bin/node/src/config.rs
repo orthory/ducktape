@@ -27,8 +27,9 @@ use serde::{Deserialize, Serialize};
 /// (see `ConsensusScheme`); anything else is a build from the future.
 pub const SCHEME_ED25519: &str = "ed25519";
 
-/// the invite blob prefix; versioned so a future format can coexist.
-const INVITE_PREFIX: &str = "ducktape-invite-v1:";
+/// the invite blob prefix; versioned so a stale-format paste fails loudly. v2 is
+/// the compact binary payload (raw keys, base64url) — see [`encode_invite`].
+const INVITE_PREFIX: &str = "ducktape-invite-v2:";
 
 // ============================================================================
 // hex — dependency-free codecs for keys, roots, and the invite blob.
@@ -231,21 +232,27 @@ impl NetworkDescriptor {
         format!("{}@{}", self.chain_id, hex_bytes(&digest.as_ref()[..16]))
     }
 
-    /// parsed bootstrap entries; a MALFORMED entry is a config error, but a
-    /// well-formed hint that is not dialable (unspecified ip, port 0 — e.g.
-    /// minted by an older binary) is skipped: hints are advisory, and dialing
-    /// 0.0.0.0 resolves to the joiner's own loopback.
+    /// bootstrap entries RESOLVED to concrete socket addrs to dial. the host may
+    /// be a literal IP or a HOSTNAME — `to_socket_addrs` resolves either (DNS for
+    /// a name), so `pubkey@node.example.com:443` works the same as an ip. a
+    /// MALFORMED entry (no `@`, bad key) is a config error; a hint that does not
+    /// resolve, or resolves to an unspecified ip / port 0, is advisory and
+    /// skipped rather than failing startup.
     pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, SocketAddr)>, String> {
+        use std::net::ToSocketAddrs as _;
         let mut out = Vec::new();
         for entry in &self.bootstrap {
-            let (key, addr) = entry
+            let (key, host_port) = entry
                 .split_once('@')
                 .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
-            let addr: SocketAddr = addr.parse().map_err(|e| format!("{entry:?}: {e}"))?;
+            let key = decode_key(key)?;
+            let Some(addr) = host_port.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+                continue; // unresolvable (stale DNS, offline) — advisory, skip.
+            };
             if addr.ip().is_unspecified() || addr.port() == 0 {
                 continue;
             }
-            out.push((decode_key(key)?, addr));
+            out.push((key, addr));
         }
         Ok(out)
     }
@@ -260,9 +267,9 @@ impl NetworkDescriptor {
         }
     }
 
-    /// record a dial hint for `key` at `addr`, replacing any previous hint for
-    /// the same key (a member's advertised addr can move).
-    pub fn add_bootstrap(&mut self, key: &ed25519::PublicKey, addr: &SocketAddr) {
+    /// record a dial hint (`host:port`, an IP or a hostname) for `key`, replacing
+    /// any previous hint for the same key (a member's advertised addr can move).
+    pub fn add_bootstrap(&mut self, key: &ed25519::PublicKey, addr: &str) {
         let hex = hex_bytes(key.as_ref());
         self.bootstrap
             .retain(|e| !e.starts_with(&format!("{hex}@")));
@@ -301,45 +308,205 @@ pub fn guard_join_descriptor(dir: &Path, incoming: &NetworkDescriptor) -> Result
     Ok(())
 }
 
-/// the addr peers should dial, if one is real: prefer `advertised`, else the
-/// listen addr when it is concrete. an UNSPECIFIED ip (0.0.0.0/[::]) or port 0
-/// is never dialable — writing one into a descriptor would hand every joiner a
-/// bootstrap hint that resolves to their own loopback. an explicitly-passed
-/// advertised addr that is not dialable is an ERROR (the caller asked for it);
-/// a non-dialable listen just means "no hint" (Ok(None)).
-pub fn dialable(advertised: Option<&str>, listen: &str) -> Result<Option<SocketAddr>, String> {
+/// the `host:port` peers should dial, if one is real: prefer `advertised`, else
+/// the listen addr when it is concrete. the returned STRING is what lands in the
+/// descriptor verbatim — a HOSTNAME stays a hostname (resolved at dial time), so
+/// `node.example.com:443` is a valid advertised addr. an IP that is UNSPECIFIED
+/// (0.0.0.0/[::]) or on port 0 is never dialable — writing one would hand every
+/// joiner a hint that resolves to their own loopback. an explicitly-passed
+/// advertised that is not dialable is an ERROR (the caller asked for it); a
+/// non-dialable listen just means "no hint" (Ok(None)).
+pub fn dialable(advertised: Option<&str>, listen: &str) -> Result<Option<String>, String> {
     if let Some(a) = advertised {
-        let addr: SocketAddr = a.parse().map_err(|e| format!("advertised: {e}"))?;
-        if addr.ip().is_unspecified() || addr.port() == 0 {
-            return Err(format!(
-                "advertised addr {addr} is not dialable (unspecified ip or port 0)"
-            ));
+        let a = a.trim();
+        match a.parse::<SocketAddr>() {
+            // an IP literal must be concrete.
+            Ok(addr) if addr.ip().is_unspecified() || addr.port() == 0 => {
+                return Err(format!(
+                    "advertised addr {addr} is not dialable (unspecified ip or port 0)"
+                ));
+            }
+            Ok(_) => {}
+            // not an IP → a hostname; require a non-empty host and a real port.
+            Err(_) if !is_host_port(a) => {
+                return Err(format!("advertised addr {a:?} is not host:port"));
+            }
+            Err(_) => {}
         }
-        return Ok(Some(addr));
+        return Ok(Some(a.to_string()));
     }
     let l: SocketAddr = listen.parse().map_err(|e| format!("listen: {e}"))?;
-    Ok((!l.ip().is_unspecified() && l.port() != 0).then_some(l))
+    Ok((!l.ip().is_unspecified() && l.port() != 0).then(|| l.to_string()))
+}
+
+/// a lightweight `host:port` shape check for a non-IP advertised hint: a
+/// non-empty host and a numeric, non-zero port. resolution happens later, at
+/// dial time (see [`NetworkDescriptor::bootstrap_entries`]).
+fn is_host_port(s: &str) -> bool {
+    match s.rsplit_once(':') {
+        Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0),
+        None => false,
+    }
+}
+
+/// resolve a `host:port` (IP literal or hostname via DNS) to a single socket
+/// addr, erroring if it does not resolve.
+fn resolve_one(host_port: &str) -> Result<SocketAddr, String> {
+    use std::net::ToSocketAddrs as _;
+    host_port
+        .to_socket_addrs()
+        .map_err(|e| format!("{host_port:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{host_port:?} did not resolve"))
 }
 
 // ============================================================================
-// the invite blob — the descriptor, hex-wrapped for a single-line paste.
+// the invite blob — the descriptor packed into a compact, single-line token.
+//
+// v1 hex-wrapped the whole `network.toml` (field names, quotes, and 64-char hex
+// keys carried twice), which ballooned a solo invite past 470 chars. v2 packs
+// only what a joiner needs — chain-id, the raw (un-hexed) validator keys, and
+// raw key+addr dial hints — and base64url-encodes it. scheme is implicit
+// (ed25519 only), so it is neither stored nor sent. ~4x smaller, and no longer
+// a "raw TOML file". flag-day change: v1 blobs no longer decode.
 // ============================================================================
 
-pub fn encode_invite(descriptor: &NetworkDescriptor) -> String {
-    format!(
-        "{INVITE_PREFIX}{}",
-        hex_bytes(descriptor.to_toml().as_bytes())
-    )
+/// invite payload format tag (the first packed byte).
+const INVITE_VERSION: u8 = 2;
+
+const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+pub fn encode_invite(descriptor: &NetworkDescriptor) -> Result<String, String> {
+    use base64::Engine as _;
+    Ok(format!("{INVITE_PREFIX}{}", INVITE_B64.encode(pack_invite(descriptor)?)))
 }
 
 pub fn decode_invite(blob: &str) -> Result<NetworkDescriptor, String> {
-    let hex = blob
+    use base64::Engine as _;
+    let body = blob
         .trim()
         .strip_prefix(INVITE_PREFIX)
         .ok_or_else(|| format!("not a ducktape invite (expected {INVITE_PREFIX}...)"))?;
-    let bytes = unhex(hex)?;
-    let text = String::from_utf8(bytes).map_err(|e| format!("invite payload: {e}"))?;
-    NetworkDescriptor::from_toml(&text)
+    let bytes = INVITE_B64
+        .decode(body)
+        .map_err(|e| format!("invite is not valid base64url: {e}"))?;
+    unpack_invite(&bytes)
+}
+
+/// pack a descriptor into the compact v2 payload. bootstrap hints are copied
+/// verbatim (any well-formed `pubkey@addr`); validator hex is decoded to raw
+/// keys, which also rejects a malformed descriptor here rather than shipping it.
+fn pack_invite(d: &NetworkDescriptor) -> Result<Vec<u8>, String> {
+    let mut out = vec![INVITE_VERSION];
+
+    let cid = d.chain_id.as_bytes();
+    let cid_len = u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?;
+    out.push(cid_len);
+    out.extend_from_slice(cid);
+
+    let vkeys = d.validator_keys()?; // hex -> raw, deduped
+    let vcount = u8::try_from(vkeys.len()).map_err(|_| format!("too many validators ({})", vkeys.len()))?;
+    out.push(vcount);
+    for k in &vkeys {
+        out.extend_from_slice(k.as_ref());
+    }
+
+    let bcount = u8::try_from(d.bootstrap.len()).map_err(|_| format!("too many bootstrap hints ({})", d.bootstrap.len()))?;
+    out.push(bcount);
+    for entry in &d.bootstrap {
+        let (key, host_port) = entry
+            .split_once('@')
+            .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
+        let key = decode_key(key)?;
+        // the addr is stored as a length-prefixed string — an IP or a HOSTNAME
+        // (resolved at dial time), so `pubkey@node.example.com:443` round-trips.
+        let hp = host_port.as_bytes();
+        let hp_len =
+            u8::try_from(hp.len()).map_err(|_| format!("bootstrap addr too long in {entry:?}"))?;
+        out.extend_from_slice(key.as_ref());
+        out.push(hp_len);
+        out.extend_from_slice(hp);
+    }
+    Ok(out)
+}
+
+/// inverse of [`pack_invite`]; yields a descriptor canonicalized exactly as
+/// [`NetworkDescriptor::from_toml`] would (lowercase, sorted validators) so the
+/// genesis fingerprint of a decoded invite matches the founder's.
+fn unpack_invite(bytes: &[u8]) -> Result<NetworkDescriptor, String> {
+    let mut r = InviteReader::new(bytes);
+    let version = r.u8()?;
+    if version != INVITE_VERSION {
+        return Err(format!(
+            "unsupported invite version {version} (this build reads v{INVITE_VERSION})"
+        ));
+    }
+    let cid_len = r.u8()? as usize;
+    let chain_id = String::from_utf8(r.take(cid_len)?.to_vec()).map_err(|e| format!("chain_id: {e}"))?;
+
+    let vcount = r.u8()? as usize;
+    let mut validators = Vec::with_capacity(vcount);
+    for _ in 0..vcount {
+        validators.push(hex_bytes(r.take(32)?));
+    }
+    validators.sort();
+
+    let bcount = r.u8()? as usize;
+    let mut bootstrap = Vec::with_capacity(bcount);
+    for _ in 0..bcount {
+        let key = hex_bytes(r.take(32)?);
+        let hp_len = r.u8()? as usize;
+        let host_port =
+            std::str::from_utf8(r.take(hp_len)?).map_err(|e| format!("bootstrap addr: {e}"))?;
+        bootstrap.push(format!("{key}@{host_port}"));
+    }
+    if !r.done() {
+        return Err("invite payload has trailing bytes".into());
+    }
+    Ok(NetworkDescriptor {
+        chain_id,
+        scheme: SCHEME_ED25519.into(),
+        validators,
+        bootstrap,
+    })
+}
+
+/// a bounds-checked forward cursor over the packed invite bytes.
+struct InviteReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> InviteReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn u8(&mut self) -> Result<u8, String> {
+        let byte = *self
+            .bytes
+            .get(self.pos)
+            .ok_or_else(|| "invite payload truncated".to_string())?;
+        self.pos += 1;
+        Ok(byte)
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| "invite length overflow".to_string())?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or_else(|| "invite payload truncated".to_string())?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn done(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
 }
 
 // ============================================================================
@@ -544,27 +711,20 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         return Err(format!("network {} has no validators", descriptor.chain_id));
     }
     let bootstrap = descriptor.bootstrap_entries()?;
-    // mesh = validators ∪ bootstrap identities (static until live admission
-    // lands; a key outside this set cannot even connect).
+    // mesh = validators ∪ bootstrap identities. A fresh network-shape joiner
+    // may be outside this set at genesis; it parks until governance admits it.
     let mut mesh = validators.clone();
     for (k, _) in &bootstrap {
         if !mesh.contains(k) {
             mesh.push(k.clone());
         }
     }
-    if !mesh.contains(&me) {
-        return Err(format!(
-            "identity {} is not a member of network {} — pre-genesis, a member must run \
-             `ducktape-node admit {}` and re-share the invite (live admission is not built yet)",
-            hex_bytes(me.as_ref()),
-            descriptor.chain_id,
-            hex_bytes(me.as_ref()),
-        ));
-    }
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
     let advertised: SocketAddr = match raw.advertised.as_deref() {
-        Some(a) => a.parse().map_err(|e| format!("advertised: {e}"))?,
+        // resolve (DNS for a hostname) — the mesh wants a concrete socket addr
+        // for our self-announced dial address.
+        Some(a) => resolve_one(a).map_err(|e| format!("advertised: {e}"))?,
         None => listen,
     };
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
@@ -641,7 +801,9 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
     let advertised: SocketAddr = match raw.advertised.as_deref() {
-        Some(a) => a.parse().map_err(|e| format!("advertised: {e}"))?,
+        // resolve (DNS for a hostname) — the mesh wants a concrete socket addr
+        // for our self-announced dial address.
+        Some(a) => resolve_one(a).map_err(|e| format!("advertised: {e}"))?,
         None => listen,
     };
 
@@ -702,9 +864,22 @@ mod tests {
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
         };
-        d.add_bootstrap(&me, &"127.0.0.1:52200".parse().unwrap());
-        let decoded = decode_invite(&encode_invite(&d)).expect("roundtrip");
+        d.add_bootstrap(&me, "127.0.0.1:52200");
+        let decoded = decode_invite(&encode_invite(&d).expect("encode")).expect("roundtrip");
         assert_eq!(decoded, d);
+
+        // a HOSTNAME dial hint survives the compact encode/decode verbatim (it is
+        // stored as a string and resolved only at dial time).
+        let other = ed25519::PrivateKey::from_seed(8).public_key();
+        d.add_bootstrap(&other, "node.ducktape.industries:443");
+        let decoded = decode_invite(&encode_invite(&d).expect("encode")).expect("roundtrip");
+        assert_eq!(decoded, d);
+        assert!(
+            decoded
+                .bootstrap
+                .iter()
+                .any(|b| b.ends_with("@node.ducktape.industries:443"))
+        );
     }
 
     #[test]
@@ -741,7 +916,7 @@ mod tests {
             ],
             bootstrap: vec![],
         };
-        d.add_bootstrap(&other, &"127.0.0.1:52200".parse().unwrap());
+        d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
         std::fs::write(
             dir.join("node.toml"),
@@ -764,9 +939,9 @@ mod tests {
     }
 
     #[test]
-    fn a_non_member_identity_is_refused_with_admit_guidance() {
+    fn a_non_member_identity_resolves_as_a_pending_joiner() {
         let dir = tmp("nonmember");
-        let (_, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let other = ed25519::PrivateKey::from_seed(3).public_key();
         let d = NetworkDescriptor {
             chain_id: "closed#00000000".into(),
@@ -780,11 +955,11 @@ mod tests {
             "network = \"network.toml\"\nlisten = \"127.0.0.1:52202\"\n",
         )
         .expect("write");
-        let err = resolve(&dir.join("node.toml")).expect_err("non-member must be refused");
-        assert!(
-            err.contains("admit"),
-            "error carries the admit guidance: {err}"
-        );
+        let r = resolve(&dir.join("node.toml")).expect("non-member resolves as a joiner");
+        assert_eq!(r.signer.public_key(), me.public_key());
+        assert!(!r.validators.contains(&me.public_key()));
+        assert_eq!(r.validators, vec![other.clone()]);
+        assert_eq!(r.mesh, vec![other]);
     }
 
     #[test]
@@ -827,7 +1002,7 @@ mod tests {
 
         // bootstrap hints are advisory and legitimately differ per member —
         // they must NOT move the namespace.
-        d.add_bootstrap(&a, &"127.0.0.1:52200".parse().unwrap());
+        d.add_bootstrap(&a, "127.0.0.1:52200");
         assert_eq!(d.genesis_namespace(), founder_only);
 
         // admitting a member DOES move it: a stale descriptor can no longer
@@ -853,8 +1028,16 @@ mod tests {
         assert!(dialable(Some("1.2.3.4:0"), "127.0.0.1:52200").is_err());
         assert_eq!(
             dialable(Some("1.2.3.4:5"), "127.0.0.1:0").unwrap(),
-            Some("1.2.3.4:5".parse().unwrap())
+            Some("1.2.3.4:5".to_string())
         );
+        // a HOSTNAME advertised is kept verbatim (resolved at dial time), not
+        // rejected — invites can carry a domain like node.example.com:443.
+        assert_eq!(
+            dialable(Some("node.example.com:443"), "127.0.0.1:0").unwrap(),
+            Some("node.example.com:443".to_string())
+        );
+        assert!(dialable(Some("node.example.com:0"), "127.0.0.1:52200").is_err());
+        assert!(dialable(Some("not-an-addr"), "127.0.0.1:52200").is_err());
     }
 
     #[cfg(unix)]

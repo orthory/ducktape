@@ -21,12 +21,14 @@ agent-interface = { workspace = true }
 saga = { workspace = true }
 saga-interface = { workspace = true }
 tasks = { workspace = true }
+profiles = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 inbox-interface = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
+jobs-interface = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }

@@ -37,7 +37,7 @@ struct TestCtx {
 impl TestCtx {
     fn new(origin: Origin, height: u64) -> Self {
         Self {
-            env: Env {
+            env: Env { protocol_version: 0,
                 height,
                 consensus_time: height,
                 origin,
@@ -364,9 +364,28 @@ fn blob_store_round_trips_and_digest_matches() {
     let digest = files.put_chunk(bytes.clone());
     assert_eq!(digest, sha256(&bytes), "put_chunk keys by sha256");
     assert!(files.has_chunk(&digest));
-    assert_eq!(files.get_chunk(&digest), Some(bytes.as_slice()));
+    assert_eq!(files.get_chunk(&digest), Some(bytes.clone()));
     assert!(!files.has_chunk(&sha256(b"absent")));
     assert_eq!(files.get_chunk(&sha256(b"absent")), None);
+}
+
+#[test]
+fn blob_handle_shares_one_store_with_the_module() {
+    block_on(async {
+        // the daemon seam: bytes uploaded through a CLONED handle must be the
+        // same store the registered module reads from and serves out of.
+        let files = Files::new(FILES);
+        let handle = files.blob_handle();
+        let bytes = b"uploaded through the daemon lane".to_vec();
+        let digest = handle.put_chunk(bytes.clone());
+        assert!(files.has_chunk(&digest), "module sees the handle's put");
+        assert_eq!(files.get_chunk(&digest), Some(bytes.clone()));
+        assert_eq!(handle.get_chunk(&digest), Some(bytes.clone()));
+
+        let (present, served) = fetch_chunk(&files, &to_hex(&digest)).await;
+        assert!(present, "serve_sync answers from the shared store");
+        assert_eq!(served, bytes);
+    });
 }
 
 /// fetch one chunk over the serve_sync wire and return (present, bytes).
@@ -649,7 +668,7 @@ fn host_dispatch_moves_app_hash_and_serves_query() {
 
         let out = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 9,
                     consensus_time: 9,
                     origin: Origin::External(b"tester".to_vec()),

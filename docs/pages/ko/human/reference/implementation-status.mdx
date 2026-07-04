@@ -14,17 +14,26 @@
 
 ## Module State
 
-- QMDB-backed module(`kv`, `document`)은 실제 authenticated root와 state-sync
-  target을 노출한다.
+- QMDB-backed module(`kv`, `document`, `chat`)은 실제 authenticated root와
+  state-sync target을 노출한다.
 - Forge는 git state에서 32바이트 state root를 계산하고 install 전에 object closure를
   verify한다.
-- Snapshot-style module(`valset`, `saga`, `tasks`, example `directory`)은 module에
-  맞는 canonical byte를 사용한다.
+- Snapshot-style module(`valset`, `saga`, `tasks`, `governance`, `vaults`,
+  `inbox`, `automations`, `files`, `memory`, `jobs`, example `directory`)은
+  module에 맞는 canonical byte를 사용한다.
 - system crate에는 validator-derived mesh control-plane type
   (`valset-mesh-interface`)과 WireGuard tunnel-upgrade protocol
   (`wireguard-upgrade`)도 있다.
 - chat(단일 storage-owning chat module; messaging/agent facade가 folded-in)은
-  workspace member지만 binary consumer는 아직 없다.
+  demo와 app daemon(`noded`)에 등록되어 있다.
+- module wave가 업무용 surface를 채운다: inbox는 notification을 원인과 같은
+  block에서 commit되는 follow-up op로 배달하고(P2), automations는
+  user-authored chat post를 operator rule로 평가하며 probe-before-emit
+  follow-up을 emit하고, files는 content-addressed manifest만 commit하며 chunk
+  byte는 digest-and-length verification 뒤 node-local에 남고, memory는 prefix
+  watch와 인용 가능한 `duck://` read를 갖춘 generation-pinned shared agent
+  workspace이고, jobs는 view lease와 permissionless reclaim을 가진
+  first-claim-wins work board다.
 
 ## Verification Surface
 
@@ -32,14 +41,19 @@
 - `cargo run -p demo`는 in-process multi-module walkthrough를 실행한다.
 - `cargo test -p demo --test joiner_rebuilds_global_app_hash`는 joiner가 모든 module을
   rebuild하고 source app-hash와 match할 수 있음을 증명한다.
-- `bin/node/examples/demo-2node.sh`는 commonware-backed node path에서 두 OS process를
-  구동한다.
+- `bin/node/examples/demo-invite.sh`는 human-runnable onboarding ceremony를 real
+  socket 위에서 구동한다. founder `init`, invite, friend `join`, founder `admit`,
+  refreshed invite 이후 두 node가 하나의 network로 boot하고 RPC-submitted directory
+  op에 converge한다.
+- `cargo test -p node-bin --test cluster_e2e`는 automated real-socket node lifecycle
+  gate다. three-validator convergence, RPC-submitted message의 consensus crossing,
+  cross-node governance vote, live epoch cutover, sync-only joiner의 post-cutover state
+  rebuild를 검증한다.
 
 ## Still Open
 
-- live node에서 network-backed module sync.
-- live valset orchestration wiring. deterministic cutover state machine
-  (`ValsetOrchestrator`)은 구현되어 test까지 있고, old orderer stop, new epoch
-  start, membership에 맞춘 transport readiness 정렬이 남아 있다.
-- running node에서 snapshot-at-height serving.
-- chat, tasks module의 product depth.
+- demoted validator가 halt하지 않고 sync-server로 degrade하는 path.
+- replicated state의 per-origin replay nonce. cross-epoch frame replay는 현재
+  per-engine finalization dedup에 의존한다.
+- chat authorship UX, agent reactor-worker seam, agent/tasks pipeline.
+- 두 parallel mesh type system 통합과 WireGuard overlay runtime wiring.

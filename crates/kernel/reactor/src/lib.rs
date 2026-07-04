@@ -148,7 +148,10 @@ impl Reactor {
             }
         }
 
-        Ok(Settled { app_hash: last, events })
+        Ok(Settled {
+            app_hash: last,
+            events,
+        })
     }
 }
 
@@ -158,8 +161,8 @@ mod tests {
     use futures::executor::block_on;
     use saga::SagaModule;
     use saga_interface::{
-        decode_reply, decode_worker_request, encode_msg, encode_query, SagaMsg, SagaQuery,
-        SagaReply, SagaStatus, SagaView,
+        SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply, decode_worker_request,
+        encode_msg, encode_query,
     };
 
     /// a MOCK oracle standing in for the real (non-deterministic) worker. it
@@ -236,8 +239,16 @@ mod tests {
     }
 
     async fn get_saga(host: &Host, id: &str) -> Option<SagaView> {
-        let reply = host.query("saga", &encode_query(&SagaQuery::Get { saga_id: id.into() })).await.unwrap();
-        match decode_reply(&reply).unwrap() { SagaReply::Saga(v) => v }
+        let reply = host
+            .query(
+                "saga",
+                &encode_query(&SagaQuery::Get { saga_id: id.into() }),
+            )
+            .await
+            .unwrap();
+        match decode_reply(&reply).unwrap() {
+            SagaReply::Saga(v) => v,
+        }
     }
 
     #[test]
@@ -246,14 +257,25 @@ mod tests {
             let host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
             let mut reactor = Reactor::new(host, vec![Box::new(MockOracle)]);
 
-            let settled = reactor.submit_and_settle(trigger("s1", b"hello")).await.expect("settle");
+            let settled = reactor
+                .submit_and_settle(trigger("s1", b"hello"))
+                .await
+                .expect("settle");
 
             // the saga reached Done carrying the AGREED (mock-oracle) result — and
             // the settled app-hash reflects that committed progress.
             let v = get_saga(reactor.host(), "s1").await.expect("saga exists");
             assert_eq!(v.status, SagaStatus::Done, "the saga settled at Done");
-            assert_eq!(v.result, Some(b"olleh".to_vec()), "the oracle result is committed");
-            assert_eq!(settled.app_hash, reactor.app_hash(), "settled hash == final host app-hash");
+            assert_eq!(
+                v.result,
+                Some(b"olleh".to_vec()),
+                "the oracle result is committed"
+            );
+            assert_eq!(
+                settled.app_hash,
+                reactor.app_hash(),
+                "settled hash == final host app-hash"
+            );
         });
     }
 
@@ -269,29 +291,61 @@ mod tests {
             let done_hash = {
                 let host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
                 let mut reactor = Reactor::new(host, vec![Box::new(MockOracle)]);
-                reactor.submit_and_settle(trigger("s1", b"hello")).await.expect("settle").app_hash
+                reactor
+                    .submit_and_settle(trigger("s1", b"hello"))
+                    .await
+                    .expect("settle")
+                    .app_hash
             };
 
             // now a bare host, no reactor: submit the Trigger directly.
             let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
             let genesis = host.app_hash();
-            let out = host.submit(trigger("s1", b"hello")).await.expect("submit trigger");
+            let out = host
+                .submit(trigger("s1", b"hello"))
+                .await
+                .expect("submit trigger");
 
             // the saga is Pending, exactly one WorkerRequest effect went unhandled,
             // and the app-hash is neither genesis nor the settled done-hash.
-            assert_eq!(get_saga(&host, "s1").await.unwrap().status, SagaStatus::Pending, "no worker -> stuck at Pending");
-            assert_eq!(out.effects.len(), 1, "the block emitted exactly one WorkerRequest effect");
-            assert_ne!(out.app_hash, genesis, "creating the pending saga moved the root off genesis");
-            assert_ne!(out.app_hash, done_hash, "without the oracle op the state is NOT the done-state");
+            assert_eq!(
+                get_saga(&host, "s1").await.unwrap().status,
+                SagaStatus::Pending,
+                "no worker -> stuck at Pending"
+            );
+            assert_eq!(
+                out.effects.len(),
+                1,
+                "the block emitted exactly one WorkerRequest effect"
+            );
+            assert_ne!(
+                out.app_hash, genesis,
+                "creating the pending saga moved the root off genesis"
+            );
+            assert_ne!(
+                out.app_hash, done_hash,
+                "without the oracle op the state is NOT the done-state"
+            );
 
             // wrap the same host in a reactor and settle from where it is: an empty
             // op is not available, so re-run the effect through the worker manually
             // to prove the ONLY thing missing was the oracle op.
             let mut reactor = Reactor::new(host, vec![Box::new(MockOracle)]);
-            let follow = MockOracle.run(&out.effects[0]).await.unwrap().expect("worker claims the effect");
+            let follow = MockOracle
+                .run(&out.effects[0])
+                .await
+                .unwrap()
+                .expect("worker claims the effect");
             let settled = reactor.submit_and_settle(follow).await.expect("settle");
-            assert_eq!(get_saga(reactor.host(), "s1").await.unwrap().status, SagaStatus::Done, "the oracle op advanced it to Done");
-            assert_eq!(settled.app_hash, done_hash, "and it converges on the same settled done-hash");
+            assert_eq!(
+                get_saga(reactor.host(), "s1").await.unwrap().status,
+                SagaStatus::Done,
+                "the oracle op advanced it to Done"
+            );
+            assert_eq!(
+                settled.app_hash, done_hash,
+                "and it converges on the same settled done-hash"
+            );
         });
     }
 

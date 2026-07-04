@@ -13,29 +13,42 @@ This status page is grounded in checked-in code, tests, and binaries.
 - `node` bridges host application to transport and ordered delivery. Op frames
   are ed25519-signed and verified on decode, so an applied op's origin is
   authenticated authorship. `OrderedNode` supports epoch cutover (engine
-  respawn with a deterministic discard ceiling and rebased app heights).
+  respawn with a deterministic discard ceiling and rebased app heights) and an
+  observation barrier: drain batches end at a watched module's root change, so
+  membership changes are observed at the same view on every validator.
 - `consensus` contains the commonware Simplex-backed orderer with bounded
   payload memory (pinned own submissions, FIFO-capped peer cache) and the
-  `ValsetOrchestrator` for epoch scheduling.
-- `statesync` defines the network state-sync wire protocol (manifest, chunked
-  snapshots, remote qmdb resolver) and the p2p transport binding.
+  `ValsetOrchestrator` for epoch scheduling — cutovers armed at the changing
+  block's view, the next participant set read from state at the boundary.
+- `statesync` defines the network state-sync wire protocol (manifest with the
+  boundary's consensus coordinates and finalization floor, chunked snapshots,
+  remote qmdb resolver) and the p2p transport binding.
 - `reactor` closes the non-deterministic worker boundary by submitting worker
   results as ordinary messages.
 
 ## Module State
 
-- QMDB-backed modules (kv, document, messaging) expose real authenticated roots
-  and answer network state-sync over `serve_sync`; messaging stores one record
-  per message (no whole-history value, no 1 MiB commit bomb) with keyset
+- QMDB-backed modules (kv, document, chat) expose real authenticated roots
+  and answer network state-sync over `serve_sync`; chat stores one record
+  per entity (no whole-history value, no 1 MiB commit bomb) with computed-key
   pagination.
 - Forge derives a 32-byte state root from git state and verifies object closure
   before install.
 - Snapshot-style modules use canonical bytes where that fits the module: valset,
-  saga, tasks, directory, governance, vaults.
+  saga, tasks, directory, governance, vaults, inbox, automations, files, memory,
+  jobs.
 - System governance gates the validator set (member-only proposals, deterministic
   tally, follow-up membership ops); valset rejects external membership writes.
 - Vaults replicate opaque secret ciphertext with owner-gated write integrity.
-- Chat and agent are wrapper modules over the messaging substrate.
+- Agent is a pure state machine holding the agent registry, channel watches, and
+  run records; automations evaluates user-authored chat posts against operator
+  rules with probe-before-emit follow-up actions.
+- The module wave rounds out the workplace surface: inbox delivers notifications
+  as follow-up ops atomic with their cause (P2), files commits content-addressed
+  manifests while chunk bytes stay node-local behind digest-and-length
+  verification, memory is a generation-pinned shared agent workspace with prefix
+  watches and citable `duck://` reads, and jobs is a first-claim-wins work board
+  with view leases and permissionless reclaim.
 
 ## Verification Surface
 
@@ -45,19 +58,28 @@ This status page is grounded in checked-in code, tests, and binaries.
   rebuild every module and match the source app-hash in-process.
 - `cargo test -p demo --test network_joiner_full` proves a joiner rebuilds every
   module purely over the state-sync wire protocol.
-- `bin/node/examples/demo-2node.sh` drives multiple OS processes through the real
-  commonware-backed node path: three-validator convergence, an RPC-submitted
-  message crossing consensus, a cross-node governance vote, a live epoch cutover,
-  and a sync-only joiner rebuilding the post-cutover state over real sockets.
+- `bin/node/examples/demo-invite.sh` drives a human-runnable onboarding ceremony
+  over real sockets: founder `init`, invite, friend `join`, founder `admit`, a
+  refreshed invite, then both nodes booting one network and converging an
+  RPC-submitted directory op.
+- `cargo test -p node-bin --test cluster_e2e` is the automated real-socket node
+  lifecycle gate: three-validator convergence, an RPC-submitted message crossing
+  consensus, a cross-node governance vote, a live epoch cutover, and a sync-only
+  joiner rebuilding the post-cutover state over real sockets.
 - `cargo test -p node-bin --test restart_e2e` crashes a solo validator process
   with SIGKILL and shuts it down gracefully; each respawn over the same storage
   dir recovers the byte-identical app-hash without re-running genesis and keeps
   finalizing over its reopened consensus journal.
+- `cargo test -p node-bin --test invite_e2e` proves invite-after-genesis over
+  real sockets: an uninvited key parks on the mesh, a member's `invite-accept`
+  passes governance, the epoch cutover re-tracks the mesh, and the joiner syncs
+  and promotes itself into a voting validator — both onto a stalled solo
+  network (epoch genesis floor) and onto a live 3-validator quorum (mid-epoch
+  boundary with its served finalization floor certificate).
 
 ## Still Open
 
-- A demoted validator degrading to a sync-server rather than halting, and a
-  synced joiner auto-promoting to a live validator at an epoch boundary.
+- A demoted validator degrading to a sync-server rather than halting.
 - Per-origin replay nonces in state (cross-epoch frame replay currently gated by
   the per-engine finalization dedup).
 - Origin-bound message authorship, the agent reactor-worker seam, and the

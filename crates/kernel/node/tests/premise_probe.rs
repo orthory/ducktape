@@ -2,7 +2,7 @@
 //! applied in different orders must yield DIFFERENT roots — otherwise the agreed
 //! total order is decoration and the negative control is vacuous.
 
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use kv::Kv;
 use sdk::Module as _;
 
@@ -21,7 +21,8 @@ fn qmdb_root_is_order_dependent() {
 
         // identical final key-set, opposite log order -> roots MUST differ.
         assert_ne!(
-            fwd.root(), rev.root(),
+            fwd.root(),
+            rev.root(),
             "qmdb root must depend on op-log order (else the order proof is vacuous)"
         );
     });
@@ -44,7 +45,8 @@ fn qmdb_root_is_context_independent() {
         }
 
         assert_eq!(
-            a.root(), b.root(),
+            a.root(),
+            b.root(),
             "qmdb root must be context-independent (same op sequence -> same root)"
         );
     });

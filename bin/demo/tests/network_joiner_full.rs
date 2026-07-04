@@ -13,31 +13,31 @@ use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};
 
 use chat::Chat;
-use chat_interface::{encode_msg as chat_encode_msg, Block as ChatBlock, ChatMsg, PostPolicy};
+use chat_interface::{Block as ChatBlock, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
 use directory::Directory;
-use directory_interface::{encode_msg as dir_encode_msg, DirMsg};
+use directory_interface::{DirMsg, encode_msg as dir_encode_msg};
 use document::Document;
-use document_interface::{encode_msg as doc_encode_msg, Block, BlockKind, DocMsg};
+use document_interface::{Block, BlockKind, DocMsg, encode_msg as doc_encode_msg};
 use forge::Forge;
 use greeter::Greeter;
 use host::{FinalizedBlock, Host};
 use kv::Kv;
-use kv_interface::{encode as kv_encode, KvMsg};
+use kv_interface::{KvMsg, encode as kv_encode};
 use saga::SagaModule;
-use saga_interface::{encode_msg as saga_encode_msg, SagaMsg};
+use saga_interface::{SagaMsg, encode_msg as saga_encode_msg};
 use sdk::{Module, Msg, StateRoot};
 use state::global_root;
 use valset::Valset;
-use valset_interface::{encode_msg as valset_encode_msg, ValsetMsg};
+use valset_interface::{ValsetMsg, encode_msg as valset_encode_msg};
 
-use commonware_cryptography::{ed25519::PrivateKey, Signer as _};
 use commonware_codec::DecodeExt as _;
-use commonware_runtime::{deterministic, Runner as _, Supervisor as _};
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 
 use statesync::qmdb::RemoteQmdbResolver;
 use statesync::{
-    decode_response, encode_request, fetch_manifest, fetch_snapshot, PayloadKind, SyncClient,
-    SyncError, SyncRequest, SyncResponse, SyncServer,
+    ManifestEntry, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse, SyncServer,
+    decode_response, encode_request, fetch_manifest, fetch_snapshot,
 };
 
 // ---- the in-process transport (same shape as the statesync crate test) -----
@@ -47,6 +47,15 @@ type RpcPair = (Vec<u8>, oneshot::Sender<Vec<u8>>);
 #[derive(Clone)]
 struct ChannelClient {
     tx: mpsc::Sender<RpcPair>,
+}
+
+fn pinned_target(entry: &ManifestEntry) -> statesync::qmdb::SyncTarget {
+    entry
+        .resolver_target
+        .as_ref()
+        .expect("resolver entry carries pinned target")
+        .to_sync_target()
+        .expect("pinned target range is non-empty")
 }
 
 impl SyncClient for ChannelClient {
@@ -110,49 +119,100 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
 
         // content through every module, including overwrites (op-log order).
         let ops: Vec<Msg> = vec![
-            Msg { target: "kv".into(), payload: kv_encode(&KvMsg::Set { key: b"motd".to_vec(), value: b"draft".to_vec() }) },
-            Msg { target: "kv".into(), payload: kv_encode(&KvMsg::Set { key: b"motd".to_vec(), value: b"final".to_vec() }) },
-            Msg { target: "document".into(), payload: doc_encode_msg(&DocMsg::CreateDoc { doc_id: "readme".into() }) },
-            Msg { target: "document".into(), payload: doc_encode_msg(&DocMsg::InsertBlock {
-                doc_id: "readme".into(),
-                after: None,
-                block: Block { id: "title".into(), kind: BlockKind::Heading, text: "ducktape".into() },
-            }) },
-            Msg { target: "chat".into(), payload: chat_encode_msg(&ChatMsg::CreateChannel {
-                channel_id: "general".into(),
-                name: "General".into(),
-                post_policy: PostPolicy::Open,
-            }) },
-            Msg { target: "chat".into(), payload: chat_encode_msg(&ChatMsg::PostMessage {
-                channel_id: "general".into(),
-                message_id: "u1".into(),
-                blocks: vec![ChatBlock::paragraph("hello")],
-                thread: None,
-                as_agent: None,
-            }) },
-            Msg { target: "chat".into(), payload: chat_encode_msg(&ChatMsg::PostMessage {
-                channel_id: "general".into(),
-                message_id: "a1".into(),
-                blocks: vec![ChatBlock::paragraph("synced over the wire")],
-                thread: None,
-                as_agent: None,
-            }) },
-            Msg { target: "forge".into(), payload: forge_interface::encode_msg(&forge_interface::ForgeMsg::Commit {
-                path: "README.md".into(),
-                content: "# ducktape\n".into(),
-                message: "init".into(),
-            }) },
-            Msg { target: "directory".into(), payload: dir_encode_msg(&DirMsg::Set { key: "name".into(), value: "world".into() }) },
-            Msg { target: "valset".into(), payload: valset_encode_msg(&ValsetMsg::Join { key: validator_key(7) }) },
-            Msg { target: "saga".into(), payload: saga_encode_msg(&SagaMsg::Trigger {
-                saga_id: "greet".into(),
-                spec: b"reverse hello".to_vec(),
-                reply_to: None,
-                reply_payload: Vec::new(),
-                deadline: None,
-                max_attempts: 1,
-                lease_views: None,
-            }) },
+            Msg {
+                target: "kv".into(),
+                payload: kv_encode(&KvMsg::Set {
+                    key: b"motd".to_vec(),
+                    value: b"draft".to_vec(),
+                }),
+            },
+            Msg {
+                target: "kv".into(),
+                payload: kv_encode(&KvMsg::Set {
+                    key: b"motd".to_vec(),
+                    value: b"final".to_vec(),
+                }),
+            },
+            Msg {
+                target: "document".into(),
+                payload: doc_encode_msg(&DocMsg::CreateDoc {
+                    doc_id: "readme".into(),
+                }),
+            },
+            Msg {
+                target: "document".into(),
+                payload: doc_encode_msg(&DocMsg::InsertBlock {
+                    doc_id: "readme".into(),
+                    after: None,
+                    block: Block {
+                        id: "title".into(),
+                        kind: BlockKind::Heading,
+                        text: "ducktape".into(),
+                    },
+                }),
+            },
+            Msg {
+                target: "chat".into(),
+                payload: chat_encode_msg(&ChatMsg::CreateChannel {
+                    channel_id: "general".into(),
+                    name: "General".into(),
+                    post_policy: PostPolicy::Open,
+                }),
+            },
+            Msg {
+                target: "chat".into(),
+                payload: chat_encode_msg(&ChatMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "u1".into(),
+                    blocks: vec![ChatBlock::paragraph("hello")],
+                    thread: None,
+                    as_agent: None,
+                }),
+            },
+            Msg {
+                target: "chat".into(),
+                payload: chat_encode_msg(&ChatMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: "a1".into(),
+                    blocks: vec![ChatBlock::paragraph("synced over the wire")],
+                    thread: None,
+                    as_agent: None,
+                }),
+            },
+            Msg {
+                target: "forge".into(),
+                payload: forge_interface::encode_msg(&forge_interface::ForgeMsg::Commit {
+                    repo: String::new(),
+                    path: "README.md".into(),
+                    content: "# ducktape\n".into(),
+                    message: "init".into(),
+                }),
+            },
+            Msg {
+                target: "directory".into(),
+                payload: dir_encode_msg(&DirMsg::Set {
+                    key: "name".into(),
+                    value: "world".into(),
+                }),
+            },
+            Msg {
+                target: "valset".into(),
+                payload: valset_encode_msg(&ValsetMsg::Join {
+                    key: validator_key(7),
+                }),
+            },
+            Msg {
+                target: "saga".into(),
+                payload: saga_encode_msg(&SagaMsg::Trigger {
+                    saga_id: "greet".into(),
+                    spec: b"reverse hello".to_vec(),
+                    reply_to: None,
+                    reply_payload: Vec::new(),
+                    deadline: None,
+                    max_attempts: 1,
+                    lease_views: None,
+                }),
+            },
         ];
         let mut height = 0u64;
         for op in ops {
@@ -160,7 +220,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             // SYSTEM origin lane (trusted test orchestration), which valset and
             // every product module accept alike.
             host.submit_at(
-                host::BlockContext {
+                host::BlockContext { protocol_version: 0,
                     height: height + 1,
                     consensus_time: height + 1,
                     origin: sdk::Origin::System,
@@ -171,7 +231,10 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             .expect("source op");
             height += 1;
         }
-        let finalized = FinalizedBlock { height, app_hash: host.app_hash() };
+        let finalized = FinalizedBlock {
+            height,
+            app_hash: host.app_hash(),
+        };
 
         // ---- the wire ---------------------------------------------------------
         let (tx, rx) = mpsc::channel::<RpcPair>(16);
@@ -184,57 +247,106 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             let client = client_for_join;
             let manifest = fetch_manifest(&client).await.expect("manifest");
             assert_eq!(manifest.app_hash, finalized.app_hash);
-            assert_eq!(manifest.entries.len(), 8, "every registered module is listed");
+            assert_eq!(
+                manifest.entries.len(),
+                8,
+                "every registered module is listed"
+            );
+            let boundary = manifest.boundary_id();
 
             // --- resolver lane: kv, document, chat -----------------------------
-            let kv_root = manifest.entry("kv").unwrap().root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), "kv");
-            let target = resolver.fetch_target().await.expect("kv target");
-            assert_eq!(StateRoot(target.root.0), kv_root, "kv target matches manifest");
-            let join_kv = Kv::sync_from(joiner_ctx.child("joiner_kv"), "kv-rebuilt", target, resolver).await;
+            let kv_entry = manifest.entry("kv").unwrap();
+            let kv_root = kv_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "kv");
+            let target = pinned_target(kv_entry);
+            assert_eq!(
+                StateRoot(target.root.0),
+                kv_root,
+                "kv target matches manifest"
+            );
+            let join_kv = Kv::sync_from(
+                joiner_ctx.child("joiner_kv"),
+                "kv-rebuilt",
+                target,
+                resolver,
+            )
+            .await;
             assert_eq!(join_kv.root(), kv_root);
-            assert_eq!(join_kv.get(b"motd").await.as_deref(), Some(b"final".as_ref()));
+            assert_eq!(
+                join_kv.get(b"motd").await.as_deref(),
+                Some(b"final".as_ref())
+            );
 
-            let doc_root = manifest.entry("document").unwrap().root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), "document");
-            let target = resolver.fetch_target().await.expect("document target");
+            let doc_entry = manifest.entry("document").unwrap();
+            let doc_root = doc_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "document");
+            let target = pinned_target(doc_entry);
             assert_eq!(StateRoot(target.root.0), doc_root);
-            let join_document =
-                Document::sync_from(joiner_ctx.child("joiner_document"), "document-rebuilt", target, resolver).await;
+            let join_document = Document::sync_from(
+                joiner_ctx.child("joiner_document"),
+                "document-rebuilt",
+                target,
+                resolver,
+            )
+            .await;
             assert_eq!(join_document.root(), doc_root);
 
-            let chat_root = manifest.entry("chat").unwrap().root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), "chat");
-            let target = resolver.fetch_target().await.expect("chat target");
+            let chat_entry = manifest.entry("chat").unwrap();
+            let chat_root = chat_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "chat");
+            let target = pinned_target(chat_entry);
             assert_eq!(StateRoot(target.root.0), chat_root);
-            let join_chat =
-                Chat::sync_from(joiner_ctx.child("joiner_chat"), "chat-rebuilt", target, resolver).await;
+            let join_chat = Chat::sync_from(
+                joiner_ctx.child("joiner_chat"),
+                "chat-rebuilt",
+                target,
+                resolver,
+            )
+            .await;
             assert_eq!(join_chat.root(), chat_root);
 
             // --- snapshot lane: directory, valset, saga, forge ----------------
             let entry = manifest.entry("directory").unwrap();
             assert_eq!(entry.kind, PayloadKind::Snapshot);
-            let bytes = fetch_snapshot(&client, manifest.height, "directory").await.expect("directory snapshot");
+            let bytes = fetch_snapshot(&client, boundary, "directory")
+                .await
+                .expect("directory snapshot");
             let mut join_directory = Directory::new("directory");
-            join_directory.install(&bytes, entry.root).expect("directory install");
+            join_directory
+                .install(&bytes, entry.root)
+                .expect("directory install");
 
             let entry = manifest.entry("valset").unwrap();
-            let bytes = fetch_snapshot(&client, manifest.height, "valset").await.expect("valset snapshot");
+            let bytes = fetch_snapshot(&client, boundary, "valset")
+                .await
+                .expect("valset snapshot");
             let mut join_valset = Valset::new("valset");
-            join_valset.install(&bytes, entry.root).expect("valset install");
+            join_valset
+                .install(&bytes, entry.root)
+                .expect("valset install");
 
             let entry = manifest.entry("saga").unwrap();
-            let bytes = fetch_snapshot(&client, manifest.height, "saga").await.expect("saga snapshot");
+            let bytes = fetch_snapshot(&client, boundary, "saga")
+                .await
+                .expect("saga snapshot");
             let mut join_saga = SagaModule::new("saga");
             join_saga.install(&bytes, entry.root).expect("saga install");
 
             let entry = manifest.entry("forge").unwrap();
-            let bytes = fetch_snapshot(&client, manifest.height, "forge").await.expect("forge snapshot");
-            let mut join_forge = Forge::init("forge", joiner_dir.clone()).expect("joiner forge init");
-            join_forge.install(&bytes, entry.root).expect("forge install");
+            let bytes = fetch_snapshot(&client, boundary, "forge")
+                .await
+                .expect("forge snapshot");
+            let mut join_forge =
+                Forge::init("forge", joiner_dir.clone()).expect("joiner forge init");
+            join_forge
+                .install(&bytes, entry.root)
+                .expect("forge install");
 
             // --- stateless lane ------------------------------------------------
-            assert_eq!(manifest.entry("greeter").unwrap().kind, PayloadKind::Stateless);
+            assert_eq!(
+                manifest.entry("greeter").unwrap().kind,
+                PayloadKind::Stateless
+            );
             let join_greeter = Greeter::new("greeter");
 
             // --- THE property: the composed app-hash equals the manifest's ----
@@ -254,13 +366,26 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 fn root(&self) -> StateRoot {
                     self.root
                 }
-                async fn execute(&mut self, _c: &mut dyn sdk::Ctx, _m: &Msg) -> Result<(), sdk::Error> {
+                async fn execute(
+                    &mut self,
+                    _c: &mut dyn sdk::Ctx,
+                    _m: &Msg,
+                ) -> Result<(), sdk::Error> {
                     Ok(())
                 }
             }
-            let kv_at = AtId { id: "kv", root: join_kv.root() };
-            let doc_at = AtId { id: "document", root: join_document.root() };
-            let chat_at = AtId { id: "chat", root: join_chat.root() };
+            let kv_at = AtId {
+                id: "kv",
+                root: join_kv.root(),
+            };
+            let doc_at = AtId {
+                id: "document",
+                root: join_document.root(),
+            };
+            let chat_at = AtId {
+                id: "chat",
+                root: join_chat.root(),
+            };
             let mods: [&dyn Module; 8] = [
                 &kv_at,
                 &doc_at,
@@ -279,9 +404,14 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
         };
 
         let server_side = async {
+            // fixed coordinates: this test exercises the module payload
+            // lanes; the epoch fields just ride the manifest.
+            let coords = statesync::BoundaryCoords::default();
             let mut rx = rx;
             while let Some((frame, reply)) = rx.next().await {
-                let resp = server.handle_frame(&host, Some(finalized), &frame).await;
+                let resp = server
+                    .handle_frame(&host, Some(finalized), &coords, &frame)
+                    .await;
                 let _ = reply.send(resp);
             }
         };

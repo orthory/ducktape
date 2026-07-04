@@ -19,7 +19,6 @@ node = { workspace = true }
 consensus = { workspace = true }
 recovery = { workspace = true }
 sdk = { workspace = true }
-state = { workspace = true }
 statesync = { workspace = true }
 kv = { workspace = true }
 kv-interface = { workspace = true }
@@ -29,31 +28,45 @@ directory-interface = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 governance = { workspace = true }
+# the invite-accept verb drives governance ops through the local rpc.
+governance-interface = { workspace = true }
+# the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
+# committed boundary snapshot; the module itself is genesis-wired post-retrofit).
+upgrade = { workspace = true }
+upgrade-interface = { workspace = true }
 saga = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }
+profiles = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
+agent = { workspace = true }
+agent-oracle = { workspace = true }
 reactor = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
+# compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
+base64 = "0.22"
 # the http/ws app surface, shared with the embedded daemon: NodeCommand lane,
 # axum router, and serve() — this binary only owns the pump-side of the lane.
 noded = { path = "../noded" }
 # the app-surface thread runs plain tokio (axum); the node itself stays on
-# commonware's runner.
-tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# commonware's runner. the promoted-validator boot catch-up also uses Tokio's
+# bounded mutex/timeout around the temporary statesync client; `signal` drives
+# the SIGTERM/SIGINT graceful-checkpoint arm of the run loop.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal"] }
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-consensus = { workspace = true }
+commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 commonware-codec = { workspace = true }
 
@@ -68,6 +81,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # drives them through the rpc with TYPED interface-crate payloads — payload
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
+async-trait = { workspace = true }
 chat-interface = { workspace = true }
-governance-interface = { workspace = true }
+forge-interface = { workspace = true }
 tempfile = "3"

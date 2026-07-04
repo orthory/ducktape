@@ -11,6 +11,11 @@ version.workspace = true
 sdk = { workspace = true }
 state = { workspace = true }
 async-trait = { workspace = true }
+# TYPES-ONLY interface dep: `Host::effective_version` decodes the upgrade module's
+# `Status` reply and applies the shared version derivation. host stays
+# module-agnostic — this is an interface crate, not a module impl (same shape as
+# governance depending on valset-interface).
+upgrade-interface = { workspace = true }
 
 [dev-dependencies]
 # the end-to-end test stands a real qmdb-backed module on the deterministic
@@ -20,6 +25,12 @@ directory = { workspace = true }
 greeter = { workspace = true }
 directory-interface = { workspace = true }
 kv-interface = { workspace = true }
+# the deterministic-activation drain-injection test stands the real upgrade +
+# valset modules on the host and drives a block across an activation boundary.
+upgrade = { workspace = true }
+valset = { workspace = true }
+valset-interface = { workspace = true }
+commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"
 # the boundary-fault tests drive stub modules on a plain futures executor.

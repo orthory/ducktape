@@ -42,6 +42,11 @@ export const color = {
   blue: "#5f7a9e",
   red: "#a35248",
   purple: "#7a6f9e",
+
+  // destructive actions (delete confirm)
+  danger: "#c0483c",
+  dangerSoft: "#faf1ef",
+  dangerBorder: "#eccbc5",
 } as const;
 
 export const font = {

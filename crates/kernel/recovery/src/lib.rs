@@ -28,33 +28,60 @@
 //!   synced, which also makes every earlier append durable). boot ROLLS it
 //!   FORWARD: if the live roots still equal the pre-block vector the frame
 //!   re-applies; if they moved, the apply completed before the crash and the
-//!   block is sealed from the observed roots. a block that touches several
-//!   disk substrates could in principle crash BETWEEN their commits — the
-//!   classic multi-store atomicity limit; today no block commits to more than
-//!   one disk substrate (ops target one module; the only cross-module
-//!   dispatch, governance -> valset, stays in the in-memory cohort). the
-//!   exact fix if that changes: a per-commit height cursor in qmdb's commit
-//!   metadata slot.
+//!   block is sealed from the observed roots.
+//! - a TORN SEALED block: a block whose commit spans substrates with different
+//!   durability — a qmdb store commits to disk PER BLOCK, while the in-memory
+//!   cohort only persists at the periodic checkpoint. a crash (or a hard kill)
+//!   after the disk commit but before the next checkpoint leaves the disk
+//!   substrate at the block's POST root and the in-memory cohort restored to
+//!   its PRE root from the checkpoint. this is no longer "all-or-nothing":
+//!   recovery replays such a block by re-running the sealed frame and
+//!   committing ONLY the still-at-pre modules (a pure state re-commitment,
+//!   deterministic and idempotent) while ABORTING the already-durable ones —
+//!   re-committing a qmdb store would MOVE its op-log root and fork us. the
+//!   per-module root compare (live vs sealed pre/post) decides the partition;
+//!   a changed module at NEITHER pre nor post is genuine damage and still
+//!   fail-stops as [`Error::Torn`], and the recomposed-vs-sealed app-hash
+//!   check is the final backstop.
+//! - a block that touches several DISK substrates could in principle crash
+//!   BETWEEN their commits — the classic multi-store atomicity limit; today no
+//!   block commits to more than one disk substrate (ops target one module; the
+//!   only cross-module dispatch, governance -> valset, stays in the in-memory
+//!   cohort). recovery refuses this EXPLICITLY: only a per-block-durable disk
+//!   substrate can be at its post-root after a crash (the in-memory cohort
+//!   always rolls back to the checkpoint), so two-or-more changed modules at
+//!   post means two-or-more disk substrates committed — a changed set spanning
+//!   >1 disk substrate at mixed roots. selective replay's premise (only the
+//!   in-memory cohort rolled back) no longer holds and its single-frame
+//!   re-execution could read a partially-committed world, so boot fail-stops
+//!   with [`Error::Torn`] at the point it detects this rather than healing and
+//!   leaning on the after-the-fact per-module verify. (a residual case — two
+//!   disk substrates where exactly ONE committed, so only one is at post — is
+//!   indistinguishable by root alone from the healthy single-disk torn block;
+//!   selective replay reconciles it and the per-module post-root verify is the
+//!   backstop that fail-stops rather than forks if the re-execution diverges.)
+//!   the exact fix if a block ever legitimately commits >1 disk substrate: a
+//!   per-commit height cursor in qmdb's commit metadata slot.
 //! - crash between the engine journaling a finalization and the drain: the
 //!   frame's bytes are already durable here — locally-submitted frames are
 //!   pinned at submit time ([`Record::Pinned`]), before the engine can ever
 //!   propose their digest. boot seeds the consensus content store from these
 //!   records so the re-reported finalization resolves and applies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 use commonware_codec::RangeCfg;
-use commonware_runtime::buffer::paged::CacheRef;
 use commonware_runtime::BufferPooler;
-use commonware_storage::journal::contiguous::{variable, Reader as _};
+use commonware_runtime::buffer::paged::CacheRef;
+use commonware_storage::journal::contiguous::{Reader as _, variable};
 use commonware_storage::metadata;
 use commonware_utils::sequence::U64;
-use futures::{pin_mut, StreamExt as _};
+use futures::{StreamExt as _, pin_mut};
 
 use host::{BlockContext, Host, SubmitError};
-use node::{decode_frame, BlockSeal, BlockSink, Disposition};
-use sdk::{ModuleId, StateRoot};
+use node::{BlockSeal, BlockSink, Disposition, decode_frame};
+use sdk::{ModuleId, StateRoot, UpgradeCoords};
 
 /// runtime bounds every store here needs (same alias the storage crate uses:
 /// `Storage + Clock + Metrics`).
@@ -76,6 +103,13 @@ pub enum Error {
     /// sealed — the recovered node would fork, so it must not start.
     #[error("recovery verification failed: {0}")]
     Verify(String),
+    /// the caller asked for records below the retained checkpoint/journal
+    /// suffix boundary. a statesync joiner must refetch a fresher manifest.
+    #[error("recovery journal range pruned after {after_height}; retained from {retained_start}")]
+    RangePruned {
+        after_height: u64,
+        retained_start: u64,
+    },
 }
 
 impl From<Error> for node::Error {
@@ -92,6 +126,10 @@ impl From<Error> for node::Error {
 const MAX_LEN: usize = 1 << 21; // 2 MiB: > the p2p frame cap + framing.
 
 fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
@@ -130,10 +168,24 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
     }
 
+    fn u32(&mut self) -> Result<u32, Error> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    }
+
+    /// true once every byte has been consumed — the tolerant-tail probe: an
+    /// old-format checkpoint ends here, a new-format one still has its version
+    /// fields to read.
+    fn at_end(&self) -> bool {
+        self.at == self.buf.len()
+    }
+
     fn bytes(&mut self) -> Result<Vec<u8>, Error> {
         let len = self.u64()? as usize;
         if len > MAX_LEN {
-            return Err(Error::Corrupt(format!("length {len} exceeds the record cap")));
+            return Err(Error::Corrupt(format!(
+                "length {len} exceeds the record cap"
+            )));
         }
         Ok(self.take(len)?.to_vec())
     }
@@ -163,7 +215,9 @@ fn put_roots(out: &mut Vec<u8>, roots: &[(ModuleId, StateRoot)]) {
 fn get_roots(c: &mut Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
     let n = c.u64()? as usize;
     if n > 4096 {
-        return Err(Error::Corrupt(format!("{n} module roots exceeds sanity cap")));
+        return Err(Error::Corrupt(format!(
+            "{n} module roots exceeds sanity cap"
+        )));
     }
     let mut roots = Vec::with_capacity(n);
     for _ in 0..n {
@@ -172,6 +226,27 @@ fn get_roots(c: &mut Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
         roots.push((id, c.root()?));
     }
     Ok(roots)
+}
+
+fn put_keys(out: &mut Vec<u8>, keys: &[Vec<u8>]) {
+    put_u64(out, keys.len() as u64);
+    for k in keys {
+        put_bytes(out, k);
+    }
+}
+
+fn get_keys(c: &mut Cursor) -> Result<Vec<Vec<u8>>, Error> {
+    let n = c.u64()? as usize;
+    if n > 4096 {
+        return Err(Error::Corrupt(format!(
+            "{n} participant keys exceeds sanity cap"
+        )));
+    }
+    let mut keys = Vec::with_capacity(n);
+    for _ in 0..n {
+        keys.push(c.bytes()?);
+    }
+    Ok(keys)
 }
 
 // ============================================================================
@@ -201,8 +276,16 @@ pub enum Record {
         roots: Vec<(ModuleId, StateRoot)>,
         app_hash: StateRoot,
     },
-    /// an epoch cutover: the new epoch and its app-height base.
-    Cutover { epoch: u64, view_base: u64 },
+    /// an epoch cutover: the new epoch, its app-height base, and the engine
+    /// participant set it was spawned over. the set rides the record so a
+    /// restart in the window between the cutover and the next checkpoint
+    /// respawns the engine with the EPOCH'S set, never the instantaneous
+    /// valset projection (which may already stage the next change).
+    Cutover {
+        epoch: u64,
+        view_base: u64,
+        participants: Vec<Vec<u8>>,
+    },
 }
 
 impl Record {
@@ -218,7 +301,12 @@ impl Record {
                 put_u64(&mut out, *height);
                 put_bytes(&mut out, frame);
             }
-            Record::Seal { height, disposition, roots, app_hash } => {
+            Record::Seal {
+                height,
+                disposition,
+                roots,
+                app_hash,
+            } => {
                 out.push(TAG_SEAL);
                 put_u64(&mut out, *height);
                 // discarded frames are never journaled — the tag is two-valued.
@@ -230,10 +318,15 @@ impl Record {
                 put_roots(&mut out, roots);
                 put_root(&mut out, app_hash);
             }
-            Record::Cutover { epoch, view_base } => {
+            Record::Cutover {
+                epoch,
+                view_base,
+                participants,
+            } => {
                 out.push(TAG_CUTOVER);
                 put_u64(&mut out, *epoch);
                 put_u64(&mut out, *view_base);
+                put_keys(&mut out, participants);
             }
         }
         out
@@ -244,7 +337,10 @@ impl Record {
         let tag = c.take(1)?[0];
         let record = match tag {
             TAG_PINNED => Record::Pinned { frame: c.bytes()? },
-            TAG_BLOCK => Record::Block { height: c.u64()?, frame: c.bytes()? },
+            TAG_BLOCK => Record::Block {
+                height: c.u64()?,
+                frame: c.bytes()?,
+            },
             TAG_SEAL => {
                 let height = c.u64()?;
                 let disposition = match c.take(1)?[0] {
@@ -254,9 +350,18 @@ impl Record {
                 };
                 let roots = get_roots(&mut c)?;
                 let app_hash = c.root()?;
-                Record::Seal { height, disposition, roots, app_hash }
+                Record::Seal {
+                    height,
+                    disposition,
+                    roots,
+                    app_hash,
+                }
             }
-            TAG_CUTOVER => Record::Cutover { epoch: c.u64()?, view_base: c.u64()? },
+            TAG_CUTOVER => Record::Cutover {
+                epoch: c.u64()?,
+                view_base: c.u64()?,
+                participants: get_keys(&mut c)?,
+            },
             t => return Err(Error::Corrupt(format!("unknown record tag {t}"))),
         };
         c.done()?;
@@ -281,6 +386,15 @@ pub struct Manifest {
     pub epoch: u64,
     /// that epoch's app-height base (`app_height = view_base + engine view`).
     pub view_base: u64,
+    /// the epoch's ENGINE PARTICIPANT SET (raw public-key bytes) — what the
+    /// live engine was spawned over. a restart respawns with exactly this
+    /// set: the checkpointed valset snapshot may already hold a membership
+    /// change whose cutover had not happened yet.
+    pub participants: Vec<Vec<u8>>,
+    /// an epoch cutover armed but not yet crossed at checkpoint time (the
+    /// ordered lane's discard-ceiling view). a restart re-arms the same
+    /// deterministic boundary its peers are converging on.
+    pub pending_cutover_view: Option<u64>,
     /// the composed app-hash at `height`.
     pub app_hash: StateRoot,
     /// every module's root at `height` — the replay baseline.
@@ -298,6 +412,19 @@ pub struct Manifest {
     /// framed (the exactly-once digest gate does not survive the process, so
     /// a reused (origin, seq, payload) triple would re-apply).
     pub next_seq: u64,
+    /// the agreed protocol version active at this boundary. an UNAUTHENTICATED
+    /// preflight hint — the authority stays the replayed upgrade-module state,
+    /// confirmed by the final app-hash compose. defaults to 0 on an on-disk
+    /// checkpoint written before this field existed (tolerant decode).
+    pub current_version: u32,
+    /// the single upgrade armed but not yet activated at checkpoint time, if
+    /// any — the version analogue of `pending_cutover_view`.
+    pub pending_upgrade: Option<UpgradeCoords>,
+    /// the highest protocol version any block at or after this boundary needs
+    /// (`pending.to_version` once `height >= pending.activation_height`, else
+    /// `current_version`). the boot preflight compares the local build's
+    /// `MAX_PROTOCOL_VERSION` against this and refuses EARLY when it is lower.
+    pub required_min_version: u32,
 }
 
 impl Manifest {
@@ -312,6 +439,14 @@ impl Manifest {
         }
         put_u64(&mut out, self.epoch);
         put_u64(&mut out, self.view_base);
+        put_keys(&mut out, &self.participants);
+        match self.pending_cutover_view {
+            Some(v) => {
+                out.push(1);
+                put_u64(&mut out, v);
+            }
+            None => out.push(0),
+        }
         put_root(&mut out, &self.app_hash);
         put_roots(&mut out, &self.roots);
         put_u64(&mut out, self.snapshots.len() as u64);
@@ -321,6 +456,18 @@ impl Manifest {
         }
         put_u64(&mut out, self.oplog_pos);
         put_u64(&mut out, self.next_seq);
+        // --- ADDITIVE version tail (see decode's tolerant read) ---
+        put_u32(&mut out, self.current_version);
+        match &self.pending_upgrade {
+            Some(u) => {
+                out.push(1);
+                put_bytes(&mut out, u.name.as_bytes());
+                put_u64(&mut out, u.activation_height);
+                put_u32(&mut out, u.to_version);
+            }
+            None => out.push(0),
+        }
+        put_u32(&mut out, self.required_min_version);
         out
     }
 
@@ -333,6 +480,12 @@ impl Manifest {
         };
         let epoch = c.u64()?;
         let view_base = c.u64()?;
+        let participants = get_keys(&mut c)?;
+        let pending_cutover_view = match c.take(1)?[0] {
+            0 => None,
+            1 => Some(c.u64()?),
+            t => return Err(Error::Corrupt(format!("bad pending-cutover tag {t}"))),
+        };
         let app_hash = c.root()?;
         let roots = get_roots(&mut c)?;
         let n = c.u64()? as usize;
@@ -347,8 +500,48 @@ impl Manifest {
         }
         let oplog_pos = c.u64()?;
         let next_seq = c.u64()?;
+        // ADDITIVE version tail. a checkpoint written by an older binary ends
+        // here; map the missing tail to baseline defaults rather than tripping
+        // the no-trailing-bytes check, so a new binary boots an old on-disk
+        // checkpoint. a present-but-malformed tail still fails loud.
+        let (current_version, pending_upgrade, required_min_version) = if c.at_end() {
+            (0, None, 0)
+        } else {
+            let current_version = c.u32()?;
+            let pending_upgrade = match c.take(1)?[0] {
+                0 => None,
+                1 => {
+                    let name = String::from_utf8(c.bytes()?)
+                        .map_err(|_| Error::Corrupt("upgrade name is not utf-8".into()))?;
+                    let activation_height = c.u64()?;
+                    let to_version = c.u32()?;
+                    Some(UpgradeCoords {
+                        name,
+                        activation_height,
+                        to_version,
+                    })
+                }
+                t => return Err(Error::Corrupt(format!("bad pending-upgrade tag {t}"))),
+            };
+            let required_min_version = c.u32()?;
+            (current_version, pending_upgrade, required_min_version)
+        };
         c.done()?;
-        Ok(Self { height, epoch, view_base, app_hash, roots, snapshots, oplog_pos, next_seq })
+        Ok(Self {
+            height,
+            epoch,
+            view_base,
+            participants,
+            pending_cutover_view,
+            app_hash,
+            roots,
+            snapshots,
+            oplog_pos,
+            next_seq,
+            current_version,
+            pending_upgrade,
+            required_min_version,
+        })
     }
 
     /// look up a stored snapshot by module id.
@@ -370,11 +563,16 @@ impl Manifest {
     /// in-memory cohort); disk-backed modules recover themselves and
     /// contribute only their root. a local checkpoint IS a statesync capture
     /// of your past self.
+    #[allow(clippy::too_many_arguments)]
     pub fn capture(
         host: &Host,
         height: Option<u64>,
         epoch: u64,
         view_base: u64,
+        participants: Vec<Vec<u8>>,
+        pending_cutover_view: Option<u64>,
+        current_version: u32,
+        pending_upgrade: Option<UpgradeCoords>,
         oplog_pos: u64,
         next_seq: u64,
     ) -> Result<Self, Error> {
@@ -399,16 +597,42 @@ impl Manifest {
                 _ => None,
             })
             .collect();
+        let required_min_version = sdk::required_min_version(
+            current_version,
+            pending_upgrade.as_ref(),
+            // genesis has no boundary yet; 0 is a placeholder height there.
+            height.unwrap_or(0),
+        );
         Ok(Self {
             height,
             epoch,
             view_base,
+            participants,
+            pending_cutover_view,
             app_hash: host.app_hash(),
             roots,
             snapshots,
             oplog_pos,
             next_seq,
+            current_version,
+            pending_upgrade,
+            required_min_version,
         })
+    }
+
+    /// this boundary's required minimum protocol version — the fence the boot
+    /// preflight checks the local build against.
+    pub fn required_min_version(&self) -> u32 {
+        self.required_min_version
+    }
+
+    /// boot preflight: fail loud when the local build's `max_supported`
+    /// protocol version is below this boundary's `required_min_version`,
+    /// turning an opaque post-replay app-hash mismatch into an early,
+    /// actionable "height needs binary vX" refusal. NOT yet wired into the
+    /// live resume path (that invocation is a later phase).
+    pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
+        sdk::check_required_version(self.required_min_version, max_supported)
     }
 }
 
@@ -435,7 +659,11 @@ impl FloorCert {
 
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut c = Cursor::new(bytes);
-        let out = Self { epoch: c.u64()?, height: c.u64()?, cert: c.bytes()? };
+        let out = Self {
+            epoch: c.u64()?,
+            height: c.u64()?,
+            cert: c.bytes()?,
+        };
         c.done()?;
         Ok(out)
     }
@@ -466,6 +694,16 @@ where
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())
+}
+
+/// one paired recovery-journal block and seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalFrame {
+    pub height: u64,
+    pub frame: Vec<u8>,
+    pub disposition: Disposition,
+    pub roots: Vec<(ModuleId, StateRoot)>,
+    pub app_hash: StateRoot,
 }
 
 impl<E> Recovery<E>
@@ -510,7 +748,11 @@ where
         )
         .await
         .map_err(storage_err)?;
-        Ok(Self { journal, manifest_store, cert_store })
+        Ok(Self {
+            journal,
+            manifest_store,
+            cert_store,
+        })
     }
 
     /// the persisted checkpoint, if any. `None` means this storage dir has
@@ -572,7 +814,113 @@ where
     /// passed that manifest's height — pruned frames must never be needed to
     /// resolve a re-reported finalization.
     pub async fn prune_oplog(&mut self, pos: u64) -> Result<(), Error> {
-        self.journal.prune(pos).await.map(|_| ()).map_err(storage_err)
+        self.journal
+            .prune(pos)
+            .await
+            .map(|_| ())
+            .map_err(storage_err)
+    }
+
+    /// read sealed recovery frames in `(after_height, up_to_height]`.
+    ///
+    /// This is the durable equivalent of a restart's replay suffix. The local
+    /// checkpoint height is the retained suffix boundary: asking below it is a
+    /// pruned-range condition, even if old journal bytes have not yet been
+    /// physically removed.
+    pub async fn read_finalized_frames(
+        &self,
+        after_height: u64,
+        up_to_height: u64,
+    ) -> Result<Vec<JournalFrame>, Error> {
+        if after_height > up_to_height {
+            return Err(Error::Corrupt(format!(
+                "invalid frame range ({after_height}, {up_to_height}]"
+            )));
+        }
+        if let Some(retained_start) = self.manifest()?.and_then(|m| m.height) {
+            if after_height < retained_start {
+                return Err(Error::RangePruned {
+                    after_height,
+                    retained_start,
+                });
+            }
+        }
+        if after_height == up_to_height {
+            return Ok(Vec::new());
+        }
+
+        let mut records: Vec<Record> = Vec::new();
+        {
+            let reader = self.journal.reader().await;
+            let bounds = reader.bounds();
+            let stream = reader
+                .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
+                .await
+                .map_err(storage_err)?;
+            pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                let (_pos, bytes) = item.map_err(storage_err)?;
+                records.push(Record::decode(&bytes)?);
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut pending: Option<(u64, Vec<u8>)> = None;
+        for record in records {
+            match record {
+                Record::Block { height, frame } => {
+                    if height <= after_height {
+                        continue;
+                    }
+                    if height > up_to_height {
+                        break;
+                    }
+                    if let Some((prev, _)) = pending {
+                        return Err(Error::Corrupt(format!(
+                            "block {height} appeared before block {prev} was sealed"
+                        )));
+                    }
+                    pending = Some((height, frame));
+                }
+                Record::Seal {
+                    height,
+                    disposition,
+                    roots,
+                    app_hash,
+                } => {
+                    if height <= after_height {
+                        continue;
+                    }
+                    if height > up_to_height {
+                        break;
+                    }
+                    let Some((block_height, frame)) = pending.take() else {
+                        return Err(Error::Corrupt(format!(
+                            "seal at height {height} without its block record"
+                        )));
+                    };
+                    if block_height != height {
+                        return Err(Error::Corrupt(format!(
+                            "seal height {height} does not match block {block_height}"
+                        )));
+                    }
+                    out.push(JournalFrame {
+                        height,
+                        frame,
+                        disposition,
+                        roots,
+                        app_hash,
+                    });
+                }
+                Record::Pinned { .. } | Record::Cutover { .. } => {}
+            }
+        }
+        if let Some((height, _)) = pending {
+            return Err(Error::Corrupt(format!(
+                "block {height} in requested range is missing its seal"
+            )));
+        }
+        Ok(out)
     }
 }
 
@@ -585,11 +933,11 @@ impl<E> BlockSink for Recovery<E>
 where
     E: Context + BufferPooler + commonware_runtime::Supervisor,
 {
-    fn pin(
-        &mut self,
-        frame: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        let record = Record::Pinned { frame: frame.to_vec() }.encode();
+    fn pin(&mut self, frame: &[u8]) -> impl std::future::Future<Output = Result<(), node::Error>> {
+        let record = Record::Pinned {
+            frame: frame.to_vec(),
+        }
+        .encode();
         async move {
             self.journal.append(&record).await.map_err(storage_err)?;
             self.journal.sync().await.map_err(storage_err)?;
@@ -602,7 +950,11 @@ where
         height: u64,
         frame: &[u8],
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        let record = Record::Block { height, frame: frame.to_vec() }.encode();
+        let record = Record::Block {
+            height,
+            frame: frame.to_vec(),
+        }
+        .encode();
         async move {
             self.journal.append(&record).await.map_err(storage_err)?;
             self.journal.sync().await.map_err(storage_err)?;
@@ -631,8 +983,14 @@ where
         &mut self,
         epoch: u64,
         view_base: u64,
+        participants: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        let record = Record::Cutover { epoch, view_base }.encode();
+        let record = Record::Cutover {
+            epoch,
+            view_base,
+            participants: participants.to_vec(),
+        }
+        .encode();
         async move {
             self.journal.append(&record).await.map_err(storage_err)?;
             self.journal.sync().await.map_err(storage_err)?;
@@ -655,10 +1013,18 @@ pub struct Recovered {
     /// the consensus epoch to respawn and its app-height base.
     pub epoch: u64,
     pub view_base: u64,
+    /// the epoch's engine participant set: the manifest's, superseded by any
+    /// newer [`Record::Cutover`] the journal retained.
+    pub participants: Vec<Vec<u8>>,
     /// every retained frame's bytes (pins and blocks) — the boot path seeds
     /// the consensus content store with these so re-reported finalizations
     /// resolve locally instead of wedging the ordered gate.
     pub frames: Vec<Vec<u8>>,
+    /// every post-checkpoint sealed block's `(height, post-block roots)`, in
+    /// order — the boot path scans these to re-derive a cutover that was
+    /// armed by a block ABOVE the checkpoint (the checkpoint itself records
+    /// one armed at or below it via `pending_cutover_view`).
+    pub blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)>,
     /// replay accounting, for the boot log line.
     pub applied: usize,
     pub skipped: usize,
@@ -677,13 +1043,19 @@ where
     /// already contains (root equality) and re-applying the rest, verifying
     /// each re-applied block against its sealed roots and the final state
     /// against the tip's sealed app-hash.
-    pub async fn recover(&mut self, host: &mut Host, manifest: &Manifest) -> Result<Recovered, Error> {
+    pub async fn recover(
+        &mut self,
+        host: &mut Host,
+        manifest: &Manifest,
+    ) -> Result<Recovered, Error> {
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.app_hash;
         let mut epoch = manifest.epoch;
         let mut view_base = manifest.view_base;
+        let mut participants = manifest.participants.clone();
         let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)> = Vec::new();
         let mut pending: Option<(u64, Vec<u8>)> = None;
         let mut applied = 0usize;
         let mut skipped = 0usize;
@@ -708,12 +1080,17 @@ where
         for record in records {
             match record {
                 Record::Pinned { frame } => frames.push(frame),
-                Record::Cutover { epoch: e, view_base: b } => {
+                Record::Cutover {
+                    epoch: e,
+                    view_base: b,
+                    participants: p,
+                } => {
                     // monotone: a stale record retained from below the
                     // checkpoint must not regress the manifest's values.
                     if e > epoch {
                         epoch = e;
                         view_base = b;
+                        participants = p;
                     }
                 }
                 Record::Block { height, frame } => {
@@ -729,7 +1106,12 @@ where
                     frames.push(frame.clone());
                     pending = Some((height, frame));
                 }
-                Record::Seal { height, disposition, roots, app_hash } => {
+                Record::Seal {
+                    height,
+                    disposition,
+                    roots,
+                    app_hash,
+                } => {
                     if manifest.height.is_some_and(|h| height <= h) {
                         continue;
                     }
@@ -743,7 +1125,21 @@ where
                             "seal height {height} does not match its block record {block_height}"
                         )));
                     }
-                    // the modules this block CHANGED: the replay unit.
+                    // VERSION-AWARE REPLAY (fork-critical): restore the boundary
+                    // version for THIS height BEFORE any `root()` read below — both
+                    // the at_pre/at_post branch decision AND the post-apply
+                    // verification branch a dual-path module's `root()` on
+                    // `active_version`, so it must equal what the live node held at
+                    // `height` or replay recomputes a different root across H.
+                    // derived the SAME pure way `Host::effective_version` does, from
+                    // the replayed committed upgrade state.
+                    // the block's OWN effective version — the value the live node
+                    // dispatched and sealed under. this is what `apply_block` stamps
+                    // and what the post-apply verification (and the at_post
+                    // already-applied check) must read `root()` under.
+                    let protocol_version = host.effective_version(height).await;
+                    // the modules this block CHANGED: the replay unit. a pure
+                    // comparison of RECORDED root values — version-independent.
                     let changed: Vec<(ModuleId, StateRoot)> = roots
                         .iter()
                         .filter(|(id, root)| expected.get(id) != Some(root))
@@ -755,16 +1151,29 @@ where
                         // root and fork us).
                         skipped += 1;
                     } else {
-                        let at_post = changed
-                            .iter()
-                            .all(|(id, root)| host.module_root(id) == Some(*root));
+                        // the PRE-apply state was sealed under the PREVIOUS height's
+                        // effective version — it differs from this block's version
+                        // ONLY at an activation boundary H, where a dual-path
+                        // `root()` switches algorithm. check "still at the pre-block
+                        // roots?" under it; check "already at the sealed post-roots?"
+                        // (a disk substrate that applied H before the crash) under
+                        // this block's version. at the boundary the two checks need
+                        // DIFFERENT selectors — evaluate each under its own.
+                        let pre_version =
+                            host.effective_version(height.saturating_sub(1)).await;
+                        host.set_active_version(pre_version);
                         let at_pre = changed
                             .iter()
                             .all(|(id, _)| host.module_root(id) == expected.get(id).copied());
+                        host.set_active_version(protocol_version);
+                        let at_post = changed
+                            .iter()
+                            .all(|(id, root)| host.module_root(id) == Some(*root));
                         if at_post {
                             skipped += 1; // a disk substrate already holds it.
                         } else if at_pre {
-                            apply_block(host, height, &frame, Some(disposition)).await?;
+                            apply_block(host, height, &frame, protocol_version, Some(disposition))
+                                .await?;
                             for (id, root) in &changed {
                                 let live = host.module_root(id);
                                 if live != Some(*root) {
@@ -776,13 +1185,105 @@ where
                             }
                             applied += 1;
                         } else {
-                            return Err(Error::Torn(format!(
-                                "block {height}: touched modules are neither all-applied \
-                                 nor all-unapplied — wipe app state and re-sync (keep the \
-                                 consensus journal)"
-                            )));
+                            // a TORN block: some changed modules are at their
+                            // pre-root (rolled back to the checkpoint — the
+                            // in-memory cohort), others already at their sealed
+                            // post-root (per-block-durable disk substrates that
+                            // committed before the crash). re-run the sealed
+                            // frame but commit ONLY the still-at-pre cohort and
+                            // ABORT the already-durable ones — re-committing a
+                            // qmdb store would move its op-log root and fork us.
+                            let mut commit_only: BTreeSet<ModuleId> = BTreeSet::new();
+                            let mut already_post = 0usize;
+                            for (id, root) in &changed {
+                                // classify each changed module under the SAME split
+                                // version selectors the bulk at_pre/at_post checks
+                                // above use: "still at pre" is read under the
+                                // PREVIOUS height's version, "already at post" under
+                                // THIS block's. a dual-path module's root() switches
+                                // format at an activation boundary, so a single
+                                // selector would misclassify a rolled-back in-memory
+                                // module as neither-pre-nor-post (false Torn brick).
+                                host.set_active_version(pre_version);
+                                let at_pre_root =
+                                    host.module_root(id) == expected.get(id).copied();
+                                host.set_active_version(protocol_version);
+                                let at_post_root = host.module_root(id) == Some(*root);
+                                if at_pre_root {
+                                    commit_only.insert(id.clone());
+                                } else if at_post_root {
+                                    already_post += 1;
+                                }
+                            }
+                            // re-execute and verify under this block's version,
+                            // matching the at_pre replay path above.
+                            host.set_active_version(protocol_version);
+                            // MULTI-DISK atomicity limit — fail-stop EXPLICITLY.
+                            // only a per-block-durable disk substrate can be at
+                            // its POST root after a crash (the in-memory cohort
+                            // always rolls back to the checkpoint pre-root), so
+                            // `already_post` counts exactly the disk substrates
+                            // that committed before the crash. two or more of
+                            // them is a changed set spanning >1 disk substrate at
+                            // mixed roots: the classic multi-store atomicity zone
+                            // whose sealed state may not be internally consistent
+                            // and whose single-frame re-execution can read a
+                            // partially-committed world. selective replay's
+                            // assumption (only the in-memory cohort was rolled
+                            // back) no longer holds, so we refuse it up front
+                            // rather than heal-and-hope the per-module verify
+                            // catches a divergence. no block commits to >1 disk
+                            // substrate today, so this is unreachable in prod;
+                            // the real fix if that changes is a per-commit height
+                            // cursor in the disk substrate's commit metadata.
+                            if already_post >= 2 {
+                                return Err(Error::Torn(format!(
+                                    "block {height}: changed set spans {already_post} \
+                                     per-block-durable disk substrates at mixed roots — the \
+                                     multi-store atomicity limit; single-frame selective replay \
+                                     cannot safely reconcile this. wipe app state and re-sync \
+                                     (keep the consensus journal)"
+                                )));
+                            }
+                            // a changed module at NEITHER pre nor post is
+                            // genuine damage — still fail-stop. so is a torn
+                            // block with nothing left to re-commit (it should
+                            // have been caught by the all-at-post fast path).
+                            if commit_only.len() + already_post != changed.len()
+                                || commit_only.is_empty()
+                            {
+                                return Err(Error::Torn(format!(
+                                    "block {height}: touched modules are neither all-applied \
+                                     nor all-unapplied and cannot be reconciled by selective \
+                                     replay — wipe app state and re-sync (keep the consensus \
+                                     journal)"
+                                )));
+                            }
+                            apply_block_committing(
+                                host,
+                                height,
+                                &frame,
+                                protocol_version,
+                                Some(disposition),
+                                &commit_only,
+                            )
+                            .await?;
+                            // every changed module — the re-committed cohort AND
+                            // the already-durable ones left untouched — must now
+                            // stand at its sealed post-root.
+                            for (id, root) in &changed {
+                                let live = host.module_root(id);
+                                if live != Some(*root) {
+                                    return Err(Error::Verify(format!(
+                                        "torn-block replay {height} left module {id} at \
+                                         {live:?}, sealed root was {root:?}"
+                                    )));
+                                }
+                            }
+                            applied += 1;
                         }
                     }
+                    blocks.push((height, roots.clone()));
                     for (id, root) in roots {
                         expected.insert(id, root);
                     }
@@ -797,12 +1298,19 @@ where
         // seal it NOW from the observed outcome.
         let mut rolled_forward = false;
         if let Some((height, frame)) = pending {
+            // version-aware replay: same split-selector restore as the sealed path
+            // above — the at_pre comparison reads `root()` under the PREVIOUS
+            // height's version, the roll-forward + seal under this block's version.
+            let protocol_version = host.effective_version(height).await;
+            let pre_version = host.effective_version(height.saturating_sub(1)).await;
+            host.set_active_version(pre_version);
             let at_pre = host
                 .module_roots()
                 .iter()
                 .all(|(id, root)| expected.get(id) == Some(root));
+            host.set_active_version(protocol_version);
             let disposition = if at_pre {
-                apply_block(host, height, &frame, None).await?
+                apply_block(host, height, &frame, protocol_version, None).await?
             } else {
                 // the apply completed before the crash; the roots that moved
                 // are its outcome. (single-disk-substrate blocks make this
@@ -815,13 +1323,25 @@ where
                 roots: host.module_roots(),
                 app_hash: host.app_hash(),
             };
-            BlockSink::seal(self, &seal).await.map_err(|e| Error::Storage(e.to_string()))?;
+            BlockSink::seal(self, &seal)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?;
             self.journal.sync().await.map_err(storage_err)?;
+            blocks.push((height, seal.roots.clone()));
             tip_height = Some(height);
             tip_hash = host.app_hash();
             rolled_forward = true;
         }
 
+        // final belt-and-suspenders: drive every dual-path module's branch
+        // selector to the TIP's effective version before the app-hash check, so a
+        // replay whose tail blocks were all skipped (disk substrates already held
+        // them) or a genesis boot with no journal suffix still evaluates `root()`
+        // at the correct boundary version. no-op below an activation boundary.
+        if let Some(h) = tip_height {
+            let v = host.effective_version(h).await;
+            host.set_active_version(v);
+        }
         // THE verification: the recomposed state must be byte-identical to
         // what consensus sealed at the tip. anything else means the recovered
         // node would fork — refuse to start.
@@ -837,7 +1357,9 @@ where
             app_hash: tip_hash,
             epoch,
             view_base,
+            participants,
             frames,
+            blocks,
             applied,
             skipped,
             rolled_forward,
@@ -852,11 +1374,25 @@ async fn apply_block(
     host: &mut Host,
     height: u64,
     frame: &[u8],
+    protocol_version: u32,
     expect: Option<Disposition>,
 ) -> Result<Disposition, Error> {
     let outcome = match decode_frame(frame) {
         Ok((origin, msg)) => {
-            let ctx = BlockContext { height, consensus_time: height, origin };
+            // `protocol_version` is the PURE `effective_version(height)` over the
+            // REPLAYED committed upgrade state — the identical value the live node
+            // stamped for this block (never the old hardcoded baseline, which would
+            // fork a dual-path module's v2 `root()` at/after an activation boundary
+            // H). the caller has already driven every dual-path module's non-hashed
+            // `active_version` to this same version so `root()` recomputes the
+            // boundary's format. inert (baseline) until the upgrade module is
+            // registered and armed.
+            let ctx = BlockContext {
+                protocol_version,
+                height,
+                consensus_time: height,
+                origin,
+            };
             match host.submit_at(ctx, msg).await {
                 Ok(_) => Disposition::Applied,
                 Err(SubmitError::Rejected(_)) => Disposition::Rejected,
@@ -878,6 +1414,50 @@ async fn apply_block(
     Ok(outcome)
 }
 
+/// re-apply one journaled frame like [`apply_block`], but commit ONLY the
+/// modules in `commit_only` at the block boundary and abort the rest (see
+/// [`Host::submit_at_committing`]). used to heal a TORN block whose disk
+/// substrates are already durable at their sealed post-root: replay re-commits
+/// only the in-memory cohort that was rolled back to the checkpoint.
+async fn apply_block_committing(
+    host: &mut Host,
+    height: u64,
+    frame: &[u8],
+    protocol_version: u32,
+    expect: Option<Disposition>,
+    commit_only: &BTreeSet<ModuleId>,
+) -> Result<Disposition, Error> {
+    let outcome = match decode_frame(frame) {
+        Ok((origin, msg)) => {
+            // stamp the block's effective version exactly like `apply_block`, so a
+            // dual-path module re-executes the sealed frame under the SAME version
+            // the live node did (fork-critical at an activation boundary).
+            let ctx = BlockContext {
+                protocol_version,
+                height,
+                consensus_time: height,
+                origin,
+            };
+            match host.submit_at_committing(ctx, msg, commit_only).await {
+                Ok(_) => Disposition::Applied,
+                Err(SubmitError::Rejected(_)) => Disposition::Rejected,
+                Err(SubmitError::Fatal(f)) => {
+                    return Err(Error::Torn(format!("boundary fault during torn replay: {f}")));
+                }
+            }
+        }
+        Err(_) => Disposition::Rejected,
+    };
+    if let Some(expect) = expect {
+        if outcome != expect {
+            return Err(Error::Verify(format!(
+                "torn-block replay {height} landed as {outcome:?}, sealed as {expect:?}"
+            )));
+        }
+    }
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,8 +1472,13 @@ mod tests {
     #[test]
     fn record_roundtrip() {
         let records = vec![
-            Record::Pinned { frame: b"frame-bytes".to_vec() },
-            Record::Block { height: 7, frame: vec![0, 1, 2] },
+            Record::Pinned {
+                frame: b"frame-bytes".to_vec(),
+            },
+            Record::Block {
+                height: 7,
+                frame: vec![0, 1, 2],
+            },
             Record::Seal {
                 height: 7,
                 disposition: Disposition::Applied,
@@ -906,7 +1491,11 @@ mod tests {
                 roots: vec![],
                 app_hash: StateRoot([6; 32]),
             },
-            Record::Cutover { epoch: 2, view_base: 40 },
+            Record::Cutover {
+                epoch: 2,
+                view_base: 40,
+                participants: vec![vec![7u8; 32], vec![8u8; 32]],
+            },
         ];
         for r in records {
             let decoded = Record::decode(&r.encode()).expect("roundtrip");
@@ -916,7 +1505,11 @@ mod tests {
 
     #[test]
     fn record_rejects_damage() {
-        let good = Record::Block { height: 7, frame: vec![0, 1, 2] }.encode();
+        let good = Record::Block {
+            height: 7,
+            frame: vec![0, 1, 2],
+        }
+        .encode();
         // truncation
         assert!(Record::decode(&good[..good.len() - 1]).is_err());
         // trailing garbage
@@ -929,12 +1522,13 @@ mod tests {
         assert!(Record::decode(&bad).is_err());
     }
 
-    #[test]
-    fn manifest_roundtrip() {
-        let m = Manifest {
+    fn sample_manifest() -> Manifest {
+        Manifest {
             height: Some(42),
             epoch: 1,
             view_base: 30,
+            participants: vec![vec![7u8; 32], vec![8u8; 32]],
+            pending_cutover_view: Some(15),
             app_hash: StateRoot([1; 32]),
             roots: roots(&[("directory", 2), ("valset", 3)]),
             snapshots: vec![
@@ -943,16 +1537,98 @@ mod tests {
             ],
             oplog_pos: 17,
             next_seq: 5,
-        };
+            current_version: 0,
+            pending_upgrade: None,
+            required_min_version: 0,
+        }
+    }
+
+    #[test]
+    fn manifest_roundtrip() {
+        // defaults for the version tail.
+        let m = sample_manifest();
         let decoded = Manifest::decode(&m.encode()).expect("roundtrip");
         assert_eq!(decoded, m);
         assert_eq!(decoded.snapshot("directory"), Some(b"dir-bytes".as_ref()));
         assert_eq!(decoded.root("valset"), Some(StateRoot([3; 32])));
+
+        // non-default version tail, with a pending upgrade set.
+        let m = Manifest {
+            current_version: 3,
+            pending_upgrade: Some(UpgradeCoords {
+                name: "v4".into(),
+                activation_height: 100,
+                to_version: 4,
+            }),
+            required_min_version: 3,
+            ..sample_manifest()
+        };
+        assert_eq!(Manifest::decode(&m.encode()).expect("roundtrip"), m);
+    }
+
+    #[test]
+    fn manifest_decode_tolerates_old_format() {
+        // an on-disk checkpoint written before the version fields existed: the
+        // encoding with its version tail truncated at `next_seq`. a new binary
+        // must map the missing tail to baseline defaults, not reject it.
+        let m = sample_manifest();
+        let full = m.encode();
+        // the tail is `u32 current + 1-byte pending tag(None) + u32 required` =
+        // 9 bytes; drop them to simulate the prior format.
+        let old = &full[..full.len() - 9];
+        let decoded = Manifest::decode(old).expect("old format decodes");
+        assert_eq!(decoded.current_version, 0);
+        assert_eq!(decoded.pending_upgrade, None);
+        assert_eq!(decoded.required_min_version, 0);
+        // everything before the tail survives unchanged.
+        assert_eq!(decoded, m);
+    }
+
+    #[test]
+    fn manifest_decode_rejects_truncated_version_tail() {
+        // a present-but-malformed tail (one byte into the version fields) must
+        // fail loud, never silently default.
+        let full = sample_manifest().encode();
+        let torn = &full[..full.len() - 4]; // half of the required_min u32.
+        assert!(Manifest::decode(torn).is_err());
+    }
+
+    #[test]
+    fn required_min_version_fencepost_via_capture() {
+        // the derivation the capture path uses, exercised through the shared
+        // sdk fence: below activation -> current_version, at/after -> to_version.
+        let pending = UpgradeCoords {
+            name: "v2".into(),
+            activation_height: 50,
+            to_version: 2,
+        };
+        assert_eq!(sdk::required_min_version(1, Some(&pending), 49), 1);
+        assert_eq!(sdk::required_min_version(1, Some(&pending), 50), 2);
+        assert_eq!(sdk::required_min_version(1, None, 50), 1);
+    }
+
+    #[test]
+    fn preflight_gates_on_required_min() {
+        let m = Manifest {
+            required_min_version: 3,
+            ..sample_manifest()
+        };
+        // a build that supports >= the required min boots.
+        assert!(m.preflight(3).is_ok());
+        assert!(m.preflight(4).is_ok());
+        // an under-versioned build refuses loud.
+        let err = m.preflight(2).expect_err("under-versioned build");
+        assert_eq!(err.required_min, 3);
+        assert_eq!(err.max_supported, 2);
     }
 
     #[test]
     fn floor_cert_roundtrip() {
-        let c = FloorCert { epoch: 3, height: 99, cert: b"certificate".to_vec() };
+        let c = FloorCert {
+            epoch: 3,
+            height: 99,
+            cert: b"certificate".to_vec(),
+        };
         assert_eq!(FloorCert::decode(&c.encode()).expect("roundtrip"), c);
     }
 }

@@ -21,8 +21,9 @@ install path는 ref를 이동하기 전에 full-closure connectivity walk를 실
 
 ## Snapshot Modules
 
-Valset, directory, saga, messaging-backed wrapper 같은 module은 필요한 곳에서
-canonical-byte snapshot/install path를 사용한다. installer는 local state를 mutate
+Valset, directory, saga, 그리고 state-based product module(tasks, vaults,
+agent, inbox, automations, files, memory, jobs)은 필요한 곳에서 canonical-byte
+snapshot/install path를 사용한다. installer는 local state를 mutate
 하기 전에 verify해야 하므로 malformed 또는 incomplete snapshot이 root를 부분적으로
 advance할 수 없다.
 

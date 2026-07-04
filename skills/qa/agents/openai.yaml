@@ -1,0 +1,4 @@
+interface:
+  display_name: "QA"
+  short_description: "Drive the fleet's real per-worktree Ducktape apps for agent QA."
+  default_prompt: "Use $qa to drive a fleet worktree's live Ducktape desktop instance over its tauri-plugin-mcp socket (/tmp/tauri-mcp-<id>.sock) — assert the DOM, drive the UI, seed node state — so an agent can QA that branch while it shows live in the fleet dashboard."

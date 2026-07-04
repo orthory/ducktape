@@ -22,7 +22,7 @@ struct TestCtx {
 impl TestCtx {
     fn with_origin(consensus_time: u64, origin: Origin) -> Self {
         Self {
-            env: sdk::Env {
+            env: sdk::Env { protocol_version: 0,
                 height: 0,
                 consensus_time,
                 origin,

@@ -4,7 +4,7 @@
   "type": "module",
   "packageManager": "bun@1.3.14",
   "scripts": {
-    "dev": "vocs dev",
+    "dev": "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=zk vocs dev",
     "build": "vocs build",
     "preview": "vocs preview",
     "docs:check": "bun scripts/check-docs-structure.mjs && vocs build"

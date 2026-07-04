@@ -35,10 +35,10 @@ use std::time::Duration;
 
 use commonware_consensus::simplex::{mocks, scheme::ed25519 as simplex_ed25519};
 use commonware_consensus::types::Epoch;
-use commonware_cryptography::{ed25519, Sha256, Signer};
+use commonware_cryptography::{Sha256, Signer, ed25519};
 use commonware_p2p::simulated::{self, Link};
-use commonware_runtime::{deterministic, Clock as _, Quota, Runner as _, Supervisor as _};
-use commonware_utils::{ordered::Set, NZUsize, NZU32};
+use commonware_runtime::{Clock as _, Quota, Runner as _, Supervisor as _, deterministic};
+use commonware_utils::{NZU32, NZUsize, ordered::Set};
 
 use consensus::{ContentStore, SimplexOrderer};
 use node::Orderer as _;
@@ -92,14 +92,12 @@ where
     // five deterministic identities. the joiner is seed 4; the epoch-0 set is the
     // first four, the epoch-1 set is all five. building schemes from these keys
     // directly (not a fixture) keeps the 4-subset and 5-superset key-identical.
-    let keys: Vec<ed25519::PrivateKey> =
-        (0..5u64).map(ed25519::PrivateKey::from_seed).collect();
+    let keys: Vec<ed25519::PrivateKey> = (0..5u64).map(ed25519::PrivateKey::from_seed).collect();
     let pubs: Vec<ed25519::PublicKey> = keys.iter().map(|k| k.public_key()).collect();
 
     let participants4: Set<ed25519::PublicKey> =
         Set::try_from(pubs[0..4].to_vec()).expect("no dup 4-set");
-    let participants5: Set<ed25519::PublicKey> =
-        Set::try_from(pubs.clone()).expect("no dup 5-set");
+    let participants5: Set<ed25519::PublicKey> = Set::try_from(pubs.clone()).expect("no dup 5-set");
     let joiner = pubs[4].clone(); // in the 5-set only.
     let epoch0_submitter = pubs[0].clone(); // any incumbent.
 
@@ -141,11 +139,18 @@ where
 
     // perfect all-pairs links among all five, so votes/certs propagate for BOTH
     // epochs deterministically.
-    let link = Link { latency: Duration::from_millis(10), jitter: Duration::from_millis(1), success_rate: 1.0 };
+    let link = Link {
+        latency: Duration::from_millis(10),
+        jitter: Duration::from_millis(1),
+        success_rate: 1.0,
+    };
     for a in participants5.iter() {
         for b in participants5.iter() {
             if a != b {
-                oracle.add_link(a.clone(), b.clone(), link.clone()).await.expect("link");
+                oracle
+                    .add_link(a.clone(), b.clone(), link.clone())
+                    .await
+                    .expect("link");
             }
         }
     }
@@ -177,9 +182,14 @@ where
 
     // op A: submitted to ONE incumbent, must finalize on all four.
     let op_a = b"epoch0-op-from-an-incumbent".to_vec();
-    e0.get_mut(&epoch0_submitter).unwrap().submit(op_a.clone()).await.expect("submit A");
+    e0.get_mut(&epoch0_submitter)
+        .unwrap()
+        .submit(op_a.clone())
+        .await
+        .expect("submit A");
 
-    let mut a_seen: HashMap<ed25519::PublicKey, bool> = participants4.iter().map(|v| (v.clone(), false)).collect();
+    let mut a_seen: HashMap<ed25519::PublicKey, bool> =
+        participants4.iter().map(|v| (v.clone(), false)).collect();
     loop {
         context.sleep(Duration::from_millis(50)).await;
         for (v, o) in e0.iter_mut() {
@@ -221,9 +231,14 @@ where
     // op B: submitted to the JOINER ONLY. B finalizing on all five is the proof —
     // v4 had to lead a view and the four incumbents had to count its proposal.
     let op_b = b"epoch1-op-from-the-joiner-v4".to_vec();
-    e1.get_mut(&joiner).unwrap().submit(op_b.clone()).await.expect("submit B");
+    e1.get_mut(&joiner)
+        .unwrap()
+        .submit(op_b.clone())
+        .await
+        .expect("submit B");
 
-    let mut b_seen: HashMap<ed25519::PublicKey, bool> = participants5.iter().map(|v| (v.clone(), false)).collect();
+    let mut b_seen: HashMap<ed25519::PublicKey, bool> =
+        participants5.iter().map(|v| (v.clone(), false)).collect();
     loop {
         context.sleep(Duration::from_millis(50)).await;
         for (v, o) in e1.iter_mut() {
@@ -240,7 +255,10 @@ where
 
     // if we got here the loops converged inside the deadline: the joiner's op was
     // finalized by the reconfigured five-validator set.
-    assert!(b_seen.contains_key(&joiner), "the joiner is in the epoch-1 set");
+    assert!(
+        b_seen.contains_key(&joiner),
+        "the joiner is in the epoch-1 set"
+    );
     assert_eq!(b_seen.len(), 5, "all five finalized the joiner's op");
 }
 

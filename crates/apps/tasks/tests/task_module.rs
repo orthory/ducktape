@@ -64,7 +64,7 @@ struct TestCtx {
 impl TestCtx {
     fn at(consensus_time: u64) -> Self {
         Self {
-            env: Env {
+            env: Env { protocol_version: 0,
                 height: 0,
                 consensus_time,
                 origin: Origin::System,
@@ -237,7 +237,7 @@ fn app_hash_changes_when_task_state_changes() {
 
         let created = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 1,
                     consensus_time: 3,
                     origin: Origin::External(b"tester".to_vec()),
@@ -254,7 +254,7 @@ fn app_hash_changes_when_task_state_changes() {
 
         let updated = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 2,
                     consensus_time: 4,
                     origin: Origin::External(b"tester".to_vec()),

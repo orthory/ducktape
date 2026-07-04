@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main-window IPC baseline: node_* commands plus the core event API the ducktape://block stream rides on.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "IPC baseline for the console (main) and the macOS menu-bar popover (tray): node_* commands, the core event API the ducktape://block stream and ducktape://navigate ride on, plus title-bar window dragging (the custom 44px TitleBar is a data-tauri-drag-region).",
+  "windows": ["main", "tray"],
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
 }

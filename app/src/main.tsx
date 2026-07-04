@@ -13,9 +13,24 @@ import "@fontsource/ibm-plex-sans-kr/500.css";
 
 import "./console/theme/global.css";
 import { DucktapeConsole } from "./console/DucktapeConsole";
+import { TrayPopover } from "./console/views/tray/TrayPopover";
+
+// The frameless menu-bar window (macOS) loads `index.html?view=tray` and renders
+// the popover instead of the full console. Every other window is the console.
+const isTray =
+  new URLSearchParams(window.location.search).get("view") === "tray";
+
+// dev-only: connect the tauri-plugin-mcp guest bindings so the socket helper
+// (app/scripts/tauri-debug.mjs) can run JS / inspect the DOM in this webview.
+// screenshots work without it; the DOM/JS commands need it. never in release.
+if (import.meta.env.DEV) {
+  void import("tauri-plugin-mcp")
+    .then(({ setupPluginListeners }) => setupPluginListeners())
+    .catch(() => {});
+}
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <DucktapeConsole />
+    {isTray ? <TrayPopover /> : <DucktapeConsole />}
   </React.StrictMode>,
 );

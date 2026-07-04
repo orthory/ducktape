@@ -68,7 +68,7 @@ struct TestCtx {
 impl TestCtx {
     fn at(consensus_time: u64, me: &str) -> Self {
         Self {
-            env: sdk::Env {
+            env: sdk::Env { protocol_version: 0,
                 height: 0,
                 consensus_time,
                 origin: sdk::Origin::System,
@@ -399,6 +399,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             &mut src_forge,
             100,
             forge_encode_msg(&ForgeMsg::Commit {
+                repo: String::new(),
                 path: "README.md".into(),
                 content: "# ducktape\n".into(),
                 message: "init".into(),
@@ -410,6 +411,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             &mut src_forge,
             200,
             forge_encode_msg(&ForgeMsg::Commit {
+                repo: String::new(),
                 path: "README.md".into(),
                 content: "# ducktape\n\nrebuilt from a snapshot\n".into(),
                 message: "expand".into(),
@@ -481,7 +483,13 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // the agent crate's own snapshot suite; this leg pins the joiner
         // path. admin ops are owner-gated, so they carry an external origin.
         let owner = sdk::Origin::External(b"agent-owner".to_vec());
-        let mut src_agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        let mut src_agent = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        );
         commit_op_as(
             &mut src_agent,
             30,
@@ -692,7 +700,13 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         join_saga
             .install(&saga_bytes, src_saga_root)
             .expect("saga install");
-        let mut join_agent = AgentModule::new("agent", "chat", "saga", Some("tasks".into()));
+        let mut join_agent = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        );
         join_agent
             .install(&agent_bytes, src_agent_root)
             .expect("agent install");
@@ -851,7 +865,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // proof the pack landed real objects (commit, tree, blob), not just a
         // head oid that rehashes to the right root.
         {
-            let repo = git2::Repository::open(&joiner_dir).expect("joiner repo opens");
+            // forge now namespaces repos under base/<name>; the default repo
+            // (an empty `repo` field) lives at joiner_dir/default.
+            let repo =
+                git2::Repository::open(joiner_dir.join("default")).expect("joiner repo opens");
             let head = repo
                 .refname_to_id("refs/heads/main")
                 .expect("joiner ref is born");
