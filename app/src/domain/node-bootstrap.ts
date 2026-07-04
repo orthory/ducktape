@@ -50,6 +50,26 @@ export const connectWorkspace = (httpUrl: string): NodeResolution => ({
   managed: true,
 });
 
+/** Connect to a node running on ANOTHER device, reachable over plain
+ *  http/https. Unmanaged: this app only dials the url the user gave — it never
+ *  spawns, adopts, or stops the process (so the daemon controls stay hidden,
+ *  same as the web build). The transport is already url-agnostic; this is just
+ *  the lifecycle label. */
+export const connectRemote = (httpUrl: string): NodeResolution => ({
+  transport: remoteTransport(httpUrl),
+  url: httpUrl,
+  managed: false,
+});
+
+/** Coerce user input into a dial-able node url: accept a full `http(s)://…`
+ *  verbatim, and default a bare `host` / `host:port` to `http://`. Trailing
+ *  slashes are the transport's to strip. Empty in → empty out (caller guards). */
+export const normalizeNodeUrl = (raw: string): string => {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+};
+
 /** Poll /v1/status until the node answers, or reject after `attempts`. */
 export const waitUntilUp = (
   transport: NodeTransport,
