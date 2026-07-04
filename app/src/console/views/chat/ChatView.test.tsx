@@ -87,10 +87,12 @@ describe("ChatView layout", () => {
       padding: "14px 18px 18px",
     });
 
+    // The column fills the pane width (full-bleed rows / hover highlight, like
+    // the reference) — long content is confined by the body's wrapping, asserted
+    // below, not by a fixed max-width that would leave an awkward right gutter.
     const column = within(stream).getByTestId("chat-message-column");
     expect(column).toHaveStyle({
       width: "100%",
-      maxWidth: "880px",
       minWidth: "0px",
     });
 

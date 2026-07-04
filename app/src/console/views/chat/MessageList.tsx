@@ -81,7 +81,6 @@ export function MessageList({
         data-testid="chat-message-column"
         style={{
           width: "100%",
-          maxWidth: 880,
           minWidth: 0,
           display: "flex",
           flexDirection: "column",
