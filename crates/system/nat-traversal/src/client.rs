@@ -39,6 +39,23 @@ impl NatClient {
             .await?;
         Ok(())
     }
+
+    pub async fn send_punch_to(&self, peer: SocketAddr) -> std::io::Result<()> {
+        self.sock
+            .send_to(&Msg::Punch { from: self.key }.encode(), peer)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn recv_punch(&self) -> std::io::Result<Msg> {
+        let mut buf = [0u8; 64];
+        loop {
+            let (n, _from) = self.sock.recv_from(&mut buf).await?;
+            if let Ok(m @ Msg::Punch { .. }) = Msg::decode(&buf[..n]) {
+                return Ok(m);
+            }
+        }
+    }
 }
 
 /// The coordinator event loop: decode, feed the pure handler, send replies.
