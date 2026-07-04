@@ -1824,7 +1824,8 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     descriptor.save(&descriptor_path)?;
-    println!("{}", config::encode_invite(&descriptor)?);
+    let expires = config::invite_expiry(config::unix_now_secs()?, config::DEFAULT_INVITE_TTL_DAYS)?;
+    println!("{}", config::encode_invite(&descriptor, &key, expires)?);
     Ok(())
 }
 
