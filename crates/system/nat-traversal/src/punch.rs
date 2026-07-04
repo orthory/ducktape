@@ -54,6 +54,32 @@ fn punch_once(a: PunchSide, b: PunchSide, a_nat: &mut SimNat, b_nat: &mut SimNat
     (a_delivered, b_delivered)
 }
 
+/// Drive simultaneous-open with retry until BOTH directions have had a datagram
+/// actually admitted (observed per-round, not inferred from final filter
+/// state), or the attempt budget is exhausted. Shared by `drive_simulated` and
+/// `drive_rebind_reconnect`.
+fn punch_until_bidirectional(
+    a_side: PunchSide,
+    b_side: PunchSide,
+    a_nat: &mut SimNat,
+    b_nat: &mut SimNat,
+) -> Result<(), PunchError> {
+    let mut a_delivered = false;
+    let mut b_delivered = false;
+    for _ in 0..MAX_PUNCH_ATTEMPTS {
+        if a_delivered && b_delivered {
+            break;
+        }
+        let (a_ok, b_ok) = punch_once(a_side, b_side, a_nat, b_nat);
+        a_delivered |= a_ok;
+        b_delivered |= b_ok;
+    }
+    if !a_delivered || !b_delivered {
+        return Err(PunchError::NotReachable);
+    }
+    Ok(())
+}
+
 /// Deterministic in-memory choreography of the full discover→rendezvous→punch
 /// dance for two endpoints behind their own `SimNat`. No real sockets: this is
 /// the CI proof that simultaneous-open works for the restricted-cone case.
@@ -95,30 +121,92 @@ pub fn drive_simulated(
     //    when it was sent (see `punch_once`'s doc comment and the
     //    `a_single_one_shot_attempt_drops_as_first_packet` regression test
     //    below — Slice 0a review). Retry each side's punch until a round
-    //    actually delivers it.
+    //    actually delivers it, observed per-round, not from final filter state.
     let a_side = PunchSide { key: a_key, mapped: a_mapped, peer: a_peer };
     let b_side = PunchSide { key: b_key, mapped: b_mapped, peer: b_peer };
-    let mut a_delivered = false;
-    let mut b_delivered = false;
-    for _ in 0..MAX_PUNCH_ATTEMPTS {
-        if a_delivered && b_delivered {
-            break;
-        }
-        let (a_ok, b_ok) = punch_once(a_side, b_side, a_nat, b_nat);
-        a_delivered |= a_ok;
-        b_delivered |= b_ok;
-    }
-
-    // 4. Verify bidirectional reachability was actually observed, not just
-    //    assumed from final filter state.
-    if !a_delivered || !b_delivered {
-        return Err(PunchError::NotReachable);
-    }
+    punch_until_bidirectional(a_side, b_side, a_nat, b_nat)?;
 
     Ok((
         PunchPlan { local_mapped: a_mapped, peer_reflexive: a_peer },
         PunchPlan { local_mapped: b_mapped, peer_reflexive: b_peer },
     ))
+}
+
+/// The proof a rebind reconnect produces: the reflexive before and after the
+/// rebind (they must differ), plus the fresh punch plans on the new mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RebindProof {
+    pub old_a_reflexive: SocketAddr,
+    pub new_a_reflexive: SocketAddr,
+    pub a_plan: PunchPlan,
+    pub b_plan: PunchPlan,
+}
+
+/// Deterministic full rebinding path: punch once, then A's NAT rebinds, A
+/// re-runs STUN and re-advertises under a HIGHER monotonic nonce (superseding
+/// its stale mapping), B re-resolves the new reflexive via the coordinator, and
+/// the pair reconnects on the new mapping. This is the CI proof for
+/// "endpoint-churn re-advertisement" (Acceptance §1) and the design's
+/// "NAT rebinding → re-run STUN and re-advertise under a higher monotonic
+/// nonce" fallback rule.
+pub fn drive_rebind_reconnect(
+    a_key: NodeKey,
+    b_key: NodeKey,
+    a_nat: &mut SimNat,
+    b_nat: &mut SimNat,
+    coord: &mut Coordinator,
+) -> Result<RebindProof, PunchError> {
+    // 1. Establish the initial direct path (also registers both nodes).
+    let (a_plan0, _b_plan0) = drive_simulated(a_key, b_key, a_nat, b_nat, coord)?;
+    let old_a_reflexive = a_plan0.local_mapped;
+
+    // 2. A's NAT rebinds: its mappings + holes are dropped.
+    a_nat.rebind();
+
+    // 3. A re-runs STUN: the datagram traverses the rebound NAT to a FRESH
+    //    reflexive, which the coordinator observes.
+    let new_a_mapped = a_nat.send(internal(&a_key), coord_addr());
+
+    // 4. A re-advertises under a strictly-higher nonce; it must supersede.
+    if coord.readvertise(a_key, new_a_mapped, 1) != crate::AdvertOutcome::Superseded {
+        return Err(PunchError::NoReflexive);
+    }
+
+    // 5. B re-resolves: its Lookup now returns A's NEW reflexive, and the
+    //    coordinator fans out PunchSync to both the new A mapping and B.
+    let b_mapped = a_plan0_b_mapped(b_key, b_nat);
+    let out = coord.handle(b_mapped, Msg::Lookup { key: a_key });
+    let mut b_peer = None; // A's new reflexive, as B sees it
+    let mut a_peer = None; // B's reflexive, as A sees it (via the fan-out)
+    for (dst, msg) in out {
+        if let Msg::PunchSync { peer_reflexive, .. } = msg {
+            if dst == b_mapped {
+                b_peer = Some(peer_reflexive);
+            } else if dst == new_a_mapped {
+                a_peer = Some(peer_reflexive);
+            }
+        }
+    }
+    let b_peer = b_peer.ok_or(PunchError::NoReflexive)?;
+    let a_peer = a_peer.ok_or(PunchError::NoReflexive)?;
+
+    // 6. Reconnect on the new mapping.
+    let a_side = PunchSide { key: a_key, mapped: new_a_mapped, peer: a_peer };
+    let b_side = PunchSide { key: b_key, mapped: b_mapped, peer: b_peer };
+    punch_until_bidirectional(a_side, b_side, a_nat, b_nat)?;
+
+    Ok(RebindProof {
+        old_a_reflexive,
+        new_a_reflexive: new_a_mapped,
+        a_plan: PunchPlan { local_mapped: new_a_mapped, peer_reflexive: a_peer },
+        b_plan: PunchPlan { local_mapped: b_mapped, peer_reflexive: b_peer },
+    })
+}
+
+// B's coordinator-facing mapping is stable (B did not rebind), so re-deriving it
+// is idempotent and matches what registration observed.
+fn a_plan0_b_mapped(b_key: NodeKey, b_nat: &mut SimNat) -> SocketAddr {
+    b_nat.send(internal(&b_key), coord_addr())
 }
 
 // Deterministic internal socket for a node key in the simulation.
@@ -297,6 +385,29 @@ mod tests {
 
         assert!(!a_delivered, "A's first punch must be dropped before B opens its filter");
         assert!(b_delivered, "B's punch lands because A already opened its filter this round");
+    }
+
+    #[test]
+    fn rebind_then_reresolve_then_reconnect_on_the_new_mapping() {
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let mut a_nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let mut b_nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
+        let mut coord = Coordinator::new();
+
+        let proof = drive_rebind_reconnect(a_key, b_key, &mut a_nat, &mut b_nat, &mut coord)
+            .expect("rebind reconnect");
+
+        // The reflexive actually MOVED, and B re-resolved the NEW one.
+        assert_ne!(proof.old_a_reflexive, proof.new_a_reflexive);
+        assert_eq!(proof.a_plan.local_mapped, proof.new_a_reflexive);
+        assert_eq!(
+            proof.b_plan.peer_reflexive, proof.new_a_reflexive,
+            "B reconnected against A's superseding reflexive, not the stale one"
+        );
+        // Bidirectional reachability re-established on the new mapping.
+        assert!(a_nat.allow_inbound(proof.a_plan.local_mapped, proof.b_plan.local_mapped));
+        assert!(b_nat.allow_inbound(proof.b_plan.local_mapped, proof.a_plan.local_mapped));
     }
 
     #[test]

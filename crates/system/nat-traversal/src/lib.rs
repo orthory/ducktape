@@ -21,8 +21,8 @@ pub use coordinator::{Coordinator, Side};
 pub use relay::{Forward, RelaySplice};
 #[cfg(any(test, feature = "simnat"))]
 pub use punch::{
-    FallbackOutcome, PunchError, PunchPlan, RelayFallbackProof, drive_simulated,
-    drive_with_relay_fallback,
+    FallbackOutcome, PunchError, PunchPlan, RebindProof, RelayFallbackProof, drive_rebind_reconnect,
+    drive_simulated, drive_with_relay_fallback,
 };
 #[cfg(any(test, feature = "simnat"))]
 pub use simnat::SimNat;
