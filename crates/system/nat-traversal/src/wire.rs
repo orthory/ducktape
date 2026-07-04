@@ -12,6 +12,8 @@ pub enum Msg {
     LookupResponse { key: NodeKey, reflexive: Option<SocketAddr> },
     PunchSync { peer: NodeKey, peer_reflexive: SocketAddr },
     Punch { from: NodeKey },
+    RelayRequest { peer: NodeKey },
+    RelayGrant { session: u64, relay: SocketAddr },
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -33,9 +35,15 @@ const TAG_LOOKUP: u8 = 4;
 const TAG_LOOKUP_RESP: u8 = 5;
 const TAG_PUNCH_SYNC: u8 = 6;
 const TAG_PUNCH: u8 = 7;
+const TAG_RELAY_REQ: u8 = 8;
+const TAG_RELAY_GRANT: u8 = 9;
 
 fn put_key(out: &mut Vec<u8>, k: &NodeKey) {
     out.extend_from_slice(&k.0);
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_be_bytes());
 }
 
 fn put_addr(out: &mut Vec<u8>, a: &SocketAddr) {
@@ -75,6 +83,12 @@ impl<'a> Reader<'a> {
         let mut k = [0u8; 32];
         k.copy_from_slice(s);
         Ok(NodeKey(k))
+    }
+    fn u64(&mut self) -> Result<u64, WireError> {
+        let s = self.take(8)?;
+        let mut b = [0u8; 8];
+        b.copy_from_slice(s);
+        Ok(u64::from_be_bytes(b))
     }
     fn addr(&mut self) -> Result<SocketAddr, WireError> {
         let fam = self.take(1)?[0];
@@ -137,6 +151,15 @@ impl Msg {
                 out.push(TAG_PUNCH);
                 put_key(&mut out, from);
             }
+            Msg::RelayRequest { peer } => {
+                out.push(TAG_RELAY_REQ);
+                put_key(&mut out, peer);
+            }
+            Msg::RelayGrant { session, relay } => {
+                out.push(TAG_RELAY_GRANT);
+                put_u64(&mut out, *session);
+                put_addr(&mut out, relay);
+            }
         }
         out
     }
@@ -164,6 +187,8 @@ impl Msg {
                 peer_reflexive: r.addr()?,
             },
             TAG_PUNCH => Msg::Punch { from: r.key()? },
+            TAG_RELAY_REQ => Msg::RelayRequest { peer: r.key()? },
+            TAG_RELAY_GRANT => Msg::RelayGrant { session: r.u64()?, relay: r.addr()? },
             other => return Err(WireError::BadTag(other)),
         };
         // Reject oversized/malformed datagrams that decode a valid prefix but
@@ -196,6 +221,8 @@ mod tests {
             Msg::LookupResponse { key: NodeKey([7u8; 32]), reflexive: None },
             Msg::PunchSync { peer: NodeKey([8u8; 32]), peer_reflexive: addr(9, 7000) },
             Msg::Punch { from: NodeKey([10u8; 32]) },
+            Msg::RelayRequest { peer: NodeKey([11u8; 32]) },
+            Msg::RelayGrant { session: 0x0102_0304_0506_0708, relay: addr(12, 51820) },
         ];
         for m in cases {
             let bytes = m.encode();
@@ -222,6 +249,17 @@ mod tests {
         let mut bytes = Msg::PunchSync { peer: NodeKey([1u8; 32]), peer_reflexive: addr(2, 51820) }
             .encode();
         bytes.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
+    }
+
+    #[test]
+    fn relay_grant_carries_session_and_addr() {
+        let m = Msg::RelayGrant { session: 42, relay: addr(3, 4000) };
+        let back = Msg::decode(&m.encode()).expect("decode");
+        assert_eq!(m, back);
+        // Trailing garbage after a RelayGrant is still rejected.
+        let mut bytes = m.encode();
+        bytes.push(0xff);
         assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
     }
 }

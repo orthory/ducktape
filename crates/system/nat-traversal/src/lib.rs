@@ -9,12 +9,19 @@ pub mod coordinator;
 // pulled into a plain non-test, non-feature build (e.g. `coordinator-bin`).
 #[cfg(any(test, feature = "simnat"))]
 pub mod punch;
+pub mod relay;
 #[cfg(any(test, feature = "simnat"))]
 pub mod simnat;
 pub mod wire;
 
-pub use client::{NatClient, run_coordinator};
-pub use coordinator::Coordinator;
+pub use client::{NatClient, run_coordinator, run_coordinator_with_idle, run_relay_pair};
+pub use coordinator::{Coordinator, Side};
+pub use relay::{Forward, RelaySplice};
 #[cfg(any(test, feature = "simnat"))]
-pub use punch::{PunchError, PunchPlan};
+pub use punch::{
+    FallbackOutcome, PunchError, PunchPlan, RelayFallbackProof, drive_simulated,
+    drive_with_relay_fallback,
+};
+#[cfg(any(test, feature = "simnat"))]
+pub use simnat::SimNat;
 pub use wire::{Msg, NodeKey, WireError};

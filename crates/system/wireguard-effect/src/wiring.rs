@@ -239,8 +239,10 @@ mod tests {
         // `InterfaceConfiguration.prvkey` failing to decode to a 32-byte
         // key. `apply_tunnel_plan` must not leave that interface behind.
         let (plan, listen) = two_party_plan();
-        let mut fake = crate::FakeWireGuardEffect::default();
-        fake.reject_next_apply = true;
+        let mut fake = crate::FakeWireGuardEffect {
+            reject_next_apply: true,
+            ..Default::default()
+        };
 
         let err = apply_tunnel_plan(
             &mut fake,
