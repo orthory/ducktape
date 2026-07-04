@@ -4041,6 +4041,7 @@ dependencies = [
  "document",
  "files",
  "forge",
+ "forge-interface",
  "futures",
  "governance",
  "governance-interface",

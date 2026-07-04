@@ -74,9 +74,10 @@ const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 /// refuse-to-boot or halt this one node, never fork the network). the
 /// `ReadinessSignaller` truthfully signals readiness for a pending upgrade iff
 /// `MAX_PROTOCOL_VERSION >= to_version`, and the boot preflight refuses a boundary
-/// whose `required_min_version` exceeds it. bumped to 2 in Phase 9 when the forge v2
-/// dual path lands; baseline-only today.
-const MAX_PROTOCOL_VERSION: u32 = 1;
+/// whose `required_min_version` exceeds it. Phase 9 raised this to 2 when the
+/// forge v2 dual path landed — this binary can execute a scheduled `to_version=2`
+/// (the forge multi-repo-v2 root/snapshot divergence) and truthfully `SignalReady`.
+const MAX_PROTOCOL_VERSION: u32 = 2;
 use automations::Automations;
 use chat::Chat;
 use directory::Directory;
@@ -286,6 +287,20 @@ async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCo
         to_version: up.to_version,
     });
     (status.current_version, pending)
+}
+
+/// read the upgrade module's raw committed [`UpgradeStatus`] (committed state,
+/// between drains). `None` when the module is absent (pre-retrofit) or the reply
+/// is unreadable — so the transition-marker latches degrade to silent on a
+/// baseline net, never panicking.
+async fn read_upgrade_status_raw(host: &Host) -> Option<upgrade_interface::UpgradeStatus> {
+    use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    let reply = host
+        .query("upgrade", &encode_query(&UpgradeQuery::Status))
+        .await
+        .ok()?;
+    let UpgradeReply::Status(status) = decode_reply(&reply).ok()?;
+    Some(status)
 }
 
 /// the node-local worker that self-emits a validator-origin `SignalReady` op
@@ -2585,6 +2600,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // one-shot effect). inert before the module is registered.
         let mut signaller =
             ReadinessSignaller::new(MAX_PROTOCOL_VERSION, signer.public_key().as_ref().to_vec());
+        // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
+        // modeled on the `converged` latch: `upgrade armed …` fires when readiness
+        // first reaches R==n (every current boundary member signaled) for the
+        // pending upgrade — the pre-boundary observable the e2e keys on; `upgrade
+        // cleared …` fires when a previously-observed pending clears (the boundary
+        // `Advance` reconciliation at H, on ARM or ABORT). the boundary crossing
+        // itself prints the `upgrade activated …` / `upgrade aborted …` verdict.
+        let mut upgrade_armed_latch: Option<(String, u32)> = None;
+        let mut upgrade_pending_seen: Option<String> = None;
         loop {
             futures::select_biased! {
                 job = rpc_ingress.next() => {
@@ -3126,6 +3150,35 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 // the next tick (the module stays idempotent).
                                 signaller.signaled = None;
                                 eprintln!("[node {label}] readiness signal submit failed: {e}");
+                            }
+                        }
+                    }
+
+                    // UPGRADE TRANSITION MARKERS (one-shot, committed-state driven):
+                    // the greppable proof surface the e2e keys on. `armed` is the
+                    // module's own R==n verdict (pending set, boundary non-empty,
+                    // every current member signaled), so this fires exactly when
+                    // readiness first reaches the full set — before H is crossed.
+                    if let Some(st) = read_upgrade_status_raw(node.host()).await {
+                        match &st.pending {
+                            Some(up) => {
+                                upgrade_pending_seen = Some(up.name.clone());
+                                let key = (up.name.clone(), up.to_version);
+                                if st.armed && upgrade_armed_latch.as_ref() != Some(&key) {
+                                    println!(
+                                        "[node {label}] upgrade armed name={} to_version={} height={}",
+                                        up.name, up.to_version, up.activation_height
+                                    );
+                                    upgrade_armed_latch = Some(key);
+                                }
+                            }
+                            None => {
+                                if let Some(name) = upgrade_pending_seen.take() {
+                                    // the boundary Advance reconciled the pending
+                                    // (ARM flip or ABORT clear) — the slot is free.
+                                    println!("[node {label}] upgrade cleared name={name}");
+                                    upgrade_armed_latch = None;
+                                }
                             }
                         }
                     }

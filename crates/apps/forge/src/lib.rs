@@ -193,38 +193,68 @@ fn norm_repo(repo: &str) -> Result<String, Error> {
 /// baseline never moves the current root.
 const FORGE_BASELINE_VERSION: u32 = 0;
 
+/// the first protocol version that selects the forge v2 layout (Phase 9): the
+/// height-gated no-downtime demonstrator. below this version every seam picks
+/// the baseline multi-repo behavior BYTE-FOR-BYTE (so version 0 AND version 1
+/// are inert — every pre-Phase-9 forge test and the Phase-5 inertness test run
+/// unchanged); at/after this version the SAME committed heads compose a
+/// domain-separated v2 root and ship a v2-tagged snapshot container. this is the
+/// single real dual-path divergence a scheduled `to_version >= 2` activates at
+/// the agreed height `H`.
+const FORGE_MULTIREPO_V2: u32 = 2;
+
+/// the domain tag that separates the v2 root preimage from v1: the SAME sorted
+/// `(name, head)` composition, rehashed under this tag, so a v2 node computes a
+/// DIFFERENT — but still deterministic and pure — root for identical committed
+/// state. this is what makes the activation OBSERVABLE (the forge module root,
+/// and hence the global app-hash, changes at `H`) while staying a pure function
+/// of the committed heads. NEVER carries a version number into the preimage — the
+/// tag is a fixed constant, the version only SELECTS the branch.
+const FORGE_V2_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v2\x00";
+
+/// the 4-byte magic a v2 snapshot container leads with, so a v2 node's
+/// self-contained snapshot bytes are distinguishable from (and never mistaken
+/// for) a v1 container. the body after the magic is the identical multi-repo
+/// container; only the root GATE differs (v2 gates against [`compose_root_v2`]).
+const FORGE_V2_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv2";
+
 /// the version-selected behavior branch for forge's root preimage, snapshot wire
-/// format, and repo-field routing. INERT TODAY: only one variant exists, so the
-/// mapping is version-invariant and nothing branches in practice — the enum is
-/// the extension point a later phase adds the real second layout to, so that
-/// every version-sensitive site (root / snapshot / install / norm-routing)
-/// diverges CONSISTENTLY through the single [`forge_layout`] map.
+/// format, and repo-field routing. TWO variants now exist (Phase 9): the
+/// baseline multi-repo layout (versions `< FORGE_MULTIREPO_V2`) and the v2 layout
+/// (versions `>=`). every version-sensitive site (root / snapshot / install /
+/// norm-routing) diverges CONSISTENTLY through the single [`forge_layout`] map,
+/// so a v2 node round-trips (snapshot v2 -> install v2 -> v2 root) coherently.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ForgeLayout {
-    /// the current behavior: the sorted multi-repo `compose_root`, the multi-repo
+    /// the baseline behavior: the sorted multi-repo `compose_root`, the multi-repo
     /// snapshot container, and repo-field-honoring routing (`norm_repo`).
     MultiRepo,
+    /// the v2 behavior: the DOMAIN-SEPARATED root ([`compose_root_v2`]) and the
+    /// v2-magic snapshot container, with the same multi-repo routing. reached only
+    /// after a scheduled `to_version >= FORGE_MULTIREPO_V2` activates at `H`.
+    MultiRepoV2,
 }
 
 /// map a protocol / active version to the behavior branch it selects. this is
-/// the SOLE dual-path decision point. INERT: every version maps to the current
-/// multi-repo layout, so it changes NOTHING today — a later phase inserts the
-/// higher-version arm here (e.g. `v if v >= FORGE_MULTIREPO_V2 => Layout::V2`)
-/// ABOVE the baseline fall-through, and every seam picks it up automatically.
+/// the SOLE dual-path decision point. versions below [`FORGE_MULTIREPO_V2`] pick
+/// the baseline layout (byte-identical to before Phase 9); at/above they pick the
+/// v2 layout. the higher-version arm sits ABOVE the baseline fall-through, and
+/// every seam picks it up automatically.
 fn forge_layout(version: u32) -> ForgeLayout {
-    // SEAM: a later phase branches on `version` here. today the selector is a
-    // no-op — read but never consequential, so behavior is version-invariant.
-    let _ = version;
-    ForgeLayout::MultiRepo
+    if version >= FORGE_MULTIREPO_V2 {
+        ForgeLayout::MultiRepoV2
+    } else {
+        ForgeLayout::MultiRepo
+    }
 }
 
-/// normalize a wire `repo` field UNDER the selected layout. INERT: every layout
-/// honors the multi-repo field (empty -> `"default"`, otherwise validated by
-/// [`norm_repo`]); a future lower layout would collapse all traffic to the
-/// default repo here. the layout is the branch point; the behavior is unchanged.
+/// normalize a wire `repo` field UNDER the selected layout. both layouts honor
+/// the multi-repo field (empty -> `"default"`, otherwise validated by
+/// [`norm_repo`]) — the v2 divergence is in the root preimage / snapshot wire,
+/// not in op routing, so a repo targeted before `H` is the same repo after.
 fn norm_repo_at(repo: &str, layout: ForgeLayout) -> Result<String, Error> {
     match layout {
-        ForgeLayout::MultiRepo => norm_repo(repo),
+        ForgeLayout::MultiRepo | ForgeLayout::MultiRepoV2 => norm_repo(repo),
     }
 }
 
@@ -291,6 +321,25 @@ fn compose_root<'a>(entries: impl Iterator<Item = (&'a str, Oid)>) -> StateRoot 
     } else {
         StateRoot::ZERO
     }
+}
+
+/// the v2 composition [`StateRoot`]: the SAME sorted `(name, head)` preimage as
+/// [`compose_root`], domain-separated under [`FORGE_V2_ROOT_DOMAIN`] so identical
+/// committed heads rehash to a DIFFERENT root under the v2 layout — the
+/// observable flip at `H`. still a PURE function of the committed heads (no IO,
+/// order-independent via the caller's sort) and preserves the empty-genesis
+/// sentinel: no committed head anywhere -> [`StateRoot::ZERO`] under BOTH layouts
+/// (so a fresh v2 namespace and a fresh v1 namespace agree on the empty root; the
+/// divergence appears exactly when a repo has a committed head).
+fn compose_root_v2<'a>(entries: impl Iterator<Item = (&'a str, Oid)>) -> StateRoot {
+    let inner = compose_root(entries);
+    if inner == StateRoot::ZERO {
+        return StateRoot::ZERO;
+    }
+    let mut h = Sha256::new();
+    h.update(FORGE_V2_ROOT_DOMAIN);
+    h.update(inner.0);
+    StateRoot(h.finalize().into())
 }
 
 /// a bounds-checked cursor over untrusted snapshot bytes: every read verifies
@@ -623,7 +672,19 @@ impl Forge {
         // container, so the bytes are byte-identical to before this seam.
         match forge_layout(self.active_version) {
             ForgeLayout::MultiRepo => self.snapshot_multi_repo(),
+            ForgeLayout::MultiRepoV2 => self.snapshot_multi_repo_v2(),
         }
+    }
+
+    /// serialize the COMMITTED state under the v2 container: the
+    /// [`FORGE_V2_SNAPSHOT_MAGIC`] tag followed by the identical multi-repo body.
+    /// the tag makes a v2 snapshot self-identifying on the wire; the root GATE at
+    /// install differs (v2 gates against [`compose_root_v2`]), so a v2 snapshot
+    /// round-trips only through a v2 install, reproducing the v2 root.
+    fn snapshot_multi_repo_v2(&self) -> Result<Vec<u8>, Error> {
+        let mut out = FORGE_V2_SNAPSHOT_MAGIC.to_vec();
+        out.extend_from_slice(&self.snapshot_multi_repo()?);
+        Ok(out)
     }
 
     /// serialize the COMMITTED state under the multi-repo container (the current,
@@ -676,14 +737,31 @@ impl Forge {
         // current multi-repo container, so accept/reject and the gated root are
         // unchanged.
         match forge_layout(self.active_version) {
-            ForgeLayout::MultiRepo => self.install_multi_repo(bytes, expected),
+            ForgeLayout::MultiRepo => self.install_body(bytes, expected, ForgeLayout::MultiRepo),
+            ForgeLayout::MultiRepoV2 => {
+                // a v2 container leads with the magic tag; strip it, then install
+                // the identical body gated against the v2 (domain-separated) root.
+                let body = bytes.strip_prefix(FORGE_V2_SNAPSHOT_MAGIC.as_slice()).ok_or_else(|| {
+                    Error::Module(
+                        "forge snapshot: expected a v2 container (missing FGv2 magic)".into(),
+                    )
+                })?;
+                self.install_body(body, expected, ForgeLayout::MultiRepoV2)
+            }
         }
     }
 
-    /// replace the WHOLE namespace from multi-repo snapshot bytes, gated on
-    /// `expected` (the current, baseline format — see [`Forge::install`] for the
-    /// verify-then-mutate contract).
-    fn install_multi_repo(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
+    /// replace the WHOLE namespace from a multi-repo snapshot BODY, gated on
+    /// `expected` under `layout` (the layout picks the root composition the gate
+    /// verifies against — [`compose_root`] for baseline, [`compose_root_v2`] for
+    /// v2; the container bytes are otherwise identical). see [`Forge::install`]
+    /// for the verify-then-mutate contract.
+    fn install_body(
+        &mut self,
+        bytes: &[u8],
+        expected: StateRoot,
+        layout: ForgeLayout,
+    ) -> Result<(), Error> {
         // ---- PHASE 1: parse (no writes) -------------------------------------
         let mut r = Reader::new(bytes);
         let count = r.u32()?;
@@ -719,7 +797,13 @@ impl Forge {
         }
 
         // ---- PHASE 2: root gate BEFORE any byte reaches an odb --------------
-        let composed = compose_root(parsed.iter().map(|(n, (oid, _))| (n.as_str(), *oid)));
+        // the layout picks the composition the gate verifies against, so a v2
+        // snapshot must rehash to the v2 (domain-separated) root, a v1 to the v1.
+        let entries = parsed.iter().map(|(n, (oid, _))| (n.as_str(), *oid));
+        let composed = match layout {
+            ForgeLayout::MultiRepo => compose_root(entries),
+            ForgeLayout::MultiRepoV2 => compose_root_v2(entries),
+        };
         if composed != expected {
             return Err(Error::Module(
                 "snapshot root mismatch: composed repo heads do not rehash to the expected root"
@@ -918,12 +1002,13 @@ impl Module for Forge {
         // the preimage — flipping it recomposes from the same in-memory heads.
         // inert today — every layout composes the current multi-repo
         // `compose_root`, so `root()` is byte-identical for every input.
+        let entries = self
+            .repos
+            .iter()
+            .filter_map(|(name, s)| s.head.map(|h| (name.as_str(), h)));
         match forge_layout(self.active_version) {
-            ForgeLayout::MultiRepo => compose_root(
-                self.repos
-                    .iter()
-                    .filter_map(|(name, s)| s.head.map(|h| (name.as_str(), h))),
-            ),
+            ForgeLayout::MultiRepo => compose_root(entries),
+            ForgeLayout::MultiRepoV2 => compose_root_v2(entries),
         }
     }
 
@@ -1221,9 +1306,12 @@ mod tests {
 
         // genesis boots on the baseline branch.
         assert_eq!(forge.active_version(), FORGE_BASELINE_VERSION);
-        // the sole layout maps for every version today (inert selector).
+        // baseline AND baseline+1 stay on the inert layout (the v2 arm is gated
+        // at FORGE_MULTIREPO_V2 = 2, exercised by the v2 divergence test); this
+        // test flips only to baseline+1 below, so its root/snapshot invariance
+        // still holds byte-for-byte.
         assert_eq!(forge_layout(FORGE_BASELINE_VERSION), ForgeLayout::MultiRepo);
-        assert_eq!(forge_layout(FORGE_BASELINE_VERSION + 7), ForgeLayout::MultiRepo);
+        assert_eq!(forge_layout(FORGE_BASELINE_VERSION + 1), ForgeLayout::MultiRepo);
 
         // stage some committed state so root()/snapshot() are non-trivial.
         commit(&mut forge, 42, "docs", "a.txt", "x", "c");
@@ -1256,6 +1344,83 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&rt_base);
+    }
+
+    // upgrade dual-path (Phase 9): the forge v2 layout is a REAL divergence.
+    // versions below FORGE_MULTIREPO_V2 stay byte-identical to the baseline (so
+    // every existing test — which runs at baseline — passes unchanged); at/after
+    // it the SAME committed heads compose a DIFFERENT root and a v2-tagged
+    // snapshot, and a v2 node round-trips (snapshot v2 -> install v2 -> v2 root).
+    #[test]
+    fn v2_layout_diverges_and_round_trips_while_v1_stays_inert() {
+        let base = tmp_base("v2");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+
+        // the layout selector: 0 and 1 are baseline (inert), 2+ select v2.
+        assert_eq!(forge_layout(0), ForgeLayout::MultiRepo);
+        assert_eq!(forge_layout(1), ForgeLayout::MultiRepo);
+        assert_eq!(forge_layout(2), ForgeLayout::MultiRepoV2);
+        assert_eq!(forge_layout(7), ForgeLayout::MultiRepoV2);
+
+        // stage committed state so root()/snapshot() are non-trivial.
+        commit(&mut forge, 42, "docs", "a.txt", "x", "c");
+        commit(&mut forge, 42, "", "b.txt", "y", "c");
+
+        // baseline (v0) and v1 must be BYTE-IDENTICAL — the inertness proof.
+        forge.set_active_version(0);
+        let root_v1 = forge.root();
+        let snap_v1 = forge.snapshot().unwrap();
+        forge.set_active_version(1);
+        assert_eq!(forge.root(), root_v1, "v1 must equal the baseline root");
+        assert_eq!(
+            forge.snapshot().unwrap(),
+            snap_v1,
+            "v1 snapshot must equal the baseline snapshot"
+        );
+
+        // v2: the SAME committed heads compose a DIFFERENT root, and the snapshot
+        // container leads with the v2 magic.
+        forge.set_active_version(FORGE_MULTIREPO_V2);
+        let root_v2 = forge.root();
+        let snap_v2 = forge.snapshot().unwrap();
+        assert_ne!(root_v2, root_v1, "v2 root must diverge from v1 (the flip)");
+        assert_ne!(root_v2, StateRoot::ZERO, "v2 root over committed heads is non-zero");
+        assert!(
+            snap_v2.starts_with(FORGE_V2_SNAPSHOT_MAGIC.as_slice()),
+            "v2 snapshot leads with the FGv2 magic"
+        );
+        // and it is exactly the domain-separated composition of the same heads.
+        let heads: Vec<(String, Oid)> = forge
+            .repos
+            .iter()
+            .filter_map(|(n, s)| s.head.map(|h| (n.clone(), h)))
+            .collect();
+        assert_eq!(
+            root_v2,
+            compose_root_v2(heads.iter().map(|(n, o)| (n.as_str(), *o))),
+            "v2 root == compose_root_v2 over the committed heads"
+        );
+
+        // a v2 snapshot round-trips ONLY through a v2 install, reproducing the v2 root.
+        let rt = tmp_base("v2-rt");
+        let mut fresh = Forge::init("forge", rt.clone()).unwrap();
+        fresh.set_active_version(FORGE_MULTIREPO_V2);
+        fresh.install(&snap_v2, root_v2).unwrap();
+        assert_eq!(fresh.root(), root_v2, "v2 install reproduces the v2 root");
+
+        // and a v1 install of a v2 container (or vice versa) is rejected — the
+        // magic/gate keep the layouts from being silently confused.
+        let rt2 = tmp_base("v2-rt-mismatch");
+        let mut mismatch = Forge::init("forge", rt2.clone()).unwrap();
+        mismatch.set_active_version(0);
+        assert!(
+            mismatch.install(&snap_v2, root_v2).is_err(),
+            "a baseline install must reject a v2 container"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&rt);
+        let _ = std::fs::remove_dir_all(&rt2);
     }
 
     #[test]
