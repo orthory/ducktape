@@ -748,6 +748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
         Some("member-remove") => return cmd_member_remove(&args[1..]),
+        Some("member-leave") => return cmd_member_leave(&args[1..]),
         Some("join") => return cmd_join(&args[1..]),
         _ => {}
     }
@@ -763,7 +764,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|member-remove|join — or \
+                     keygen|init|invite|admit|invite-accept|member-remove|member-leave|join — or \
                      --config <path> [--sync-only])"
                 )
                 .into());
@@ -1379,6 +1380,46 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         }
         status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
     }
+}
+
+// ---- member-leave: this node drives its OWN removal from the set -----------
+
+/// `member-leave [--config node.toml]` — a member drives its OWN removal:
+/// resolve this node's identity and route it through the EXACT SAME governance
+/// path as `member-remove` (a RemoveValidator proposal targeting self). there
+/// is no separate governance logic — it hands off to [`cmd_member_remove`] with
+/// this node's own pubkey.
+///
+/// honesty: leaving is NOT unilateral in a set of n>=2. this casts only this
+/// node's own yes-ballot, so the removal stays PENDING until a strict majority
+/// (n/2+1) of the members approve — member-remove's own output prints the tally
+/// and names the command the remaining members run (`member-remove <this key>`).
+/// a lone member (n==1) meets its own majority-of-one and executes at once.
+fn cmd_member_leave(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("member-leave takes no positional args (got {pos:?})").into());
+    }
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
+    // resolve the running node's identity — the key it signs ballots with, and
+    // the one this verb submits for removal.
+    let resolved = config::resolve(&cfg_path)?;
+    let me_hex = hex_bytes(resolved.signer.public_key().as_ref());
+    eprintln!("leaving the network: opening a self-removal for {me_hex}");
+    // delegate to member-remove targeting SELF — same propose+vote+execute
+    // path, same strict-majority honesty. rebuild the arg vector so the flags
+    // (notably --config) reach the delegate unchanged.
+    let mut forwarded = vec![me_hex];
+    for (name, value) in &flags {
+        forwarded.push(format!("--{name}"));
+        forwarded.push(value.clone());
+    }
+    cmd_member_remove(&forwarded)
 }
 
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
