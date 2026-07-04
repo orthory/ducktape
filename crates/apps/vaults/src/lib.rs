@@ -61,9 +61,15 @@ impl Vaults {
     }
 
     /// the AUTHENTICATED submitter. vault ops are user actions: module and
-    /// system origins are refused so no module can quietly become an owner.
+    /// system origins are refused so no module can quietly become an owner, and
+    /// the pre-consensus empty external default is refused so it cannot become
+    /// one either — an empty owner would let any unauthenticated caller pass
+    /// `require_owner`. mirrors chat/agent's rejection of an empty external id.
     fn external_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         match &ctx.env().origin {
+            Origin::External(key) if key.is_empty() => Err(Error::Module(
+                "vault ops require a non-empty external submitter".into(),
+            )),
             Origin::External(key) => Ok(key.clone()),
             other => Err(Error::Module(format!(
                 "vault ops require an external submitter, got {other:?}"
@@ -436,4 +442,51 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
         return Err(Error::Module("snapshot carries trailing bytes".into()));
     }
     Ok(vaults)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use host::{Host, SubmitError};
+    use vaults_interface::{decode_reply, encode_msg, encode_query, VaultQuery, VaultReply};
+
+    /// the noded surface applies client bytes verbatim as `Origin::External`, so
+    /// an empty origin (also `Host::submit`'s pre-consensus default) must not
+    /// mint a vault owned by `[]` — an empty owner any later empty-origin caller
+    /// would pass `require_owner` for. the op is a clean deterministic rejection.
+    #[test]
+    fn empty_external_origin_creates_no_vault() {
+        block_on(async {
+            let mut host = Host::genesis(vec![Box::new(Vaults::new("vaults"))]).expect("genesis");
+            let app0 = host.app_hash();
+
+            // Host::submit uses the default Origin::External(vec![]).
+            let err = host
+                .submit(Msg {
+                    target: "vaults".into(),
+                    payload: encode_msg(&VaultMsg::CreateVault {
+                        vault_id: "infra".into(),
+                        name: "Infra".into(),
+                    }),
+                })
+                .await
+                .expect_err("empty-origin create must be refused");
+            assert!(
+                matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("non-empty external submitter")),
+                "got {err:?}"
+            );
+
+            // no empty-owner vault landed, and the app hash is untouched.
+            let reply = host
+                .query("vaults", &encode_query(&VaultQuery::Vaults))
+                .await
+                .expect("query");
+            let VaultReply::Vaults(views) = decode_reply(&reply).expect("decode") else {
+                panic!("vaults reply");
+            };
+            assert!(views.is_empty(), "no vault must exist");
+            assert_eq!(host.app_hash(), app0, "refused create leaves no trace");
+        });
+    }
 }
