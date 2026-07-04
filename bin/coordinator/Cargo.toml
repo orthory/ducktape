@@ -1,0 +1,16 @@
+[package]
+name = "coordinator-bin"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "coordinator"
+path = "src/main.rs"
+
+[dependencies]
+nat-traversal = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+nat-traversal = { workspace = true, features = ["simnat"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
