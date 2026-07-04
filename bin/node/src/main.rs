@@ -64,6 +64,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
 mod config;
+mod lobby;
 use config::{Resolved, hex_bytes, unhex};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
@@ -142,6 +143,16 @@ const MAX_BACKLOG: usize = 128;
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 const CHANNEL_STATE_SYNC: u64 = 4;
+/// the lobby channel: a not-yet-admitted joiner (connected as the derived
+/// lobby identity) announces `{invite token, pubkey, proof}` here; members
+/// verify and RECORD the join request for manual approval, and answer with an
+/// informational reply. see the `lobby` module.
+const CHANNEL_LOBBY: u64 = 5;
+/// while parked and un-admitted, re-announce every N park-loop attempts
+/// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
+/// survive member restarts (the request queue is in-memory), quiet enough to
+/// stay out of the members' way.
+const LOBBY_ANNOUNCE_EVERY: usize = 5;
 /// how many epochs of engine channels are PRE-REGISTERED. discovery channels
 /// can only be registered before `network.start()`, and every epoch's respawned
 /// engine needs FRESH channels (an aborted old engine must never collide with
@@ -302,6 +313,23 @@ async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCo
         to_version: up.to_version,
     });
     (status.current_version, pending)
+}
+
+/// the CURRENT member set from the valset module's committed+staged projection
+/// (host-routed read, between drains). an unreadable reply degrades to empty —
+/// callers treat that as "can't authorize anything right now", never a panic.
+async fn read_members_from_host(host: &Host) -> Vec<Vec<u8>> {
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    let Ok(raw) = host
+        .query("valset", &encode_query(&ValsetQuery::Validators))
+        .await
+    else {
+        return Vec::new();
+    };
+    match decode_reply(&raw) {
+        Ok(ValsetReply::Validators(v)) => v,
+        Err(_) => Vec::new(),
+    }
 }
 
 /// read the upgrade module's raw committed [`UpgradeStatus`] (committed state,
@@ -1560,8 +1588,37 @@ enum RpcRequest {
     Query { target: String, req_hex: String },
     /// node status: latest applied boundary + every module root.
     Status,
+    /// the verified join requests parked joiners announced to THIS member —
+    /// the queue the approve button (or `invite-accept`) settles.
+    JoinRequests,
     /// graceful stop: replies ok, then exits 0 after the current pump turn.
     Shutdown,
+}
+
+/// one verified, unapproved join announce (node-local, in-memory; the parked
+/// joiner re-announces every few seconds, so nothing here is durable state).
+struct JoinRequestRecord {
+    issuer: Vec<u8>,
+    first_seen_ms: u64,
+    last_seen_ms: u64,
+}
+
+/// the rpc/console projection of one [`JoinRequestRecord`].
+#[derive(serde::Serialize)]
+struct JoinRequestView {
+    /// the key asking to join, hex.
+    joiner: String,
+    /// the member whose invite token authorized the announce, hex.
+    issuer: String,
+    first_seen_ms: u64,
+    last_seen_ms: u64,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(serde::Serialize)]
@@ -1573,6 +1630,8 @@ struct RpcReply {
     reply_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<RpcStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    join_requests: Option<Vec<JoinRequestView>>,
 }
 
 #[derive(serde::Serialize)]
@@ -1589,6 +1648,7 @@ impl RpcReply {
             error: None,
             reply_hex: None,
             status: None,
+            join_requests: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -1597,6 +1657,7 @@ impl RpcReply {
             error: Some(msg.into()),
             reply_hex: None,
             status: None,
+            join_requests: None,
         }
     }
 }
@@ -1659,6 +1720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
+        Some("join-requests") => return cmd_join_requests(&args[1..]),
         Some("member-remove") => return cmd_member_remove(&args[1..]),
         Some("member-leave") => return cmd_member_leave(&args[1..]),
         Some("member-status") => return cmd_member_status(&args[1..]),
@@ -1804,11 +1866,27 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `invite [--config node.toml]` — emit the one-line paste blob: the network
-/// descriptor with THIS member's dial hint folded in (and persisted, so every
-/// future invite carries it).
+/// `invite [--config node.toml] [--manual]` — emit the one-line paste blob:
+/// the network descriptor with THIS member's dial hint folded in (and
+/// persisted, so every future invite carries it), plus a signed INVITE TOKEN.
+/// the token lets the joiner's parked node deliver its pubkey over the lobby
+/// channel automatically — the join request then awaits member approval
+/// (`invite-accept`, or the app's approve button); a token never admits by
+/// itself. `--manual` omits the token: the joiner's pubkey travels out-of-band
+/// exactly as before.
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
+    // `--manual` is a bare boolean; strip it before the `--flag value` parser.
+    let mut manual = false;
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| {
+            let is_manual = a.as_str() == "--manual";
+            manual |= is_manual;
+            !is_manual
+        })
+        .cloned()
+        .collect();
+    let (pos, flags) = parse_flags(&args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
@@ -1839,7 +1917,9 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     descriptor.save(&descriptor_path)?;
-    println!("{}", config::encode_invite(&descriptor)?);
+    let token = (!manual)
+        .then(|| config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes()));
+    println!("{}", config::encode_invite(&descriptor, token.as_ref())?);
     Ok(())
 }
 
@@ -1940,6 +2020,41 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     match decode_reply(&raw)? {
         ValsetReply::Validators(v) => Ok(v),
     }
+}
+
+/// `join-requests [--config node.toml]` — the verified join announces parked
+/// joiners delivered to THIS member's running node, as one JSON array on
+/// stdout (machine-parseable — the app's members view renders it). approving
+/// is a separate, deliberate act: `invite-accept <joiner>` (or the app's
+/// approve button) casts this member's governance ballot, and a strict
+/// majority admits.
+fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let cfg_path = PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    );
+    let resolved = config::resolve(&cfg_path)?;
+    let addr = resolved
+        .rpc_listen
+        .ok_or("join-requests reads the node's local rpc — set `rpc_listen` in node.toml")?;
+    let reply = rpc_call(&addr, &serde_json::json!({ "cmd": "join_requests" }))?;
+    if reply["ok"] != true {
+        return Err(format!("join-requests: {}", reply["error"]).into());
+    }
+    println!(
+        "{}",
+        reply
+            .get("join_requests")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]))
+    );
+    Ok(())
 }
 
 /// `upgrade-status [--config node.toml]` — query the upgrade module Status over
@@ -2442,7 +2557,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let [blob] = pos.as_slice() else {
         return Err("join needs exactly one <invite blob>".into());
     };
-    let descriptor = config::decode_invite(blob)?;
+    let (descriptor, token) = config::decode_invite(blob)?;
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
     config::guard_join_descriptor(&dir, &descriptor)?;
@@ -2463,6 +2578,11 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
     config::write_node_toml(&dir, &plumbing)?;
+    if let Some(token) = &token {
+        // the bearer credential the parked node announces with; a re-join
+        // with a fresh invite replaces a stale one.
+        config::save_invite_token(&dir, token)?;
+    }
     eprintln!(
         "{} identity {me_hex}",
         if generated { "generated" } else { "reusing" }
@@ -2475,6 +2595,15 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if descriptor.validators.contains(&me_hex) {
         eprintln!(
             "this identity is a member — start: ducktape-node --config {}/node.toml",
+            dir.display()
+        );
+    } else if token.is_some() {
+        eprintln!(
+            "NOT yet a member. start now — `ducktape-node --config {}/node.toml` parks on \
+             the mesh and DELIVERS this identity to the members automatically (the invite \
+             carries a token); a member then approves the join request (the app's approve \
+             button, or `ducktape-node invite-accept {me_hex}`), and this node promotes \
+             itself.",
             dir.display()
         );
     } else {
@@ -2514,6 +2643,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         http_listen,
         dev_demo,
         checkpoint_blocks,
+        invite_token,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -2532,12 +2662,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         .unwrap_or(false);
     let joiner = !sync_only && !validators.contains(&signer.public_key()) && !promoted;
     if joiner {
-        println!(
-            "[node {label}] identity {} is not in the genesis validator set — joiner mode: \
-             parking on the mesh until a member runs `ducktape-node invite-accept {}`",
-            hex_bytes(signer.public_key().as_ref()),
-            hex_bytes(signer.public_key().as_ref())
-        );
+        if invite_token.is_some() {
+            println!(
+                "[node {label}] identity {} is not in the genesis validator set — joiner \
+                 mode: parking on the mesh and announcing this key with the invite token; \
+                 a member approves the join request (the app, or `ducktape-node \
+                 invite-accept {}`)",
+                hex_bytes(signer.public_key().as_ref()),
+                hex_bytes(signer.public_key().as_ref())
+            );
+        } else {
+            println!(
+                "[node {label}] identity {} is not in the genesis validator set — joiner \
+                 mode: parking on the mesh until a member runs `ducktape-node \
+                 invite-accept {}`",
+                hex_bytes(signer.public_key().as_ref()),
+                hex_bytes(signer.public_key().as_ref())
+            );
+        }
     }
 
     // keep the raw (key, addr) pairs for statesync source selection before
@@ -2644,8 +2786,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // switching to a preset with allow_private_ips:false would reject the
         // forwarded connection from a private source IP — use a public-IP sentry
         // or a reverse tunnel then.
+        //
+        // TRANSPORT IDENTITY: a parked joiner's own key is untracked on every
+        // member (that is what admission changes), so it would be bounced at
+        // the handshake and could neither announce itself nor poll the
+        // statesync manifest. it therefore connects AS the network's derived
+        // LOBBY identity — the one key every member tracks that any invite
+        // holder can derive. its REAL key still signs everything that matters
+        // (the join proof, and consensus after the promotion reboot).
+        let p2p_signer = if joiner {
+            config::lobby_identity(&namespace)
+        } else {
+            signer.clone()
+        };
         let p2p_cfg = discovery::Config::local(
-            signer.clone(),
+            p2p_signer,
             &namespace,
             listen,
             advertised,
@@ -2684,6 +2839,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            // the lobby lane: a sync-only observer never announces or answers,
+            // but an unregistered channel is a protocol violation — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+                context.child("blackhole_lobby").spawn(move |_ctx| async move {
+                    while rx.recv().await.is_ok() {}
+                });
+            }
             network.start();
 
             let Some(server_peer) = sync_source else {
@@ -2800,6 +2963,25 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            // the lobby lane: where this parked node announces its key. member
+            // replies are drained by a printer task — purely informational.
+            let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+            {
+                let label = label.clone();
+                context.child("lobby_replies").spawn(move |_ctx| async move {
+                    while let Ok((peer, msg)) = lobby_rx.recv().await {
+                        let bytes: Vec<u8> = msg.into();
+                        match lobby::decode_msg(&bytes) {
+                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail }) => println!(
+                                "[node {label}] member {}: {}{detail}",
+                                hex_bytes(&peer.as_ref()[..4]),
+                                if recorded { "" } else { "join request refused — " },
+                            ),
+                            Ok(_) | Err(_) => {}
+                        }
+                    }
+                });
+            }
             network.start();
 
             let Some(server_peer) = sync_source else {
@@ -2812,9 +2994,35 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let client =
                 P2pSyncClient::new(context.child("sync_client"), sync_tx, sync_rx, server_peer);
 
+            // the announce, built once: this key + the invite token + the
+            // proof-of-possession binding them. re-sent (round-robin over the
+            // known members) until the manifest shows this key admitted —
+            // members keep the request queue in memory, so a member restart
+            // just gets the next re-announce.
+            let announce_frame = invite_token
+                .as_ref()
+                .map(|t| IoBuf::from(lobby::encode_msg(&lobby::join_request(&signer, &namespace, t))));
+            let mut announce_targets: Vec<ed25519::PublicKey> = validators.clone();
+
             let me_bytes = signer.public_key().as_ref().to_vec();
             let mut last_tracked = PEER_SET;
             let mut attempt = 0usize;
+            let mut announce_round = 0usize;
+            let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
+                let Some(frame) = &announce_frame else { return };
+                if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
+                    return;
+                }
+                let target = targets[announce_round % targets.len()].clone();
+                announce_round += 1;
+                let attempted = lobby_tx.send(Recipients::One(target.clone()), frame.clone(), false);
+                if !attempted.is_empty() {
+                    println!(
+                        "[node {label}] join request sent to member {} — awaiting approval",
+                        hex_bytes(&target.as_ref()[..4])
+                    );
+                }
+            };
             let (boundary, host, floor) = loop {
                 attempt += 1;
                 if attempt > 900 {
@@ -2844,6 +3052,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                              unreachable) — a member must run `invite-accept` for this \
                              key; see the joiner-mode banner above. retrying ({e})"
                         );
+                        send_announce(&announce_targets, attempt);
                         continue;
                     }
                 };
@@ -2875,11 +3084,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     last_tracked = m.epoch;
                 }
                 if !m.participants.iter().any(|k| k == &me_bytes) {
+                    // the manifest names the CURRENT members — better announce
+                    // targets than the genesis descriptor's list.
+                    let current: Vec<ed25519::PublicKey> = m
+                        .participants
+                        .iter()
+                        .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                        .collect();
+                    if !current.is_empty() {
+                        announce_targets = current;
+                    }
                     println!(
                         "[node {label}] parked: awaiting admission (epoch {} has {} validators)",
                         m.epoch,
                         m.participants.len()
                     );
+                    send_announce(&announce_targets, attempt);
                     continue;
                 }
                 // in the epoch set. a boundary PAST the epoch base needs its
@@ -3238,6 +3458,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             })
             .collect();
         let (mut sync_tx, mut sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+        // the lobby lane: parked joiners announce their keys here (connected
+        // as the derived lobby identity); this member verifies each announce
+        // against the invite token it carries and RECORDS it for approval.
+        let (mut lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
 
         // start the network actors (dialer/listener/router/tracker). registered
         // receivers buffer regardless, so starting before the engine is fine.
@@ -3614,6 +3838,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
         });
+        // the lobby lane rides the same bridge pattern: announces are consumed
+        // by the pump between drains. drop-on-full is doubly safe here — a
+        // parked joiner re-announces every few seconds anyway.
+        let (lobby_bridge_tx, mut lobby_ingress) =
+            futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
+        context.child("lobby_ingress").spawn(move |_ctx| {
+            let mut receiver = lobby_rx;
+            let mut bridge_tx = lobby_bridge_tx;
+            async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok((peer, msg)) => {
+                            let bytes: Vec<u8> = msg.into();
+                            let _ = bridge_tx.try_send((peer, bytes));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+        });
 
         // spawn one epoch's engine from the channel bank. scheme built the
         // production way (`signer` finds our key's index in the sorted
@@ -3863,6 +4107,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         > = std::collections::HashMap::new();
         let mut last_published: Option<u64> = None;
         let mut sync_server = SyncServer::new();
+        // verified-but-unapproved join requests, keyed by joiner key. NODE-
+        // LOCAL and in-memory by design: this is a doorbell, not state — the
+        // parked joiner re-announces every few seconds, so a restart loses
+        // nothing durable. read by the `join-requests` rpc; entries whose key
+        // has since become a member are dropped at read time.
+        let mut join_requests: std::collections::BTreeMap<Vec<u8>, JoinRequestRecord> =
+            std::collections::BTreeMap::new();
         // recovery cadence: sealed blocks since the last checkpoint manifest.
         let mut blocks_since_checkpoint: u64 = 0;
         // throttle for the pending-cutover nop pusher below.
@@ -4033,6 +4284,25 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 ..RpcReply::ok()
                             }
                         }
+                        RpcRequest::JoinRequests => {
+                            // read-time hygiene: an approved joiner is a member
+                            // now — its request is settled, drop it.
+                            let members = read_members_from_host(node.host()).await;
+                            join_requests.retain(|joiner, _| !members.contains(joiner));
+                            let views = join_requests
+                                .iter()
+                                .map(|(joiner, r)| JoinRequestView {
+                                    joiner: hex_bytes(joiner),
+                                    issuer: hex_bytes(&r.issuer),
+                                    first_seen_ms: r.first_seen_ms,
+                                    last_seen_ms: r.last_seen_ms,
+                                })
+                                .collect();
+                            RpcReply {
+                                join_requests: Some(views),
+                                ..RpcReply::ok()
+                            }
+                        }
                         RpcRequest::Shutdown => {
                             // best-effort final checkpoint + journal barrier so
                             // the restart replays a minimal suffix; a failure
@@ -4045,6 +4315,69 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     };
                     let _ = reply.send(resp);
+                }
+                announce = lobby_ingress.next() => {
+                    let Some((peer, bytes)) = announce else { continue };
+                    let mut send_reply = |recorded: bool, detail: String| {
+                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
+                        let _ = lobby_tx.send(
+                            Recipients::One(peer.clone()),
+                            IoBuf::from(lobby::encode_msg(&msg)),
+                            false,
+                        );
+                    };
+                    let msg = match lobby::decode_msg(&bytes) {
+                        Ok(m) => m,
+                        Err(_) => continue, // junk on the doorbell — drop.
+                    };
+                    // crypto first (pure, cheap): the token must verify for
+                    // THIS network and the announced key must prove itself.
+                    let verified = match lobby::verify_join_request(&msg, &namespace) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            send_reply(false, e);
+                            continue;
+                        }
+                    };
+                    // then membership: the issuer must still be a member (a
+                    // removed member's outstanding invites die with it), and a
+                    // joiner that is already a member has nothing pending.
+                    let members = read_members_from_host(node.host()).await;
+                    let joiner_bytes = verified.joiner.as_ref().to_vec();
+                    if members.contains(&joiner_bytes) {
+                        send_reply(false, "already a validator".into());
+                        continue;
+                    }
+                    if !members.contains(&verified.issuer.as_ref().to_vec()) {
+                        send_reply(
+                            false,
+                            "the inviting member is no longer part of this network".into(),
+                        );
+                        continue;
+                    }
+                    let now = unix_ms();
+                    let fresh = !join_requests.contains_key(&joiner_bytes);
+                    let record = join_requests
+                        .entry(joiner_bytes)
+                        .or_insert(JoinRequestRecord {
+                            issuer: verified.issuer.as_ref().to_vec(),
+                            first_seen_ms: now,
+                            last_seen_ms: now,
+                        });
+                    record.last_seen_ms = now;
+                    if fresh {
+                        println!(
+                            "[node {label}] join request: {} asks to join (invited by {}) — \
+                             approve in the app, or run `ducktape-node invite-accept {}`",
+                            hex_bytes(verified.joiner.as_ref()),
+                            hex_bytes(&record.issuer),
+                            hex_bytes(verified.joiner.as_ref())
+                        );
+                    }
+                    send_reply(
+                        true,
+                        "join request recorded — awaiting member approval".into(),
+                    );
                 }
                 cmd = http_ingress.next() => {
                     let Some(cmd) = cmd else { continue };
