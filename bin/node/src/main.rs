@@ -92,6 +92,7 @@ use jobs::Jobs;
 use kv::Kv;
 use memory::Memory;
 use node::OrderedNode;
+use pages::Pages;
 use profiles::Profiles;
 use recovery::{Manifest, Recovery};
 use saga::SagaModule;
@@ -155,9 +156,10 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 18] = [
+const MODULE_IDS: [&str; 19] = [
     "kv",
     "document",
+    "pages",
     "chat",
     "forge",
     "valset",
@@ -416,6 +418,7 @@ async fn genesis_host(
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
+    let pages = Pages::init(context.child("pages"), "pages").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
     // forge shares the files body plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
@@ -431,6 +434,7 @@ async fn genesis_host(
     Host::genesis(vec![
         Box::new(kv),
         Box::new(document),
+        Box::new(pages),
         Box::new(chat),
         Box::new(forge),
         Box::new(valset),
@@ -488,6 +492,7 @@ async fn restore_host(
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
+    let pages = Pages::init(context.child("pages"), "pages").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
     // forge shares the files body plane (see genesis_host) for Push materialization.
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
@@ -600,6 +605,7 @@ async fn restore_host(
     Host::genesis(vec![
         Box::new(kv),
         Box::new(document),
+        Box::new(pages),
         Box::new(chat),
         Box::new(forge),
         Box::new(valset),
@@ -687,6 +693,15 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let document = Document::sync_from(
         scratch_context.child(child_label("document")),
         "document",
+        target,
+        resolver,
+    )
+    .await;
+
+    let (target, resolver) = fetch_target("pages").await?;
+    let pages = Pages::sync_from(
+        scratch_context.child(child_label("pages")),
+        "pages",
         target,
         resolver,
     )
@@ -825,6 +840,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let host = Host::genesis(vec![
         Box::new(kv),
         Box::new(document),
+        Box::new(pages),
         Box::new(chat),
         Box::new(forge),
         Box::new(valset),
