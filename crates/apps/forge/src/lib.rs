@@ -164,6 +164,70 @@ fn norm_repo(repo: &str) -> Result<String, Error> {
     Ok(repo.to_string())
 }
 
+// ============================================================================
+// upgrade dual-path SEAM (inert) — the version-selected behavior branch.
+// ============================================================================
+//
+// forge is a `root()`-changing module, so a no-downtime protocol upgrade that
+// alters its root preimage / wire format ships as a DUAL-PATH binary: the same
+// binary can reproduce the OLD behavior below the agreed activation height `H`
+// and the NEW behavior at/after `H`, flipping deterministically at the boundary.
+// this section wires the SEAM — the single place a version maps to a behavior
+// branch — WITHOUT changing any behavior yet. the real divergence (a second
+// layout) lands in a later phase; today every version selects the current
+// multi-repo layout, so `root()` is byte-identical for every input and every
+// accept/reject and snapshot byte is unchanged.
+//
+// the branch selector comes from two version signals, never hashed into any
+// preimage: `Env::protocol_version` (the read-only per-block dispatch input,
+// used inside `execute`) and the module's own cached `Forge::active_version`
+// (the committed branch selector, used by `root`/`snapshot`/`install`/`query`,
+// which have no `Ctx`). both default to the baseline below, so a fresh or
+// existing forge behaves EXACTLY as before this seam landed.
+
+/// the forge protocol baseline — the version whose behavior THIS binary
+/// reproduces byte-for-byte today. `active_version` defaults here at genesis and
+/// sdk's `Env::protocol_version` defaults to the same baseline (`0`), so the
+/// inert default branch is the current multi-repo behavior. a later phase raises
+/// the ceiling with a fresh higher `to_version` that selects a NEW layout; this
+/// baseline never moves the current root.
+const FORGE_BASELINE_VERSION: u32 = 0;
+
+/// the version-selected behavior branch for forge's root preimage, snapshot wire
+/// format, and repo-field routing. INERT TODAY: only one variant exists, so the
+/// mapping is version-invariant and nothing branches in practice — the enum is
+/// the extension point a later phase adds the real second layout to, so that
+/// every version-sensitive site (root / snapshot / install / norm-routing)
+/// diverges CONSISTENTLY through the single [`forge_layout`] map.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ForgeLayout {
+    /// the current behavior: the sorted multi-repo `compose_root`, the multi-repo
+    /// snapshot container, and repo-field-honoring routing (`norm_repo`).
+    MultiRepo,
+}
+
+/// map a protocol / active version to the behavior branch it selects. this is
+/// the SOLE dual-path decision point. INERT: every version maps to the current
+/// multi-repo layout, so it changes NOTHING today — a later phase inserts the
+/// higher-version arm here (e.g. `v if v >= FORGE_MULTIREPO_V2 => Layout::V2`)
+/// ABOVE the baseline fall-through, and every seam picks it up automatically.
+fn forge_layout(version: u32) -> ForgeLayout {
+    // SEAM: a later phase branches on `version` here. today the selector is a
+    // no-op — read but never consequential, so behavior is version-invariant.
+    let _ = version;
+    ForgeLayout::MultiRepo
+}
+
+/// normalize a wire `repo` field UNDER the selected layout. INERT: every layout
+/// honors the multi-repo field (empty -> `"default"`, otherwise validated by
+/// [`norm_repo`]); a future lower layout would collapse all traffic to the
+/// default repo here. the layout is the branch point; the behavior is unchanged.
+fn norm_repo_at(repo: &str, layout: ForgeLayout) -> Result<String, Error> {
+    match layout {
+        ForgeLayout::MultiRepo => norm_repo(repo),
+    }
+}
+
 /// parse exactly `OID_RAW_LEN` (20) raw sha1 bytes into an `Oid`, with a
 /// deterministic module error on any other length. validates the untrusted
 /// `Push` oid fields: `git2::Oid::from_bytes` length-checks too, but a
@@ -422,6 +486,13 @@ pub struct Forge {
     /// so `root()` composes order-independently. seeded at construction from the
     /// on-disk dirs (restart re-adopt) and grown lazily on first write.
     repos: BTreeMap<String, RepoState>,
+    /// the cached dual-path branch selector (see the SEAM section above). set to
+    /// [`FORGE_BASELINE_VERSION`] at genesis, driven deterministically at the
+    /// activation height `H` by the host activation hook (a later phase) and
+    /// restored per replayed/synced height. it is NEVER part of the
+    /// `root()`/`snapshot()` preimage — it only SELECTS the branch — so flipping
+    /// it recomposes `root()` from the in-memory heads with zero odb/blob IO.
+    active_version: u32,
 }
 
 impl Forge {
@@ -497,7 +568,25 @@ impl Forge {
             base,
             blobs,
             repos,
+            // genesis boots on the baseline branch — the current behavior. the
+            // activation hook (a later phase) is the only thing that moves it.
+            active_version: FORGE_BASELINE_VERSION,
         })
+    }
+
+    /// the current dual-path branch selector. read-only accessor for the host /
+    /// tests; the value is driven by [`Forge::set_active_version`].
+    pub fn active_version(&self) -> u32 {
+        self.active_version
+    }
+
+    /// deterministically set the dual-path branch selector. driven by the host
+    /// activation hook (a later phase) at the agreed height `H`, and by
+    /// restart/state-sync restoration. exposed on the concrete type (NOT the
+    /// `Module` trait) so only the host activation path moves it; it is NEVER
+    /// folded into the `root()`/`snapshot()` preimage.
+    pub fn set_active_version(&mut self, v: u32) {
+        self.active_version = v;
     }
 
     /// ensure a [`RepoState`] entry exists for `name` (already normalized). the
@@ -527,6 +616,18 @@ impl Forge {
     /// (`[0,0,0,0]`), the marker for [`StateRoot::ZERO`]. a staged (this-block)
     /// head is deliberately excluded — a snapshot must reproduce `root()`.
     pub fn snapshot(&self) -> Result<Vec<u8>, Error> {
+        // SEAM (dual-path snapshot wire): the selected layout picks the
+        // container format. `active_version` selects it (a snapshot has no
+        // `Ctx`); it is NEVER serialized. inert today — the current multi-repo
+        // container, so the bytes are byte-identical to before this seam.
+        match forge_layout(self.active_version) {
+            ForgeLayout::MultiRepo => self.snapshot_multi_repo(),
+        }
+    }
+
+    /// serialize the COMMITTED state under the multi-repo container (the current,
+    /// baseline format — see [`Forge::snapshot`] for the format contract).
+    fn snapshot_multi_repo(&self) -> Result<Vec<u8>, Error> {
         let born: Vec<(&str, Oid)> = self
             .repos
             .iter()
@@ -568,6 +669,20 @@ impl Forge {
     /// byte-identical to before the call. on `Ok` all staged/pending state is
     /// dropped: install is a full state replacement, not a merge.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
+        // SEAM (dual-path snapshot wire): decode + install under the selected
+        // layout (must match the format `snapshot` emits at this version).
+        // `active_version` selects it (install has no `Ctx`). inert today — the
+        // current multi-repo container, so accept/reject and the gated root are
+        // unchanged.
+        match forge_layout(self.active_version) {
+            ForgeLayout::MultiRepo => self.install_multi_repo(bytes, expected),
+        }
+    }
+
+    /// replace the WHOLE namespace from multi-repo snapshot bytes, gated on
+    /// `expected` (the current, baseline format — see [`Forge::install`] for the
+    /// verify-then-mutate contract).
+    fn install_multi_repo(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         // ---- PHASE 1: parse (no writes) -------------------------------------
         let mut r = Reader::new(bytes);
         let count = r.u32()?;
@@ -788,11 +903,18 @@ impl Module for Forge {
     /// reason `head` is a write-through cache). no committed head anywhere ->
     /// `ZERO`. see the composition invariant in the module doc.
     fn root(&self) -> StateRoot {
-        compose_root(
-            self.repos
-                .iter()
-                .filter_map(|(name, s)| s.head.map(|h| (name.as_str(), h))),
-        )
+        // SEAM (dual-path root preimage): the selected layout picks the root
+        // composition. `active_version` selects the branch and is NEVER part of
+        // the preimage — flipping it recomposes from the same in-memory heads.
+        // inert today — every layout composes the current multi-repo
+        // `compose_root`, so `root()` is byte-identical for every input.
+        match forge_layout(self.active_version) {
+            ForgeLayout::MultiRepo => compose_root(
+                self.repos
+                    .iter()
+                    .filter_map(|(name, s)| s.head.map(|h| (name.as_str(), h))),
+            ),
+        }
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -809,6 +931,12 @@ impl Module for Forge {
     /// git2 IO is blocking with no `.await`, so the "await only deterministic
     /// resources" rule holds vacuously.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        // SEAM (dual-path repo routing): interpret the wire `repo` field under
+        // the layout the THIS-BLOCK protocol version selects. `protocol_version`
+        // is the read-only per-dispatch input (never hashed); inert today — the
+        // layout always honors the multi-repo field, so accept/reject is
+        // unchanged.
+        let layout = forge_layout(ctx.env().protocol_version);
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             ForgeMsg::Commit {
                 repo,
@@ -816,7 +944,7 @@ impl Module for Forge {
                 content,
                 message,
             } => {
-                let name = norm_repo(&repo)?;
+                let name = norm_repo_at(&repo, layout)?;
                 self.ensure_repo(&name);
                 self.stage_commit(&name, ctx.env().consensus_time, path, content, message)
             }
@@ -826,7 +954,7 @@ impl Module for Forge {
                 new_oid,
                 pack_digest,
             } => {
-                let name = norm_repo(&repo)?;
+                let name = norm_repo_at(&repo, layout)?;
                 self.ensure_repo(&name);
                 self.stage_push(&name, prev_oid, new_oid, pack_digest)
             }
@@ -844,7 +972,10 @@ impl Module for Forge {
                 self.read_head(DEFAULT_REPO),
             ))),
             ForgeQuery::HeadOf { repo } => {
-                let name = norm_repo(&repo)?;
+                // SEAM (dual-path repo routing): a query has no `Ctx`, so it
+                // routes under the module's committed branch selector. inert
+                // today — the layout honors the multi-repo field.
+                let name = norm_repo_at(&repo, forge_layout(self.active_version))?;
                 Ok(encode_reply(&ForgeReply::Head(self.read_head(&name))))
             }
             ForgeQuery::ListRepos => {
@@ -1067,6 +1198,54 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    // upgrade dual-path SEAM (Phase 5): the branch selector defaults to the
+    // baseline and the seam is INERT — flipping `active_version` recomposes the
+    // SAME root/snapshot from the same in-memory heads (no real v2 divergence
+    // exists yet), and every version maps to the one current layout.
+    #[test]
+    fn active_version_defaults_to_baseline_and_seam_is_inert() {
+        let base = tmp_base("active-version");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+
+        // genesis boots on the baseline branch.
+        assert_eq!(forge.active_version(), FORGE_BASELINE_VERSION);
+        // the sole layout maps for every version today (inert selector).
+        assert_eq!(forge_layout(FORGE_BASELINE_VERSION), ForgeLayout::MultiRepo);
+        assert_eq!(forge_layout(FORGE_BASELINE_VERSION + 7), ForgeLayout::MultiRepo);
+
+        // stage some committed state so root()/snapshot() are non-trivial.
+        commit(&mut forge, 42, "docs", "a.txt", "x", "c");
+        commit(&mut forge, 42, "", "b.txt", "y", "c");
+        let root_baseline = forge.root();
+        let snap_baseline = forge.snapshot().unwrap();
+
+        // flipping the selector must NOT move root() or snapshot() today: the
+        // seam exists, the behavior does not. (the real v2 divergence is a later
+        // phase.)
+        forge.set_active_version(FORGE_BASELINE_VERSION + 1);
+        assert_eq!(forge.active_version(), FORGE_BASELINE_VERSION + 1);
+        assert_eq!(
+            forge.root(),
+            root_baseline,
+            "inert seam: root() must be branch-invariant"
+        );
+        assert_eq!(
+            forge.snapshot().unwrap(),
+            snap_baseline,
+            "inert seam: snapshot() must be branch-invariant"
+        );
+
+        // and a snapshot round-trips within the baseline layout.
+        forge.set_active_version(FORGE_BASELINE_VERSION);
+        let rt_base = tmp_base("active-version-rt");
+        let mut fresh = Forge::init("forge", rt_base.clone()).unwrap();
+        fresh.install(&snap_baseline, root_baseline).unwrap();
+        assert_eq!(fresh.root(), root_baseline, "install reproduces the root");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&rt_base);
     }
 
     #[test]
