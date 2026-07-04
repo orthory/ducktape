@@ -141,7 +141,7 @@ fn joiner_enters_through_a_sentry() {
     // sentry; it must PARK until admitted. an UNINVITED key is (correctly)
     // rejected by node 0's p2p bouncer BEFORE admission — node 0 does not yet
     // track it — so the pre-admission parked state is genuinely
-    // "parked: mesh unreachable (...); retrying", matched by the generic
+    // "parked: not yet admitted (...); retrying", matched by the generic
     // "parked:" prefix exactly as the sibling invite_e2e does. (the joiner
     // cannot reach node 0 until `invite-accept` runs, direct OR fronted; the
     // sentry is what carries the sync + votes AFTER admission.)

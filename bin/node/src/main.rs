@@ -2815,7 +2815,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let m = match fetch_manifest(&client).await {
                     Ok(m) => m,
                     Err(e) => {
-                        println!("[node {label}] parked: mesh unreachable ({e}); retrying");
+                        // two causes look identical on the wire here: this key is
+                        // not admitted yet (the server's p2p bouncer rejects an
+                        // un-tracked peer — the common case), or the bootstrap addr
+                        // is genuinely unreachable. lead with admission and demote
+                        // the raw transport error: the old "mesh unreachable /
+                        // server dead" wording read as a crash and misdirected
+                        // debugging. the joiner-mode banner above carries the exact
+                        // `invite-accept <key>` command, so we don't repeat the key.
+                        println!(
+                            "[node {label}] parked: not yet admitted (or the mesh is \
+                             unreachable) — a member must run `invite-accept` for this \
+                             key; see the joiner-mode banner above. retrying ({e})"
+                        );
                         continue;
                     }
                 };
