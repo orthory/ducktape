@@ -17,9 +17,16 @@ export interface BlockEvent {
   appHash: string;
 }
 
+/** How the app groups a module in the Modules view. The node attaches this by
+ *  id in its status catalog; it is presentation metadata only, never consensus
+ *  identity. Optional: a node built before categories shipped omits it, and the
+ *  view treats an absent/unknown value as `system`. */
+export type ModuleCategory = "workspace" | "developer" | "automation" | "system";
+
 export interface ModuleStatus {
   id: string;
   root: string;
+  category?: ModuleCategory;
 }
 
 export interface NodeStatus {

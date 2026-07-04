@@ -144,6 +144,35 @@ pub struct NodeStatus {
 pub struct ModuleStatus {
     pub id: String,
     pub root: String,
+    pub category: ModuleCategory,
+}
+
+/// A module's presentation category — how the app's Modules view groups the
+/// registered set. This is catalog metadata the status projection attaches by
+/// id; it is not part of a module's consensus identity (that stays `id` +
+/// `root`) and never enters the app-hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModuleCategory {
+    Workspace,
+    Developer,
+    Automation,
+    System,
+}
+
+impl ModuleCategory {
+    /// The category a module id belongs to. Ids not listed here —
+    /// infrastructure and internal modules (files, memory, saga, profiles, kv,
+    /// valset, governance, vaults, directory, …) — fall to `System`, so a new
+    /// or unknown module always groups sensibly rather than breaking the view.
+    pub fn of(id: &str) -> Self {
+        match id {
+            "chat" | "tasks" | "inbox" | "document" => Self::Workspace,
+            "forge" | "agent" => Self::Developer,
+            "automations" | "jobs" => Self::Automation,
+            _ => Self::System,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1171,5 +1200,36 @@ mod tests {
             ring.recent(Some(TELEMETRY_RING_CAP + 100)).len(),
             TELEMETRY_RING_CAP,
         );
+    }
+
+    #[test]
+    fn module_categories_group_the_genesis_set() {
+        use ModuleCategory::*;
+        for id in ["chat", "tasks", "inbox", "document"] {
+            assert_eq!(ModuleCategory::of(id), Workspace, "{id}");
+        }
+        for id in ["forge", "agent"] {
+            assert_eq!(ModuleCategory::of(id), Developer, "{id}");
+        }
+        for id in ["automations", "jobs"] {
+            assert_eq!(ModuleCategory::of(id), Automation, "{id}");
+        }
+        // infra + internals fall to the System bucket — including ids only the
+        // full `node` binary registers (kv/valset/governance/vaults/directory)
+        // and anything unknown, so the view never breaks on a new module.
+        for id in [
+            "files",
+            "memory",
+            "saga",
+            "profiles",
+            "kv",
+            "valset",
+            "governance",
+            "vaults",
+            "directory",
+            "totally-unknown",
+        ] {
+            assert_eq!(ModuleCategory::of(id), System, "{id}");
+        }
     }
 }
