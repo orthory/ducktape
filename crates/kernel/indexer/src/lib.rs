@@ -34,6 +34,9 @@
 //! serving) rather than skipping a block — a silent gap would break the
 //! watermark's contiguity promise, and a derived tier's honest recovery is a
 //! rebuild, not a patch.
+//!
+//! the full "indexable" contract a per-module mapper must satisfy (fold
+//! rules, view rules, when NOT to index) is `docs/indexable-spec.md`.
 
 pub mod search;
 
