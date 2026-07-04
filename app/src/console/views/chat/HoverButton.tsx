@@ -12,6 +12,7 @@ export function HoverButton({
   style,
   hoverStyle,
   onClick,
+  onMouseDown,
   onMouseEnter,
   onMouseLeave,
   title,
@@ -21,6 +22,7 @@ export function HoverButton({
   style?: CSSProperties;
   hoverStyle: CSSProperties;
   onClick?: MouseEventHandler<HTMLButtonElement>;
+  onMouseDown?: MouseEventHandler<HTMLButtonElement>;
   onMouseEnter?: MouseEventHandler<HTMLButtonElement>;
   onMouseLeave?: MouseEventHandler<HTMLButtonElement>;
   title?: string;
@@ -35,6 +37,7 @@ export function HoverButton({
       title={title}
       disabled={disabled}
       onClick={onClick}
+      onMouseDown={onMouseDown}
       onMouseEnter={(event) => {
         setHovered(true);
         onMouseEnter?.(event);

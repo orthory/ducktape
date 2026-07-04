@@ -5,12 +5,38 @@
 // since they're just two separate component instances).
 
 import { useEffect, useRef, useState } from "react";
-import type { KeyboardEvent } from "react";
+import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 
 import { Icon } from "../../components/Icon";
+import { HoverButton } from "./HoverButton";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
+
+function FmtButton({ label, title, onClick }: { label: ReactNode; title: string; onClick: () => void }) {
+  const style: CSSProperties = {
+    minWidth: 22,
+    height: 22,
+    padding: "0 5px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 5,
+    color: color.muted2,
+    font: `600 12px ${font.sans}`,
+  };
+  return (
+    <HoverButton
+      title={title}
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={onClick}
+      style={style}
+      hoverStyle={{ background: color.hover, color: color.ink }}
+    >
+      {label}
+    </HoverButton>
+  );
+}
 
 export function Composer({
   value,
@@ -30,6 +56,8 @@ export function Composer({
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const [focused, setFocused] = useState(false);
+  // Caret range to restore after a toolbar edit re-renders the controlled value.
+  const pendingSelection = useRef<[number, number] | null>(null);
 
   // Auto-grow: reset to `auto` first so shrinking (deleting text) is picked
   // up too, then clamp to `maxHeight` — past that the textarea scrolls
@@ -39,7 +67,26 @@ export function Composer({
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+    if (pendingSelection.current) {
+      const [start, end] = pendingSelection.current;
+      pendingSelection.current = null;
+      el.focus();
+      el.setSelectionRange(start, end);
+    }
   }, [value, maxHeight]);
+
+  // Wrap the current selection (or a placeholder) in markdown the composer's
+  // own parser understands (**bold**, *italic*, ```code```), then re-select the
+  // wrapped text so the user can keep typing or toggle it off.
+  const wrap = (before: string, after: string, placeholder: string) => {
+    const el = ref.current;
+    if (!el) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const selected = value.slice(start, end) || placeholder;
+    pendingSelection.current = [start + before.length, start + before.length + selected.length];
+    onChange(value.slice(0, start) + before + selected + after + value.slice(end));
+  };
 
   const canSend = value.trim().length > 0;
 
@@ -99,20 +146,33 @@ export function Composer({
           }}
         />
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, minWidth: 0 }}>
-          <span
-            style={{
-              font: `500 10px ${font.mono}`,
-              color: color.muted2,
-              userSelect: "none",
-              minWidth: 0,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-          >
-            <b style={{ fontWeight: 600, color: color.muted }}>Enter</b> to send ·{" "}
-            <b style={{ fontWeight: 600, color: color.muted }}>Shift+Enter</b> for a new line
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 1, minWidth: 0 }}>
+            <FmtButton title="Bold  **text**" label="B" onClick={() => wrap("**", "**", "bold")} />
+            <FmtButton
+              title="Italic  *text*"
+              label={<span style={{ fontStyle: "italic" }}>I</span>}
+              onClick={() => wrap("*", "*", "italic")}
+            />
+            <FmtButton
+              title="Code block  ```"
+              label={<span style={{ font: `600 11px ${font.mono}` }}>{"</>"}</span>}
+              onClick={() => wrap("```\n", "\n```", "code")}
+            />
+            <div style={{ width: 1, height: 14, background: color.borderSoft, margin: "0 5px" }} />
+            <span
+              style={{
+                font: `500 10px ${font.mono}`,
+                color: color.muted2,
+                userSelect: "none",
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              <b style={{ fontWeight: 600, color: color.muted }}>Enter</b> to send
+            </span>
+          </div>
           <button
             type="button"
             onClick={() => canSend && onSend()}
