@@ -258,6 +258,107 @@ fn a_passing_proposal_removes_the_validator_and_emits_leave() {
     });
 }
 
+/// the `member-leave` verb's on-chain shape: a member drives its OWN removal by
+/// opening a RemoveValidator proposal for its own key and casting its yes-ballot
+/// — the SAME governance path as `member-remove`, targeting self. this pins the
+/// honesty of a unilateral leave: at n=2 the leaver's single ballot is NOT a
+/// strict majority (majority = 2), so its own execute is not decidable early —
+/// the removal stays PENDING until the remaining member also approves, and only
+/// then does the leaver drop from the set.
+#[test]
+fn a_member_leaves_by_removing_itself_pending_the_remaining_majority() {
+    block_on(async {
+        let mut host = gov_host();
+        let (m1, m2) = (member_key(1), member_key(2));
+        assert_eq!(validators(&host).await.len(), 2, "seeded with two members");
+
+        // m2 (the leaver) opens a self-removal and casts its own yes-ballot.
+        submit_as(
+            &mut host,
+            &m2,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "leave-2".into(),
+                action: GovAction::RemoveValidator { key: m2.clone() },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("leaver proposes its own removal");
+        submit_as(
+            &mut host,
+            &m2,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "leave-2".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("leaver votes to leave");
+
+        // the leaver's lone ballot is 1 of 2 — NOT a majority. its own execute
+        // is refused as not-yet-decidable: leaving is not unilateral at n>=2.
+        let err = submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "leave-2".into(),
+            }),
+        )
+        .await
+        .expect_err("a lone leave ballot is not a deciding majority");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable")),
+            "got {err:?}"
+        );
+        assert_eq!(
+            validators(&host).await.len(),
+            2,
+            "the leaver is still in the set while pending"
+        );
+
+        // the remaining member approves -> strict majority (2 of 2) -> execute
+        // removes the leaver at the valset Leave that rides the same block.
+        submit_as(
+            &mut host,
+            &m1,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "leave-2".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("remaining member approves the departure");
+        submit_as(
+            &mut host,
+            &m1,
+            5,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "leave-2".into(),
+            }),
+        )
+        .await
+        .expect("execute once the majority approves");
+
+        assert_eq!(
+            proposal_status(&host, "leave-2").await,
+            Some(ProposalStatus::Passed)
+        );
+        let members = validators(&host).await;
+        assert_eq!(members.len(), 1, "the leaver is gone");
+        assert!(members.contains(&m1), "the remaining member stays");
+        assert!(!members.contains(&m2), "the leaver's key is dropped from the set");
+    });
+}
+
 /// the solo-network tally: with one member, majority = 1/2 + 1 = 1, so the
 /// founder's own ballot decides immediately — `invite-accept` on a network
 /// of one admits the friend in a single propose/vote/execute round, no
