@@ -10,11 +10,13 @@ import { color, font, radius } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import type { OnboardingPhase } from "../../../domain/workspace-client";
 
-// The ordered steps shown; the node's phase maps onto one of these.
+// The ordered steps shown; the node's phase maps onto one of these. A tokened
+// invite delivers this identity to the members automatically (the lobby
+// announce); the identity card below stays as the manual fallback.
 const STEPS = [
   {
     label: "Parked on invite mesh",
-    detail: "Send this node identity to a member",
+    detail: "Requesting to join — a member approves in their Members view",
   },
   {
     label: "Admitted by a member",
