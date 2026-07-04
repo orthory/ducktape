@@ -16,6 +16,7 @@ import {
 import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
+import { parseMessageInput } from "../views/chat/chat-input";
 import type { Action } from "./reducer";
 import { channelIdOf, docIdOf, nextTaskStatus } from "./state";
 import type { ConsoleState } from "./state";
@@ -337,7 +338,7 @@ export function createActions({
         chatClient.postMessage(live, {
           channelId,
           messageId: crypto.randomUUID(),
-          text: body.trim(),
+          blocks: parseMessageInput(body),
           origin: getState().author,
         }),
       );
@@ -368,7 +369,7 @@ export function createActions({
         chatClient.postMessage(live, {
           channelId,
           messageId: crypto.randomUUID(),
-          text: body.trim(),
+          blocks: parseMessageInput(body),
           origin: getState().author,
           thread: root.seq,
         }),
@@ -399,7 +400,7 @@ export function createActions({
         chatClient.editMessage(live, {
           channelId,
           seq,
-          text: body.trim(),
+          blocks: parseMessageInput(body),
           baseRev: target?.head.rev ?? null,
           origin: getState().author,
         }),

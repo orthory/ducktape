@@ -66,12 +66,12 @@ describe("chat msgs", () => {
     );
   });
 
-  it("encodes PostMessage as a single plain paragraph, no author field", async () => {
+  it("encodes PostMessage with the given blocks and no author field", async () => {
     const transport = stubTransport();
     await postMessage(transport, {
       channelId: "general",
       messageId: "m1",
-      text: "hello",
+      blocks: [{ Paragraph: [{ text: "hello", marks: [] }] }],
       origin: "jess",
     });
     expect(transport.submit).toHaveBeenCalledWith(
@@ -94,7 +94,7 @@ describe("chat msgs", () => {
     await postMessage(transport, {
       channelId: "general",
       messageId: "m2",
-      text: "in thread",
+      blocks: [{ Paragraph: [{ text: "in thread", marks: [] }] }],
       origin: "jess",
       thread: 7,
     });

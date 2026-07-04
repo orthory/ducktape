@@ -7,9 +7,10 @@
 import { useEffect, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
-import { authorName, blocksText } from "../../../domain/chat-client";
+import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../../../domain/chat-client";
 import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
+import { blocksToInput } from "./chat-input";
 import { HoverButton } from "./HoverButton";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -765,7 +766,7 @@ export function MessageItem({
 
   const startEdit = () => {
     setConfirmingDelete(false);
-    setEditDraft(blocksText(message.head.blocks));
+    setEditDraft(blocksToInput(message.head.blocks));
     setEditing(true);
   };
   const saveEdit = () => {

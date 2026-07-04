@@ -161,7 +161,7 @@ export const postMessage = (
   params: {
     channelId: string;
     messageId: string;
-    text: string;
+    blocks: ChatBlock[];
     origin: string;
     /** Root seq — set to post a thread reply. */
     thread?: number;
@@ -173,7 +173,7 @@ export const postMessage = (
       PostMessage: {
         channel_id: params.channelId,
         message_id: params.messageId,
-        blocks: [{ Paragraph: [{ text: params.text, marks: [] }] }],
+        blocks: params.blocks,
         thread: params.thread ?? null,
         as_agent: null,
       },
@@ -211,7 +211,7 @@ export const removeReaction = (
  *  Paragraph; rich blocks/marks are a later increment. */
 export const editMessage = (
   transport: NodeTransport,
-  params: { channelId: string; seq: number; text: string; baseRev: number | null; origin: string },
+  params: { channelId: string; seq: number; blocks: ChatBlock[]; baseRev: number | null; origin: string },
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
@@ -219,7 +219,7 @@ export const editMessage = (
       EditMessage: {
         channel_id: params.channelId,
         seq: params.seq,
-        blocks: [{ Paragraph: [{ text: params.text, marks: [] }] }],
+        blocks: params.blocks,
         base_rev: params.baseRev,
       },
     },
