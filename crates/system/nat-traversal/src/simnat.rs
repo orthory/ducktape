@@ -1,14 +1,25 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
-/// Endpoint-independent mapping, address-and-port-dependent filtering NAT
-/// (restricted-cone). One public IP; each internal socket gets a stable public
-/// port; inbound is allowed only from destinations this internal socket has
-/// already sent to. This is the case simultaneous-open hole-punch targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mapping {
+    /// Endpoint-independent: one stable public port per internal socket.
+    Cone,
+    /// Address-dependent: a fresh public port per (internal, destination).
+    Symmetric,
+}
+
+/// A NAT model. `new` is restricted-cone (endpoint-independent mapping,
+/// address-dependent filtering) — the case simultaneous-open hole-punch
+/// targets. `symmetric` is the case hole-punch cannot beat, forcing relay
+/// fallback: a different public port per destination, so the coordinator-
+/// observed reflexive port never admits a peer's punch.
 pub struct SimNat {
     public_ip: IpAddr,
     next_port: u16,
-    mapping: HashMap<SocketAddr, SocketAddr>, // internal -> public
+    mode: Mapping,
+    cone: HashMap<SocketAddr, SocketAddr>, // internal -> public (endpoint-independent)
+    sym: HashMap<(SocketAddr, SocketAddr), SocketAddr>, // (internal, dst) -> public
     holes: HashSet<(SocketAddr, SocketAddr)>, // (public mapped, remote) opened
 }
 
@@ -17,21 +28,49 @@ impl SimNat {
         Self {
             public_ip,
             next_port: 1024,
-            mapping: HashMap::new(),
+            mode: Mapping::Cone,
+            cone: HashMap::new(),
+            sym: HashMap::new(),
             holes: HashSet::new(),
         }
+    }
+
+    pub fn symmetric(public_ip: IpAddr) -> Self {
+        Self {
+            mode: Mapping::Symmetric,
+            ..Self::new(public_ip)
+        }
+    }
+
+    fn alloc_port(&mut self) -> u16 {
+        let port = self.next_port;
+        self.next_port = self.next_port.wrapping_add(1).max(1024);
+        port
     }
 
     /// Record an outbound datagram from `internal_src` toward `dst`; return the
     /// public source address peers will observe.
     pub fn send(&mut self, internal_src: SocketAddr, dst: SocketAddr) -> SocketAddr {
-        let public_ip = self.public_ip;
-        let next = &mut self.next_port;
-        let mapped = *self.mapping.entry(internal_src).or_insert_with(|| {
-            let port = *next;
-            *next = next.wrapping_add(1).max(1024);
-            SocketAddr::new(public_ip, port)
-        });
+        let mapped = match self.mode {
+            Mapping::Cone => {
+                if let Some(&m) = self.cone.get(&internal_src) {
+                    m
+                } else {
+                    let m = SocketAddr::new(self.public_ip, self.alloc_port());
+                    self.cone.insert(internal_src, m);
+                    m
+                }
+            }
+            Mapping::Symmetric => {
+                if let Some(&m) = self.sym.get(&(internal_src, dst)) {
+                    m
+                } else {
+                    let m = SocketAddr::new(self.public_ip, self.alloc_port());
+                    self.sym.insert((internal_src, dst), m);
+                    m
+                }
+            }
+        };
         self.holes.insert((mapped, dst));
         mapped
     }
@@ -71,5 +110,20 @@ mod tests {
         assert!(!nat.allow_inbound(mapped, peer), "unsolicited inbound is dropped");
         let _ = nat.send(internal, peer); // now punch toward peer
         assert!(nat.allow_inbound(mapped, peer), "hole toward peer now open");
+    }
+
+    #[test]
+    fn symmetric_allocates_a_fresh_port_per_destination() {
+        let mut nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let internal = a([192, 168, 1, 5], 51820);
+        let to_coord = nat.send(internal, a([192, 0, 2, 1], 3478));
+        let to_peer = nat.send(internal, a([198, 51, 100, 2], 6000));
+        assert_ne!(
+            to_coord, to_peer,
+            "symmetric NAT maps a different public port per destination"
+        );
+        // The port the coordinator observed does NOT admit the peer: the peer
+        // would punch `to_coord`, but only `to_peer` opened a hole toward it.
+        assert!(!nat.allow_inbound(to_coord, a([198, 51, 100, 2], 6000)));
     }
 }

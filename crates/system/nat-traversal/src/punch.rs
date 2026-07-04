@@ -212,4 +212,17 @@ mod tests {
         assert!(a_nat.allow_inbound(a_plan.local_mapped, b_plan.local_mapped));
         assert!(b_nat.allow_inbound(b_plan.local_mapped, a_plan.local_mapped));
     }
+
+    #[test]
+    fn symmetric_nat_pair_fails_hole_punch_with_not_reachable() {
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let mut a_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let mut b_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
+        let mut coord = Coordinator::new();
+
+        let err = drive_simulated(a_key, b_key, &mut a_nat, &mut b_nat, &mut coord)
+            .expect_err("symmetric NAT must defeat hole-punch");
+        assert_eq!(err, PunchError::NotReachable);
+    }
 }
