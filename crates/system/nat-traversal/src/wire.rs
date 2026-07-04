@@ -22,6 +22,8 @@ pub enum WireError {
     BadTag(u8),
     #[error("bad address encoding")]
     BadAddr,
+    #[error("trailing bytes after message")]
+    Trailing,
 }
 
 const TAG_BIND_REQ: u8 = 1;
@@ -142,11 +144,11 @@ impl Msg {
     pub fn decode(buf: &[u8]) -> Result<Msg, WireError> {
         let mut r = Reader::new(buf);
         let tag = r.take(1)?[0];
-        match tag {
-            TAG_BIND_REQ => Ok(Msg::BindRequest { from: r.key()? }),
-            TAG_BIND_RESP => Ok(Msg::BindResponse { reflexive: r.addr()? }),
-            TAG_REGISTER => Ok(Msg::Register { key: r.key()? }),
-            TAG_LOOKUP => Ok(Msg::Lookup { key: r.key()? }),
+        let msg = match tag {
+            TAG_BIND_REQ => Msg::BindRequest { from: r.key()? },
+            TAG_BIND_RESP => Msg::BindResponse { reflexive: r.addr()? },
+            TAG_REGISTER => Msg::Register { key: r.key()? },
+            TAG_LOOKUP => Msg::Lookup { key: r.key()? },
             TAG_LOOKUP_RESP => {
                 let key = r.key()?;
                 let present = r.take(1)?[0];
@@ -155,15 +157,22 @@ impl Msg {
                     1 => Some(r.addr()?),
                     _ => return Err(WireError::BadAddr),
                 };
-                Ok(Msg::LookupResponse { key, reflexive })
+                Msg::LookupResponse { key, reflexive }
             }
-            TAG_PUNCH_SYNC => Ok(Msg::PunchSync {
+            TAG_PUNCH_SYNC => Msg::PunchSync {
                 peer: r.key()?,
                 peer_reflexive: r.addr()?,
-            }),
-            TAG_PUNCH => Ok(Msg::Punch { from: r.key()? }),
-            other => Err(WireError::BadTag(other)),
+            },
+            TAG_PUNCH => Msg::Punch { from: r.key()? },
+            other => return Err(WireError::BadTag(other)),
+        };
+        // Reject oversized/malformed datagrams that decode a valid prefix but
+        // carry trailing garbage: a well-formed message consumes the whole
+        // buffer, nothing more.
+        if r.pos != buf.len() {
+            return Err(WireError::Trailing);
         }
+        Ok(msg)
     }
 }
 
@@ -199,5 +208,20 @@ mod tests {
     fn short_buffer_is_error() {
         assert_eq!(Msg::decode(&[]), Err(WireError::Short));
         assert_eq!(Msg::decode(&[0xff]), Err(WireError::BadTag(0xff)));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_garbage_bytes() {
+        // A well-formed message with extra bytes appended (oversized /
+        // malformed datagram) must be rejected outright, not silently
+        // accepted by ignoring whatever the reader didn't consume.
+        let mut bytes = Msg::BindRequest { from: NodeKey([9u8; 32]) }.encode();
+        bytes.push(0xff);
+        assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
+
+        let mut bytes = Msg::PunchSync { peer: NodeKey([1u8; 32]), peer_reflexive: addr(2, 51820) }
+            .encode();
+        bytes.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
     }
 }
