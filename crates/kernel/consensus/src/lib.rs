@@ -390,6 +390,19 @@ impl ConsensusHandle {
             .expect("pending queue poisoned")
             .push_back(digest);
     }
+
+    /// current depth of the pending FIFO. the node's heartbeat gates idle-nop
+    /// injection on this being 0 — the FIFO is strictly serial (one frame
+    /// finalized per block), so a nop pushed while real frames are queued only
+    /// builds a serial backlog that starves them. reading empty-first bounds
+    /// outstanding nops to one and only when it is alone in the queue, so nops
+    /// can never pile up behind — or in front of — real frames.
+    pub fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .expect("pending queue poisoned")
+            .len()
+    }
 }
 
 // ============================================================================
@@ -1080,6 +1093,14 @@ impl SimplexOrderer {
     /// before the certificate read has been released (and applied).
     pub fn unreleased_len(&self) -> usize {
         self.inbox.unreleased_len()
+    }
+
+    /// depth of this node's pending FIFO — delegates to the shared
+    /// [`ConsensusHandle`]. the node's heartbeat reads it to gate idle-nop
+    /// injection on an empty queue, so a nop is only ever pushed when nothing
+    /// real is already waiting behind it.
+    pub fn pending_len(&self) -> usize {
+        self.handle.pending_len()
     }
 }
 
@@ -1800,6 +1821,32 @@ mod tests {
         assert!(!inbox.record(1, d, &store, false));
         inbox.record(1, d, &store, false); // same digest again -> ignored by `seen`.
         assert_eq!(inbox.drain(), vec![(1, b"once".to_vec())]);
+    }
+
+    #[test]
+    fn pending_len_tracks_queue_depth() {
+        // the heartbeat gate reads `pending_len` to decide whether to inject an
+        // idle nop; it must report the true FIFO depth so a nop is skipped
+        // whenever a real frame is already queued. a fresh handle sees 0, and
+        // each submit climbs the count by one.
+        //
+        // covers the submit (grow) side only: driving the paired
+        // `SimplexReporter` to REMOVE the front digest needs a real
+        // `Activity::Finalization` certificate — new harness machinery this
+        // module has no existing pattern for — so the finalized-shrink side is
+        // left to the e2e path.
+        let store = ContentStore::new();
+        let automaton = ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey, ()>::new(
+            store.clone(),
+            (),
+        );
+        let handle = automaton.handle(store);
+
+        assert_eq!(handle.pending_len(), 0, "a fresh queue is empty");
+        handle.submit(b"first frame".to_vec());
+        assert_eq!(handle.pending_len(), 1, "one submit -> depth 1");
+        handle.submit(b"second frame".to_vec());
+        assert_eq!(handle.pending_len(), 2, "a second submit -> depth 2");
     }
 
     #[test]

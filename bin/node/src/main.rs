@@ -4524,7 +4524,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // rejects identically on every node, leaves no state) once
                     // per block-time so the chain — and the height the console
                     // shows — keeps moving whether or not anyone is active.
-                    if last_nop.elapsed() >= HEARTBEAT_INTERVAL {
+                    //
+                    // GATE on an EMPTY pending FIFO: the queue is strictly serial
+                    // (one frame finalized per block), so a nop pushed while real
+                    // frames are pending only builds a backlog that starves real
+                    // ops after any finalization stall (a flapping quorum peer piles
+                    // nops at 1/s; recovery then drains them ahead of real work —
+                    // minutes of head-of-line latency). a nop only ticks an IDLE
+                    // chain, and an idle chain has an empty queue, so beat only when
+                    // the FIFO is empty — at most one nop outstanding, and only when
+                    // it is alone. the reset stays inside the taken branch: when the
+                    // gate skips, the timer stays elapsed, so the first tick after
+                    // the queue drains injects the next nop immediately.
+                    if last_nop.elapsed() >= HEARTBEAT_INTERVAL
+                        && node.orderer().pending_len() == 0
+                    {
                         last_nop = std::time::Instant::now();
                         let seq = next_seq;
                         next_seq += 1;
