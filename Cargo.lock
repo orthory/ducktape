@@ -8313,6 +8313,7 @@ version = "0.1.0"
 dependencies = [
  "commonware-cryptography",
  "defguard_wireguard_rs",
+ "nat-traversal",
  "wireguard-upgrade",
 ]
 
