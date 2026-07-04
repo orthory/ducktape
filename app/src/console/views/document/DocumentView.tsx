@@ -1,12 +1,14 @@
 // The docs surface over the node's `document` module: a block-based store where
 // a document is exactly an ordered list of blocks keyed by doc_id.
 //
-// The module has no "list docs" query, so known doc ids come from a client-side
-// registry the store keeps per node. This view keeps that limitation visible:
-// the rail switches remembered docs, while explicit create/open forms let an
-// operator add a known id without pretending the node can enumerate documents.
+// Doc ids are "/"-delimited PATHS, and the module keeps a reserved enumeration
+// index (ListDocs) so the console can DISCOVER every doc on the node — not just
+// the ones this session happened to open. This view turns that enumeration into
+// a filesystem-like reader: a LEFT collapsible folder/document tree derived from
+// the path ids, and a MAIN reader/editor pane that keeps the block editing and
+// create/open flows.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type { Block, BlockKind } from "../../../domain/document-client";
@@ -68,12 +70,6 @@ const sectionLabelStyle: CSSProperties = {
   letterSpacing: ".11em",
   color: color.muted2,
   textTransform: "uppercase",
-};
-
-const monoId: CSSProperties = {
-  font: `500 11px ${font.mono}`,
-  color: color.muted3,
-  wordBreak: "break-all",
 };
 
 const srOnly: CSSProperties = {
@@ -308,6 +304,206 @@ function DocIdForm({
         </RailSubmitButton>
       </div>
     </form>
+  );
+}
+
+// -- Folder / document tree --------------------------------------------------
+//
+// Doc ids are "/"-delimited paths; the enumeration index is a flat id list.
+// buildDocTree folds those ids into a nested tree so the rail can render a
+// filesystem browser: intermediate segments become folders, and every id is a
+// document leaf at its full path. A path can be BOTH a folder and a document
+// (e.g. "projects" alongside "projects/launch") — such a node opens on click
+// and still expands to reveal its children.
+
+interface DocNode {
+  /** Last path segment — the label shown in the tree. */
+  name: string;
+  /** Full "/"-delimited path — the doc id and the open target. */
+  path: string;
+  /** True when a document exists exactly at this path (not just a prefix). */
+  isDoc: boolean;
+  children: DocNode[];
+}
+
+function buildDocTree(docIds: string[]): DocNode[] {
+  const roots: DocNode[] = [];
+  const byPath = new Map<string, DocNode>();
+
+  for (const id of docIds) {
+    const segments = id.split("/").filter((segment) => segment.length > 0);
+    let prefix = "";
+    let siblings = roots;
+    for (let i = 0; i < segments.length; i += 1) {
+      const segment = segments[i];
+      prefix = prefix ? `${prefix}/${segment}` : segment;
+      let node = byPath.get(prefix);
+      if (!node) {
+        node = { name: segment, path: prefix, isDoc: false, children: [] };
+        byPath.set(prefix, node);
+        siblings.push(node);
+      }
+      if (i === segments.length - 1) node.isDoc = true;
+      siblings = node.children;
+    }
+  }
+
+  // Folders first, then documents, each group alphabetical — the usual file
+  // browser ordering. Recurse so every level is sorted the same way.
+  const sortLevel = (nodes: DocNode[]): void => {
+    nodes.sort((a, b) => {
+      const aFolder = a.children.length > 0;
+      const bFolder = b.children.length > 0;
+      if (aFolder !== bFolder) return aFolder ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const node of nodes) sortLevel(node.children);
+  };
+  sortLevel(roots);
+
+  return roots;
+}
+
+function TreeItem({
+  node,
+  depth,
+  activeDoc,
+  collapsed,
+  onToggle,
+  openDoc,
+}: {
+  node: DocNode;
+  depth: number;
+  activeDoc: string | null;
+  collapsed: ReadonlySet<string>;
+  onToggle: (path: string) => void;
+  openDoc: (path: string) => void;
+}) {
+  const isFolder = node.children.length > 0;
+  const expanded = !collapsed.has(node.path);
+  const active = node.isDoc && node.path === activeDoc;
+  const indent = 8 + depth * 13;
+
+  return (
+    <div>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          margin: "1px 6px",
+          paddingLeft: indent,
+          borderRadius: radius.sm,
+          background: active ? color.hover : "transparent",
+          color: active ? color.ink : color.inkSofter,
+        }}
+      >
+        {isFolder ? (
+          <button
+            type="button"
+            aria-label={`${expanded ? "Collapse" : "Expand"} ${node.path}`}
+            aria-expanded={expanded}
+            title={node.path}
+            onClick={() => onToggle(node.path)}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              flexShrink: 0,
+              width: 18,
+              height: 28,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: color.muted2,
+            }}
+          >
+            <Icon
+              name="chevronRight"
+              size={12}
+              strokeWidth={1.9}
+              style={{ transform: `rotate(${expanded ? 90 : 0}deg)` }}
+            />
+          </button>
+        ) : (
+          <span aria-hidden="true" style={{ flexShrink: 0, width: 18 }} />
+        )}
+
+        <button
+          type="button"
+          aria-label={
+            node.isDoc
+              ? `Open ${node.path}`
+              : `${expanded ? "Collapse" : "Expand"} folder ${node.path}`
+          }
+          aria-expanded={isFolder && !node.isDoc ? expanded : undefined}
+          title={node.path}
+          onClick={() => (node.isDoc ? openDoc(node.path) : onToggle(node.path))}
+          style={{
+            all: "unset",
+            cursor: "pointer",
+            flex: 1,
+            minWidth: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "6px 8px 6px 2px",
+            color: "inherit",
+          }}
+        >
+          <Icon
+            name={isFolder ? "folder" : "document"}
+            size={14}
+            strokeWidth={1.7}
+            style={{
+              flexShrink: 0,
+              color: active ? accentVar : color.muted2,
+            }}
+          />
+          <span
+            style={{
+              flex: 1,
+              minWidth: 0,
+              font: active ? `600 12.5px ${font.sans}` : `500 12.5px ${font.sans}`,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {node.name}
+          </span>
+          {active ? (
+            <span
+              style={{
+                flexShrink: 0,
+                font: `600 8.5px ${font.mono}`,
+                color: color.onDark,
+                background: color.dark,
+                borderRadius: 4,
+                padding: "2px 5px",
+                letterSpacing: ".05em",
+              }}
+            >
+              OPEN
+            </span>
+          ) : null}
+        </button>
+      </div>
+
+      {isFolder && expanded ? (
+        <div>
+          {node.children.map((child) => (
+            <TreeItem
+              key={child.path}
+              node={child}
+              depth={depth + 1}
+              activeDoc={activeDoc}
+              collapsed={collapsed}
+              onToggle={onToggle}
+              openDoc={openDoc}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -547,7 +743,7 @@ function AddBlock({ onAdd }: { onAdd: (kind: BlockKind, text: string) => void })
   );
 }
 
-// -- Registry rail -----------------------------------------------------------
+// -- Enumerated document rail (folder/document tree) -------------------------
 
 function DocRail({
   docIds,
@@ -558,6 +754,7 @@ function DocRail({
   setNewId,
   onOpen,
   onCreate,
+  onRefresh,
   openDoc,
 }: {
   docIds: string[];
@@ -568,8 +765,20 @@ function DocRail({
   setNewId: (id: string) => void;
   onOpen: (event: FormEvent) => void;
   onCreate: (event: FormEvent) => void;
+  onRefresh: () => void;
   openDoc: (id: string) => void;
 }) {
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  const tree = useMemo(() => buildDocTree(docIds), [docIds]);
+
+  const toggle = (path: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+
   return (
     <aside
       style={{
@@ -611,7 +820,7 @@ function DocRail({
         <div style={{ minWidth: 0 }}>
           <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Documents</div>
           <div style={{ marginTop: 1, font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
-            local registry
+            node index
           </div>
         </div>
         <div style={{ marginLeft: "auto", font: `500 11px ${font.mono}`, color: color.muted2 }}>
@@ -623,7 +832,7 @@ function DocRail({
         <DocIdForm
           id="document-create-id"
           label="Create document id"
-          placeholder="release-notes"
+          placeholder="projects/release-notes"
           value={newId}
           setValue={setNewId}
           submitLabel="Create document"
@@ -636,7 +845,7 @@ function DocRail({
         <DocIdForm
           id="document-open-id"
           label="Open document id"
-          placeholder="existing-doc-id"
+          placeholder="existing/doc-id"
           value={openId}
           setValue={setOpenId}
           submitLabel="Open document"
@@ -645,14 +854,44 @@ function DocRail({
         />
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "13px 8px" }}>
-        <div style={{ padding: "0 8px 8px" }}>
-          <SectionLabel>Known Documents</SectionLabel>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "13px 0" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "0 14px 8px",
+          }}
+        >
+          <SectionLabel>Files</SectionLabel>
+          <button
+            type="button"
+            aria-label="Refresh documents"
+            title="Refresh documents"
+            onClick={onRefresh}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              marginLeft: "auto",
+              width: 24,
+              height: 24,
+              borderRadius: 6,
+              border: `1px solid ${color.border}`,
+              background: color.paper,
+              color: color.muted3,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Icon name="refresh" size={13} strokeWidth={1.7} />
+          </button>
         </div>
-        {docIds.length === 0 ? (
+
+        {tree.length === 0 ? (
           <div
             style={{
-              margin: "7px 8px",
+              margin: "7px 14px",
               padding: "13px 12px",
               border: `1px dashed ${color.borderStrong}`,
               borderRadius: radius.md,
@@ -661,71 +900,20 @@ function DocRail({
               color: color.muted2,
             }}
           >
-            No documents have been opened on this node yet.
+            No documents on this node yet. Create one above to start the tree.
           </div>
         ) : (
-          docIds.map((id) => {
-            const active = id === activeDoc;
-            return (
-              <button
-                key={id}
-                type="button"
-                aria-label={`Open ${id}`}
-                title={id}
-                onClick={() => openDoc(id)}
-                style={{
-                  all: "unset",
-                  cursor: "pointer",
-                  boxSizing: "border-box",
-                  width: "100%",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 9,
-                  margin: "1px 0",
-                  padding: "9px 10px",
-                  borderRadius: radius.sm,
-                  background: active ? color.hover : "transparent",
-                  color: active ? color.ink : color.inkSofter,
-                }}
-              >
-                <span
-                  style={{
-                    width: 24,
-                    height: 24,
-                    borderRadius: 7,
-                    border: `1px solid ${active ? color.borderStrong : color.border}`,
-                    background: active ? color.paper : color.sunken,
-                    color: active ? accentVar : color.muted2,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    flexShrink: 0,
-                  }}
-                >
-                  <Icon name="hash" size={12} strokeWidth={1.8} />
-                </span>
-                <span style={{ ...monoId, color: active ? color.ink : color.inkSofter }}>
-                  {id}
-                </span>
-                {active ? (
-                  <span
-                    style={{
-                      marginLeft: "auto",
-                      font: `600 8.5px ${font.mono}`,
-                      color: color.onDark,
-                      background: color.dark,
-                      borderRadius: 4,
-                      padding: "2px 5px",
-                      letterSpacing: ".05em",
-                      flexShrink: 0,
-                    }}
-                  >
-                    OPEN
-                  </span>
-                ) : null}
-              </button>
-            );
-          })
+          tree.map((node) => (
+            <TreeItem
+              key={node.path}
+              node={node}
+              depth={0}
+              activeDoc={activeDoc}
+              collapsed={collapsed}
+              onToggle={toggle}
+              openDoc={openDoc}
+            />
+          ))
         )}
       </div>
 
@@ -737,7 +925,7 @@ function DocRail({
           color: color.muted2,
         }}
       >
-        The node does not expose document discovery; opened ids are remembered locally.
+        Enumerated from the node&apos;s document index. Slashes in an id become folders.
       </div>
     </aside>
   );
@@ -751,6 +939,14 @@ export function DocumentView() {
   const [newId, setNewId] = useState("");
 
   const blocks = state.activeDocBlocks;
+
+  // Enumerate the node's document index on mount so the tree reflects every
+  // doc, not just ones opened this session. `actions` is a stable facade, so
+  // this fires once; the rail's refresh control re-runs it on demand, and every
+  // committed block event re-enumerates through the store's refresh.
+  useEffect(() => {
+    actions.listDocs();
+  }, [actions]);
 
   const open = (event: FormEvent) => {
     event.preventDefault();
@@ -801,6 +997,7 @@ export function DocumentView() {
         setNewId={setNewId}
         onOpen={open}
         onCreate={create}
+        onRefresh={actions.listDocs}
         openDoc={actions.openDoc}
       />
 
@@ -863,7 +1060,7 @@ export function DocumentView() {
           {!state.activeDoc ? (
             <EmptyState
               title="No document open"
-              body="Create a document from the rail or open a known id to load its blocks."
+              body="Pick a document from the tree, or create one to load its blocks."
             />
           ) : (
             <div
