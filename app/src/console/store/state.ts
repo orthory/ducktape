@@ -136,6 +136,10 @@ export interface ConsoleState {
   needsOnboarding: boolean;
   /** An onboarding step is running (create/join/select) — disables the gate. */
   onboardingBusy: boolean;
+  /** The last guarded forget couldn't confirm the node left its valset (node
+   *  down/bricked) — reveal the force-forget override so a workspace whose node
+   *  can never start is still removable. Cleared on any fresh forget attempt. */
+  forgetNeedsForce: boolean;
   /** A joiner's live park→promote phase while its node is not yet a ready
    *  validator; null on the founder/member path and once the node answers. */
   onboardingPhase: PhaseReport | null;
@@ -247,6 +251,7 @@ export const createInitialState = (): ConsoleState => {
     workspace: null,
     needsOnboarding: false,
     onboardingBusy: false,
+    forgetNeedsForce: false,
     onboardingPhase: null,
     inviteBlob: null,
   };
