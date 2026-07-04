@@ -95,7 +95,7 @@ async fn multi_coordinator_failover() {
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead.local_addr().unwrap();
 
-    let client = NatClient::bind_multi(NodeKey([3u8; 32]), vec![dead_addr, live_addr])
+    let mut client = NatClient::bind_multi(NodeKey([3u8; 32]), vec![dead_addr, live_addr])
         .await
         .unwrap();
     let (idx, _reflexive) = timeout(
@@ -110,16 +110,19 @@ async fn multi_coordinator_failover() {
 
 #[tokio::test]
 async fn punched_survives_relayed_needs_coordinator() {
-    // Punched path survives coordinator downtime (deterministic proof mirrored
-    // here via the async direct send).
+    // A punched path survives coordinator downtime; an ESTABLISHED relayed path
+    // does not (it flows through the coordinator, so its death kills it); and no
+    // fresh relay can even be allocated once the coordinator is gone.
     let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
     let coord = tokio::spawn(run_coordinator(coord_sock));
-    let a = NatClient::bind(NodeKey([0xaa; 32]), coord_addr).await.unwrap();
-    let b = NatClient::bind(NodeKey([0xbb; 32]), coord_addr).await.unwrap();
+    let a_key = NodeKey([0xaa; 32]);
+    let b_key = NodeKey([0xbb; 32]);
+    let a = NatClient::bind(a_key, coord_addr).await.unwrap();
+    let b = NatClient::bind(b_key, coord_addr).await.unwrap();
     a.register().await.unwrap();
     b.register().await.unwrap();
-    let _ = timeout(Duration::from_secs(2), a.lookup(NodeKey([0xbb; 32])))
+    let _ = timeout(Duration::from_secs(2), a.lookup(b_key))
         .await
         .expect("no timeout")
         .expect("lookup");
@@ -131,7 +134,34 @@ async fn punched_survives_relayed_needs_coordinator() {
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         a.local_addr().await.unwrap().port(),
     );
+
+    // Establish a RELAYED data path too, and PROVE it forwards while the
+    // coordinator is alive — so the post-abort stall below is a genuine death,
+    // not a path that never carried data.
+    let (_s_a, a_relay) = timeout(Duration::from_secs(2), a.request_relay(b_key))
+        .await
+        .expect("no timeout")
+        .expect("grant a");
+    let (_s_b, b_relay) = timeout(Duration::from_secs(2), b.request_relay(a_key))
+        .await
+        .expect("no timeout")
+        .expect("grant b");
+    const RELAY_A: &[u8] = b"relayed-A";
+    a.relay_send(a_relay, RELAY_A).await.unwrap();
+    b.relay_send(b_relay, b"relayed-B").await.unwrap();
+    let mut relay_forwarded = false;
+    for _ in 0..50 {
+        a.relay_send(a_relay, RELAY_A).await.unwrap();
+        if let Ok(v) = timeout(Duration::from_millis(100), b.relay_recv()).await {
+            assert_eq!(v.expect("recv").as_slice(), RELAY_A);
+            relay_forwarded = true;
+            break;
+        }
+    }
+    assert!(relay_forwarded, "the relay must forward while the coordinator is alive");
+
     coord.abort();
+
     // A sends straight to B with no coordinator. Retransmit-until-received so the
     // proof is order-independent and immune to loopback scheduling jitter under
     // the concurrently-running suite (the direct path is what's under test, not
@@ -146,10 +176,23 @@ async fn punched_survives_relayed_needs_coordinator() {
     }
     assert_eq!(
         got.expect("direct path survives"),
-        nat_traversal::Msg::Punch { from: NodeKey([0xaa; 32]) }
+        nat_traversal::Msg::Punch { from: a_key }
     );
 
-    // Relayed path needs a live coordinator: with it down, allocation fails.
+    // The ESTABLISHED relayed path is now dead: the splice was owned by the
+    // coordinator task, so aborting it tore the relay down. Drain anything the
+    // pre-abort proof left buffered, then prove no new datagram is forwarded.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while timeout(Duration::from_millis(50), b.relay_recv()).await.is_ok() {}
+    for _ in 0..5 {
+        let _ = a.relay_send(a_relay, RELAY_A).await;
+    }
+    assert!(
+        timeout(Duration::from_millis(500), b.relay_recv()).await.is_err(),
+        "an established relayed path must NOT survive coordinator downtime"
+    );
+
+    // And a fresh relay cannot even be allocated once the coordinator is down.
     let c2 = NatClient::bind(NodeKey([0xcc; 32]), coord_addr).await.unwrap();
     let res = timeout(Duration::from_millis(400), c2.request_relay(NodeKey([0xdd; 32]))).await;
     assert!(res.is_err(), "relay setup requires a live coordinator");

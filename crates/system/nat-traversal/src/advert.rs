@@ -37,11 +37,23 @@ pub struct AdvertBook {
 }
 
 impl AdvertBook {
-    /// Boot/live registration. The coordinator-observed `src` is authoritative;
-    /// establish (or reset) the baseline at nonce 0. Matches the coordinator's
-    /// original unconditional `Register` insert.
+    /// Boot/live registration at the nonce-0 baseline. The coordinator-observed
+    /// `src` is authoritative. This establishes the baseline for a first-seen key
+    /// and refreshes it while still at the baseline, but it is NOT unconditional:
+    /// once a rebind re-advertisement has advanced the stored nonce above 0, a
+    /// later (necessarily nonce-0) `Register` — which under UDP may be a
+    /// duplicated, reordered, or replayed datagram from the STALE mapping — must
+    /// not roll the fresh mapping back. Only `readvertise` moves a superseded
+    /// mapping, and only under a strictly-higher nonce.
     pub fn observe(&mut self, key: NodeKey, src: SocketAddr) {
-        self.latest.insert(key, ReflexiveAdvert { reflexive: src, nonce: 0 });
+        match self.latest.get(&key) {
+            // Already superseded past the boot baseline: a nonce-0 Register is
+            // stale by construction and cannot roll it back.
+            Some(prev) if prev.nonce > 0 => {}
+            _ => {
+                self.latest.insert(key, ReflexiveAdvert { reflexive: src, nonce: 0 });
+            }
+        }
     }
 
     /// Rebind re-advertisement. A strictly-higher `nonce` supersedes the stored
@@ -108,6 +120,39 @@ mod tests {
         assert_eq!(book.readvertise(key, addr(9, 9999), 2), AdvertOutcome::Stale);
         assert_eq!(book.readvertise(key, addr(9, 9999), 1), AdvertOutcome::Stale);
         assert_eq!(book.current(key), Some(addr(2, 5000)), "stale adverts leave state untouched");
+    }
+
+    #[test]
+    fn observe_does_not_roll_back_a_superseded_higher_nonce_mapping() {
+        let key = NodeKey([0xdd; 32]);
+        let mut book = AdvertBook::default();
+        book.observe(key, addr(1, 4000)); // boot: nonce 0
+        assert_eq!(book.readvertise(key, addr(2, 5000), 1), AdvertOutcome::Superseded);
+
+        // A replayed/reordered boot Register (observe) from the STALE source must
+        // NOT roll the fresh nonce-1 mapping back to the old one.
+        book.observe(key, addr(1, 4000));
+        assert_eq!(
+            book.current(key),
+            Some(addr(2, 5000)),
+            "a stale nonce-0 register cannot clobber a rebind re-advertisement"
+        );
+        assert_eq!(book.key_for_src(addr(1, 4000)), None, "stale mapping stays gone");
+    }
+
+    #[test]
+    fn observe_still_refreshes_while_at_the_boot_baseline() {
+        // Before any rebind (still nonce 0), a re-register updates the mapping —
+        // the fix only blocks rollback of an already-superseded mapping.
+        let key = NodeKey([0xee; 32]);
+        let mut book = AdvertBook::default();
+        book.observe(key, addr(1, 4000));
+        book.observe(key, addr(3, 7000));
+        assert_eq!(
+            book.current(key),
+            Some(addr(3, 7000)),
+            "a nonce-0 re-register refreshes the baseline mapping"
+        );
     }
 
     #[test]

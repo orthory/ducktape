@@ -57,11 +57,20 @@ impl NatClient {
     /// reflexive it observed. Total wait is bounded by `per_try * coords.len()`,
     /// so a dead coordinator never wedges the joiner — the coordinator set is
     /// not uniquely load-bearing.
+    ///
+    /// Crucially, on success this REPOINTS `self.coord` at the coordinator that
+    /// actually answered, so every subsequent `register`/`lookup`/`request_relay`
+    /// uses the live coordinator too. Without that, failover would only cover
+    /// reflexive discovery while the dead primary stayed uniquely load-bearing
+    /// for the rest of the join path.
     pub async fn discover_reflexive_failover(
-        &self,
+        &mut self,
         per_try: std::time::Duration,
     ) -> std::io::Result<(usize, SocketAddr)> {
-        for (i, &c) in self.coords.iter().enumerate() {
+        // Iterate a local snapshot of the hint set so the loop's borrow does not
+        // conflict with repointing `self.coord` on success.
+        let coords = self.coords.clone();
+        for (i, c) in coords.iter().copied().enumerate() {
             self.sock
                 .send_to(&Msg::BindRequest { from: self.key }.encode(), c)
                 .await?;
@@ -81,7 +90,11 @@ impl NatClient {
                 }
             };
             match tokio::time::timeout(per_try, attempt).await {
-                Ok(Ok(reflexive)) => return Ok((i, reflexive)),
+                Ok(Ok(reflexive)) => {
+                    // Repoint the join path at the coordinator that answered.
+                    self.coord = c;
+                    return Ok((i, reflexive));
+                }
                 // Timeout or socket error on this coordinator -> try the next.
                 _ => continue,
             }
@@ -95,6 +108,20 @@ impl NatClient {
     pub async fn register(&self) -> std::io::Result<()> {
         self.sock
             .send_to(&Msg::Register { key: self.key }.encode(), self.coord)
+            .await?;
+        Ok(())
+    }
+
+    /// Republish this node's reflexive to the coordinator after a NAT rebind,
+    /// under a strictly-higher `nonce` than any prior advert for this key. This
+    /// is the wire path a rebound node uses to move its mapping: the coordinator
+    /// re-observes the datagram's NEW source and applies the nonce-staleness
+    /// guard, so a replayed/reordered lower-or-equal nonce cannot supersede the
+    /// fresh mapping — unlike `register`, whose nonce-0 baseline a stale
+    /// duplicate could otherwise roll back.
+    pub async fn readvertise(&self, nonce: u64) -> std::io::Result<()> {
+        self.sock
+            .send_to(&Msg::Readvertise { key: self.key, nonce }.encode(), self.coord)
             .await?;
         Ok(())
     }
@@ -278,6 +305,15 @@ pub async fn run_coordinator_with_idle(sock: UdpSocket, relay_idle: std::time::D
         .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
     // session id -> (side-A relay addr, side-B relay addr)
     let mut relay_addrs: HashMap<u64, (SocketAddr, SocketAddr)> = HashMap::new();
+    // Relay splices are OWNED by this coordinator task via a `JoinSet`, not
+    // detached. If this task is dropped or aborted — the runtime-local model of
+    // the coordinator PROCESS dying — the `JoinSet` drops with it and every live
+    // splice is aborted, so an established RELAYED path does not outlive the
+    // coordinator. (A punched direct path touches no coordinator socket, so it
+    // survives — that asymmetry is the invariant.) Detaching the splices (a plain
+    // `tokio::spawn`) would instead let a relay keep forwarding after the
+    // coordinator was gone, a false "relay needs the coordinator" guarantee.
+    let mut relay_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     // Each relay-pair task signals its session id here once it idles out and its
     // sockets are gone. The coordinator can't observe data-plane relay activity
     // (it flows through the spawned splice, not this control socket), so a
@@ -288,6 +324,9 @@ pub async fn run_coordinator_with_idle(sock: UdpSocket, relay_idle: std::time::D
     // back a dead relay port.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<u64>(64);
     loop {
+        // Reap splices that have already idled out so the JoinSet stays bounded;
+        // their `relay_addrs`/session bookkeeping is reclaimed via `done_rx`.
+        while relay_tasks.try_join_next().is_some() {}
         let (n, from) = tokio::select! {
             r = sock.recv_from(&mut buf) => match r {
                 Ok(v) => v,
@@ -330,10 +369,11 @@ pub async fn run_coordinator_with_idle(sock: UdpSocket, relay_idle: std::time::D
                             (Ok(x), Ok(y)) => (x, y),
                             _ => continue,
                         };
-                        // Spawn the opaque splice; when it idles out, signal its
-                        // session id so the coordinator reclaims the entry.
+                        // Spawn the opaque splice INTO the coordinator-owned
+                        // JoinSet; when it idles out, signal its session id so the
+                        // coordinator reclaims the entry.
                         let done = done_tx.clone();
-                        tokio::spawn(async move {
+                        relay_tasks.spawn(async move {
                             run_relay_pair(a, b, relay_idle).await;
                             let _ = done.send(session).await;
                         });
@@ -377,7 +417,7 @@ mod tests {
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
-        let client = NatClient::bind_multi(NodeKey([1u8; 32]), vec![dead_addr, live_addr])
+        let mut client = NatClient::bind_multi(NodeKey([1u8; 32]), vec![dead_addr, live_addr])
             .await
             .unwrap();
         let (idx, reflexive) =
@@ -401,7 +441,7 @@ mod tests {
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
-        let client = NatClient::bind_multi(NodeKey([2u8; 32]), vec![live_addr, dead_addr])
+        let mut client = NatClient::bind_multi(NodeKey([2u8; 32]), vec![live_addr, dead_addr])
             .await
             .unwrap();
         let (idx, reflexive) =
@@ -750,6 +790,164 @@ mod tests {
             got_b.expect("B received A's ciphertext on the fresh relay").as_slice(),
             PAYLOAD,
             "the re-granted relay must be live, not a stale dead port"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_readvertise_supersedes_stale_mapping_over_the_real_udp_path() {
+        // The nonce-gated rebind must be reachable over the LIVE protocol, not
+        // only via the in-process `Coordinator::readvertise` API: a rebound node
+        // sends `Msg::Readvertise` over UDP and a peer re-resolves the new mapping.
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(coord_sock));
+
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let a = NatClient::bind(a_key, coord_addr).await.unwrap();
+        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        // B resolves A's original mapping.
+        let a_first = timeout(Duration::from_secs(2), b.lookup(a_key))
+            .await
+            .expect("no timeout")
+            .expect("lookup a");
+        assert_eq!(a_first.port(), a.local_addr().await.unwrap().port());
+
+        // A rebinds: model the fresh reflexive with a NEW socket, and republish it
+        // over the wire under a strictly-higher nonce. The coordinator observes
+        // the new socket's source and must supersede the stale mapping.
+        let a2 = NatClient::bind(a_key, coord_addr).await.unwrap();
+        let a2_port = a2.local_addr().await.unwrap().port();
+        assert_ne!(a2_port, a_first.port(), "the rebound socket has a fresh port");
+        a2.readvertise(1).await.unwrap();
+
+        // B re-resolves and now sees A's NEW mapping, not the stale one. Poll to
+        // absorb cross-socket datagram-scheduling jitter (bounded).
+        let mut resolved = None;
+        for _ in 0..50 {
+            if let Ok(Ok(addr)) = timeout(Duration::from_millis(100), b.lookup(a_key)).await
+                && addr.port() == a2_port
+            {
+                resolved = Some(addr);
+                break;
+            }
+        }
+        let new = resolved.expect("B must re-resolve A's superseding mapping over the wire");
+        assert_eq!(new.port(), a2_port);
+        assert_ne!(
+            new.port(),
+            a_first.port(),
+            "the wire Readvertise superseded the stale mapping end-to-end"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_repoints_coord_so_join_path_uses_the_live_secondary() {
+        // Discovery failover is worthless if register/lookup/relay still hardcode
+        // the dead primary. After failover, the WHOLE join path must use the
+        // coordinator that answered.
+        let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        tokio::spawn(run_coordinator(live));
+        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+
+        // A joins via failover: primary dead, secondary live.
+        let mut a = NatClient::bind_multi(NodeKey([1u8; 32]), vec![dead_addr, live_addr])
+            .await
+            .unwrap();
+        let (idx, _reflexive) = timeout(
+            Duration::from_secs(2),
+            a.discover_reflexive_failover(Duration::from_millis(150)),
+        )
+        .await
+        .expect("bounded")
+        .expect("secondary answers");
+        assert_eq!(idx, 1, "the live secondary answered discovery");
+
+        // B registers directly with the live secondary.
+        let b_key = NodeKey([2u8; 32]);
+        let b = NatClient::bind(b_key, live_addr).await.unwrap();
+        b.register().await.unwrap();
+
+        // A registers and looks B up. If `self.coord` still pointed at the dead
+        // primary, this Register would land nowhere and the Lookup would hang
+        // (bounded by the timeout) and fail — the whole point of the fix.
+        a.register().await.unwrap();
+        let b_reflexive = timeout(Duration::from_secs(2), a.lookup(b_key))
+            .await
+            .expect("lookup must reach the live secondary, not the dead primary")
+            .expect("b resolved");
+        assert_eq!(
+            b_reflexive.port(),
+            b.local_addr().await.unwrap().port(),
+            "A's join path resolved B via the coordinator that actually answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn established_relay_path_does_not_survive_coordinator_downtime() {
+        // Companion to the allocation-side check: prove an ALREADY-ESTABLISHED
+        // relayed data path stops flowing when the coordinator dies — not merely
+        // that a NEW allocation fails.
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        // Long relay idle: only the coordinator's death — never a self-timeout —
+        // should stop the splice during this test.
+        let coord = tokio::spawn(run_coordinator_with_idle(coord_sock, Duration::from_secs(30)));
+
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let a = NatClient::bind(a_key, coord_addr).await.unwrap();
+        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        let (_s_a, a_relay) = timeout(Duration::from_secs(2), a.request_relay(b_key))
+            .await
+            .expect("no timeout")
+            .expect("grant a");
+        let (_s_b, b_relay) = timeout(Duration::from_secs(2), b.request_relay(a_key))
+            .await
+            .expect("no timeout")
+            .expect("grant b");
+
+        // Establish the relayed data path and PROVE it forwards while the
+        // coordinator lives (so the post-abort stall is a real death, not a path
+        // that never worked). Prime both sources first, then retransmit A->B.
+        const A_PAYLOAD: &[u8] = b"pre-abort-A";
+        a.relay_send(a_relay, A_PAYLOAD).await.unwrap();
+        b.relay_send(b_relay, b"pre-abort-B").await.unwrap();
+        let mut forwarded = false;
+        for _ in 0..50 {
+            a.relay_send(a_relay, A_PAYLOAD).await.unwrap();
+            if let Ok(v) = timeout(Duration::from_millis(100), b.relay_recv()).await {
+                assert_eq!(v.expect("recv").as_slice(), A_PAYLOAD);
+                forwarded = true;
+                break;
+            }
+        }
+        assert!(forwarded, "the relay must forward while the coordinator is alive");
+
+        // The coordinator dies. Because the splice is OWNED by the coordinator
+        // task, aborting it tears the established relay down too.
+        coord.abort();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Flush anything the pre-abort proof loop left buffered in B's socket.
+        while timeout(Duration::from_millis(50), b.relay_recv()).await.is_ok() {}
+
+        // The established relayed path no longer carries data: A's datagrams die
+        // at the now-dead relay port, so B receives nothing within a bounded wait.
+        // This is the RELAYED-non-survival invariant a punched path does NOT share.
+        for _ in 0..5 {
+            let _ = a.relay_send(a_relay, A_PAYLOAD).await;
+        }
+        assert!(
+            timeout(Duration::from_millis(500), b.relay_recv()).await.is_err(),
+            "an established relayed path must die with the coordinator"
         );
     }
 }

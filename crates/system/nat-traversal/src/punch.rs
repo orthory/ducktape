@@ -167,10 +167,14 @@ pub fn drive_rebind_reconnect(
     //    reflexive, which the coordinator observes.
     let new_a_mapped = a_nat.send(internal(&a_key), coord_addr());
 
-    // 4. A re-advertises under a strictly-higher nonce; it must supersede.
-    if coord.readvertise(a_key, new_a_mapped, 1) != crate::AdvertOutcome::Superseded {
-        return Err(PunchError::NoReflexive);
-    }
+    // 4. A re-advertises under a strictly-higher nonce, over the SAME wire
+    //    message + `handle` dispatch the real UDP coordinator loop uses
+    //    (`Msg::Readvertise`), not the in-process `readvertise` shortcut — so the
+    //    deterministic proof exercises the live protocol path. The coordinator
+    //    re-observes `new_a_mapped` as the source and applies the nonce guard.
+    //    Supersession is asserted end-to-end by step 5's re-resolution below (a
+    //    stale mapping would resolve the OLD reflexive and fail `NoReflexive`).
+    let _ = coord.handle(new_a_mapped, Msg::Readvertise { key: a_key, nonce: 1 });
 
     // 5. B re-resolves: its Lookup now returns A's NEW reflexive, and the
     //    coordinator fans out PunchSync to both the new A mapping and B.

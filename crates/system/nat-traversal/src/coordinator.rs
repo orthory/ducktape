@@ -50,6 +50,15 @@ impl Coordinator {
                 self.adverts.observe(key, from);
                 Vec::new()
             }
+            Msg::Readvertise { key, nonce } => {
+                // The wire-level rebind path: a NAT-rebound node re-runs STUN and
+                // republishes its NEW reflexive (the observed `from`, never a
+                // self-reported address) under a strictly-higher `nonce`. The
+                // `AdvertBook` staleness guard rejects an equal-or-lower nonce, so
+                // a replayed/reordered datagram cannot supersede a fresh mapping.
+                self.adverts.readvertise(key, from, nonce);
+                Vec::new()
+            }
             Msg::Lookup { key } => {
                 let target = self.adverts.current(key);
                 let mut out = vec![(from, Msg::LookupResponse { key, reflexive: target })];
@@ -189,6 +198,43 @@ mod tests {
         assert_eq!(c.readvertise(a, addr(1, 7777), 1), AdvertOutcome::Stale);
         let out2 = c.handle(b_src, Msg::Lookup { key: a });
         assert!(out2.contains(&(b_src, Msg::LookupResponse { key: a, reflexive: Some(a_new) })));
+    }
+
+    #[test]
+    fn wire_readvertise_supersedes_and_replayed_register_cannot_roll_it_back() {
+        // Everything here goes through `handle` — the SAME dispatch the real UDP
+        // loop uses — so this proves the nonce-gated rebind is reachable over the
+        // wire protocol, not only via the in-process `readvertise` API.
+        let mut c = Coordinator::new();
+        let a = NodeKey([0xaa; 32]);
+        let b_src = addr(2, 2222);
+        let old = addr(1, 1111);
+        let new = addr(1, 9999);
+
+        // Boot: A registers from its old mapping (implicit nonce 0).
+        assert!(c.handle(old, Msg::Register { key: a }).is_empty());
+
+        // A rebinds and re-advertises the NEW mapping over the wire under nonce 1.
+        assert!(c.handle(new, Msg::Readvertise { key: a, nonce: 1 }).is_empty());
+        let out = c.handle(b_src, Msg::Lookup { key: a });
+        assert!(
+            out.contains(&(b_src, Msg::LookupResponse { key: a, reflexive: Some(new) })),
+            "a wire Readvertise supersedes the stale mapping"
+        );
+
+        // A duplicated/reordered/replayed Register from the OLD mapping arrives
+        // late. It must NOT roll the fresh {new, nonce=1} mapping back to old.
+        assert!(c.handle(old, Msg::Register { key: a }).is_empty());
+        let out2 = c.handle(b_src, Msg::Lookup { key: a });
+        assert!(
+            out2.contains(&(b_src, Msg::LookupResponse { key: a, reflexive: Some(new) })),
+            "a replayed nonce-0 Register must not clobber a higher-nonce readvertised mapping"
+        );
+
+        // A wire Readvertise at an equal-or-lower nonce is likewise stale.
+        assert!(c.handle(old, Msg::Readvertise { key: a, nonce: 1 }).is_empty());
+        let out3 = c.handle(b_src, Msg::Lookup { key: a });
+        assert!(out3.contains(&(b_src, Msg::LookupResponse { key: a, reflexive: Some(new) })));
     }
 
     #[test]
