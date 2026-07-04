@@ -622,6 +622,92 @@ impl Host {
         }
     }
 
+    /// RECOVERY-ONLY selective-commit replay of one block. identical to
+    /// [`Host::submit_at`] — same [`drain`](Self::drain), same deterministic
+    /// execution — except at the boundary it partitions the touched set: a
+    /// module in `commit_only` is committed (its staged writes published),
+    /// every other touched module is ABORTED (its stage discarded).
+    ///
+    /// this exists to heal a TORN block at boot: a block that committed a
+    /// per-block-durable disk substrate (already at its sealed post-root on
+    /// disk) but whose in-memory cohort was rolled back to the checkpoint
+    /// (still at its pre-root). replay re-runs the sealed frame and commits
+    /// ONLY the in-memory cohort — the modules still at pre — while ABORTING
+    /// the disk substrates, because re-committing an already-durable qmdb store
+    /// would MOVE its op-log root and fork this node. the caller (`recovery`)
+    /// computes `commit_only` by per-module root compare and verifies every
+    /// touched module lands on its sealed root afterward.
+    ///
+    /// NOT for the live consensus path: on a live block every touched module
+    /// commits together (that is [`Host::submit_at`]); this reconstructs an
+    /// outcome consensus already sealed and never manufactures new live state.
+    pub async fn submit_at_committing(
+        &mut self,
+        ctx: BlockContext,
+        msg: Msg,
+        commit_only: &BTreeSet<ModuleId>,
+    ) -> Result<BlockOutcome, SubmitError> {
+        let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
+
+        match self.drain(ctx, msg, &mut touched).await {
+            Ok((events, effects, dispatches)) => {
+                // partition the touched set at the boundary: commit the modules
+                // the caller marked (the in-memory cohort still at pre), abort
+                // the rest (disk substrates already durable at post — a
+                // re-commit would move their op-log root and fork). both hooks
+                // run in deterministic registry order; either failing is FATAL.
+                for id in &touched {
+                    if let Some(m) = self.registry.get_mut(id) {
+                        if commit_only.contains(id) {
+                            m.commit_block().await.map_err(|source| {
+                                SubmitError::Fatal(FatalError {
+                                    module: id.clone(),
+                                    phase: BoundaryPhase::Commit,
+                                    source,
+                                })
+                            })?;
+                        } else {
+                            m.abort_block().await.map_err(|source| {
+                                SubmitError::Fatal(FatalError {
+                                    module: id.clone(),
+                                    phase: BoundaryPhase::Abort,
+                                    source,
+                                })
+                            })?;
+                        }
+                    }
+                }
+                Ok(BlockOutcome {
+                    app_hash: self.app_hash(),
+                    events,
+                    effects,
+                    dispatches,
+                })
+            }
+            Err(e) => {
+                // drain failure: identical to submit_at — abort every touched
+                // module, report the first abort fault as fatal else the
+                // deterministic rejection.
+                let mut fatal: Option<FatalError> = None;
+                for id in &touched {
+                    if let Some(m) = self.registry.get_mut(id) {
+                        if let Err(source) = m.abort_block().await {
+                            fatal.get_or_insert(FatalError {
+                                module: id.clone(),
+                                phase: BoundaryPhase::Abort,
+                                source,
+                            });
+                        }
+                    }
+                }
+                match fatal {
+                    Some(f) => Err(SubmitError::Fatal(f)),
+                    None => Err(SubmitError::Rejected(e)),
+                }
+            }
+        }
+    }
+
     /// the block's dispatch DRAIN: route the root op, run its `execute`, and
     /// re-dispatch every emitted follow-up FIFO until the queue empties or the
     /// dispatch budget is hit. modules only STAGE here — nothing is committed;
