@@ -352,6 +352,22 @@ impl Cluster {
         self.nodes[idx] = None; // NodeProc::drop kills + waits
     }
 
+    /// send SIGTERM to node `idx` WITHOUT reaping it — the graceful-quit fault
+    /// the desktop shell injects when it SIGTERMs the daemon on app quit. the
+    /// node's own signal arm should run its final checkpoint and exit 0; the
+    /// caller then reaps via [`Self::wait_exit`]. dependency-free: shells out to
+    /// `kill(1)` on the child pid rather than pulling in libc/nix for one call.
+    pub fn term(&self, idx: usize) {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        let pid = node.child.id();
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success(), "kill -TERM {pid} failed");
+    }
+
     /// the deterministic path of node `idx`'s config file (written by a prior
     /// [`Self::spawn`] / [`Self::spawn_joiner`]) — for verbs that read it.
     pub fn config_file(&self, idx: usize) -> PathBuf {

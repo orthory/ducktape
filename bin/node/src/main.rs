@@ -3865,8 +3865,101 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // itself prints the `upgrade activated …` / `upgrade aborted …` verdict.
         let mut upgrade_armed_latch: Option<(String, u32)> = None;
         let mut upgrade_pending_seen: Option<String> = None;
+
+        // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
+        // shell SIGTERMs the daemon on quit, so it must take the SAME safe path
+        // as an rpc `Shutdown` — a best-effort final manifest + journal barrier
+        // — instead of tearing down mid-block and leaving the disk ahead of the
+        // last in-memory checkpoint (the recovery brick). the streams are made
+        // INSIDE the tokio async context so the signal driver is live; a
+        // failure to install them is non-fatal: log and carry on WITHOUT the
+        // graceful-quit arm rather than aborting daemon boot — a hard SIGKILL /
+        // power loss already lands on the same WAL-forward recovery, so the
+        // worst case of a missing handler is the pre-fix behavior, not a brick.
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "[node {label}] WARN: SIGTERM handler install failed ({e}); \
+                         graceful-quit checkpoint disabled (a hard kill still recovers)"
+                    );
+                    None
+                }
+            };
+        let mut sigint =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "[node {label}] WARN: SIGINT handler install failed ({e}); \
+                         graceful-quit checkpoint disabled (a hard kill still recovers)"
+                    );
+                    None
+                }
+            };
+
+        // the graceful checkpoint sequence, shared by the rpc `Shutdown` arm and
+        // the signal arm so the two can never drift. a macro (not a fn) because
+        // it borrows `node` mutably while reading `orchestrator`/`next_seq` and
+        // `node`'s type is a large generic — it runs on the SAME single-threaded
+        // select loop, so it can never race the periodic checkpoint below.
+        // captures the committed upgrade version fields the same way the periodic
+        // checkpoint does, so a graceful-quit manifest is byte-identical to one.
+        macro_rules! graceful_checkpoint {
+            () => {{
+                if let Some(f) = node.finalized() {
+                    let pos = node.sink_mut().oplog_pos().await;
+                    let (cv, pu) = read_upgrade_version_fields(node.host()).await;
+                    if let Ok(m) = Manifest::capture(
+                        node.host(),
+                        Some(f.height),
+                        orchestrator.epoch(),
+                        orchestrator.epoch_base(),
+                        participant_bytes(&orchestrator),
+                        orchestrator.pending_cutover().map(|c| c.cutover_view()),
+                        cv,
+                        pu,
+                        pos,
+                        next_seq,
+                    ) {
+                        let _ = node.sink_mut().write_manifest(&m).await;
+                    }
+                }
+                let _ = node.sink_mut().sync().await;
+            }};
+        }
         loop {
+            // resolve on whichever signal stream installed; if neither did,
+            // this arm simply never fires (pending forever) and the loop runs
+            // exactly as before the fix.
+            let signalled = async {
+                match (sigterm.as_mut(), sigint.as_mut()) {
+                    (Some(t), Some(i)) => {
+                        let t = t.recv();
+                        let i = i.recv();
+                        futures::pin_mut!(t, i);
+                        futures::future::select(t, i).await;
+                    }
+                    (Some(t), None) => {
+                        t.recv().await;
+                    }
+                    (None, Some(i)) => {
+                        i.recv().await;
+                    }
+                    (None, None) => futures::future::pending::<()>().await,
+                }
+            }
+            .fuse();
+            futures::pin_mut!(signalled);
             futures::select_biased! {
+                _ = signalled => {
+                    println!(
+                        "[node {label}] SIGTERM/SIGINT — graceful checkpoint then exit"
+                    );
+                    graceful_checkpoint!();
+                    std::process::exit(0);
+                }
                 job = rpc_ingress.next() => {
                     let Some((req, reply)) = job else { continue };
                     let resp = match req {
@@ -3916,26 +4009,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // best-effort final checkpoint + journal barrier so
                             // the restart replays a minimal suffix; a failure
                             // here is just the crash path, which also recovers.
-                            if let Some(f) = node.finalized() {
-                                let pos = node.sink_mut().oplog_pos().await;
-                                let (cv, pu) =
-                                    read_upgrade_version_fields(node.host()).await;
-                                if let Ok(m) = Manifest::capture(
-                                    node.host(),
-                                    Some(f.height),
-                                    orchestrator.epoch(),
-                                    orchestrator.epoch_base(),
-                                    participant_bytes(&orchestrator),
-                                    orchestrator.pending_cutover().map(|c| c.cutover_view()),
-                                    cv,
-                                    pu,
-                                    pos,
-                                    next_seq,
-                                ) {
-                                    let _ = node.sink_mut().write_manifest(&m).await;
-                                }
-                            }
-                            let _ = node.sink_mut().sync().await;
+                            // SAME sequence as the signal arm (shared macro).
+                            graceful_checkpoint!();
                             let _ = reply.send(RpcReply::ok());
                             println!("[node {label}] shutdown requested via rpc — exiting");
                             std::process::exit(0);

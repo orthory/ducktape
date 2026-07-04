@@ -28,20 +28,47 @@
 //!   synced, which also makes every earlier append durable). boot ROLLS it
 //!   FORWARD: if the live roots still equal the pre-block vector the frame
 //!   re-applies; if they moved, the apply completed before the crash and the
-//!   block is sealed from the observed roots. a block that touches several
-//!   disk substrates could in principle crash BETWEEN their commits — the
-//!   classic multi-store atomicity limit; today no block commits to more than
-//!   one disk substrate (ops target one module; the only cross-module
-//!   dispatch, governance -> valset, stays in the in-memory cohort). the
-//!   exact fix if that changes: a per-commit height cursor in qmdb's commit
-//!   metadata slot.
+//!   block is sealed from the observed roots.
+//! - a TORN SEALED block: a block whose commit spans substrates with different
+//!   durability — a qmdb store commits to disk PER BLOCK, while the in-memory
+//!   cohort only persists at the periodic checkpoint. a crash (or a hard kill)
+//!   after the disk commit but before the next checkpoint leaves the disk
+//!   substrate at the block's POST root and the in-memory cohort restored to
+//!   its PRE root from the checkpoint. this is no longer "all-or-nothing":
+//!   recovery replays such a block by re-running the sealed frame and
+//!   committing ONLY the still-at-pre modules (a pure state re-commitment,
+//!   deterministic and idempotent) while ABORTING the already-durable ones —
+//!   re-committing a qmdb store would MOVE its op-log root and fork us. the
+//!   per-module root compare (live vs sealed pre/post) decides the partition;
+//!   a changed module at NEITHER pre nor post is genuine damage and still
+//!   fail-stops as [`Error::Torn`], and the recomposed-vs-sealed app-hash
+//!   check is the final backstop.
+//! - a block that touches several DISK substrates could in principle crash
+//!   BETWEEN their commits — the classic multi-store atomicity limit; today no
+//!   block commits to more than one disk substrate (ops target one module; the
+//!   only cross-module dispatch, governance -> valset, stays in the in-memory
+//!   cohort). recovery refuses this EXPLICITLY: only a per-block-durable disk
+//!   substrate can be at its post-root after a crash (the in-memory cohort
+//!   always rolls back to the checkpoint), so two-or-more changed modules at
+//!   post means two-or-more disk substrates committed — a changed set spanning
+//!   >1 disk substrate at mixed roots. selective replay's premise (only the
+//!   in-memory cohort rolled back) no longer holds and its single-frame
+//!   re-execution could read a partially-committed world, so boot fail-stops
+//!   with [`Error::Torn`] at the point it detects this rather than healing and
+//!   leaning on the after-the-fact per-module verify. (a residual case — two
+//!   disk substrates where exactly ONE committed, so only one is at post — is
+//!   indistinguishable by root alone from the healthy single-disk torn block;
+//!   selective replay reconciles it and the per-module post-root verify is the
+//!   backstop that fail-stops rather than forks if the re-execution diverges.)
+//!   the exact fix if a block ever legitimately commits >1 disk substrate: a
+//!   per-commit height cursor in qmdb's commit metadata slot.
 //! - crash between the engine journaling a finalization and the drain: the
 //!   frame's bytes are already durable here — locally-submitted frames are
 //!   pinned at submit time ([`Record::Pinned`]), before the engine can ever
 //!   propose their digest. boot seeds the consensus content store from these
 //!   records so the re-reported finalization resolves and applies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 use commonware_codec::RangeCfg;
@@ -1158,11 +1185,102 @@ where
                             }
                             applied += 1;
                         } else {
-                            return Err(Error::Torn(format!(
-                                "block {height}: touched modules are neither all-applied \
-                                 nor all-unapplied — wipe app state and re-sync (keep the \
-                                 consensus journal)"
-                            )));
+                            // a TORN block: some changed modules are at their
+                            // pre-root (rolled back to the checkpoint — the
+                            // in-memory cohort), others already at their sealed
+                            // post-root (per-block-durable disk substrates that
+                            // committed before the crash). re-run the sealed
+                            // frame but commit ONLY the still-at-pre cohort and
+                            // ABORT the already-durable ones — re-committing a
+                            // qmdb store would move its op-log root and fork us.
+                            let mut commit_only: BTreeSet<ModuleId> = BTreeSet::new();
+                            let mut already_post = 0usize;
+                            for (id, root) in &changed {
+                                // classify each changed module under the SAME split
+                                // version selectors the bulk at_pre/at_post checks
+                                // above use: "still at pre" is read under the
+                                // PREVIOUS height's version, "already at post" under
+                                // THIS block's. a dual-path module's root() switches
+                                // format at an activation boundary, so a single
+                                // selector would misclassify a rolled-back in-memory
+                                // module as neither-pre-nor-post (false Torn brick).
+                                host.set_active_version(pre_version);
+                                let at_pre_root =
+                                    host.module_root(id) == expected.get(id).copied();
+                                host.set_active_version(protocol_version);
+                                let at_post_root = host.module_root(id) == Some(*root);
+                                if at_pre_root {
+                                    commit_only.insert(id.clone());
+                                } else if at_post_root {
+                                    already_post += 1;
+                                }
+                            }
+                            // re-execute and verify under this block's version,
+                            // matching the at_pre replay path above.
+                            host.set_active_version(protocol_version);
+                            // MULTI-DISK atomicity limit — fail-stop EXPLICITLY.
+                            // only a per-block-durable disk substrate can be at
+                            // its POST root after a crash (the in-memory cohort
+                            // always rolls back to the checkpoint pre-root), so
+                            // `already_post` counts exactly the disk substrates
+                            // that committed before the crash. two or more of
+                            // them is a changed set spanning >1 disk substrate at
+                            // mixed roots: the classic multi-store atomicity zone
+                            // whose sealed state may not be internally consistent
+                            // and whose single-frame re-execution can read a
+                            // partially-committed world. selective replay's
+                            // assumption (only the in-memory cohort was rolled
+                            // back) no longer holds, so we refuse it up front
+                            // rather than heal-and-hope the per-module verify
+                            // catches a divergence. no block commits to >1 disk
+                            // substrate today, so this is unreachable in prod;
+                            // the real fix if that changes is a per-commit height
+                            // cursor in the disk substrate's commit metadata.
+                            if already_post >= 2 {
+                                return Err(Error::Torn(format!(
+                                    "block {height}: changed set spans {already_post} \
+                                     per-block-durable disk substrates at mixed roots — the \
+                                     multi-store atomicity limit; single-frame selective replay \
+                                     cannot safely reconcile this. wipe app state and re-sync \
+                                     (keep the consensus journal)"
+                                )));
+                            }
+                            // a changed module at NEITHER pre nor post is
+                            // genuine damage — still fail-stop. so is a torn
+                            // block with nothing left to re-commit (it should
+                            // have been caught by the all-at-post fast path).
+                            if commit_only.len() + already_post != changed.len()
+                                || commit_only.is_empty()
+                            {
+                                return Err(Error::Torn(format!(
+                                    "block {height}: touched modules are neither all-applied \
+                                     nor all-unapplied and cannot be reconciled by selective \
+                                     replay — wipe app state and re-sync (keep the consensus \
+                                     journal)"
+                                )));
+                            }
+                            apply_block_committing(
+                                host,
+                                height,
+                                &frame,
+                                protocol_version,
+                                Some(disposition),
+                                &commit_only,
+                            )
+                            .await?;
+                            // every changed module — the re-committed cohort AND
+                            // the already-durable ones left untouched — must now
+                            // stand at its sealed post-root.
+                            for (id, root) in &changed {
+                                let live = host.module_root(id);
+                                if live != Some(*root) {
+                                    return Err(Error::Verify(format!(
+                                        "torn-block replay {height} left module {id} at \
+                                         {live:?}, sealed root was {root:?}"
+                                    )));
+                                }
+                            }
+                            applied += 1;
                         }
                     }
                     blocks.push((height, roots.clone()));
@@ -1290,6 +1408,50 @@ async fn apply_block(
         if outcome != expect {
             return Err(Error::Verify(format!(
                 "replayed block {height} landed as {outcome:?}, sealed as {expect:?}"
+            )));
+        }
+    }
+    Ok(outcome)
+}
+
+/// re-apply one journaled frame like [`apply_block`], but commit ONLY the
+/// modules in `commit_only` at the block boundary and abort the rest (see
+/// [`Host::submit_at_committing`]). used to heal a TORN block whose disk
+/// substrates are already durable at their sealed post-root: replay re-commits
+/// only the in-memory cohort that was rolled back to the checkpoint.
+async fn apply_block_committing(
+    host: &mut Host,
+    height: u64,
+    frame: &[u8],
+    protocol_version: u32,
+    expect: Option<Disposition>,
+    commit_only: &BTreeSet<ModuleId>,
+) -> Result<Disposition, Error> {
+    let outcome = match decode_frame(frame) {
+        Ok((origin, msg)) => {
+            // stamp the block's effective version exactly like `apply_block`, so a
+            // dual-path module re-executes the sealed frame under the SAME version
+            // the live node did (fork-critical at an activation boundary).
+            let ctx = BlockContext {
+                protocol_version,
+                height,
+                consensus_time: height,
+                origin,
+            };
+            match host.submit_at_committing(ctx, msg, commit_only).await {
+                Ok(_) => Disposition::Applied,
+                Err(SubmitError::Rejected(_)) => Disposition::Rejected,
+                Err(SubmitError::Fatal(f)) => {
+                    return Err(Error::Torn(format!("boundary fault during torn replay: {f}")));
+                }
+            }
+        }
+        Err(_) => Disposition::Rejected,
+    };
+    if let Some(expect) = expect {
+        if outcome != expect {
+            return Err(Error::Verify(format!(
+                "torn-block replay {height} landed as {outcome:?}, sealed as {expect:?}"
             )));
         }
     }

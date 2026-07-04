@@ -58,8 +58,9 @@ base64 = "0.22"
 noded = { path = "../noded" }
 # the app-surface thread runs plain tokio (axum); the node itself stays on
 # commonware's runner. the promoted-validator boot catch-up also uses Tokio's
-# bounded mutex/timeout around the temporary statesync client.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+# bounded mutex/timeout around the temporary statesync client; `signal` drives
+# the SIGTERM/SIGINT graceful-checkpoint arm of the run loop.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal"] }
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
