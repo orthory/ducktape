@@ -364,23 +364,44 @@ mod tests {
         assert_ne!(a_relay, b_relay, "one relay port per side");
 
         // The relay learns a side's source on its first datagram, so the far
-        // side's source must already be known before a payload can be
-        // forwarded (real WireGuard retransmits). Sequence the sends: B first
-        // (learned, dropped), then A (A->B delivered), then B again (B->A).
-        b.relay_send(b_relay, b"drop-until-a-known").await.unwrap();
-        a.relay_send(a_relay, b"opaque-ciphertext-A").await.unwrap();
-        let got_b = timeout(Duration::from_secs(2), b.relay_recv())
-            .await
-            .expect("no timeout")
-            .expect("recv b");
-        assert_eq!(got_b, b"opaque-ciphertext-A");
+        // side's source must be known before a payload can be forwarded, and
+        // that first datagram is dropped. `run_relay_pair`'s `tokio::select!`
+        // also processes the two sockets in a nondeterministic order when both
+        // are ready, so a fixed send sequence cannot guarantee delivery. Model
+        // real WireGuard, which simply retransmits until a reply arrives: each
+        // side re-sends its OWN opaque payload until the far side receives it.
+        // `a` only ever emits `A_PAYLOAD` and `b` only ever emits `B_PAYLOAD`,
+        // and the relay only forwards a->b and b->a, so whatever a side
+        // receives is unambiguously the peer's ciphertext.
+        const A_PAYLOAD: &[u8] = b"opaque-ciphertext-A";
+        const B_PAYLOAD: &[u8] = b"opaque-ciphertext-B";
 
-        b.relay_send(b_relay, b"opaque-ciphertext-B").await.unwrap();
-        let got_a = timeout(Duration::from_secs(2), a.relay_recv())
-            .await
-            .expect("no timeout")
-            .expect("recv a");
-        assert_eq!(got_a, b"opaque-ciphertext-B");
+        // Prime both sources so each direction can eventually forward.
+        a.relay_send(a_relay, A_PAYLOAD).await.unwrap();
+        b.relay_send(b_relay, B_PAYLOAD).await.unwrap();
+
+        // A -> B, retransmitting until B receives A's ciphertext (bounded so a
+        // genuinely broken relay fails fast instead of hanging CI).
+        let mut got_b = None;
+        for _ in 0..50 {
+            a.relay_send(a_relay, A_PAYLOAD).await.unwrap();
+            if let Ok(v) = timeout(Duration::from_millis(100), b.relay_recv()).await {
+                got_b = Some(v.expect("recv b"));
+                break;
+            }
+        }
+        assert_eq!(got_b.expect("B received A's ciphertext").as_slice(), A_PAYLOAD);
+
+        // B -> A, retransmitting until A receives B's ciphertext.
+        let mut got_a = None;
+        for _ in 0..50 {
+            b.relay_send(b_relay, B_PAYLOAD).await.unwrap();
+            if let Ok(v) = timeout(Duration::from_millis(100), a.relay_recv()).await {
+                got_a = Some(v.expect("recv a"));
+                break;
+            }
+        }
+        assert_eq!(got_a.expect("A received B's ciphertext").as_slice(), B_PAYLOAD);
     }
 
     #[tokio::test]
