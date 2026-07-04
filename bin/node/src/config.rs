@@ -247,6 +247,10 @@ impl NetworkDescriptor {
     /// MALFORMED entry (no `@`, bad key) is a config error; a hint that does not
     /// resolve, or resolves to an unspecified ip / port 0, is advisory and
     /// skipped rather than failing startup.
+    // retained as descriptor API (and exercised by tests) though the live dial
+    // path now goes through `reach_entries`, which synthesises the same Direct
+    // entries from `bootstrap` when `reach` is empty.
+    #[allow(dead_code)]
     pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, SocketAddr)>, String> {
         use std::net::ToSocketAddrs as _;
         let mut out = Vec::new();
@@ -308,6 +312,10 @@ impl NetworkDescriptor {
     /// record a reach hint for a member, replacing any previous hint for the
     /// same expected key (a member's reach can move/upgrade). keeps the list
     /// sorted for stable file diffs — mirrors [`NetworkDescriptor::add_bootstrap`].
+    // forward-looking API: the founder/member gains a `Coordinated`/`Fronted`
+    // reach via this in Slice 2/4; Slice 1's CLI only ever calls `add_bootstrap`,
+    // so it is currently exercised only by tests.
+    #[allow(dead_code)]
     pub fn add_reach(&mut self, hint: &ReachHint) {
         let ek = hex_bytes(hint.expected_key.as_ref());
         self.reach.retain(|s| {
@@ -317,6 +325,30 @@ impl NetworkDescriptor {
         });
         self.reach.push(hint.to_canonical());
         self.reach.sort();
+    }
+
+    /// reach hints resolved to `(expected_key, dial_addr)`: what a joiner dials
+    /// and the identity it must end up authenticating end-to-end. `Direct`/
+    /// `Fronted` dial the hint's own address; `Coordinated` dials the COORDINATOR
+    /// while still expecting the target's key. advisory: an unresolvable or
+    /// unspecified/port-0 hint is skipped, mirroring [`NetworkDescriptor::bootstrap_entries`].
+    pub fn reach_entries(&self) -> Result<Vec<(ed25519::PublicKey, SocketAddr)>, String> {
+        use std::net::ToSocketAddrs as _;
+        let mut out = Vec::new();
+        for hint in self.reach_hints()? {
+            let dial = match &hint.reach {
+                Reach::Direct(a) | Reach::Fronted(a) => a,
+                Reach::Coordinated(c) => &c.coord_addr,
+            };
+            let Some(addr) = dial.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+                continue; // unresolvable (stale DNS, offline) — advisory, skip.
+            };
+            if addr.ip().is_unspecified() || addr.port() == 0 {
+                continue;
+            }
+            out.push((hint.expected_key.clone(), addr));
+        }
+        Ok(out)
     }
 }
 
@@ -1029,7 +1061,10 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     if validators.is_empty() {
         return Err(format!("network {} has no validators", descriptor.chain_id));
     }
-    let bootstrap = descriptor.bootstrap_entries()?;
+    // one dial source of truth: reach_entries() falls through to bootstrap
+    // synthesis for v2/legacy descriptors, so existing behaviour is preserved
+    // and Coordinated/Fronted hints route their dial target correctly.
+    let bootstrap = descriptor.reach_entries()?;
     // mesh = validators ∪ bootstrap identities. A fresh network-shape joiner
     // may be outside this set at genesis; it parks until governance admits it.
     let mut mesh = validators.clone();
@@ -1813,7 +1848,7 @@ bootstrapper_addr = "127.0.0.1:52200"
         let (inviter, d) = v3_fixture(5_000);
         let mut bytes = pack_invite_v3(&d, &inviter, 5_000).unwrap();
         // flip one byte inside the first reach hint's expected_key region.
-        let cid = d.chain_id.as_bytes().len();
+        let cid = d.chain_id.len();
         let flip = 1 + 1 + cid + 1 + 32 * d.validators.len() + 1 + 1; // into expected_key
         bytes[flip] ^= 0x01;
         let blob = format!("{INVITE_PREFIX_V3}{}", INVITE_B64.encode(bytes));
@@ -1913,5 +1948,46 @@ bootstrapper_addr = "127.0.0.1:52200"
         assert_eq!(invite_expiry(0, 1).unwrap(), 86_400);
         assert!(invite_expiry(0, u64::MAX).is_err(), "absurd ttl errors, never overflows");
         assert!(invite_expiry(u64::MAX, 1).is_err(), "expiry overflow errors");
+    }
+
+    // ---- Task 7: reach resolution to dial targets ----
+
+    #[test]
+    fn coordinated_hint_resolves_dial_target_to_coord_addr_with_expected_key() {
+        let target = ed25519::PrivateKey::from_seed(71).public_key();
+        let coord = ed25519::PrivateKey::from_seed(72).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "co#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(target.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        // dial the coordinator's socket, but the identity we expect is the TARGET.
+        d.add_reach(&ReachHint {
+            expected_key: target.clone(),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "127.0.0.1:59999".into(), coord_key: coord }),
+        });
+        let entries = d.reach_entries().expect("resolve");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, target); // expect target key
+        assert_eq!(entries[0].1, "127.0.0.1:59999".parse().unwrap()); // dial coordinator
+    }
+
+    #[test]
+    fn reach_entries_falls_back_to_bootstrap_for_v2_and_skips_unresolvable() {
+        let a = ed25519::PrivateKey::from_seed(73).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "co#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        d.add_bootstrap(&a, "127.0.0.1:52200"); // resolvable
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("127.0.0.1:52200".into()) });
+        // reach present -> parsed from reach; the direct entry resolves.
+        let entries = d.reach_entries().unwrap();
+        assert_eq!(entries, vec![(a, "127.0.0.1:52200".parse().unwrap())]);
     }
 }
