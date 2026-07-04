@@ -27,8 +27,10 @@ use serde::{Deserialize, Serialize};
 /// (see `ConsensusScheme`); anything else is a build from the future.
 pub const SCHEME_ED25519: &str = "ed25519";
 
-/// the v2 invite prefix (PARSE-ONLY now — no production encoder). a v2 paste
-/// still decodes to all-`Direct`, unsigned reach hints for backward compat.
+/// the v2 invite prefix. v2 is UNSIGNED and no longer decodes (flag-day) — the
+/// prefix is still recognised so a v2 paste gets a targeted "re-issue as v3"
+/// error instead of a generic one. a test-only encoder still synthesises v2
+/// blobs to prove the join path refuses them.
 const INVITE_PREFIX_V2: &str = "ducktape-invite-v2:";
 /// the v3 invite prefix; a v3 paste is visibly distinct from v2 and the two are
 /// never confusable (prefix and payload version byte must agree on decode).
@@ -521,12 +523,18 @@ impl ReachHint {
 // embedded public key, and a domain-separated ed25519 signature over the whole
 // envelope. decode FAILS CLOSED: it verifies the signature against the embedded
 // key, requires that key to be a genesis validator, and rejects an expired blob.
-// v2 remains PARSE-ONLY (a v2 paste decodes to all-`Direct`, unsigned hints);
-// v3 and v2 are never confusable — distinct prefix AND version byte, which must
-// agree on decode. flag-day: v1 blobs no longer decode.
+// v2 is REJECTED on decode (SECURITY, Slice 1 review: a v2 blob is unsigned, so
+// trusting one would let an attacker downgrade past v3's signature and persist an
+// arbitrary descriptor). the production v2 parser is gone; only a test-only v2
+// encoder survives, to prove the join path refuses a well-formed v2 blob. v3 and
+// v2 stay non-confusable — distinct prefix AND version byte. flag-day: v1 AND v2
+// blobs no longer decode; v3 is the only invite a joiner trusts.
 // ============================================================================
 
-/// v2 invite payload format tag (the first packed byte). parse-only.
+/// v2 invite payload format tag (the first packed byte). test-only now: v2 no
+/// longer decodes in production, so this tag is used only by the test-only v2
+/// encoder that synthesises blobs to prove the join path refuses them.
+#[cfg(test)]
 const INVITE_VERSION_V2: u8 = 2;
 /// v3 invite payload format tag (the first packed byte). the production encoder.
 const INVITE_VERSION_V3: u8 = 3;
@@ -577,33 +585,33 @@ pub fn decode_invite(blob: &str) -> Result<NetworkDescriptor, String> {
 fn decode_invite_at(blob: &str, now_unix: u64) -> Result<NetworkDescriptor, String> {
     use base64::Engine as _;
     let blob = blob.trim();
-    // choose the codec by prefix; the payload version byte must AGREE (defence in
-    // depth: a v2 payload can never ride under a v3 prefix, or vice-versa).
-    let (body, prefix_version) = if let Some(b) = blob.strip_prefix(INVITE_PREFIX_V3) {
-        (b, INVITE_VERSION_V3)
-    } else if let Some(b) = blob.strip_prefix(INVITE_PREFIX_V2) {
-        (b, INVITE_VERSION_V2)
+    // v3 is the ONLY invite a joiner will trust. SECURITY (Slice 1 review): an
+    // unsigned v2 blob carries no inviter signature, domain tag, or expiry, so
+    // accepting one would let an attacker downgrade past v3 authentication and
+    // have `cmd_join` persist an arbitrary, unauthenticated descriptor. v2 is
+    // still recognised by prefix only to emit a targeted "re-issue as v3" error
+    // (never a decode) instead of a generic "not a ducktape invite".
+    let body = if let Some(b) = blob.strip_prefix(INVITE_PREFIX_V3) {
+        b
+    } else if blob.starts_with(INVITE_PREFIX_V2) {
+        return Err("this is an unsigned v2 invite, which is no longer accepted — \
+                    ask the inviter to re-issue a signed v3 invite"
+            .into());
     } else {
-        return Err(format!(
-            "not a ducktape invite (expected {INVITE_PREFIX_V3}... or {INVITE_PREFIX_V2}...)"
-        ));
+        return Err(format!("not a ducktape invite (expected {INVITE_PREFIX_V3}...)"));
     };
     let bytes = INVITE_B64
         .decode(body)
         .map_err(|e| format!("invite is not valid base64url: {e}"))?;
+    // defence in depth: the payload version byte must AGREE with the v3 prefix,
+    // so a non-v3 payload can never ride in under a v3 prefix.
     let version = *bytes.first().ok_or("invite payload is empty")?;
-    if version != prefix_version {
+    if version != INVITE_VERSION_V3 {
         return Err(format!(
-            "invite prefix is v{prefix_version} but payload is v{version}"
+            "invite prefix is v{INVITE_VERSION_V3} but payload is v{version}"
         ));
     }
-    match version {
-        INVITE_VERSION_V2 => unpack_invite_v2(&bytes),
-        INVITE_VERSION_V3 => unpack_invite_v3(&bytes, now_unix),
-        other => Err(format!(
-            "unsupported invite version {other} (this build reads v{INVITE_VERSION_V2}/v{INVITE_VERSION_V3})"
-        )),
-    }
+    unpack_invite_v3(&bytes, now_unix)
 }
 
 /// pack a descriptor into the v3 payload and sign it. reach hints come from
@@ -738,48 +746,9 @@ fn unpack_invite_v3(bytes: &[u8], now_unix: u64) -> Result<NetworkDescriptor, St
     })
 }
 
-/// inverse of the v2 packer (PARSE-ONLY in production). yields a descriptor
-/// canonicalized exactly as [`NetworkDescriptor::from_toml`] would so the
-/// genesis fingerprint of a decoded v2 invite matches the founder's. carries
-/// `bootstrap` (not `reach`); [`NetworkDescriptor::reach_hints`] synthesises
-/// all-`Direct` hints from it.
-fn unpack_invite_v2(bytes: &[u8]) -> Result<NetworkDescriptor, String> {
-    let mut r = InviteReader::new(bytes);
-    let version = r.u8()?;
-    debug_assert_eq!(version, INVITE_VERSION_V2);
-    let cid_len = r.u8()? as usize;
-    let chain_id = String::from_utf8(r.take(cid_len)?.to_vec()).map_err(|e| format!("chain_id: {e}"))?;
-
-    let vcount = r.u8()? as usize;
-    let mut validators = Vec::with_capacity(vcount);
-    for _ in 0..vcount {
-        validators.push(hex_bytes(r.take(32)?));
-    }
-    validators.sort();
-
-    let bcount = r.u8()? as usize;
-    let mut bootstrap = Vec::with_capacity(bcount);
-    for _ in 0..bcount {
-        let key = hex_bytes(r.take(32)?);
-        let hp_len = r.u8()? as usize;
-        let host_port =
-            std::str::from_utf8(r.take(hp_len)?).map_err(|e| format!("bootstrap addr: {e}"))?;
-        bootstrap.push(format!("{key}@{host_port}"));
-    }
-    if !r.done() {
-        return Err("invite payload has trailing bytes".into());
-    }
-    Ok(NetworkDescriptor {
-        chain_id,
-        scheme: SCHEME_ED25519.into(),
-        validators,
-        bootstrap,
-        reach: Vec::new(),
-    })
-}
-
-/// test-only v2 encoder — v2 is PARSE-ONLY in production, but tests must be able
-/// to synthesise real v2 blobs to prove parse-compatibility and non-confusability.
+/// test-only v2 encoder — v2 no longer decodes in production, but tests must be
+/// able to synthesise real v2 blobs to prove the join path refuses them and that
+/// v2/v3 stay non-confusable.
 #[cfg(test)]
 fn encode_invite_v2(d: &NetworkDescriptor) -> Result<String, String> {
     use base64::Engine as _;
@@ -1210,9 +1179,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_invite_blob_roundtrips_the_descriptor() {
-        // v2 is parse-only in production; the test-only encoder lets us prove a
-        // real v2 blob still round-trips through the (unsigned) v2 decode path.
+    fn v2_invite_blob_is_rejected_by_the_join_path() {
+        // SECURITY (Slice 1 review): a well-formed, unsigned v2 blob carries no
+        // inviter signature, domain tag, or expiry — so the production decode
+        // path (what `cmd_join` calls before persisting network.toml) must
+        // REFUSE it. Otherwise an attacker downgrades past v3 authentication and
+        // has the joiner trust an arbitrary chain_id/validator-set/bootstrap.
+        // The test-only encoder synthesises a real v2 blob to prove the refusal.
         let me = ed25519::PrivateKey::from_seed(7).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
@@ -1222,21 +1195,9 @@ mod tests {
             reach: vec![],
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
-        let decoded = decode_invite(&encode_invite_v2(&d).expect("encode")).expect("roundtrip");
-        assert_eq!(decoded, d);
-
-        // a HOSTNAME dial hint survives the compact encode/decode verbatim (it is
-        // stored as a string and resolved only at dial time).
-        let other = ed25519::PrivateKey::from_seed(8).public_key();
-        d.add_bootstrap(&other, "node.ducktape.industries:443");
-        let decoded = decode_invite(&encode_invite_v2(&d).expect("encode")).expect("roundtrip");
-        assert_eq!(decoded, d);
-        assert!(
-            decoded
-                .bootstrap
-                .iter()
-                .any(|b| b.ends_with("@node.ducktape.industries:443"))
-        );
+        let blob = encode_invite_v2(&d).expect("encode");
+        let err = decode_invite(&blob).expect_err("a v2 blob must be refused, never trusted");
+        assert!(err.contains("v2"), "error names the rejected version: {err}");
     }
 
     #[test]
@@ -1884,10 +1845,13 @@ bootstrapper_addr = "127.0.0.1:52200"
         assert!(decode_invite_at(&blob, 4_000).is_err(), "truncation rejected");
     }
 
-    // ---- Task 6: v2 parse-only + non-confusability ----
+    // ---- Task 6: v2 rejected (no downgrade) + non-confusability ----
 
     #[test]
-    fn v2_blob_decodes_to_all_direct_unsigned_hints() {
+    fn v2_blob_is_refused_before_it_can_be_trusted() {
+        // a v2 paste is unsigned; `decode_invite_at` refuses it up front (there
+        // is no signature/expiry to trust) with a targeted "re-issue as v3"
+        // error, and never returns a descriptor a caller could persist.
         let a = ed25519::PrivateKey::from_seed(61).public_key();
         let b = ed25519::PrivateKey::from_seed(62).public_key();
         let mut d = NetworkDescriptor {
@@ -1903,13 +1867,8 @@ bootstrapper_addr = "127.0.0.1:52200"
 
         let blob = encode_invite_v2(&d).expect("v2 encode (test-only)");
         assert!(blob.starts_with(INVITE_PREFIX_V2));
-        let got = decode_invite_at(&blob, 4_000).expect("v2 decodes, no signature/expiry");
-        assert_eq!(got.bootstrap, d.bootstrap);
-        assert!(got.reach.is_empty(), "v2 stores no explicit reach");
-        // the TYPED view is all-Direct.
-        let hints = got.reach_hints().unwrap();
-        assert_eq!(hints.len(), 2);
-        assert!(hints.iter().all(|h| matches!(h.reach, Reach::Direct(_))));
+        let err = decode_invite_at(&blob, 4_000).expect_err("v2 is refused, not decoded");
+        assert!(err.contains("v3"), "error steers to a signed v3 invite: {err}");
     }
 
     #[test]
@@ -1928,15 +1887,17 @@ bootstrapper_addr = "127.0.0.1:52200"
 
         let v3 = pack_invite_v3(&d, &inviter, 5_000).unwrap();
         let v2 = pack_invite_v2(&d).unwrap();
-        // a v3 payload under a v2 prefix (and vice-versa) is rejected on the agreement check.
+        // a v3 payload under a v2 prefix is refused as a v2 paste; a v2 payload
+        // under a v3 prefix is refused on the version-agreement check. neither
+        // can be confused for a trusted v3 invite.
         let mislabelled_v3 = format!("{INVITE_PREFIX_V2}{}", INVITE_B64.encode(&v3));
         let mislabelled_v2 = format!("{INVITE_PREFIX_V3}{}", INVITE_B64.encode(&v2));
         assert!(decode_invite_at(&mislabelled_v3, 4_000).is_err());
         assert!(decode_invite_at(&mislabelled_v2, 4_000).is_err());
-        // an unknown version tag is rejected.
-        let mut bogus = v2.clone();
+        // an unknown version byte under the v3 prefix is rejected on agreement.
+        let mut bogus = v3.clone();
         bogus[0] = 9;
-        let blob = format!("{INVITE_PREFIX_V2}{}", INVITE_B64.encode(bogus));
+        let blob = format!("{INVITE_PREFIX_V3}{}", INVITE_B64.encode(bogus));
         assert!(decode_invite_at(&blob, 4_000).is_err());
         // a garbage prefix is rejected.
         assert!(decode_invite_at("ducktape-invite-v1:AAAA", 4_000).is_err());
