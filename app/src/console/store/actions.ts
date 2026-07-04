@@ -75,6 +75,11 @@ export interface ConsoleActions {
   openThread(rootSeq: number): void;
   closeThread(): void;
   replyInThread(body: string): void;
+  /** Replace our own message's text (EditMessage). The module rejects edits
+   *  from a non-author, so this is only surfaced on own messages. */
+  editMessage(seq: number, body: string): void;
+  /** Tombstone our own message (DeleteMessage). Author-gated by the module. */
+  deleteMessage(seq: number): void;
   /** Toggle our own reaction on a message: adds it if we haven't reacted with
    *  that emoji yet, removes it if we have. Refreshes the open thread panel
    *  too, since its replies are a separate snapshot from `state.messages`. */
@@ -192,6 +197,23 @@ export function createActions({
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
       .then((messages) => patch({ messages }))
+      .catch(fail);
+  };
+
+  // Re-pull the open thread's own ChatThread snapshot after a write that may
+  // have touched the root or a reply. `submitThenRefresh` already refreshed the
+  // flat `state.messages` (every sequence, replies included), but the thread
+  // panel reads a separate snapshot, so it needs this extra cheap re-query.
+  const resyncOpenThread = (): Promise<void> => {
+    const live = getNode();
+    const channelId = getState().activeChannel;
+    const root = getState().activeThread?.root;
+    if (!live || !channelId || !root) return Promise.resolve();
+    return chatClient
+      .thread(live, { channelId, rootSeq: root.seq })
+      .then((activeThread) =>
+        update((prev) => (prev.activeThread?.root.seq === root.seq ? { activeThread } : {})),
+      )
       .catch(fail);
   };
 
@@ -362,6 +384,34 @@ export function createActions({
           )
           .catch(fail);
       });
+    },
+
+    editMessage: (seq, body) => {
+      const channelId = getState().activeChannel;
+      if (!channelId || !body.trim()) return;
+      const activeThread = getState().activeThread;
+      const target =
+        getState().messages.find((m) => m.seq === seq) ??
+        (activeThread?.root.seq === seq
+          ? activeThread.root
+          : activeThread?.replies.find((m) => m.seq === seq));
+      submitThenRefresh((live) =>
+        chatClient.editMessage(live, {
+          channelId,
+          seq,
+          text: body.trim(),
+          baseRev: target?.head.rev ?? null,
+          origin: getState().author,
+        }),
+      ).then(resyncOpenThread);
+    },
+
+    deleteMessage: (seq) => {
+      const channelId = getState().activeChannel;
+      if (!channelId) return;
+      submitThenRefresh((live) =>
+        chatClient.deleteMessage(live, { channelId, seq, origin: getState().author }),
+      ).then(resyncOpenThread);
     },
 
     toggleReaction: (seq, emoji) => {

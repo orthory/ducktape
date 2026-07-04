@@ -7,9 +7,9 @@
 import { useEffect, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
-import { authorName } from "../../../domain/chat-client";
+import { authorName, blocksText } from "../../../domain/chat-client";
 import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../../../domain/chat-client";
-import { hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
+import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
 import { HoverButton } from "./HoverButton";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -58,6 +58,23 @@ function RefGlyph({ size = 13 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
       <path d="M8 4.5h8a2 2 0 0 1 2 2v13l-6-3-6 3v-13a2 2 0 0 1 2-2z" />
+    </svg>
+  );
+}
+
+function PencilGlyph({ size = 13 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 20h4l10.5-10.5a2 2 0 0 0-2.8-2.8L5 17v3z" />
+      <path d="M13.5 6.5l4 4" />
+    </svg>
+  );
+}
+
+function TrashGlyph({ size = 13 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 7h14M10 7V5.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V7M6.5 7l.8 11a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-11" />
     </svg>
   );
 }
@@ -303,6 +320,140 @@ function ThreadIndicator({
   );
 }
 
+// ── Inline edit box + delete confirm ─────────────────────
+
+function EditBox({
+  draft,
+  onChange,
+  onSave,
+  onCancel,
+}: {
+  draft: string;
+  onChange: (value: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div style={{ marginTop: 2 }}>
+      <textarea
+        autoFocus
+        value={draft}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          } else if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            onSave();
+          }
+        }}
+        rows={Math.min(8, Math.max(1, draft.split("\n").length))}
+        style={{
+          width: "100%",
+          boxSizing: "border-box",
+          resize: "vertical",
+          padding: "8px 10px",
+          borderRadius: radius.sm,
+          border: `1px solid ${accentVar}`,
+          background: color.paper,
+          font: `400 13.5px ${font.sans}`,
+          color: color.ink,
+          lineHeight: 1.5,
+          outline: "none",
+        }}
+      />
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+        <button
+          type="button"
+          onClick={onSave}
+          style={{
+            all: "unset",
+            cursor: "pointer",
+            padding: "5px 12px",
+            borderRadius: radius.sm,
+            background: color.dark,
+            color: color.onDark,
+            font: `600 11.5px ${font.sans}`,
+          }}
+        >
+          Save
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          style={{
+            all: "unset",
+            cursor: "pointer",
+            padding: "5px 10px",
+            borderRadius: radius.sm,
+            color: color.muted3,
+            font: `500 11.5px ${font.sans}`,
+          }}
+        >
+          Cancel
+        </button>
+        <span style={{ font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
+          Enter to save · Esc to cancel
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function DeleteConfirm({ onConfirm, onCancel }: { onConfirm: () => void; onCancel: () => void }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        marginTop: 6,
+        padding: "7px 11px",
+        borderRadius: radius.sm,
+        border: `1px solid ${color.dangerBorder}`,
+        background: color.dangerSoft,
+        maxWidth: "100%",
+      }}
+    >
+      <span style={{ flex: 1, font: `400 12px ${font.sans}`, color: color.danger, minWidth: 0 }}>
+        Delete this message? This can't be undone.
+      </span>
+      <button
+        type="button"
+        onClick={onConfirm}
+        style={{
+          all: "unset",
+          cursor: "pointer",
+          padding: "4px 11px",
+          borderRadius: radius.sm,
+          background: color.danger,
+          color: "#fff",
+          font: `600 11.5px ${font.sans}`,
+          flexShrink: 0,
+        }}
+      >
+        Delete
+      </button>
+      <button
+        type="button"
+        onClick={onCancel}
+        style={{
+          all: "unset",
+          cursor: "pointer",
+          padding: "4px 8px",
+          borderRadius: radius.sm,
+          color: color.muted3,
+          font: `500 11.5px ${font.sans}`,
+          flexShrink: 0,
+        }}
+      >
+        Cancel
+      </button>
+    </div>
+  );
+}
+
 // ── Hover action bar + overflow menu ─────────────────────
 
 function MenuRow({
@@ -380,18 +531,49 @@ function CopyMenuRow({
   );
 }
 
+function DangerMenuRow({ label, icon, onClick }: { label: string; icon: ReactNode; onClick: () => void }) {
+  return (
+    <HoverButton
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        width: "100%",
+        padding: "7px 9px",
+        borderRadius: radius.sm,
+        font: `400 12.5px ${font.sans}`,
+        color: color.danger,
+      }}
+      hoverStyle={{ background: color.dangerSoft }}
+    >
+      <span style={{ display: "flex" }}>{icon}</span>
+      <span>{label}</span>
+    </HoverButton>
+  );
+}
+
 function OverflowMenu({
   onClose,
   onReplyInThread,
   copyLinkValue,
   copyRefValue,
   threadable,
+  canModify,
+  onStartEdit,
+  onStartDelete,
 }: {
   onClose: () => void;
   onReplyInThread: () => void;
   copyLinkValue: string;
   copyRefValue: string;
   threadable: boolean;
+  canModify: boolean;
+  onStartEdit: () => void;
+  onStartDelete: () => void;
 }) {
   // Escape closes it; an outside click does too — but the listener attaches
   // one tick late so the click that OPENED the menu doesn't immediately
@@ -437,6 +619,27 @@ function OverflowMenu({
       )}
       <CopyMenuRow label="Copy link" icon={<LinkGlyph size={13} />} value={copyLinkValue} onDone={onClose} />
       <CopyMenuRow label="Copy reference" icon={<RefGlyph size={13} />} value={copyRefValue} onDone={onClose} />
+      {canModify && (
+        <>
+          <div style={{ height: 1, background: color.borderSoft, margin: "4px 6px" }} />
+          <MenuRow
+            label="Edit message"
+            icon={<PencilGlyph size={13} />}
+            onClick={() => {
+              onStartEdit();
+              onClose();
+            }}
+          />
+          <DangerMenuRow
+            label="Delete message"
+            icon={<TrashGlyph size={13} />}
+            onClick={() => {
+              onStartDelete();
+              onClose();
+            }}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -523,6 +726,8 @@ export function MessageItem({
   onMenuToggle,
   onOpenThread,
   onReact,
+  onEdit,
+  onDelete,
   threadable = true,
 }: {
   message: MessageView;
@@ -540,6 +745,10 @@ export function MessageItem({
   onMenuToggle: (open: boolean) => void;
   onOpenThread: () => void;
   onReact: (emoji: string) => void;
+  /** Replace this message's text (author-gated; only offered on own messages). */
+  onEdit: (text: string) => void;
+  /** Tombstone this message (author-gated; only offered on own messages). */
+  onDelete: () => void;
   /** False inside the ThreadPanel — a thread reply can't itself spawn a
    *  nested thread, so the thread affordances are hidden there. */
   threadable?: boolean;
@@ -547,7 +756,26 @@ export function MessageItem({
   const author = authorName(message.head.author, names);
   const deleted = message.head.deleted;
   const replyCount = message.head.reply_count;
-  const showBar = (hovered || menuOpen) && !deleted;
+  // A message we authored can be edited/deleted — the module rejects the write
+  // from anyone else, so the affordances are hidden rather than shown-and-failing.
+  const canModify = !deleted && authorKey(message.head.author) === selfKey;
+  const [editing, setEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState("");
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+
+  const startEdit = () => {
+    setConfirmingDelete(false);
+    setEditDraft(blocksText(message.head.blocks));
+    setEditing(true);
+  };
+  const saveEdit = () => {
+    const next = editDraft.trim();
+    if (next) onEdit(next);
+    setEditing(false);
+  };
+  // Hide the hover bar while editing/confirming so the row's action UI is the
+  // sole focus and the floating bar can't overlap the textarea.
+  const showBar = (hovered || menuOpen) && !deleted && !editing && !confirmingDelete;
 
   return (
     <div
@@ -614,10 +842,25 @@ export function MessageItem({
             wordBreak: "break-word",
           }}
         >
-          {deleted ? <span style={{ fontStyle: "italic" }}>message deleted</span> : renderBlocks(message.head.blocks, names)}
+          {deleted ? (
+            <span style={{ fontStyle: "italic" }}>message deleted</span>
+          ) : editing ? (
+            <EditBox draft={editDraft} onChange={setEditDraft} onSave={saveEdit} onCancel={() => setEditing(false)} />
+          ) : (
+            renderBlocks(message.head.blocks, names)
+          )}
         </div>
-        {!deleted && <ReactionsRow message={message} selfKey={selfKey} onReact={onReact} />}
-        {!deleted && threadable && replyCount > 0 && (
+        {confirmingDelete && (
+          <DeleteConfirm
+            onConfirm={() => {
+              onDelete();
+              setConfirmingDelete(false);
+            }}
+            onCancel={() => setConfirmingDelete(false)}
+          />
+        )}
+        {!deleted && !editing && <ReactionsRow message={message} selfKey={selfKey} onReact={onReact} />}
+        {!deleted && !editing && threadable && replyCount > 0 && (
           <ThreadIndicator replyCount={replyCount} replyHint={replyHint} onClick={onOpenThread} />
         )}
       </div>
@@ -636,6 +879,9 @@ export function MessageItem({
           copyLinkValue={linkRef}
           copyRefValue={refRef}
           threadable={threadable}
+          canModify={canModify}
+          onStartEdit={startEdit}
+          onStartDelete={() => setConfirmingDelete(true)}
         />
       )}
     </div>

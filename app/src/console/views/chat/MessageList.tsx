@@ -35,6 +35,8 @@ export function MessageList({
   onMenuToggle,
   onOpenThread,
   onReact,
+  onEdit,
+  onDelete,
 }: {
   channelName: string;
   /** Every sequence of the active channel (roots + replies + tombstones) —
@@ -52,6 +54,8 @@ export function MessageList({
   onMenuToggle: (seq: number | null) => void;
   onOpenThread: (seq: number) => void;
   onReact: (seq: number, emoji: string) => void;
+  onEdit: (seq: number, text: string) => void;
+  onDelete: (seq: number) => void;
 }) {
   const roots = messages.filter((m) => m.head.thread === null);
   const rows = buildStreamRows(roots);
@@ -106,6 +110,8 @@ export function MessageList({
                 onMenuToggle={(open) => onMenuToggle(open ? message.seq : null)}
                 onOpenThread={() => onOpenThread(message.seq)}
                 onReact={(emoji) => onReact(message.seq, emoji)}
+                onEdit={(text) => onEdit(message.seq, text)}
+                onDelete={() => onDelete(message.seq)}
               />
             </div>
           );

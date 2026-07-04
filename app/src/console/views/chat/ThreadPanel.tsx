@@ -29,6 +29,8 @@ export function ThreadPanel({
   onHover,
   onMenuToggle,
   onReact,
+  onEdit,
+  onDelete,
   onReply,
   onClose,
 }: {
@@ -42,6 +44,8 @@ export function ThreadPanel({
   onHover: (seq: number | null) => void;
   onMenuToggle: (seq: number | null) => void;
   onReact: (seq: number, emoji: string) => void;
+  onEdit: (seq: number, text: string) => void;
+  onDelete: (seq: number) => void;
   onReply: (body: string) => void;
   onClose: () => void;
 }) {
@@ -151,6 +155,8 @@ export function ThreadPanel({
             onMenuToggle={(open) => onMenuToggle(open ? thread.root.seq : null)}
             onOpenThread={() => {}}
             onReact={(emoji) => onReact(thread.root.seq, emoji)}
+            onEdit={(text) => onEdit(thread.root.seq, text)}
+            onDelete={() => onDelete(thread.root.seq)}
             threadable={false}
           />
         </div>
@@ -176,6 +182,8 @@ export function ThreadPanel({
                 onMenuToggle={(open) => onMenuToggle(open ? reply.seq : null)}
                 onOpenThread={() => {}}
                 onReact={(emoji) => onReact(reply.seq, emoji)}
+                onEdit={(text) => onEdit(reply.seq, text)}
+                onDelete={() => onDelete(reply.seq)}
                 threadable={false}
               />
             </div>

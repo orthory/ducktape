@@ -317,6 +317,8 @@ export function ChatView() {
               onMenuToggle={setMsgMenuId}
               onOpenThread={actions.openThread}
               onReact={actions.toggleReaction}
+              onEdit={actions.editMessage}
+              onDelete={actions.deleteMessage}
             />
             <Composer
               value={draft}
@@ -341,6 +343,8 @@ export function ChatView() {
           onHover={setHoverMsg}
           onMenuToggle={setMsgMenuId}
           onReact={actions.toggleReaction}
+          onEdit={actions.editMessage}
+          onDelete={actions.deleteMessage}
           onReply={actions.replyInThread}
           onClose={actions.closeThread}
         />

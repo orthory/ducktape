@@ -204,6 +204,40 @@ export const removeReaction = (
     params.origin,
   );
 
+/** Replace a message's blocks. Only the stored author may edit (the module
+ *  checks the submit origin); `baseRev` records the revision the edit claims to
+ *  build on — a stale base is recorded, never rejected (head is last-write-wins
+ *  under the consensus order). Like `postMessage`, this sends a single plain
+ *  Paragraph; rich blocks/marks are a later increment. */
+export const editMessage = (
+  transport: NodeTransport,
+  params: { channelId: string; seq: number; text: string; baseRev: number | null; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    {
+      EditMessage: {
+        channel_id: params.channelId,
+        seq: params.seq,
+        blocks: [{ Paragraph: [{ text: params.text, marks: [] }] }],
+        base_rev: params.baseRev,
+      },
+    },
+    params.origin,
+  );
+
+/** Tombstone a message: content and reactions are cleared, the skeleton (and
+ *  thread linkage) kept. Only the stored author may delete. */
+export const deleteMessage = (
+  transport: NodeTransport,
+  params: { channelId: string; seq: number; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { DeleteMessage: { channel_id: params.channelId, seq: params.seq } },
+    params.origin,
+  );
+
 // ── Queries (reads over committed state) ────────────────
 
 export const channels = (transport: NodeTransport): Promise<Channel[]> =>
