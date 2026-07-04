@@ -8,12 +8,24 @@ pub struct NatClient {
     sock: UdpSocket,
     key: NodeKey,
     coord: SocketAddr,
+    coords: Vec<SocketAddr>,
 }
 
 impl NatClient {
     pub async fn bind(key: NodeKey, coord: SocketAddr) -> std::io::Result<Self> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { sock, key, coord })
+        Ok(Self { sock, key, coord, coords: vec![coord] })
+    }
+
+    /// Bind with an ordered set of coordinator hints (the reach `Vec`). The
+    /// primary is `coords[0]`; single-coordinator methods use it, while
+    /// `discover_reflexive_failover` walks the whole set.
+    pub async fn bind_multi(key: NodeKey, coords: Vec<SocketAddr>) -> std::io::Result<Self> {
+        let coord = *coords.first().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
+        })?;
+        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        Ok(Self { sock, key, coord, coords })
     }
 
     pub async fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -37,6 +49,47 @@ impl NatClient {
                 return Ok(reflexive);
             }
         }
+    }
+
+    /// Discover this node's reflexive address, trying each coordinator hint in
+    /// order and falling through a dead/unresponsive one after `per_try` to the
+    /// next. Returns the index of the coordinator that answered plus the
+    /// reflexive it observed. Total wait is bounded by `per_try * coords.len()`,
+    /// so a dead coordinator never wedges the joiner — the coordinator set is
+    /// not uniquely load-bearing.
+    pub async fn discover_reflexive_failover(
+        &self,
+        per_try: std::time::Duration,
+    ) -> std::io::Result<(usize, SocketAddr)> {
+        for (i, &c) in self.coords.iter().enumerate() {
+            self.sock
+                .send_to(&Msg::BindRequest { from: self.key }.encode(), c)
+                .await?;
+            let attempt = async {
+                let mut buf = [0u8; 64];
+                loop {
+                    let (n, from) = self.sock.recv_from(&mut buf).await?;
+                    // Only THIS coordinator's own reply counts; a stray/forged
+                    // datagram from anyone else is ignored (same rule as the
+                    // single-coordinator discover_reflexive).
+                    if from != c {
+                        continue;
+                    }
+                    if let Ok(Msg::BindResponse { reflexive }) = Msg::decode(&buf[..n]) {
+                        return Ok::<SocketAddr, std::io::Error>(reflexive);
+                    }
+                }
+            };
+            match tokio::time::timeout(per_try, attempt).await {
+                Ok(Ok(reflexive)) => return Ok((i, reflexive)),
+                // Timeout or socket error on this coordinator -> try the next.
+                _ => continue,
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no coordinator in the hint set responded",
+        ))
     }
 
     pub async fn register(&self) -> std::io::Result<()> {
@@ -311,6 +364,54 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::net::UdpSocket;
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn dead_primary_falls_through_to_live_secondary() {
+        // A live coordinator (the secondary).
+        let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        tokio::spawn(run_coordinator(live));
+
+        // A DEAD primary: a bound socket nobody ever serves. Datagrams sent to
+        // it are buffered and never answered, so the per-try budget elapses.
+        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+
+        let client = NatClient::bind_multi(NodeKey([1u8; 32]), vec![dead_addr, live_addr])
+            .await
+            .unwrap();
+        let (idx, reflexive) =
+            timeout(Duration::from_secs(2), client.discover_reflexive_failover(Duration::from_millis(150)))
+                .await
+                .expect("failover must be bounded, never stuck")
+                .expect("secondary answers");
+
+        assert_eq!(idx, 1, "the dead primary is skipped; the live secondary answers");
+        assert_eq!(reflexive.port(), client.local_addr().await.unwrap().port());
+    }
+
+    #[tokio::test]
+    async fn no_single_coordinator_is_load_bearing_either_position_works() {
+        // Same live coordinator, but now in PRIMARY position with a dead
+        // secondary: discovery still succeeds, via index 0. Together with the
+        // previous test this proves neither position is uniquely required.
+        let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        tokio::spawn(run_coordinator(live));
+        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+
+        let client = NatClient::bind_multi(NodeKey([2u8; 32]), vec![live_addr, dead_addr])
+            .await
+            .unwrap();
+        let (idx, reflexive) =
+            timeout(Duration::from_secs(2), client.discover_reflexive_failover(Duration::from_millis(150)))
+                .await
+                .expect("no timeout")
+                .expect("primary answers");
+        assert_eq!(idx, 0, "a live primary is used directly");
+        assert_eq!(reflexive.port(), client.local_addr().await.unwrap().port());
+    }
 
     #[tokio::test]
     async fn client_discovers_its_reflexive_via_coordinator() {
