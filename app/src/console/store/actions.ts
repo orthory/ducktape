@@ -8,7 +8,6 @@ import * as documentClient from "../../domain/document-client";
 import type { BlockKind } from "../../domain/document-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
-import type { GovAction } from "../../domain/governance-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
 import {
@@ -320,7 +319,32 @@ export function createActions({
   };
 
   return {
-    setScreen: (screen) => patch({ screen }),
+    setScreen: (screen) => {
+      // Navigating adopts the target surface's rail, so the sidebar highlight and
+      // the body never disagree. Shell screens (settings → null section) leave the
+      // current rail untouched.
+      const section = sectionForScreen(screen);
+      if (section) {
+        saveViewMode(section);
+        patch({ screen, viewMode: section });
+      } else {
+        patch({ screen });
+      }
+    },
+
+    setViewMode: (mode) => {
+      saveViewMode(mode);
+      update((prev) => {
+        // Keep the body on the chosen rail: if the current screen belongs to the
+        // other rail (or is a shell screen), land on this rail's default surface.
+        const screen =
+          sectionForScreen(prev.screen) === mode
+            ? prev.screen
+            : defaultScreenForSection(mode);
+        return { viewMode: mode, screen };
+      });
+    },
+
     setAccent: (accent) => patch({ accent }),
     setAuthor: (author) => patch({ author }),
 
@@ -634,6 +658,35 @@ export function createActions({
       if (!runId) return;
       submitThenRefresh((live) =>
         agentClient.cancelRun(live, { runId, origin: getState().author }),
+      );
+    },
+
+    // ── Governance ──
+    // Every submit is signed by THIS node's validator key (the daemon ignores the
+    // claimed origin), so these carry no origin. `refresh()` re-reads the proposal
+    // set after each write.
+    proposeSignal: (text) => {
+      const body = text.trim();
+      if (!body) return;
+      submitThenRefresh((live) =>
+        governanceClient.propose(live, {
+          proposalId: crypto.randomUUID(),
+          action: { Signal: { text: body } },
+        }),
+      );
+    },
+
+    voteProposal: (proposalId, approve) => {
+      if (!proposalId) return;
+      submitThenRefresh((live) =>
+        governanceClient.vote(live, { proposalId, approve }),
+      );
+    },
+
+    executeProposal: (proposalId) => {
+      if (!proposalId) return;
+      submitThenRefresh((live) =>
+        governanceClient.execute(live, { proposalId }),
       );
     },
 
