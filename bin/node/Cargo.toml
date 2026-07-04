@@ -30,6 +30,10 @@ valset-interface = { workspace = true }
 governance = { workspace = true }
 # the invite-accept verb drives governance ops through the local rpc.
 governance-interface = { workspace = true }
+# the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
+# committed boundary snapshot; the module itself is genesis-wired post-retrofit).
+upgrade = { workspace = true }
+upgrade-interface = { workspace = true }
 saga = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
@@ -75,4 +79,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
 chat-interface = { workspace = true }
+forge-interface = { workspace = true }
 tempfile = "3"

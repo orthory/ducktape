@@ -39,6 +39,12 @@ use sdk::{
 /// loop is guaranteed to terminate regardless of module behavior.
 pub const MAX_DISPATCHES: u32 = 1024;
 
+/// the genesis-constant module id the `upgrade` module registers under. read by
+/// [`Host::effective_version`] to derive the block's protocol version; absent
+/// before the coordinated retrofit, in which case the derivation falls back to
+/// [`BASELINE_VERSION`].
+pub const UPGRADE_MODULE_ID: &str = "upgrade";
+
 /// the block-constant consensus context for one [`Host::submit_at`]: the agreed
 /// `height` / `consensus_time` (identical on every validator — sourced from the
 /// finalized view) and the ROOT op's `origin`. these are constant across every
@@ -50,16 +56,31 @@ pub struct BlockContext {
     pub consensus_time: u64,
     /// the root op's real submitter. follow-ups override with `Origin::Module`.
     pub origin: Origin,
+    /// the effective protocol version for this block — `effective_version(height)`
+    /// derived from committed upgrade-module state and stamped by the node layer
+    /// (see [`Host::effective_version`]). copied verbatim into every dispatch's
+    /// [`Env::protocol_version`]. a read-only dispatch input: it is NEVER folded
+    /// into any module `root()` preimage, op/wire encoding, or the app-hash
+    /// composition. defaults to [`BASELINE_VERSION`].
+    pub protocol_version: u32,
 }
 
+/// the baseline protocol version — the version every node runs before any upgrade
+/// activates, and the graceful fallback when the `upgrade` module is not yet
+/// registered (pre-retrofit nets). Matches the `upgrade` module's uninitialized
+/// `current_version == 0`, so a fresh module and a module-absent host agree.
+pub const BASELINE_VERSION: u32 = 0;
+
 impl Default for BlockContext {
-    /// the pre-consensus default: height/time 0 and an empty external origin, so
-    /// [`Host::submit`] is byte-for-byte the old hardcoded behavior.
+    /// the pre-consensus default: height/time 0, an empty external origin, and the
+    /// baseline protocol version, so [`Host::submit`] is byte-for-byte the old
+    /// hardcoded behavior.
     fn default() -> Self {
         Self {
             height: 0,
             consensus_time: 0,
             origin: Origin::External(Vec::new()),
+            protocol_version: BASELINE_VERSION,
         }
     }
 }
@@ -316,6 +337,9 @@ impl Host {
                         consensus_time: 0,
                         origin: Origin::System,
                         me: target.clone(),
+                        // an out-of-block external read has no block version; it
+                        // reads committed state under the baseline format.
+                        protocol_version: BASELINE_VERSION,
                     },
                     snapshot: &snapshot,
                     registry: &self.registry,
@@ -335,6 +359,92 @@ impl Host {
         match self.registry.get(target) {
             Some(m) => m.serve_sync(req).await,
             None => Err(Error::UnknownModule(target.to_string())),
+        }
+    }
+
+    /// the effective protocol version governing block `height`, derived from the
+    /// committed `upgrade`-module state (the pure `effective_version` derivation,
+    /// not the raw stored `current_version`). the node layer stamps this onto
+    /// [`BlockContext::protocol_version`] so dispatch and hashing agree that block
+    /// `height` runs one version.
+    ///
+    /// this is a read-only, out-of-block committed read (routed like any external
+    /// [`Host::query`]). the `upgrade` module is a genesis constant on an upgraded
+    /// net, but is ABSENT before the coordinated retrofit — so a missing module,
+    /// an undecodable reply, or any query error gracefully falls back to
+    /// [`BASELINE_VERSION`] rather than panicking or erroring. behavior is
+    /// therefore unchanged until the module is registered and a pending upgrade
+    /// arms at its activation height.
+    pub async fn effective_version(&self, height: u64) -> u32 {
+        let req = upgrade_interface::encode_query(&upgrade_interface::UpgradeQuery::Status);
+        match self.query(UPGRADE_MODULE_ID, &req).await {
+            Ok(bytes) => match upgrade_interface::decode_reply(&bytes) {
+                Ok(upgrade_interface::UpgradeReply::Status(s)) => {
+                    // the ONE shared predicate — the host stamps EXACTLY what the
+                    // module's Advance arm check computes (both route through
+                    // upgrade_interface::effective_version), so dispatch and hashing
+                    // can never diverge at the boundary (risk R4).
+                    let ready: std::collections::BTreeMap<Vec<u8>, ()> =
+                        s.ready.iter().map(|k| (k.clone(), ())).collect();
+                    upgrade_interface::effective_version(
+                        height,
+                        s.current_version,
+                        s.pending.as_ref(),
+                        &s.members,
+                        &ready,
+                    )
+                }
+                // module present but reply unreadable — never fork on a decode slip.
+                Err(_) => BASELINE_VERSION,
+            },
+            // module absent (pre-retrofit) or unreadable — baseline, never error.
+            Err(_) => BASELINE_VERSION,
+        }
+    }
+
+    /// drive the agreed boundary protocol version into EVERY registered module at
+    /// the finalized activation boundary (design §4). the version is read from
+    /// frozen boundary state (the orchestrator's `RespawnPlan::boundary_version`),
+    /// identical on every honest node, so this is a deterministic self-transition —
+    /// never a wall-clock/IO/RNG input. a no-op for modules that don't override
+    /// [`Module::set_active_version`] (only dual-path modules like forge do), and
+    /// `version` is a NON-hashed branch selector — it never enters any `root()`
+    /// preimage, so `app_hash()` is unmoved by this call alone (the app-hashed
+    /// reconciliation of the upgrade module's own `current_version` rides the
+    /// in-block System `Advance` the drain injects at the same height).
+    pub fn set_active_version(&mut self, version: u32) {
+        for m in self.registry.values_mut() {
+            m.set_active_version(version);
+        }
+    }
+
+    /// the SYSTEM-ORIGIN `Advance` the drain injects in-block at a finalized
+    /// activation boundary, or `None` when there is nothing to reconcile.
+    ///
+    /// this is the replay-safe realization of the design's "arm/abort is a
+    /// deterministic self-transition evaluated exactly once at `H`": because it
+    /// rides the SAME [`Host::submit_at`] drain that recovery-replay and
+    /// state-sync-install also run, the `current_version` flip + pending clear
+    /// reconstruct byte-for-byte on every node (never a respawn side-effect,
+    /// invisible to replay). keyed purely on committed upgrade state + `height`:
+    /// injected iff the committed `upgrade` module holds a pending upgrade whose
+    /// `activation_height` has been reached. idempotent — the first block at/after
+    /// `H` clears the pending, so later blocks inject nothing. ABSENT until the
+    /// module is registered (the `Status` query errors → `None`), so the drain is
+    /// byte-identical on a pre-retrofit net.
+    async fn pending_advance(&self, height: u64) -> Option<Msg> {
+        let req = upgrade_interface::encode_query(&upgrade_interface::UpgradeQuery::Status);
+        let bytes = self.query(UPGRADE_MODULE_ID, &req).await.ok()?;
+        let upgrade_interface::UpgradeReply::Status(status) =
+            upgrade_interface::decode_reply(&bytes).ok()?;
+        let pending = status.pending?;
+        if height >= pending.activation_height {
+            Some(Msg {
+                target: UPGRADE_MODULE_ID.into(),
+                payload: upgrade_interface::encode_msg(&upgrade_interface::UpgradeMsg::Advance),
+            })
+        } else {
+            None
         }
     }
 
@@ -518,9 +628,26 @@ impl Host {
         // block-constant across every dispatch this block — the agreed values.
         let height = ctx.height;
         let consensus_time = ctx.consensus_time;
+        // effective_version(height) for this block — stamped constant across the
+        // root op and every FIFO follow-up; a read-only dispatch input, NEVER hashed.
+        let protocol_version = ctx.protocol_version;
 
         // the root op carries the real submitter's origin; follow-ups override.
         let mut queue: VecDeque<(Origin, Msg)> = VecDeque::from([(ctx.origin, msg)]);
+
+        // DETERMINISTIC ACTIVATION INJECTION (design §4 / plan Task 6.3). at a
+        // finalized boundary where the committed `upgrade` module holds a pending
+        // upgrade that has reached its activation height, append EXACTLY ONE
+        // System-origin `Advance` so the module reconciles its own app-hashed state
+        // in-block (ARM: `current_version = to_version` + clear pending/readiness;
+        // ABORT: clear only) at the SAME finalized view on every node. it rides this
+        // drain (not the respawn side-path), so live, recovery-replay, and
+        // state-sync nodes all reconstruct it byte-for-byte. this is what frees the
+        // at-most-one-pending slot after activation. INERT until the module is
+        // registered — `pending_advance` returns `None` when the module is absent.
+        if let Some(advance) = self.pending_advance(height).await {
+            queue.push_back((Origin::System, advance));
+        }
         let mut events: Vec<Event> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
         let mut dispatches: Vec<DispatchRecord> = Vec::new();
@@ -558,6 +685,7 @@ impl Host {
                     consensus_time,
                     origin: trigger.clone(),
                     me: msg.target.clone(),
+                    protocol_version,
                 },
                 snapshot,
                 registry: &self.registry, // the rest — for query routing
@@ -640,6 +768,7 @@ impl Ctx for HostCtx<'_> {
                         consensus_time: self.env.consensus_time,
                         origin: self.env.origin.clone(),
                         me: target.clone(),
+                        protocol_version: self.env.protocol_version,
                     },
                     snapshot: &self.snapshot,
                     registry: self.registry,
@@ -701,6 +830,7 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
                         consensus_time: self.env.consensus_time,
                         origin: self.env.origin.clone(),
                         me: target,
+                        protocol_version: self.env.protocol_version,
                     },
                     snapshot: self.snapshot,
                     registry: self.registry,

@@ -102,7 +102,7 @@ struct TestCtx {
 impl TestCtx {
     fn new(origin: Origin, consensus_time: u64) -> Self {
         Self {
-            env: Env {
+            env: Env { protocol_version: 0,
                 height: 0,
                 consensus_time,
                 origin,
@@ -570,7 +570,7 @@ fn module_follow_up_delivers_atomically_with_source_of_emitter() {
 
         let out = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 1,
                     consensus_time: 42,
                     origin: Origin::External(b"tester".to_vec()),
@@ -627,7 +627,7 @@ fn noop_ack_follow_up_does_not_abort_the_block() {
             .expect("genesis");
 
         host.submit_at(
-            BlockContext {
+            BlockContext { protocol_version: 0,
                 height: 1,
                 consensus_time: 7,
                 origin: Origin::System,

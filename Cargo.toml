@@ -23,6 +23,7 @@ members = [
     "crates/system/valset", "crates/system/valset-interface",
     "crates/system/valset-mesh-interface",
     "crates/system/governance", "crates/system/governance-interface",
+    "crates/system/upgrade", "crates/system/upgrade-interface",
     "crates/system/wireguard-upgrade",
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
@@ -87,6 +88,7 @@ recovery = { path = "crates/kernel/recovery" }
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
 governance = { path = "crates/system/governance" }
+upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
@@ -107,6 +109,7 @@ greeter = { path = "crates/examples/greeter" }
 kv-interface = { path = "crates/system/kv-interface" }
 valset-interface = { path = "crates/system/valset-interface" }
 governance-interface = { path = "crates/system/governance-interface" }
+upgrade-interface = { path = "crates/system/upgrade-interface" }
 valset-mesh-interface = { path = "crates/system/valset-mesh-interface" }
 wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 saga-interface = { path = "crates/system/saga-interface" }

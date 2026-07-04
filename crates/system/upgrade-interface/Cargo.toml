@@ -1,0 +1,12 @@
+[package]
+name = "upgrade-interface"
+edition.workspace = true
+version.workspace = true
+
+# the upgrade module's public wire surface — types only. the legal cross-module
+# boundary: governance emits schedule/cancel follow-ups, validators emit
+# SignalReady, and the host/node layer reads Status + the pure effective_version
+# derivation, all from these shapes without linking the upgrade implementation.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

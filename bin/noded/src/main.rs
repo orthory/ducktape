@@ -427,7 +427,7 @@ async fn submit_one(
     msg: Msg,
 ) -> Result<(BlockSummary, Vec<Effect>), SubmitError> {
     let consensus_time = unix_millis();
-    let ctx = BlockContext {
+    let ctx = BlockContext { protocol_version: 0,
         height: *height + 1,
         consensus_time,
         origin,

@@ -38,7 +38,7 @@ struct TestCtx {
 impl TestCtx {
     fn with_origin(height: u64, origin: Origin) -> Self {
         Self {
-            env: sdk::Env {
+            env: sdk::Env { protocol_version: 0,
                 height,
                 consensus_time: 0,
                 origin,
@@ -275,7 +275,7 @@ fn add_manifest(file_id: &str, bytes: &[u8]) -> FilesMsg {
 }
 
 fn block_ctx(height: u64) -> BlockContext {
-    BlockContext {
+    BlockContext { protocol_version: 0,
         height,
         consensus_time: height,
         origin: Origin::System,
@@ -1971,7 +1971,7 @@ fn failed_watch_follow_up_aborts_the_publish_atomically() {
             Box::new(ExplodingWatcher),
         ])
         .expect("genesis");
-        let ctx_at = |height| BlockContext {
+        let ctx_at = |height| BlockContext { protocol_version: 0,
             height,
             consensus_time: height,
             origin: Origin::External(b"tester".to_vec()),

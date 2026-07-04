@@ -108,7 +108,7 @@ struct TestCtx {
 impl TestCtx {
     fn new(height: u64, origin: Origin) -> Self {
         Self {
-            env: Env {
+            env: Env { protocol_version: 0,
                 height,
                 consensus_time: 0,
                 origin,
@@ -1297,7 +1297,7 @@ fn commit_and_abort_staging_including_prune_tombstones() {
 // ============================================================================
 
 fn as_origin(height: u64, origin: Origin) -> BlockContext {
-    BlockContext {
+    BlockContext { protocol_version: 0,
         height,
         consensus_time: 0,
         origin,

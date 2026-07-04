@@ -62,7 +62,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         // genesis checkpoint: height 0 = nothing applied.
         let pos = node.sink_mut().oplog_pos().await;
         let manifest =
-            Manifest::capture(node.host(), None, 0, 0, vec![], None, pos, 1).expect("capture");
+            Manifest::capture(node.host(), None, 0, 0, vec![], None, 0, None, pos, 1).expect("capture");
         assert_eq!(manifest.app_hash, genesis_hash);
         node.sink_mut()
             .write_manifest(&manifest)
@@ -88,6 +88,8 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
             0,
             0,
             vec![],
+            None,
+            0,
             None,
             pos,
             2,
@@ -215,7 +217,7 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
             .await
             .expect("open recovery");
         let host = fresh_host();
-        let manifest = Manifest::capture(&host, None, 0, 0, vec![], None, 0, 1).expect("capture");
+        let manifest = Manifest::capture(&host, None, 0, 0, vec![], None, 0, None, 0, 1).expect("capture");
         recovery
             .write_manifest(&manifest)
             .await

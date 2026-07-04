@@ -68,7 +68,7 @@ struct TestCtx {
 impl TestCtx {
     fn at(consensus_time: u64, me: &str) -> Self {
         Self {
-            env: sdk::Env {
+            env: sdk::Env { protocol_version: 0,
                 height: 0,
                 consensus_time,
                 origin: sdk::Origin::System,

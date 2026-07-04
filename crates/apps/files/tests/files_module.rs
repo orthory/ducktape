@@ -37,7 +37,7 @@ struct TestCtx {
 impl TestCtx {
     fn new(origin: Origin, height: u64) -> Self {
         Self {
-            env: Env {
+            env: Env { protocol_version: 0,
                 height,
                 consensus_time: height,
                 origin,
@@ -668,7 +668,7 @@ fn host_dispatch_moves_app_hash_and_serves_query() {
 
         let out = host
             .submit_at(
-                BlockContext {
+                BlockContext { protocol_version: 0,
                     height: 9,
                     consensus_time: 9,
                     origin: Origin::External(b"tester".to_vec()),
