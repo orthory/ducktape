@@ -152,12 +152,12 @@ describe("desktop onboarding", () => {
       expect(screen.getByTestId("gate").textContent).toBe("true");
 
       await act(async () => {
-        actions!.joinWorkspace("Guest", "ducktape-invite-v1:blob");
+        actions!.joinWorkspace("Guest", "ducktape-invite-v2:blob");
       });
 
       expect(invokeMock).toHaveBeenCalledWith("workspace_join", {
         name: "Guest",
-        blob: "ducktape-invite-v1:blob",
+        blob: "ducktape-invite-v2:blob",
       });
       expect(screen.getByTestId("ws").textContent).toBe("Guest");
       expect(screen.getByTestId("phase").textContent).toBe("parked");
@@ -212,7 +212,7 @@ describe("onboarding gate — live join UI", () => {
         target: { value: "Guest" },
       });
       fireEvent.change(screen.getByPlaceholderText(/Paste invite blob/i), {
-        target: { value: "ducktape-invite-v1:blob" },
+        target: { value: "ducktape-invite-v2:blob" },
       });
 
       await act(async () => {
@@ -221,7 +221,7 @@ describe("onboarding gate — live join UI", () => {
 
       expect(invokeMock).toHaveBeenCalledWith("workspace_join", {
         name: "Guest",
-        blob: "ducktape-invite-v1:blob",
+        blob: "ducktape-invite-v2:blob",
       });
     } finally {
       vi.useRealTimers();

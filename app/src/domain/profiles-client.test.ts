@@ -13,7 +13,9 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   query: vi.fn().mockResolvedValue(reply),
   putBlob: vi.fn(),
   status: vi.fn(),
+  telemetry: vi.fn(),
   onBlock: vi.fn(),
+  onTelemetry: vi.fn(),
 });
 
 describe("profile msgs", () => {

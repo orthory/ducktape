@@ -41,6 +41,10 @@ import {
 export type { ConsoleActions } from "./actions";
 export type { ConsoleContextValue } from "./context";
 
+/** How many recent telemetry frames the console keeps in memory (the node's
+ *  ring holds more; this bounds the live view's buffer). */
+const TELEMETRY_KEEP = 200;
+
 export function DucktapeProvider({
   transport,
   children,
@@ -212,13 +216,49 @@ export function DucktapeProvider({
     };
   }, [transport, actions, fail]);
 
-  // 2. Hydrate once the node is resolved, then follow the block stream.
+  // 2. Hydrate once the node is resolved, then follow the block stream and the
+  //    node-local telemetry stream (backfilled from the ring, then live). The
+  //    telemetry updaters stay pure (StrictMode double-invokes them): they append
+  //    idempotently and dedupe on the strictly-increasing block height.
   useEffect(() => {
     if (!node) return;
     refresh();
-    return node.onBlock(() => {
+
+    // Backfill recent telemetry, then keep any newer live frames layered on top.
+    node
+      .telemetry(TELEMETRY_KEEP)
+      .then((frames) =>
+        dispatch({
+          type: "update",
+          fn: (prev) => {
+            const cutoff = frames.length ? frames[frames.length - 1].height : -1;
+            const newer = prev.telemetry.filter((f) => f.height > cutoff);
+            return { telemetry: [...frames, ...newer].slice(-TELEMETRY_KEEP) };
+          },
+        }),
+      )
+      .catch(() => {
+        /* telemetry is best-effort observability; a miss just leaves it empty */
+      });
+
+    const offBlock = node.onBlock(() => {
       refresh();
     });
+    const offTelemetry = node.onTelemetry((frame) => {
+      dispatch({
+        type: "update",
+        fn: (prev) => {
+          const last = prev.telemetry[prev.telemetry.length - 1];
+          // Heights strictly increase; drop a seam duplicate or a reconnect replay.
+          if (last && frame.height <= last.height) return {};
+          return { telemetry: [...prev.telemetry, frame].slice(-TELEMETRY_KEEP) };
+        },
+      });
+    });
+    return () => {
+      offBlock();
+      offTelemetry();
+    };
   }, [node, refresh]);
 
   // 3. Reflect the accent into the css var the theme reads.

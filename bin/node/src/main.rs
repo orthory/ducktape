@@ -57,7 +57,7 @@ use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
 use commonware_p2p::{Manager, Receiver as _, Recipients, Sender as _};
-use commonware_runtime::{Clock, IoBuf, Quota, Runner, Spawner, Supervisor};
+use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
 
@@ -228,7 +228,10 @@ async fn genesis_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
-    let forge = Forge::init("forge", forge_repo.to_path_buf()).expect("forge init");
+    // forge shares the files body plane so a Push's packfile (staged on the blob
+    // lane before submit) can materialize locally; the pack never touches root.
+    let forge =
+        Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone()).expect("forge init");
     let mut valset = Valset::new("valset");
     // genesis-seed the validator set from config — deterministic and identical
     // on every node, so membership is IN consensus state from block zero (the
@@ -293,8 +296,9 @@ async fn restore_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let chat = Chat::init(context.child("chat"), "chat").await;
-    let forge =
-        Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge: {e}"))?;
+    // forge shares the files body plane (see genesis_host) for Push materialization.
+    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
+        .map_err(|e| format!("forge: {e}"))?;
 
     let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
         let bytes = manifest
@@ -918,7 +922,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     descriptor.save(&descriptor_path)?;
-    println!("{}", config::encode_invite(&descriptor));
+    println!("{}", config::encode_invite(&descriptor)?);
     Ok(())
 }
 
@@ -1359,6 +1363,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    // point the http handle at this node's forge repo base (the same
+    // `storage/forge-repo` the host materializes into) so the git upload-pack
+    // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
+    let http_handle = http_handle.with_forge_repo(storage.join("forge-repo"));
     let blobs = http_handle.blob_handle();
     match http_listen.as_deref() {
         Some(addr) if !sync_only && !joiner => {
@@ -2370,6 +2378,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 modules,
                             });
                         }
+                        noded::NodeCommand::Metrics { reply } => {
+                            // the validator serves commonware's runtime registry;
+                            // the `ducktape_*` block series are the local daemon's
+                            // (noded's) surface, not wired into this consensus path.
+                            let _ = reply.send(context.encode());
+                        }
                     }
                 }
                 msg = sync_ingress.next() => {
@@ -2464,13 +2478,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                     // publish each newly-applied boundary to ws subscribers
-                    // (send only errs when nobody is subscribed — fine).
+                    // (send only errs when nobody is subscribed — fine). the
+                    // validator serves block frames only — telemetry frames come
+                    // from the local `noded` daemon, which owns the dispatch
+                    // trace this finalized-boundary seam does not carry.
                     if let Some(f) = node.finalized() {
                         if last_published != Some(f.height) {
-                            let _ = http_events.send(noded::BlockSummary {
+                            let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
                                 height: f.height,
                                 app_hash: hex(&f.app_hash),
-                            });
+                            }));
                             last_published = Some(f.height);
                         }
                     }

@@ -272,6 +272,52 @@ pub fn workspace_active(app: tauri::AppHandle) -> Result<Option<Workspace>, Stri
         .and_then(|id| reg.workspaces.iter().find(|w| &w.id == id).cloned()))
 }
 
+/// our public, internet-facing IP, asked of a plain-text echo service over a
+/// bare HTTP/1.0 GET (no dependency, no TLS). behind NAT the OS only knows its
+/// own private address, so the reachable one has to come from the outside.
+/// best-effort: a timeout or an unparseable reply just yields `None`.
+fn public_ip() -> Option<std::net::IpAddr> {
+    use std::io::{Read as _, Write as _};
+    use std::net::ToSocketAddrs as _;
+    let timeout = std::time::Duration::from_secs(4);
+    let addr = "api.ipify.org:80".to_socket_addrs().ok()?.next()?;
+    let mut sock = std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
+    sock.set_read_timeout(Some(timeout)).ok()?;
+    sock.write_all(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut resp = String::new();
+    sock.read_to_string(&mut resp).ok()?;
+    // the body follows the blank line; ipify returns just the bare IP.
+    resp.rsplit("\r\n\r\n").next()?.trim().parse().ok()
+}
+
+/// the full `host:port` a peer on another machine dials to reach this node —
+/// baked into the invite. we peer directly, so we expose a real reachable
+/// address. precedence:
+///   1. `DUCKTAPE_ADVERTISE_ADDR` — a full `host:port` used verbatim. this is
+///      how you advertise a DOMAIN on a specific external port, e.g.
+///      `node.ducktape.industries:443` (a stable name behind a proxy / forward),
+///      independent of the local mesh port.
+///   2. `DUCKTAPE_ADVERTISE_HOST` (a hostname or known public ip) on our own
+///      `listen_port`.
+///   3. our auto-discovered public ip on `listen_port`.
+///   4. `127.0.0.1:listen_port` — offline single-box fallback.
+fn advertised_addr(listen_port: u16) -> String {
+    if let Ok(addr) = std::env::var("DUCKTAPE_ADVERTISE_ADDR") {
+        let addr = addr.trim();
+        if !addr.is_empty() {
+            return addr.to_string();
+        }
+    }
+    let host = std::env::var("DUCKTAPE_ADVERTISE_HOST")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| public_ip().map(|ip| ip.to_string()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    format!("{host}:{listen_port}")
+}
+
 /// found a NEW network: mint a fresh chain-id + this workspace's identity, seed
 /// the genesis validator set with it (a solo 1-validator network usable at
 /// once), and record it active. does not spawn — the ui calls
@@ -289,7 +335,10 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
     let ports = allocate_ports(&reserved_ports(&reg))?;
 
-    let listen = format!("127.0.0.1:{}", ports.listen);
+    // bind the mesh listener on every interface so an invited peer can actually
+    // reach it; advertise the address they should dial (never loopback).
+    let listen = format!("0.0.0.0:{}", ports.listen);
+    let advertised = advertised_addr(ports.listen);
     let http = format!("127.0.0.1:{}", ports.http);
     let rpc = format!("127.0.0.1:{}", ports.rpc);
     let dir_s = dir.to_string_lossy().to_string();
@@ -304,7 +353,7 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
             "--listen",
             &listen,
             "--advertised",
-            &listen,
+            &advertised,
             "--http",
             &http,
             "--rpc",
@@ -364,7 +413,10 @@ pub fn workspace_join(
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
     let ports = allocate_ports(&reserved_ports(&reg))?;
 
-    let listen = format!("127.0.0.1:{}", ports.listen);
+    // bind on every interface + advertise the dialable address (never loopback),
+    // matching `workspace_create` so this joiner is itself reachable once admitted.
+    let listen = format!("0.0.0.0:{}", ports.listen);
+    let advertised = advertised_addr(ports.listen);
     let http = format!("127.0.0.1:{}", ports.http);
     let rpc = format!("127.0.0.1:{}", ports.rpc);
     let dir_s = dir.to_string_lossy().to_string();
@@ -379,7 +431,7 @@ pub fn workspace_join(
             "--listen",
             &listen,
             "--advertised",
-            &listen,
+            &advertised,
             "--http",
             &http,
             "--rpc",

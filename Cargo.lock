@@ -2416,6 +2416,7 @@ name = "forge"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "files",
  "forge-interface",
  "futures",
  "git2",
@@ -4049,6 +4050,7 @@ dependencies = [
  "agent",
  "agent-oracle",
  "automations",
+ "base64 0.22.1",
  "chat",
  "chat-interface",
  "commonware-codec",
@@ -4109,8 +4111,11 @@ dependencies = [
  "document",
  "files",
  "files-interface",
+ "flate2",
  "forge",
+ "forge-interface",
  "futures",
+ "git2",
  "host",
  "http-body-util",
  "inbox",
