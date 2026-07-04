@@ -17,6 +17,14 @@ import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
 const QUICK_REACTS = ["👍", "✅", "👀"];
 
+// The message content (avatar + body + hover affordances) is capped to a
+// readable measure and left-aligned, while the row's hover highlight spans the
+// full pane. This keeps long lines legible on a wide pane AND anchors the hover
+// bar / menu / picker to the content's right edge instead of the far pane edge.
+// 880 is the width the console already used for the column — the earlier hover
+// complaint was the highlight stopping short of the edge, not the text measure.
+const CONTENT_MAX = 880;
+
 // `created_at` is UNIX SECONDS (the node's consensus_time) — multiply by 1000
 // to get a JS `Date`, or every message renders as "Jan 1, 1970".
 // Empty when the timestamp isn't real wall-clock (the node's consensus_time is
@@ -836,9 +844,6 @@ export function MessageItem({
       onMouseEnter={() => onHover(true)}
       onMouseLeave={() => onHover(false)}
       style={{
-        position: "relative",
-        display: "flex",
-        gap: 11,
         borderRadius: 9,
         padding: `${groupStart ? 7 : 1}px 8px`,
         margin: `${groupStart ? 3 : 0}px -8px 0`,
@@ -849,6 +854,7 @@ export function MessageItem({
         background: active ? color.sunken : "transparent",
       }}
     >
+      <div style={{ position: "relative", display: "flex", gap: 11, maxWidth: CONTENT_MAX, minWidth: 0 }}>
       <div style={{ width: 30, flexShrink: 0, display: "flex", justifyContent: "center", paddingTop: 1 }}>
         {groupStart ? (
           <Avatar author={message.head.author} name={author} size={30} />
@@ -956,6 +962,7 @@ export function MessageItem({
           onStartDelete={() => setConfirmingDelete(true)}
         />
       )}
+      </div>
     </div>
   );
 }
