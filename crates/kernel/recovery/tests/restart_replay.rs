@@ -11,7 +11,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use host::Host;
-use node::{OrderedNode, RoundOrderer};
+use node::{Disposition, OrderedNode, RoundOrderer};
 use recovery::{Manifest, Recovery};
 use sdk::Msg;
 
@@ -298,5 +298,95 @@ fn a_journal_without_a_manifest_is_damage_not_a_fresh_dir() {
             recovery.manifest().expect("decodes").is_none(),
             "boot must treat journal-without-manifest as damaged state"
         );
+    });
+}
+
+#[test]
+fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let recovery = Recovery::open(context.child("range1"))
+            .await
+            .expect("open recovery");
+        let host = fresh_host();
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+        let signer = sk(9);
+
+        node.submit(&signer, 0, set("k0", "v0"))
+            .await
+            .expect("submit");
+        node.submit(&signer, 1, set("k1", "v1"))
+            .await
+            .expect("submit");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        let checkpoint_height = node.finalized().expect("boundary").height;
+        assert_eq!(checkpoint_height, 1);
+
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(
+            node.host(),
+            Some(checkpoint_height),
+            0,
+            0,
+            vec![],
+            None,
+            pos,
+            2,
+        )
+        .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        let frame2 = node::encode_frame(&signer, 2, &set("k2", "v2"));
+        let frame3 = node::encode_frame(
+            &signer,
+            3,
+            &Msg {
+                target: "no-such-module".into(),
+                payload: vec![1],
+            },
+        );
+        node.submit(&signer, 2, set("k2", "v2"))
+            .await
+            .expect("submit");
+        node.submit(
+            &signer,
+            3,
+            Msg {
+                target: "no-such-module".into(),
+                payload: vec![1],
+            },
+        )
+        .await
+        .expect("submit");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+
+        let frames = node
+            .sink_mut()
+            .read_finalized_frames(checkpoint_height, 3)
+            .await
+            .expect("range read");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].height, 2);
+        assert_eq!(frames[0].frame, frame2);
+        assert_eq!(frames[0].disposition, Disposition::Applied);
+        assert_eq!(frames[1].height, 3);
+        assert_eq!(frames[1].frame, frame3);
+        assert_eq!(frames[1].disposition, Disposition::Rejected);
+
+        let err = node
+            .sink_mut()
+            .read_finalized_frames(0, 3)
+            .await
+            .expect_err("range below checkpoint is pruned");
+        assert!(matches!(
+            err,
+            recovery::Error::RangePruned {
+                after_height: 0,
+                retained_start: 1
+            }
+        ));
     });
 }

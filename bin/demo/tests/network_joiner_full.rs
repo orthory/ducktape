@@ -36,8 +36,8 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 
 use statesync::qmdb::RemoteQmdbResolver;
 use statesync::{
-    PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse, SyncServer, decode_response,
-    encode_request, fetch_manifest, fetch_snapshot,
+    ManifestEntry, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse, SyncServer,
+    decode_response, encode_request, fetch_manifest, fetch_snapshot,
 };
 
 // ---- the in-process transport (same shape as the statesync crate test) -----
@@ -47,6 +47,15 @@ type RpcPair = (Vec<u8>, oneshot::Sender<Vec<u8>>);
 #[derive(Clone)]
 struct ChannelClient {
     tx: mpsc::Sender<RpcPair>,
+}
+
+fn pinned_target(entry: &ManifestEntry) -> statesync::qmdb::SyncTarget {
+    entry
+        .resolver_target
+        .as_ref()
+        .expect("resolver entry carries pinned target")
+        .to_sync_target()
+        .expect("pinned target range is non-empty")
 }
 
 impl SyncClient for ChannelClient {
@@ -243,11 +252,13 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 8,
                 "every registered module is listed"
             );
+            let boundary = manifest.boundary_id();
 
             // --- resolver lane: kv, document, chat -----------------------------
-            let kv_root = manifest.entry("kv").unwrap().root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), "kv");
-            let target = resolver.fetch_target().await.expect("kv target");
+            let kv_entry = manifest.entry("kv").unwrap();
+            let kv_root = kv_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "kv");
+            let target = pinned_target(kv_entry);
             assert_eq!(
                 StateRoot(target.root.0),
                 kv_root,
@@ -266,9 +277,10 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 Some(b"final".as_ref())
             );
 
-            let doc_root = manifest.entry("document").unwrap().root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), "document");
-            let target = resolver.fetch_target().await.expect("document target");
+            let doc_entry = manifest.entry("document").unwrap();
+            let doc_root = doc_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "document");
+            let target = pinned_target(doc_entry);
             assert_eq!(StateRoot(target.root.0), doc_root);
             let join_document = Document::sync_from(
                 joiner_ctx.child("joiner_document"),
@@ -279,9 +291,10 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             .await;
             assert_eq!(join_document.root(), doc_root);
 
-            let chat_root = manifest.entry("chat").unwrap().root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), "chat");
-            let target = resolver.fetch_target().await.expect("chat target");
+            let chat_entry = manifest.entry("chat").unwrap();
+            let chat_root = chat_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "chat");
+            let target = pinned_target(chat_entry);
             assert_eq!(StateRoot(target.root.0), chat_root);
             let join_chat = Chat::sync_from(
                 joiner_ctx.child("joiner_chat"),
@@ -295,7 +308,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             // --- snapshot lane: directory, valset, saga, forge ----------------
             let entry = manifest.entry("directory").unwrap();
             assert_eq!(entry.kind, PayloadKind::Snapshot);
-            let bytes = fetch_snapshot(&client, manifest.height, "directory")
+            let bytes = fetch_snapshot(&client, boundary, "directory")
                 .await
                 .expect("directory snapshot");
             let mut join_directory = Directory::new("directory");
@@ -304,7 +317,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 .expect("directory install");
 
             let entry = manifest.entry("valset").unwrap();
-            let bytes = fetch_snapshot(&client, manifest.height, "valset")
+            let bytes = fetch_snapshot(&client, boundary, "valset")
                 .await
                 .expect("valset snapshot");
             let mut join_valset = Valset::new("valset");
@@ -313,14 +326,14 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 .expect("valset install");
 
             let entry = manifest.entry("saga").unwrap();
-            let bytes = fetch_snapshot(&client, manifest.height, "saga")
+            let bytes = fetch_snapshot(&client, boundary, "saga")
                 .await
                 .expect("saga snapshot");
             let mut join_saga = SagaModule::new("saga");
             join_saga.install(&bytes, entry.root).expect("saga install");
 
             let entry = manifest.entry("forge").unwrap();
-            let bytes = fetch_snapshot(&client, manifest.height, "forge")
+            let bytes = fetch_snapshot(&client, boundary, "forge")
                 .await
                 .expect("forge snapshot");
             let mut join_forge =

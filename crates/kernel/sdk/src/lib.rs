@@ -148,6 +148,14 @@ pub struct Env {
     pub me: ModuleId,
 }
 
+/// a resolver-backed module's committed sync target at one boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolverSyncTarget {
+    pub root: StateRoot,
+    pub start: u64,
+    pub op_count: u64,
+}
+
 /// errors surfaced through the system api.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Error {
@@ -264,6 +272,13 @@ pub trait Module {
     /// install. the default is explicit non-coverage for modules whose whole
     /// sync surface is [`StateSyncHandle::SnapshotBytes`].
     async fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::SyncUnsupported)
+    }
+
+    /// return the committed resolver target for modules that advertise
+    /// [`StateSyncHandle::ResolverBacked`]. default modules have no resolver
+    /// lane, so they cannot provide a target.
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
         Err(Error::SyncUnsupported)
     }
 

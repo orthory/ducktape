@@ -56,7 +56,7 @@ use commonware_utils::range::NonEmptyRange;
 use document_interface::{
     Block, DocMsg, DocQuery, DocReply, decode_msg, decode_query, encode_reply,
 };
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, ResolverSyncTarget, StateRoot, StateSyncHandle};
 
 /// write-time cap on a SERIALIZED document. [`doc_config`]'s codec [`RangeCfg`]
 /// bounds a stored value at 1 MiB AT DECODE TIME only — an oversized doc would
@@ -450,15 +450,19 @@ where
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "serve_sync answers qmdb target + op-range requests (statesync wire)".into(),
+            detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
         })
     }
 
     /// the network state-sync serve lane: answers the shared qmdb wire requests
-    /// (current target, historical proof-carrying op ranges) from committed
-    /// state. read-only; the joiner's sync engine merkle-verifies every batch.
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         statesync::qmdb::serve_bytes(&self.db, req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        statesync::qmdb::resolver_sync_target(&self.db).await
     }
 
     /// decode a [`DocMsg`] and apply it to the staged overlay. the only `.await`

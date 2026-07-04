@@ -4049,6 +4049,7 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "agent-oracle",
+ "async-trait",
  "automations",
  "base64 0.22.1",
  "chat",
@@ -4058,6 +4059,7 @@ dependencies = [
  "commonware-cryptography",
  "commonware-p2p",
  "commonware-runtime",
+ "commonware-storage",
  "commonware-utils",
  "consensus",
  "directory",
