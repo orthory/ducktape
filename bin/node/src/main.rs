@@ -1669,6 +1669,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the real encrypted TCP mesh. `local` is the dev preset (allows private
         // ips). MUST be the real tokio runtime — discovery live-locks under the
         // deterministic clock.
+        // reachability plane (docs/sentry-deployment.md): a forward sentry on a
+        // private network relies on this `local` preset's allow_private_ips:true;
+        // switching to a preset with allow_private_ips:false would reject the
+        // forwarded connection from a private source IP — use a public-IP sentry
+        // or a reverse tunnel then.
         let p2p_cfg = discovery::Config::local(
             signer.clone(),
             &namespace,
