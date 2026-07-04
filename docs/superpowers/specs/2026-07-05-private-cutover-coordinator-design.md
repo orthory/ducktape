@@ -264,11 +264,19 @@ branch off the epic branch, merged into the epic branch by PR.
 
 `epic/p3-private-cutover` is a long-lived branch off `origin/dev`, worked in a
 dedicated worktree. Each slice is a feature branch off the epic branch, merged
-into it by PR (a reviewable unit). Once Slices 0–3 are green and the Slice 4
-runbook is in place, the epic merges to `dev` via one integration PR. This
-reconciles with the repo's "work targets `dev`, one PR per task" rule by
-treating the epic branch as this task's integration point and `dev` as the
-release target.
+into it by PR (a reviewable unit). The epic merges to `dev` via one integration
+PR **only when all three Acceptance items above hold** — not merely when the
+Slice 4 runbook lands. Landing the docs/config/runbook (Slice 4) satisfies
+Acceptance §3 and *documents* §2, but Acceptance §2 (the real cross-machine
+zero-exposure demo) is still open: it is blocked on the node-side reachability
+wiring the node does not yet have — `NatClient` reflexive discovery, hole-punch,
+WireGuard-effect bring-up, relay fallback, and the §3.5 coordinator-auth work —
+enumerated in `docs/deploy/private-cutover-integration-gap.md` and gated on the
+user's real NAT/VPS/WireGuard infra. So the runbook being "in place" is a
+**necessary, not sufficient** condition for merge; the epic is merge-ready only
+once §2 also passes. This reconciles with the repo's "work targets `dev`, one PR
+per task" rule by treating the epic branch as this task's integration point and
+`dev` as the release target.
 
 ## Resolved open questions (from the entry design)
 

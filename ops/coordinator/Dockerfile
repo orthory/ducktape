@@ -13,5 +13,11 @@ USER nonroot:nonroot
 # STUN/rendezvous/relay control port. Publish with:  -p 3478:3478/udp
 EXPOSE 3478/udp
 ENTRYPOINT ["/usr/local/bin/ducktape-coordinator"]
-# Override for relay: --listen <container-routable-ip>:3478 (see coordinator.md).
+# This image is the STUN + rendezvous coordinator. Run it hardened, published as
+# a single UDP port (NOT --network host): docker run --cap-drop=ALL
+# --security-opt no-new-privileges --read-only --restart unless-stopped
+# -p 3478:3478/udp ducktape-coordinator. Relay fallback belongs on the bare-VPS
+# systemd path with --listen <public-ip>:3478 (see coordinator.md, "Relay under
+# Docker") — a RelayGrant carries the bind IP, which bridge networking cannot
+# make dialable.
 CMD ["--listen", "0.0.0.0:3478"]

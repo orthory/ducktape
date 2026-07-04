@@ -108,7 +108,8 @@ design's non-goals and the two-relay separation.
    bootstrappers, `Coordinated` → the `NatClient`.
 3. **Boot the client.** At mesh boot (`bin/node/src/main.rs` ~2641, alongside
    `Network::new` / `network.start()`), construct
-   `NatClient::bind_multi(node_key, coord_addrs)`;
+   `NatClient::bind_multi(node_key, coord_addrs)` — **note this drops
+   `coord_key` and carries no auth token; see §3.5, this is not just plumbing**;
    `discover_reflexive_failover(per_try)`; publish the reflexive into
    `EndpointRecord.wireguard_endpoint` with a monotonic nonce; `readvertise(nonce+1)`
    on rebind (mirrors the dup rule that `MeshView::verify` enforces on
@@ -136,6 +137,46 @@ design's non-goals and the two-relay separation.
    `main.rs` ~2567-2611, which already runs a plain
    `tokio::runtime::Builder::new_multi_thread()` (axum/`noded::serve`) alongside
    the runner and communicates over channels.
+
+## §3.5 — The unbuilt coordinator-auth story (NOT plumbing — read this)
+
+The §3 checklist above reads like "wire existing APIs together." For the
+transport that is true; for **authentication it is not**. This is the single
+biggest omission in taking §3 at face value, and it is security-relevant, so it
+gets its own section.
+
+**The design requires inviter-signed rendezvous auth. Nothing implements it.**
+The design of record is explicit (§"Authorization", §"Data flow" step 1):
+rendezvous requests **must present an inviter-signed membership/invite token**,
+and that is what "prevents a compromised coordinator from substituting keys."
+`CoordRef` also carries a `coord_key` ("how to reach the coordinator + **its
+channel key**"). Neither exists on the wire or in `NatClient`:
+
+- **The wire protocol carries no token and no channel.** Every
+  `nat_traversal::wire::Msg` variant (`crates/system/nat-traversal/src/wire.rs`)
+  carries only `NodeKey`/`SocketAddr`/`nonce`:
+  `Register { key }`, `Lookup { key }`, `RelayRequest { peer }`, `BindRequest`,
+  `PunchSync`, `Readvertise { key, nonce }`. There is **no** field for an
+  inviter-signed invite token, and **no** encrypted/authenticated channel to the
+  coordinator (`coord_key` has no wire presence at all). `register`/`lookup`/
+  `request_relay` (`client.rs` ~108/132/202) send these plaintext, unauthenticated
+  datagrams.
+- **`NatClient` has nowhere to put `coord_key`.** `bind`/`bind_multi`
+  (`client.rs` ~15/23) take `(key: NodeKey, coord[s]: SocketAddr…)` **only**. Item
+  2's `coordinator_refs() -> Vec<(coord_addr, coord_key)>` threads a `coord_key`
+  that item 3 then **silently discards** — there is no API surface that consumes
+  it.
+
+**So the real remaining work is not "call `register`/`lookup`."** It is a
+protocol change: add an inviter-signed token field to the rendezvous messages (or
+an authenticated channel keyed by `coord_key`), have the coordinator verify it
+against the signed `expected_key`/`admission_root`, and thread `coord_key`
+through `NatClient`. That is a wire-format and coordinator-verification change —
+consensus-adjacent in review weight — **not** the "plumb existing calls together"
+task the §3 checklist otherwise implies. Until it lands, a v3 `Coordinated` hint's
+`coord_key` and the inviter-signed auth guarantee are decorative: the mechanism
+would rendezvous **unauthenticated**, which is precisely the key-substitution
+window the design says the token closes.
 
 ## §4 — The coordinator-side relay-bind fix
 
@@ -183,7 +224,11 @@ pre-existingly-red `bin/node`/`noded` clippy from unrelated toolchain drift.
 The node wiring is the enumerated **§3 checklist** — a self-contained follow-on
 ("Slice 5 — node reachability wiring"). Its shape: add two deps, split the config
 accessor, add one orchestrator crate, drive rendezvous/punch, and make the first
-`apply_tunnel_plan` effect call, plus the §4 coordinator relay fix.
+`apply_tunnel_plan` effect call, plus the §4 coordinator relay fix. **Plus the
+§3.5 coordinator-auth work** — an inviter-signed-token wire-protocol change and
+`coord_key` threading — which is *not* mere plumbing and should be scoped and
+reviewed as the security-relevant piece it is, not folded silently into "drive
+rendezvous/punch."
 
 **Acceptance status:**
 

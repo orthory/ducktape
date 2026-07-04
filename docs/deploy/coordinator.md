@@ -42,14 +42,25 @@ the recipe is wrong.
 
 ## What it is
 
-`coordinator --listen <addr>` (default `0.0.0.0:3478`). One **UDP** socket.
-Stateless. It provides three services on that one socket:
+`coordinator --listen <addr>` (default `0.0.0.0:3478`). One **UDP** *control*
+socket. Stateless. It provides three services on that one socket:
 
 - **Rendezvous** — peers `register` their key and `lookup` each other.
 - **STUN reflexive** — answers a `BindRequest` with the peer's observed
   public `ip:port` so it can learn its own NAT-mapped address.
 - **Ciphertext relay** — a last-resort splice when hole-punch fails; the
   coordinator forwards opaque bytes between two peers' relay sockets.
+
+**Caveat to the single-socket picture (load-bearing for the firewall).** 3478 is
+the only *fixed* port, but the relay service is **not** served on it. When (and
+only when) a `RelayRequest` arrives, the coordinator binds **two additional
+ephemeral UDP sockets per relay session**
+(`crates/system/nat-traversal/src/client.rs` ~360/364 — `UdpSocket::bind(bind_ip:0)`
+twice) and splices opaque bytes between them, releasing them when the session
+idles out. So a relay-enabled coordinator opens ephemeral UDP sockets on demand
+beyond 3478 — which is exactly why the firewall guidance below has a relay
+branch. If you never enable relay (STUN + rendezvous only), 3478 genuinely is the
+only socket the process holds.
 
 No TCP listener. No config file. No disk. No secret. `--listen` is the only flag
 the binary parses; on bind it prints `coordinator listening on <addr>` to
@@ -75,7 +86,7 @@ sudo systemctl enable --now ducktape-coordinator
 
 # 5. Verify.
 systemctl status ducktape-coordinator
-ss -lunp 'sport = :3478'     # one UDP socket, owned by the dynamic user
+ss -lunp 'sport = :3478'     # the fixed control socket, owned by the dynamic user
 ```
 
 The unit runs under `DynamicUser=yes` (an ephemeral throwaway user — no home,
@@ -91,16 +102,62 @@ to corrupt**, so the box can be treated as disposable and replaced at will.
 
 ```sh
 docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
-docker run --rm -p 3478:3478/udp ducktape-coordinator
+
+# STUN + rendezvous coordinator: 3478 is the only socket, so one published UDP
+# port is enough. Harden the container to match the systemd unit — this is
+# untrusted-by-design infra, so drop everything it does not need.
+docker run \
+  --cap-drop=ALL \
+  --security-opt no-new-privileges \
+  --read-only \
+  --restart unless-stopped \
+  -p 3478:3478/udp \
+  ducktape-coordinator
 ```
 
 The image is multi-stage: a `rust:1.96-bookworm` build stage compiles exactly
 `-p coordinator-bin`, and the runtime stage is
 `gcr.io/distroless/cc-debian12:nonroot` — glibc + libgcc for the
 dynamically-linked binary, **no shell, no package manager**, running as the
-built-in non-root uid `65532`. For the **relay** fallback, publishing a mapped
-port is not enough (see the caveat below): use `--network host` and
-`--listen <public-ip>:3478` so relay grants inherit a dialable IP.
+built-in non-root uid `65532`. The `docker run` flags above are not optional
+decoration — they mirror the systemd unit's posture and are the container-side
+equivalent of its empty capability set and read-only root:
+
+- `--cap-drop=ALL` — the binary needs **no** Linux capabilities (3478 > 1024, so
+  no privileged-port capability), the same as the unit's empty
+  `CapabilityBoundingSet=`/`AmbientCapabilities=`.
+- `--security-opt no-new-privileges` — mirrors `NoNewPrivileges=yes`.
+- `--read-only` — the coordinator keeps **no** state, so its root filesystem can
+  be immutable, mirroring `ProtectSystem=strict` + `ReadOnlyPaths=/`.
+- `--restart unless-stopped` — the production restart policy; the disposable box
+  comes back after a crash or reboot. Drop it (and add `--rm`) only for a
+  throwaway smoke run.
+
+Keep these: the whole premise is that a compromised coordinator has nothing to
+steal and nowhere to write. Publishing **only** `-p 3478:3478/udp` (not
+`--network host`) is what keeps that true — see the relay note next.
+
+### Relay under Docker — do **not** reach for `--network host`
+
+The relay fallback binds ephemeral UDP sockets on the coordinator socket's own IP
+(see the single-socket caveat above and the relay-bind caveat below), and those
+ports are **not** covered by `-p 3478:3478/udp`. The tempting "fix" is
+`--network host` — **don't.** Host networking removes the container's network
+namespace entirely, letting an intentionally-untrusted process bind or listen on
+**any** host TCP/UDP port; that defeats the "exposes only UDP" design goal and is
+the wrong trade for a disposable, untrusted component.
+
+There is also no clean *bridge*-networking relay recipe today, because a
+`RelayGrant` carries the coordinator's **bind** IP: `--listen 0.0.0.0:3478`
+yields an undialable `0.0.0.0` grant, and a container-internal address is not
+routable from off-host either. So if you need relay, run it on the **bare-VPS
+systemd path (Deploy A) with `--listen <public-ip>:3478`**, where the bind IP is
+genuinely dialable — not a host-networked container. The clean containerized
+relay story waits on the coordinator-side reflexive fix (learn the public IP from
+observed peer sources and emit *that* as the relay-grant IP), tracked in
+[the integration-gap doc](private-cutover-integration-gap.md) §4. Until then,
+Docker is the right tool for a **STUN + rendezvous** coordinator; relay belongs on
+the bare-VPS path.
 
 ## The relay-bind caveat (load-bearing)
 
