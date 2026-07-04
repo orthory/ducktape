@@ -182,6 +182,183 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
     });
 }
 
+#[test]
+fn a_passing_proposal_removes_the_validator_and_emits_leave() {
+    block_on(async {
+        let mut host = gov_host();
+        let (m1, m2) = (member_key(1), member_key(2));
+        assert_eq!(validators(&host).await.len(), 2, "seeded with two members");
+
+        // the `member-remove` verb's on-chain shape: a member opens a
+        // RemoveValidator proposal, members vote, and execution PERFORMS the
+        // membership change by emitting `ValsetMsg::Leave` as a
+        // governance-origin follow-up — the same path `invite-accept` drives
+        // for AddValidator/Join, inverted.
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "remove-2".into(),
+                action: GovAction::RemoveValidator { key: m2.clone() },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("propose removal");
+        // both current members vote yes -> early-decidable strict majority
+        // (2 of 2). a member may cast the deciding ballot to remove another.
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "remove-2".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote m1");
+        submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "remove-2".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote m2");
+
+        // execution tallies and rides the valset Leave on the SAME block.
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "remove-2".into(),
+            }),
+        )
+        .await
+        .expect("execute");
+
+        assert_eq!(
+            proposal_status(&host, "remove-2").await,
+            Some(ProposalStatus::Passed)
+        );
+        let members = validators(&host).await;
+        assert_eq!(members.len(), 1, "the removed validator is gone");
+        assert!(members.contains(&m1), "the remaining member stays");
+        assert!(!members.contains(&m2), "the removed key is dropped from the set");
+    });
+}
+
+/// the `member-leave` verb's on-chain shape: a member drives its OWN removal by
+/// opening a RemoveValidator proposal for its own key and casting its yes-ballot
+/// — the SAME governance path as `member-remove`, targeting self. this pins the
+/// honesty of a unilateral leave: at n=2 the leaver's single ballot is NOT a
+/// strict majority (majority = 2), so its own execute is not decidable early —
+/// the removal stays PENDING until the remaining member also approves, and only
+/// then does the leaver drop from the set.
+#[test]
+fn a_member_leaves_by_removing_itself_pending_the_remaining_majority() {
+    block_on(async {
+        let mut host = gov_host();
+        let (m1, m2) = (member_key(1), member_key(2));
+        assert_eq!(validators(&host).await.len(), 2, "seeded with two members");
+
+        // m2 (the leaver) opens a self-removal and casts its own yes-ballot.
+        submit_as(
+            &mut host,
+            &m2,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "leave-2".into(),
+                action: GovAction::RemoveValidator { key: m2.clone() },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("leaver proposes its own removal");
+        submit_as(
+            &mut host,
+            &m2,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "leave-2".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("leaver votes to leave");
+
+        // the leaver's lone ballot is 1 of 2 — NOT a majority. its own execute
+        // is refused as not-yet-decidable: leaving is not unilateral at n>=2.
+        let err = submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "leave-2".into(),
+            }),
+        )
+        .await
+        .expect_err("a lone leave ballot is not a deciding majority");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not decidable")),
+            "got {err:?}"
+        );
+        assert_eq!(
+            validators(&host).await.len(),
+            2,
+            "the leaver is still in the set while pending"
+        );
+
+        // the remaining member approves -> strict majority (2 of 2) -> execute
+        // removes the leaver at the valset Leave that rides the same block.
+        submit_as(
+            &mut host,
+            &m1,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "leave-2".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("remaining member approves the departure");
+        submit_as(
+            &mut host,
+            &m1,
+            5,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "leave-2".into(),
+            }),
+        )
+        .await
+        .expect("execute once the majority approves");
+
+        assert_eq!(
+            proposal_status(&host, "leave-2").await,
+            Some(ProposalStatus::Passed)
+        );
+        let members = validators(&host).await;
+        assert_eq!(members.len(), 1, "the leaver is gone");
+        assert!(members.contains(&m1), "the remaining member stays");
+        assert!(!members.contains(&m2), "the leaver's key is dropped from the set");
+    });
+}
+
 /// the solo-network tally: with one member, majority = 1/2 + 1 = 1, so the
 /// founder's own ballot decides immediately — `invite-accept` on a network
 /// of one admits the friend in a single propose/vote/execute round, no
@@ -263,6 +440,120 @@ fn a_single_member_ballot_is_a_deciding_majority() {
         let members = validators(&host).await;
         assert_eq!(members.len(), 2, "the friend is admitted");
         assert!(members.contains(&friend));
+    });
+}
+
+/// the last-validator guard at the governance layer: a solo member's ballot IS
+/// a deciding majority (1 of 1), but enacting its own removal would empty the
+/// validator set — a zero-validator orderer hits commonware `quorum(0)`, which
+/// panics. governance refuses: it does NOT emit the set-emptying valset Leave,
+/// marks the proposal Rejected instead, and the sole validator stays. this is
+/// the "solo can't leave on-chain" case — a solo node forgets its workspace
+/// locally rather than removing the last validator.
+#[test]
+fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
+    block_on(async {
+        let founder = member_key(1);
+        let mut valset = Valset::new("valset");
+        valset.insert(founder.clone());
+        let mut host = Host::genesis(vec![
+            Box::new(valset),
+            Box::new(Governance::new("governance", "valset")),
+        ])
+        .expect("genesis");
+        assert_eq!(validators(&host).await.len(), 1, "a solo network of one");
+
+        // the sole member opens a self-removal and casts its own yes-ballot —
+        // majority = 1/2 + 1 = 1, so this is early-decidable.
+        submit_as(
+            &mut host,
+            &founder,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "leave-solo".into(),
+                action: GovAction::RemoveValidator {
+                    key: founder.clone(),
+                },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("solo proposes its own removal");
+        submit_as(
+            &mut host,
+            &founder,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "leave-solo".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("solo votes to leave");
+
+        // executing is a CLEAN op (the block commits): governance pre-checks that
+        // the removal would empty the set and REJECTS the proposal rather than
+        // emitting the set-emptying valset Leave. no block-abort, no panic.
+        submit_as(
+            &mut host,
+            &founder,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "leave-solo".into(),
+            }),
+        )
+        .await
+        .expect("execute settles the proposal cleanly");
+
+        assert_eq!(
+            proposal_status(&host, "leave-solo").await,
+            Some(ProposalStatus::Rejected),
+            "a last-validator removal is refused, not passed"
+        );
+        let members = validators(&host).await;
+        assert_eq!(members.len(), 1, "the set never went empty");
+        assert!(members.contains(&founder), "the sole validator stays");
+    });
+}
+
+/// belt-and-suspenders: even if a set-emptying valset `Leave` reached the valset
+/// module directly (a module-origin write, bypassing governance's pre-check),
+/// the valset handler itself refuses it. this pins the AUTHORITATIVE guard —
+/// the invariant lives in the module that owns the set, not only in its caller.
+#[test]
+fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
+    block_on(async {
+        let founder = member_key(1);
+        let mut valset = Valset::new("valset");
+        valset.insert(founder.clone());
+        let mut host = Host::genesis(vec![Box::new(valset)]).expect("genesis");
+
+        // a System-origin op (genesis orchestration shape) that would empty the
+        // set is refused deterministically — the block is rejected, set intact.
+        let err = host
+            .submit_at(
+                BlockContext {
+                    height: 1,
+                    consensus_time: 1,
+                    origin: Origin::System,
+                },
+                Msg {
+                    target: "valset".into(),
+                    payload: valset_encode(&ValsetMsg::Leave {
+                        key: founder.clone(),
+                    }),
+                },
+            )
+            .await
+            .expect_err("emptying the set must be refused");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("last validator")),
+            "got {err:?}"
+        );
+        assert_eq!(validators(&host).await, vec![founder], "the set is untouched");
     });
 }
 

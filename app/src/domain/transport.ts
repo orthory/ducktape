@@ -17,9 +17,16 @@ export interface BlockEvent {
   appHash: string;
 }
 
+/** How the app groups a module in the Modules view. The node attaches this by
+ *  id in its status catalog; it is presentation metadata only, never consensus
+ *  identity. Optional: a node built before categories shipped omits it, and the
+ *  view treats an absent/unknown value as `system`. */
+export type ModuleCategory = "workspace" | "developer" | "automation" | "system";
+
 export interface ModuleStatus {
   id: string;
   root: string;
+  category?: ModuleCategory;
 }
 
 export interface NodeStatus {
@@ -84,6 +91,14 @@ export interface NodeTransport {
    * returns) so they go straight into the fetch body.
    */
   putBlob(bytes: Uint8Array<ArrayBuffer>): Promise<string>;
+  /**
+   * Read raw bytes back out of the node's content-addressed blob store by their
+   * sha256 `digest` (64 lowercase hex) — the GET counterpart to `putBlob`. This
+   * is how the files module's chunks are fetched for reassembly; the caller MUST
+   * still `verifyChunk` the bytes against a committed manifest before trusting
+   * them. Rejects when the digest is absent (the node replies 404).
+   */
+  getBlob(digest: string): Promise<Uint8Array<ArrayBuffer>>;
   status(): Promise<NodeStatus>;
   /**
    * Recent per-block telemetry from the node's ring, oldest-first — the
@@ -198,6 +213,19 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
         )
         .then(async (res) => {
           if (res.ok) return ((await res.json()) as { digest: string }).digest;
+          const detail = await res
+            .json()
+            .then((payload) => String((payload as { error?: string }).error ?? ""))
+            .catch(() => "");
+          throw new Error(detail || `node replied ${res.status}`);
+        }),
+    // GET the raw chunk bytes back; the error envelope is the node's json
+    // `{error}` shape, matching putBlob.
+    getBlob: (digest) =>
+      Promise.resolve()
+        .then(() => fetch(`${base}/v1/files/blob/${digest}`))
+        .then(async (res) => {
+          if (res.ok) return new Uint8Array(await res.arrayBuffer());
           const detail = await res
             .json()
             .then((payload) => String((payload as { error?: string }).error ?? ""))

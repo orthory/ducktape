@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
@@ -27,8 +27,8 @@ const renderSettings = (patch: Partial<ConsoleState> = {}) => {
     connected: true,
     ...patch,
   };
-  const spies: Record<string, (...args: unknown[]) => void> = {};
-  const noop = vi.fn() as (...args: unknown[]) => void;
+  const spies: Record<string, Mock<(...args: unknown[]) => void>> = {};
+  const noop: Mock<(...args: unknown[]) => void> = vi.fn();
 
   function Harness() {
     const [state, setState] = useState(initialState);
@@ -36,16 +36,16 @@ const renderSettings = (patch: Partial<ConsoleState> = {}) => {
       {},
       {
         get: (_target, key: string) => {
-          spies[key] ??= vi.fn() as (...args: unknown[]) => void;
+          spies[key] ??= vi.fn();
           if (key === "setAuthor") {
             return (author: string) => {
-              spies[key](author);
+              spies[key]?.(author);
               setState((prev) => ({ ...prev, author }));
             };
           }
           if (key === "setAccent") {
             return (accent: string) => {
-              spies[key](accent);
+              spies[key]?.(accent);
               setState((prev) => ({ ...prev, accent }));
             };
           }
@@ -97,8 +97,98 @@ describe("SettingsView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /workspaces/i }));
     expect(spies.newWorkspace).toHaveBeenCalled();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: /leave network/i }));
-    expect(spies.stopNode).toHaveBeenCalled();
+  it("requests an on-chain leave that keeps the node running, without tearing down", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    // A member of a set of two -> Request leave is enabled (a real majority is
+    // needed, so the node must stay up through its own pending removal).
+    const { spies } = renderSettings({
+      members: [workspace.pubkey, "beefbeef".repeat(8)],
+    });
+
+    // The copy is honest: an on-chain self-removal, node keeps running.
+    expect(screen.getByText(/on-chain self-removal/i)).toBeInTheDocument();
+    expect(screen.getByText(/keeps running until they approve/i)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/full workspace deletion is not wired/i),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /request leave/i }));
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(spies.requestLeaveWorkspace).toHaveBeenCalled();
+    // Requesting a leave never tears down: no node stop, no forget.
+    expect(spies.forgetWorkspace?.mock.calls ?? []).toHaveLength(0);
+    expect(spies.stopNode?.mock.calls ?? []).toHaveLength(0);
+
+    confirm.mockRestore();
+  });
+
+  it("aborts the request-leave when the confirm is dismissed", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const { spies } = renderSettings({
+      members: [workspace.pubkey, "beefbeef".repeat(8)],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /request leave/i }));
+    expect(confirm).toHaveBeenCalledOnce();
+    // Dismissed confirm -> requestLeaveWorkspace is never referenced, so the
+    // proxy never even created a spy for it.
+    expect(spies.requestLeaveWorkspace?.mock.calls ?? []).toHaveLength(0);
+
+    confirm.mockRestore();
+  });
+
+  it("forgets the workspace on a confirmed forget click (guarded in the backend)", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { spies } = renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: /forget workspace/i }));
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(spies.forgetWorkspace).toHaveBeenCalled();
+
+    confirm.mockRestore();
+  });
+
+  it("does not lock a validator out of leaving during the cold-start window", () => {
+    // Before the first roster query hydrates state.members it is []. A real
+    // member must NOT be locked out of request-leave (or forget) just because
+    // the roster hasn't arrived yet — we fall back to workspace.member.
+    renderSettings({ members: [] });
+
+    expect(
+      screen.getByRole("button", { name: /request leave/i }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: /forget workspace/i }),
+    ).toBeEnabled();
+    // No confirmed-solo hint before the roster proves the set size.
+    expect(
+      screen.queryByText(/can’t remove the last validator/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps request-leave disabled for a non-member remote node", () => {
+    // A remote (non-managed) node, or one whose workspace.member is false, is
+    // not a validator: leaving is not its to request.
+    renderSettings({
+      workspace: { ...workspace, member: false },
+      members: [],
+    });
+
+    expect(
+      screen.getByRole("button", { name: /request leave/i }),
+    ).toBeDisabled();
+  });
+
+  it("disables Request leave for a solo validator (can't remove the last one)", () => {
+    // Only this node in the set -> leaving on-chain would empty it, which is
+    // refused; the button is disabled and the user forgets instead.
+    renderSettings({ members: [workspace.pubkey] });
+
+    const requestLeave = screen.getByRole("button", { name: /request leave/i });
+    expect(requestLeave).toBeDisabled();
+    // Forget is still available for a solo network.
+    expect(screen.getByRole("button", { name: /forget workspace/i })).toBeEnabled();
   });
 });

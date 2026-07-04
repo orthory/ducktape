@@ -179,4 +179,34 @@ describe("AgentView", () => {
       allowedActions: ["chat.post"],
     });
   });
+
+  it("edits an agent through the inline Edit form", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+
+    fireEvent.click(within(detail).getByRole("button", { name: /^edit$/i }));
+
+    const nameField = screen.getByLabelText("Edit display name");
+    expect(nameField).toHaveValue("Summary Agent");
+    fireEvent.change(nameField, { target: { value: "Renamed Agent" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    // Exact match proves a blank prompt is omitted (never sent as an empty
+    // string), while the other fields keep their current values.
+    expect(spies.updateAgent).toHaveBeenCalledWith({
+      agentId: "summarizer",
+      displayName: "Renamed Agent",
+      modelRef: "gpt-5.5",
+      allowedActions: ["chat.post", "tasks.create"],
+    });
+  });
+
+  it("toggles the agent module into jobs-board work", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("switch", { name: /jobs worker/i }));
+    expect(spies.enableJobWorker).toHaveBeenCalledWith(true);
+  });
 });

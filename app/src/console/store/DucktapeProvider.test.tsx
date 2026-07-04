@@ -93,9 +93,16 @@ const makeFakeNode = () => {
       if (target === "valset") {
         return Promise.resolve({ Validators: [[0xde, 0xad, 0xbe, 0xef]] });
       }
+      if (target === "document") {
+        // refresh now enumerates the doc index (ListDocs) and, when a doc is
+        // open, re-reads its blocks (GetDoc) — answer both so refresh resolves.
+        if (query === "ListDocs") return Promise.resolve({ DocList: [] });
+        return Promise.resolve({ Doc: null });
+      }
       return Promise.resolve({ Tasks: [] });
     }),
     putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
+    getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
     status: vi.fn().mockResolvedValue({
       version: "0.1.0",
       appHash: "aa".repeat(32),

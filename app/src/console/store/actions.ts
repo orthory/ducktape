@@ -2,11 +2,20 @@ import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
 import type { TurnPolicy } from "../../domain/agent-client";
+import * as automationsClient from "../../domain/automations-client";
+import type { Action as RuleAction, Trigger } from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
 import type { BlockKind } from "../../domain/document-client";
+import * as filesClient from "../../domain/files-client";
+import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
+import * as governanceClient from "../../domain/governance-client";
+import * as inboxClient from "../../domain/inbox-client";
+import * as jobsClient from "../../domain/jobs-client";
+import * as memoryClient from "../../domain/memory-client";
+import type { Meta } from "../../domain/memory-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
 import {
@@ -18,9 +27,13 @@ import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
+import {
+  defaultScreenForSection,
+  sectionForScreen,
+} from "../modules/registry";
 import type { Action } from "./reducer";
-import { channelIdOf, docIdOf, nextTaskStatus } from "./state";
-import type { ConsoleState } from "./state";
+import { channelIdOf, docIdOf, nextTaskStatus, saveViewMode } from "./state";
+import type { ConsoleState, ViewMode } from "./state";
 
 /** How often a parked joiner's phase is polled while it promotes. */
 const JOIN_POLL_MS = 1500;
@@ -34,38 +47,12 @@ const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
     ? list.map((w) => (w.id === next.id ? next : w))
     : [...list, next];
 
-// ── Per-node document registry ──────────────────────────
-//
-// The document module has NO "list docs" query — its store is keyed by
-// sha256(doc_id) and cannot enumerate — so the set of known doc-ids is tracked
-// CLIENT-SIDE and persisted per resolved node url (i.e. per workspace). This is
-// a convenience registry, not a source of truth: a doc created on another
-// client won't appear here until its id is opened by hand.
-const docRegistryKey = (nodeUrl: string): string => `ducktape.docs.${nodeUrl}`;
-
-export const loadDocIds = (nodeUrl: string): string[] => {
-  try {
-    const raw = localStorage.getItem(docRegistryKey(nodeUrl));
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed)
-      ? parsed.filter((id): id is string => typeof id === "string")
-      : [];
-  } catch {
-    return []; // storage unavailable / corrupt entry — start from an empty list
-  }
-};
-
-const saveDocIds = (nodeUrl: string, docIds: string[]): void => {
-  try {
-    localStorage.setItem(docRegistryKey(nodeUrl), JSON.stringify(docIds));
-  } catch {
-    // storage may be unavailable (private mode / quota); the registry is a
-    // convenience, so a failed persist is non-fatal.
-  }
-};
-
 export interface ConsoleActions {
   setScreen(screen: string): void;
+  /** Switch the sidebar rail (user apps vs operator surfaces) and persist it.
+   *  Jumps to the target rail's default surface when the current screen belongs
+   *  to the other rail, so the body always matches the rail. */
+  setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
   setAuthor(author: string): void;
   /** Set our own display name in the `profiles` module (origin-gated SetName)
@@ -91,9 +78,13 @@ export interface ConsoleActions {
   commitForge(params: { path: string; content: string; message: string }): void;
 
   // ── Documents (block store over the `document` module) ──
-  /** Create a doc (CreateDoc, idempotent), register it, and open it. */
+  /** Re-query the module's enumeration index into `state.docIds` (the tree). */
+  listDocs(): void;
+  /** Create a doc at a "/"-delimited path (CreateDoc, idempotent) and open it.
+   *  The refresh after the write re-enumerates the index, so the new path
+   *  appears in the tree. */
   createDoc(docId: string): void;
-  /** Register + open a doc by id, loading its blocks (like selectChannel). */
+  /** Open a doc by path, loading its blocks (like selectChannel). */
   openDoc(docId: string): void;
   /** Append/insert a fresh block into the active doc (id generated here). */
   insertBlock(params: { after: string | null; kind: BlockKind; text: string }): void;
@@ -124,6 +115,92 @@ export interface ConsoleActions {
   requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
+  /** Owner-gated edit of a registered agent. A provided `prompt` is staged in
+   *  the blob store and its digest committed as the new prompt_hash; every
+   *  omitted field keeps its current value. */
+  updateAgent(params: {
+    agentId: string;
+    displayName?: string;
+    modelRef?: string;
+    prompt?: string;
+    allowedActions?: string[];
+  }): void;
+  /** Opt the agent MODULE into (or out of) jobs-board work notifications, so it
+   *  can process job-backed runs. */
+  enableJobWorker(enabled: boolean): void;
+
+  // ── Governance (proposals + votes over the `governance` module) ──
+  /** Open a binding Signal proposal (no on-chain effect beyond its outcome).
+   *  Membership-gated by the module: only a current validator can propose. */
+  proposeSignal(text: string): void;
+  /** Cast (or change) this node's ballot on an open proposal. */
+  voteProposal(proposalId: string, approve: boolean): void;
+  /** Tally and settle a decidable proposal (anyone may trigger it). */
+  executeProposal(proposalId: string): void;
+
+  // ── Inbox (per-member notification queue over the `inbox` module) ──
+  /** Mark every notification in the local member's queue read (idempotent). */
+  markInboxRead(): void;
+  /** Mark every item up to and including `seq` read. */
+  markInboxReadTo(seq: number): void;
+  /** Delete every notification in the local member's queue (up to the latest). */
+  clearInbox(): void;
+  /** Enqueue a notification (module follow-ups are the primary writers, but the
+   *  console can self-deliver or notify another member). */
+  deliverNotification(params: { member: string; kind: string; body: string }): void;
+
+  // ── Jobs (consensus work board over the `jobs` module) ──
+  /** Post a new job (id generated here). */
+  submitJob(params: { kind: string; spec: string }): void;
+  /** Claim a Pending job under a view-count lease. */
+  claimJob(params: { jobId: string; leaseViews: number }): void;
+  /** Report a result on a job this node is processing. */
+  finalizeJob(params: { jobId: string; ok: boolean; payload: string }): void;
+  /** Hand a Processing job back to Pending. */
+  releaseJob(jobId: string): void;
+  /** Permissionless requeue of a Processing job whose lease expired. */
+  reclaimJob(jobId: string): void;
+  /** Cancel a still-Pending job (submitter only). */
+  cancelJob(jobId: string): void;
+  /** Remove a terminal job's record entirely (submitter only). */
+  pruneJob(jobId: string): void;
+
+  // ── Automations (event-triggered rules over the `automations` module) ──
+  /** Create a rule pairing a trigger with an action. */
+  createRule(params: { ruleId: string; trigger: Trigger; action: RuleAction }): void;
+  /** Enable or disable a rule without deleting it. */
+  setRuleEnabled(ruleId: string, enabled: boolean): void;
+  /** Delete a rule. */
+  deleteRule(ruleId: string): void;
+
+  // ── Memory (agent filesystem over the `memory` module) ──
+  /** Browse a directory: list its entries and make it the active path. */
+  browseMemory(path: string): void;
+  /** Open a file into the viewer, loading its latest (or a specific) generation. */
+  openMemoryFile(params: { path: string; generation?: number | null }): void;
+  /** Close the open file. */
+  closeMemoryFile(): void;
+  /** Write-once publish of an inline document at `path`, then refresh the tree. */
+  publishMemory(params: { path: string; text: string; meta?: Meta }): void;
+  /** Delete a memory file (all live generations). */
+  deleteMemory(path: string): void;
+  /** Run a case-sensitive substring search under `prefix`; results land in
+   *  `state.memoryMatches`. */
+  searchMemory(params: { prefix: string; pattern: string }): void;
+  /** Clear the active search. */
+  clearMemorySearch(): void;
+
+  // ── Files (content-addressed manifests over the `files` module) ──
+  /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
+  uploadFile(params: { name: string; mime: string; bytes: Uint8Array<ArrayBuffer> }): void;
+  /** Remove a manifest (owner-gated; rides the daemon identity that added it). */
+  removeFile(fileId: string): void;
+  /** Reassemble a file's bytes, verifying every chunk against the manifest.
+   *  Returns the manifest + bytes for the view to hand to a browser download,
+   *  or null when the file/node is unavailable. */
+  downloadFile(
+    fileId: string,
+  ): Promise<{ manifest: Manifest; bytes: Uint8Array<ArrayBuffer> } | null>;
 
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
@@ -142,6 +219,20 @@ export interface ConsoleActions {
   revealInvite(): void;
   /** Admit a joiner by pubkey through the active (member) workspace. */
   admitMember(pubkey: string): void;
+  /** Open a removal proposal for a validator by pubkey and cast this node's
+   *  yes-ballot; the removal takes effect only once a strict majority approve. */
+  demoteMember(pubkey: string): void;
+  /** Request to leave the active network: drive this node's on-chain
+   *  self-removal (pending remaining-member approval) and KEEP THE NODE RUNNING.
+   *  The node must stay up through its own pending removal or quorum can't
+   *  finalize it. On success the roster re-query shows the removal is pending;
+   *  once approved and this node drops out of the valset, use `forgetWorkspace`. */
+  requestLeaveWorkspace(): void;
+  /** Forget the active workspace: stop its node, delete its directory + registry
+   *  entry, then switch to another workspace or open the onboarding gate. Guarded
+   *  in the backend — refused while this node is still a current validator of a
+   *  set of two-or-more (that would halt quorum). */
+  forgetWorkspace(): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -219,19 +310,16 @@ export function createActions({
       .catch(fail);
   };
 
-  // the single entry point into a doc: record it in the per-node registry
-  // (persist), make it active, and load its blocks. Every path into a doc
-  // (new-doc, open-by-id, a registry click) goes here — like enterChannel.
+  // the single entry point into a doc: make it active and load its blocks.
+  // Every path into a doc (new-doc, a tree click) goes here — like
+  // enterChannel. The known-doc set is the node's index (state.docIds), not a
+  // local registry, so entering a doc no longer writes any list — it just
+  // focuses the reader on `docId`.
   const enterDoc = (rawId: string) => {
     const live = getNode();
     const docId = docIdOf(rawId);
     if (!live || !docId) return;
-    const known = getState().docIds;
-    const docIds = known.includes(docId) ? known : [...known, docId];
-    const url = getState().nodeUrl;
-    if (url) saveDocIds(url, docIds);
     patch({
-      docIds,
       activeDoc: docId,
       activeDocBlocks: [],
     });
@@ -301,7 +389,32 @@ export function createActions({
   };
 
   return {
-    setScreen: (screen) => patch({ screen }),
+    setScreen: (screen) => {
+      // Navigating adopts the target surface's rail, so the sidebar highlight and
+      // the body never disagree. Shell screens (settings → null section) leave the
+      // current rail untouched.
+      const section = sectionForScreen(screen);
+      if (section) {
+        saveViewMode(section);
+        patch({ screen, viewMode: section });
+      } else {
+        patch({ screen });
+      }
+    },
+
+    setViewMode: (mode) => {
+      saveViewMode(mode);
+      update((prev) => {
+        // Keep the body on the chosen rail: if the current screen belongs to the
+        // other rail (or is a shell screen), land on this rail's default surface.
+        const screen =
+          sectionForScreen(prev.screen) === mode
+            ? prev.screen
+            : defaultScreenForSection(mode);
+        return { viewMode: mode, screen };
+      });
+    },
+
     setAccent: (accent) => patch({ accent }),
     setAuthor: (author) => patch({ author }),
 
@@ -491,13 +604,23 @@ export function createActions({
     },
 
     // ── Documents ──
+    listDocs: () => {
+      const live = getNode();
+      if (!live) return;
+      Promise.resolve()
+        .then(() => documentClient.listDocs(live))
+        .then((docIds) => patch({ docIds }))
+        .catch(fail);
+    },
+
     openDoc: enterDoc,
 
     createDoc: (rawId) => {
       const docId = docIdOf(rawId);
       if (!docId) return;
-      // CreateDoc is idempotent and REQUIRED before any block op; then open
-      // it (registers the id + loads blocks), mirroring createChannel.
+      // CreateDoc is idempotent and REQUIRED before any block op; the refresh
+      // re-enumerates the index so the new path shows in the tree, then open
+      // it (loads blocks), mirroring createChannel.
       submitThenRefresh((live) => documentClient.createDoc(live, { docId })).then(
         () => enterDoc(docId),
       );
@@ -618,6 +741,273 @@ export function createActions({
       );
     },
 
+    updateAgent: ({ agentId, displayName, modelRef, prompt, allowedActions }) => {
+      const id = agentId.trim();
+      if (!id) return;
+      submitThenRefresh((live) =>
+        Promise.resolve()
+          // a provided prompt is re-staged in the blob store; its digest becomes
+          // the new prompt_hash. An absent prompt leaves the hash untouched.
+          .then(() =>
+            prompt !== undefined && prompt.length > 0
+              ? live
+                  .putBlob(new TextEncoder().encode(prompt))
+                  .then((digest) => agentClient.hexToBytes(digest))
+              : null,
+          )
+          .then((promptHash) =>
+            agentClient.updateAgent(live, {
+              agentId: id,
+              displayName: displayName?.trim() || null,
+              modelRef: modelRef?.trim() || null,
+              promptHash,
+              allowedActions: allowedActions ?? null,
+              origin: getState().author,
+            }),
+          ),
+      );
+    },
+
+    enableJobWorker: (enabled) => {
+      submitThenRefresh((live) =>
+        agentClient.enableJobWorker(live, { enabled, origin: getState().author }),
+      );
+    },
+
+    // ── Governance ──
+    // Every submit is signed by THIS node's validator key (the daemon ignores the
+    // claimed origin), so these carry no origin. `refresh()` re-reads the proposal
+    // set after each write.
+    proposeSignal: (text) => {
+      const body = text.trim();
+      if (!body) return;
+      submitThenRefresh((live) =>
+        governanceClient.propose(live, {
+          proposalId: crypto.randomUUID(),
+          action: { Signal: { text: body } },
+        }),
+      );
+    },
+
+    voteProposal: (proposalId, approve) => {
+      if (!proposalId) return;
+      submitThenRefresh((live) =>
+        governanceClient.vote(live, { proposalId, approve }),
+      );
+    },
+
+    executeProposal: (proposalId) => {
+      if (!proposalId) return;
+      submitThenRefresh((live) =>
+        governanceClient.execute(live, { proposalId }),
+      );
+    },
+
+    // ── Inbox ──
+    // The local member's queue is keyed by the author identity; mark/clear act on
+    // the highest seq currently loaded, so "mark all read" needs no per-item loop.
+    markInboxRead: () => {
+      const items = getState().inbox;
+      if (items.length === 0) return;
+      const upToSeq = items[items.length - 1].seq;
+      submitThenRefresh((live) =>
+        inboxClient.markRead(live, { member: getState().author, upToSeq }),
+      );
+    },
+
+    markInboxReadTo: (seq) => {
+      submitThenRefresh((live) =>
+        inboxClient.markRead(live, { member: getState().author, upToSeq: seq }),
+      );
+    },
+
+    clearInbox: () => {
+      const items = getState().inbox;
+      if (items.length === 0) return;
+      const upToSeq = items[items.length - 1].seq;
+      submitThenRefresh((live) =>
+        inboxClient.clear(live, { member: getState().author, upToSeq }),
+      );
+    },
+
+    deliverNotification: ({ member, kind, body }) => {
+      if (!member.trim() || !kind.trim()) return;
+      submitThenRefresh((live) =>
+        inboxClient.deliver(live, { member: member.trim(), kind: kind.trim(), body }),
+      );
+    },
+
+    // ── Jobs ──
+    // Identity-gated ops (cancel/prune by submitter; finalize/release by
+    // claimant) all ride the daemon's default identity — origin is omitted — so
+    // submitter and claimant stay consistent for this node's own jobs.
+    submitJob: ({ kind, spec }) => {
+      if (!kind.trim()) return;
+      submitThenRefresh((live) =>
+        jobsClient.submitJob(live, { jobId: crypto.randomUUID(), kind: kind.trim(), spec }),
+      );
+    },
+
+    claimJob: ({ jobId, leaseViews }) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.claimJob(live, { jobId, leaseViews }));
+    },
+
+    finalizeJob: ({ jobId, ok, payload }) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.finalizeJob(live, { jobId, ok, payload }));
+    },
+
+    releaseJob: (jobId) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.releaseJob(live, { jobId }));
+    },
+
+    reclaimJob: (jobId) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.reclaimJob(live, { jobId }));
+    },
+
+    cancelJob: (jobId) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.cancelJob(live, { jobId }));
+    },
+
+    pruneJob: (jobId) => {
+      if (!jobId) return;
+      submitThenRefresh((live) => jobsClient.pruneJob(live, { jobId }));
+    },
+
+    // ── Automations ──
+    createRule: ({ ruleId, trigger, action }) => {
+      const id = ruleId.trim();
+      if (!id) return;
+      submitThenRefresh((live) =>
+        automationsClient.createRule(live, { ruleId: id, trigger, action }),
+      );
+    },
+
+    setRuleEnabled: (ruleId, enabled) => {
+      if (!ruleId) return;
+      submitThenRefresh((live) =>
+        automationsClient.setEnabled(live, { ruleId, enabled }),
+      );
+    },
+
+    deleteRule: (ruleId) => {
+      if (!ruleId) return;
+      submitThenRefresh((live) => automationsClient.deleteRule(live, ruleId));
+    },
+
+    // ── Memory ──
+    browseMemory: (path) => {
+      const live = getNode();
+      const dir = path || "/";
+      if (!live) return;
+      // set the active dir immediately (so refresh re-lists it), clear the open
+      // file + any search, then list eagerly for a snappy transition.
+      patch({ memoryPath: dir, memoryOpen: null, memoryMatches: null });
+      Promise.resolve()
+        .then(() => memoryClient.ls(live, { path: dir }))
+        .then((memoryEntries) => patch({ memoryEntries }))
+        .catch(fail);
+    },
+
+    openMemoryFile: ({ path, generation }) => {
+      const live = getNode();
+      if (!live || !path) return;
+      Promise.resolve()
+        .then(() =>
+          Promise.all([
+            memoryClient.stat(live, path),
+            memoryClient.read(live, { path, generation: generation ?? null }),
+          ]),
+        )
+        .then(([stat, gen]) =>
+          patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
+        )
+        .catch(fail);
+    },
+
+    closeMemoryFile: () => patch({ memoryOpen: null }),
+
+    publishMemory: ({ path, text, meta }) => {
+      const p = path.trim();
+      if (!p) return;
+      submitThenRefresh((live) =>
+        memoryClient.publish(live, { path: p, body: memoryClient.inlineBody(text), meta }),
+      ).then(() => {
+        const live = getNode();
+        if (!live) return;
+        // reflect the new generation in the open viewer if it is this file.
+        if (getState().memoryOpen?.stat.path === p) {
+          return Promise.all([
+            memoryClient.stat(live, p),
+            memoryClient.read(live, { path: p, generation: null }),
+          ])
+            .then(([stat, gen]) =>
+              patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
+            )
+            .catch(fail);
+        }
+      });
+    },
+
+    deleteMemory: (path) => {
+      if (!path) return;
+      submitThenRefresh((live) => memoryClient.remove(live, path)).then(() => {
+        if (getState().memoryOpen?.stat.path === path) patch({ memoryOpen: null });
+      });
+    },
+
+    searchMemory: ({ prefix, pattern }) => {
+      const live = getNode();
+      if (!live || !pattern) return;
+      Promise.resolve()
+        .then(() => memoryClient.grep(live, { prefix: prefix || "/", pattern }))
+        .then((memoryMatches) => patch({ memoryMatches }))
+        .catch(fail);
+    },
+
+    clearMemorySearch: () => patch({ memoryMatches: null }),
+
+    // ── Files ──
+    uploadFile: ({ name, mime, bytes }) => {
+      const cleanName = name.trim();
+      if (!cleanName) return;
+      submitThenRefresh((live) =>
+        filesClient.uploadFile(live, {
+          fileId: crypto.randomUUID(),
+          name: cleanName,
+          mime: mime || "application/octet-stream",
+          bytes,
+        }),
+      );
+    },
+
+    removeFile: (fileId) => {
+      if (!fileId) return;
+      submitThenRefresh((live) => filesClient.removeManifest(live, fileId));
+    },
+
+    downloadFile: (fileId) => {
+      const live = getNode();
+      if (!live || !fileId) return Promise.resolve(null);
+      return Promise.resolve()
+        .then(() => filesClient.stat(live, fileId))
+        .then((manifest) =>
+          manifest
+            ? filesClient
+                .downloadFile(live, manifest)
+                .then((bytes) => ({ manifest, bytes }))
+            : null,
+        )
+        .catch((err) => {
+          fail(err);
+          return null;
+        });
+    },
+
     stopNode: () => {
       const url = getState().nodeUrl;
       if (!url || !getState().managed) return;
@@ -692,6 +1082,16 @@ export function createActions({
         agents: [],
         watches: [],
         runs: [],
+        inbox: [],
+        inboxUnread: 0,
+        jobs: [],
+        jobCounts: null,
+        rules: [],
+        memoryPath: "/",
+        memoryEntries: [],
+        memoryOpen: null,
+        memoryMatches: null,
+        files: [],
         onboardingPhase: null,
       });
       connectActive(target).catch(fail);
@@ -713,6 +1113,83 @@ export function createActions({
         .then(() => ws.admitMember(target.id, pubkey.trim()))
         .then(() => refresh())
         .catch(fail);
+    },
+
+    demoteMember: (pubkey) => {
+      const target = getState().workspace;
+      if (!target || !pubkey.trim()) return;
+      Promise.resolve()
+        .then(() => ws.demoteMember(target.id, pubkey.trim()))
+        .then(() => refresh())
+        .catch(fail);
+    },
+
+    requestLeaveWorkspace: () => {
+      const target = getState().workspace;
+      if (!target) return;
+      patch({ error: null });
+      // Submit the on-chain self-removal but KEEP the node running — it must
+      // stay up through its own pending removal or quorum can't finalize it.
+      // The per-block roster re-query surfaces the pending removal; nothing is
+      // torn down here.
+      Promise.resolve()
+        .then(() => ws.requestLeaveWorkspace(target.id))
+        .then(() => refresh())
+        .catch(fail);
+    },
+
+    forgetWorkspace: () => {
+      const target = getState().workspace;
+      if (!target) return;
+      patch({ onboardingBusy: true, error: null });
+      // Call the GUARDED backend FIRST — it refuses while this node is still a
+      // current validator of a set of two-or-more. Only tear down the local
+      // node + projections once the backend has actually forgotten it, so a
+      // refused forget leaves the live UI intact (still connected, error shown).
+      Promise.resolve()
+        .then(() => ws.forgetWorkspace(target.id))
+        .then((next) => {
+          // Forgotten: drop the live node + its projections (mirrors
+          // selectWorkspace's reset), then repoint the switcher.
+          setNode(null);
+          patch({
+            connected: false,
+            status: null,
+            channels: [],
+            messages: [],
+            activeChannel: null,
+            activeThread: null,
+            authorNames: {},
+            tasks: [],
+            docIds: [],
+            activeDoc: null,
+            activeDocBlocks: [],
+            agents: [],
+            watches: [],
+            runs: [],
+            onboardingPhase: null,
+            inviteBlob: null,
+          });
+          update((prev) => ({
+            workspaces: prev.workspaces.filter((w) => w.id !== target.id),
+          }));
+          if (next) {
+            // The registry repointed to another workspace — connect to it.
+            return connectActive(next);
+          }
+          // None remain — fall back to the onboarding gate.
+          patch({
+            workspace: null,
+            needsOnboarding: true,
+            onboardingBusy: false,
+            managed: false,
+            nodeUrl: null,
+          });
+        })
+        .catch((err) => {
+          patch({ onboardingBusy: false });
+          fail(err);
+        });
     },
 
     newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null }),

@@ -41,7 +41,16 @@ const renderDocumentView = (patch: Partial<ConsoleState> = {}) => {
 };
 
 describe("DocumentView", () => {
-  it("exposes labelled create/open flows and a document switcher", () => {
+  it("enumerates the document index on mount and via the refresh control", () => {
+    const { spies } = renderDocumentView();
+    // Fired once on mount so the tree reflects every enumerated doc.
+    expect(spies.listDocs).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh documents" }));
+    expect(spies.listDocs).toHaveBeenCalledTimes(2);
+  });
+
+  it("exposes labelled create/open flows and opens a doc from the tree", () => {
     const { spies } = renderDocumentView();
 
     fireEvent.change(screen.getByLabelText("Create document id"), {
@@ -56,8 +65,33 @@ describe("DocumentView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open document" }));
     expect(spies.openDoc).toHaveBeenCalledWith("retro");
 
+    // A top-level doc renders as a leaf in the tree; clicking it opens it.
     fireEvent.click(screen.getByRole("button", { name: "Open retro" }));
     expect(spies.openDoc).toHaveBeenCalledWith("retro");
+  });
+
+  it("derives a collapsible folder tree from slash-delimited path ids", () => {
+    const { spies } = renderDocumentView({
+      docIds: ["projects/launch-plan", "projects/retro", "notes"],
+      activeDoc: null,
+      activeDocBlocks: [],
+    });
+
+    // The shared "projects" prefix becomes a folder; children hang under it.
+    const collapse = screen.getByRole("button", { name: "Collapse projects" });
+    expect(screen.getByRole("button", { name: "Open projects/launch-plan" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open projects/retro" })).toBeTruthy();
+    // A single-segment id is a top-level document leaf, not a folder.
+    expect(screen.getByRole("button", { name: "Open notes" })).toBeTruthy();
+
+    // Collapsing the folder hides its children.
+    fireEvent.click(collapse);
+    expect(screen.queryByRole("button", { name: "Open projects/launch-plan" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand projects" })).toBeTruthy();
+
+    // Leaves still open through the same enterDoc path (full path id).
+    fireEvent.click(screen.getByRole("button", { name: "Open notes" }));
+    expect(spies.openDoc).toHaveBeenCalledWith("notes");
   });
 
   it("wires block edit, insert, remove, and move controls to the store actions", () => {

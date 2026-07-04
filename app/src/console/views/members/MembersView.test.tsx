@@ -72,7 +72,7 @@ describe("MembersView", () => {
 
     expect(screen.getByRole("heading", { name: "Founder Rae" })).toBeInTheDocument();
     expect(screen.getByText(localKey)).toBeInTheDocument();
-    expect(screen.getByText("founder validator")).toBeInTheDocument();
+    expect(screen.getByText("genesis validator")).toBeInTheDocument();
     expect(screen.getByText("validator key")).toBeInTheDocument();
     expect(screen.getByText("not exposed by this node")).toBeInTheDocument();
 
@@ -110,5 +110,49 @@ describe("MembersView", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /reveal invite/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /admit joiner/i })).not.toBeInTheDocument();
+  });
+
+  it("offers a confirmed removal per row but never for this node itself", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { spies } = renderMembers();
+
+    // The peer gets a removal control; this node (the local key) never does.
+    const removePeer = screen.getByRole("button", {
+      name: /remove Ben Validator from validator set/i,
+    });
+    expect(removePeer).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /remove Founder Rae from validator set/i }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(removePeer);
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(spies.demoteMember).toHaveBeenCalledWith(peerKey);
+
+    confirm.mockRestore();
+  });
+
+  it("aborts the removal when the confirm is dismissed", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const { spies } = renderMembers();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /remove Ben Validator from validator set/i }),
+    );
+    expect(confirm).toHaveBeenCalledOnce();
+    // Dismissed confirm -> demoteMember is never even referenced, so the proxy
+    // never minted a spy for it.
+    expect(spies.demoteMember?.mock.calls ?? []).toHaveLength(0);
+
+    confirm.mockRestore();
+  });
+
+  it("hides the removal control when this workspace cannot administer", () => {
+    renderMembers({
+      workspace: { ...workspace, founder: false, member: false },
+    });
+    expect(
+      screen.queryByRole("button", { name: /remove Ben Validator from validator set/i }),
+    ).not.toBeInTheDocument();
   });
 });
