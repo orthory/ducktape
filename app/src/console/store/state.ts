@@ -6,15 +6,24 @@
 import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client";
 import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
 import type { Block } from "../../domain/document-client";
+import type { ProposalView } from "../../domain/governance-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
+
+/** The two sidebar partitions the view-mode toggle switches between: the
+ *  participant "user" apps and the "operator" node/network surfaces. Neither
+ *  side confers authority — it is purely which surfaces the rail shows. */
+export type ViewMode = "user" | "operator";
 
 // ── State shape ─────────────────────────────────────────
 
 export interface ConsoleState {
   // ── Session / node core ──
   screen: string;
+  /** Which sidebar rail is shown. Persisted across sessions (see loadViewMode).
+   *  Kept in sync with `screen`: navigating to a surface adopts its section. */
+  viewMode: ViewMode;
   accent: string;
   author: string;
   /** The node answered the last status query. */
@@ -41,6 +50,11 @@ export interface ConsoleState {
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
   members: string[];
+
+  // ── Governance ──
+  /** Every proposal from the `governance` module, sorted by id. Re-queried per
+   *  block like the roster; empty when the node exposes no governance surface. */
+  proposals: ProposalView[];
 
   // ── Forge ──
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
@@ -89,37 +103,69 @@ export interface ConsoleState {
 
 export const DEFAULT_ACCENT = "#a05a3c";
 
-export const createInitialState = (): ConsoleState => ({
-  screen: "chat",
-  accent: DEFAULT_ACCENT,
-  author: "operator",
-  connected: false,
-  nodeUrl: null,
-  managed: false,
-  status: null,
-  channels: [],
-  activeChannel: null,
-  messages: [],
-  activeThread: null,
-  authorNames: {},
-  tasks: [],
-  members: [],
-  forgeHead: null,
-  docIds: [],
-  activeDoc: null,
-  activeDocBlocks: [],
-  agents: [],
-  watches: [],
-  runs: [],
-  telemetry: [],
-  error: null,
-  workspaces: [],
-  workspace: null,
-  needsOnboarding: false,
-  onboardingBusy: false,
-  onboardingPhase: null,
-  inviteBlob: null,
-});
+// ── View-mode persistence ───────────────────────────────
+//
+// The chosen rail survives restarts. The screen itself is NOT persisted, so on
+// boot we land on the persisted rail's default surface. These two ids duplicate
+// the registry's first-in-section screens (chat / members) rather than import
+// the registry into this low-level state module, keeping the store free of the
+// views graph.
+const VIEW_MODE_KEY = "ducktape.viewMode";
+export const DEFAULT_USER_SCREEN = "chat";
+export const DEFAULT_OPERATOR_SCREEN = "members";
+
+export const loadViewMode = (): ViewMode => {
+  try {
+    return localStorage.getItem(VIEW_MODE_KEY) === "operator" ? "operator" : "user";
+  } catch {
+    return "user"; // storage unavailable (private mode / quota) — default rail
+  }
+};
+
+export const saveViewMode = (mode: ViewMode): void => {
+  try {
+    localStorage.setItem(VIEW_MODE_KEY, mode);
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+export const createInitialState = (): ConsoleState => {
+  const viewMode = loadViewMode();
+  return {
+    screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
+    viewMode,
+    accent: DEFAULT_ACCENT,
+    author: "operator",
+    connected: false,
+    nodeUrl: null,
+    managed: false,
+    status: null,
+    channels: [],
+    activeChannel: null,
+    messages: [],
+    activeThread: null,
+    authorNames: {},
+    tasks: [],
+    members: [],
+    proposals: [],
+    forgeHead: null,
+    docIds: [],
+    activeDoc: null,
+    activeDocBlocks: [],
+    agents: [],
+    watches: [],
+    runs: [],
+    telemetry: [],
+    error: null,
+    workspaces: [],
+    workspace: null,
+    needsOnboarding: false,
+    onboardingBusy: false,
+    onboardingPhase: null,
+    inviteBlob: null,
+  };
+};
 
 export interface ConsoleSnapshot {
   connected: boolean;
@@ -127,6 +173,7 @@ export interface ConsoleSnapshot {
   channels: Channel[];
   tasks: Task[];
   members: string[];
+  proposals: ProposalView[];
   forgeHead: string | null;
   activeChannel: string | null;
   messages: MessageView[];
@@ -147,6 +194,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   channels: snapshot.channels,
   tasks: snapshot.tasks,
   members: snapshot.members,
+  proposals: snapshot.proposals,
   forgeHead: snapshot.forgeHead,
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,

@@ -7,6 +7,7 @@ import type { PostPolicy } from "../../domain/chat-client";
 import * as documentClient from "../../domain/document-client";
 import type { BlockKind } from "../../domain/document-client";
 import * as forgeClient from "../../domain/forge-client";
+import * as governanceClient from "../../domain/governance-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
 import {
@@ -18,9 +19,13 @@ import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
+import {
+  defaultScreenForSection,
+  sectionForScreen,
+} from "../modules/registry";
 import type { Action } from "./reducer";
-import { channelIdOf, docIdOf, nextTaskStatus } from "./state";
-import type { ConsoleState } from "./state";
+import { channelIdOf, docIdOf, nextTaskStatus, saveViewMode } from "./state";
+import type { ConsoleState, ViewMode } from "./state";
 
 /** How often a parked joiner's phase is polled while it promotes. */
 const JOIN_POLL_MS = 1500;
@@ -36,6 +41,10 @@ const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
 
 export interface ConsoleActions {
   setScreen(screen: string): void;
+  /** Switch the sidebar rail (user apps vs operator surfaces) and persist it.
+   *  Jumps to the target rail's default surface when the current screen belongs
+   *  to the other rail, so the body always matches the rail. */
+  setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
   setAuthor(author: string): void;
   /** Set our own display name in the `profiles` module (origin-gated SetName)
@@ -98,6 +107,15 @@ export interface ConsoleActions {
   requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
+
+  // ── Governance (proposals + votes over the `governance` module) ──
+  /** Open a binding Signal proposal (no on-chain effect beyond its outcome).
+   *  Membership-gated by the module: only a current validator can propose. */
+  proposeSignal(text: string): void;
+  /** Cast (or change) this node's ballot on an open proposal. */
+  voteProposal(proposalId: string, approve: boolean): void;
+  /** Tally and settle a decidable proposal (anyone may trigger it). */
+  executeProposal(proposalId: string): void;
 
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
@@ -275,7 +293,32 @@ export function createActions({
   };
 
   return {
-    setScreen: (screen) => patch({ screen }),
+    setScreen: (screen) => {
+      // Navigating adopts the target surface's rail, so the sidebar highlight and
+      // the body never disagree. Shell screens (settings → null section) leave the
+      // current rail untouched.
+      const section = sectionForScreen(screen);
+      if (section) {
+        saveViewMode(section);
+        patch({ screen, viewMode: section });
+      } else {
+        patch({ screen });
+      }
+    },
+
+    setViewMode: (mode) => {
+      saveViewMode(mode);
+      update((prev) => {
+        // Keep the body on the chosen rail: if the current screen belongs to the
+        // other rail (or is a shell screen), land on this rail's default surface.
+        const screen =
+          sectionForScreen(prev.screen) === mode
+            ? prev.screen
+            : defaultScreenForSection(mode);
+        return { viewMode: mode, screen };
+      });
+    },
+
     setAccent: (accent) => patch({ accent }),
     setAuthor: (author) => patch({ author }),
 
@@ -599,6 +642,35 @@ export function createActions({
       if (!runId) return;
       submitThenRefresh((live) =>
         agentClient.cancelRun(live, { runId, origin: getState().author }),
+      );
+    },
+
+    // ── Governance ──
+    // Every submit is signed by THIS node's validator key (the daemon ignores the
+    // claimed origin), so these carry no origin. `refresh()` re-reads the proposal
+    // set after each write.
+    proposeSignal: (text) => {
+      const body = text.trim();
+      if (!body) return;
+      submitThenRefresh((live) =>
+        governanceClient.propose(live, {
+          proposalId: crypto.randomUUID(),
+          action: { Signal: { text: body } },
+        }),
+      );
+    },
+
+    voteProposal: (proposalId, approve) => {
+      if (!proposalId) return;
+      submitThenRefresh((live) =>
+        governanceClient.vote(live, { proposalId, approve }),
+      );
+    },
+
+    executeProposal: (proposalId) => {
+      if (!proposalId) return;
+      submitThenRefresh((live) =>
+        governanceClient.execute(live, { proposalId }),
       );
     },
 

@@ -64,9 +64,9 @@ function workspaceRole(workspace: {
 } | null) {
   if (workspace?.founder) {
     return {
-      role: "founder validator",
-      title: "Admin validator",
-      tier: "ADMIN",
+      role: "genesis validator",
+      title: "Genesis validator",
+      tier: "GENESIS",
       fg: color.onDark,
       bg: color.dark,
       bd: color.dark,
@@ -356,6 +356,11 @@ function IdentityCard() {
             }}
           />
           <span
+            title={
+              workspace?.founder
+                ? "Founding node — created the network at genesis. Provenance only; it confers no special governance authority."
+                : undefined
+            }
             style={{
               font: `600 9px ${font.mono}`,
               color: role.fg,

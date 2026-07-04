@@ -72,7 +72,7 @@ describe("MembersView", () => {
 
     expect(screen.getByRole("heading", { name: "Founder Rae" })).toBeInTheDocument();
     expect(screen.getByText(localKey)).toBeInTheDocument();
-    expect(screen.getByText("founder validator")).toBeInTheDocument();
+    expect(screen.getByText("genesis validator")).toBeInTheDocument();
     expect(screen.getByText("validator key")).toBeInTheDocument();
     expect(screen.getByText("not exposed by this node")).toBeInTheDocument();
 

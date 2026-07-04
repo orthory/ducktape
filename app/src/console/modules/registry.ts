@@ -5,25 +5,49 @@ import { AgentView } from "../views/agent/AgentView";
 import { ChatView } from "../views/chat/ChatView";
 import { DocumentView } from "../views/document/DocumentView";
 import { ForgeView } from "../views/forge/ForgeView";
+import { GovernanceView } from "../views/governance/GovernanceView";
 import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { StatusView } from "../views/status/StatusView";
 import { TasksView } from "../views/tasks/TasksView";
 import { TelemetryView } from "../views/telemetry/TelemetryView";
-import type { AppModule } from "./module-def";
+import type { AppModule, NavSection } from "./module-def";
 
+// The sidebar's view-mode toggle partitions these into two rails:
+//   USER          — the participant apps (chat, tasks, docs, forge, agents)
+//   NODE OPERATOR — the node/network surfaces (members, approvals, modules,
+//                   node, telemetry)
+// `order` is a sort key WITHIN a section, so the two rails number from 0
+// independently.
 export const MODULES: AppModule[] = [
-  { id: "chat", nav: { icon: "chat", label: "Chat", order: 0 }, Screen: ChatView },
-  { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 1 }, Screen: TasksView },
-  { id: "forge", nav: { icon: "forge", label: "Forge", order: 2 }, Screen: ForgeView },
-  { id: "document", nav: { icon: "document", label: "Docs", order: 3 }, Screen: DocumentView },
-  { id: "members", nav: { icon: "members", label: "Members", order: 4 }, Screen: MembersView },
-  { id: "modules", nav: { icon: "modules", label: "Modules", order: 5 }, Screen: ModulesView },
-  { id: "agent", nav: { icon: "agent", label: "Agents", order: 6 }, Screen: AgentView },
-  // Node (status) + Telemetry are the ops surfaces — grouped at the rail's foot.
-  { id: "status", nav: { icon: "node", label: "Node", order: 7 }, Screen: StatusView },
-  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 8 }, Screen: TelemetryView },
+  // ── User apps ──
+  { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
+  { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 1, section: "user" }, Screen: TasksView },
+  { id: "document", nav: { icon: "document", label: "Docs", order: 2, section: "user" }, Screen: DocumentView },
+  { id: "forge", nav: { icon: "forge", label: "Forge", order: 3, section: "user" }, Screen: ForgeView },
+  { id: "agent", nav: { icon: "agent", label: "Agents", order: 4, section: "user" }, Screen: AgentView },
+  // ── Node operator surfaces ──
+  { id: "members", nav: { icon: "members", label: "Members", order: 0, section: "operator" }, Screen: MembersView },
+  { id: "governance", nav: { icon: "approvals", label: "Approvals", order: 1, section: "operator" }, Screen: GovernanceView },
+  { id: "modules", nav: { icon: "modules", label: "Modules", order: 2, section: "operator" }, Screen: ModulesView },
+  { id: "status", nav: { icon: "node", label: "Node", order: 3, section: "operator" }, Screen: StatusView },
+  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 4, section: "operator" }, Screen: TelemetryView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>
   MODULES.find((m) => m.id === id);
+
+/** The modules of one view-mode rail, ordered. */
+export const modulesInSection = (section: NavSection): AppModule[] =>
+  MODULES.filter((m) => m.nav.section === section).sort(
+    (a, b) => a.nav.order - b.nav.order,
+  );
+
+/** Which view-mode rail owns a screen id, or null for the shell's own screens
+ *  (settings) and unknown ids. */
+export const sectionForScreen = (screen: string): NavSection | null =>
+  moduleById(screen)?.nav.section ?? null;
+
+/** The default screen a rail lands on (its first, lowest-order module). */
+export const defaultScreenForSection = (section: NavSection): string =>
+  modulesInSection(section)[0]?.id ?? "chat";

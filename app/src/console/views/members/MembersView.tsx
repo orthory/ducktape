@@ -8,7 +8,13 @@ import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 
-type FilterId = "all" | "validators" | "founder" | "local";
+type FilterId = "all" | "validators" | "genesis" | "local";
+
+// Provenance, not privilege: the genesis (founding) node created the network at
+// genesis. It carries NO special governance authority — membership is pure
+// majority rule, one member one vote — so this tooltip rides every genesis tag.
+const GENESIS_TOOLTIP =
+  "Founding node — created the network at genesis. This is provenance only: it confers no special governance authority (one member, one vote).";
 
 interface MemberVM {
   key: string;
@@ -17,7 +23,7 @@ interface MemberVM {
   profileName: string | null;
   initials: string;
   shortKey: string;
-  role: "founder validator" | "member validator" | "validator";
+  role: "genesis validator" | "member validator" | "validator";
   kind: "validator key";
   status: "in validator set";
   isFounder: boolean;
@@ -28,13 +34,13 @@ interface MemberVM {
 const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
   { id: "all", label: "All" },
   { id: "validators", label: "Validators" },
-  { id: "founder", label: "Founder" },
+  { id: "genesis", label: "Genesis" },
   { id: "local", label: "This Node" },
 ];
 
 const STATUS_PILLS = {
   validator: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
-  founder: { text: color.onDark, bg: color.dark, border: color.dark },
+  genesis: { text: color.onDark, bg: color.dark, border: color.dark },
   local: { text: color.accentAlt2, bg: "#eef5f0", border: "#cfe3d7" },
   muted: { text: color.muted3, bg: color.paper, border: color.borderStrong },
   unavailable: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
@@ -99,7 +105,7 @@ function makeMembers(
     const isLocal = sameKey(key, localKey);
     const isFounder = Boolean(workspace?.founder && isLocal);
     const role = isFounder
-      ? "founder validator"
+      ? "genesis validator"
       : isLocal && workspace?.member
         ? "member validator"
         : "validator";
@@ -126,7 +132,7 @@ function roleForFilter(member: MemberVM, filter: FilterId): boolean {
     case "all":
     case "validators":
       return true;
-    case "founder":
+    case "genesis":
       return member.isFounder;
     case "local":
       return member.isLocal;
@@ -139,29 +145,32 @@ function HeaderRole({
   workspace: { founder: boolean; member: boolean } | null;
 }) {
   const label = workspace?.founder
-    ? "Founder"
+    ? "Genesis"
     : workspace?.member
       ? "Admitted"
       : "Read Only";
   const pill = workspace?.founder
-    ? STATUS_PILLS.founder
+    ? STATUS_PILLS.genesis
     : workspace?.member
       ? STATUS_PILLS.local
       : STATUS_PILLS.unavailable;
-  return <Pill label={label} pill={pill} />;
+  return <Pill label={label} pill={pill} title={workspace?.founder ? GENESIS_TOOLTIP : undefined} />;
 }
 
 function Pill({
   label,
   pill,
   mono,
+  title,
 }: {
   label: string;
   pill: { text: string; bg: string; border: string };
   mono?: boolean;
+  title?: string;
 }) {
   return (
     <span
+      title={title}
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -357,7 +366,9 @@ function MemberRow({
             justifyContent: "flex-end",
           }}
         >
-          {member.isFounder ? <Pill label="Founder" pill={STATUS_PILLS.founder} mono /> : null}
+          {member.isFounder ? (
+            <Pill label="Genesis" pill={STATUS_PILLS.genesis} mono title={GENESIS_TOOLTIP} />
+          ) : null}
           <Pill label="Validator" pill={STATUS_PILLS.validator} />
         </div>
       </button>
@@ -693,7 +704,9 @@ function MemberDetailPane({
             }}
           >
             <Pill label="In validator set" pill={STATUS_PILLS.validator} />
-            {member.isFounder ? <Pill label="Founder" pill={STATUS_PILLS.founder} mono /> : null}
+            {member.isFounder ? (
+              <Pill label="Genesis" pill={STATUS_PILLS.genesis} mono title={GENESIS_TOOLTIP} />
+            ) : null}
           </div>
         </div>
 
@@ -712,7 +725,7 @@ function MemberDetailPane({
           <InfoRow label="role" value={member.role} />
           <InfoRow label="kind" value={member.kind} />
           <InfoRow label="status" value={member.status} />
-          <InfoRow label="founder" value={member.isFounder ? "yes" : "no"} />
+          <InfoRow label="genesis" value={member.isFounder ? "yes" : "no"} />
           <InfoRow label="this node" value={member.isLocal ? "yes" : "no"} />
           <InfoRow label="presence" value="not exposed by this node" />
         </div>
