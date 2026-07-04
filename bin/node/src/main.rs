@@ -2782,15 +2782,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // forwarded connection from a private source IP — use a public-IP sentry
         // or a reverse tunnel then.
         //
-        // TRANSPORT IDENTITY: a parked joiner's own key is untracked on every
-        // member (that is what admission changes), so it would be bounced at
-        // the handshake and could neither announce itself nor poll the
-        // statesync manifest. it therefore connects AS the network's derived
-        // LOBBY identity — the one key every member tracks that any invite
-        // holder can derive. its REAL key still signs everything that matters
-        // (the join proof, and consensus after the promotion reboot).
-        let p2p_signer = if joiner {
-            config::lobby_identity(&namespace)
+        // TRANSPORT IDENTITY: a parked joiner's own key is usually untracked
+        // on every member (that is what admission changes), so it would be
+        // bounced at the handshake and could neither announce itself nor poll
+        // the statesync manifest. such a joiner connects AS the network's
+        // derived LOBBY identity — the one key every member tracks that any
+        // invite holder can derive. its REAL key still signs everything that
+        // matters (the join proof, and consensus after the promotion reboot).
+        // the door only exists where the mesh tracks it: the network shape
+        // folds the lobby key into every member's mesh, so `peers` carries it
+        // here too (both sides derive the same mesh). a mesh WITHOUT a lobby
+        // key (the dev-seed shape) keeps the old behavior — the joiner parks
+        // under its real identity, refused until the cutover re-tracks it.
+        let lobby = config::lobby_identity(&namespace);
+        let p2p_signer = if joiner && peers.contains(&lobby.public_key()) {
+            lobby
         } else {
             signer.clone()
         };
