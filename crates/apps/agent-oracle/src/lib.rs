@@ -7,10 +7,12 @@
 //!
 //! credentials are emphatically NOT this crate's concern: it never reads,
 //! writes, or refreshes any auth file. it renders a prompt, hands it to a BYO
-//! CLI, and parses the CLI's answer. which CLI runs is chosen by the request's
-//! `model_ref` (see [`capability_for`]); whether that CLI exists on this node
-//! is the capability registry's concern, surfaced here as a clean per-request
-//! error when the capability is unavailable.
+//! CLI, and parses the CLI's answer. which CLI runs — and which model an
+//! unpinned request gets — is decided by capability SPECS via
+//! `ProviderSet::resolve` (pattern routing + per-spec default models; see
+//! `docs/capability-spec.md`), so this crate carries no model-naming
+//! knowledge at all. a request for an uninstalled or unroutable capability is
+//! a clean per-request error naming exactly what is missing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,7 +20,7 @@ use agent_interface::{
     AgentAction, AgentOutput, LlmRequest, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES,
     decode_llm_request, encode_output,
 };
-use capability_host::{CLAUDE, CODEX, ProviderJob, ProviderSet};
+use capability_host::{ProviderJob, ProviderSet};
 use chat_interface::{AuthorRef, Block, MessageView};
 use reactor::Worker;
 use saga_interface::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
@@ -35,34 +37,23 @@ Allowed reply block kinds are Paragraph, Heading, and Code. Heading is rendered 
 static MISSING_PROMPT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Production LLM worker for agent `LlmRequest` saga effects. holds the host's
-/// discovered provider set — the CLIs this node can actually run — and a
-/// default model for requests that do not pin one.
+/// provider surface (loaded specs + discovered providers); routing and
+/// default-model policy live in the specs, not here.
 pub struct LlmWorker {
     blobs: files::BlobHandle,
     providers: ProviderSet,
-    default_model: String,
 }
 
 impl LlmWorker {
-    pub fn new(blobs: files::BlobHandle, providers: ProviderSet, default_model: String) -> Self {
-        Self {
-            blobs,
-            providers,
-            default_model,
-        }
+    pub fn new(blobs: files::BlobHandle, providers: ProviderSet) -> Self {
+        Self { blobs, providers }
     }
 
     async fn answer(&self, llm: &LlmRequest) -> Result<Vec<u8>, String> {
         let system = self.prompt_text(llm)?;
-        let model = self.effective_model(llm);
-        let capability = capability_for(&model);
-        let Some(provider) = self.providers.find(capability) else {
-            return Err(format!(
-                "no local provider for capability '{capability}' (model {model:?}); \
-                 this node provides {:?}",
-                self.providers.capabilities()
-            ));
-        };
+        // spec-driven resolution: route the (possibly unpinned) model_ref to a
+        // capability, resolve the effective model, find the local provider.
+        let (provider, model) = self.providers.resolve(&llm.model_ref)?;
         let prompt = render_prompt(&system, llm);
         let text = provider
             .run(&ProviderJob {
@@ -72,15 +63,6 @@ impl LlmWorker {
             .await?;
         let output = agent_output_from_text(&text, llm.job_id.is_some());
         Ok(encode_output(&output))
-    }
-
-    /// the request's pinned model, or this worker's default when unset.
-    fn effective_model(&self, llm: &LlmRequest) -> String {
-        if llm.model_ref.trim().is_empty() {
-            self.default_model.clone()
-        } else {
-            llm.model_ref.clone()
-        }
     }
 
     fn prompt_text(&self, llm: &LlmRequest) -> Result<String, String> {
@@ -120,20 +102,6 @@ impl Worker for LlmWorker {
         };
         let outcome = self.answer(&llm).await.map_err(clean_error);
         Ok(Some(oracle_result(&request, outcome)))
-    }
-}
-
-/// map a model ref to the capability that serves it. the ONE place model
-/// naming meets provider selection — a future explicit capability field on the
-/// request replaces this derivation without touching the dispatch around it.
-/// anything not obviously a claude model routes to codex (the historical
-/// default), so an unknown model fails loud on a codex-less node rather than
-/// silently picking the wrong CLI.
-pub fn capability_for(model_ref: &str) -> &'static str {
-    if model_ref.trim().to_ascii_lowercase().starts_with("claude") {
-        CLAUDE
-    } else {
-        CODEX
     }
 }
 
@@ -370,14 +338,9 @@ mod tests {
     use super::*;
     use chat_interface::{MessageHead, ReactionSummary, Span};
 
-    #[test]
-    fn capability_is_chosen_by_model_ref() {
-        assert_eq!(capability_for("claude-sonnet-5"), CLAUDE);
-        assert_eq!(capability_for("Claude-Opus"), CLAUDE, "case-insensitive");
-        assert_eq!(capability_for("gpt-5.3-codex-spark"), CODEX);
-        assert_eq!(capability_for("gpt-5.5-codex"), CODEX);
-        assert_eq!(capability_for(""), CODEX, "unknown defaults to codex");
-    }
+    // model-ref -> capability routing is spec-driven and lives in
+    // capability-host (spec::tests::routing_*); this crate no longer carries
+    // model-naming knowledge to test.
 
     #[test]
     fn prompt_renders_system_contract_and_transcript() {
@@ -452,11 +415,16 @@ mod tests {
 
     #[test]
     fn a_missing_capability_is_a_clean_error_not_a_panic() {
-        // an empty provider set (no CLIs installed) answers every request with
-        // a descriptive error rather than dispatching into the void.
+        // specs loaded but no CLIs installed: resolve() routes the request and
+        // then names the missing capability, rather than dispatching into the
+        // void — the operator learns WHAT to install.
         let blobs = files::BlobHandle::default();
         let prompt_hash = blobs.put_chunk(b"be helpful".to_vec());
-        let worker = LlmWorker::new(blobs, ProviderSet::new(Vec::new()), "gpt-5.3-codex".into());
+        let specs = capability_host::SpecSet::load(None).expect("builtin specs");
+        let worker = LlmWorker::new(
+            blobs,
+            ProviderSet::assemble(specs, Vec::new()),
+        );
         let llm = LlmRequest {
             run_id: "r".into(),
             agent_id: "bot".into(),
@@ -469,24 +437,29 @@ mod tests {
             transcript: vec![message(1, AuthorRef::User(b"h".to_vec()), "hi")],
         };
         let err = futures::executor::block_on(worker.answer(&llm)).unwrap_err();
-        assert!(err.contains("no local provider"), "got: {err}");
-        assert!(err.contains("codex"), "names the missing capability: {err}");
+        assert!(err.contains("capability 'codex'"), "got: {err}");
+        assert!(err.contains("not provided"), "names the gap: {err}");
     }
 
     /// live end-to-end against a REAL locally installed CLI (BYO auth). ignored
     /// by default; run with the CLI on PATH and authenticated:
     /// `cargo test -p agent-oracle -- --ignored live_run`.
+    /// unpinned routes to the codex catch-all; on a codex-less host pin a
+    /// model your installed CLI serves:
+    /// `DUCKTAPE_LIVE_MODEL=claude-sonnet-5 cargo test -p agent-oracle -- --ignored live_run`.
     #[tokio::test]
     #[ignore]
     async fn live_run_uses_a_local_cli() {
         let blobs = files::BlobHandle::default();
         let prompt_hash = blobs.put_chunk(b"Reply with a tiny JSON AgentOutput.".to_vec());
-        let worker =
-            LlmWorker::new(blobs, capability_host::discover(), "gpt-5.3-codex-spark".into());
+        let worker = LlmWorker::new(
+            blobs,
+            capability_host::discover().expect("capability specs load"),
+        );
         let llm = LlmRequest {
             run_id: "live".into(),
             agent_id: "bot".into(),
-            model_ref: String::new(),
+            model_ref: std::env::var("DUCKTAPE_LIVE_MODEL").unwrap_or_default(),
             prompt_hash: prompt_hash.to_vec(),
             channel_id: "general".into(),
             anchor_seq: 1,

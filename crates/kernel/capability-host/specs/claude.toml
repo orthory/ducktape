@@ -1,0 +1,39 @@
+# Capability spec: Claude Code CLI.
+#
+# Embedded built-in default — see codex.toml for the annotated reference and
+# docs/capability-spec.md for the full format.
+
+spec = 1
+
+[capability]
+tag = "claude"
+description = "Claude Code CLI, non-interactive print mode (BYO auth: the CLI manages its own login)"
+
+[detect]
+bin = "claude"
+env = "DUCKTAPE_CLAUDE_BIN"
+
+[invoke]
+# Print mode with a single JSON result object; one turn so the agent answers
+# instead of embarking on tool-use loops. Prompt arrives on stdin.
+args = [
+    "-p",
+    "--output-format",
+    "json",
+    "--max-turns",
+    "1",
+    "--model",
+    "{model}",
+]
+prompt = "stdin"
+timeout_secs = 300
+
+[output]
+# The single `{"type":"result",...}` object from --output-format json.
+format = "claude-json"
+
+[models]
+# claude-* model refs route here. More literal characters than codex's "*"
+# catch-all, so "claude-sonnet-5" prefers this spec deterministically.
+patterns = ["claude*"]
+default = "claude-sonnet-5"

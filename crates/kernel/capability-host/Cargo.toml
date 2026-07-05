@@ -10,5 +10,9 @@ version.workspace = true
 # that actually provides it.
 [dependencies]
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# the capability spec format: executors are described by TOML files (embedded
+# defaults + operator dir), not Rust — see src/spec.rs and docs/capability-spec.md.
+toml = "0.8"
 tokio = { workspace = true, features = ["process", "io-util"] }

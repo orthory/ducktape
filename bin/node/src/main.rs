@@ -65,7 +65,7 @@ use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of
 
 mod config;
 mod lobby;
-use config::{Resolved, hex_bytes, unhex};
+use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
@@ -2834,7 +2834,9 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// the reachability plane's thread body: derive the plane's endpoints, bind
 /// the nat client against the coordinated-reach coordinators, and drive
-/// `reachability::run` with the phase-A fake WireGuard effect. every failure
+/// `reachability::run` with the configured WireGuard effect — real (an
+/// actual interface via the userspace WireGuard runtime) by default,
+/// in-memory fake when `wireguard_effect = "fake"` opts out. every failure
 /// path prints and returns — the plane is an overlay on a working node,
 /// never a reason to take the node down.
 #[allow(clippy::too_many_arguments)]
@@ -2844,6 +2846,7 @@ async fn reachability_plane(
     signer: ed25519::PrivateKey,
     wireguard_key_file: PathBuf,
     wireguard_listen: std::net::SocketAddr,
+    effect_kind: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
@@ -2929,16 +2932,58 @@ async fn reachability_plane(
         coordinators: coords,
         port_policy: policy,
     };
-    if let Err(err) = reachability::run(
-        config,
-        wireguard_effect::FakeWireGuardEffect::default(),
-        resolver,
-        commands,
-        events,
-    )
-    .await
-    {
-        eprintln!("[node {label}] reachability plane exited: {err}");
+    match effect_kind {
+        WireGuardEffectKind::Fake => {
+            println!(
+                "[node {label}] reachability: wireguard_effect = \"fake\" — tunnel configs are \
+                 recorded in memory; no real interface is touched"
+            );
+            if let Err(err) = reachability::run(
+                config,
+                wireguard_effect::FakeWireGuardEffect::default(),
+                resolver,
+                commands,
+                events,
+            )
+            .await
+            {
+                eprintln!("[node {label}] reachability plane exited: {err}");
+            }
+        }
+        WireGuardEffectKind::Real => {
+            #[cfg(unix)]
+            {
+                // same name the orchestrator writes into every
+                // InterfaceConfiguration it applies — the WGApi handle and
+                // the configs it receives must agree on the interface.
+                let ifname = reachability::interface_name(&config.chain_id);
+                let effect = match wireguard_effect::DefguardWireGuardEffect::new(&ifname) {
+                    Ok(effect) => effect,
+                    Err(err) => {
+                        eprintln!(
+                            "[node {label}] reachability: wireguard api handle for {ifname:?} \
+                             failed ({err}) — plane not started; set wireguard_effect = \
+                             \"fake\" to run without a real interface"
+                        );
+                        return;
+                    }
+                };
+                println!("[node {label}] reachability: driving wireguard interface {ifname}");
+                if let Err(err) =
+                    reachability::run(config, effect, resolver, commands, events).await
+                {
+                    eprintln!("[node {label}] reachability plane exited: {err}");
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!(
+                    "[node {label}] reachability: the real wireguard effect needs a unix host — \
+                     plane not started; set wireguard_effect = \"fake\" to run without a real \
+                     interface"
+                );
+            }
+        }
     }
 }
 
@@ -2964,6 +3009,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         rpc_listen,
         http_listen,
         wireguard_listen,
+        wireguard_effect,
         wireguard_key_file,
         dev_demo,
         checkpoint_blocks,
@@ -3910,6 +3956,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     reach_signer,
                                     key_file,
                                     wg_addr,
+                                    wireguard_effect,
                                     advertised_reach,
                                     coordinators,
                                     cmd_rx,
@@ -4675,19 +4722,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the host-owned worker set (reactor seam): effects of finalized
         // blocks are offered here, and claimed follow-ups re-enter the ordered
         // lane as their own blocks.
-        // discover this host's installed executor CLIs (BYO — no credential
-        // handling here). the discovered tag set is BOTH what the oracle worker
-        // can run and what this node announces to the capability registry, so
-        // the two can never drift.
-        let providers = capability_host::discover();
+        // load capability specs and discover this host's installed executor
+        // CLIs (BYO — no credential handling here). the discovered tag set is
+        // BOTH what the oracle worker can run and what this node announces to
+        // the capability registry, so the two can never drift. routing and
+        // default models live in the specs (docs/capability-spec.md); a broken
+        // operator spec is a boot error, not a silently dropped executor.
+        let providers = capability_host::discover()
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
-        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
-            blobs.clone(),
-            providers,
-            // default codex model when a request pins none; a claude model_ref
-            // routes to the claude provider instead (see agent_oracle::capability_for).
-            "gpt-5.3-codex-spark".into(),
-        ))];
+        let workers: Vec<Box<dyn reactor::Worker>> =
+            vec![Box::new(LlmWorker::new(blobs.clone(), providers))];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
         // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
         // this binary can execute. survives restart/late-join (state-driven, not a
