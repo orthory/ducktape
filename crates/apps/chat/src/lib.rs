@@ -43,6 +43,7 @@ use sdk::{
     Ctx, Error, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot, StateSyncHandle,
 };
 use serde::{Serialize, de::DeserializeOwned};
+use tagging_interface::{TagEvent, TaggingMsg};
 
 /// the qmdb key: a fixed-width digest of a logical chat record key.
 type ChatKey = <Sha256 as Hasher>::Digest;
@@ -183,6 +184,34 @@ fn collect_mentions(blocks: &[Block]) -> Vec<AuthorRef> {
     mentions
 }
 
+/// chat's author shape in the tagging plane's vocabulary — the edge
+/// translation the plane's module-agnosticism depends on.
+fn tag_author(author: &AuthorRef) -> tagging_interface::Author {
+    match author {
+        AuthorRef::User(key) => tagging_interface::Author::User(key.clone()),
+        AuthorRef::Agent { module, agent_id } => {
+            tagging_interface::Author::Entity(tagging_interface::EntityRef {
+                module: module.clone(),
+                entity: agent_id.clone(),
+            })
+        }
+        AuthorRef::Module(module) => tagging_interface::Author::Module(module.clone()),
+        AuthorRef::System => tagging_interface::Author::System,
+    }
+}
+
+/// the entity tag a mention names, if it names a module-hosted entity at all
+/// (user mentions address people, not module entities — no tag).
+fn tag_ref(mention: &AuthorRef) -> Option<tagging_interface::EntityRef> {
+    match mention {
+        AuthorRef::Agent { module, agent_id } => Some(tagging_interface::EntityRef {
+            module: module.clone(),
+            entity: agent_id.clone(),
+        }),
+        AuthorRef::User(_) | AuthorRef::Module(_) | AuthorRef::System => None,
+    }
+}
+
 fn clamp_limit(limit: u64) -> u64 {
     limit.min(MAX_QUERY_LIMIT)
 }
@@ -235,6 +264,11 @@ where
     db: ChatDb<E>,
     /// logical-key -> staged write for the current block; `None` = delete.
     pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// the tagging plane every post is reported to (one `TagEvent` follow-up
+    /// per post, same block). `None` = no plane on this host (tests, minimal
+    /// registries). the plane owns the loop rule and the subscription check;
+    /// chat only translates its shapes at this edge.
+    tagging: Option<ModuleId>,
 }
 
 impl<E> Chat<E>
@@ -252,7 +286,14 @@ where
             id,
             db,
             pending: BTreeMap::new(),
+            tagging: None,
         }
+    }
+
+    /// report every post to `tagging` as a [`tagging_interface::TagEvent`].
+    pub fn with_tagging(mut self, tagging: impl Into<ModuleId>) -> Self {
+        self.tagging = Some(tagging.into());
+        self
     }
 
     fn validate_non_empty(field: &str, value: &str) -> Result<(), Error> {
@@ -982,6 +1023,7 @@ where
             id,
             db,
             pending: BTreeMap::new(),
+            tagging: None,
         })
     }
 }
@@ -1072,6 +1114,21 @@ where
                             author: author.clone(),
                             mentions: mentions.clone(),
                         }),
+                    });
+                }
+                // report the post to the tagging plane in this same block,
+                // translating chat shapes at this edge. unconditional on
+                // author kind: the loop rule (only user posts engage) is the
+                // PLANE's rule, stated once there — chat does not pre-judge.
+                if let Some(tagging) = &self.tagging {
+                    ctx.emit_msg(Msg {
+                        target: tagging.clone(),
+                        payload: tagging_interface::encode_msg(&TaggingMsg::Tag(TagEvent {
+                            container: channel_id,
+                            content_seq: posted.seq,
+                            author: tag_author(&author),
+                            tags: mentions.iter().filter_map(tag_ref).collect(),
+                        })),
                     });
                 }
                 Ok(())

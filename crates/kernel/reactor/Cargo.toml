@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+dispatch-interface = { workspace = true }
 sdk = { workspace = true }
 host = { workspace = true }
 async-trait = { workspace = true }

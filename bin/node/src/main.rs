@@ -60,6 +60,7 @@ use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver, Recipients, Send
 use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 use dispatch::DispatchModule;
+use tagging::TaggingModule;
 use dispatch_oracle::DispatchWorker;
 use futures::{FutureExt as _, StreamExt as _};
 
@@ -189,7 +190,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 20] = [
+const MODULE_IDS: [&str; 22] = [
     "kv",
     "document",
     "pages",
@@ -200,6 +201,8 @@ const MODULE_IDS: [&str; 20] = [
     "upgrade",
     "saga",
     "capability",
+    "dispatch",
+    "tagging",
     "tasks",
     "vaults",
     "profiles",
@@ -553,6 +556,22 @@ impl CapabilityAnnouncer {
     }
 }
 
+/// the committed dispatch mailbox's undelivered-result count — the nudge
+/// pump's read. `0` when the module is absent or the mailbox is empty.
+async fn dispatch_pending_deliveries(host: &Host) -> u64 {
+    use dispatch_interface::{DispatchQuery, DispatchReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("dispatch", &encode_query(&DispatchQuery::PendingDeliveries))
+        .await
+    else {
+        return 0;
+    };
+    match decode_reply(&reply) {
+        Ok(DispatchReply::PendingDeliveries(n)) => n,
+        _ => 0,
+    }
+}
+
 /// the committed saga ledger's earliest pending lease-expiry/deadline — the
 /// crank pump's read. `None` when the module is absent or nothing pending
 /// carries one.
@@ -587,7 +606,9 @@ async fn genesis_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
-    let chat = Chat::init(context.child("chat"), "chat").await;
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
     // forge shares the files body plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge =
@@ -630,6 +651,9 @@ async fn genesis_host(
         // the task plane: recipe manifests + capability-routed dispatch with
         // next-block result delivery (the host's DeliverPending injection).
         Box::new(DispatchModule::new("dispatch", "saga")),
+        // the engagement plane: content modules report tags, subscriber
+        // modules receive engagement events — router only, module-agnostic.
+        Box::new(TaggingModule::new("tagging")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
         // the origin-gated display-name registry: each verified submit origin
@@ -647,8 +671,11 @@ async fn genesis_host(
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -677,7 +704,9 @@ async fn restore_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
-    let chat = Chat::init(context.child("chat"), "chat").await;
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
     // forge shares the files body plane (see genesis_host) for Push materialization.
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
         .map_err(|e| format!("forge: {e}"))?;
@@ -733,6 +762,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
 
+    let mut tagging = TaggingModule::new("tagging");
+    let (bytes, root) = snapshot_of("tagging")?;
+    tagging
+        .install(bytes, root)
+        .map_err(|e| format!("tagging install: {e}"))?;
+
     let mut tasks = Tasks::new("tasks");
     let (bytes, root) = snapshot_of("tasks")?;
     tasks
@@ -778,8 +813,11 @@ async fn restore_host(
         "agent",
         "chat",
         "saga",
+        "tagging",
+        "dispatch",
         Some("tasks".into()),
         Some("jobs".into()),
+        Some("document".into()),
     );
     let (bytes, root) = snapshot_of("agent")?;
     agent
@@ -810,6 +848,7 @@ async fn restore_host(
         Box::new(saga),
         Box::new(capability),
         Box::new(dispatch),
+        Box::new(tagging),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -912,7 +951,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await?;
+    .await?
+    .with_tagging("tagging");
 
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
@@ -957,6 +997,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     dispatch
         .install(&bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("tagging").await?;
+    let mut tagging = TaggingModule::new("tagging");
+    tagging
+        .install(&bytes, root)
+        .map_err(|e| format!("tagging install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance = Governance::new("governance", "valset", "upgrade");
@@ -1016,8 +1062,11 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "agent",
         "chat",
         "saga",
+        "tagging",
+        "dispatch",
         Some("tasks".into()),
         Some("jobs".into()),
+        Some("document".into()),
     );
     agent
         .install(&bytes, root)
@@ -1059,6 +1108,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(saga),
         Box::new(capability),
         Box::new(dispatch),
+        Box::new(tagging),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -5514,6 +5564,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut last_nop = std::time::Instant::now();
         // throttle for the saga crank pump below.
         let mut last_crank = std::time::Instant::now();
+        // throttle for the dispatch delivery-nudge pump below.
+        let mut last_nudge = std::time::Instant::now();
         // the host-owned worker set (reactor seam): effects of finalized
         // blocks are offered here, and claimed follow-ups re-enter the ordered
         // lane as their own blocks.
@@ -6261,6 +6313,40 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 "[node {label}] saga crank submitted \
                                  (next expiry {expiry} <= height {finalized_height})"
                             );
+                        }
+                    }
+
+                    // DISPATCH DELIVERY NUDGE (never-pop-stack liveness): a
+                    // result committed into the dispatch mailbox delivers via
+                    // the drain's DeliverPending injection in the NEXT
+                    // successful block — and heartbeat nops are rejected
+                    // frames that never apply, so a quiet chain would sit on
+                    // its mailbox. state-driven: while the committed mailbox
+                    // is non-empty, push one permissionless Nudge — a no-op
+                    // whose block carries the injection. duplicate nudges
+                    // from other nodes are free.
+                    if last_nudge.elapsed() >= HEARTBEAT_INTERVAL
+                        && dispatch_pending_deliveries(node.host()).await > 0
+                    {
+                        last_nudge = std::time::Instant::now();
+                        let seq = next_seq;
+                        next_seq += 1;
+                        if let Err(e) = node
+                            .submit(
+                                &signer,
+                                seq,
+                                Msg {
+                                    target: "dispatch".into(),
+                                    payload: dispatch_interface::encode_msg(
+                                        &dispatch_interface::DispatchMsg::Nudge {},
+                                    ),
+                                },
+                            )
+                            .await
+                        {
+                            eprintln!("[node {label}] dispatch nudge submit failed: {e}");
+                        } else {
+                            println!("[node {label}] dispatch delivery nudge submitted");
                         }
                     }
 

@@ -31,6 +31,7 @@ use chat::Chat;
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
+use tagging::TaggingModule;
 use dispatch_oracle::DispatchWorker;
 use document::Document;
 use files::Files;
@@ -57,10 +58,11 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 14] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
+    "tagging",
     "tasks",
     "inbox",
     "automations",
@@ -249,11 +251,15 @@ fn run_node(
         // files registers over the
         // http layer's blob handle so uploads land in the store `serve_sync`
         // reads — the bytes themselves never touch consensus.
-        let chat = Chat::init(context.child("chat"), "chat").await;
+        let chat = Chat::init(context.child("chat"), "chat")
+            .await
+            .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         // the task plane: recipe manifests + capability dispatch with
         // next-block result delivery.
         let dispatch = DispatchModule::new("dispatch", "saga");
+        // the engagement plane: tag reports in, engagement events out.
+        let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
@@ -262,8 +268,11 @@ fn run_node(
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         );
         let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
@@ -286,6 +295,7 @@ fn run_node(
             Box::new(chat),
             Box::new(saga),
             Box::new(dispatch),
+            Box::new(tagging),
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
@@ -426,17 +436,17 @@ fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
             // docs/capability-spec.md). a broken operator spec is a boot error.
             capability_host::discover()
                 .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-            // the single-node daemon's saga ledger never assigns leases (no
-            // valset, no registry), so no WorkerRequest ever carries an assignee
-            // and this key is never consulted.
-            Vec::new(),
+            // the daemon's oracle identity: its worker follow-ups are
+            // submitted under ORACLE_ORIGIN, so an Accept claim records that
+            // key as the assignee and the re-emitted request must match it.
+            ORACLE_ORIGIN.to_vec(),
         )),
         Box::new(DispatchWorker::new(
             // a second, identical discovery: ProviderSet owns its providers
             // (not Clone); same specs + PATH at boot, so no drift.
             capability_host::discover()
                 .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-            Vec::new(),
+            ORACLE_ORIGIN.to_vec(),
         )),
     ]
 }
@@ -473,7 +483,20 @@ async fn submit_and_drain(
     offer_effects(workers, effects, &mut queue).await;
     let mut rounds = 1u32;
 
-    while let Some(follow) = queue.pop_front() {
+    loop {
+        let Some(follow) = queue.pop_front() else {
+            // the never-pop-stack tail: results committed into the dispatch
+            // mailbox deliver in a LATER block, and this block-per-op daemon
+            // ticks no other blocks — nudge one flush block per pending batch.
+            if !host.has_pending_deliveries().await {
+                break;
+            }
+            queue.push_back(Msg {
+                target: dispatch_interface::DEFAULT_DISPATCH_TARGET.into(),
+                payload: dispatch_interface::encode_msg(&dispatch_interface::DispatchMsg::Nudge {}),
+            });
+            continue;
+        };
         rounds += 1;
         if rounds > MAX_WORKER_ROUNDS {
             return Err("worker-round budget exceeded".into());
@@ -676,6 +699,19 @@ impl reactor::Worker for EchoWorker {
             Ok(request) => request,
             Err(_) => return Ok(reactor::WorkOutcome::NotMine),
         };
+        // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
+        // module judged a Text contract; the agent module normalizes).
+        if let Ok(work) = dispatch_interface::decode_work_spec(&request.spec) {
+            return Ok(reactor::WorkOutcome::Handled(Some(Msg {
+                target: "saga".into(),
+                payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
+                    saga_id: request.saga_id,
+                    attempt: request.attempt,
+                    outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id)
+                        .into_bytes()),
+                }),
+            })));
+        }
         let llm = match agent_interface::decode_llm_request(&request.spec) {
             Ok(llm) => llm,
             Err(_) => return Ok(reactor::WorkOutcome::NotMine),

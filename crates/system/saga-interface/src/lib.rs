@@ -1,7 +1,7 @@
 //! the saga module's public wire surface — types only.
 //!
 //! saga v2 is the deterministic async-RPC ledger: one effect, one agreed
-//! result, with attempts, leases, deadlines, and a requester callback. five op
+//! result, with attempts, leases, deadlines, and a requester callback. six op
 //! shapes cross this surface, all as [`SagaMsg`]:
 //!
 //! - `Trigger` STARTS a saga. the module records a pending saga and emits a
@@ -12,6 +12,12 @@
 //!   AGREED result through the same ordered path. the `(saga_id, attempt)`
 //!   pair is the idempotency key: exactly one result transitions a given
 //!   attempt; duplicates and stale attempts are deterministic no-ops.
+//! - `Accept` CLAIMS an unassigned attempt: an UNASSIGNED [`WorkerRequest`]
+//!   (empty/unavailable provider pool) is an ANNOUNCEMENT, not a work order —
+//!   a capable node answers it with `Accept` under its own key, the first
+//!   accept in consensus order becomes the assignee, and the saga re-emits
+//!   the effect naming the winner. one execution, however many nodes could
+//!   have run it.
 //! - `Crank` is the permissionless liveness op: it deterministically fires
 //!   past-deadline timeouts and expires stale leases (retry or fail). anyone
 //!   may crank; safety never depends on who does.
@@ -125,6 +131,18 @@ pub enum SagaMsg {
         attempt: u32,
         outcome: Result<Vec<u8>, String>,
     },
+    /// claim an UNASSIGNED attempt: the first accept in consensus order
+    /// becomes the attempt's assignee (its lease starts) and the saga
+    /// re-emits the [`WorkerRequest`] effect naming the winner — only the
+    /// winner runs. submitted by a capable node under its own external key.
+    /// unknown/terminal sagas, stale attempts, and already-assigned attempts
+    /// are deterministic no-ops (late accepts lose quietly).
+    Accept {
+        saga_id: SagaId,
+        /// the attempt being claimed — echoed from the announcement
+        /// [`WorkerRequest`].
+        attempt: u32,
+    },
     /// permissionless deterministic sweep: fire past-deadline timeouts and
     /// expire stale leases (retry or fail), bounded per op.
     Crank {},
@@ -140,7 +158,10 @@ pub enum SagaMsg {
 /// host-owned worker's work order. `(saga_id, attempt)` is the idempotency key
 /// the worker echoes back in its `OracleResult`; `assignee` is the lease
 /// holder that should execute (advisory under the open policy, enforced under
-/// strict).
+/// strict). an `assignee` of `None` is an ANNOUNCEMENT: under the strict
+/// policy no result can land for it — a capable worker answers with
+/// [`SagaMsg::Accept`] instead of running, and the accept's re-emitted
+/// request (now naming the winner) is the actual work order.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRequest {
     pub saga_id: SagaId,

@@ -1,26 +1,25 @@
-//! the collaboration loop end-to-end under a real host + reactor (design §3):
-//! a human posts with a mention → chat's hook engages the agent → the run and
-//! its saga trigger commit IN THE SAME BLOCK as the post (P2) → the reactor's
-//! mock LLM worker answers the WorkerRequest effect as an ordinary oracle op
-//! → the saga's terminal transition, its callback, the agent's validated
-//! reply (authored as the AGENT), and the task action all commit in ONE block
-//! (P2, P6) → and a second composition replaying the identical op sequence
-//! (the oracle op included) lands on the byte-identical app-hash — the
-//! oracle-as-op laundering that makes a non-deterministic LLM consensus-safe
-//! (N2: validators agree on the one finalized output, never on reproducing
-//! it).
-
-use std::cell::RefCell;
-use std::rc::Rc;
+//! the collaboration loop end-to-end under a real host (design §3), on the
+//! tagging + dispatch planes: a human posts with a mention → chat reports the
+//! post to the TAGGING plane → the plane's engagement event, the run record,
+//! the dispatch, and its saga trigger all commit IN THE SAME BLOCK as the
+//! post (P2) → the mock worker answers the WorkerRequest effect as an
+//! ordinary oracle op → the saga's terminal transition and the dispatch
+//! module's contract-checked mailbox write commit in that op's block — and
+//! NOTHING reaches the agent yet (the never-pop-stack rule) → the NEXT block
+//! injects the delivery, and the agent's validated reply (authored as the
+//! AGENT) plus the task action commit in that delivery block → a second
+//! composition replaying the identical op sequence lands on the
+//! byte-identical app-hash — the oracle-as-op laundering that makes a
+//! non-deterministic LLM consensus-safe (N2).
 
 use agent::{
-    AgentModule, context_hash, job_run_id_for, job_spec_hash, reply_message_id, run_id_for,
+    AgentModule, dispatch_id_for, job_run_id_for, job_spec_hash, reply_message_id, run_id_for,
     saga_id_for,
 };
 use agent_interface::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentOutput, AgentQuery,
-    AgentReply, AgentStatus, LlmRequest, RunStatus, TurnPolicy, decode_llm_request, decode_reply,
-    encode_msg, encode_output, encode_query,
+    AgentReply, AgentStatus, RunStatus, TurnPolicy, decode_reply, encode_msg, encode_output,
+    encode_query,
 };
 use chat::Chat;
 use chat_interface::{
@@ -29,55 +28,31 @@ use chat_interface::{
     encode_query as chat_encode_query,
 };
 use commonware_runtime::{Runner as _, deterministic};
+use dispatch::DispatchModule;
+use dispatch_interface::{
+    DispatchQuery, DispatchReply, DispatchStatus, decode_work_spec,
+    encode_query as dispatch_encode_query,
+};
 use host::{BlockContext, Host};
 use jobs::Jobs;
 use jobs_interface::{
     Job, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_reply as jobs_decode_reply,
     encode_msg as jobs_encode_msg, encode_query as jobs_encode_query,
 };
-use reactor::{Reactor, Worker};
 use saga::SagaModule;
 use saga_interface::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
     decode_worker_request, encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
 use sdk::{Effect, Msg, Origin, StateRoot};
+use tagging::TaggingModule;
 use tasks::Tasks;
 use tasks_interface::{
     TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
 };
 
-/// the mock oracle standing in for the real (non-deterministic) LLM worker:
-/// it claims a `WorkerRequest` only when the spec decodes as an [`LlmRequest`]
-/// (try-decode routing) and answers with a canned [`AgentOutput`] — a reply
-/// plus one task action — through the NORMAL submit path, echoing the
-/// request's `(saga_id, attempt)` idempotency key. the call counter lets the
-/// test prove how many worker rounds a settle actually took.
-struct MockLlmWorker {
-    calls: Rc<RefCell<u32>>,
-}
-
-#[async_trait::async_trait(?Send)]
-impl Worker for MockLlmWorker {
-    async fn run(&self, effect: &Effect) -> Result<reactor::WorkOutcome, reactor::Error> {
-        let Ok(request) = decode_worker_request(&effect.0) else {
-            return Ok(reactor::WorkOutcome::NotMine);
-        };
-        let Ok(llm) = decode_llm_request(&request.spec) else {
-            return Ok(reactor::WorkOutcome::NotMine);
-        };
-        *self.calls.borrow_mut() += 1;
-        Ok(reactor::WorkOutcome::Handled(Some(Msg {
-            target: "saga".into(),
-            payload: saga_encode_msg(&SagaMsg::OracleResult {
-                saga_id: request.saga_id,
-                attempt: request.attempt,
-                outcome: Ok(canned_output(&llm.run_id)),
-            }),
-        })))
-    }
-}
-
+/// the mock oracle's answer: RAW model text (here: a strict AgentOutput JSON
+/// — the agent module's in-consensus normalization accepts it as-is).
 fn canned_output(run_id: &str) -> Vec<u8> {
     encode_output(&AgentOutput {
         reply_blocks: vec![Block::paragraph(format!("quack: handling {run_id}"))],
@@ -86,6 +61,23 @@ fn canned_output(run_id: &str) -> Vec<u8> {
             title: "follow up on the mention".into(),
         }],
     })
+}
+
+/// stand in for the off-consensus worker: decode the effect's WorkerRequest,
+/// kind-gate the dispatch WorkSpec, and answer with `raw` through the normal
+/// oracle-op submit path, echoing the request's idempotency key.
+fn oracle_op_for(effect: &Effect, raw: Vec<u8>) -> Msg {
+    let request = decode_worker_request(&effect.0).expect("a WorkerRequest effect");
+    let work = decode_work_spec(&request.spec).expect("a dispatch WorkSpec");
+    assert_eq!(work.capability, "mock-llm-1");
+    Msg {
+        target: "saga".into(),
+        payload: saga_encode_msg(&SagaMsg::OracleResult {
+            saga_id: request.saga_id,
+            attempt: request.attempt,
+            outcome: Ok(raw),
+        }),
+    }
 }
 
 fn alice() -> Origin {
@@ -111,6 +103,33 @@ fn quackbot_ref() -> AuthorRef {
     }
 }
 
+/// a benign op to advance one block — what triggers the host's committed
+/// delivery injection.
+fn noop_block(n: u64) -> Msg {
+    Msg {
+        target: "chat".into(),
+        payload: chat_encode_msg(&ChatMsg::CreateChannel {
+            channel_id: format!("noop-{n}"),
+            name: "Noop".into(),
+            post_policy: PostPolicy::Open,
+        }),
+    }
+}
+
+fn register_quackbot(actions: Vec<String>) -> Msg {
+    Msg {
+        target: "agent".into(),
+        payload: encode_msg(&AgentMsg::RegisterAgent {
+            agent_id: "quackbot".into(),
+            display_name: "Quackbot".into(),
+            capability: "mock-llm-1".into(),
+            prompt_hash: vec![7u8; 32],
+            prompt_doc: None,
+            allowed_actions: actions,
+        }),
+    }
+}
+
 /// the four setup + post ops, in consensus order. block heights ride along so
 /// the replay composition sees the identical `BlockContext`s.
 fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
@@ -130,16 +149,7 @@ fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
         (
             2,
             alice(),
-            Msg {
-                target: "agent".into(),
-                payload: encode_msg(&AgentMsg::RegisterAgent {
-                    agent_id: "quackbot".into(),
-                    display_name: "Quackbot".into(),
-                    capability: "mock-llm-1".into(),
-                    prompt_hash: vec![7u8; 32],
-                    allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
-                }),
-            },
+            register_quackbot(vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()]),
         ),
         (
             3,
@@ -177,16 +187,21 @@ fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
 }
 
 async fn genesis(context: deterministic::Context) -> Host {
-    let chat = Chat::init(context, "chat").await;
+    let chat = Chat::init(context, "chat").await.with_tagging("tagging");
     Host::genesis(vec![
         Box::new(chat),
+        Box::new(TaggingModule::new("tagging")),
         Box::new(SagaModule::new("saga")),
+        Box::new(DispatchModule::new("dispatch", "saga")),
         Box::new(AgentModule::new(
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            None,
         )),
         Box::new(Tasks::new("tasks")),
         Box::new(Jobs::new("jobs")),
@@ -223,6 +238,25 @@ async fn saga_status(host: &Host, saga_id: &str) -> Option<SagaStatus> {
     match saga_decode_reply(&reply).unwrap() {
         SagaReply::Saga(view) => view.map(|v| v.status),
         other => panic!("expected Saga reply, got {other:?}"),
+    }
+}
+
+/// the agent's chat-run dispatch as the dispatch module sees it — including
+/// the INTERNAL saga id the failure tests feed oracle results to.
+async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch_interface::DispatchView {
+    let reply = host
+        .query(
+            "dispatch",
+            &dispatch_encode_query(&DispatchQuery::Dispatch {
+                receiver: "agent".into(),
+                dispatch_id: dispatch_id_for(run_id),
+            }),
+        )
+        .await
+        .unwrap();
+    match dispatch_interface::decode_reply(&reply).unwrap() {
+        DispatchReply::Dispatch(Some(view)) => view,
+        other => panic!("expected the run's dispatch, got {other:?}"),
     }
 }
 
@@ -309,17 +343,31 @@ fn claim_job(job_id: &str) -> Msg {
     })
 }
 
+fn register_duck() -> Msg {
+    Msg {
+        target: "agent".into(),
+        payload: encode_msg(&AgentMsg::RegisterAgent {
+            agent_id: "duck".into(),
+            display_name: "Duck".into(),
+            capability: "mock-llm-1".into(),
+            prompt_hash: vec![9u8; 32],
+            prompt_doc: None,
+            allowed_actions: vec![ACTION_TASKS_CREATE.into()],
+        }),
+    }
+}
+
 #[test]
-fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_block() {
+fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_block() {
     let run_id = run_id_for("general", 1, "quackbot");
     let replay_run_id = run_id.clone();
 
-    // ---- instance one: the live flow through host + reactor ----------------
+    // ---- instance one: the live flow, block by block ------------------------
     let (settled_hash, oracle_op) = deterministic::Runner::default().start(|context| async move {
         let mut host = genesis(context).await;
 
-        // blocks 1..3: channel, registry, watch. the watch and chat's hook
-        // registration are one atomic block (P2).
+        // blocks 1..3: channel, registry (+ the agent's dispatch recipe),
+        // watch (+ the plane subscription) — each pair one atomic block (P2).
         let ops = scripted_ops();
         for (height, origin, op) in &ops[..3] {
             host.submit_at(at(*height, origin.clone()), op.clone())
@@ -328,8 +376,9 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
         }
 
         // block 4: the user post. THE SAME BLOCK must carry the message, the
-        // hook delivery, the run record, and the saga trigger (P2) — and emit
-        // exactly one WorkerRequest effect for the off-consensus seam.
+        // tag report, the plane's engagement delivery, the run record, the
+        // dispatch, and its saga trigger (P2) — and emit exactly one
+        // WorkerRequest effect for the off-consensus seam.
         let (height, origin, post) = &ops[3];
         let outcome = host
             .submit_at(at(*height, origin.clone()), post.clone())
@@ -338,98 +387,78 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
         let run = run_view(&host, &run_id).await.expect("run created");
         assert_eq!(
             run.status,
-            RunStatus::AwaitingOracle {
-                saga_id: saga_id_for(&run_id),
+            RunStatus::AwaitingResult {
+                dispatch_id: dispatch_id_for(&run_id),
             },
-            "the run awaits its oracle in the SAME block as the post"
+            "the run awaits its dispatch result in the SAME block as the post"
         );
+        let dispatch_view = agent_dispatch(&host, &run_id).await;
+        let DispatchStatus::AwaitingResult { saga_id } = dispatch_view.status.clone() else {
+            panic!("the dispatch awaits its saga, got {:?}", dispatch_view.status);
+        };
         assert_eq!(
-            saga_status(&host, &saga_id_for(&run_id)).await,
+            saga_status(&host, &saga_id).await,
             Some(SagaStatus::Pending),
-            "the saga is pending in the SAME block too"
+            "the dispatch's saga is pending in the SAME block too"
         );
         assert_eq!(outcome.effects.len(), 1, "one WorkerRequest effect");
 
-        // the spec is a decodable LlmRequest whose context hash any validator
-        // can re-derive from the transcript — verified here out-of-band by
-        // querying chat for the pinned window and re-hashing it (P4).
+        // the effect's spec is a kind-gated dispatch WorkSpec whose payload
+        // is the ENTIRE composed model input — instructions + transcript.
         let request = decode_worker_request(&outcome.effects[0].0).unwrap();
-        let llm: LlmRequest = decode_llm_request(&request.spec).unwrap();
-        assert_eq!(llm.run_id, run_id);
-        assert_eq!(llm.agent_id, "quackbot");
-        assert_eq!(llm.capability, "mock-llm-1");
-        assert_eq!(llm.channel_id, "general");
-        assert_eq!(llm.anchor_seq, 1);
-        let reply = host
-            .query(
-                "chat",
-                &chat_encode_query(&ChatQuery::MessagesRange {
-                    channel_id: "general".into(),
-                    from_seq: 1,
-                    limit: 1,
-                }),
-            )
-            .await
-            .unwrap();
-        let ChatReply::Messages(window) = chat_decode_reply(&reply).unwrap() else {
-            panic!("messages reply expected");
-        };
-        assert_eq!(
-            llm.context_hash,
-            context_hash(&window),
-            "the pin re-derives from the log (P4)"
-        );
-        assert_eq!(
-            llm.transcript, window,
-            "the worker receives the pinned transcript"
-        );
+        let work = decode_work_spec(&request.spec).unwrap();
+        assert_eq!(work.dispatch_id, dispatch_id_for(&run_id));
+        assert_eq!(work.capability, "mock-llm-1");
+        let payload_text = String::from_utf8(work.payload.clone()).unwrap();
+        assert!(payload_text.contains("Return ONLY a JSON object"));
+        assert!(payload_text.contains("@quackbot"));
 
         // nothing downstream exists yet: the reply, the task, and the
         // terminal states all wait on the oracle op.
         assert_eq!(chat_message(&host, &reply_message_id(&run_id)).await, None);
         assert_eq!(task_ids(&host).await, Vec::<String>::new());
 
-        // the mock worker claims the effect and produces the oracle op —
-        // capture it so the second instance can replay the IDENTICAL bytes.
-        let calls = Rc::new(RefCell::new(0u32));
-        let worker = MockLlmWorker {
-            calls: calls.clone(),
-        };
-        let oracle_op = match worker.run(&outcome.effects[0]).await.unwrap() {
-            reactor::WorkOutcome::Handled(Some(op)) => op,
-            other => panic!("the worker must claim the LlmRequest effect, got {other:?}"),
-        };
-        let calls_before_settle = *calls.borrow();
+        // block 5: the worker's oracle op. the saga settles, the dispatch
+        // module judges the Text contract and commits the outcome into its
+        // MAILBOX — and the agent sees NOTHING this block (never pop-stack).
+        let oracle_op = oracle_op_for(&outcome.effects[0], canned_output(&run_id));
+        host.submit_at(
+            at(5, Origin::External(b"oracle".to_vec())),
+            oracle_op.clone(),
+        )
+        .await
+        .expect("oracle block");
+        assert_eq!(saga_status(&host, &saga_id).await, Some(SagaStatus::Done));
+        assert_eq!(
+            agent_dispatch(&host, &run_id).await.status,
+            DispatchStatus::AwaitingDelivery
+        );
+        assert!(matches!(
+            run_view(&host, &run_id).await.unwrap().status,
+            RunStatus::AwaitingResult { .. }
+        ));
+        assert_eq!(
+            chat_message(&host, &reply_message_id(&run_id)).await,
+            None,
+            "a result never reaches its receiver in the block that agreed on it"
+        );
 
-        // settle through the REACTOR: the oracle op is one block, and its
-        // cascade — saga Done + callback + validated reply post + task create
-        // — drains inside it (P2, P6). the worker counter staying at zero
-        // proves the settle needed no further rounds: everything terminal
-        // committed in that ONE block (the reply's own hook notification
-        // no-opped under loop prevention instead of spawning a new run).
-        let mut reactor = Reactor::new(host, vec![Box::new(worker)]);
-        let settled = reactor
-            .submit_and_settle(oracle_op.clone())
+        // block 6: ANY next block injects the delivery. the ResultEvent, the
+        // validated reply (authored as the AGENT), and the task action all
+        // commit in this one delivery block.
+        host.submit_at(at(6, alice()), noop_block(6))
             .await
-            .expect("settle");
+            .expect("delivery block");
         assert_eq!(
-            *calls.borrow(),
-            calls_before_settle,
-            "no worker round during settle -> the terminal cascade was ONE block"
-        );
-
-        let host = reactor.host();
-        assert_eq!(
-            run_view(host, &run_id).await.unwrap().status,
+            run_view(&host, &run_id).await.unwrap().status,
             RunStatus::Done,
-            "the run settled Done"
+            "the run settled Done in the delivery block"
         );
         assert_eq!(
-            saga_status(host, &saga_id_for(&run_id)).await,
-            Some(SagaStatus::Done),
-            "the saga settled Done"
+            agent_dispatch(&host, &run_id).await.status,
+            DispatchStatus::Delivered
         );
-        let reply = chat_message(host, &reply_message_id(&run_id))
+        let reply = chat_message(&host, &reply_message_id(&run_id))
             .await
             .expect("the agent's reply landed in chat");
         assert_eq!(
@@ -441,9 +470,10 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
             reply.head.blocks,
             vec![Block::paragraph(format!("quack: handling {run_id}"))]
         );
-        assert_eq!(task_ids(host).await, vec!["task-1".to_string()]);
+        assert_eq!(task_ids(&host).await, vec!["task-1".to_string()]);
 
-        // loop prevention held: the agent's own reply engaged nothing.
+        // loop prevention held PLANE-SIDE: the agent's reply was reported to
+        // the tagging plane too, but an entity-authored post fires nothing.
         let runs = host
             .query(
                 "agent",
@@ -475,14 +505,11 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
         assert_eq!(record.status, AgentStatus::Active);
         assert_eq!(record.capability, "mock-llm-1");
 
-        assert_eq!(settled.app_hash, reactor.app_hash());
-        (settled.app_hash, oracle_op)
+        (host.app_hash(), oracle_op)
     });
 
     // ---- instance two: replay the identical op sequence -------------------
-    // a fresh composition applies the same four blocks plus the SAME oracle
-    // op (the reactor submits worker results through `Host::submit`, i.e. the
-    // default block context — mirrored here) and must land on the
+    // a fresh composition applies the same six blocks and must land on the
     // byte-identical app-hash: the LLM's non-determinism was laundered into
     // an ordered op, so replay is pure state-machine (N2).
     let replayed_hash = deterministic::Runner::default().start(|context| async move {
@@ -492,7 +519,13 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
                 .await
                 .expect("replayed block");
         }
-        let outcome = host.submit(oracle_op).await.expect("replayed oracle op");
+        host.submit_at(at(5, Origin::External(b"oracle".to_vec())), oracle_op)
+            .await
+            .expect("replayed oracle op");
+        let outcome = host
+            .submit_at(at(6, alice()), noop_block(6))
+            .await
+            .expect("replayed delivery block");
         assert_eq!(
             run_view(&host, &replay_run_id).await.unwrap().status,
             RunStatus::Done
@@ -514,21 +547,9 @@ fn an_agent_job_is_claimed_and_records_a_run_in_the_submit_cascade() {
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
             .expect("enable the agent module as the single jobs worker");
-        host.submit_at(
-            as_user(1, 2),
-            Msg {
-                target: "agent".into(),
-                payload: encode_msg(&AgentMsg::RegisterAgent {
-                    agent_id: "duck".into(),
-                    display_name: "Duck".into(),
-                    capability: "mock-llm-1".into(),
-                    prompt_hash: vec![9u8; 32],
-                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
-                }),
-            },
-        )
-        .await
-        .expect("register duck");
+        host.submit_at(as_user(1, 2), register_duck())
+            .await
+            .expect("register duck");
 
         let spec = "summarize this work item";
         host.submit_at(as_user(2, 3), submit_job("job-1", "duck", spec))
@@ -585,21 +606,9 @@ fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_output() {
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
             .expect("enable the agent module as the jobs worker");
-        host.submit_at(
-            as_user(1, 2),
-            Msg {
-                target: "agent".into(),
-                payload: encode_msg(&AgentMsg::RegisterAgent {
-                    agent_id: "duck".into(),
-                    display_name: "Duck".into(),
-                    capability: "mock-llm-1".into(),
-                    prompt_hash: vec![9u8; 32],
-                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
-                }),
-            },
-        )
-        .await
-        .expect("register duck");
+        host.submit_at(as_user(1, 2), register_duck())
+            .await
+            .expect("register duck");
         host.submit_at(as_user(2, 3), submit_job("job-1", "duck", "job spec"))
             .await
             .expect("submit job");
@@ -649,21 +658,9 @@ fn a_pruned_and_resubmitted_job_id_gets_a_fresh_episode_run() {
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
             .expect("enable jobs worker");
-        host.submit_at(
-            as_user(1, 2),
-            Msg {
-                target: "agent".into(),
-                payload: encode_msg(&AgentMsg::RegisterAgent {
-                    agent_id: "duck".into(),
-                    display_name: "Duck".into(),
-                    capability: "mock-llm-1".into(),
-                    prompt_hash: vec![9u8; 32],
-                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
-                }),
-            },
-        )
-        .await
-        .expect("register duck");
+        host.submit_at(as_user(1, 2), register_duck())
+            .await
+            .expect("register duck");
 
         host.submit_at(as_user(2, 3), submit_job("repeat", "duck", "first"))
             .await
@@ -724,21 +721,9 @@ fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
             .expect("enable jobs worker");
-        host.submit_at(
-            as_user(1, 2),
-            Msg {
-                target: "agent".into(),
-                payload: encode_msg(&AgentMsg::RegisterAgent {
-                    agent_id: "duck".into(),
-                    display_name: "Duck".into(),
-                    capability: "mock-llm-1".into(),
-                    prompt_hash: vec![9u8; 32],
-                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
-                }),
-            },
-        )
-        .await
-        .expect("register duck");
+        host.submit_at(as_user(1, 2), register_duck())
+            .await
+            .expect("register duck");
 
         host.submit_at(as_user(2, 3), submit_job("lease", "duck", "stale"))
             .await
@@ -793,21 +778,9 @@ fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
             .expect("enable the agent module as the jobs worker");
-        host.submit_at(
-            as_user(1, 2),
-            Msg {
-                target: "agent".into(),
-                payload: encode_msg(&AgentMsg::RegisterAgent {
-                    agent_id: "duck".into(),
-                    display_name: "Duck".into(),
-                    capability: "mock-llm-1".into(),
-                    prompt_hash: vec![9u8; 32],
-                    allowed_actions: vec![ACTION_TASKS_CREATE.into()],
-                }),
-            },
-        )
-        .await
-        .expect("register duck");
+        host.submit_at(as_user(1, 2), register_duck())
+            .await
+            .expect("register duck");
         host.submit_at(as_user(2, 3), submit_job("job-fail", "duck", "job spec"))
             .await
             .expect("submit job");
@@ -854,11 +827,16 @@ fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
             host.submit_at(at(height, origin), op).await.expect("block");
         }
         let run_id = run_id_for("general", 1, "quackbot");
+        let DispatchStatus::AwaitingResult { saga_id } =
+            agent_dispatch(&host, &run_id).await.status
+        else {
+            panic!("the run's dispatch must await its saga");
+        };
 
         // the oracle reports a hard failure after saga retries are exhausted:
-        // saga v2 retries an Err while attempts remain (max_attempts = 2), so
-        // two failing results land the saga — and therefore the run — Failed,
-        // all in the failing result's own block (P6).
+        // the recipe grants one retry (max_attempts = 2), so two failing
+        // results land the saga Failed; the dispatch module judges the Err
+        // into its mailbox, and the NEXT block's delivery fails the run.
         for attempt in 0..2u32 {
             host.submit_at(
                 at(
@@ -868,7 +846,7 @@ fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
                 Msg {
                     target: "saga".into(),
                     payload: saga_encode_msg(&SagaMsg::OracleResult {
-                        saga_id: saga_id_for(&run_id),
+                        saga_id: saga_id.clone(),
                         attempt,
                         outcome: Err("model unavailable".into()),
                     }),
@@ -877,16 +855,16 @@ fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
             .await
             .expect("failing oracle block");
         }
+        assert_eq!(saga_status(&host, &saga_id).await, Some(SagaStatus::Failed));
+        host.submit_at(at(20, alice()), noop_block(20))
+            .await
+            .expect("delivery block");
 
         assert_eq!(
             run_view(&host, &run_id).await.unwrap().status,
             RunStatus::Failed {
                 reason: "model unavailable".into(),
             }
-        );
-        assert_eq!(
-            saga_status(&host, &saga_id_for(&run_id)).await,
-            Some(SagaStatus::Failed)
         );
         assert_eq!(
             chat_message(&host, &reply_message_id(&run_id)).await,
@@ -908,48 +886,48 @@ fn an_output_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
         // same script, but quackbot may ONLY post to chat — no task grants.
         for (height, origin, op) in scripted_ops() {
             let op = if height == 2 {
-                Msg {
-                    target: "agent".into(),
-                    payload: encode_msg(&AgentMsg::RegisterAgent {
-                        agent_id: "quackbot".into(),
-                        display_name: "Quackbot".into(),
-                        capability: "mock-llm-1".into(),
-                        prompt_hash: vec![7u8; 32],
-                        allowed_actions: vec![ACTION_CHAT_POST.into()],
-                    }),
-                }
+                register_quackbot(vec![ACTION_CHAT_POST.into()])
             } else {
                 op
             };
             host.submit_at(at(height, origin), op).await.expect("block");
         }
         let run_id = run_id_for("general", 1, "quackbot");
+        let DispatchStatus::AwaitingResult { saga_id } =
+            agent_dispatch(&host, &run_id).await.status
+        else {
+            panic!("the run's dispatch must await its saga");
+        };
 
         // the oracle answers with an output that includes a task action the
-        // agent was never granted: the block commits (no-fail rule), the run
-        // fails deterministically, and NOTHING was written to chat or tasks.
+        // agent was never granted: the delivery block commits (no-fail rule),
+        // the run fails deterministically, and NOTHING was written to chat
+        // or tasks.
         host.submit_at(
             at(10, Origin::External(b"oracle".to_vec())),
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
-                    saga_id: saga_id_for(&run_id),
+                    saga_id: saga_id.clone(),
                     attempt: 0,
                     outcome: Ok(canned_output(&run_id)),
                 }),
             },
         )
         .await
-        .expect("the disallowed output must NOT abort the block");
+        .expect("the disallowed output must NOT abort the oracle block");
+        host.submit_at(at(11, alice()), noop_block(11))
+            .await
+            .expect("the disallowed output must NOT abort the delivery block");
 
         let RunStatus::Failed { reason } = run_view(&host, &run_id).await.unwrap().status else {
             panic!("the run must fail");
         };
         assert!(reason.contains(ACTION_TASKS_CREATE));
         assert_eq!(
-            saga_status(&host, &saga_id_for(&run_id)).await,
-            Some(SagaStatus::Done),
-            "the saga itself still settled — the RUN failed, not the block"
+            agent_dispatch(&host, &run_id).await.status,
+            DispatchStatus::Delivered,
+            "the dispatch itself delivered — the RUN failed, not the block"
         );
         assert_eq!(chat_message(&host, &reply_message_id(&run_id)).await, None);
         assert_eq!(task_ids(&host).await, Vec::<String>::new());

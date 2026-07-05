@@ -133,13 +133,30 @@ impl Reactor {
     /// `drain-to-fixpoint`, with a worker step wedged between blocks — each worker
     /// result crossing a real block boundary, exactly as it would cross a
     /// consensus round on a real node.
+    ///
+    /// a committed non-empty dispatch mailbox counts as more work: results
+    /// deliver in a LATER block (the never-pop-stack rule), and nothing else
+    /// ticks blocks here, so the fixpoint nudges one flush block per pending
+    /// batch until the mailbox drains.
     pub async fn submit_and_settle(&mut self, msg: Msg) -> Result<Settled, Error> {
         let mut queue: VecDeque<Msg> = VecDeque::from([msg]);
         let mut rounds: u32 = 0;
         let mut last = self.host.app_hash();
         let mut events: Vec<Event> = Vec::new();
 
-        while let Some(op) = queue.pop_front() {
+        loop {
+            let Some(op) = queue.pop_front() else {
+                if !self.host.has_pending_deliveries().await {
+                    break;
+                }
+                queue.push_back(Msg {
+                    target: dispatch_interface::DEFAULT_DISPATCH_TARGET.into(),
+                    payload: dispatch_interface::encode_msg(
+                        &dispatch_interface::DispatchMsg::Nudge {},
+                    ),
+                });
+                continue;
+            };
             rounds += 1;
             if rounds > MAX_WORKER_ROUNDS {
                 return Err(Error::BudgetExceeded);

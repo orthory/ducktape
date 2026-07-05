@@ -10,10 +10,12 @@
 //     owner (and a run's requester) from the block's origin, so every write
 //     function takes an `origin` and passes it to transport.submit, exactly
 //     like chat-client.
-//   - prompt CONTENT lives off-registry: RegisterAgent/UpdateAgent commit only
-//     a 32-byte `prompt_hash` (= sha256 of the prompt bytes = the digest
-//     `transport.putBlob` returns), and the oracle worker fetches the prompt
-//     text from the node's blob store by that hash.
+//   - prompt CONTENT lives off-registry: RegisterAgent/UpdateAgent commit a
+//     32-byte `prompt_hash` pin plus an optional `prompt_doc` — a document
+//     module doc id whose canonical rendering (block texts joined by blank
+//     lines) must hash to the pin. chat-engaged runs compose the prompt
+//     in-consensus from that doc; the legacy blob-store lane remains for the
+//     jobs path's oracle worker.
 //
 // Everything is a pure function over an injected NodeTransport.
 
@@ -42,6 +44,9 @@ export interface AgentRecord {
   capability: string;
   /** sha256 of the agent's prompt content — exactly 32 bytes. */
   prompt_hash: number[];
+  /** The document module doc holding the prompt content, when the prompt is
+   *  consensus-resident; its canonical rendering must hash to `prompt_hash`. */
+  prompt_doc: string | null;
   /** Granted action names, each from `KNOWN_ACTIONS`; sorted and deduped. */
   allowed_actions: string[];
   status: AgentStatus;
@@ -54,9 +59,12 @@ export interface WatchView {
   policy: TurnPolicy;
 }
 
-/** Where a run is in its lifecycle. Only `AwaitingOracle` is non-terminal. */
+/** Where a run is in its lifecycle. `AwaitingOracle` (a job-backed run's
+ *  saga) and `AwaitingResult` (a chat run's dispatch-plane delivery) are the
+ *  non-terminal states. */
 export type RunStatus =
   | { AwaitingOracle: { saga_id: string } }
+  | { AwaitingResult: { dispatch_id: string } }
   | "Done"
   | { Failed: { reason: string } }
   | "Cancelled";
@@ -114,6 +122,8 @@ export const registerAgent = (
     capability: string;
     /** Exactly 32 bytes — see hexToBytes / the prompt-upload flow. */
     promptHash: number[];
+    /** Document module doc id holding the prompt content, when set. */
+    promptDoc?: string | null;
     allowedActions: string[];
     origin: string;
   },
@@ -126,6 +136,7 @@ export const registerAgent = (
         display_name: params.displayName,
         capability: params.capability,
         prompt_hash: params.promptHash,
+        prompt_doc: params.promptDoc ?? null,
         allowed_actions: params.allowedActions,
       },
     },
@@ -140,6 +151,7 @@ export const updateAgent = (
     displayName?: string | null;
     capability?: string | null;
     promptHash?: number[] | null;
+    promptDoc?: string | null;
     allowedActions?: string[] | null;
     origin: string;
   },
@@ -152,6 +164,7 @@ export const updateAgent = (
         display_name: params.displayName ?? null,
         capability: params.capability ?? null,
         prompt_hash: params.promptHash ?? null,
+        prompt_doc: params.promptDoc ?? null,
         allowed_actions: params.allowedActions ?? null,
       },
     },

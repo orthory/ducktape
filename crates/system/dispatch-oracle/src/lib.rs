@@ -60,18 +60,29 @@ impl Worker for DispatchWorker {
             Ok(work) => work,
             Err(_) => return Ok(WorkOutcome::NotMine),
         };
-        // the lease gate, host side: someone else's assignment is a claimed
-        // skip — it IS our effect type, but the assignee submits the result.
-        if let Some(assignee) = &request.assignee {
-            if *assignee != self.node_key {
-                return Ok(WorkOutcome::Handled(None));
+        match &request.assignee {
+            // the lease gate, host side: someone else's assignment is a
+            // claimed skip — it IS our effect type, but the assignee submits
+            // the result.
+            Some(assignee) if *assignee != self.node_key => Ok(WorkOutcome::Handled(None)),
+            Some(_) => {
+                let outcome = self
+                    .answer(&work.capability, &work.payload)
+                    .await
+                    .map_err(clean_error);
+                Ok(WorkOutcome::Handled(Some(oracle_result(&request, outcome))))
+            }
+            // an UNASSIGNED request is an announcement, not a work order:
+            // running it would be one execution per capable node. claim it
+            // with Accept when this host can actually run the capability;
+            // the re-emitted request naming the winner is what executes.
+            None => {
+                if self.providers.resolve(&work.capability).is_err() {
+                    return Ok(WorkOutcome::Handled(None));
+                }
+                Ok(WorkOutcome::Handled(Some(accept_op(&request))))
             }
         }
-        let outcome = self
-            .answer(&work.capability, &work.payload)
-            .await
-            .map_err(clean_error);
-        Ok(WorkOutcome::Handled(Some(oracle_result(&request, outcome))))
     }
 }
 
@@ -82,6 +93,18 @@ fn oracle_result(request: &WorkerRequest, outcome: Result<Vec<u8>, String>) -> M
             saga_id: request.saga_id.clone(),
             attempt: request.attempt,
             outcome,
+        }),
+    }
+}
+
+/// the claim op for an announcement request — submitted under this node's
+/// key; the saga's first-accept-wins rule settles who executes.
+fn accept_op(request: &WorkerRequest) -> Msg {
+    Msg {
+        target: "saga".into(),
+        payload: encode_msg(&SagaMsg::Accept {
+            saga_id: request.saga_id.clone(),
+            attempt: request.attempt,
         }),
     }
 }
@@ -172,28 +195,111 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn own_and_open_leases_execute_to_a_clean_missing_capability_error() {
+    async fn an_own_lease_executes_to_a_clean_missing_capability_error() {
         let worker = DispatchWorker::new(mock_specs_only(), b"me".to_vec());
         // the spec is loaded but no binary installed: the spawn path is taken
         // and errors by capability name — proving execution was attempted.
-        for assignee in [Some(b"me".as_slice()), None] {
-            match worker
-                .run(&effect_for(work_spec(), assignee))
-                .await
-                .unwrap()
-            {
-                WorkOutcome::Handled(Some(msg)) => {
-                    let SagaMsg::OracleResult { outcome, .. } =
-                        saga_interface::decode_msg(&msg.payload).unwrap()
-                    else {
-                        panic!("expected an oracle result");
-                    };
-                    let err = outcome.unwrap_err();
-                    assert!(err.contains("\"alpha\" is not provided"), "got: {err}");
-                }
-                other => panic!("an executable lease must produce an op, got {other:?}"),
+        match worker
+            .run(&effect_for(work_spec(), Some(b"me")))
+            .await
+            .unwrap()
+        {
+            WorkOutcome::Handled(Some(msg)) => {
+                let SagaMsg::OracleResult { outcome, .. } =
+                    saga_interface::decode_msg(&msg.payload).unwrap()
+                else {
+                    panic!("expected an oracle result");
+                };
+                let err = outcome.unwrap_err();
+                assert!(err.contains("\"alpha\" is not provided"), "got: {err}");
             }
+            other => panic!("an executable lease must produce an op, got {other:?}"),
         }
+    }
+
+    /// a provider whose only job is making resolve() succeed in tests.
+    struct StubProvider;
+    #[async_trait::async_trait(?Send)]
+    impl capability_host::Provider for StubProvider {
+        fn capability(&self) -> &str {
+            "alpha"
+        }
+        async fn run(&self, _prompt: &str) -> Result<String, String> {
+            Ok("stub answer".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unassigned_request_is_claimed_not_run() {
+        // an announcement this host CAN serve: the worker answers with an
+        // Accept claim, never an execution — the saga's first-accept-wins
+        // rule is what turns N capable nodes into one run.
+        let spec = capability_host::CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "alpha"
+[detect]
+bin = "alpha-cli"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+"#,
+            "test",
+        )
+        .expect("mock spec parses");
+        let providers = ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec]),
+            vec![Box::new(StubProvider)],
+        );
+        let worker = DispatchWorker::new(providers, b"me".to_vec());
+        match worker.run(&effect_for(work_spec(), None)).await.unwrap() {
+            WorkOutcome::Handled(Some(msg)) => {
+                match saga_interface::decode_msg(&msg.payload).unwrap() {
+                    SagaMsg::Accept { saga_id, attempt } => {
+                        assert_eq!(saga_id, "s");
+                        assert_eq!(attempt, 0);
+                    }
+                    other => panic!("expected an Accept claim, got {other:?}"),
+                }
+            }
+            other => panic!("a claimable announcement must produce an op, got {other:?}"),
+        }
+
+        // an announcement this host CANNOT serve (spec loaded, nothing
+        // installed): a quiet skip — never a claim it could not honor.
+        let worker = DispatchWorker::new(mock_specs_only(), b"me".to_vec());
+        match worker.run(&effect_for(work_spec(), None)).await.unwrap() {
+            WorkOutcome::Handled(None) => {}
+            other => panic!("an unservable announcement must be a skip, got {other:?}"),
+        }
+    }
+
+    /// live end-to-end against a REAL locally installed CLI (BYO auth):
+    /// the payload goes to the provider VERBATIM and the raw answer comes
+    /// back — the whole opinion-free contract. ignored by default; name the
+    /// capability tag your host provides:
+    /// `DUCKTAPE_LIVE_CAPABILITY=<tag> cargo test -p dispatch-oracle -- --ignored live_run`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_run_feeds_the_payload_verbatim_to_a_local_cli() {
+        let capability = std::env::var("DUCKTAPE_LIVE_CAPABILITY")
+            .expect("set DUCKTAPE_LIVE_CAPABILITY to a capability this host provides");
+        let worker = DispatchWorker::new(
+            capability_host::discover().expect("capability specs load"),
+            b"live".to_vec(),
+        );
+        let payload = b"Reply with exactly one word: quack".to_vec();
+        let answer = worker
+            .answer(&capability, &payload)
+            .await
+            .expect("the provider answered");
+        assert!(
+            !answer.is_empty(),
+            "the raw answer must be non-empty (got zero bytes)"
+        );
     }
 
     #[tokio::test]
@@ -205,7 +311,7 @@ format = "text"
             capability: "alpha".into(),
             payload: vec![0xff, 0xfe],
         });
-        match worker.run(&effect_for(spec, None)).await.unwrap() {
+        match worker.run(&effect_for(spec, Some(b"me"))).await.unwrap() {
             WorkOutcome::Handled(Some(msg)) => {
                 let SagaMsg::OracleResult { outcome, .. } =
                     saga_interface::decode_msg(&msg.payload).unwrap()

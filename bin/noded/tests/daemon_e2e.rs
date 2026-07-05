@@ -330,6 +330,7 @@ fn full_surface_blocks_authorship_and_ws() {
             "chat",
             "saga",
             "dispatch",
+            "tagging",
             "tasks",
             "inbox",
             "automations",
@@ -485,11 +486,14 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
         block["height"], 4,
         "the receipt should carry the post's inclusion block"
     );
-    // …while the oracle follow-up block still drains behind it.
+    // …while the drain tail runs behind it: the oracle follow-up block (5)
+    // commits the result into the dispatch mailbox, and the nudge block (6)
+    // carries the DeliverPending injection that posts the reply — the
+    // never-pop-stack rule made visible in the block arithmetic.
     assert_eq!(
         daemon.status()["height"],
-        5,
-        "the post block plus oracle follow-up block should both drain"
+        6,
+        "post + oracle follow-up + delivery nudge should all drain"
     );
 
     let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
@@ -511,9 +515,13 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
         agent_reply["author"],
         serde_json::json!({ "Agent": { "module": "agent", "agent_id": "quackbot" } })
     );
-    assert_eq!(
-        agent_reply["blocks"][0]["Paragraph"][0]["text"],
-        format!("echo: handling {run_id}")
+    let text = agent_reply["blocks"][0]["Paragraph"][0]["text"]
+        .as_str()
+        .expect("reply text");
+    assert!(
+        text.starts_with("echo: handling dispatch "),
+        "the reply is the echo worker's dispatch-lane answer, normalized \
+         into a paragraph by the agent module: {text}"
     );
 }
 

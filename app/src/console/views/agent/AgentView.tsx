@@ -152,8 +152,11 @@ const policyText = (policy: TurnPolicy, agents: AgentRecord[]): string => {
 
 const isAwaiting = (
   status: RunStatus,
-): status is { AwaitingOracle: { saga_id: string } } =>
-  typeof status === "object" && "AwaitingOracle" in status;
+): status is
+  | { AwaitingOracle: { saga_id: string } }
+  | { AwaitingResult: { dispatch_id: string } } =>
+  typeof status === "object" &&
+  ("AwaitingOracle" in status || "AwaitingResult" in status);
 
 const runTone = (status: RunStatus): Tone => {
   if (status === "Done") return statusTone.success;
@@ -165,14 +168,17 @@ const runTone = (status: RunStatus): Tone => {
 const runLabel = (status: RunStatus): string => {
   if (status === "Done") return "DONE";
   if (status === "Cancelled") return "CANCELLED";
-  if (isAwaiting(status)) return "AWAITING ORACLE";
+  if (isAwaiting(status)) return "AWAITING RESULT";
   return "FAILED";
 };
 
 const runDetail = (status: RunStatus): string => {
   if (status === "Done") return "completed";
   if (status === "Cancelled") return "cancelled";
-  if (isAwaiting(status)) return `saga ${status.AwaitingOracle.saga_id}`;
+  if (isAwaiting(status))
+    return "AwaitingOracle" in status
+      ? `saga ${status.AwaitingOracle.saga_id}`
+      : `dispatch ${status.AwaitingResult.dispatch_id.slice(0, 12)}…`;
   return status.Failed.reason;
 };
 

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use agent::{AgentModule, run_id_for};
+use agent::{AgentModule, dispatch_id_for, recipe_id_for, run_id_for};
 use agent_interface::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentOutput, AgentQuery, AgentReply,
     AgentStatus, RunStatus, TurnPolicy, decode_reply, encode_msg, encode_output, encode_query,
@@ -18,8 +18,9 @@ use chat_interface::{
     AuthorRef, Block, ChatQuery, ChatReply, MessageHead, MessageView,
     decode_query as chat_decode_query, encode_reply as chat_encode_reply,
 };
+use dispatch_interface::{ResultEvent, encode_result_event};
 use futures::executor::block_on;
-use saga_interface::{SagaCallback, SagaOrigin, SagaOutcome, encode_callback};
+use saga_interface::SagaOrigin;
 use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
 
 /// a minimal `Ctx`: drives `execute` with a controllable env and serves
@@ -113,6 +114,25 @@ fn message_in(channel: &str, seq: u64, text: &str, thread: Option<u64>) -> Messa
     }
 }
 
+fn module() -> AgentModule {
+    AgentModule::new(
+        "agent",
+        "chat",
+        "saga",
+        "tagging",
+        "dispatch",
+        Some("tasks".into()),
+        Some("jobs".into()),
+        None,
+    )
+}
+
+fn bare_module() -> AgentModule {
+    AgentModule::new(
+        "agent", "chat", "saga", "tagging", "dispatch", None, None, None,
+    )
+}
+
 fn exec(m: &mut AgentModule, mut ctx: TestCtx, op: &AgentMsg) {
     let msg = Msg {
         target: "agent".into(),
@@ -121,12 +141,20 @@ fn exec(m: &mut AgentModule, mut ctx: TestCtx, op: &AgentMsg) {
     block_on(m.execute(&mut ctx, &msg)).unwrap();
 }
 
-fn exec_callback(m: &mut AgentModule, mut ctx: TestCtx, run_id: &str, outcome: SagaOutcome) {
+/// deliver a dispatch-plane result for a chat run — the completion path.
+fn exec_result(
+    m: &mut AgentModule,
+    mut ctx: TestCtx,
+    run_id: &str,
+    agent_id: &str,
+    outcome: Result<Vec<u8>, String>,
+) {
+    ctx.env.origin = Origin::Module("dispatch".into());
     let msg = Msg {
         target: "agent".into(),
-        payload: encode_callback(&SagaCallback {
-            saga_id: format!("agent/{run_id}"),
-            payload: run_id.as_bytes().to_vec(),
+        payload: encode_result_event(&ResultEvent {
+            dispatch_id: dispatch_id_for(run_id),
+            recipe_id: recipe_id_for(agent_id),
             outcome,
         }),
     };
@@ -143,6 +171,7 @@ fn register(agent_id: &str, actions: &[&str]) -> AgentMsg {
         display_name: agent_id.to_uppercase(),
         capability: "model-1".into(),
         prompt_hash: vec![7u8; 32],
+        prompt_doc: None,
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
     }
 }
@@ -170,13 +199,7 @@ fn run_status(m: &AgentModule, run_id: &str) -> Option<RunStatus> {
 /// poking internals.
 fn source() -> AgentModule {
     let alice = Origin::External(b"alice".to_vec());
-    let mut m = AgentModule::new(
-        "agent",
-        "chat",
-        "saga",
-        Some("tasks".into()),
-        Some("jobs".into()),
-    );
+    let mut m = module();
     // "general": seqs 1..2 plain, seq 3 a thread reply to root 1.
     let general = vec![
         message_in("general", 1, "root", None),
@@ -230,7 +253,7 @@ fn source() -> AgentModule {
         channel_id: channel.into(),
         anchor_seq,
     };
-    // stays AwaitingOracle; its anchor is threaded, so thread_root = Some(1).
+    // stays AwaitingResult; its anchor is threaded, so thread_root = Some(1).
     exec(
         &mut m,
         TestCtx::new(2, alice.clone()).with_transcript("general", general.clone()),
@@ -255,21 +278,22 @@ fn source() -> AgentModule {
 
     // general/2 -> Done (a valid reply output), general/1 -> Failed,
     // dev/1 -> Cancelled by its requester.
-    let saga = || Origin::Module("saga".into());
-    exec_callback(
+    exec_result(
         &mut m,
-        TestCtx::new(3, saga()).with_transcript("general", general.clone()),
+        TestCtx::new(3, Origin::System).with_transcript("general", general.clone()),
         &run_id_for("general", 2, "ext-bot"),
-        SagaOutcome::Done(encode_output(&AgentOutput {
+        "ext-bot",
+        Ok(encode_output(&AgentOutput {
             reply_blocks: vec![Block::paragraph("answered")],
             actions: Vec::new(),
         })),
     );
-    exec_callback(
+    exec_result(
         &mut m,
-        TestCtx::new(3, saga()),
+        TestCtx::new(3, Origin::System),
         &run_id_for("general", 1, "ext-bot"),
-        SagaOutcome::Failed("worker crashed".into()),
+        "ext-bot",
+        Err("worker crashed".into()),
     );
     exec(
         &mut m,
@@ -304,7 +328,7 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
     assert_eq!(watches.len(), 4);
     assert!(matches!(
         run_status(&src, &run_id_for("general", 3, "ext-bot")),
-        Some(RunStatus::AwaitingOracle { .. })
+        Some(RunStatus::AwaitingResult { .. })
     ));
     assert_eq!(
         run_status(&src, &run_id_for("general", 2, "ext-bot")),
@@ -334,13 +358,7 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
 
     // the joiner has UNCOMMITTED staged work of its own: install must drop it
     // — a snapshot describes a block boundary, nothing staged may shadow it.
-    let mut dst = AgentModule::new(
-        "agent",
-        "chat",
-        "saga",
-        Some("tasks".into()),
-        Some("jobs".into()),
-    );
+    let mut dst = module();
     exec(
         &mut dst,
         TestCtx::new(0, Origin::External(b"bob".to_vec())),
@@ -391,13 +409,7 @@ fn tampered_snapshot_is_rejected_and_leaves_state_untouched() {
 
     // the target already has COMMITTED state of its own, so "untouched" is
     // observable through both root and query.
-    let mut dst = AgentModule::new(
-        "agent",
-        "chat",
-        "saga",
-        Some("tasks".into()),
-        Some("jobs".into()),
-    );
+    let mut dst = module();
     exec(
         &mut dst,
         TestCtx::new(0, Origin::External(b"bob".to_vec())),
@@ -434,12 +446,12 @@ fn truncated_or_padded_snapshot_is_rejected() {
     let src = source();
     let src_root = src.root();
     let snap = src.snapshot();
-    let empty_root = AgentModule::new("agent", "chat", "saga", None, None).root();
+    let empty_root = bare_module().root();
 
     // EVERY strict prefix must fail — no cut point leaves a decodable
     // snapshot, and none of the failures may move the fresh module's root.
     for cut in 0..snap.len() {
-        let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
+        let mut dst = bare_module();
         assert!(
             dst.install(&snap[..cut], src_root).is_err(),
             "a {cut}-byte prefix of a {}-byte snapshot must be rejected",
@@ -455,20 +467,15 @@ fn truncated_or_padded_snapshot_is_rejected() {
     // trailing bytes after a complete snapshot are equally malformed.
     let mut padded = snap.clone();
     padded.push(0);
-    let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
+    let mut dst = bare_module();
     assert!(dst.install(&padded, src_root).is_err());
     assert_eq!(dst.root(), empty_root);
 
     // a count field claiming more entries than the bytes carry is caught
-    // before anything is built from it — for all THREE section counts.
-    let agents_section_end = {
-        // recompute by decoding a legit install and measuring: cheaper — just
-        // inflate the low byte of each count we can locate: the agent count
-        // is at offset 0; corrupting it must reject.
-        0usize
-    };
+    // before anything is built from it: the agent count is at offset 0;
+    // corrupting it must reject.
     let mut inflated = snap.clone();
-    inflated[agents_section_end] = inflated[agents_section_end].wrapping_add(1);
+    inflated[0] = inflated[0].wrapping_add(1);
     assert!(
         dst.install(&inflated, src_root).is_err(),
         "an inflated agent count must be rejected"
@@ -480,15 +487,17 @@ fn truncated_or_padded_snapshot_is_rejected() {
 /// built through the real op path. the layout is pinned by the asserted
 /// length so the discriminant-tampering test can index into it:
 /// agents:  count 8 | id 8+1 | owner disc 1 + key 8+1 | display 8+1
-///          | model 8+1 | prompt 8+32 | action count 8 | status 1 | times 16
+///          | model 8+1 | prompt 8+32 | prompt-doc tag 1 | action count 8
+///          | status 1 | times 16
 /// watches: count 8 | channel 8+1 | policy 1
 /// runs:    count 8 | run id 8+10 | agent 8+1 | channel 8+1 | anchor 8
 ///          | thread tag 1 | job id tag 1 | job claim height 8
 ///          | requester disc 1 + key 8+1 | status disc 1
-///          + saga id 8+16 | ctx hash 8+32 | times 16
+///          + dispatch id 8+64 | ctx hash 8+32 | times 16
+/// index:   count 8 | dispatch id 8+64 | run id 8+10
 fn minimal_snapshot() -> Vec<u8> {
     let owner = Origin::External(vec![5]);
-    let mut m = AgentModule::new("agent", "chat", "saga", None, None);
+    let mut m = bare_module();
     exec(
         &mut m,
         TestCtx::new(0, owner.clone()),
@@ -497,6 +506,7 @@ fn minimal_snapshot() -> Vec<u8> {
             display_name: "A".into(),
             capability: "m".into(),
             prompt_hash: vec![7u8; 32],
+            prompt_doc: None,
             allowed_actions: Vec::new(),
         },
     );
@@ -519,31 +529,31 @@ fn minimal_snapshot() -> Vec<u8> {
     );
     commit(&mut m);
     let snap = m.snapshot();
-    assert_eq!(snap.len(), 281, "the minimal layout this test indexes into");
+    assert_eq!(snap.len(), 428, "the minimal layout this test indexes into");
     snap
 }
 
 #[test]
 fn unknown_discriminants_and_tags_are_rejected() {
-    let empty_root = AgentModule::new("agent", "chat", "saga", None, None).root();
+    let empty_root = bare_module().root();
     let snap = minimal_snapshot();
 
-    // owner origin disc (17), agent status (93), watch policy (127), the run's
-    // thread-root option tag (180), job-id option tag (181), requester origin
-    // disc (190), and run status disc (200) each admit exactly their known
+    // owner origin disc (17), agent status (94), watch policy (128), the run's
+    // thread-root option tag (181), job-id option tag (182), requester origin
+    // disc (191), and run status disc (201) each admit exactly their known
     // values — a state has ONE valid encoding.
     for (index, what) in [
         (17usize, "owner origin discriminant"),
-        (93, "agent status"),
-        (127, "watch policy"),
-        (180, "thread-root option tag"),
-        (181, "job-id option tag"),
-        (190, "requester origin discriminant"),
-        (200, "run status discriminant"),
+        (94, "agent status"),
+        (128, "watch policy"),
+        (181, "thread-root option tag"),
+        (182, "job-id option tag"),
+        (191, "requester origin discriminant"),
+        (201, "run status discriminant"),
     ] {
         let mut bad = snap.clone();
         bad[index] = 9;
-        let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
+        let mut dst = bare_module();
         let err = dst.install(&bad, StateRoot::ZERO).unwrap_err();
         assert!(
             matches!(err, Error::Module(_)),
@@ -555,6 +565,15 @@ fn unknown_discriminants_and_tags_are_rejected() {
             "rejected {what} must not move the root"
         );
     }
+
+    // the dispatch index is DERIVED state: an entry whose id is not the
+    // run's own dispatch id must be rejected, not adopted.
+    let mut bad = snap.clone();
+    let index_id_start = snap.len() - (8 + 64 + 8 + 10) + 8;
+    bad[index_id_start] = bad[index_id_start].wrapping_add(1);
+    let mut dst = bare_module();
+    assert!(dst.install(&bad, StateRoot::ZERO).is_err());
+    assert_eq!(dst.root(), empty_root);
 }
 
 #[test]
@@ -564,7 +583,7 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     // copying one over the other a duplicate-id stream — both must reject,
     // since sorted-unique keys are what make the encoding canonical.
     let owner = Origin::External(vec![5]);
-    let mut m = AgentModule::new("agent", "chat", "saga", None, None);
+    let mut m = bare_module();
     for id in ["a", "b"] {
         exec(
             &mut m,
@@ -574,6 +593,7 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
                 display_name: id.to_uppercase(),
                 capability: "m".into(),
                 prompt_hash: vec![7u8; 32],
+                prompt_doc: None,
                 allowed_actions: Vec::new(),
             },
         );
@@ -581,31 +601,28 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     commit(&mut m);
     let snap = m.snapshot();
     let good_root = m.root();
-    // agents section: count 8, then two 102-byte bodies; watches + runs
-    // counts trail.
-    assert_eq!(snap.len(), 8 + 102 * 2 + 8 + 8);
-    let body_a = snap[8..110].to_vec();
-    let body_b = snap[110..212].to_vec();
+    // agents section: count 8, then two 103-byte bodies; watches + runs +
+    // dispatch-index counts trail.
+    assert_eq!(snap.len(), 8 + 103 * 2 + 8 + 8 + 8);
+    let body_a = snap[8..111].to_vec();
+    let body_b = snap[111..214].to_vec();
 
     for (first, second, what) in [
         (&body_b, &body_a, "descending ids"),
         (&body_a, &body_a, "duplicate ids"),
     ] {
         let mut bytes = snap.clone();
-        bytes[8..110].copy_from_slice(first);
-        bytes[110..212].copy_from_slice(second);
-        let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
+        bytes[8..111].copy_from_slice(first);
+        bytes[111..214].copy_from_slice(second);
+        let mut dst = bare_module();
         let err = dst.install(&bytes, StateRoot::ZERO).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "{what} must be rejected");
-        assert_eq!(
-            dst.root(),
-            AgentModule::new("agent", "chat", "saga", None, None).root()
-        );
+        assert_eq!(dst.root(), bare_module().root());
     }
 
     // the untouched stream still installs — the rejection above is the
     // ordering check, not an artifact of the splicing.
-    let mut dst = AgentModule::new("agent", "chat", "saga", None, None);
+    let mut dst = bare_module();
     dst.install(&snap, good_root).unwrap();
     assert_eq!(dst.root(), good_root);
 }

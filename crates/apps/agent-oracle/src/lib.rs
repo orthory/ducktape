@@ -114,17 +114,33 @@ impl Worker for LlmWorker {
             Ok(llm) => llm,
             Err(_) => return Ok(WorkOutcome::NotMine),
         };
-        // the lease gate, host side: someone else's assignment is a
-        // deliberate skip — claimed (it IS our effect type), not run. the
-        // assignee submits the result; running it here would just burn an
-        // LLM call on a result strict would no-op.
-        if let Some(assignee) = &request.assignee {
-            if *assignee != self.node_key {
-                return Ok(WorkOutcome::Handled(None));
+        match &request.assignee {
+            // the lease gate, host side: someone else's assignment is a
+            // deliberate skip — claimed (it IS our effect type), not run.
+            // the assignee submits the result; running it here would just
+            // burn an LLM call on a result strict would no-op.
+            Some(assignee) if *assignee != self.node_key => Ok(WorkOutcome::Handled(None)),
+            Some(_) => {
+                let outcome = self.answer(&llm).await.map_err(clean_error);
+                Ok(WorkOutcome::Handled(Some(oracle_result(&request, outcome))))
+            }
+            // an UNASSIGNED request is an announcement, not a work order:
+            // claim it with Accept when this host can actually run the
+            // capability, and let the re-emitted request naming the winner
+            // do the executing — one LLM call, however many capable nodes.
+            None => {
+                if self.providers.resolve(&llm.capability).is_err() {
+                    return Ok(WorkOutcome::Handled(None));
+                }
+                Ok(WorkOutcome::Handled(Some(Msg {
+                    target: "saga".into(),
+                    payload: encode_msg(&SagaMsg::Accept {
+                        saga_id: request.saga_id.clone(),
+                        attempt: request.attempt,
+                    }),
+                })))
             }
         }
-        let outcome = self.answer(&llm).await.map_err(clean_error);
-        Ok(WorkOutcome::Handled(Some(oracle_result(&request, outcome))))
     }
 }
 
@@ -512,13 +528,89 @@ format = "text"
             other => panic!("a foreign lease must be a claimed skip, got {other:?}"),
         }
 
-        // our own lease and an unassigned request both execute (here: to the
-        // clean not-provided error, proving the spawn path was taken).
-        for assignee in [Some(b"me".as_slice()), None] {
-            match worker.run(&effect_for(assignee)).await.unwrap() {
-                WorkOutcome::Handled(Some(_)) => {}
-                other => panic!("an executable lease must produce an op, got {other:?}"),
+        // our own lease executes (here: to the clean not-provided error,
+        // proving the spawn path was taken).
+        match worker.run(&effect_for(Some(b"me"))).await.unwrap() {
+            WorkOutcome::Handled(Some(_)) => {}
+            other => panic!("an executable lease must produce an op, got {other:?}"),
+        }
+
+        // an UNASSIGNED request is an announcement: with the capability not
+        // actually provided here, the worker skips instead of claiming work
+        // it could not honor.
+        match worker.run(&effect_for(None)).await.unwrap() {
+            WorkOutcome::Handled(None) => {}
+            other => panic!("an unservable announcement must be a skip, got {other:?}"),
+        }
+    }
+
+    /// a provider whose only job is making resolve() succeed in tests.
+    struct StubProvider;
+    #[async_trait::async_trait(?Send)]
+    impl capability_host::Provider for StubProvider {
+        fn capability(&self) -> &str {
+            "alpha"
+        }
+        async fn run(&self, _prompt: &str) -> Result<String, String> {
+            Ok("stub".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unassigned_request_this_host_provides_is_claimed_not_run() {
+        use saga_interface::{SagaMsg, WorkerRequest, encode_worker_request};
+
+        let blobs = files::BlobHandle::default();
+        let spec = capability_host::CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "alpha"
+[detect]
+bin = "alpha-cli"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+"#,
+            "test",
+        )
+        .expect("mock spec parses");
+        let providers = capability_host::ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec]),
+            vec![Box::new(StubProvider)],
+        );
+        let worker = LlmWorker::new(blobs, providers, b"me".to_vec());
+        let llm = LlmRequest {
+            run_id: "r".into(),
+            agent_id: "bot".into(),
+            capability: "alpha".into(),
+            prompt_hash: vec![0; 32],
+            channel_id: "general".into(),
+            anchor_seq: 1,
+            job_id: None,
+            context_hash: Vec::new(),
+            transcript: Vec::new(),
+        };
+        let effect = Effect(encode_worker_request(&WorkerRequest {
+            saga_id: "s".into(),
+            attempt: 3,
+            spec: agent_interface::encode_llm_request(&llm),
+            deadline: None,
+            assignee: None,
+        }));
+        match worker.run(&effect).await.unwrap() {
+            WorkOutcome::Handled(Some(msg)) => {
+                match saga_interface::decode_msg(&msg.payload).unwrap() {
+                    SagaMsg::Accept { saga_id, attempt } => {
+                        assert_eq!(saga_id, "s");
+                        assert_eq!(attempt, 3);
+                    }
+                    other => panic!("expected an Accept claim, got {other:?}"),
+                }
             }
+            other => panic!("a claimable announcement must produce an op, got {other:?}"),
         }
     }
 

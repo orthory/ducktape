@@ -33,6 +33,7 @@ members = [
     "crates/system/capability", "crates/system/capability-interface",
     "crates/system/dispatch", "crates/system/dispatch-interface",
     "crates/system/dispatch-oracle",
+    "crates/system/tagging", "crates/system/tagging-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
     "crates/apps/document", "crates/apps/document-interface", "crates/apps/document-index",
@@ -119,6 +120,7 @@ saga = { path = "crates/system/saga" }
 capability = { path = "crates/system/capability" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
+tagging = { path = "crates/system/tagging" }
 forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
 pages = { path = "crates/apps/pages" }
@@ -148,6 +150,7 @@ reachability = { path = "crates/system/reachability" }
 saga-interface = { path = "crates/system/saga-interface" }
 capability-interface = { path = "crates/system/capability-interface" }
 dispatch-interface = { path = "crates/system/dispatch-interface" }
+tagging-interface = { path = "crates/system/tagging-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
 pages-interface = { path = "crates/apps/pages-interface" }

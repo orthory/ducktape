@@ -21,22 +21,30 @@
 //!   terminal transition, and every validated follow-up commit in the same
 //!   block.
 //!
-//! ## execute routing — three payload namespaces, keyed by ORIGIN
+//! ## execute routing — four payload namespaces, keyed by ORIGIN
 //!
 //! the dispatch origin is host-assigned and cannot be chosen by a submitter,
-//! so routing on it makes the two privileged intakes spoof-proof by
+//! so routing on it makes every privileged intake spoof-proof by
 //! construction:
 //!
-//! - `Origin::Module(chat)` → a [`ChatEvent`] (the hook intake);
-//! - `Origin::Module(saga)` → a [`SagaCallback`] (the completion intake);
+//! - `Origin::Module(tagging)` → an `EngagementEvent` (the engagement
+//!   intake): the tagging plane's routed report of a user post in a watched
+//!   channel, tags included;
+//! - `Origin::Module(dispatch)` → a `ResultEvent` (the dispatch-plane result
+//!   intake for chat-engaged runs);
+//! - `Origin::Module(saga)` → a [`SagaCallback`] (the completion intake for
+//!   JOB-BACKED runs, which still ride the saga directly);
 //! - `Origin::Module(jobs)` → a [`JobsEvent`] (the jobs-board intake);
+//! - `Origin::Module(chat)` → a dead-letter no-op (chat no longer notifies
+//!   this module directly; the tombstone keeps a stray follow-up from ever
+//!   aborting a posting block);
 //! - anything else → an [`AgentMsg`] (admin ops and explicit runs). an
-//!   external submitter shipping hook- or callback-shaped bytes lands HERE
-//!   and fails the `AgentMsg` decode — it can never fake an intake.
+//!   external submitter shipping intake-shaped bytes lands HERE and fails the
+//!   `AgentMsg` decode — it can never fake an intake.
 //!
 //! ## the NO-FAIL arms (design §4, the callback-poison rule)
 //!
-//! both privileged intakes MUST NEVER return `Err`:
+//! every privileged intake MUST NEVER return `Err`:
 //!
 //! - the saga callback commits in the same block as the saga's terminal
 //!   transition. an `Err` here aborts that block; the saga wedges at Pending
@@ -47,9 +55,14 @@
 //!   message id, an oversized reply, a duplicate task id, a full thread) is
 //!   probed deterministically first — an emitted follow-up must be valid by
 //!   construction.
-//! - the hook intake runs in the same block as the user's post. an `Err` here
-//!   would abort the post (and every other subscriber's delivery), so a
-//!   malformed event or a failed context pin is equally a staged no-op.
+//! - the dispatch-plane result intake runs inside the delivery block; an
+//!   `Err` would abort it, the committed mailbox would re-inject next block,
+//!   and every subsequent block would abort (the permanent-abort loop the
+//!   dispatch module documents). same discipline, same staging.
+//! - the engagement intake runs in the same block as the user's post. an
+//!   `Err` here would abort the post (and every other subscriber's
+//!   delivery), so a malformed event, a failed context pin, a broken prompt
+//!   document, or an oversized payload is equally a staged no-op.
 //! - the jobs intake runs in the same block as the job submit. jobs queries are
 //!   committed-only, so the just-staged job is invisible to `JobsQuery::Get`;
 //!   this path skips that blind probe and relies on the documented single
@@ -57,11 +70,10 @@
 //!
 //! ## loop prevention
 //!
-//! an agent's reply is itself a post and re-fires the hook. the intake
-//! engages ONLY posts authored by `AuthorRef::User(_)` — agent-, module-, and
-//! system-authored posts never create runs. this single check is what stops
-//! infinite agent-answers-agent loops (and it composes: an agent mentioning
-//! another agent does NOT trigger it; only humans open turns).
+//! lives in the TAGGING PLANE, stated once for every module: only
+//! user-authored content fires engagement events, so an agent's reply (or
+//! any module-attributed post) never re-engages. this module trusts the
+//! plane's rule — the events it receives are user-authored by construction.
 //!
 //! ## the turn claim
 //!
@@ -88,9 +100,16 @@ use agent_interface::{
     encode_reply,
 };
 use chat_interface::{
-    AuthorRef, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
-    decode_event as chat_decode_event, decode_reply as chat_decode_reply,
-    encode_msg as chat_encode_msg, encode_query as chat_encode_query,
+    AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
+    decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
+    encode_query as chat_encode_query,
+};
+use dispatch_interface::{
+    DispatchMsg, MAX_PAYLOAD_BYTES, OutputContract, ResultEvent, Routing,
+    decode_result_event, encode_msg as dispatch_encode_msg,
+};
+use document_interface::{
+    DocQuery, DocReply, decode_reply as doc_decode_reply, encode_query as doc_encode_query,
 };
 use jobs_interface::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_event as jobs_decode_event,
@@ -103,7 +122,12 @@ use saga_interface::{
 };
 use capability_interface::validate_tag;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tagging_interface::{
+    EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
+    encode_msg as tagging_encode_msg,
+};
 use tasks_interface::{
     TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_reply as tasks_decode_reply,
     encode_msg as tasks_encode_msg, encode_query as tasks_encode_query,
@@ -155,6 +179,230 @@ pub fn saga_id_for(run_id: &str) -> String {
 /// the chat message id of a run's reply — one run posts at most one reply.
 pub fn reply_message_id(run_id: &str) -> String {
     format!("agent/{run_id}")
+}
+
+/// the dispatch-plane recipe an agent's chat runs execute under — registered
+/// (module-owned) in the same block as the agent itself.
+pub fn recipe_id_for(agent_id: &str) -> String {
+    format!("agent/{agent_id}")
+}
+
+/// the dispatch-plane id of a chat run's dispatch. run ids carry the
+/// reserved `\x1f` separator the dispatch module rejects in caller-chosen
+/// ids, so the dispatch id is the run id's hex sha256 — fixed-width, always
+/// within the dispatch id cap; the `dispatch_runs` index maps it back.
+pub fn dispatch_id_for(run_id: &str) -> String {
+    hex(&Sha256::digest(run_id.as_bytes()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ---- dispatch payload composition ------------------------------------------------
+// the dispatch plane's rule: the DISPATCHER composes the entire model input,
+// in consensus, and the host-side worker feeds it to the provider verbatim.
+// this framing is that composition for chat-engaged runs. (job-backed runs
+// still ride the saga + agent-oracle path, which keeps its own framing.)
+
+/// generic instructions when the agent has no consensus-resident prompt.
+const DEFAULT_PROMPT: &str =
+    "You are a Ducktape agent. Reply helpfully and return only the requested JSON output.";
+
+/// the strict output contract appended to every composed payload.
+const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
+{"reply_blocks":[{"id":"<uuid>","kind":"Paragraph","text":"..."}],"actions":[]}
+Allowed reply block kinds are Paragraph, Heading, and Code. Heading is rendered as a paragraph in Ducktape chat. Code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
+
+/// the canonical rendering of a prompt document: block texts joined by blank
+/// lines, kind-agnostic. `AgentRecord::prompt_hash` pins sha256 of exactly
+/// this string, so registrant and validator agree byte-for-byte.
+pub fn render_prompt_doc(blocks: &[document_interface::Block]) -> String {
+    blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// flatten a run into the single payload a non-interactive CLI takes: the
+/// system instructions, the strict-output contract, then the conversation.
+fn render_payload(
+    system: Option<&str>,
+    module_id: &str,
+    agent_id: &str,
+    transcript: &[MessageView],
+) -> String {
+    let mut out = String::new();
+    out.push_str(system.unwrap_or(DEFAULT_PROMPT));
+    out.push_str("\n\n");
+    out.push_str(STRICT_OUTPUT_INSTRUCTION);
+    out.push_str("\n\n");
+    if transcript.is_empty() {
+        out.push_str("No transcript was embedded for this run. Answer the user helpfully.");
+        return out;
+    }
+    out.push_str("Conversation so far:\n");
+    for message in transcript {
+        let speaker = match &message.head.author {
+            AuthorRef::Agent { module, agent_id: author }
+                if module == module_id && author == agent_id =>
+            {
+                "you"
+            }
+            _ => "them",
+        };
+        out.push_str(&format!("[{speaker}] {}\n", render_message(message)));
+    }
+    out.push_str("\nReply as the agent.");
+    out
+}
+
+fn render_message(message: &MessageView) -> String {
+    format!(
+        "{} @{}: {}",
+        render_author(&message.head.author),
+        message.seq,
+        message
+            .head
+            .blocks
+            .iter()
+            .map(render_block)
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn render_author(author: &AuthorRef) -> String {
+    match author {
+        AuthorRef::User(bytes) => format!("user:{}", hex(bytes)),
+        AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
+        AuthorRef::Module(module) => format!("module:{module}"),
+        AuthorRef::System => "system".into(),
+    }
+}
+
+fn render_block(block: &Block) -> String {
+    match block {
+        Block::Paragraph(spans) => spans.iter().map(|s| s.text.as_str()).collect(),
+        Block::Code { lang, text } => match lang {
+            Some(lang) if !lang.is_empty() => format!("```{lang}\n{text}\n```"),
+            _ => format!("```\n{text}\n```"),
+        },
+        Block::Quote(spans) => {
+            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+            text.lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        Block::Divider => "---".into(),
+    }
+}
+
+// ---- output normalization ---------------------------------------------------------
+// the dispatch-plane oracle returns the model's RAW text (opinion-free, Text
+// contract); shaping it into an [`AgentOutput`] is deterministic string
+// processing and therefore consensus work, done here in the result intake.
+
+/// the model's raw answer as an [`AgentOutput`]: strict shape first, a
+/// lenient mirror second, and a plain paragraph reply as the fallback.
+fn agent_output_from_text(text: &str) -> AgentOutput {
+    let parsed = serde_json::from_str::<AgentOutput>(text)
+        .or_else(|_| serde_json::from_str::<ModelOutput>(text).map(ModelOutput::into_agent_output));
+    let output = parsed.unwrap_or_else(|_| AgentOutput {
+        reply_blocks: vec![Block::paragraph(non_empty_text(text))],
+        actions: Vec::new(),
+    });
+    normalize_output(output, text)
+}
+
+/// a lenient mirror of the model-facing output shape: unknown block kinds and
+/// empty texts drop instead of failing the whole answer.
+#[derive(Debug, Deserialize)]
+struct ModelOutput {
+    #[serde(default)]
+    reply_blocks: Vec<ModelBlock>,
+    #[serde(default)]
+    actions: Vec<AgentAction>,
+}
+
+impl ModelOutput {
+    fn into_agent_output(self) -> AgentOutput {
+        AgentOutput {
+            reply_blocks: self
+                .reply_blocks
+                .into_iter()
+                .filter_map(ModelBlock::into_block)
+                .collect(),
+            actions: self.actions,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelBlock {
+    #[allow(dead_code)]
+    #[serde(default)]
+    id: Option<String>,
+    kind: String,
+    text: String,
+    #[serde(default)]
+    lang: Option<String>,
+}
+
+impl ModelBlock {
+    fn into_block(self) -> Option<Block> {
+        let text = self.text.trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        match self.kind.as_str() {
+            "Paragraph" | "Heading" => Some(Block::paragraph(text)),
+            "Code" => Some(Block::Code {
+                lang: self.lang.filter(|l| !l.is_empty()),
+                text,
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn normalize_output(mut output: AgentOutput, raw_text: &str) -> AgentOutput {
+    output.actions.truncate(MAX_ACTIONS_PER_RUN);
+    if output.reply_blocks.is_empty() {
+        output
+            .reply_blocks
+            .push(Block::paragraph(non_empty_text(raw_text)));
+    }
+    let bytes = serde_json::to_vec(&output.reply_blocks).expect("blocks serialize");
+    if bytes.len() > MAX_REPLY_BLOCKS_BYTES {
+        output.reply_blocks = vec![Block::paragraph(truncate_utf8(
+            &non_empty_text(raw_text),
+            MAX_REPLY_BLOCKS_BYTES / 4,
+        ))];
+    }
+    output
+}
+
+fn non_empty_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "Done.".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn truncate_utf8(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut keep = max;
+    while keep > 0 && !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}…", &text[..keep])
 }
 
 /// canonical digest of a pinned transcript window: u64-le message count, then
@@ -209,6 +457,9 @@ struct AgentState {
     capability: String,
     /// sha256 of the prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
     prompt_hash: Vec<u8>,
+    /// the document module doc holding the prompt content; its canonical
+    /// rendering must hash to `prompt_hash` (verified at dispatch time).
+    prompt_doc: Option<String>,
     /// granted action names from the known vocabulary, deduped and sorted.
     allowed_actions: BTreeSet<String>,
     /// false = paused: the agent never engages new runs.
@@ -235,6 +486,14 @@ struct RunState {
     context_hash: Vec<u8>,
     created_at: u64,
     updated_at: u64,
+}
+
+/// a chat run's read-only dispatch preparation: the pinned context plus the
+/// fully composed payload, gathered before anything is staged.
+struct PreparedDispatch {
+    thread_root: Option<u64>,
+    context_hash: Vec<u8>,
+    payload: Vec<u8>,
 }
 
 // ---- canonical encoding -------------------------------------------------------
@@ -288,6 +547,7 @@ fn encode_committed(
     agents: &BTreeMap<String, AgentState>,
     watches: &BTreeMap<String, TurnPolicy>,
     runs: &BTreeMap<String, RunState>,
+    dispatch_runs: &BTreeMap<String, String>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -298,6 +558,7 @@ fn encode_committed(
         put_bytes(&mut out, a.display_name.as_bytes());
         put_bytes(&mut out, a.capability.as_bytes());
         put_bytes(&mut out, &a.prompt_hash);
+        put_opt_string(&mut out, &a.prompt_doc);
         out.extend_from_slice(&(a.allowed_actions.len() as u64).to_le_bytes());
         for action in &a.allowed_actions {
             put_bytes(&mut out, action.as_bytes());
@@ -342,10 +603,20 @@ fn encode_committed(
                 put_bytes(&mut out, reason.as_bytes());
             }
             RunStatus::Cancelled => out.push(3),
+            RunStatus::AwaitingResult { dispatch_id } => {
+                out.push(4);
+                put_bytes(&mut out, dispatch_id.as_bytes());
+            }
         }
         put_bytes(&mut out, &r.context_hash);
         out.extend_from_slice(&r.created_at.to_le_bytes());
         out.extend_from_slice(&r.updated_at.to_le_bytes());
+    }
+
+    out.extend_from_slice(&(dispatch_runs.len() as u64).to_le_bytes());
+    for (dispatch_id, run_id) in dispatch_runs {
+        put_bytes(&mut out, dispatch_id.as_bytes());
+        put_bytes(&mut out, run_id.as_bytes());
     }
 
     out
@@ -358,8 +629,9 @@ fn committed_root(
     agents: &BTreeMap<String, AgentState>,
     watches: &BTreeMap<String, TurnPolicy>,
     runs: &BTreeMap<String, RunState>,
+    dispatch_runs: &BTreeMap<String, String>,
 ) -> StateRoot {
-    StateRoot(Sha256::digest(encode_committed(agents, watches, runs)).into())
+    StateRoot(Sha256::digest(encode_committed(agents, watches, runs, dispatch_runs)).into())
 }
 
 // ---- canonical decoding (UNTRUSTED input) ---------------------------------
@@ -510,17 +782,20 @@ type Committed = (
     BTreeMap<String, AgentState>,
     BTreeMap<String, TurnPolicy>,
     BTreeMap<String, RunState>,
+    BTreeMap<String, String>,
 );
 
 fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     // per-entry minimum sizes: an agent costs its id prefix, one origin
-    // discriminant, three length prefixes, an action count, a status byte,
-    // and two u64s; a watch its id prefix and a policy discriminant; a run
-    // its four length prefixes, anchor, option tag, two discriminants, and
-    // two u64s.
-    const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
+    // discriminant, three length prefixes, a prompt-doc tag, an action
+    // count, a status byte, and two u64s; a watch its id prefix and a policy
+    // discriminant; a run its four length prefixes, anchor, option tag, two
+    // discriminants, and two u64s; a dispatch-run index entry its two
+    // length prefixes.
+    const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 1 + 8 + 1 + 8 + 8;
     const MIN_WATCH_BYTES: u64 = 8 + 1;
     const MIN_RUN_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 1 + 1 + 8 + 8 + 8;
+    const MIN_DISPATCH_RUN_BYTES: u64 = 8 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
@@ -533,6 +808,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         let display_name = take_lp_string(&mut buf)?;
         let capability = take_lp_string(&mut buf)?;
         let prompt_hash = take_lp_bytes(&mut buf)?;
+        let prompt_doc = take_opt_string(&mut buf)?;
         let mut allowed_actions: BTreeSet<String> = BTreeSet::new();
         let actions = take_count(&mut buf, 8, "action")?;
         for _ in 0..actions {
@@ -559,6 +835,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
                 display_name,
                 capability,
                 prompt_hash,
+                prompt_doc,
                 allowed_actions,
                 active,
                 created_at,
@@ -604,6 +881,9 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
                 reason: take_lp_string(&mut buf)?,
             },
             3 => RunStatus::Cancelled,
+            4 => RunStatus::AwaitingResult {
+                dispatch_id: take_lp_string(&mut buf)?,
+            },
             d => return Err(format!("snapshot has unknown run status {d}")),
         };
         let context_hash = take_lp_bytes(&mut buf)?;
@@ -636,10 +916,26 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         )?;
     }
 
+    let mut dispatch_runs: BTreeMap<String, String> = BTreeMap::new();
+    let count = take_count(&mut buf, MIN_DISPATCH_RUN_BYTES, "dispatch run")?;
+    for _ in 0..count {
+        let dispatch_id = take_lp_string(&mut buf)?;
+        let run_id = take_lp_string(&mut buf)?;
+        // the index is derived state: each entry must be exactly the run's
+        // own dispatch id, and the run must exist.
+        if dispatch_id != dispatch_id_for(&run_id) {
+            return Err("snapshot dispatch id does not match its run id".into());
+        }
+        if !runs.contains_key(&run_id) {
+            return Err("snapshot dispatch index names an unknown run".into());
+        }
+        insert_ascending(&mut dispatch_runs, dispatch_id, run_id)?;
+    }
+
     if !buf.is_empty() {
         return Err("snapshot has trailing bytes".into());
     }
-    Ok((agents, watches, runs))
+    Ok((agents, watches, runs, dispatch_runs))
 }
 
 // ---- the module -----------------------------------------------------------
@@ -649,59 +945,88 @@ pub struct AgentModule {
     /// genesis config, not state: which module ids the origin router trusts.
     chat: ModuleId,
     saga: ModuleId,
+    /// the tagging plane — the engagement intake's trusted origin and the
+    /// target of watch subscriptions.
+    tagging: ModuleId,
+    /// the dispatch plane — chat-engaged runs' recipe registry and executor.
+    dispatch: ModuleId,
     tasks: Option<ModuleId>,
     jobs: Option<ModuleId>,
+    /// the document module prompt content is read from (`prompt_doc`).
+    document: Option<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
     agents: BTreeMap<String, AgentState>,
     watches: BTreeMap<String, TurnPolicy>,
     runs: BTreeMap<String, RunState>,
+    /// derived index: a chat run's dispatch id → its run id, so a
+    /// `ResultEvent` (which only carries the dispatch id) finds its run.
+    dispatch_runs: BTreeMap<String, String>,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
-    /// `commit_block`. agents and runs are upsert-only (nothing deletes
-    /// them); a watch stages `None` for removal (unwatch).
+    /// `commit_block`. agents, runs, and the dispatch index are upsert-only
+    /// (nothing deletes them); a watch stages `None` for removal (unwatch).
     pending_agents: BTreeMap<String, AgentState>,
     pending_watches: BTreeMap<String, Option<TurnPolicy>>,
     pending_runs: BTreeMap<String, RunState>,
+    pending_dispatch_runs: BTreeMap<String, String>,
 }
 
 impl AgentModule {
     /// wire the orchestrator to its collaborators. the ids must be pairwise
-    /// distinct — origin routing is what makes the hook and callback intakes
+    /// distinct — origin routing is what makes the privileged intakes
     /// spoof-proof, and colliding ids would collapse those namespaces.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<ModuleId>,
         chat: impl Into<ModuleId>,
         saga: impl Into<ModuleId>,
+        tagging: impl Into<ModuleId>,
+        dispatch: impl Into<ModuleId>,
         tasks: Option<ModuleId>,
         jobs: Option<ModuleId>,
+        document: Option<ModuleId>,
     ) -> Self {
         let id = id.into();
         let chat = chat.into();
         let saga = saga.into();
-        let mut ids = BTreeSet::from([id.clone(), chat.clone(), saga.clone()]);
-        if let Some(tasks) = &tasks {
-            ids.insert(tasks.clone());
-        }
-        if let Some(jobs) = &jobs {
-            ids.insert(jobs.clone());
+        let tagging = tagging.into();
+        let dispatch = dispatch.into();
+        let mut ids = BTreeSet::from([
+            id.clone(),
+            chat.clone(),
+            saga.clone(),
+            tagging.clone(),
+            dispatch.clone(),
+        ]);
+        let mut expected = 5;
+        for optional in [&tasks, &jobs, &document] {
+            if let Some(module) = optional {
+                ids.insert(module.clone());
+                expected += 1;
+            }
         }
         assert_eq!(
             ids.len(),
-            3 + usize::from(tasks.is_some()) + usize::from(jobs.is_some()),
-            "agent/chat/saga/tasks/jobs module ids must be pairwise distinct"
+            expected,
+            "agent collaborator module ids must be pairwise distinct"
         );
         Self {
             id,
             chat,
             saga,
+            tagging,
+            dispatch,
             tasks,
             jobs,
+            document,
             agents: BTreeMap::new(),
             watches: BTreeMap::new(),
             runs: BTreeMap::new(),
+            dispatch_runs: BTreeMap::new(),
             pending_agents: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
             pending_runs: BTreeMap::new(),
+            pending_dispatch_runs: BTreeMap::new(),
         }
     }
 
@@ -724,6 +1049,12 @@ impl AgentModule {
         self.pending_runs
             .get(run_id)
             .or_else(|| self.runs.get(run_id))
+    }
+
+    fn dispatch_run(&self, dispatch_id: &str) -> Option<&String> {
+        self.pending_dispatch_runs
+            .get(dispatch_id)
+            .or_else(|| self.dispatch_runs.get(dispatch_id))
     }
 
     fn visible_ids<'a, V, W>(
@@ -757,6 +1088,7 @@ impl AgentModule {
             display_name: a.display_name.clone(),
             capability: a.capability.clone(),
             prompt_hash: a.prompt_hash.clone(),
+            prompt_doc: a.prompt_doc.clone(),
             allowed_actions: a.allowed_actions.iter().cloned().collect(),
             status: if a.active {
                 AgentStatus::Active
@@ -901,12 +1233,125 @@ impl AgentModule {
         Ok((hash, thread_root, window))
     }
 
-    // ---- run creation ------------------------------------------------------------
+    // ---- prompt + payload preparation (the dispatch plane's composition rule) -----
 
-    /// stage a run and trigger its saga — one atomic unit with whatever op
-    /// caused it (P2). the trigger asks for a callback to this module with
-    /// the run id as the correlation payload, a view-denominated deadline,
-    /// and one retry.
+    /// the agent's consensus-resident prompt text, when it has one: read from
+    /// the document module and verified against the registered
+    /// `prompt_hash`, so which prompt ran is part of the app-hash — a
+    /// drifted document is an error the caller turns into a skipped run.
+    async fn prompt_text(&self, ctx: &dyn Ctx, agent: &AgentState) -> Result<Option<String>, String> {
+        let Some(doc_id) = &agent.prompt_doc else {
+            return Ok(None);
+        };
+        let Some(document) = &self.document else {
+            return Err("agent has a prompt_doc but no document module is configured".into());
+        };
+        let reply = ctx
+            .query(
+                document,
+                &doc_encode_query(&DocQuery::GetDoc {
+                    doc_id: doc_id.clone(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("document query failed: {e}"))?;
+        let blocks = match doc_decode_reply(&reply) {
+            Ok(DocReply::Doc(Some(blocks))) => blocks,
+            Ok(DocReply::Doc(None)) => return Err(format!("prompt document is missing: {doc_id}")),
+            _ => return Err("unexpected document reply for a prompt query".into()),
+        };
+        let text = render_prompt_doc(&blocks);
+        if Sha256::digest(text.as_bytes()).as_slice() != agent.prompt_hash.as_slice() {
+            return Err(format!(
+                "prompt document {doc_id} does not hash to the registered prompt_hash"
+            ));
+        }
+        Ok(Some(text))
+    }
+
+    /// everything a chat run's dispatch needs, prepared read-only: the pinned
+    /// context (P4) and the fully composed payload. any failure here is a
+    /// clean skip for the no-fail engagement intake and a clean error for an
+    /// explicit `RequestRun`.
+    async fn prepare_dispatch(
+        &self,
+        ctx: &dyn Ctx,
+        agent_id: &str,
+        channel_id: &str,
+        anchor_seq: u64,
+    ) -> Result<PreparedDispatch, String> {
+        let agent = self
+            .agent(agent_id)
+            .ok_or_else(|| format!("agent is not registered: {agent_id}"))?;
+        let (context_hash, thread_root, transcript) =
+            self.pin_context(ctx, channel_id, anchor_seq).await?;
+        let prompt = self.prompt_text(ctx, agent).await?;
+        let payload =
+            render_payload(prompt.as_deref(), &self.id, agent_id, &transcript).into_bytes();
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "composed payload is {} bytes; the dispatch cap is {MAX_PAYLOAD_BYTES}",
+                payload.len()
+            ));
+        }
+        Ok(PreparedDispatch {
+            thread_root,
+            context_hash,
+            payload,
+        })
+    }
+
+    /// stage a chat run and dispatch it through the dispatch plane — one
+    /// atomic unit with whatever op caused it (P2). the recipe is the
+    /// agent's own (`agent/{agent_id}`, registered with the agent); the
+    /// result lands as a next-block `ResultEvent` keyed by the dispatch id.
+    fn stage_dispatch_run(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: String,
+        agent_id: String,
+        channel_id: String,
+        anchor_seq: u64,
+        requester: SagaOrigin,
+        prepared: PreparedDispatch,
+    ) {
+        let now = ctx.env().consensus_time;
+        let dispatch_id = dispatch_id_for(&run_id);
+        ctx.emit_msg(Msg {
+            target: self.dispatch.clone(),
+            payload: dispatch_encode_msg(&DispatchMsg::Dispatch {
+                dispatch_id: dispatch_id.clone(),
+                recipe_id: recipe_id_for(&agent_id),
+                payload: prepared.payload,
+            }),
+        });
+        self.pending_dispatch_runs
+            .insert(dispatch_id.clone(), run_id.clone());
+        self.pending_runs.insert(
+            run_id,
+            RunState {
+                agent_id,
+                channel_id,
+                anchor_seq,
+                thread_root: prepared.thread_root,
+                job_id: None,
+                job_claim_height: 0,
+                requester,
+                status: RunStatus::AwaitingResult { dispatch_id },
+                context_hash: prepared.context_hash,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+    }
+
+    // ---- run creation (job-backed runs — the remaining direct-saga lane) ----------
+
+    /// stage a JOB-BACKED run and trigger its saga — one atomic unit with
+    /// whatever op caused it (P2). the trigger asks for a callback to this
+    /// module with the run id as the correlation payload, a view-denominated
+    /// deadline, and one retry. chat-engaged runs do not come through here —
+    /// they ride the dispatch plane ([`AgentModule::stage_dispatch_run`]).
     #[allow(clippy::too_many_arguments)]
     fn stage_run(
         &mut self,
@@ -1065,22 +1510,20 @@ impl AgentModule {
         Ok(())
     }
 
-    // ---- the hook intake (origin == chat) -----------------------------------------
+    // ---- the engagement intake (origin == tagging) ----------------------------------
 
-    /// which agents a post engages under `policy`. only ACTIVE registered
-    /// agents ever engage; every branch reads agreed state only.
-    fn engaged_agents(&self, policy: &TurnPolicy, mentions: &[AuthorRef], seq: u64) -> Vec<String> {
+    /// which agents an engagement engages under `policy`. only ACTIVE
+    /// registered agents ever engage; every branch reads agreed state only.
+    fn engaged_agents(&self, policy: &TurnPolicy, tags: &[EntityRef], seq: u64) -> Vec<String> {
         match policy {
-            // structured mention spans naming THIS module's agents, in
-            // mention order (chat dedupes them).
-            TurnPolicy::Mention => mentions
+            // entity tags naming THIS module's agents, in content order (the
+            // content module dedupes them).
+            TurnPolicy::Mention => tags
                 .iter()
-                .filter_map(|mention| match mention {
-                    AuthorRef::Agent { module, agent_id } if *module == self.id => self
-                        .agent(agent_id)
-                        .is_some_and(|a| a.active)
-                        .then(|| agent_id.clone()),
-                    _ => None,
+                .filter_map(|tag| {
+                    (tag.module == self.id
+                        && self.agent(&tag.entity).is_some_and(|a| a.active))
+                    .then(|| tag.entity.clone())
                 })
                 .collect(),
             TurnPolicy::All => self.active_agent_ids(),
@@ -1102,68 +1545,58 @@ impl AgentModule {
         }
     }
 
-    /// NO-FAIL ARM. this runs in the same block as the user's post — an `Err`
-    /// would abort the post itself (and every other hook subscriber's
-    /// delivery), so malformed events, unwatched channels, and failed context
-    /// pins are all staged no-ops.
-    async fn on_chat_event(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
-        let Ok(event) = chat_decode_event(payload) else {
-            self.note(ctx, "dropped undecodable chat event".into());
+    /// NO-FAIL ARM. the tagging plane routes a user post here in the same
+    /// block as the post itself — an `Err` would abort the post (and every
+    /// other subscriber's delivery), so malformed events, unwatched
+    /// channels, failed context pins, broken prompt documents, and oversized
+    /// payloads are all staged no-ops. the plane's loop rule guarantees the
+    /// event is user-authored.
+    async fn on_engagement(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
+        let Ok(event) = tagging_decode_event(payload) else {
+            self.note(ctx, "dropped undecodable engagement event".into());
             return Ok(());
         };
-        let ChatEvent::MessagePosted {
-            channel_id,
-            seq,
-            thread_root: _,
-            author,
-            mentions,
+        let EngagementEvent {
+            source,
+            container: channel_id,
+            content_seq: seq,
+            author: _,
+            tags,
         } = event;
-
-        // LOOP PREVENTION: an agent reply re-fires this hook. only a post
-        // authored by an external USER opens a turn — agent-, module-, and
-        // system-authored posts never create runs, which is the check that
-        // stops infinite agent-answers-agent loops.
-        if !matches!(author, AuthorRef::User(_)) {
+        if source != self.chat {
+            // this module only understands chat containers; a subscription
+            // to another source would be a config bug, not a block abort.
+            self.note(ctx, format!("dropped engagement from source {source}"));
             return Ok(());
         }
         let Some(policy) = self.watch(&channel_id).cloned() else {
-            // a hook registered outside WatchChannel (chat hooks are
-            // permissionless today) notifies us about channels we do not
-            // watch: a no-op, never an error.
+            // an engagement for a channel we no longer watch (subscription
+            // and watch drift within a block): a no-op, never an error.
             return Ok(());
         };
 
         let requester = canonical_origin(&ctx.env().origin);
-        for agent_id in self.engaged_agents(&policy, &mentions, seq) {
+        for agent_id in self.engaged_agents(&policy, &tags, seq) {
             let run_id = run_id_for(&channel_id, seq, &agent_id);
             if self.run(&run_id).is_some() {
                 // the turn claim: the first creation in consensus order won.
                 continue;
             }
-            let (capability, prompt_hash) = {
-                let agent = self
-                    .agent(&agent_id)
-                    .expect("engaged agents are registered");
-                (agent.capability.clone(), agent.prompt_hash.clone())
-            };
-            match self.pin_context(&*ctx, &channel_id, seq).await {
-                Ok((context_hash, thread_root, transcript)) => self.stage_run(
+            match self
+                .prepare_dispatch(&*ctx, &agent_id, &channel_id, seq)
+                .await
+            {
+                Ok(prepared) => self.stage_dispatch_run(
                     ctx,
                     run_id,
                     agent_id,
                     channel_id.clone(),
                     seq,
-                    thread_root,
-                    None,
-                    0,
                     requester.clone(),
-                    capability,
-                    prompt_hash,
-                    context_hash,
-                    transcript,
+                    prepared,
                 ),
-                // a failed pin must not poison the posting block — same
-                // no-fail reasoning as the callback arm.
+                // a failed preparation must not poison the posting block —
+                // same no-fail reasoning as the callback arm.
                 Err(reason) => self.note(ctx, format!("run skipped for {run_id}: {reason}")),
             }
         }
@@ -1206,7 +1639,7 @@ impl AgentModule {
         let now = ctx.env().consensus_time;
         match callback.outcome {
             SagaOutcome::Done(bytes) => {
-                match self.validate_output(&*ctx, &run_id, &run, &bytes).await {
+                match self.validate_output_bytes(&*ctx, &run_id, &run, &bytes).await {
                     Ok(output) => {
                         let payload = String::from_utf8(encode_output(&output))
                             .expect("AgentOutput JSON is utf-8");
@@ -1255,13 +1688,70 @@ impl AgentModule {
         Ok(())
     }
 
+    // ---- the dispatch-plane result intake (origin == dispatch) ---------------------
+
+    /// NO-FAIL ARM. the dispatch plane delivers a chat run's outcome here
+    /// inside its delivery block; an `Err` would abort that block, the
+    /// committed mailbox would re-inject next block, and every block after
+    /// would abort (the permanent-abort loop). unknown dispatch ids and
+    /// terminal runs are staged no-ops; the model's raw text is normalized
+    /// deterministically, and an output that fails validation FAILS THE RUN,
+    /// never the block.
+    async fn on_result_event(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
+        let Ok(event) = decode_result_event(payload) else {
+            self.note(ctx, "dropped undecodable dispatch result event".into());
+            return Ok(());
+        };
+        let Some(run_id) = self.dispatch_run(&event.dispatch_id).cloned() else {
+            self.note(
+                ctx,
+                format!("dropped result for unknown dispatch {}", event.dispatch_id),
+            );
+            return Ok(());
+        };
+        let Some(run) = self.run(&run_id).cloned() else {
+            self.note(ctx, format!("dropped result for unknown run {run_id}"));
+            return Ok(());
+        };
+        // only the dispatch this run is actually awaiting may transition it —
+        // a terminal run's late delivery is a no-op.
+        let RunStatus::AwaitingResult { dispatch_id } = &run.status else {
+            return Ok(());
+        };
+        if *dispatch_id != event.dispatch_id {
+            return Ok(());
+        }
+
+        let now = ctx.env().consensus_time;
+        let ResultEvent { outcome, .. } = event;
+        match outcome {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let output = agent_output_from_text(&text);
+                match self.validate_output(&*ctx, &run_id, &run, output).await {
+                    Ok(output) => {
+                        self.emit_output(ctx, &run_id, &run, output);
+                        self.stage_run_status(run_id, run, RunStatus::Done, now);
+                    }
+                    // deterministically invalid output: the run fails, the
+                    // delivery block commits.
+                    Err(reason) => {
+                        self.stage_run_status(run_id, run, RunStatus::Failed { reason }, now)
+                    }
+                }
+            }
+            Err(reason) => self.stage_run_status(run_id, run, RunStatus::Failed { reason }, now),
+        }
+        Ok(())
+    }
+
     /// deterministic output validation — THE safety boundary (design §5). the
     /// output is data until every check here passes; only then do its
     /// follow-ups exist. beyond schema and caps, this probes everything the
     /// emitted follow-ups could make chat or tasks REJECT (which would abort
     /// the terminal block — the poison rule): a squatted reply message id, a
     /// full thread, a duplicate or unknown task id.
-    async fn validate_output(
+    async fn validate_output_bytes(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
@@ -1269,6 +1759,16 @@ impl AgentModule {
         bytes: &[u8],
     ) -> Result<AgentOutput, String> {
         let output = decode_output(bytes).map_err(|e| format!("undecodable AgentOutput: {e}"))?;
+        self.validate_output(ctx, run_id, run, output).await
+    }
+
+    async fn validate_output(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        run: &RunState,
+        output: AgentOutput,
+    ) -> Result<AgentOutput, String> {
         let agent = self
             .agent(&run.agent_id)
             .ok_or_else(|| format!("agent is not registered: {}", run.agent_id))?;
@@ -1526,23 +2026,55 @@ impl AgentModule {
                 display_name,
                 capability,
                 prompt_hash,
+                prompt_doc,
                 allowed_actions,
             } => {
                 let owner = Self::admin_origin(&ctx.env().origin)?;
                 Self::validate_non_empty("agent_id", &agent_id)?;
                 reject_run_separator("agent_id", &agent_id)?;
+                // the agent's recipe id must fit the dispatch plane's id cap,
+                // or the atomic recipe registration below could never land.
+                if recipe_id_for(&agent_id).len() > dispatch_interface::MAX_ID_BYTES {
+                    return Err(Error::Module(format!(
+                        "agent_id is too long for its dispatch recipe id (cap {})",
+                        dispatch_interface::MAX_ID_BYTES - recipe_id_for("").len()
+                    )));
+                }
                 Self::validate_non_empty("display_name", &display_name)?;
                 validate_tag(&capability).map_err(Error::Module)?;
                 Self::validate_prompt_hash(&prompt_hash)?;
+                if let Some(doc_id) = &prompt_doc {
+                    Self::validate_non_empty("prompt_doc", doc_id)?;
+                }
                 let allowed_actions = Self::validate_actions(allowed_actions)?;
                 if self.agent(&agent_id).is_some() {
                     return Err(Error::Module(format!("agent already exists: {agent_id}")));
                 }
+                // the agent and its dispatch recipe are ONE atomic unit: if
+                // the dispatch module rejects the recipe (a squatted id), the
+                // whole block aborts and the staged agent vanishes with it.
+                ctx.emit_msg(Msg {
+                    target: self.dispatch.clone(),
+                    payload: dispatch_encode_msg(&DispatchMsg::RegisterRecipe {
+                        recipe_id: recipe_id_for(&agent_id),
+                        description: format!("chat runs for agent {agent_id}"),
+                        capability: capability.clone(),
+                        routing: Routing::Rendezvous,
+                        // Text on purpose: the oracle returns the model's raw
+                        // answer and THIS module normalizes it — a strict
+                        // Json contract would fail every prose reply.
+                        output_contract: OutputContract::Text,
+                        max_attempts: RUN_MAX_ATTEMPTS,
+                        deadline_views: Some(RUN_DEADLINE_VIEWS),
+                        lease_views: None,
+                    }),
+                });
                 let state = AgentState {
                     owner,
                     display_name,
                     capability,
                     prompt_hash,
+                    prompt_doc,
                     allowed_actions,
                     active: true,
                     created_at: now,
@@ -1557,6 +2089,7 @@ impl AgentModule {
                 display_name,
                 capability,
                 prompt_hash,
+                prompt_doc,
                 allowed_actions,
             } => {
                 let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
@@ -1566,11 +2099,30 @@ impl AgentModule {
                 }
                 if let Some(capability) = capability {
                     validate_tag(&capability).map_err(Error::Module)?;
+                    if capability != state.capability {
+                        // keep the agent's dispatch recipe on the same tag,
+                        // atomically with the record change.
+                        ctx.emit_msg(Msg {
+                            target: self.dispatch.clone(),
+                            payload: dispatch_encode_msg(&DispatchMsg::UpdateRecipe {
+                                recipe_id: recipe_id_for(&agent_id),
+                                description: None,
+                                capability: Some(capability.clone()),
+                                routing: None,
+                                output_contract: None,
+                                max_attempts: None,
+                            }),
+                        });
+                    }
                     state.capability = capability;
                 }
                 if let Some(prompt_hash) = prompt_hash {
                     Self::validate_prompt_hash(&prompt_hash)?;
                     state.prompt_hash = prompt_hash;
+                }
+                if let Some(doc_id) = prompt_doc {
+                    Self::validate_non_empty("prompt_doc", &doc_id)?;
+                    state.prompt_doc = Some(doc_id);
                 }
                 if let Some(allowed_actions) = allowed_actions {
                     state.allowed_actions = Self::validate_actions(allowed_actions)?;
@@ -1593,16 +2145,17 @@ impl AgentModule {
                         )));
                     }
                 }
-                // the watch and the chat hook are ONE atomic unit (P2): if
-                // chat rejects the hook (unknown channel, hook cap), the
-                // whole block aborts and the staged watch vanishes with it.
+                // the watch and the plane subscription are ONE atomic unit
+                // (P2): if the tagging plane rejects the subscription (bad
+                // container, subscriber cap), the whole block aborts and the
+                // staged watch vanishes with it.
                 self.pending_watches
                     .insert(channel_id.clone(), Some(policy));
                 ctx.emit_msg(Msg {
-                    target: self.chat.clone(),
-                    payload: chat_encode_msg(&ChatMsg::RegisterHook {
-                        channel_id,
-                        module_id: ctx.env().me.clone(),
+                    target: self.tagging.clone(),
+                    payload: tagging_encode_msg(&TaggingMsg::Subscribe {
+                        source: self.chat.clone(),
+                        container: channel_id,
                     }),
                 });
                 Ok(())
@@ -1616,10 +2169,10 @@ impl AgentModule {
                 }
                 self.pending_watches.insert(channel_id.clone(), None);
                 ctx.emit_msg(Msg {
-                    target: self.chat.clone(),
-                    payload: chat_encode_msg(&ChatMsg::UnregisterHook {
-                        channel_id,
-                        module_id: ctx.env().me.clone(),
+                    target: self.tagging.clone(),
+                    payload: tagging_encode_msg(&TaggingMsg::Unsubscribe {
+                        source: self.chat.clone(),
+                        container: channel_id,
                     }),
                 });
                 Ok(())
@@ -1667,28 +2220,21 @@ impl AgentModule {
                 if !agent.active {
                     return Err(Error::Module(format!("agent is paused: {agent_id}")));
                 }
-                let (capability, prompt_hash) = (agent.capability.clone(), agent.prompt_hash.clone());
-                // unlike the hook intake, an explicit request REJECTS on a
-                // failed pin: this is the root op of its own block, so an
-                // error poisons nothing but the request itself.
-                let (context_hash, thread_root, transcript) = self
-                    .pin_context(&*ctx, &channel_id, anchor_seq)
+                // unlike the engagement intake, an explicit request REJECTS
+                // on a failed preparation: this is the root op of its own
+                // block, so an error poisons nothing but the request itself.
+                let prepared = self
+                    .prepare_dispatch(&*ctx, &agent_id, &channel_id, anchor_seq)
                     .await
                     .map_err(Error::Module)?;
-                self.stage_run(
+                self.stage_dispatch_run(
                     ctx,
                     run_id,
                     agent_id,
                     channel_id,
                     anchor_seq,
-                    thread_root,
-                    None,
-                    0,
                     requester,
-                    capability,
-                    prompt_hash,
-                    context_hash,
-                    transcript,
+                    prepared,
                 );
                 Ok(())
             }
@@ -1705,17 +2251,23 @@ impl AgentModule {
                         "only the run creator or the agent owner may cancel a run".into(),
                     ));
                 }
-                let RunStatus::AwaitingOracle { saga_id } = run.status.clone() else {
+                match run.status.clone() {
+                    // a job-backed run: cancel its saga in the same block;
+                    // the Cancelled callback echoes back next dispatch and
+                    // no-ops against the (by then terminal) run.
+                    RunStatus::AwaitingOracle { saga_id } => ctx.emit_msg(Msg {
+                        target: self.saga.clone(),
+                        payload: saga_encode_msg(&SagaMsg::Cancel { saga_id }),
+                    }),
+                    // a chat run: cancel through the dispatch plane; its
+                    // Err("cancelled") ResultEvent later no-ops the same way.
+                    RunStatus::AwaitingResult { dispatch_id } => ctx.emit_msg(Msg {
+                        target: self.dispatch.clone(),
+                        payload: dispatch_encode_msg(&DispatchMsg::CancelDispatch { dispatch_id }),
+                    }),
                     // terminal: an idempotent no-op.
-                    return Ok(());
-                };
-                // cancel the saga in the same block; its Cancelled callback
-                // echoes back next dispatch and no-ops against the (by then
-                // terminal) run.
-                ctx.emit_msg(Msg {
-                    target: self.saga.clone(),
-                    payload: saga_encode_msg(&SagaMsg::Cancel { saga_id }),
-                });
+                    _ => return Ok(()),
+                }
                 self.stage_run_status(run_id, run, RunStatus::Cancelled, now);
                 Ok(())
             }
@@ -1749,7 +2301,7 @@ impl AgentModule {
     /// into the canonical encoding `root()` commits to. deterministic across
     /// nodes.
     pub fn snapshot(&self) -> Vec<u8> {
-        encode_committed(&self.agents, &self.watches, &self.runs)
+        encode_committed(&self.agents, &self.watches, &self.runs, &self.dispatch_runs)
     }
 
     /// adopt a peer's snapshot as own committed state — but only after the
@@ -1760,8 +2312,9 @@ impl AgentModule {
     /// dropped — a snapshot describes a block boundary, and nothing
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (agents, watches, runs) = decode_committed(bytes).map_err(Error::Module)?;
-        if committed_root(&agents, &watches, &runs) != expected {
+        let (agents, watches, runs, dispatch_runs) =
+            decode_committed(bytes).map_err(Error::Module)?;
+        if committed_root(&agents, &watches, &runs, &dispatch_runs) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
             ));
@@ -1769,9 +2322,11 @@ impl AgentModule {
         self.agents = agents;
         self.watches = watches;
         self.runs = runs;
+        self.dispatch_runs = dispatch_runs;
         self.pending_agents.clear();
         self.pending_watches.clear();
         self.pending_runs.clear();
+        self.pending_dispatch_runs.clear();
         Ok(())
     }
 }
@@ -1787,7 +2342,7 @@ impl Module for AgentModule {
     /// sorted-key order. sensitive to every field, so any transition moves
     /// the root. the preimage IS the snapshot encoding.
     fn root(&self) -> StateRoot {
-        committed_root(&self.agents, &self.watches, &self.runs)
+        committed_root(&self.agents, &self.watches, &self.runs, &self.dispatch_runs)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -1795,20 +2350,30 @@ impl Module for AgentModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        // three payload namespaces, routed by the HOST-ASSIGNED origin —
-        // spoof-proof by construction: only chat's own follow-ups reach the
-        // hook intake, only saga's reach the callback intake, and everything
-        // else (external submitters included) must decode as an AgentMsg.
+        // four payload namespaces, routed by the HOST-ASSIGNED origin —
+        // spoof-proof by construction: only the tagging plane's follow-ups
+        // reach the engagement intake, only dispatch's reach the result
+        // intake, only saga's reach the callback intake, and everything else
+        // (external submitters included) must decode as an AgentMsg.
         let origin = ctx.env().origin.clone();
         match origin {
-            Origin::Module(module) if module == self.chat => {
-                self.on_chat_event(ctx, &msg.payload).await
+            Origin::Module(module) if module == self.tagging => {
+                self.on_engagement(ctx, &msg.payload).await
+            }
+            Origin::Module(module) if module == self.dispatch => {
+                self.on_result_event(ctx, &msg.payload).await
             }
             Origin::Module(module) if module == self.saga => {
                 self.on_saga_callback(ctx, &msg.payload).await
             }
             Origin::Module(module) if self.jobs.as_ref() == Some(&module) => {
                 self.on_jobs_event(ctx, &msg.payload).await
+            }
+            Origin::Module(module) if module == self.chat => {
+                // dead letter: chat no longer notifies this module directly.
+                // a stray follow-up must never abort a posting block.
+                self.note(ctx, "dropped a direct chat follow-up".into());
+                Ok(())
             }
             _ => self.on_admin(ctx, msg).await,
         }
@@ -1876,6 +2441,9 @@ impl Module for AgentModule {
         for (id, run) in std::mem::take(&mut self.pending_runs) {
             self.runs.insert(id, run);
         }
+        for (dispatch_id, run_id) in std::mem::take(&mut self.pending_dispatch_runs) {
+            self.dispatch_runs.insert(dispatch_id, run_id);
+        }
         Ok(())
     }
 
@@ -1883,6 +2451,7 @@ impl Module for AgentModule {
         self.pending_agents.clear();
         self.pending_watches.clear();
         self.pending_runs.clear();
+        self.pending_dispatch_runs.clear();
         Ok(())
     }
 }
@@ -1895,12 +2464,17 @@ mod tests {
         encode_query,
     };
     use chat_interface::{
-        Block, MessageHead, decode_msg as chat_decode_msg, decode_query as chat_decode_query,
-        encode_event as chat_encode_event, encode_reply as chat_encode_reply,
+        MessageHead, decode_msg as chat_decode_msg, decode_query as chat_decode_query,
+        encode_reply as chat_encode_reply,
     };
+    use dispatch_interface::{
+        decode_msg as dispatch_decode_msg, encode_result_event,
+    };
+    use document_interface::{BlockKind, decode_query as doc_decode_query, encode_reply as doc_encode_reply};
     use futures::executor::block_on;
     use saga_interface::{SagaCallback, encode_callback as saga_encode_callback};
     use sdk::{Effect, Env};
+    use tagging_interface::{Author, encode_event as tagging_encode_event};
     use tasks_interface::{
         Task, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
     };
@@ -1913,6 +2487,8 @@ mod tests {
         /// channel -> messages with contiguous seqs starting at 1.
         transcripts: BTreeMap<String, Vec<MessageView>>,
         tasks: Vec<Task>,
+        /// doc_id -> prompt document blocks served by the document arm.
+        docs: BTreeMap<String, Vec<document_interface::Block>>,
         msgs: Vec<Msg>,
         #[allow(dead_code)]
         effects: Vec<Effect>,
@@ -1929,6 +2505,7 @@ mod tests {
                 },
                 transcripts: BTreeMap::new(),
                 tasks: Vec::new(),
+                docs: BTreeMap::new(),
                 msgs: Vec::new(),
                 effects: Vec::new(),
                 events: Vec::new(),
@@ -1943,8 +2520,11 @@ mod tests {
             self.env.origin = origin;
             self
         }
-        fn from_chat(self) -> Self {
-            self.from_origin(Origin::Module("chat".into()))
+        fn from_tagging(self) -> Self {
+            self.from_origin(Origin::Module("tagging".into()))
+        }
+        fn from_dispatch(self) -> Self {
+            self.from_origin(Origin::Module("dispatch".into()))
         }
         fn from_saga(self) -> Self {
             self.from_origin(Origin::Module("saga".into()))
@@ -1964,6 +2544,17 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
             });
+            self
+        }
+        fn with_doc(mut self, doc_id: &str, text: &str) -> Self {
+            self.docs.insert(
+                doc_id.into(),
+                vec![document_interface::Block {
+                    id: "b1".into(),
+                    kind: BlockKind::Paragraph,
+                    text: text.into(),
+                }],
+            );
             self
         }
         /// decoded saga msgs emitted this dispatch.
@@ -1998,6 +2589,22 @@ mod tests {
                 .map(|m| jobs_interface::decode_msg(&m.payload).expect("jobs msg"))
                 .collect()
         }
+        /// decoded dispatch-plane msgs emitted this dispatch.
+        fn dispatch_msgs(&self) -> Vec<DispatchMsg> {
+            self.msgs
+                .iter()
+                .filter(|m| m.target == "dispatch")
+                .map(|m| dispatch_decode_msg(&m.payload).expect("dispatch msg"))
+                .collect()
+        }
+        /// decoded tagging-plane msgs emitted this dispatch.
+        fn tagging_msgs(&self) -> Vec<TaggingMsg> {
+            self.msgs
+                .iter()
+                .filter(|m| m.target == "tagging")
+                .map(|m| tagging_interface::decode_msg(&m.payload).expect("tagging msg"))
+                .collect()
+        }
     }
     #[async_trait::async_trait(?Send)]
     impl Ctx for CaptureCtx {
@@ -2009,6 +2616,12 @@ mod tests {
         }
         async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
             match target {
+                "document" => match doc_decode_query(req).map_err(Error::Module)? {
+                    DocQuery::GetDoc { doc_id } => Ok(doc_encode_reply(&DocReply::Doc(
+                        self.docs.get(&doc_id).cloned(),
+                    ))),
+                    _ => Err(Error::QueryUnsupported),
+                },
                 "chat" => match chat_decode_query(req).map_err(Error::Module)? {
                     ChatQuery::MessagesRange {
                         channel_id,
@@ -2060,8 +2673,11 @@ mod tests {
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         )
     }
 
@@ -2069,10 +2685,10 @@ mod tests {
         Origin::External(vec![byte; 32])
     }
 
-    fn agent_ref(agent_id: &str) -> AuthorRef {
-        AuthorRef::Agent {
+    fn agent_tag(agent_id: &str) -> EntityRef {
+        EntityRef {
             module: "agent".into(),
-            agent_id: agent_id.into(),
+            entity: agent_id.into(),
         }
     }
 
@@ -2118,6 +2734,7 @@ mod tests {
             display_name: agent_id.to_uppercase(),
             capability: "model-1".into(),
             prompt_hash: vec![7u8; PROMPT_HASH_LEN],
+            prompt_doc: None,
             allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -2129,15 +2746,18 @@ mod tests {
         }
     }
 
-    fn posted(channel: &str, seq: u64, author: AuthorRef, mentions: Vec<AuthorRef>) -> Msg {
+    /// the tagging plane's routed report of a user post — the engagement
+    /// intake's payload. the plane's loop rule means these are always
+    /// user-authored in practice.
+    fn engagement(channel: &str, seq: u64, tags: Vec<EntityRef>) -> Msg {
         Msg {
             target: "agent".into(),
-            payload: chat_encode_event(&ChatEvent::MessagePosted {
-                channel_id: channel.into(),
-                seq,
-                thread_root: None,
-                author,
-                mentions,
+            payload: tagging_encode_event(&EngagementEvent {
+                source: "chat".into(),
+                container: channel.into(),
+                content_seq: seq,
+                author: Author::User(vec![1; 32]),
+                tags,
             }),
         }
     }
@@ -2148,6 +2768,18 @@ mod tests {
             payload: saga_encode_callback(&SagaCallback {
                 saga_id: saga_id_for(run_id),
                 payload: run_id.as_bytes().to_vec(),
+                outcome,
+            }),
+        }
+    }
+
+    /// the dispatch plane's next-block delivery for a chat run.
+    fn result_event(run_id: &str, outcome: Result<Vec<u8>, String>) -> Msg {
+        Msg {
+            target: "agent".into(),
+            payload: encode_result_event(&ResultEvent {
+                dispatch_id: dispatch_id_for(run_id),
+                recipe_id: recipe_id_for("bot"),
                 outcome,
             }),
         }
@@ -2208,19 +2840,14 @@ mod tests {
         m
     }
 
-    /// drive a hook post at `seq` (author user(1)) mentioning `mentioned`.
-    fn hook_post(m: &mut AgentModule, seq: u64, mentioned: &[&str]) -> CaptureCtx {
+    /// drive an engagement at `seq` (author user(1)) tagging `mentioned`.
+    fn engage_post(m: &mut AgentModule, seq: u64, mentioned: &[&str]) -> CaptureCtx {
         let mut ctx = CaptureCtx::new()
             .at(seq)
-            .from_chat()
+            .from_tagging()
             .with_transcript("general", transcript(seq));
-        let mentions = mentioned.iter().map(|a| agent_ref(a)).collect();
-        exec(
-            m,
-            &mut ctx,
-            &posted("general", seq, AuthorRef::User(vec![1; 32]), mentions),
-        )
-        .unwrap();
+        let tags = mentioned.iter().map(|a| agent_tag(a)).collect();
+        exec(m, &mut ctx, &engagement("general", seq, tags)).unwrap();
         ctx
     }
 
@@ -2243,6 +2870,32 @@ mod tests {
         assert_eq!(record.status, AgentStatus::Active);
         assert_eq!(record.allowed_actions, vec![ACTION_CHAT_POST.to_string()]);
         assert_eq!(record.created_at, 3);
+
+        // the agent's dispatch recipe registers atomically with the record.
+        let recipes = ctx.dispatch_msgs();
+        assert_eq!(recipes.len(), 1);
+        let DispatchMsg::RegisterRecipe {
+            recipe_id,
+            capability,
+            routing,
+            output_contract,
+            max_attempts,
+            deadline_views,
+            ..
+        } = &recipes[0]
+        else {
+            panic!("expected a recipe registration");
+        };
+        assert_eq!(*recipe_id, recipe_id_for("bot"));
+        assert_eq!(*capability, "model-1");
+        assert_eq!(*routing, Routing::Rendezvous);
+        assert_eq!(
+            *output_contract,
+            OutputContract::Text,
+            "raw model text back; THIS module normalizes"
+        );
+        assert_eq!(*max_attempts, RUN_MAX_ATTEMPTS);
+        assert_eq!(*deadline_views, Some(RUN_DEADLINE_VIEWS));
 
         // duplicate registration is an error, even from the same owner.
         let err = exec(
@@ -2272,6 +2925,7 @@ mod tests {
                     display_name: "A".into(),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 31],
+                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -2283,6 +2937,7 @@ mod tests {
                     display_name: "A".into(),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
+                    prompt_doc: None,
                     allowed_actions: vec!["forge.push".into()],
                 },
             ),
@@ -2294,6 +2949,7 @@ mod tests {
                     display_name: "A".into(),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
+                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -2304,6 +2960,7 @@ mod tests {
                     display_name: "A".into(),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
+                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -2314,6 +2971,7 @@ mod tests {
                     display_name: "A".into(),
                     capability: String::new(),
                     prompt_hash: vec![7u8; 32],
+                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -2325,6 +2983,7 @@ mod tests {
                     display_name: "x".repeat(MAX_AGENT_RECORD_BYTES),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
+                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -2372,8 +3031,16 @@ mod tests {
         assert_eq!(ctx.job_msgs(), vec![JobsMsg::UnregisterWorker {}]);
         commit(&mut m);
 
-        let mut without_jobs =
-            AgentModule::new("agent", "chat", "saga", Some("tasks".into()), None);
+        let mut without_jobs = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            "tagging",
+            "dispatch",
+            Some("tasks".into()),
+            None,
+            None,
+        );
         let mut ctx = CaptureCtx::new().from_origin(user(9));
         let err = exec(
             &mut without_jobs,
@@ -2398,6 +3065,7 @@ mod tests {
                 display_name: Some("Stolen".into()),
                 capability: None,
                 prompt_hash: None,
+                prompt_doc: None,
                 allowed_actions: None,
             },
             AgentMsg::PauseAgent {
@@ -2423,10 +3091,23 @@ mod tests {
                 display_name: None,
                 capability: Some("model-2".into()),
                 prompt_hash: None,
+                prompt_doc: None,
                 allowed_actions: Some(vec![ACTION_TASKS_CREATE.into()]),
             }),
         )
         .unwrap();
+        // a capability change retunes the agent's dispatch recipe atomically.
+        assert_eq!(
+            ctx.dispatch_msgs(),
+            vec![DispatchMsg::UpdateRecipe {
+                recipe_id: recipe_id_for("bot"),
+                description: None,
+                capability: Some("model-2".into()),
+                routing: None,
+                output_contract: None,
+                max_attempts: None,
+            }]
+        );
         exec(
             &mut m,
             &mut ctx,
@@ -2474,7 +3155,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_and_unwatch_stage_the_policy_and_emit_the_chat_hook_atomically() {
+    fn watch_and_unwatch_stage_the_policy_and_emit_the_plane_subscription_atomically() {
         let mut m = module();
         let mut ctx = CaptureCtx::new().from_origin(user(9));
         exec(
@@ -2486,12 +3167,12 @@ mod tests {
             }),
         )
         .unwrap();
-        // the watch and the RegisterHook follow-up are one atomic unit (P2).
+        // the watch and the plane Subscribe follow-up are one atomic unit (P2).
         assert_eq!(
-            ctx.chat_msgs(),
-            vec![ChatMsg::RegisterHook {
-                channel_id: "general".into(),
-                module_id: "agent".into(),
+            ctx.tagging_msgs(),
+            vec![TaggingMsg::Subscribe {
+                source: "chat".into(),
+                container: "general".into(),
             }]
         );
         commit(&mut m);
@@ -2510,7 +3191,7 @@ mod tests {
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
 
-        // unwatch removes the watch and unregisters the hook.
+        // unwatch removes the watch and drops the plane subscription.
         let mut ctx = CaptureCtx::new().from_origin(user(9));
         exec(
             &mut m,
@@ -2521,10 +3202,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ctx.chat_msgs(),
-            vec![ChatMsg::UnregisterHook {
-                channel_id: "general".into(),
-                module_id: "agent".into(),
+            ctx.tagging_msgs(),
+            vec![TaggingMsg::Unsubscribe {
+                source: "chat".into(),
+                container: "general".into(),
             }]
         );
         commit(&mut m);
@@ -2545,37 +3226,34 @@ mod tests {
         assert_eq!(m.root(), before);
     }
 
-    // ---- the hook intake: turn policies ----------------------------------------
+    // ---- the engagement intake: turn policies ----------------------------------
 
     #[test]
-    fn mention_policy_engages_only_this_modules_mentioned_active_agents() {
+    fn mention_policy_engages_only_this_modules_tagged_active_agents() {
         let mut m = watched(
             TurnPolicy::Mention,
             &[("bot1", &[ACTION_CHAT_POST]), ("bot2", &[ACTION_CHAT_POST])],
         );
 
-        // the post mentions bot1, an agent of a FOREIGN module, a bare module,
-        // an unregistered agent, and a user — only bot1 engages.
+        // the post tags bot1, an entity of a FOREIGN module, and an
+        // unregistered agent — only bot1 engages.
         let mut ctx = CaptureCtx::new()
             .at(3)
-            .from_chat()
+            .from_tagging()
             .with_transcript("general", transcript(3));
         exec(
             &mut m,
             &mut ctx,
-            &posted(
+            &engagement(
                 "general",
                 3,
-                AuthorRef::User(vec![1; 32]),
                 vec![
-                    agent_ref("bot1"),
-                    AuthorRef::Agent {
+                    agent_tag("bot1"),
+                    EntityRef {
                         module: "other-module".into(),
-                        agent_id: "bot2".into(),
+                        entity: "bot2".into(),
                     },
-                    AuthorRef::Module("agent".into()),
-                    agent_ref("ghost"),
-                    AuthorRef::User(vec![2; 32]),
+                    agent_tag("ghost"),
                 ],
             ),
         )
@@ -2586,57 +3264,40 @@ mod tests {
         let run = get_run(&m, &run_id).expect("bot1 engaged");
         assert_eq!(
             run.status,
-            RunStatus::AwaitingOracle {
-                saga_id: saga_id_for(&run_id),
+            RunStatus::AwaitingResult {
+                dispatch_id: dispatch_id_for(&run_id),
             }
         );
-        assert_eq!(run.requester, SagaOrigin::Module("chat".into()));
+        assert_eq!(run.requester, SagaOrigin::Module("tagging".into()));
         assert_eq!(run.context_hash, context_hash(&transcript(3)));
         assert_eq!(get_run(&m, &run_id_for("general", 3, "bot2")), None);
 
-        // exactly one saga trigger, carrying the decodable LlmRequest spec.
-        let triggers = ctx.saga_msgs();
-        assert_eq!(triggers.len(), 1);
-        let SagaMsg::Trigger {
-            saga_id,
-            spec,
-            reply_to,
-            reply_payload,
-            deadline,
-            max_attempts,
-            lease_views,
-            capability,
-            pinned_assignee,
-        } = &triggers[0]
+        // exactly one dispatch, under the agent's own recipe, carrying the
+        // fully composed payload — prompt framing, contract, transcript.
+        let dispatches = ctx.dispatch_msgs();
+        assert_eq!(dispatches.len(), 1);
+        let DispatchMsg::Dispatch {
+            dispatch_id,
+            recipe_id,
+            payload,
+        } = &dispatches[0]
         else {
-            panic!("expected a trigger");
+            panic!("expected a dispatch");
         };
-        assert_eq!(*saga_id, saga_id_for(&run_id));
-        assert_eq!(*reply_to, Some("agent".to_string()));
-        assert_eq!(*reply_payload, run_id.clone().into_bytes());
-        assert_eq!(*deadline, Some(3 + RUN_DEADLINE_VIEWS));
-        assert_eq!(*max_attempts, RUN_MAX_ATTEMPTS);
-        assert_eq!(*lease_views, None);
-        assert_eq!(
-            capability.as_deref(),
-            Some("model-1"),
-            "the record's capability rides the trigger for provider assignment"
+        assert_eq!(*dispatch_id, dispatch_id_for(&run_id));
+        assert_eq!(*recipe_id, recipe_id_for("bot1"));
+        let text = String::from_utf8(payload.clone()).unwrap();
+        assert!(
+            text.contains("Return ONLY a JSON object"),
+            "the strict output contract rides the payload"
         );
-        assert_eq!(*pinned_assignee, None, "chat runs never statically bind");
-        let request = agent_interface::decode_llm_request(spec).unwrap();
-        assert_eq!(
-            request,
-            LlmRequest {
-                run_id: run_id.clone(),
-                agent_id: "bot1".into(),
-                capability: "model-1".into(),
-                prompt_hash: vec![7u8; 32],
-                channel_id: "general".into(),
-                anchor_seq: 3,
-                job_id: None,
-                context_hash: context_hash(&transcript(3)),
-                transcript: transcript(3),
-            }
+        assert!(
+            text.contains("msg 3"),
+            "the pinned transcript rides the payload verbatim"
+        );
+        assert!(
+            text.starts_with("You are a Ducktape agent."),
+            "no prompt_doc: the generic instructions lead the payload"
         );
     }
 
@@ -2654,9 +3315,13 @@ mod tests {
         .unwrap();
         commit(&mut m);
 
-        let ctx = hook_post(&mut m, 2, &[]);
+        let ctx = engage_post(&mut m, 2, &[]);
         commit(&mut m);
-        assert_eq!(ctx.saga_msgs().len(), 2, "two active agents, two triggers");
+        assert_eq!(
+            ctx.dispatch_msgs().len(),
+            2,
+            "two active agents, two dispatches"
+        );
         assert!(get_run(&m, &run_id_for("general", 2, "a")).is_some());
         assert_eq!(
             get_run(&m, &run_id_for("general", 2, "b")),
@@ -2674,7 +3339,7 @@ mod tests {
         );
 
         // seq 4 over [a, b, c]: 4 % 3 = 1 -> "b".
-        hook_post(&mut m, 4, &[]);
+        engage_post(&mut m, 4, &[]);
         commit(&mut m);
         assert!(get_run(&m, &run_id_for("general", 4, "b")).is_some());
         assert_eq!(get_run(&m, &run_id_for("general", 4, "a")), None);
@@ -2691,7 +3356,7 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        hook_post(&mut m, 5, &[]);
+        engage_post(&mut m, 5, &[]);
         commit(&mut m);
         assert!(get_run(&m, &run_id_for("general", 5, "c")).is_some());
         assert_eq!(get_run(&m, &run_id_for("general", 5, "b")), None);
@@ -2700,7 +3365,7 @@ mod tests {
     #[test]
     fn assigned_policy_engages_exactly_its_agent_and_respects_pause() {
         let mut m = watched(TurnPolicy::Assigned("b".into()), &[("a", &[]), ("b", &[])]);
-        hook_post(&mut m, 2, &[]);
+        engage_post(&mut m, 2, &[]);
         commit(&mut m);
         assert!(get_run(&m, &run_id_for("general", 2, "b")).is_some());
         assert_eq!(get_run(&m, &run_id_for("general", 2, "a")), None);
@@ -2716,71 +3381,76 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        let ctx = hook_post(&mut m, 3, &[]);
+        let ctx = engage_post(&mut m, 3, &[]);
         commit(&mut m);
-        assert!(ctx.saga_msgs().is_empty());
+        assert!(ctx.dispatch_msgs().is_empty());
         assert_eq!(get_run(&m, &run_id_for("general", 3, "b")), None);
     }
 
     #[test]
-    fn agent_module_and_system_authored_posts_never_create_runs() {
-        // LOOP PREVENTION: an agent reply re-fires the hook; if it engaged
-        // agents, two agents would answer each other forever.
+    fn foreign_source_engagements_and_direct_chat_follow_ups_are_dead_letters() {
+        // the LOOP RULE itself lives in the tagging plane (only user posts
+        // fire) and is tested there; this module's job is to survive the
+        // events it should not act on.
         let mut m = watched(TurnPolicy::All, &[("bot", &[ACTION_CHAT_POST])]);
         let before = m.root();
-        for author in [
-            agent_ref("bot"),
-            AuthorRef::Module("agent".into()),
-            AuthorRef::System,
-        ] {
-            let mut ctx = CaptureCtx::new()
-                .at(2)
-                .from_chat()
-                .with_transcript("general", transcript(2));
-            exec(
-                &mut m,
-                &mut ctx,
-                &posted("general", 2, author.clone(), vec![agent_ref("bot")]),
-            )
-            .unwrap();
-            assert!(
-                ctx.msgs.is_empty(),
-                "a non-user post must not trigger anything ({author:?})"
-            );
-            commit(&mut m);
-            assert_eq!(m.root(), before, "no run was staged ({author:?})");
-        }
-    }
 
-    #[test]
-    fn unwatched_channels_and_failed_pins_are_staged_no_ops_on_the_hook_arm() {
-        let mut m = watched(TurnPolicy::All, &[("bot", &[])]);
-        let before = m.root();
-
-        // an event for a channel we never watched (someone hooked us into
-        // chat directly): no-op, never an error.
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .from_chat()
-            .with_transcript("random", transcript(2));
+        // an engagement whose source is not chat: dropped with a breadcrumb.
+        let mut ctx = CaptureCtx::new().at(2).from_tagging();
         exec(
             &mut m,
             &mut ctx,
-            &posted("random", 2, AuthorRef::User(vec![1; 32]), vec![]),
+            &Msg {
+                target: "agent".into(),
+                payload: tagging_encode_event(&EngagementEvent {
+                    source: "pages".into(),
+                    container: "general".into(),
+                    content_seq: 2,
+                    author: Author::User(vec![1; 32]),
+                    tags: vec![],
+                }),
+            },
         )
         .unwrap();
+        assert!(ctx.msgs.is_empty());
+        assert!(!ctx.events.is_empty(), "the drop leaves a breadcrumb");
+
+        // a direct chat-origin follow-up (no hook is ever registered now):
+        // dead-lettered, never an abort of the posting block.
+        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("chat".into()));
+        exec(
+            &mut m,
+            &mut ctx,
+            &Msg {
+                target: "agent".into(),
+                payload: b"anything at all".to_vec(),
+            },
+        )
+        .unwrap();
+        assert!(ctx.msgs.is_empty());
+        commit(&mut m);
+        assert_eq!(m.root(), before, "nothing was staged");
+    }
+
+    #[test]
+    fn unwatched_channels_and_failed_pins_are_staged_no_ops_on_the_engagement_arm() {
+        let mut m = watched(TurnPolicy::All, &[("bot", &[])]);
+        let before = m.root();
+
+        // an engagement for a channel we do not watch (subscription drift
+        // within a block): no-op, never an error.
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_tagging()
+            .with_transcript("random", transcript(2));
+        exec(&mut m, &mut ctx, &engagement("random", 2, vec![])).unwrap();
         assert!(ctx.msgs.is_empty());
 
         // a failing context pin (the ctx serves NO transcript at all — the
         // chat query errors) must not poison the posting block: Ok, no run.
-        let mut ctx = CaptureCtx::new().at(2).from_chat();
-        exec(
-            &mut m,
-            &mut ctx,
-            &posted("general", 2, AuthorRef::User(vec![1; 32]), vec![]),
-        )
-        .unwrap();
-        assert!(ctx.saga_msgs().is_empty(), "no trigger on a failed pin");
+        let mut ctx = CaptureCtx::new().at(2).from_tagging();
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+        assert!(ctx.dispatch_msgs().is_empty(), "no dispatch on a failed pin");
         assert!(!ctx.events.is_empty(), "the skip leaves a breadcrumb event");
         commit(&mut m);
         assert_eq!(m.root(), before, "nothing was staged");
@@ -2792,9 +3462,9 @@ mod tests {
     fn duplicate_turn_claims_are_deterministic_no_ops() {
         let mut m = watched(TurnPolicy::All, &[("bot", &[])]);
 
-        // the hook claims the turn in the posting block...
-        let ctx = hook_post(&mut m, 2, &[]);
-        assert_eq!(ctx.saga_msgs().len(), 1);
+        // the engagement claims the turn in the posting block...
+        let ctx = engage_post(&mut m, 2, &[]);
+        assert_eq!(ctx.dispatch_msgs().len(), 1);
         let run_id = run_id_for("general", 2, "bot");
         let created = get_run(&m, &run_id).unwrap();
 
@@ -2822,10 +3492,10 @@ mod tests {
             "the first claim's record survives untouched"
         );
 
-        // ...and a COMMITTED duplicate (the same hook event replayed later)
+        // ...and a COMMITTED duplicate (the same engagement replayed later)
         // is equally a no-op.
         let root = m.root();
-        let ctx = hook_post(&mut m, 2, &[]);
+        let ctx = engage_post(&mut m, 2, &[]);
         assert!(ctx.msgs.is_empty());
         commit(&mut m);
         assert_eq!(m.root(), root, "a duplicate claim moves nothing");
@@ -2894,23 +3564,36 @@ mod tests {
     // ---- the no-fail arms ----------------------------------------------------------
 
     #[test]
-    fn malformed_intake_payloads_from_chat_and_saga_are_staged_no_ops() {
+    fn malformed_intake_payloads_are_staged_no_ops() {
         let mut m = watched(TurnPolicy::All, &[("bot", &[])]);
         let before = m.root();
 
-        // garbage from the chat origin: the posting block must survive.
-        let mut ctx = CaptureCtx::new().from_chat();
+        // garbage from the tagging origin: the posting block must survive.
+        let mut ctx = CaptureCtx::new().from_tagging();
         exec(
             &mut m,
             &mut ctx,
             &Msg {
                 target: "agent".into(),
-                payload: b"not a chat event".to_vec(),
+                payload: b"not an engagement".to_vec(),
             },
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
         assert!(!ctx.events.is_empty(), "the drop leaves a breadcrumb");
+
+        // garbage from the dispatch origin: the delivery block must survive.
+        let mut ctx = CaptureCtx::new().from_dispatch();
+        exec(
+            &mut m,
+            &mut ctx,
+            &Msg {
+                target: "agent".into(),
+                payload: b"not a result event".to_vec(),
+            },
+        )
+        .unwrap();
+        assert!(ctx.msgs.is_empty());
 
         // garbage from the saga origin: the terminal block must survive.
         let mut ctx = CaptureCtx::new().from_saga();
@@ -2934,19 +3617,24 @@ mod tests {
         )
         .unwrap();
 
+        // a well-formed result event for an UNKNOWN dispatch: staged no-op.
+        let mut ctx = CaptureCtx::new().from_dispatch();
+        exec(&mut m, &mut ctx, &result_event("ghost-run", Ok(Vec::new()))).unwrap();
+
         commit(&mut m);
         assert_eq!(m.root(), before, "none of the drops staged anything");
     }
 
     #[test]
-    fn a_callback_from_the_wrong_saga_never_transitions_the_run() {
+    fn a_stale_or_mismatched_delivery_never_transitions_the_run() {
         let mut m = watched(TurnPolicy::All, &[("bot", &[ACTION_CHAT_POST])]);
-        hook_post(&mut m, 2, &[]);
+        engage_post(&mut m, 2, &[]);
         commit(&mut m);
         let run_id = run_id_for("general", 2, "bot");
-        let before = m.root();
 
-        // same correlation payload, DIFFERENT saga id: ignored.
+        // a saga callback echoing the run id: chat runs have no saga — the
+        // run is not AwaitingOracle, so the callback is a no-op.
+        let before = m.root();
         let mut ctx = CaptureCtx::new().from_saga();
         exec(
             &mut m,
@@ -2966,52 +3654,40 @@ mod tests {
         assert_eq!(m.root(), before);
         assert!(matches!(
             get_run(&m, &run_id).unwrap().status,
-            RunStatus::AwaitingOracle { .. }
+            RunStatus::AwaitingResult { .. }
         ));
     }
 
     #[test]
-    fn external_submitters_cannot_fake_the_hook_or_callback_intakes() {
+    fn external_submitters_cannot_fake_the_engagement_or_result_intakes() {
         let mut m = watched(TurnPolicy::All, &[("bot", &[ACTION_CHAT_POST])]);
-        let before = m.root();
 
-        // hook-shaped bytes from an EXTERNAL origin route to the AgentMsg
-        // decoder and fail there — no run is ever created.
+        // engagement-shaped bytes from an EXTERNAL origin route to the
+        // AgentMsg decoder and fail there — no run is ever created.
         let mut ctx = CaptureCtx::new()
             .at(2)
             .from_origin(user(1))
             .with_transcript("general", transcript(2));
-        let err = exec(
-            &mut m,
-            &mut ctx,
-            &posted("general", 2, AuthorRef::User(vec![1; 32]), vec![]),
-        )
-        .unwrap_err();
+        let err = exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
         assert_eq!(get_run(&m, &run_id_for("general", 2, "bot")), None);
 
-        // callback-shaped bytes from an EXTERNAL origin: same story.
-        hook_post(&mut m, 2, &[]);
+        // result-shaped bytes from an EXTERNAL origin: same story.
+        engage_post(&mut m, 2, &[]);
         commit(&mut m);
         let run_id = run_id_for("general", 2, "bot");
         let mut ctx = CaptureCtx::new().from_origin(user(1));
-        let err = exec(
-            &mut m,
-            &mut ctx,
-            &callback(&run_id, SagaOutcome::Done(Vec::new())),
-        )
-        .unwrap_err();
+        let err = exec(&mut m, &mut ctx, &result_event(&run_id, Ok(Vec::new()))).unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
         assert!(
             matches!(
                 get_run(&m, &run_id).unwrap().status,
-                RunStatus::AwaitingOracle { .. }
+                RunStatus::AwaitingResult { .. }
             ),
-            "the forged callback transitioned nothing"
+            "the forged delivery transitioned nothing"
         );
-        let _ = before;
     }
 
     // ---- output validation ----------------------------------------------------------
@@ -3020,7 +3696,7 @@ mod tests {
     /// `actions`) at general/2, plus the run id.
     fn awaiting_run(actions: &[&str]) -> (AgentModule, String) {
         let mut m = watched(TurnPolicy::All, &[("bot", actions)]);
-        hook_post(&mut m, 2, &[]);
+        engage_post(&mut m, 2, &[]);
         commit(&mut m);
         (m, run_id_for("general", 2, "bot"))
     }
@@ -3041,14 +3717,14 @@ mod tests {
         ]);
         let mut ctx = CaptureCtx::new()
             .at(8)
-            .from_saga()
+            .from_dispatch()
             .with_transcript("general", transcript(2));
         exec(
             &mut m,
             &mut ctx,
-            &callback(
+            &result_event(
                 &run_id,
-                SagaOutcome::Done(output(
+                Ok(output(
                     &["on it"],
                     vec![
                         AgentAction::CreateTask {
@@ -3098,7 +3774,7 @@ mod tests {
     #[test]
     fn a_threaded_anchor_threads_the_reply() {
         let mut m = watched(TurnPolicy::All, &[("bot", &[ACTION_CHAT_POST])]);
-        // seq 3 is a reply to root 1; the hook pin records thread_root = 1.
+        // seq 3 is a reply to root 1; the pin records thread_root = 1.
         let mut transcript = transcript(2);
         transcript.push(message_in(
             "general",
@@ -3109,26 +3785,21 @@ mod tests {
         ));
         let mut ctx = CaptureCtx::new()
             .at(3)
-            .from_chat()
+            .from_tagging()
             .with_transcript("general", transcript.clone());
-        exec(
-            &mut m,
-            &mut ctx,
-            &posted("general", 3, AuthorRef::User(vec![1; 32]), vec![]),
-        )
-        .unwrap();
+        exec(&mut m, &mut ctx, &engagement("general", 3, vec![])).unwrap();
         commit(&mut m);
         let run_id = run_id_for("general", 3, "bot");
         assert_eq!(get_run(&m, &run_id).unwrap().thread_root, Some(1));
 
         let mut ctx = CaptureCtx::new()
             .at(9)
-            .from_saga()
+            .from_dispatch()
             .with_transcript("general", transcript);
         exec(
             &mut m,
             &mut ctx,
-            &callback(&run_id, SagaOutcome::Done(output(&["answered"], vec![]))),
+            &result_event(&run_id, Ok(output(&["answered"], vec![]))),
         )
         .unwrap();
         commit(&mut m);
@@ -3142,20 +3813,14 @@ mod tests {
 
     #[test]
     fn invalid_outputs_fail_the_run_and_emit_no_follow_ups() {
-        let nine_creates: Vec<AgentAction> = (0..=MAX_ACTIONS_PER_RUN)
-            .map(|i| AgentAction::CreateTask {
-                task_id: format!("t{i}"),
-                title: "x".into(),
-            })
-            .collect();
+        // normalization already absorbed shape problems (prose, fences,
+        // oversize); what remains failable is POLICY: task validity and
+        // grants. every case still emits NOTHING and fails only the run.
         let cases: Vec<(&str, Vec<u8>)> = vec![
-            ("undecodable", b"not an output".to_vec()),
-            ("neither reply blocks nor actions", output(&[], vec![])),
-            ("exceed the cap", output(&[], nine_creates)),
             (
                 "task already exists: t0",
                 output(
-                    &[],
+                    &["ok"],
                     vec![AgentAction::CreateTask {
                         task_id: "t0".into(),
                         title: "dup of a committed task".into(),
@@ -3165,7 +3830,7 @@ mod tests {
             (
                 "task already exists: fresh",
                 output(
-                    &[],
+                    &["ok"],
                     vec![
                         AgentAction::CreateTask {
                             task_id: "fresh".into(),
@@ -3181,7 +3846,7 @@ mod tests {
             (
                 "unknown task: ghost",
                 output(
-                    &[],
+                    &["ok"],
                     vec![AgentAction::UpdateTaskStatus {
                         task_id: "ghost".into(),
                         status: "done".into(),
@@ -3191,7 +3856,7 @@ mod tests {
             (
                 "unknown task status",
                 output(
-                    &[],
+                    &["ok"],
                     vec![AgentAction::UpdateTaskStatus {
                         task_id: "t0".into(),
                         status: "shipped".into(),
@@ -3201,16 +3866,12 @@ mod tests {
             (
                 "non-empty task_id",
                 output(
-                    &[],
+                    &["ok"],
                     vec![AgentAction::CreateTask {
                         task_id: String::new(),
                         title: "x".into(),
                     }],
                 ),
-            ),
-            (
-                "reply blocks are",
-                output(&[&"x".repeat(MAX_REPLY_BLOCKS_BYTES + 1)], vec![]),
             ),
         ];
         for (fragment, bytes) in cases {
@@ -3221,15 +3882,10 @@ mod tests {
             ]);
             let mut ctx = CaptureCtx::new()
                 .at(8)
-                .from_saga()
+                .from_dispatch()
                 .with_transcript("general", transcript(2))
                 .with_task("t0");
-            exec(
-                &mut m,
-                &mut ctx,
-                &callback(&run_id, SagaOutcome::Done(bytes)),
-            )
-            .unwrap();
+            exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes))).unwrap();
             assert!(
                 ctx.msgs.is_empty(),
                 "an invalid output must emit NOTHING ({fragment})"
@@ -3246,18 +3902,42 @@ mod tests {
     }
 
     #[test]
+    fn raw_model_text_normalizes_into_a_postable_reply() {
+        // the dispatch oracle returns RAW text; the intake's deterministic
+        // normalization turns prose, empty JSON, and oversized answers into
+        // valid replies instead of failed runs.
+        let cases: Vec<Vec<u8>> = vec![
+            b"just prose, no JSON anywhere".to_vec(),
+            output(&[], vec![]),
+            "x".repeat(MAX_REPLY_BLOCKS_BYTES + 1).into_bytes(),
+        ];
+        for bytes in cases {
+            let (mut m, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+            let mut ctx = CaptureCtx::new()
+                .at(8)
+                .from_dispatch()
+                .with_transcript("general", transcript(2));
+            exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes))).unwrap();
+            commit(&mut m);
+            assert_eq!(get_run(&m, &run_id).unwrap().status, RunStatus::Done);
+            let posts = ctx.chat_msgs();
+            assert_eq!(posts.len(), 1, "exactly one normalized reply posts");
+        }
+    }
+
+    #[test]
     fn outputs_beyond_the_agents_grants_fail_the_run() {
         // an agent granted ONLY chat.post must not create tasks...
         let (mut m, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
         let mut ctx = CaptureCtx::new()
-            .from_saga()
+            .from_dispatch()
             .with_transcript("general", transcript(2));
         exec(
             &mut m,
             &mut ctx,
-            &callback(
+            &result_event(
                 &run_id,
-                SagaOutcome::Done(output(
+                Ok(output(
                     &["look what i did"],
                     vec![AgentAction::CreateTask {
                         task_id: "t1".into(),
@@ -3277,12 +3957,12 @@ mod tests {
         // ...and an agent granted only tasks.create must not post replies.
         let (mut m, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
         let mut ctx = CaptureCtx::new()
-            .from_saga()
+            .from_dispatch()
             .with_transcript("general", transcript(2));
         exec(
             &mut m,
             &mut ctx,
-            &callback(&run_id, SagaOutcome::Done(output(&["hello"], vec![]))),
+            &result_event(&run_id, Ok(output(&["hello"], vec![]))),
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
@@ -3295,12 +3975,21 @@ mod tests {
 
     #[test]
     fn task_actions_without_a_configured_tasks_module_fail_the_run() {
-        let mut m = AgentModule::new("agent", "chat", "saga", None, None);
+        let mut m = AgentModule::new(
+            "agent",
+            "chat",
+            "saga",
+            "tagging",
+            "dispatch",
+            None,
+            None,
+            None,
+        );
         let mut ctx = CaptureCtx::new().from_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
-            &admin(&register("bot", &[ACTION_TASKS_CREATE])),
+            &admin(&register("bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])),
         )
         .unwrap();
         exec(
@@ -3313,18 +4002,20 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        hook_post(&mut m, 2, &[]);
+        engage_post(&mut m, 2, &[]);
         commit(&mut m);
         let run_id = run_id_for("general", 2, "bot");
 
-        let mut ctx = CaptureCtx::new().from_saga();
+        let mut ctx = CaptureCtx::new()
+            .from_dispatch()
+            .with_transcript("general", transcript(2));
         exec(
             &mut m,
             &mut ctx,
-            &callback(
+            &result_event(
                 &run_id,
-                SagaOutcome::Done(output(
-                    &[],
+                Ok(output(
+                    &["ok"],
                     vec![AgentAction::CreateTask {
                         task_id: "t1".into(),
                         title: "x".into(),
@@ -3348,12 +4039,12 @@ mod tests {
         let mut transcript = transcript(2);
         transcript[1].head.message_id = reply_message_id(&run_id);
         let mut ctx = CaptureCtx::new()
-            .from_saga()
+            .from_dispatch()
             .with_transcript("general", transcript);
         exec(
             &mut m,
             &mut ctx,
-            &callback(&run_id, SagaOutcome::Done(output(&["hi"], vec![]))),
+            &result_event(&run_id, Ok(output(&["hi"], vec![]))),
         )
         .unwrap();
         assert!(ctx.msgs.is_empty(), "the squatted id emits NOTHING");
@@ -3374,24 +4065,19 @@ mod tests {
         let full = vec![root, anchor];
         let mut ctx = CaptureCtx::new()
             .at(2)
-            .from_chat()
+            .from_tagging()
             .with_transcript("general", full.clone());
-        exec(
-            &mut m,
-            &mut ctx,
-            &posted("general", 2, AuthorRef::User(vec![1; 32]), vec![]),
-        )
-        .unwrap();
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
         commit(&mut m);
         let run_id = run_id_for("general", 2, "bot");
 
         let mut ctx = CaptureCtx::new()
-            .from_saga()
+            .from_dispatch()
             .with_transcript("general", full);
         exec(
             &mut m,
             &mut ctx,
-            &callback(&run_id, SagaOutcome::Done(output(&["hi"], vec![]))),
+            &result_event(&run_id, Ok(output(&["hi"], vec![]))),
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
@@ -3403,38 +4089,33 @@ mod tests {
     }
 
     #[test]
-    fn saga_failure_timeout_and_cancel_transition_the_run() {
+    fn failed_dispatch_outcomes_transition_the_run() {
         let mut m = watched(TurnPolicy::All, &[("bot", &[ACTION_CHAT_POST])]);
-        for seq in [2, 3, 4] {
-            hook_post(&mut m, seq, &[]);
+        for seq in [2, 3] {
+            engage_post(&mut m, seq, &[]);
         }
         commit(&mut m);
 
-        let cases = [
-            (
-                2u64,
-                SagaOutcome::Failed("worker exploded".into()),
-                RunStatus::Failed {
-                    reason: "worker exploded".into(),
-                },
-            ),
-            (
-                3,
-                SagaOutcome::TimedOut,
-                RunStatus::Failed {
-                    reason: "timed out".into(),
-                },
-            ),
-            (4, SagaOutcome::Cancelled, RunStatus::Cancelled),
-        ];
-        for (seq, outcome, expected) in cases {
+        // the dispatch plane already folded saga failures, timeouts, and
+        // contract violations into the Err lane — one shape lands here.
+        for (seq, reason) in [(2u64, "worker exploded"), (3, "timed out")] {
             let run_id = run_id_for("general", seq, "bot");
-            let mut ctx = CaptureCtx::new().at(20).from_saga();
-            exec(&mut m, &mut ctx, &callback(&run_id, outcome)).unwrap();
+            let mut ctx = CaptureCtx::new().at(20).from_dispatch();
+            exec(
+                &mut m,
+                &mut ctx,
+                &result_event(&run_id, Err(reason.into())),
+            )
+            .unwrap();
             assert!(ctx.msgs.is_empty(), "terminal failures emit nothing");
             commit(&mut m);
             let run = get_run(&m, &run_id).unwrap();
-            assert_eq!(run.status, expected);
+            assert_eq!(
+                run.status,
+                RunStatus::Failed {
+                    reason: reason.into(),
+                }
+            );
             assert_eq!(run.updated_at, 20);
         }
     }
@@ -3508,7 +4189,7 @@ mod tests {
             .from_origin(user(1))
             .with_transcript("general", transcript(3));
         exec(&mut m, &mut ctx, &request("bot", 3)).unwrap();
-        assert_eq!(ctx.saga_msgs().len(), 1);
+        assert_eq!(ctx.dispatch_msgs().len(), 1);
         commit(&mut m);
         let run = get_run(&m, &run_id_for("general", 3, "bot")).unwrap();
         assert_eq!(run.requester, SagaOrigin::External(vec![1; 32]));
@@ -3555,19 +4236,19 @@ mod tests {
         );
         abort(&mut m);
 
-        // the REQUESTER cancels: saga cancel emitted, run Cancelled.
+        // the REQUESTER cancels: the dispatch plane is told, run Cancelled.
         let mut ctx = CaptureCtx::new().at(7).from_origin(user(1));
         exec(&mut m, &mut ctx, &cancel).unwrap();
         assert_eq!(
-            ctx.saga_msgs(),
-            vec![SagaMsg::Cancel {
-                saga_id: saga_id_for(&run_id),
+            ctx.dispatch_msgs(),
+            vec![DispatchMsg::CancelDispatch {
+                dispatch_id: dispatch_id_for(&run_id),
             }]
         );
         commit(&mut m);
         assert_eq!(get_run(&m, &run_id).unwrap().status, RunStatus::Cancelled);
 
-        // cancelling a TERMINAL run is an idempotent no-op, no saga msg.
+        // cancelling a TERMINAL run is an idempotent no-op, no dispatch msg.
         let root = m.root();
         let mut ctx = CaptureCtx::new().from_origin(user(1));
         exec(&mut m, &mut ctx, &cancel).unwrap();
@@ -3575,21 +4256,38 @@ mod tests {
         commit(&mut m);
         assert_eq!(m.root(), root);
 
-        // the OWNER may cancel a hook-created run (requester = chat module).
-        hook_post(&mut m, 2, &["bot"]);
+        // the plane's late Err("cancelled") delivery no-ops against the (by
+        // then terminal) run.
+        let mut ctx = CaptureCtx::new().from_dispatch();
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Err("cancelled".into())),
+        )
+        .unwrap();
+        assert!(ctx.msgs.is_empty());
         commit(&mut m);
-        let hook_run = run_id_for("general", 2, "bot");
+        assert_eq!(get_run(&m, &run_id).unwrap().status, RunStatus::Cancelled);
+
+        // the OWNER may cancel an engagement-created run (requester = the
+        // tagging plane).
+        engage_post(&mut m, 2, &["bot"]);
+        commit(&mut m);
+        let engaged_run = run_id_for("general", 2, "bot");
         let mut ctx = CaptureCtx::new().from_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
             &admin(&AgentMsg::CancelRun {
-                run_id: hook_run.clone(),
+                run_id: engaged_run.clone(),
             }),
         )
         .unwrap();
         commit(&mut m);
-        assert_eq!(get_run(&m, &hook_run).unwrap().status, RunStatus::Cancelled);
+        assert_eq!(
+            get_run(&m, &engaged_run).unwrap().status,
+            RunStatus::Cancelled
+        );
     }
 
     // ---- context pinning ------------------------------------------------------------
@@ -3669,33 +4367,28 @@ mod tests {
             .unwrap();
             commit(&mut m);
             roots.push(m.root());
-            // block 2: a hook post engages bot.
+            // block 2: an engagement engages bot.
             let mut ctx = CaptureCtx::new()
                 .at(2)
-                .from_chat()
+                .from_tagging()
                 .with_transcript("general", transcript(2));
             exec(
                 &mut m,
                 &mut ctx,
-                &posted(
-                    "general",
-                    2,
-                    AuthorRef::User(vec![1; 32]),
-                    vec![agent_ref("bot")],
-                ),
+                &engagement("general", 2, vec![agent_tag("bot")]),
             )
             .unwrap();
             commit(&mut m);
             roots.push(m.root());
-            // block 3: the oracle result lands Done.
+            // block 3: the dispatch result lands Done.
             let mut ctx = CaptureCtx::new()
                 .at(3)
-                .from_saga()
+                .from_dispatch()
                 .with_transcript("general", transcript(2));
             exec(
                 &mut m,
                 &mut ctx,
-                &callback(&run_id, SagaOutcome::Done(output(&["done"], vec![]))),
+                &result_event(&run_id, Ok(output(&["done"], vec![]))),
             )
             .unwrap();
             commit(&mut m);
@@ -3736,8 +4429,8 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        hook_post(&mut m, 2, &[]);
-        let mut ctx = CaptureCtx::new().at(3).from_chat().with_transcript(
+        engage_post(&mut m, 2, &[]);
+        let mut ctx = CaptureCtx::new().at(3).from_tagging().with_transcript(
             "dev",
             vec![message_in(
                 "dev",
@@ -3747,12 +4440,7 @@ mod tests {
                 None,
             )],
         );
-        exec(
-            &mut m,
-            &mut ctx,
-            &posted("dev", 1, AuthorRef::User(vec![1; 32]), vec![]),
-        )
-        .unwrap();
+        exec(&mut m, &mut ctx, &engagement("dev", 1, vec![])).unwrap();
         commit(&mut m);
 
         let runs = |channel: Option<&str>, limit: u64| {
@@ -3805,12 +4493,100 @@ mod tests {
     #[test]
     fn state_sync_handle_exposes_the_snapshot_bytes() {
         let mut m = watched(TurnPolicy::All, &[("bot", &[ACTION_CHAT_POST])]);
-        hook_post(&mut m, 2, &[]);
+        engage_post(&mut m, 2, &[]);
         commit(&mut m);
         assert_eq!(
             m.state_sync_handle().unwrap(),
             StateSyncHandle::SnapshotBytes(m.snapshot()),
             "the handle IS the canonical snapshot"
         );
+    }
+
+    // ---- consensus-resident prompts ---------------------------------------------
+
+    #[test]
+    fn a_prompt_doc_rides_the_payload_only_when_it_hashes_to_the_pin() {
+        let prompt = "You are DUCK-1, a terse reviewer.";
+        let register_with_doc = |prompt_hash: Vec<u8>| {
+            let mut m = module();
+            let mut ctx = CaptureCtx::new().from_origin(user(9));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&AgentMsg::RegisterAgent {
+                    agent_id: "bot".into(),
+                    display_name: "BOT".into(),
+                    capability: "model-1".into(),
+                    prompt_hash,
+                    prompt_doc: Some("prompts/bot".into()),
+                    allowed_actions: vec![ACTION_CHAT_POST.into()],
+                }),
+            )
+            .unwrap();
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&AgentMsg::WatchChannel {
+                    channel_id: "general".into(),
+                    policy: TurnPolicy::All,
+                }),
+            )
+            .unwrap();
+            commit(&mut m);
+            m
+        };
+
+        // the doc's canonical rendering hashes to the pin: it LEADS the
+        // composed payload.
+        let good_hash = Sha256::digest(prompt.as_bytes()).to_vec();
+        let mut m = register_with_doc(good_hash);
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_tagging()
+            .with_transcript("general", transcript(2))
+            .with_doc("prompts/bot", prompt);
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+        let dispatches = ctx.dispatch_msgs();
+        assert_eq!(dispatches.len(), 1);
+        let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
+            panic!("expected a dispatch");
+        };
+        assert!(String::from_utf8(payload.clone()).unwrap().starts_with(prompt));
+
+        // a drifted document (hash mismatch) skips the run — a breadcrumb,
+        // never a block abort; and an explicit request errors cleanly.
+        let mut m = register_with_doc(vec![7u8; PROMPT_HASH_LEN]);
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_tagging()
+            .with_transcript("general", transcript(2))
+            .with_doc("prompts/bot", prompt);
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+        assert!(ctx.msgs.is_empty(), "a drifted prompt doc dispatches nothing");
+        assert!(!ctx.events.is_empty());
+        let mut ctx = CaptureCtx::new()
+            .from_origin(user(1))
+            .with_transcript("general", transcript(2))
+            .with_doc("prompts/bot", prompt);
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::RequestRun {
+                agent_id: "bot".into(),
+                channel_id: "general".into(),
+                anchor_seq: 2,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(reason) if reason.contains("prompt")));
+
+        // a MISSING document skips the same way.
+        let mut m = register_with_doc(Sha256::digest(prompt.as_bytes()).to_vec());
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_tagging()
+            .with_transcript("general", transcript(2));
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+        assert!(ctx.msgs.is_empty());
     }
 }

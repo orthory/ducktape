@@ -28,6 +28,9 @@ dependencies = [
  "chat",
  "chat-interface",
  "commonware-runtime",
+ "dispatch",
+ "dispatch-interface",
+ "document-interface",
  "futures",
  "host",
  "jobs",
@@ -36,8 +39,11 @@ dependencies = [
  "saga",
  "saga-interface",
  "sdk",
+ "serde",
  "serde_json",
  "sha2",
+ "tagging",
+ "tagging-interface",
  "tasks",
  "tasks-interface",
 ]
@@ -902,6 +908,7 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
+ "tagging-interface",
 ]
 
 [[package]]
@@ -1927,6 +1934,8 @@ dependencies = [
  "commonware-storage",
  "directory",
  "directory-interface",
+ "dispatch",
+ "dispatch-interface",
  "document",
  "document-interface",
  "files",
@@ -1951,6 +1960,7 @@ dependencies = [
  "serde_json",
  "state",
  "statesync",
+ "tagging",
  "tasks",
  "valset",
  "valset-interface",
@@ -4223,6 +4233,7 @@ dependencies = [
  "directory",
  "directory-interface",
  "dispatch",
+ "dispatch-interface",
  "dispatch-oracle",
  "document",
  "files",
@@ -4252,6 +4263,7 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
+ "tagging",
  "tasks",
  "tempfile",
  "tokio",
@@ -4282,6 +4294,7 @@ dependencies = [
  "chat-interface",
  "commonware-runtime",
  "dispatch",
+ "dispatch-interface",
  "dispatch-oracle",
  "document",
  "document-index",
@@ -4307,6 +4320,7 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "tagging",
  "tasks",
  "tasks-index",
  "tempfile",
@@ -5420,6 +5434,7 @@ name = "reactor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dispatch-interface",
  "futures",
  "host",
  "saga",
@@ -6091,6 +6106,7 @@ dependencies = [
  "chat-interface",
  "commonware-runtime",
  "dispatch",
+ "dispatch-interface",
  "document",
  "document-index",
  "files",
@@ -6111,6 +6127,7 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "tagging",
  "tasks",
  "tasks-index",
  "tempfile",
@@ -6395,6 +6412,25 @@ dependencies = [
  "pkg-config",
  "toml 0.8.23",
  "version-compare",
+]
+
+[[package]]
+name = "tagging"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "sdk",
+ "sha2",
+ "tagging-interface",
+]
+
+[[package]]
+name = "tagging-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

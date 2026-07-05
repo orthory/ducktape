@@ -62,6 +62,7 @@ use axum::{Json, Router};
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
+use tagging::TaggingModule;
 use document::Document;
 use files::Files;
 use forge::Forge;
@@ -89,10 +90,11 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 14] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
+    "tagging",
     "tasks",
     "inbox",
     "automations",
@@ -372,9 +374,12 @@ fn run_sim(
     executor.start(|context| async move {
         // genesis: noded's exact module set (keep in sync with MODULE_IDS) so
         // app queries and status roots behave like a real daemon's.
-        let chat = Chat::init(context.child("chat"), "chat").await;
+        let chat = Chat::init(context.child("chat"), "chat")
+            .await
+            .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         let dispatch = DispatchModule::new("dispatch", "saga");
+        let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
@@ -383,8 +388,11 @@ fn run_sim(
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         );
         let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
@@ -396,6 +404,7 @@ fn run_sim(
             Box::new(chat),
             Box::new(saga),
             Box::new(dispatch),
+            Box::new(tagging),
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
@@ -557,10 +566,27 @@ impl Sim {
     }
 
     /// noded's follow-up budget, for auto mode only: manual steps are already
-    /// bounded by the test issuing them one at a time.
+    /// bounded by the test issuing them one at a time. (in HOLD mode a
+    /// committed dispatch mailbox flushes on the next explicit step's block —
+    /// that is the deterministic-sim semantic, deliberately not auto-nudged.)
     async fn drain_oracle_budgeted(&mut self) -> Result<(), String> {
         let mut rounds = 1u32;
-        while let Some(follow) = self.oracle_queue.pop_front() {
+        loop {
+            let Some(follow) = self.oracle_queue.pop_front() else {
+                // the never-pop-stack tail: results committed into the
+                // dispatch mailbox deliver in a LATER block — auto mode
+                // settles fully, so nudge one flush block per pending batch.
+                if !self.host.has_pending_deliveries().await {
+                    break;
+                }
+                self.oracle_queue.push_back(Msg {
+                    target: dispatch_interface::DEFAULT_DISPATCH_TARGET.into(),
+                    payload: dispatch_interface::encode_msg(
+                        &dispatch_interface::DispatchMsg::Nudge {},
+                    ),
+                });
+                continue;
+            };
             rounds += 1;
             if rounds > MAX_WORKER_ROUNDS {
                 return Err("worker-round budget exceeded".into());
@@ -800,6 +826,19 @@ impl reactor::Worker for EchoWorker {
             Ok(request) => request,
             Err(_) => return Ok(reactor::WorkOutcome::NotMine),
         };
+        // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
+        // module judged a Text contract; the agent module normalizes).
+        if let Ok(work) = dispatch_interface::decode_work_spec(&request.spec) {
+            return Ok(reactor::WorkOutcome::Handled(Some(Msg {
+                target: "saga".into(),
+                payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
+                    saga_id: request.saga_id,
+                    attempt: request.attempt,
+                    outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id)
+                        .into_bytes()),
+                }),
+            })));
+        }
         let llm = match agent_interface::decode_llm_request(&request.spec) {
             Ok(llm) => llm,
             Err(_) => return Ok(reactor::WorkOutcome::NotMine),
