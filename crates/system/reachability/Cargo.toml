@@ -18,6 +18,7 @@ wireguard-upgrade.workspace = true
 x25519-dalek.workspace = true
 
 [dev-dependencies]
+defguard_wireguard_rs.workspace = true
 nat-traversal = { workspace = true, features = ["simnat"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "rt-multi-thread"] }

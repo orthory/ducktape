@@ -8,18 +8,34 @@
 //! app-surface thread), talking to the commonware runner over the two mpsc
 //! channels. The future is not required to be `Send` — nothing here may
 //! assume `tokio::spawn` onto a shared runtime.
+//!
+//! Phase-A scope, deliberately: the record/advert set LOCKS once the epoch's
+//! mesh version is computed — a mid-epoch re-advertisement (NAT rebind, key
+//! rotation) retunnels at the NEXT cutover, not live. And a member that
+//! never shows up stalls its epoch's bring-up exactly like
+//! `MeshView::verify`'s all-members rule says it must; the previous epoch's
+//! tunnels stay up meanwhile.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use commonware_cryptography::ed25519;
-use nat_traversal::NodeKey;
+use commonware_cryptography::{Signer as _, ed25519};
+use nat_traversal::{NatClient, NodeKey};
 use tokio::sync::mpsc;
-use wireguard_upgrade::{Endpoint, MeshVersion, PortPolicy, UpgradeError, ValidatorIdentity};
+use wireguard_effect::{WireGuardEffect, apply_tunnel_plans};
+use wireguard_upgrade::{
+    ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, Endpoint, MeshVersion, MeshView,
+    OverlayPolicy, Perspective, PortPolicy, ReplayCache, TunnelInstallPlan, TunnelUpgradeAck,
+    TunnelUpgradeAckFields, TunnelUpgradeRequest, TunnelUpgradeRequestFields,
+    TunnelUpgradeResponse, TunnelUpgradeResponseFields, UpgradeError, ValidatorIdentity,
+    compute_mesh_version,
+};
 
-use crate::keys::KeyError;
-use crate::msg::MsgError;
+use crate::binding;
+use crate::keys::{KeyError, WireGuardKeypair};
+use crate::msg::{MsgError, ReachabilityMsg};
 
 /// Views an advertisement stays valid for past the cutover view that minted
 /// it. Generous: a re-advertisement (NAT rebind, key rotation) supersedes by
@@ -81,7 +97,7 @@ pub struct MeshEpochEvent {
 pub enum ReachabilityCommand {
     /// Boot or epoch cutover: (re)build the mesh for this member set. A
     /// retarget SUPERSEDES any epoch still assembling — tear down in-flight
-    /// state, remove the previous interface, start over.
+    /// state and start over.
     Retarget(MeshEpochEvent),
     /// A reachability-channel message arrived from a mesh peer.
     Deliver {
@@ -112,12 +128,15 @@ pub enum ReachabilityEvent {
         peers: usize,
     },
     /// A peer could not be brought up (handshake refused, resolution
-    /// failed, effect rejected). The mesh keeps running without it; the
-    /// node surfaces the warning.
+    /// failed) or sent traffic it had no business sending. The mesh keeps
+    /// going without it; the node surfaces the warning.
     PeerFailed {
         peer: ed25519::PublicKey,
         reason: String,
     },
+    /// The epoch as a whole failed (mesh verification, effect rejection).
+    /// Previous tunnels stay as they were; the next cutover retries.
+    EpochFailed { epoch: u64, reason: String },
 }
 
 /// How a peer's WireGuard endpoint was resolved.
@@ -161,33 +180,85 @@ impl EndpointResolver for StaticResolver {
     }
 }
 
+/// How long each coordinator interaction (reflexive discovery, lookup,
+/// relay grant) may take before the resolver moves on.
+const COORD_STEP_TIMEOUT: Duration = Duration::from_secs(3);
+/// One punch exchange attempt; retried [`PUNCH_TRIES`] times before the
+/// relay fallback.
+const PUNCH_STEP_TIMEOUT: Duration = Duration::from_secs(1);
+const PUNCH_TRIES: usize = 3;
+
 /// The production resolver: drives `nat_traversal::NatClient` against the
-/// configured coordinators — STUN reflexive discovery + `register` at boot,
-/// then per peer `lookup`/punch-sync/`send_punch_to`/`recv_punch_from`, and
-/// `request_relay` after bounded punch failure. With NO coordinators
-/// configured every resolution is `Advertised`.
+/// configured coordinators — reflexive discovery + `register` at bind, then
+/// per peer `lookup` -> simultaneous-open punch -> `request_relay` fallback.
+/// With NO coordinators configured every resolution is `Advertised`.
 pub struct NatResolver {
-    // implementer note: holds the bound NatClient (bind_multi over
-    // ReachabilityConfig.coordinators), the local NodeKey, and punch retry
-    // bounds. Constructed by `NatResolver::bind`.
-    _private: (),
+    client: Option<NatClient>,
+    reflexive: Option<SocketAddr>,
 }
 
 impl NatResolver {
-    /// Bind the nat client's UDP socket and register with the coordinators.
-    /// `key` is this node's identity bytes (`binding::node_key`).
-    pub async fn bind(_key: NodeKey, _coordinators: Vec<SocketAddr>) -> std::io::Result<Self> {
-        todo!("phase A implementation: wrap NatClient::bind_multi + register")
+    /// Bind the nat client's UDP socket, discover this node's reflexive
+    /// (failing over across the coordinator hints), and register. `key` is
+    /// this node's identity bytes (`binding::node_key`). An empty
+    /// coordinator set yields the pass-through resolver.
+    pub async fn bind(key: NodeKey, coordinators: Vec<SocketAddr>) -> std::io::Result<Self> {
+        if coordinators.is_empty() {
+            return Ok(Self {
+                client: None,
+                reflexive: None,
+            });
+        }
+        let mut client = NatClient::bind_multi(key, coordinators).await?;
+        let (_idx, reflexive) = client.discover_reflexive_failover(COORD_STEP_TIMEOUT).await?;
+        client.register().await?;
+        Ok(Self {
+            client: Some(client),
+            reflexive: Some(reflexive),
+        })
+    }
+
+    /// The coordinator-observed reflexive address, when one was discovered —
+    /// what a NATed node should advertise as its WireGuard endpoint.
+    pub fn reflexive(&self) -> Option<SocketAddr> {
+        self.reflexive
     }
 }
 
 impl EndpointResolver for NatResolver {
     async fn resolve(
         &mut self,
-        _peer: NodeKey,
+        peer: NodeKey,
         _advertised: SocketAddr,
     ) -> Result<Resolution, String> {
-        todo!("phase A implementation: lookup -> punch -> relay fallback")
+        let Some(client) = &self.client else {
+            return Ok(Resolution::Advertised);
+        };
+        let peer_reflexive = tokio::time::timeout(COORD_STEP_TIMEOUT, client.lookup(peer))
+            .await
+            .map_err(|_| "coordinator lookup timed out".to_string())?
+            .map_err(|e| format!("coordinator lookup: {e}"))?;
+        // simultaneous open: both sides resolve around the same time (the
+        // initiator's lookup fans a PunchSync to the passive side, and the
+        // passive side runs its own lookup anyway), so a few send/recv
+        // rounds absorb the timing skew.
+        for _ in 0..PUNCH_TRIES {
+            if let Err(e) = client.send_punch_to(peer_reflexive).await {
+                return Err(format!("punch send: {e}"));
+            }
+            match tokio::time::timeout(PUNCH_STEP_TIMEOUT, client.recv_punch_from(peer_reflexive))
+                .await
+            {
+                Ok(Ok(_)) => return Ok(Resolution::Punched(peer_reflexive)),
+                Ok(Err(e)) => return Err(format!("punch recv: {e}")),
+                Err(_) => continue,
+            }
+        }
+        let (_session, relay) = tokio::time::timeout(COORD_STEP_TIMEOUT, client.request_relay(peer))
+            .await
+            .map_err(|_| "relay request timed out".to_string())?
+            .map_err(|e| format!("relay request: {e}"))?;
+        Ok(Resolution::Relayed(relay))
     }
 }
 
@@ -199,7 +270,7 @@ pub enum ReachabilityError {
     Upgrade(UpgradeError),
     #[error("message codec: {0}")]
     Msg(#[from] MsgError),
-    #[error("the node dropped the command channel")]
+    #[error("the node dropped a reachability channel")]
     ChannelClosed,
     #[error("wireguard effect: {0}")]
     Effect(String),
@@ -211,69 +282,684 @@ impl From<UpgradeError> for ReachabilityError {
     }
 }
 
-/// Drive the reachability plane until `Shutdown` (clean exit) or the command
-/// channel closes (error). One call outlives every epoch; `Retarget` events
-/// move it between epochs.
-///
-/// # The per-epoch state machine (the implementation contract)
-///
-/// On `Retarget { epoch, members, current_view }`:
+/// Which half of a pending handshake this node is waiting on.
+enum PeerHandshake {
+    /// We initiated and sent the request; the peer's response is due.
+    AwaitingResponse { request: TunnelUpgradeRequest },
+    /// We responded to the peer's request; its ack is due.
+    AwaitingAck {
+        request: TunnelUpgradeRequest,
+        response: TunnelUpgradeResponse,
+    },
+}
+
+/// Everything one epoch accumulates on the way to its `apply` call.
+struct EpochState {
+    epoch: u64,
+    set: ActiveValidatorSet,
+    peers: Vec<ValidatorIdentity>,
+    pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+    /// One strictly-monotonic counter for EVERYTHING this identity signs in
+    /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
+    /// advert duplicate rule wants strictly-increasing nonces too.
+    nonce: u64,
+    records: BTreeMap<ValidatorIdentity, EndpointRecord>,
+    adverts: BTreeMap<ValidatorIdentity, EndpointAdvertisement>,
+    own_advert_sent: bool,
+    view_state: Option<MeshView>,
+    replay: ReplayCache,
+    /// Requests that arrived before our own `MeshView` completed (the peer
+    /// verified faster); drained the moment it does.
+    pending_requests: Vec<TunnelUpgradeRequest>,
+    handshakes: HashMap<ValidatorIdentity, PeerHandshake>,
+    plans: BTreeMap<ValidatorIdentity, TunnelInstallPlan>,
+    overrides: BTreeMap<ValidatorIdentity, SocketAddr>,
+    failed: HashSet<ValidatorIdentity>,
+    applied: bool,
+}
+
+impl EpochState {
+    fn next_nonce(&mut self) -> u64 {
+        self.nonce += 1;
+        self.nonce
+    }
+}
+
+/// The orchestrator's cross-epoch context.
+struct Driver<'a, E, R> {
+    config: &'a ReachabilityConfig,
+    keypair: WireGuardKeypair,
+    me: ValidatorIdentity,
+    overlay: OverlayPolicy,
+    interface: String,
+    effect: E,
+    resolver: R,
+    events: mpsc::Sender<ReachabilityEvent>,
+    view: u64,
+    state: Option<EpochState>,
+    /// A previous epoch's interface is live and must be removed before (or
+    /// instead of) the next apply.
+    interface_live: bool,
+}
+
+/// Drive the reachability plane until `Shutdown` (clean exit) or a channel
+/// closes (error). One call outlives every epoch; `Retarget` events move it
+/// between epochs. The per-epoch state machine:
 ///
 /// 1. **Bind.** Derive the epoch's `ActiveValidatorSet` via
-///    `binding::active_set(chain_id, epoch, identities)`. Load the WireGuard
-///    keypair (once, at startup — not per epoch).
-/// 2. **Record gossip.** Build this node's `EndpointRecord` — identity, WG
-///    public key, `control_endpoint`, `wireguard_listen`, `expires_at_view =
-///    current_view + ADVERT_TTL_VIEWS`, nonce from the per-epoch counter —
-///    and `Send` it (as `ReachabilityMsg::Record`) to every OTHER member.
-///    Collect members' records; re-send ours on receiving a record from a
-///    member we haven't answered this epoch (join-order independence).
-/// 3. **Advertise.** Once ALL members' records (ours included) are held:
-///    `compute_mesh_version`, sign `EndpointAdvertisement`, `Send` to every
-///    other member. Collect signed advertisements the same way.
-/// 4. **Verify.** With all advertisements held, `MeshView::verify(...)` at
-///    the latest known view. Emit `MeshReady`. A verification failure is an
-///    epoch-fatal error event, not a crash: emit `PeerFailed` per offender
-///    where attributable and keep serving the previous epoch's tunnels.
-/// 5. **Handshakes.** For every peer where `initiates(local, peer)`: resolve
-///    the endpoint via the `EndpointResolver`, then run request ->
-///    (peer's response) -> ack over `Send`/`Deliver`, nonces from the
-///    per-epoch counter, expiries at `+ HANDSHAKE_TTL_VIEWS`, keepalive
-///    `KEEPALIVE_SECONDS`. Validate the completed triple with
-///    `validate_upgrade_as(Perspective::Initiator, ...)`. As RESPONDER
-///    (`!initiates`): on `Request`, sign the matching response (accepting
-///    the canonical overlay routes), send it, await the ack, validate with
-///    `Perspective::Responder`. Overlay policy: `OverlayPolicy::ula_v6(chain_id)`.
-///    One shared `ReplayCache` per epoch.
-/// 6. **Apply.** When every peer's plan is validated (or each failure has
-///    emitted `PeerFailed`), remove any previous epoch's interface and make
-///    the epoch's ONE effect call:
-///    `apply_tunnel_plans(effect, binding::interface_name(chain_id),
-///    keypair.private_key_base64(), wireguard_listen, &plans, &overrides)`
-///    where `overrides` maps each peer resolved `Punched`/`Relayed` to that
-///    address. Emit `TunnelsApplied`. Partial meshes apply what validated.
-///
-/// Nonce discipline: ONE strictly-monotonic counter per epoch for everything
-/// this identity signs (record, advertisement, request, response, ack) —
-/// replay keys are `(identity, epoch, nonce)`, and `MeshView`'s duplicate
-/// rule needs re-advertisements strictly increasing.
-///
-/// `ViewTick` advances the freshness clock used for expiry checks;
-/// `Deliver` from a non-member of the current epoch is dropped with a
-/// `PeerFailed` (stale or hostile traffic, never a crash).
+///    [`binding::active_set`]; fresh replay cache and nonce counter.
+/// 2. **Record gossip.** Send our `EndpointRecord` (WG public key, control +
+///    wireguard endpoints, `+ ADVERT_TTL_VIEWS` expiry) to every other
+///    member; collect theirs, re-sending ours on first contact so joining
+///    order can't strand anyone.
+/// 3. **Advertise.** With ALL records held: `compute_mesh_version`, sign the
+///    `EndpointAdvertisement`, fan out; collect everyone's.
+/// 4. **Verify.** With all advertisements held: `MeshView::verify`; emit
+///    `MeshReady` or `EpochFailed`.
+/// 5. **Handshakes.** Initiator per [`initiates`]: resolve the peer's
+///    endpoint, then request -> response -> ack; both sides validate the
+///    triple via `validate_upgrade_as` from their own perspective under the
+///    `OverlayPolicy::ula_v6` overlay and one shared per-epoch replay cache.
+/// 6. **Apply.** When every peer has a validated plan or a `PeerFailed`:
+///    tear down any previous interface and make the epoch's ONE
+///    `apply_tunnel_plans` call; emit `TunnelsApplied`.
 pub async fn run<E, R>(
     config: ReachabilityConfig,
     effect: E,
     resolver: R,
-    commands: mpsc::Receiver<ReachabilityCommand>,
+    mut commands: mpsc::Receiver<ReachabilityCommand>,
     events: mpsc::Sender<ReachabilityEvent>,
 ) -> Result<(), ReachabilityError>
 where
-    E: wireguard_effect::WireGuardEffect,
+    E: WireGuardEffect,
     R: EndpointResolver,
 {
-    let _ = (config, effect, resolver, commands, events);
-    todo!("phase A implementation: the per-epoch state machine documented above")
+    let (keypair, _generated) = WireGuardKeypair::load_or_generate(&config.wireguard_key_file)?;
+    let mut driver = Driver {
+        me: binding::identity_of(&config.signer.public_key()),
+        overlay: OverlayPolicy::ula_v6(config.chain_id.clone()),
+        interface: binding::interface_name(&config.chain_id),
+        keypair,
+        config: &config,
+        effect,
+        resolver,
+        events,
+        view: 0,
+        state: None,
+        interface_live: false,
+    };
+    while let Some(command) = commands.recv().await {
+        match command {
+            ReachabilityCommand::Retarget(event) => driver.retarget(event).await?,
+            ReachabilityCommand::Deliver { from, bytes } => driver.deliver(from, bytes).await?,
+            ReachabilityCommand::ViewTick(view) => driver.view = driver.view.max(view),
+            ReachabilityCommand::Shutdown => {
+                if driver.interface_live {
+                    // best-effort: exiting matters more than the teardown's
+                    // error detail.
+                    let _ = driver.effect.remove_interface();
+                }
+                return Ok(());
+            }
+        }
+    }
+    Err(ReachabilityError::ChannelClosed)
+}
+
+impl<E, R> Driver<'_, E, R>
+where
+    E: WireGuardEffect,
+    R: EndpointResolver,
+{
+    async fn emit(&self, event: ReachabilityEvent) -> Result<(), ReachabilityError> {
+        self.events
+            .send(event)
+            .await
+            .map_err(|_| ReachabilityError::ChannelClosed)
+    }
+
+    async fn send_msg(
+        &self,
+        to: ValidatorIdentity,
+        msg: &ReachabilityMsg,
+    ) -> Result<(), ReachabilityError> {
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        let Some(pk) = state.pk_of.get(&to) else {
+            return Ok(());
+        };
+        self.emit(ReachabilityEvent::Send {
+            to: pk.clone(),
+            bytes: msg.encode(),
+        })
+        .await
+    }
+
+    async fn retarget(&mut self, event: MeshEpochEvent) -> Result<(), ReachabilityError> {
+        self.view = self.view.max(event.current_view);
+        let identities: Vec<ValidatorIdentity> =
+            event.members.iter().map(binding::identity_of).collect();
+        if !identities.contains(&self.me) {
+            // demotion normally exits the node before this; be inert, not
+            // wrong: drop epoch state and any live tunnel.
+            if self.interface_live {
+                let _ = self.effect.remove_interface();
+                self.interface_live = false;
+            }
+            self.state = None;
+            return self
+                .emit(ReachabilityEvent::EpochFailed {
+                    epoch: event.epoch,
+                    reason: "this node is not a member of the epoch".into(),
+                })
+                .await;
+        }
+        let set = binding::active_set(&self.config.chain_id, event.epoch, identities.clone())?;
+        let pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey> = event
+            .members
+            .iter()
+            .map(|pk| (binding::identity_of(pk), pk.clone()))
+            .collect();
+        let peers: Vec<ValidatorIdentity> = identities
+            .iter()
+            .copied()
+            .filter(|id| *id != self.me)
+            .collect();
+        let mut state = EpochState {
+            epoch: event.epoch,
+            set,
+            peers,
+            pk_of,
+            nonce: 0,
+            records: BTreeMap::new(),
+            adverts: BTreeMap::new(),
+            own_advert_sent: false,
+            view_state: None,
+            replay: ReplayCache::default(),
+            pending_requests: Vec::new(),
+            handshakes: HashMap::new(),
+            plans: BTreeMap::new(),
+            overrides: BTreeMap::new(),
+            failed: HashSet::new(),
+            applied: false,
+        };
+        let own = EndpointRecord {
+            namespace: self.config.chain_id.clone(),
+            epoch: state.epoch,
+            valset_root: state.set.valset_root,
+            admission_root: state.set.admission_root,
+            validator_identity: self.me,
+            wireguard_public_key: self.keypair.public_key(),
+            control_endpoint: self.config.control_endpoint,
+            wireguard_endpoint: self.config.wireguard_listen,
+            capabilities: vec![],
+            expires_at_view: self.view + ADVERT_TTL_VIEWS,
+            nonce: state.next_nonce(),
+        };
+        state.records.insert(self.me, own.clone());
+        let peers = state.peers.clone();
+        self.state = Some(state);
+        for peer in peers {
+            self.send_msg(peer, &ReachabilityMsg::Record(own.clone()))
+                .await?;
+        }
+        // a single-member network is a complete mesh already.
+        self.advance().await
+    }
+
+    async fn deliver(
+        &mut self,
+        from: ed25519::PublicKey,
+        bytes: Vec<u8>,
+    ) -> Result<(), ReachabilityError> {
+        let sender = binding::identity_of(&from);
+        let Some(state) = &mut self.state else {
+            // no active epoch (pre-boot traffic) — nothing to bind it to.
+            return Ok(());
+        };
+        if !state.pk_of.contains_key(&sender) {
+            return self
+                .emit(ReachabilityEvent::PeerFailed {
+                    peer: from,
+                    reason: "reachability traffic from a non-member".into(),
+                })
+                .await;
+        }
+        let msg = match ReachabilityMsg::decode(&bytes) {
+            Ok(msg) => msg,
+            Err(err) => {
+                return self
+                    .emit(ReachabilityEvent::PeerFailed {
+                        peer: from,
+                        reason: format!("undecodable reachability message: {err}"),
+                    })
+                    .await;
+            }
+        };
+        match msg {
+            ReachabilityMsg::Record(record) => self.on_record(sender, record).await,
+            ReachabilityMsg::Advert(advert) => self.on_advert(sender, advert).await,
+            ReachabilityMsg::Request(request) => self.on_request(sender, request).await,
+            ReachabilityMsg::Response(response) => self.on_response(sender, response).await,
+            ReachabilityMsg::Ack(ack) => self.on_ack(sender, ack).await,
+        }
+    }
+
+    async fn on_record(
+        &mut self,
+        sender: ValidatorIdentity,
+        record: EndpointRecord,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("deliver checked state");
+        if record.validator_identity != sender || record.epoch != state.epoch {
+            return self.fail_peer(sender, "record identity/epoch mismatch").await;
+        }
+        // phase A: the set locks at version time — later (higher-nonce)
+        // re-advertisements retunnel at the next cutover.
+        if state.own_advert_sent {
+            return Ok(());
+        }
+        let first_contact = !state.records.contains_key(&sender);
+        match state.records.get(&sender) {
+            Some(prev) if record.nonce <= prev.nonce => {}
+            _ => {
+                state.records.insert(sender, record);
+            }
+        }
+        if first_contact {
+            // heal join-order: the peer that just appeared may have missed
+            // our initial fan-out.
+            let own = state.records.get(&self.me).cloned().expect("own record");
+            self.send_msg(sender, &ReachabilityMsg::Record(own)).await?;
+        }
+        self.advance().await
+    }
+
+    async fn on_advert(
+        &mut self,
+        sender: ValidatorIdentity,
+        advert: EndpointAdvertisement,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("deliver checked state");
+        if advert.record.validator_identity != sender || advert.record.epoch != state.epoch {
+            return self.fail_peer(sender, "advert identity/epoch mismatch").await;
+        }
+        if state.view_state.is_some() {
+            return Ok(());
+        }
+        let first_contact = !state.adverts.contains_key(&sender);
+        match state.adverts.get(&sender) {
+            Some(prev) if advert.record.nonce <= prev.record.nonce => {}
+            _ => {
+                state.adverts.insert(sender, advert);
+            }
+        }
+        if first_contact && state.own_advert_sent {
+            let own = state.adverts.get(&self.me).cloned().expect("own advert");
+            self.send_msg(sender, &ReachabilityMsg::Advert(own)).await?;
+        }
+        self.advance().await
+    }
+
+    /// Move the epoch forward through every stage the accumulated state now
+    /// satisfies: records complete -> sign + fan out our advert; adverts
+    /// complete -> verify the mesh + start handshakes; plans complete ->
+    /// apply. Idempotent; called after every state change.
+    async fn advance(&mut self) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("advance without epoch");
+
+        // records -> our signed advert
+        if !state.own_advert_sent && state.records.len() == state.set.validators().len() {
+            let records: Vec<EndpointRecord> = state.records.values().cloned().collect();
+            let version = compute_mesh_version(&records)?;
+            let own_record = state.records.get(&self.me).cloned().expect("own record");
+            let advert = EndpointAdvertisement::sign(own_record, version, &self.config.signer);
+            state.adverts.insert(self.me, advert.clone());
+            state.own_advert_sent = true;
+            let peers = state.peers.clone();
+            for peer in peers {
+                self.send_msg(peer, &ReachabilityMsg::Advert(advert.clone()))
+                    .await?;
+            }
+            return Box::pin(self.advance()).await;
+        }
+
+        // adverts -> the verified mesh view + handshake kick-off
+        if state.view_state.is_none()
+            && state.own_advert_sent
+            && state.adverts.len() == state.set.validators().len()
+        {
+            let ads: Vec<EndpointAdvertisement> = state.adverts.values().cloned().collect();
+            let epoch = state.epoch;
+            match MeshView::verify(state.set.clone(), ads, &self.config.port_policy, self.view) {
+                Ok(view) => {
+                    let version = view.mesh_version;
+                    state.view_state = Some(view);
+                    self.emit(ReachabilityEvent::MeshReady { epoch, version })
+                        .await?;
+                    self.start_handshakes().await?;
+                    let state = self.state.as_mut().expect("still in epoch");
+                    let pending = std::mem::take(&mut state.pending_requests);
+                    for request in pending {
+                        let sender = request.fields.initiator_identity;
+                        self.on_request(sender, request).await?;
+                    }
+                    return Box::pin(self.advance()).await;
+                }
+                Err(err) => {
+                    return self
+                        .emit(ReachabilityEvent::EpochFailed {
+                            epoch,
+                            reason: format!("mesh verification: {err:?}"),
+                        })
+                        .await;
+                }
+            }
+        }
+
+        // plans (or failures) complete -> the epoch's one apply
+        if !state.applied
+            && state.view_state.is_some()
+            && state.plans.len() + state.failed.len() == state.peers.len()
+        {
+            state.applied = true;
+            let epoch = state.epoch;
+            let plans: Vec<TunnelInstallPlan> = state.plans.values().cloned().collect();
+            let overrides = state.overrides.clone();
+            if self.interface_live {
+                let _ = self.effect.remove_interface();
+                self.interface_live = false;
+            }
+            if !plans.is_empty() {
+                if let Err(err) = apply_tunnel_plans(
+                    &mut self.effect,
+                    self.interface.clone(),
+                    self.keypair.private_key_base64(),
+                    self.config.wireguard_listen,
+                    &plans,
+                    &overrides,
+                ) {
+                    return self
+                        .emit(ReachabilityEvent::EpochFailed {
+                            epoch,
+                            reason: format!("wireguard effect: {err:?}"),
+                        })
+                        .await;
+                }
+                self.interface_live = true;
+            }
+            return self
+                .emit(ReachabilityEvent::TunnelsApplied {
+                    epoch,
+                    interface: self.interface.clone(),
+                    peers: plans.len(),
+                })
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Initiator side: resolve each lower-identity-initiates peer and send
+    /// the signed request.
+    async fn start_handshakes(&mut self) -> Result<(), ReachabilityError> {
+        let state = self.state.as_ref().expect("mesh just verified");
+        let targets: Vec<ValidatorIdentity> = state
+            .peers
+            .iter()
+            .copied()
+            .filter(|peer| initiates(self.me, *peer))
+            .collect();
+        for peer in targets {
+            self.resolve_peer(peer).await?;
+            let state = self.state.as_mut().expect("still in epoch");
+            let nonce = state.next_nonce();
+            let view = state.view_state.as_ref().expect("mesh verified");
+            let fields = TunnelUpgradeRequestFields {
+                namespace: state.set.namespace.clone(),
+                epoch: state.set.epoch,
+                valset_root: state.set.valset_root,
+                admission_root: state.set.admission_root,
+                mesh_version: view.mesh_version,
+                initiator_identity: self.me,
+                responder_identity: peer,
+                initiator_wireguard_public_key: self.keypair.public_key(),
+                initiator_wireguard_endpoint: self.config.wireguard_listen,
+                requested_allowed_ips: self.overlay.allowed_ips_for(view, peer)?,
+                port_policy_hash: self.config.port_policy.hash(),
+                expires_at_view: self.view + HANDSHAKE_TTL_VIEWS,
+                nonce,
+            };
+            let request = TunnelUpgradeRequest::sign(fields, &self.config.signer);
+            state
+                .handshakes
+                .insert(peer, PeerHandshake::AwaitingResponse {
+                    request: request.clone(),
+                });
+            self.send_msg(peer, &ReachabilityMsg::Request(request))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Run the endpoint resolver for `peer`, recording a punched/relayed
+    /// override or a `PeerFailed` observability event (the peer then rides
+    /// its advertised endpoint).
+    async fn resolve_peer(&mut self, peer: ValidatorIdentity) -> Result<(), ReachabilityError> {
+        let state = self.state.as_ref().expect("resolving inside an epoch");
+        let advertised = state
+            .view_state
+            .as_ref()
+            .and_then(|view| view.record(peer))
+            .map(|record| record.wireguard_endpoint.socket_addr());
+        let Some(advertised) = advertised else {
+            return Ok(());
+        };
+        match self
+            .resolver
+            .resolve(binding::node_key(peer), advertised)
+            .await
+        {
+            Ok(Resolution::Advertised) => Ok(()),
+            Ok(Resolution::Punched(addr)) | Ok(Resolution::Relayed(addr)) => {
+                let state = self.state.as_mut().expect("still in epoch");
+                state.overrides.insert(peer, addr);
+                Ok(())
+            }
+            Err(reason) => {
+                let pk = state.pk_of.get(&peer).cloned();
+                if let Some(pk) = pk {
+                    self.emit(ReachabilityEvent::PeerFailed {
+                        peer: pk,
+                        reason: format!("endpoint resolution: {reason}"),
+                    })
+                    .await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Responder side: answer a request with our signed response.
+    async fn on_request(
+        &mut self,
+        sender: ValidatorIdentity,
+        request: TunnelUpgradeRequest,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("deliver checked state");
+        if request.fields.initiator_identity != sender
+            || request.fields.epoch != state.epoch
+            || !initiates(sender, self.me)
+        {
+            return self.fail_peer(sender, "request from the wrong side").await;
+        }
+        if state.view_state.is_none() {
+            // the peer's mesh completed before ours; answer once ours does.
+            state.pending_requests.push(request);
+            return Ok(());
+        }
+        self.resolve_peer(sender).await?;
+        let state = self.state.as_mut().expect("still in epoch");
+        let nonce = state.next_nonce();
+        let view = state.view_state.as_ref().expect("mesh verified");
+        let fields = TunnelUpgradeResponseFields {
+            request_hash: request.hash(),
+            namespace: state.set.namespace.clone(),
+            epoch: state.set.epoch,
+            valset_root: state.set.valset_root,
+            admission_root: state.set.admission_root,
+            mesh_version: view.mesh_version,
+            responder_identity: self.me,
+            initiator_identity: sender,
+            responder_wireguard_public_key: self.keypair.public_key(),
+            responder_wireguard_endpoint: self.config.wireguard_listen,
+            accepted_allowed_ips: self.overlay.allowed_ips_for(view, sender)?,
+            relay_candidates: vec![],
+            direct_dial_failure: None,
+            keepalive_seconds: Some(KEEPALIVE_SECONDS),
+            expires_at_view: self.view + HANDSHAKE_TTL_VIEWS,
+            nonce,
+        };
+        let response = TunnelUpgradeResponse::sign(fields, &self.config.signer);
+        state
+            .handshakes
+            .insert(sender, PeerHandshake::AwaitingAck {
+                request,
+                response: response.clone(),
+            });
+        self.send_msg(sender, &ReachabilityMsg::Response(response))
+            .await
+    }
+
+    /// Initiator side: the peer responded — ack, then validate our plan.
+    async fn on_response(
+        &mut self,
+        sender: ValidatorIdentity,
+        response: TunnelUpgradeResponse,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("deliver checked state");
+        let Some(PeerHandshake::AwaitingResponse { request }) = state.handshakes.get(&sender)
+        else {
+            return self.fail_peer(sender, "unsolicited handshake response").await;
+        };
+        if response.fields.responder_identity != sender
+            || response.fields.request_hash != request.hash()
+        {
+            return self.fail_peer(sender, "response does not match our request").await;
+        }
+        let request = request.clone();
+        let view = state.view_state.as_ref().expect("mesh verified").clone();
+        let fields = TunnelUpgradeAckFields {
+            request_hash: request.hash(),
+            response_hash: response.hash(),
+            namespace: state.set.namespace.clone(),
+            epoch: state.set.epoch,
+            valset_root: state.set.valset_root,
+            admission_root: state.set.admission_root,
+            mesh_version: view.mesh_version,
+            initiator_identity: self.me,
+            responder_identity: sender,
+            installed_at_view: self.view,
+            expires_at_view: self.view + HANDSHAKE_TTL_VIEWS,
+            nonce: state.next_nonce(),
+        };
+        let ack = TunnelUpgradeAck::sign(fields, &self.config.signer);
+        let plan = wireguard_upgrade::validate_upgrade_as(
+            Perspective::Initiator,
+            &view,
+            &self.config.port_policy,
+            &self.overlay,
+            self.view,
+            &request,
+            &response,
+            &ack,
+            &mut state.replay,
+        );
+        // send the ack regardless of our local verdict? No: an invalid
+        // triple must not be acked into the peer's replay state — fail loud
+        // and let the peer's own validation refuse it too.
+        match plan {
+            Ok(plan) => {
+                state.handshakes.remove(&sender);
+                state.plans.insert(sender, plan);
+                self.send_msg(sender, &ReachabilityMsg::Ack(ack)).await?;
+                self.advance().await
+            }
+            Err(err) => {
+                state.handshakes.remove(&sender);
+                state.failed.insert(sender);
+                let reason = format!("handshake validation: {err:?}");
+                self.fail_peer(sender, &reason).await?;
+                self.advance().await
+            }
+        }
+    }
+
+    /// Responder side: the initiator acked — validate our plan.
+    async fn on_ack(
+        &mut self,
+        sender: ValidatorIdentity,
+        ack: TunnelUpgradeAck,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("deliver checked state");
+        let Some(PeerHandshake::AwaitingAck { request, response }) = state.handshakes.get(&sender)
+        else {
+            return self.fail_peer(sender, "unsolicited handshake ack").await;
+        };
+        if ack.fields.initiator_identity != sender
+            || ack.fields.request_hash != request.hash()
+            || ack.fields.response_hash != response.hash()
+        {
+            return self.fail_peer(sender, "ack does not match the handshake").await;
+        }
+        let (request, response) = (request.clone(), response.clone());
+        let view = state.view_state.as_ref().expect("mesh verified").clone();
+        let plan = wireguard_upgrade::validate_upgrade_as(
+            Perspective::Responder,
+            &view,
+            &self.config.port_policy,
+            &self.overlay,
+            self.view,
+            &request,
+            &response,
+            &ack,
+            &mut state.replay,
+        );
+        match plan {
+            Ok(plan) => {
+                state.handshakes.remove(&sender);
+                state.plans.insert(sender, plan);
+                self.advance().await
+            }
+            Err(err) => {
+                state.handshakes.remove(&sender);
+                state.failed.insert(sender);
+                let reason = format!("handshake validation: {err:?}");
+                self.fail_peer(sender, &reason).await?;
+                self.advance().await
+            }
+        }
+    }
+
+    async fn fail_peer(
+        &mut self,
+        peer: ValidatorIdentity,
+        reason: &str,
+    ) -> Result<(), ReachabilityError> {
+        let pk = self
+            .state
+            .as_ref()
+            .and_then(|state| state.pk_of.get(&peer))
+            .cloned();
+        let Some(pk) = pk else {
+            return Ok(());
+        };
+        self.emit(ReachabilityEvent::PeerFailed {
+            peer: pk,
+            reason: reason.to_string(),
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
