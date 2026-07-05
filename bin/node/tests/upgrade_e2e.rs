@@ -291,6 +291,70 @@ fn push_until(cluster: &Cluster, what: &str, mut done: impl FnMut() -> bool) {
     );
 }
 
+/// [`push_until`], but every lane RECORDS the filler keys the rpc ACKED
+/// (`ok: true`) — the accept-contract witness for a boundary crossing: an
+/// acked op may finalize LATE (the cutover carries accepted-but-unresolved
+/// frames into the new epoch), but it may never vanish. returns the acked
+/// keys for the caller's post-crossing presence assert.
+fn push_tracked_until(
+    cluster: &Cluster,
+    what: &str,
+    mut done: impl FnMut() -> bool,
+) -> Vec<String> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let deadline = Instant::now() + CONVERGE;
+    let stop = AtomicBool::new(false);
+    let acked = Mutex::new(Vec::new());
+    let timed_out = std::thread::scope(|s| {
+        for lane in 0..3usize {
+            let stop = &stop;
+            let acked = &acked;
+            s.spawn(move || {
+                let mut filler = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    filler += 1;
+                    let key = format!("crossing-l{lane}-{filler}");
+                    let payload =
+                        directory_interface::encode_msg(&directory_interface::DirMsg::Set {
+                            key: key.clone(),
+                            value: "x".into(),
+                        });
+                    let reply = cluster.rpc(
+                        lane,
+                        serde_json::json!({
+                            "cmd": "submit",
+                            "target": "directory",
+                            "payload_hex": common::hex(&payload),
+                        }),
+                    );
+                    if reply["ok"] == true {
+                        acked.lock().expect("acked lock").push(key);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            });
+        }
+        loop {
+            if done() {
+                stop.store(true, Ordering::Relaxed);
+                return false;
+            }
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::Relaxed);
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    });
+    assert!(
+        !timed_out,
+        "timed out waiting for {what};\n{}",
+        cluster.all_log_tails(60)
+    );
+    acked.into_inner().expect("acked lock")
+}
+
 /// the cross-node app-hash agreement witness, robust to the concurrent push
 /// lanes: for a few seconds after [`push_until`] returns, each node is still
 /// draining its own lane's accepted-but-unfinalized backlog, so instantaneous
@@ -380,7 +444,9 @@ fn cluster_upgrade() {
 
     // 5. cross H (fillers advance finalized views) -> the ACTIVATION marker on
     //    every validator: the version cutover fired and forge flipped to v2.
-    push_until(&cluster, "the upgrade to activate on every validator", || {
+    //    the lanes TRACK every acked filler — the boundary-crossing accept
+    //    contract is asserted at (a') below.
+    let acked = push_tracked_until(&cluster, "the upgrade to activate on every validator", || {
         (0..3).all(|i| {
             cluster
                 .marker(i, "upgrade activated name=forge-v2 version=2")
@@ -395,10 +461,12 @@ fn cluster_upgrade() {
     assert_eq!(activated[0], activated[2], "activation height fork 0 vs 2");
 
     // (c) NO HALT: the new epoch must keep finalizing. a version-only cutover
-    //     DISCARDS the frames at the boundary view, so finalized height sits below
-    //     H until the respawned epoch produces fresh blocks — push a directory op
-    //     and require it to apply past the boundary on ANOTHER node (proves the
-    //     post-H engine finalizes, and drives height past H).
+    //     DISCARDS the frames at the boundary view (then re-proposes the
+    //     locally-accepted ones into the new epoch — the boundary carry), so
+    //     finalized height sits below H until the respawned epoch produces
+    //     fresh blocks — push a directory op and require it to apply past the
+    //     boundary on ANOTHER node (proves the post-H engine finalizes, and
+    //     drives height past H).
     poll_until("the new epoch to finalize a post-H op", CONVERGE, || {
         let payload = directory_interface::encode_msg(&DirMsg::Set {
             key: "post-h-liveness".into(),
@@ -423,6 +491,28 @@ fn cluster_upgrade() {
     // (a) NO FORK: every honest node agrees on the app-hash at/after H (the
     // settle poll rides out the push lanes' still-draining backlog).
     settled_app_hash(&cluster, 3);
+
+    // (a') NO ACKED OP LOST: every filler the rpc acked during the crossing
+    //      is readable after the boundary. accepted frames the old epoch
+    //      never resolved — finalized past the discard ceiling, or still
+    //      queued in the torn-down engine — are CARRIED into the new epoch
+    //      by the cutover, so an ack may finalize late but may never vanish.
+    //      polls generously: carried frames re-finalize behind the new
+    //      epoch's queue.
+    let mut remaining = acked;
+    let total = remaining.len();
+    let all_present = wait_pred(CONVERGE, || {
+        remaining.retain(|k| dir_value(&cluster, 0, k).is_none());
+        remaining.is_empty()
+    });
+    assert!(
+        all_present,
+        "accept contract BROKEN: {} of {total} acked crossing fillers never appeared post-H \
+         (sample: {:?})",
+        remaining.len(),
+        &remaining[..remaining.len().min(5)]
+    );
+    println!("accept contract held: all {total} acked crossing fillers present post-H");
 
     // (b) THE UPGRADE DID SOMETHING: the forge module root recomputed under v2, so
     //     it differs from the byte-identical baseline captured before H (forge state
