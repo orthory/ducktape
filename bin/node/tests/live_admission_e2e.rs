@@ -75,12 +75,17 @@ fn network_shape_joiner_parks_until_promote() {
 ///
 ///   1. while the friend holds observer standing, the valset's VALIDATOR set
 ///      still names only the founder — committed state proves the tier split;
-///   2. the chain keeps finalizing with the observer KILLED (under the old
+///   2. the observer SERVES: local reads (rpc + http) answer from its own
+///      pre-synced boundary, a write is refused as reads-only, and a value the
+///      founder finalizes becomes readable through the observer's surface (the
+///      continuous follow);
+///   3. the chain keeps finalizing with the observer KILLED (under the old
 ///      one-step flow the friend would already hold a quorum seat here, and a
 ///      2-member quorum with one member down is a stall);
-///   3. a restarted observer parks straight back into observer mode (the
-///      pre-sync writes no checkpoint manifest — a reboot is clean);
-///   4. `promote` then seats a WARM validator through the normal path.
+///   4. a restarted observer parks straight back into observer mode (the
+///      pre-sync writes no checkpoint manifest — a reboot is clean) and serves
+///      again;
+///   5. `promote` then seats a WARM validator through the normal path.
 ///
 /// observer ops are protocol-v3-gated, so the leg first drives the upgrade
 /// ceremony to v3 on the solo founder (schedule → auto-signal → activate).
@@ -253,7 +258,80 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         "the friend holds observer standing"
     );
 
-    // (2) quorum untouched: kill the observer; the founder keeps finalizing.
+    // (2) the SERVING observer: the same local read surfaces a validator
+    //     binds, answered from the observer's own pre-synced boundary.
+    //     rpc status names the served boundary…
+    poll("the observer to serve rpc status", Box::new(|| {
+        let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
+        st["ok"] == serde_json::json!(true)
+            && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
+    }));
+    //     …module reads answer from the OBSERVER's surface (the tier split is
+    //     visible through the observer itself, not just the founder)…
+    poll("the observer to serve valset reads", Box::new(|| {
+        cluster
+            .query(1, "valset", &valset_interface::encode_query(&ValsetQuery::Observers))
+            .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+            .is_some_and(|r| matches!(
+                r,
+                ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
+            ))
+    }));
+    //     …the http app surface answers its status route from the same host…
+    {
+        use std::io::{Read as _, Write as _};
+        let mut conn =
+            std::net::TcpStream::connect(("127.0.0.1", cluster.http_ports[1]))
+                .expect("connect the observer's app surface");
+        conn.set_read_timeout(Some(Duration::from_secs(15))).expect("http timeout");
+        conn.write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("http write");
+        let mut raw = String::new();
+        conn.read_to_string(&mut raw).expect("http read");
+        assert!(raw.starts_with("HTTP/1.1 200"), "observer /v1/status must answer 200:\n{raw}");
+        assert!(raw.contains("\"height\""), "observer /v1/status carries a height:\n{raw}");
+    }
+    //     …a write is refused as reads-only…
+    let refused = cluster.rpc(
+        1,
+        serde_json::json!({
+            "cmd": "submit",
+            "target": "directory",
+            "payload_hex": common::hex(&directory_interface::encode_msg(&DirMsg::Set {
+                key: "observer-no-writes".into(),
+                value: "refused".into(),
+            })),
+        }),
+    );
+    assert_eq!(refused["ok"], serde_json::json!(false), "observer must refuse writes: {refused}");
+    assert!(
+        refused["error"].as_str().unwrap_or_default().contains("reads only"),
+        "the refusal names the reads-only contract: {refused}"
+    );
+    //     …and the follow is CONTINUOUS: a value the founder finalizes now
+    //     becomes readable through the observer within a few boundaries.
+    cluster.submit(
+        0,
+        "directory",
+        &directory_interface::encode_msg(&DirMsg::Set {
+            key: "observer-follow".into(),
+            value: "fresh".into(),
+        }),
+    );
+    poll("the observer to serve the followed write", Box::new(|| {
+        cluster
+            .query(
+                1,
+                "directory",
+                &directory_interface::encode_query(&DirQuery::Get {
+                    key: "observer-follow".into(),
+                }),
+            )
+            .and_then(|raw| directory_interface::decode_reply(&raw).ok())
+            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
+    }));
+
+    // (3) quorum untouched: kill the observer; the founder keeps finalizing.
     cluster.kill(1);
     cluster.submit(
         0,
@@ -276,15 +354,20 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
     }));
 
-    // (3) a restarted observer parks straight back into observer mode — the
+    // (4) a restarted observer parks straight back into observer mode — the
     //     pre-sync left NO checkpoint manifest behind. (the config-time
     //     joiner banner may not reprint: the first run's recovery-journal
     //     files flip the cheap boot probe, and the runtime then re-decides
     //     from the real store — the observer marker alone is the proof.)
+    //     it then SERVES again from a fresh pre-sync.
     cluster.spawn(1);
-    cluster.wait_marker(1, "observer:", CONVERGE);
+    cluster.wait_marker(1, "observer: pre-synced boundary", CONVERGE);
+    poll("the restarted observer to serve reads again", Box::new(|| {
+        cluster.rpc(1, serde_json::json!({ "cmd": "status" }))["ok"]
+            == serde_json::json!(true)
+    }));
 
-    // (4) promote: the warm observer becomes a validator through the normal
+    // (5) promote: the warm observer becomes a validator through the normal
     //     promotion path; valset Join clears its observer standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
