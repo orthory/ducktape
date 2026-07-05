@@ -39,7 +39,7 @@ members = [
     "crates/apps/document", "crates/apps/document-interface", "crates/apps/document-index",
     "crates/apps/pages", "crates/apps/pages-interface", "crates/apps/pages-index",
     "crates/apps/chat", "crates/apps/chat-interface", "crates/apps/chat-index",
-    "crates/apps/agent", "crates/apps/agent-interface", "crates/apps/agent-oracle",
+    "crates/apps/agent", "crates/apps/agent-interface",
     "crates/apps/tasks", "crates/apps/tasks-interface", "crates/apps/tasks-index",
     "crates/apps/vaults", "crates/apps/vaults-interface",
     "crates/apps/profiles", "crates/apps/profiles-interface",
@@ -126,7 +126,6 @@ document = { path = "crates/apps/document" }
 pages = { path = "crates/apps/pages" }
 chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }
-agent-oracle = { path = "crates/apps/agent-oracle" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
 profiles = { path = "crates/apps/profiles" }

@@ -471,10 +471,11 @@ fn main() {
         // the chat channel under a Mention policy — the watch and chat's hook
         // registration commit atomically — enable the agent module as the
         // jobs-board worker by agent admin op (not genesis config), then post a message MENTIONING the
-        // agent: the very same block carries the post, the hook delivery, the
-        // run record, and the saga trigger. the emitted WorkerRequest effect
-        // is the off-consensus LLM seam a reactor driver answers as an
-        // ordinary oracle op in some later block.
+        // agent: the very same block carries the post, the tagging plane's
+        // engagement delivery, the pending entry, the dispatch, and its saga
+        // trigger. the emitted WorkerRequest effect is the off-consensus LLM
+        // seam a reactor driver answers as an ordinary oracle op in some
+        // later block.
         host.submit_at(
             as_demo_user(),
             Msg {
@@ -549,19 +550,16 @@ fn main() {
         );
         let run_id = run_id_for("general", 3, "quackbot");
         let reply = host
-            .query(
-                "agent",
-                &agent_encode_query(&AgentQuery::Run {
-                    run_id: run_id.clone(),
-                }),
-            )
+            .query("agent", &agent_encode_query(&AgentQuery::PendingRuns))
             .await
-            .expect("query agent run");
-        if let AgentReply::Run(Some(run)) = agent_decode_reply(&reply).unwrap() {
-            println!(
-                "  run            : {} {:?} (context pinned to seq {})",
-                run.run_id, run.status, run.anchor_seq
-            );
+            .expect("query agent pending runs");
+        if let AgentReply::PendingRuns(pending) = agent_decode_reply(&reply).unwrap() {
+            for entry in pending.iter().filter(|p| p.run_id == run_id) {
+                println!(
+                    "  pending run    : {} (dispatch {}, anchored at seq {})",
+                    entry.run_id, entry.dispatch_id, entry.anchor_seq
+                );
+            }
         }
         let reply = host
             .query(

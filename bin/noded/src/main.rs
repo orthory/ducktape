@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
-use agent_oracle::LlmWorker;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
@@ -280,7 +279,6 @@ fn run_node(
         // the blob lane before the op is submitted — materializes locally; the
         // pack bytes never enter consensus (root stays sha256(head oid)).
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
-        let worker_blobs = blobs.clone();
         // the block loop's own handle: each block's root payload is staged as
         // its explorer row is built, so op hashes stay dereferencable via the
         // blob lane (worker follow-ups included — the http submit handler only
@@ -317,7 +315,7 @@ fn run_node(
         // runtime metrics. the handles are retained for the block loop's life.
         let metrics = NodeMetrics::register(&context);
 
-        let workers = oracle_workers(worker_blobs);
+        let workers = oracle_workers();
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.
@@ -421,34 +419,24 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
+fn oracle_workers() -> Vec<Box<dyn reactor::Worker>> {
     #[cfg(debug_assertions)]
     {
         if std::env::var_os("DUCKTAPE_NODED_ECHO_ORACLE").is_some() {
             return vec![Box::new(EchoWorker)];
         }
     }
-    vec![
-        Box::new(LlmWorker::new(
-            blobs,
-            // BYO: run whatever executor CLIs the capability specs describe and
-            // this host has installed — no credential handling here (see
-            // docs/capability-spec.md). a broken operator spec is a boot error.
-            capability_host::discover()
-                .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-            // the daemon's oracle identity: its worker follow-ups are
-            // submitted under ORACLE_ORIGIN, so an Accept claim records that
-            // key as the assignee and the re-emitted request must match it.
-            ORACLE_ORIGIN.to_vec(),
-        )),
-        Box::new(DispatchWorker::new(
-            // a second, identical discovery: ProviderSet owns its providers
-            // (not Clone); same specs + PATH at boot, so no drift.
-            capability_host::discover()
-                .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-            ORACLE_ORIGIN.to_vec(),
-        )),
-    ]
+    vec![Box::new(DispatchWorker::new(
+        // BYO: run whatever executor CLIs the capability specs describe and
+        // this host has installed — no credential handling here (see
+        // docs/capability-spec.md). a broken operator spec is a boot error.
+        capability_host::discover()
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
+        // the daemon's oracle identity: its worker follow-ups are
+        // submitted under ORACLE_ORIGIN, so an Accept claim records that
+        // key as the assignee and the re-emitted request must match it.
+        ORACLE_ORIGIN.to_vec(),
+    ))]
 }
 
 /// commit the caller's op, then drain worker follow-ups (each its own block).
@@ -701,35 +689,15 @@ impl reactor::Worker for EchoWorker {
         };
         // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
         // module judged a Text contract; the agent module normalizes).
-        if let Ok(work) = dispatch_interface::decode_work_spec(&request.spec) {
-            return Ok(reactor::WorkOutcome::Handled(Some(Msg {
-                target: "saga".into(),
-                payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
-                    saga_id: request.saga_id,
-                    attempt: request.attempt,
-                    outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id)
-                        .into_bytes()),
-                }),
-            })));
-        }
-        let llm = match agent_interface::decode_llm_request(&request.spec) {
-            Ok(llm) => llm,
-            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
+        let Ok(work) = dispatch_interface::decode_work_spec(&request.spec) else {
+            return Ok(reactor::WorkOutcome::NotMine);
         };
         Ok(reactor::WorkOutcome::Handled(Some(Msg {
             target: "saga".into(),
             payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
                 saga_id: request.saga_id,
                 attempt: request.attempt,
-                outcome: Ok(agent_interface::encode_output(
-                    &agent_interface::AgentOutput {
-                        reply_blocks: vec![chat_interface::Block::paragraph(format!(
-                            "echo: handling {}",
-                            llm.run_id
-                        ))],
-                        actions: Vec::new(),
-                    },
-                )),
+                outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
             }),
         })))
     }

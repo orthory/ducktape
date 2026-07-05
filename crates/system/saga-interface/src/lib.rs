@@ -88,7 +88,7 @@ pub enum SagaMsg {
     /// callback-poison rule) and `max_attempts` must be >= 1.
     Trigger {
         saga_id: SagaId,
-        /// opaque work spec (e.g. an LlmRequest), echoed to the worker.
+        /// opaque work spec (e.g. a dispatch WorkSpec), echoed to the worker.
         spec: Vec<u8>,
         /// callback target: on EVERY terminal transition the module sends
         /// this module a [`SagaCallback`] in the same block. `None` = fire

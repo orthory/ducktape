@@ -59,7 +59,6 @@ files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
-agent-oracle = { workspace = true }
 reactor = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability orchestrator runs
 # on its own plain-tokio thread (mirroring the app-surface split) behind the
