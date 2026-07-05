@@ -113,6 +113,9 @@ impl Governance {
             .await?;
         match valset_decode_reply(&reply).map_err(Error::Module)? {
             ValsetReply::Validators(members) => Ok(members),
+            other => Err(Error::Module(format!(
+                "valset answered Validators with an unexpected reply shape: {other:?}"
+            ))),
         }
     }
 

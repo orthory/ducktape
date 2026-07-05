@@ -555,8 +555,11 @@ impl SagaModule {
                     .query(valset, &valset_encode_query(&ValsetQuery::Validators))
                     .await
                     .ok()?;
-                let ValsetReply::Validators(validators) = valset_decode_reply(&reply).ok()?;
-                validators
+                match valset_decode_reply(&reply).ok()? {
+                    ValsetReply::Validators(validators) => validators,
+                    // the module answered a different query — no pool.
+                    _ => return None,
+                }
             }
         };
         (!pool.is_empty()).then_some(pool)

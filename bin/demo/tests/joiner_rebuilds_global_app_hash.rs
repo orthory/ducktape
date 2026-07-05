@@ -207,6 +207,7 @@ async fn validators(v: &Valset) -> Vec<Vec<u8>> {
         .unwrap();
     match valset_decode_reply(&reply).unwrap() {
         ValsetReply::Validators(list) => list,
+        other => panic!("unexpected valset reply shape: {other:?}"),
     }
 }
 

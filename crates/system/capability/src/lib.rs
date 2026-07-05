@@ -100,6 +100,9 @@ impl CapabilityRegistry {
             .await?;
         match valset_decode_reply(&reply).map_err(Error::Module)? {
             ValsetReply::Validators(v) => Ok(v),
+            other => Err(Error::Module(format!(
+                "valset answered Validators with an unexpected reply shape: {other:?}"
+            ))),
         }
     }
 

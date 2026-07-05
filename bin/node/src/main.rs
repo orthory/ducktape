@@ -262,7 +262,7 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
     };
     match decode_reply(&reply) {
         Ok(ValsetReply::Validators(v)) => v,
-        Err(_) => Vec::new(),
+        Ok(_) | Err(_) => Vec::new(),
     }
 }
 
@@ -348,7 +348,7 @@ async fn read_members_from_host(host: &Host) -> Vec<Vec<u8>> {
     };
     match decode_reply(&raw) {
         Ok(ValsetReply::Validators(v)) => v,
-        Err(_) => Vec::new(),
+        Ok(_) | Err(_) => Vec::new(),
     }
 }
 
@@ -2388,6 +2388,7 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
     match decode_reply(&raw)? {
         ValsetReply::Validators(v) => Ok(v),
+        other => Err(format!("unexpected valset reply shape: {other:?}")),
     }
 }
 
