@@ -868,7 +868,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await
+    .expect("sync_from");
 
     let (target, resolver) = fetch_target("document").await?;
     let document = Document::sync_from(
@@ -877,7 +878,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await
+    .expect("sync_from");
 
     let (target, resolver) = fetch_target("pages").await?;
     let pages = Pages::sync_from(
@@ -886,7 +888,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await
+    .expect("sync_from");
 
     let (target, resolver) = fetch_target("chat").await?;
     let chat = Chat::sync_from(
@@ -895,7 +898,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await
+    .expect("sync_from");
 
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
@@ -3700,12 +3704,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                              key; see the joiner-mode banner above. retrying ({e})"
                         );
                         if let Some(frame) = &announce_frame {
-                            send_lobby(
-                                &announce_targets,
-                                attempt,
-                                frame.clone(),
-                                "join request — awaiting approval",
-                            );
+                            send_lobby(&announce_targets, attempt, frame.clone(), "join request");
                         }
                         continue;
                     }
@@ -3799,12 +3798,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             m.participants.len()
                         );
                         if let Some(frame) = &announce_frame {
-                            send_lobby(
-                                &announce_targets,
-                                attempt,
-                                frame.clone(),
-                                "join request — awaiting approval",
-                            );
+                            send_lobby(&announce_targets, attempt, frame.clone(), "join request");
                         }
                     }
                     continue;

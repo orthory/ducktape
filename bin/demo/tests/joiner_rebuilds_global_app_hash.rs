@@ -671,21 +671,24 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             kv_target,
             kv_resolver,
         )
-        .await;
+        .await
+        .expect("sync_from");
         let join_document = Document::sync_from(
             context.child("joiner_document"),
             "document-rebuilt",
             document_target,
             document_resolver,
         )
-        .await;
+        .await
+        .expect("sync_from");
         let join_chat = Chat::sync_from(
             context.child("joiner_chat"),
             "chat-rebuilt",
             chat_target,
             chat_resolver,
         )
-        .await;
+        .await
+        .expect("sync_from");
 
         let mut join_directory = Directory::new("directory");
         join_directory
