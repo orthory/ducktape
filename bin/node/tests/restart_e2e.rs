@@ -43,12 +43,32 @@ fn write_and_confirm(cluster: &Cluster, idx: usize, key: &str, value: &str) {
     );
 }
 
+/// the explorer rows /v1/blocks currently serves, keyed by height. only real
+/// ops appear (heartbeat nops never get a row), so this is exactly the set
+/// restart recovery must preserve.
+fn block_rows(cluster: &Cluster, idx: usize) -> Vec<(u64, serde_json::Value)> {
+    let (code, body) = cluster.http(idx, "GET", "/v1/blocks", None);
+    assert_eq!(code, 200, "explorer blocks fetch failed: {body}");
+    body["blocks"]
+        .as_array()
+        .expect("blocks is an array")
+        .iter()
+        .map(|b| (b["height"].as_u64().expect("row height"), b.clone()))
+        .collect()
+}
+
 #[test]
 fn solo_validator_survives_crash_and_graceful_restart() {
     let _guard = common::serial();
     // a network of ONE: the sharpest recovery case — no peer holds the state,
     // so local recovery is the only path back.
     let mut cluster = Cluster::new(&[0], &[0]);
+    // pin the periodic checkpoint far out so every sealed block stays in the
+    // journal-replay window: the explorer-continuity assertions below must
+    // exercise the boot fold's row REBUILD deterministically, not race the
+    // default cadence (a checkpoint landing right after a write would shrink
+    // the replay suffix and leave the rows to the index's fsync timing).
+    cluster.extra_toml.push("checkpoint_blocks = 100000".into());
     cluster.spawn(0);
     cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(30));
 
@@ -62,6 +82,20 @@ fn solo_validator_survives_crash_and_graceful_restart() {
         .expect("status app_hash")
         .to_string();
     let height_before = before["height"].as_u64().expect("status height");
+
+    // snapshot the drain-built explorer rows before the crash: both writes'
+    // rows must be visible (the row lands in the same drain pass that
+    // finalized the op, but the confirm reads canonical state — poll the
+    // tiny gap away).
+    let rows_before = poll_until(
+        "both drain rows visible in /v1/blocks",
+        Duration::from_secs(30),
+        || {
+            let rows = block_rows(&cluster, 0);
+            (rows.iter().filter(|(_, r)| r["target"] == "directory").count() >= 2)
+                .then_some(rows)
+        },
+    );
 
     // ---- crash: SIGKILL, no goodbye ------------------------------------
     cluster.kill(0);
@@ -95,6 +129,37 @@ fn solo_validator_survives_crash_and_graceful_restart() {
         dir_value(&cluster, 0, "where").as_deref(),
         Some("a-worktree")
     );
+
+    // the explorer survives the crash window: the SIGKILL almost certainly
+    // beat the index's periodic fsync, so the boot fold must have REBUILT the
+    // lost rows from the journaled frames — byte-identical to what the drain
+    // wrote (same shared row seam), never merely "some row at that height".
+    let rows_after = poll_until(
+        "explorer rows to reappear after recovery",
+        Duration::from_secs(30),
+        || {
+            let rows = block_rows(&cluster, 0);
+            (rows.len() >= rows_before.len()).then_some(rows)
+        },
+    );
+    for (height, row) in &rows_before {
+        let recovered = rows_after
+            .iter()
+            .find(|(h, _)| h == height)
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| panic!("explorer row at height {height} lost across the crash"));
+        assert_eq!(
+            recovered, row,
+            "rebuilt explorer row at height {height} must equal the drain's row"
+        );
+    }
+    // and the rebuilt rows' op payloads are dereferencable again — the blob
+    // store is in-memory, so ONLY the fold's re-staging can answer this.
+    for (_, row) in rows_before.iter().filter(|(_, r)| r["target"] == "directory") {
+        let op_hash = row["opHash"].as_str().expect("row opHash");
+        let (code, _) = cluster.http(0, "GET", &format!("/v1/files/blob/{op_hash}"), None);
+        assert_eq!(code, 200, "op payload blob must re-stage during the boot fold");
+    }
 
     // ...and the engine is LIVE again over its reopened journal: new ops
     // finalize (a same-epoch respawn that lost its vote state would refuse

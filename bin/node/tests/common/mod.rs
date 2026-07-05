@@ -86,6 +86,11 @@ pub struct Cluster {
     /// `dt-<chainid>` interface name, so the fake is the only correct
     /// same-host shape.
     pub wireguard: bool,
+    /// extra `node.toml` lines appended verbatim to EVERY node's generated
+    /// config (`spawn` regenerates the file, so a hand-edit after the fact
+    /// would not survive a respawn). set before the first spawn; empty by
+    /// default so existing tests are byte-for-byte unchanged.
+    pub extra_toml: Vec<String>,
     /// declared BEFORE `dir` so drop order kills + reaps every child first —
     /// removing the tempdir under live processes races their qmdb/journal
     /// writes and silently leaks the subtree.
@@ -325,6 +330,7 @@ impl Cluster {
             advertised: peer_ids.iter().map(|_| None).collect(),
             bootstrap_addr_override: None,
             wireguard: false,
+            extra_toml: Vec::new(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
         }
@@ -375,6 +381,10 @@ impl Cluster {
                 self.p2p_ports[idx]
             ));
             cfg.push_str("wireguard_effect = \"fake\"\n");
+        }
+        for line in &self.extra_toml {
+            cfg.push_str(line);
+            cfg.push('\n');
         }
         std::fs::write(&path, cfg).expect("write node config");
         path
