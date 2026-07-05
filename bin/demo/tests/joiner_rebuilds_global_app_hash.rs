@@ -421,14 +421,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         .await;
 
         let mut src_valset = Valset::new("valset");
-        commit_op(
-            &mut src_valset,
-            0,
-            valset_encode_msg(&ValsetMsg::Join {
-                key: validator_key(7),
-            }),
-        )
-        .await;
+        // an established source network: one ACTIVE validator (genesis-style
+        // seeding — a Join alone lands STANDBY now) plus one standby
+        // registrant, so the two-class snapshot round-trips both sections.
+        src_valset.insert(validator_key(7));
         commit_op(
             &mut src_valset,
             0,
@@ -809,8 +805,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
 
         assert_eq!(join_directory.get("name"), Some(&"world".to_string()));
 
-        assert_eq!(src_validators.len(), 2);
+        assert_eq!(src_validators.len(), 1, "one ACTIVE source validator");
         assert_eq!(validators(&join_valset).await, src_validators);
+        // both membership classes survive the rebuild byte-for-byte.
+        assert_eq!(join_valset.membership(), src_valset.membership());
 
         let reply = join_saga
             .query(&saga_encode_query(&SagaQuery::Get {
