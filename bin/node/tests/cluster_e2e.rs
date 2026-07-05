@@ -142,16 +142,12 @@ fn cluster_lifecycle() {
     // (the harness-documented pattern) — poll until every validator reports
     // the same status app-hash. a real fork never reconciles, so it fails
     // this poll's budget; sampling skew settles within a block or two.
-    poll_until(
-        "status app-hashes to agree across validators",
-        FINALIZE,
-        || {
-            let hashes: Vec<serde_json::Value> = (0..3)
-                .map(|i| cluster.status(i)["app_hash"].clone())
-                .collect();
-            (!hashes[0].is_null() && hashes[0] == hashes[1] && hashes[0] == hashes[2]).then_some(())
-        },
-    );
+    poll_until("status app-hashes to agree across validators", FINALIZE, || {
+        let hashes: Vec<serde_json::Value> = (0..3)
+            .map(|i| cluster.status(i)["app_hash"].clone())
+            .collect();
+        (!hashes[0].is_null() && hashes[0] == hashes[1] && hashes[0] == hashes[2]).then_some(())
+    });
 
     // 4. ops actually applied: every node's own sampled hash moved off its
     // (agreed) genesis hash.
@@ -324,10 +320,7 @@ fn cluster_lifecycle() {
         "explorer record carries the op's content address: {submitted}"
     );
     let (code, blob) = cluster.http(0, "GET", &format!("/v1/files/blob/{op_hash}"), None);
-    assert_eq!(
-        code, 200,
-        "op hash must dereference on the blob lane: {blob}"
-    );
+    assert_eq!(code, 200, "op hash must dereference on the blob lane: {blob}");
     assert_eq!(
         blob,
         serde_json::json!({ "Set": { "key": "via-app-surface", "value": "held" } }),

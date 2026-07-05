@@ -103,11 +103,8 @@ fn pending_is_none(host: &Host) -> bool {
 }
 
 fn validator_count(host: &Host) -> usize {
-    let reply = block_on(host.query(
-        "valset",
-        &valset_interface::encode_query(&ValsetQuery::Validators),
-    ))
-    .expect("valset query");
+    let reply = block_on(host.query("valset", &valset_interface::encode_query(&ValsetQuery::Validators)))
+        .expect("valset query");
     match valset_interface::decode_reply(&reply).expect("decode valset") {
         ValsetReply::Validators(v) => v.len(),
     }
@@ -138,9 +135,7 @@ fn armed_forge_host(base: &std::path::Path, activate: bool) -> (Host, StateRoot)
     valset.insert(m1.clone());
     host.register(Box::new(valset));
     host.register(Box::new(Upgrade::new("upgrade", "valset")));
-    host.register(Box::new(
-        forge::Forge::init("forge", base.to_path_buf()).expect("forge init"),
-    ));
+    host.register(Box::new(forge::Forge::init("forge", base.to_path_buf()).expect("forge init")));
 
     // seed committed forge state so the v2 recomposition at H is OBSERVABLE.
     apply(
@@ -159,27 +154,9 @@ fn armed_forge_host(base: &std::path::Path, activate: bool) -> (Host, StateRoot)
         },
     );
     // schedule (governance/system-authored) + both members signal -> armed.
-    apply(
-        &mut host,
-        1,
-        BASELINE_VERSION,
-        Origin::System,
-        schedule("forge-v2", H, TO_VERSION),
-    );
-    apply(
-        &mut host,
-        2,
-        BASELINE_VERSION,
-        Origin::External(m0.clone()),
-        signal("forge-v2", TO_VERSION),
-    );
-    apply(
-        &mut host,
-        3,
-        BASELINE_VERSION,
-        Origin::External(m1.clone()),
-        signal("forge-v2", TO_VERSION),
-    );
+    apply(&mut host, 1, BASELINE_VERSION, Origin::System, schedule("forge-v2", H, TO_VERSION));
+    apply(&mut host, 2, BASELINE_VERSION, Origin::External(m0.clone()), signal("forge-v2", TO_VERSION));
+    apply(&mut host, 3, BASELINE_VERSION, Origin::External(m1.clone()), signal("forge-v2", TO_VERSION));
 
     // the forge root just below H (baseline v1 layout, committed heads unchanged).
     let forge_pre = host.module_root("forge").expect("forge root pre-H");
@@ -189,22 +166,13 @@ fn armed_forge_host(base: &std::path::Path, activate: bool) -> (Host, StateRoot)
     // protocol_version is the agreed derivation on BOTH (a straggler still dispatches
     // under the agreed version — its divergence is the un-flipped forge branch).
     let boundary_pv = block_on(host.effective_version(H));
-    assert_eq!(
-        boundary_pv, TO_VERSION,
-        "the armed boundary must derive to_version"
-    );
+    assert_eq!(boundary_pv, TO_VERSION, "the armed boundary must derive to_version");
     if activate {
         host.set_active_version(boundary_pv);
     }
     // a re-signal at H is idempotent; it merely carries the block whose drain
     // injects the boundary Advance (which reconciles the upgrade module's own state).
-    apply(
-        &mut host,
-        H,
-        boundary_pv,
-        Origin::External(m0),
-        signal("forge-v2", TO_VERSION),
-    );
+    apply(&mut host, H, boundary_pv, Origin::External(m0), signal("forge-v2", TO_VERSION));
 
     (host, forge_pre)
 }
@@ -219,20 +187,11 @@ fn divergent_participant_computes_a_different_app_hash() {
     let (straggler, straggler_pre) = armed_forge_host(straggler_dir.path(), false);
 
     // the seed produced an identical (deterministic, non-zero) forge root on both.
-    assert_ne!(
-        correct_pre,
-        StateRoot::ZERO,
-        "seed must give a non-zero forge root"
-    );
-    assert_eq!(
-        correct_pre, straggler_pre,
-        "identical seed -> identical pre-H forge root"
-    );
+    assert_ne!(correct_pre, StateRoot::ZERO, "seed must give a non-zero forge root");
+    assert_eq!(correct_pre, straggler_pre, "identical seed -> identical pre-H forge root");
 
     let correct_forge = correct.module_root("forge").expect("correct forge root");
-    let straggler_forge = straggler
-        .module_root("forge")
-        .expect("straggler forge root");
+    let straggler_forge = straggler.module_root("forge").expect("straggler forge root");
 
     // the correctly-activated node RECOMPUTED the forge root under the v2 layout...
     assert_ne!(
@@ -253,16 +212,8 @@ fn divergent_participant_computes_a_different_app_hash() {
     // the divergence is LOCALIZED to forge: the upgrade module's own state (version
     // flipped to 2, pending cleared) and the valset reconcile IDENTICALLY on both —
     // the straggler is not "behind", it is running the WRONG forge branch.
-    assert_eq!(
-        current_version(&correct),
-        TO_VERSION,
-        "correct node flipped to v2"
-    );
-    assert_eq!(
-        current_version(&straggler),
-        TO_VERSION,
-        "straggler's upgrade module still flipped"
-    );
+    assert_eq!(current_version(&correct), TO_VERSION, "correct node flipped to v2");
+    assert_eq!(current_version(&straggler), TO_VERSION, "straggler's upgrade module still flipped");
     assert_eq!(
         correct.module_root("upgrade"),
         straggler.module_root("upgrade"),
@@ -314,27 +265,9 @@ fn boundary_with_optional_admission(admit_extra: bool) -> Host {
     host.register(Box::new(valset));
     host.register(Box::new(Upgrade::new("upgrade", "valset")));
 
-    apply(
-        &mut host,
-        1,
-        BASELINE_VERSION,
-        Origin::System,
-        schedule("forge-v2", ADMIT_H, TO_VERSION),
-    );
-    apply(
-        &mut host,
-        2,
-        BASELINE_VERSION,
-        Origin::External(m0.clone()),
-        signal("forge-v2", TO_VERSION),
-    );
-    apply(
-        &mut host,
-        3,
-        BASELINE_VERSION,
-        Origin::External(m1.clone()),
-        signal("forge-v2", TO_VERSION),
-    );
+    apply(&mut host, 1, BASELINE_VERSION, Origin::System, schedule("forge-v2", ADMIT_H, TO_VERSION));
+    apply(&mut host, 2, BASELINE_VERSION, Origin::External(m0.clone()), signal("forge-v2", TO_VERSION));
+    apply(&mut host, 3, BASELINE_VERSION, Origin::External(m1.clone()), signal("forge-v2", TO_VERSION));
 
     if admit_extra {
         // a fresh validator admitted DURING the open upgrade window — governance
@@ -352,23 +285,13 @@ fn boundary_with_optional_admission(admit_extra: bool) -> Host {
         );
         assert_eq!(validator_count(&host), 3, "m2 must be admitted before H");
     } else {
-        assert_eq!(
-            validator_count(&host),
-            2,
-            "no admission -> the schedule-time set"
-        );
+        assert_eq!(validator_count(&host), 2, "no admission -> the schedule-time set");
     }
 
     // cross H: a re-signal carries the block whose drain injects the boundary
     // Advance, which arms-or-aborts against the LIVE boundary valset.
     let boundary_pv = block_on(host.effective_version(ADMIT_H));
-    apply(
-        &mut host,
-        ADMIT_H,
-        boundary_pv,
-        Origin::External(m0),
-        signal("forge-v2", TO_VERSION),
-    );
+    apply(&mut host, ADMIT_H, boundary_pv, Origin::External(m0), signal("forge-v2", TO_VERSION));
     host
 }
 
@@ -381,10 +304,7 @@ fn mid_window_admission_of_an_unready_member_aborts_the_flip() {
         TO_VERSION,
         "control (no admission) must ARM: every boundary member signaled"
     );
-    assert!(
-        pending_is_none(&control),
-        "control must clear the pending slot on arm"
-    );
+    assert!(pending_is_none(&control), "control must clear the pending slot on arm");
 
     // ADVERSARIAL: admitting one unready validator mid-window is the SOLE change,
     // and it moves the identical boundary to the clean ABORT.

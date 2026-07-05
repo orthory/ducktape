@@ -357,10 +357,7 @@ impl Cluster {
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
         if idx != 0 {
-            cfg.push_str(&format!(
-                "bootstrapper_addr = \"{}\"\n",
-                self.bootstrap_addr()
-            ));
+            cfg.push_str(&format!("bootstrapper_addr = \"{}\"\n", self.bootstrap_addr()));
         }
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
@@ -467,10 +464,7 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
-        cfg.push_str(&format!(
-            "bootstrapper_addr = \"{}\"\n",
-            self.bootstrap_addr()
-        ));
+        cfg.push_str(&format!("bootstrapper_addr = \"{}\"\n", self.bootstrap_addr()));
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
             self.dir

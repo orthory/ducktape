@@ -35,11 +35,7 @@ fn a_tokened_join_delivers_the_pubkey_and_manual_approval_promotes() {
     cluster.wait_marker(1, "join request sent to member", Duration::from_secs(90));
     let requests = cluster.join_requests();
     let requests = requests.as_array().expect("a json array");
-    assert_eq!(
-        requests.len(),
-        1,
-        "exactly one pending request: {requests:?}"
-    );
+    assert_eq!(requests.len(), 1, "exactly one pending request: {requests:?}");
     assert_eq!(requests[0]["joiner"], friend_key.as_str());
     let issuer = requests[0]["issuer"].as_str().expect("issuer is hex");
     assert_eq!(issuer.len(), 64, "the queue names the inviting member");

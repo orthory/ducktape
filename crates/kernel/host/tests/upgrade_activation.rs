@@ -87,24 +87,9 @@ fn advance_injection_arms_and_frees_slot() {
     let mut host = host_with(&members);
 
     // schedule (governance/system authored) + every member signals ready.
-    submit(
-        &mut host,
-        0,
-        Origin::System,
-        schedule_msg("forge-multi-repo", 10, 2),
-    );
-    submit(
-        &mut host,
-        1,
-        Origin::External(m0.clone()),
-        signal_msg("forge-multi-repo", 2),
-    );
-    submit(
-        &mut host,
-        2,
-        Origin::External(m1.clone()),
-        signal_msg("forge-multi-repo", 2),
-    );
+    submit(&mut host, 0, Origin::System, schedule_msg("forge-multi-repo", 10, 2));
+    submit(&mut host, 1, Origin::External(m0.clone()), signal_msg("forge-multi-repo", 2));
+    submit(&mut host, 2, Origin::External(m1.clone()), signal_msg("forge-multi-repo", 2));
     let before = status(&host);
     assert_eq!(before.current_version, 0);
     assert!(before.pending.is_some());
@@ -112,17 +97,9 @@ fn advance_injection_arms_and_frees_slot() {
 
     // a block AT the activation height: the root op is a (harmless, idempotent)
     // re-signal; the drain then injects the System Advance in the SAME block.
-    submit(
-        &mut host,
-        10,
-        Origin::External(m0.clone()),
-        signal_msg("forge-multi-repo", 2),
-    );
+    submit(&mut host, 10, Origin::External(m0.clone()), signal_msg("forge-multi-repo", 2));
     let after = status(&host);
-    assert_eq!(
-        after.current_version, 2,
-        "Advance flipped to to_version at H"
-    );
+    assert_eq!(after.current_version, 2, "Advance flipped to to_version at H");
     assert!(after.pending.is_none(), "pending cleared");
     assert_eq!(after.ready_count, 0, "readiness cleared");
 
@@ -140,33 +117,15 @@ fn advance_injection_aborts_on_unmet_quorum() {
     let members = vec![m0.clone(), m1.clone()];
     let mut host = host_with(&members);
 
-    submit(
-        &mut host,
-        0,
-        Origin::System,
-        schedule_msg("forge-multi-repo", 10, 2),
-    );
+    submit(&mut host, 0, Origin::System, schedule_msg("forge-multi-repo", 10, 2));
     // only m0 signals — m1 is a straggler.
-    submit(
-        &mut host,
-        1,
-        Origin::External(m0.clone()),
-        signal_msg("forge-multi-repo", 2),
-    );
+    submit(&mut host, 1, Origin::External(m0.clone()), signal_msg("forge-multi-repo", 2));
     assert!(!status(&host).armed, "R < n");
 
     // at H the drain injects Advance; the root op is a neutral re-signal.
-    submit(
-        &mut host,
-        10,
-        Origin::External(m0.clone()),
-        signal_msg("forge-multi-repo", 2),
-    );
+    submit(&mut host, 10, Origin::External(m0.clone()), signal_msg("forge-multi-repo", 2));
     let after = status(&host);
-    assert_eq!(
-        after.current_version, 0,
-        "abort leaves current_version unchanged"
-    );
+    assert_eq!(after.current_version, 0, "abort leaves current_version unchanged");
     assert!(after.pending.is_none(), "abort clears pending");
     assert_eq!(after.ready_count, 0, "abort clears readiness");
 
@@ -184,29 +143,15 @@ fn no_injection_below_activation_height() {
     let mut host = host_with(&members);
 
     submit(&mut host, 0, Origin::System, schedule_msg("n", 10, 2));
-    submit(
-        &mut host,
-        1,
-        Origin::External(m0.clone()),
-        signal_msg("n", 2),
-    );
+    submit(&mut host, 1, Origin::External(m0.clone()), signal_msg("n", 2));
     let root_before = host.module_root("upgrade");
 
     // a block at height 9 (< 10): no Advance, no flip, root unmoved.
-    submit(
-        &mut host,
-        9,
-        Origin::External(m0.clone()),
-        signal_msg("n", 2),
-    );
+    submit(&mut host, 9, Origin::External(m0.clone()), signal_msg("n", 2));
     let after = status(&host);
     assert_eq!(after.current_version, 0);
     assert!(after.pending.is_some());
-    assert_eq!(
-        host.module_root("upgrade"),
-        root_before,
-        "root unmoved below H"
-    );
+    assert_eq!(host.module_root("upgrade"), root_before, "root unmoved below H");
 }
 
 /// INERT before the retrofit: a host WITHOUT the upgrade module registered runs
@@ -231,23 +176,10 @@ fn inert_without_upgrade_module() {
         origin: Origin::External(m0),
         protocol_version: BASELINE_VERSION,
     };
-    let err = block_on(host.submit_at(
-        ctx,
-        Msg {
-            target: "nop".into(),
-            payload: Vec::new(),
-        },
-    ))
-    .expect_err("unknown target rejects");
-    assert!(
-        matches!(err, SubmitError::Rejected(_)),
-        "clean rejection, not Fatal"
-    );
-    assert_eq!(
-        host.app_hash(),
-        hash_before,
-        "no upgrade activity, hash unmoved"
-    );
+    let err = block_on(host.submit_at(ctx, Msg { target: "nop".into(), payload: Vec::new() }))
+        .expect_err("unknown target rejects");
+    assert!(matches!(err, SubmitError::Rejected(_)), "clean rejection, not Fatal");
+    assert_eq!(host.app_hash(), hash_before, "no upgrade activity, hash unmoved");
 }
 
 /// If the finalized ROOT op at exactly `H` is REJECTED (so the whole block aborts
@@ -266,24 +198,9 @@ fn activation_defers_when_the_carrier_block_at_h_aborts() {
     let members = vec![m0.clone(), m1.clone()];
     let mut host = host_with(&members);
 
-    submit(
-        &mut host,
-        0,
-        Origin::System,
-        schedule_msg("forge-multi-repo", 10, 2),
-    );
-    submit(
-        &mut host,
-        1,
-        Origin::External(m0.clone()),
-        signal_msg("forge-multi-repo", 2),
-    );
-    submit(
-        &mut host,
-        2,
-        Origin::External(m1.clone()),
-        signal_msg("forge-multi-repo", 2),
-    );
+    submit(&mut host, 0, Origin::System, schedule_msg("forge-multi-repo", 10, 2));
+    submit(&mut host, 1, Origin::External(m0.clone()), signal_msg("forge-multi-repo", 2));
+    submit(&mut host, 2, Origin::External(m1.clone()), signal_msg("forge-multi-repo", 2));
     assert!(status(&host).armed, "R == n before the boundary");
 
     // a block AT H=10 whose ROOT op is REJECTED (a SignalReady from a non-member):
@@ -300,30 +217,16 @@ fn activation_defers_when_the_carrier_block_at_h_aborts() {
         .expect_err("a non-member SignalReady rejects the whole block at H");
     assert!(matches!(err, SubmitError::Rejected(_)));
     let deferred = status(&host);
-    assert_eq!(
-        deferred.current_version, 0,
-        "an aborted carrier block defers activation"
-    );
-    assert!(
-        deferred.pending.is_some(),
-        "pending survives the aborted block"
-    );
+    assert_eq!(deferred.current_version, 0, "an aborted carrier block defers activation");
+    assert!(deferred.pending.is_some(), "pending survives the aborted block");
 
     // the NEXT applied block (>= H) re-injects the Advance and activation lands —
     // deterministic self-heal; the slot then frees.
-    submit(
-        &mut host,
-        11,
-        Origin::External(m0.clone()),
-        signal_msg("forge-multi-repo", 2),
-    );
+    submit(&mut host, 11, Origin::External(m0.clone()), signal_msg("forge-multi-repo", 2));
     let healed = status(&host);
     assert_eq!(
         healed.current_version, 2,
         "activation self-heals at the first APPLIED block >= H"
     );
-    assert!(
-        healed.pending.is_none(),
-        "pending cleared on the healed boundary"
-    );
+    assert!(healed.pending.is_none(), "pending cleared on the healed boundary");
 }

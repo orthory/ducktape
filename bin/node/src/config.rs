@@ -307,10 +307,7 @@ impl NetworkDescriptor {
             let expected_key = decode_key(k)?;
             by_key.insert(
                 expected_key.as_ref().to_vec(),
-                ReachHint {
-                    expected_key,
-                    reach: Reach::Direct(addr.to_string()),
-                },
+                ReachHint { expected_key, reach: Reach::Direct(addr.to_string()) },
             );
         }
         for s in &self.reach {
@@ -349,10 +346,7 @@ impl NetworkDescriptor {
                     None => continue, // unspecified ip / port 0 — advisory noise.
                 },
                 Reach::Coordinated(c) => match ingress_of(&c.coord_addr)? {
-                    Some(coord) => ReachDial::Coordinated {
-                        coord,
-                        coord_key: c.coord_key.clone(),
-                    },
+                    Some(coord) => ReachDial::Coordinated { coord, coord_key: c.coord_key.clone() },
                     None => continue,
                 },
             };
@@ -501,9 +495,7 @@ pub fn save_invite_token(dir: &Path, token: &InviteToken) -> Result<(), String> 
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
-    let mut f = opts
-        .open(&path)
-        .map_err(|e| format!("create {path:?}: {e}"))?;
+    let mut f = opts.open(&path).map_err(|e| format!("create {path:?}: {e}"))?;
     f.write_all(format!("{}\n", hex_bytes(&pack_invite_token(token))).as_bytes())
         .map_err(|e| format!("write {path:?}: {e}"))
 }
@@ -673,11 +665,7 @@ impl ReachHint {
             Reach::Direct(a) => format!("direct:{ek}@{a}"),
             Reach::Fronted(a) => format!("fronted:{ek}@{a}"),
             Reach::Coordinated(c) => {
-                format!(
-                    "coordinated:{ek}@{}#{}",
-                    c.coord_addr,
-                    hex_bytes(c.coord_key.as_ref())
-                )
+                format!("coordinated:{ek}@{}#{}", c.coord_addr, hex_bytes(c.coord_key.as_ref()))
             }
         }
     }
@@ -704,10 +692,7 @@ impl ReachHint {
             }
             other => return Err(format!("unknown reach tag {other:?} in {s:?}")),
         };
-        Ok(Self {
-            expected_key,
-            reach,
-        })
+        Ok(Self { expected_key, reach })
     }
 }
 
@@ -783,23 +768,17 @@ fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec
     }];
 
     let cid = d.chain_id.as_bytes();
-    out.push(
-        u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?,
-    );
+    out.push(u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?);
     out.extend_from_slice(cid);
 
     let vkeys = d.validator_keys()?; // hex -> raw, deduped, rejects malformed here
-    out.push(
-        u8::try_from(vkeys.len()).map_err(|_| format!("too many validators ({})", vkeys.len()))?,
-    );
+    out.push(u8::try_from(vkeys.len()).map_err(|_| format!("too many validators ({})", vkeys.len()))?);
     for k in &vkeys {
         out.extend_from_slice(k.as_ref());
     }
 
     let hints = d.reach_hints()?;
-    out.push(
-        u8::try_from(hints.len()).map_err(|_| format!("too many reach hints ({})", hints.len()))?,
-    );
+    out.push(u8::try_from(hints.len()).map_err(|_| format!("too many reach hints ({})", hints.len()))?);
     for h in &hints {
         out.extend_from_slice(h.expected_key.as_ref());
         match &h.reach {
@@ -827,9 +806,7 @@ fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec
 /// length-prefix (u8) a short utf-8 string into the packed buffer.
 fn put_str_u8(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
     let b = s.as_bytes();
-    out.push(
-        u8::try_from(b.len()).map_err(|_| format!("string too long ({} bytes): {s:?}", b.len()))?,
-    );
+    out.push(u8::try_from(b.len()).map_err(|_| format!("string too long ({} bytes): {s:?}", b.len()))?);
     out.extend_from_slice(b);
     Ok(())
 }
@@ -849,8 +826,7 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
         ));
     }
     let cid_len = r.u8()? as usize;
-    let chain_id =
-        String::from_utf8(r.take(cid_len)?.to_vec()).map_err(|e| format!("chain_id: {e}"))?;
+    let chain_id = String::from_utf8(r.take(cid_len)?.to_vec()).map_err(|e| format!("chain_id: {e}"))?;
 
     let vcount = r.u8()? as usize;
     let mut validators = Vec::with_capacity(vcount);
@@ -869,20 +845,11 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
             2 => {
                 let coord_addr = r.take_str_u8()?;
                 let coord_key = r.take_key()?;
-                Reach::Coordinated(CoordRef {
-                    coord_addr,
-                    coord_key,
-                })
+                Reach::Coordinated(CoordRef { coord_addr, coord_key })
             }
             other => return Err(format!("unknown reach tag {other} in v3 invite")),
         };
-        reach.push(
-            ReachHint {
-                expected_key,
-                reach: reach_val,
-            }
-            .to_canonical(),
-        );
+        reach.push(ReachHint { expected_key, reach: reach_val }.to_canonical());
     }
     reach.sort();
     // a v3 payload carries the lobby token; v2 stops after the descriptor.
@@ -1276,9 +1243,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     for (key, dial) in descriptor.reach_entries()? {
         match dial {
             ReachDial::Direct(ingress) => bootstrap.push((key, ingress)),
-            ReachDial::Coordinated { coord, coord_key } => {
-                coordinated.push((key, coord, coord_key))
-            }
+            ReachDial::Coordinated { coord, coord_key } => coordinated.push((key, coord, coord_key)),
         }
     }
     // mesh = validators ∪ every reach identity (direct + coordinated) ∪ the
@@ -2130,14 +2095,8 @@ bootstrapper_addr = "127.0.0.1:52200"
         let ek = ed25519::PrivateKey::from_seed(11).public_key();
         let ck = ed25519::PrivateKey::from_seed(12).public_key();
         let cases = [
-            ReachHint {
-                expected_key: ek.clone(),
-                reach: Reach::Direct("127.0.0.1:9000".into()),
-            },
-            ReachHint {
-                expected_key: ek.clone(),
-                reach: Reach::Fronted("front.example.com:443".into()),
-            },
+            ReachHint { expected_key: ek.clone(), reach: Reach::Direct("127.0.0.1:9000".into()) },
+            ReachHint { expected_key: ek.clone(), reach: Reach::Fronted("front.example.com:443".into()) },
             ReachHint {
                 expected_key: ek.clone(),
                 reach: Reach::Coordinated(CoordRef {
@@ -2159,10 +2118,7 @@ bootstrapper_addr = "127.0.0.1:52200"
         assert!(ReachHint::parse("bogus:00@host:1").is_err(), "unknown tag");
         assert!(ReachHint::parse("direct:zz@host:1").is_err(), "bad hex key");
         // coordinated without the #coord_key delimiter:
-        assert!(
-            ReachHint::parse("coordinated:00@host:1").is_err(),
-            "missing #coord_key"
-        );
+        assert!(ReachHint::parse("coordinated:00@host:1").is_err(), "missing #coord_key");
     }
 
     #[test]
@@ -2178,10 +2134,7 @@ bootstrapper_addr = "127.0.0.1:52200"
         // an existing network.toml without a [reach] array still parses (serde default),
         // and an empty reach is not serialised (skip_serializing_if).
         assert!(!d.to_toml().contains("reach"));
-        d.add_reach(&ReachHint {
-            expected_key: a.clone(),
-            reach: Reach::Direct("10.0.0.1:9000".into()),
-        });
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("10.0.0.1:9000".into()) });
         let back = NetworkDescriptor::from_toml(&d.to_toml()).expect("roundtrip");
         assert_eq!(back.reach, d.reach);
     }
@@ -2199,13 +2152,7 @@ bootstrapper_addr = "127.0.0.1:52200"
         d.add_bootstrap(&a, "127.0.0.1:52200");
         let hints = d.reach_hints().expect("hints");
         assert_eq!(hints.len(), 1);
-        assert_eq!(
-            hints[0],
-            ReachHint {
-                expected_key: a,
-                reach: Reach::Direct("127.0.0.1:52200".into())
-            }
-        );
+        assert_eq!(hints[0], ReachHint { expected_key: a, reach: Reach::Direct("127.0.0.1:52200".into()) });
     }
 
     #[test]
@@ -2219,23 +2166,14 @@ bootstrapper_addr = "127.0.0.1:52200"
             bootstrap: vec![],
             reach: vec![],
         };
-        d.add_reach(&ReachHint {
-            expected_key: a.clone(),
-            reach: Reach::Direct("1.1.1.1:1".into()),
-        });
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("1.1.1.1:1".into()) });
         // same expected_key, different reach — replaces, never duplicates.
         d.add_reach(&ReachHint {
             expected_key: a.clone(),
-            reach: Reach::Coordinated(CoordRef {
-                coord_addr: "c:2".into(),
-                coord_key: coord,
-            }),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "c:2".into(), coord_key: coord }),
         });
         assert_eq!(d.reach.len(), 1);
-        assert!(matches!(
-            d.reach_hints().unwrap()[0].reach,
-            Reach::Coordinated(_)
-        ));
+        assert!(matches!(d.reach_hints().unwrap()[0].reach, Reach::Coordinated(_)));
         let mut sorted = d.reach.clone();
         sorted.sort();
         assert_eq!(d.reach, sorted);
@@ -2258,20 +2196,14 @@ bootstrapper_addr = "127.0.0.1:52200"
         with_reach.add_bootstrap(&v, "127.0.0.1:52200");
         with_reach.add_reach(&ReachHint {
             expected_key: v.clone(),
-            reach: Reach::Coordinated(CoordRef {
-                coord_addr: "p2p:7777".into(),
-                coord_key: coord,
-            }),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "p2p:7777".into(), coord_key: coord }),
         });
 
         // advisory reach + bootstrap NEVER move the consensus identity.
         assert_eq!(with_reach.genesis_namespace(), ns0);
         // two descriptors differing ONLY in reach fingerprint identically.
         let mut other_reach = base.clone();
-        other_reach.add_reach(&ReachHint {
-            expected_key: v,
-            reach: Reach::Direct("9.9.9.9:9".into()),
-        });
+        other_reach.add_reach(&ReachHint { expected_key: v, reach: Reach::Direct("9.9.9.9:9".into()) });
         assert_eq!(other_reach.genesis_namespace(), ns0);
     }
 
@@ -2293,19 +2225,13 @@ bootstrapper_addr = "127.0.0.1:52200"
         // key ride along for the nat client to rendezvous through.
         d.add_reach(&ReachHint {
             expected_key: target.clone(),
-            reach: Reach::Coordinated(CoordRef {
-                coord_addr: "127.0.0.1:59999".into(),
-                coord_key: coord.clone(),
-            }),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "127.0.0.1:59999".into(), coord_key: coord.clone() }),
         });
         let entries = d.reach_entries().expect("resolve");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, target); // expect target key
         match &entries[0].1 {
-            ReachDial::Coordinated {
-                coord: c,
-                coord_key,
-            } => {
+            ReachDial::Coordinated { coord: c, coord_key } => {
                 assert_eq!(*c, Ingress::Socket("127.0.0.1:59999".parse().unwrap()));
                 assert_eq!(*coord_key, coord);
             }
@@ -2328,19 +2254,12 @@ bootstrapper_addr = "127.0.0.1:52200"
         let entries = d.reach_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, a);
-        assert!(
-            matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52200".parse().unwrap()))
-        );
+        assert!(matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52200".parse().unwrap())));
         // ...and an explicit reach hint for the same key wins over it (union,
         // reach-preferred), still one Direct entry.
-        d.add_reach(&ReachHint {
-            expected_key: a.clone(),
-            reach: Reach::Direct("127.0.0.1:52201".into()),
-        });
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("127.0.0.1:52201".into()) });
         let entries = d.reach_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(
-            matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52201".parse().unwrap()))
-        );
+        assert!(matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52201".parse().unwrap())));
     }
 }

@@ -797,15 +797,19 @@ struct IndexOpsResponse {
 }
 
 fn index_store(handle: &NodeHandle) -> Result<&Arc<indexer::IndexStore>, Response> {
-    handle
-        .index
-        .as_ref()
-        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "no index store configured"))
+    handle.index.as_ref().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no index store configured",
+        )
+    })
 }
 
 fn index_error(err: indexer::Error) -> Response {
     let status = match err {
-        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => StatusCode::NOT_FOUND,
+        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => {
+            StatusCode::NOT_FOUND
+        }
         indexer::Error::View(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -909,7 +913,10 @@ async fn index_view(
     match store.view(&module, &req_bytes) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "view reply was not json",
+            ),
         },
         Err(err) => index_error(err),
     }
@@ -941,7 +948,8 @@ async fn index_scan(
         .entries
         .iter()
         .map(|(key, value)| {
-            let json: Option<Box<serde_json::value::RawValue>> = serde_json::from_slice(value).ok();
+            let json: Option<Box<serde_json::value::RawValue>> =
+                serde_json::from_slice(value).ok();
             IndexEntry {
                 key: String::from_utf8_lossy(key).into_owned(),
                 value_hex: json.is_none().then(|| hex_bytes(value)),
@@ -973,7 +981,10 @@ pub struct BlocksParams {
 /// history survives a restart. heartbeat nops never get a row, so an empty
 /// reply means no real ops have finalized, not an idle chain. a handle with
 /// no index store configured serves the same "no blocks yet" shape.
-async fn blocks(State(handle): State<NodeHandle>, Query(params): Query<BlocksParams>) -> Response {
+async fn blocks(
+    State(handle): State<NodeHandle>,
+    Query(params): Query<BlocksParams>,
+) -> Response {
     let Some(store) = handle.index.as_ref() else {
         return Json(serde_json::json!({ "blocks": [] })).into_response();
     };
@@ -1418,10 +1429,7 @@ async fn git_receive_pack(
         return (
             StatusCode::OK,
             [
-                (
-                    header::CONTENT_TYPE,
-                    "application/x-git-receive-pack-result",
-                ),
+                (header::CONTENT_TYPE, "application/x-git-receive-pack-result"),
                 (header::CACHE_CONTROL, "no-cache"),
             ],
             GIT_FLUSH_PKT.to_vec(),

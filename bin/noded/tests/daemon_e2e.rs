@@ -591,9 +591,7 @@ fn state_persists_across_restart() {
     assert_eq!(post["hash"], "");
     assert_eq!(post["proposer"], "65646479");
     assert!(
-        post["operations"]
-            .as_array()
-            .is_some_and(|ops| !ops.is_empty()),
+        post["operations"].as_array().is_some_and(|ops| !ops.is_empty()),
         "the dispatch trace rides the row: {post}"
     );
 }
@@ -616,11 +614,7 @@ fn per_module_index_serves_ops_and_views() {
             None,
         );
         assert_eq!(code, 200);
-        let (code, _) = daemon.submit(
-            "chat",
-            post_message("eng", "m1", "fluent index demo"),
-            Some("eddy"),
-        );
+        let (code, _) = daemon.submit("chat", post_message("eng", "m1", "fluent index demo"), Some("eddy"));
         assert_eq!(code, 200);
         let (code, _) = daemon.submit(
             "tasks",
@@ -709,11 +703,7 @@ fn per_module_index_serves_ops_and_views() {
     assert_eq!(code, 200);
     assert_eq!(hits_of(&reply).len(), 1, "index survives a restart");
 
-    let (code, _) = daemon.submit(
-        "chat",
-        post_message("eng", "m2", "fresh after restart"),
-        Some("eddy"),
-    );
+    let (code, _) = daemon.submit("chat", post_message("eng", "m2", "fresh after restart"), Some("eddy"));
     assert_eq!(code, 200);
     let (code, reply) = daemon.request(
         "POST",
@@ -1138,9 +1128,7 @@ fn git_clone_over_http_round_trips_full_history() {
 #[test]
 fn git_push_larger_than_post_buffer_uses_the_probe_path() {
     if !have_git() {
-        eprintln!(
-            "skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH"
-        );
+        eprintln!("skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH");
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");

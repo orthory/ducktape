@@ -160,8 +160,9 @@ fn protocol_version_is_never_folded_into_any_root_or_app_hash() {
     deterministic::Runner::default().start(|_| async move {
         async fn run_block(version: u32) -> (StateRoot, StateRoot, Vec<u32>) {
             let seen = Rc::new(RefCell::new(Vec::new()));
-            let mut host = Host::genesis(vec![Box::new(ProbeModule::new("a", None, seen.clone()))])
-                .expect("genesis");
+            let mut host =
+                Host::genesis(vec![Box::new(ProbeModule::new("a", None, seen.clone()))])
+                    .expect("genesis");
             host.submit_at(
                 ctx_v(9, version),
                 Msg {
@@ -201,8 +202,9 @@ fn default_context_and_legacy_submit_are_baseline() {
         assert_eq!(BlockContext::default().protocol_version, BASELINE_VERSION);
 
         let seen = Rc::new(RefCell::new(Vec::new()));
-        let mut host = Host::genesis(vec![Box::new(ProbeModule::new("a", None, seen.clone()))])
-            .expect("genesis");
+        let mut host =
+            Host::genesis(vec![Box::new(ProbeModule::new("a", None, seen.clone()))])
+                .expect("genesis");
         host.submit(Msg {
             target: "a".into(),
             payload: Vec::new(),
@@ -243,17 +245,9 @@ fn effective_version_derivation_over_committed_state() {
         .expect("genesis");
 
         // below H -> stored current_version; at/after H -> to_version.
-        assert_eq!(
-            host.effective_version(9).await,
-            1,
-            "below H runs OLD version"
-        );
+        assert_eq!(host.effective_version(9).await, 1, "below H runs OLD version");
         assert_eq!(host.effective_version(10).await, 2, "at H runs to_version");
-        assert_eq!(
-            host.effective_version(11).await,
-            2,
-            "after H runs to_version"
-        );
+        assert_eq!(host.effective_version(11).await, 2, "after H runs to_version");
 
         // not armed (a straggler unready): a boundary member missing from ready,
         // so the shared predicate the host runs never flips — even past H. (the
@@ -267,8 +261,8 @@ fn effective_version_derivation_over_committed_state() {
             armed: false,
             ..armed
         };
-        let host =
-            Host::genesis(vec![Box::new(StatusModule { status: not_armed })]).expect("genesis");
+        let host = Host::genesis(vec![Box::new(StatusModule { status: not_armed })])
+            .expect("genesis");
         assert_eq!(
             host.effective_version(100).await,
             1,
@@ -283,8 +277,8 @@ fn effective_version_derivation_over_committed_state() {
 fn effective_version_falls_back_to_baseline_when_module_absent() {
     deterministic::Runner::default().start(|_| async move {
         let seen = Rc::new(RefCell::new(Vec::new()));
-        let host =
-            Host::genesis(vec![Box::new(ProbeModule::new("a", None, seen))]).expect("genesis");
+        let host = Host::genesis(vec![Box::new(ProbeModule::new("a", None, seen))])
+            .expect("genesis");
         assert_eq!(
             host.effective_version(12345).await,
             BASELINE_VERSION,
