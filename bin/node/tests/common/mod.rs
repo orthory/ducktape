@@ -413,6 +413,14 @@ impl Cluster {
         self.nodes[idx] = None; // NodeProc::drop kills + waits
     }
 
+    /// remove node `idx`'s storage directory — a killed slot reused as a
+    /// FRESH observer (the sync-only rebuild) must not inherit the previous
+    /// occupant's state or index locks.
+    pub fn wipe_storage(&self, idx: usize) {
+        let id = self.peer_ids[idx];
+        let _ = std::fs::remove_dir_all(self.dir.path().join(format!("storage-{id}")));
+    }
+
     /// send SIGTERM to node `idx` WITHOUT reaping it — the graceful-quit fault
     /// the desktop shell injects when it SIGTERMs the daemon on app quit. the
     /// node's own signal arm should run its final checkpoint and exit 0; the

@@ -10,8 +10,10 @@
 //!   4. converged != genesis                -> ops actually applied
 //!   5. chat posted via node 0 reads on 1   -> rpc -> consensus -> cross-apply
 //!   6. governance admits a 4th key         -> member gating, votes, tally
-//!   7. all validators cut over to epoch 1  -> live engine teardown + respawn
-//!   8. post-cutover post reads on node 2   -> the epoch-1 engines finalize
+//!   7. two-phase activation                -> registration cutover (standby,
+//!      quorum unchanged), then node 3 syncs + announces online, a member
+//!      relays the proof, and the ACTIVATION cutover widens the quorum
+//!   8. post-cutover post reads on node 2   -> the respawned engines finalize
 //!   9. status app-hashes agree             -> the boundary a joiner rebuilds
 //!  10. sync-only joiner hash parity        -> network statesync, full rebuild
 //!
@@ -211,14 +213,27 @@ fn cluster_lifecycle() {
         proposal_status(&cluster, 0, "admit-node3").filter(|(s, _)| *s == ProposalStatus::Passed)
     });
 
-    // 7. LIVE EPOCH CUTOVER: the valset change schedules a cutover at
-    // observed_view + CUTOVER_DELAY; finalized views only advance with ops,
-    // so push fillers until every validator respawns onto the 4-member set.
-    // fillers go through the raw rpc and tolerate rejection — an op caught
-    // mid-teardown dies with its epoch's content store by design.
+    // activation is NODE-ATTESTED now: an admitted key that never shows up
+    // stays standby forever (and costs the quorum nothing) — so node 3 must
+    // actually run to get activated. it boots as a parked joiner, probes its
+    // registration, proves a sync, and announces online.
+    cluster.spawn(3);
+    cluster.wait_marker(3, "joiner mode: parking", Duration::from_secs(60));
+
+    // 7. TWO-PHASE ACTIVATION. the passed proposal registered node 3 as
+    // STANDBY: cutover #1 (epoch 1) re-tracks the transport mesh with the
+    // standby key but the quorum stays 3. node 3's parked loop then probes
+    // its registration from the valset snapshot, verifies a full state sync,
+    // and announces ONLINE over the lobby with its own signed proof; a member
+    // relays it into the ordered lane and cutover #2 (epoch 2) widens the
+    // quorum to 4 — at which point node 3 sees itself in the participant set
+    // and promotes. finalized views only advance with ops, so push fillers
+    // through both boundaries. fillers go through the raw rpc and tolerate
+    // rejection — an op caught mid-teardown dies with its epoch's content
+    // store by design.
     let mut filler = 0u32;
     let mut last_filler = std::time::Instant::now() - Duration::from_secs(1);
-    poll_until("all validators to cut over to epoch 1", CONVERGE, || {
+    poll_until("standby registration, online relay, activation", CONVERGE, || {
         if last_filler.elapsed() >= Duration::from_secs(1) {
             last_filler = std::time::Instant::now();
             filler += 1;
@@ -236,9 +251,19 @@ fn cluster_lifecycle() {
             );
         }
         (0..3)
-            .all(|i| cluster.marker(i, "cutover complete: epoch 1").is_some())
+            .all(|i| cluster.marker(i, "cutover complete: epoch 2").is_some())
             .then_some(())
     });
+    // the activation was node-attested: a member relayed node 3's own signed
+    // online announce, and node 3 proved a full state sync first.
+    assert!(
+        (0..3).any(|i| cluster.marker(i, "online announce from standby").is_some()),
+        "some member must have relayed node 3's online proof"
+    );
+    cluster.wait_marker(3, "standby: state verified", Duration::from_secs(30));
+    // the activated key sees itself in the epoch-2 participant set and
+    // promotes through the normal restore path.
+    cluster.wait_marker(3, "promoted: validator at epoch 2", CONVERGE);
 
     // 8. the epoch-1 engines must still finalize: post through the respawned
     // net via node 0, read on node 2.
@@ -356,7 +381,12 @@ fn cluster_lifecycle() {
         .expect("status carries app_hash");
 
     // 10. the sync-only joiner rebuilds EVERY module over the statesync
-    // channel from node 0 and must compose the identical app-hash.
+    // channel from node 0 and must compose the identical app-hash. node 3's
+    // slot is reused as a FRESH observer: kill the promoted validator
+    // (quorum(4) = 3 keeps the network live — nops move heights, not state,
+    // so the step-9 boundary hash stands) and wipe its state.
+    cluster.kill(3);
+    cluster.wipe_storage(3);
     let (ok, log) = cluster.run_sync_only(3, Duration::from_secs(120));
     assert!(ok, "sync-only joiner failed:\n{log}");
     let synced = log

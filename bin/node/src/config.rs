@@ -563,10 +563,16 @@ pub fn guard_join_descriptor(dir: &Path, incoming: &NetworkDescriptor) -> Result
 /// (0.0.0.0/[::]) or on port 0 is never dialable — writing one would hand every
 /// joiner a hint that resolves to their own loopback. an explicitly-passed
 /// advertised that is not dialable is an ERROR (the caller asked for it); a
-/// non-dialable listen just means "no hint" (Ok(None)).
+/// non-dialable listen just means "no hint" (Ok(None)). the `"overlay"`
+/// sentinel is also "no hint", not an error: the overlay ULA is dialable only
+/// over an established tunnel, so it must never be minted into an invite a
+/// fresh joiner would dial cold.
 pub fn dialable(advertised: Option<&str>, listen: &str) -> Result<Option<String>, String> {
     if let Some(a) = advertised {
         let a = a.trim();
+        if a == "overlay" {
+            return Ok(None);
+        }
         match a.parse::<SocketAddr>() {
             // an IP literal must be concrete.
             Ok(addr) if addr.ip().is_unspecified() || addr.port() == 0 => {
@@ -1270,14 +1276,12 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     }
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
-    let advertised: Ingress = match raw.advertised.as_deref() {
-        // an explicitly-configured advertised that can never be dialed is a
-        // config error; a hostname is kept VERBATIM (no boot-time DNS).
-        Some(a) => ingress_of(a)
-            .map_err(|e| format!("advertised: {e}"))?
-            .ok_or_else(|| format!("advertised addr {a:?} is not dialable"))?,
-        None => Ingress::Socket(listen),
-    };
+    let advertised = resolve_advertised(
+        raw.advertised.as_deref(),
+        listen,
+        &descriptor.genesis_namespace(),
+        &me,
+    )?;
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
@@ -1329,6 +1333,46 @@ fn parse_wireguard_effect(raw: Option<&str>) -> Result<WireGuardEffectKind, Stri
         Some(other) => Err(format!(
             "wireguard_effect: {other:?} is not \"real\" or \"fake\""
         )),
+    }
+}
+
+/// resolve the `advertised` config value into a dial ingress. the sentinel
+/// `"overlay"` advertises this node's chain-derived WireGuard overlay address
+/// (`ula_v6_member_addr(namespace, identity)`) at the mesh listen port — the
+/// address peers can dial once a tunnel to this node is up, and the RIGHT
+/// advertisement for a member with no dialable underlay address (NAT, zero
+/// exposed ports). the overlay is IPv6, so it requires an IPv6 mesh listener
+/// (`listen = "[::]:port"` accepts both families on a default dual-stack
+/// host); a v4-only listener would never see the tunnel's SYNs.
+fn resolve_advertised(
+    raw: Option<&str>,
+    listen: SocketAddr,
+    namespace: &str,
+    me: &ed25519::PublicKey,
+) -> Result<Ingress, String> {
+    match raw {
+        Some("overlay") => {
+            if !listen.is_ipv6() {
+                return Err(format!(
+                    "advertised = \"overlay\" needs an IPv6 mesh listener to accept tunnel \
+                     traffic — set listen = \"[::]:{}\"",
+                    listen.port()
+                ));
+            }
+            let identity = wireguard_upgrade::ValidatorIdentity::try_from(me.as_ref())
+                .map_err(|e| format!("advertised: {e:?}"))?;
+            let ula = wireguard_upgrade::ula_v6_member_addr(namespace, identity);
+            Ok(Ingress::Socket(SocketAddr::new(
+                std::net::IpAddr::V6(ula),
+                listen.port(),
+            )))
+        }
+        // an explicitly-configured advertised that can never be dialed is a
+        // config error; a hostname is kept VERBATIM (no boot-time DNS).
+        Some(a) => ingress_of(a)
+            .map_err(|e| format!("advertised: {e}"))?
+            .ok_or_else(|| format!("advertised addr {a:?} is not dialable")),
+        None => Ok(Ingress::Socket(listen)),
     }
 }
 
@@ -1386,12 +1430,12 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     };
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
-    let advertised: Ingress = match raw.advertised.as_deref() {
-        Some(a) => ingress_of(a)
-            .map_err(|e| format!("advertised: {e}"))?
-            .ok_or_else(|| format!("advertised addr {a:?} is not dialable"))?,
-        None => Ingress::Socket(listen),
-    };
+    let advertised = resolve_advertised(
+        raw.advertised.as_deref(),
+        listen,
+        &namespace,
+        &ed25519::PrivateKey::from_seed(id).public_key(),
+    )?;
 
     let storage_dir = raw
         .storage_dir
@@ -1815,6 +1859,10 @@ mod tests {
         );
         assert!(dialable(Some("node.example.com:0"), "127.0.0.1:52200").is_err());
         assert!(dialable(Some("not-an-addr"), "127.0.0.1:52200").is_err());
+        // the overlay sentinel is "no underlay hint", never an error — an
+        // invite minted from an overlay-advertised member carries only the
+        // descriptor's existing reach hints.
+        assert!(dialable(Some("overlay"), "[::]:52200").unwrap().is_none());
     }
 
     #[cfg(unix)]
@@ -2088,6 +2136,38 @@ bootstrapper_addr = "127.0.0.1:52200"
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err("unknown effect refused");
         assert!(err.contains("wireguard_effect"), "{err}");
+    }
+
+    #[test]
+    fn overlay_advertised_derives_the_ula_and_requires_v6_listen() {
+        let dir = tmp("overlay-advertised");
+        let base = "id = 1\nnamespace = \"demo\"\npeer_seeds = [0, 1]\n\
+                    bootstrapper_addr = \"127.0.0.1:52240\"\n";
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}listen = \"[::]:52241\"\nadvertised = \"overlay\"\n"),
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve");
+        let identity = wireguard_upgrade::ValidatorIdentity::try_from(
+            ed25519::PrivateKey::from_seed(1).public_key().as_ref(),
+        )
+        .unwrap();
+        let ula = wireguard_upgrade::ula_v6_member_addr("demo", identity);
+        assert_eq!(
+            r.advertised,
+            Ingress::Socket(SocketAddr::new(std::net::IpAddr::V6(ula), 52241)),
+            "the overlay sentinel advertises the chain-derived ULA at the listen port"
+        );
+
+        // the overlay is v6: a v4-only listener would never see tunnel SYNs.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}listen = \"0.0.0.0:52241\"\nadvertised = \"overlay\"\n"),
+        )
+        .expect("write");
+        let err = resolve(&dir.join("node.toml")).expect_err("v4 listener refused");
+        assert!(err.contains("IPv6"), "{err}");
     }
 
     #[test]

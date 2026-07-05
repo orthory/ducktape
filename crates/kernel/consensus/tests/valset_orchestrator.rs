@@ -40,7 +40,7 @@ fn pending_upgrade(
 fn respawn_waits_until_cutover_view() {
     let mut orchestrator = ValsetOrchestrator::new(3, members(&["a", "b", "c"]));
 
-    let outcome = orchestrator.observe_members(10, members(&["a", "b", "c", "d"]));
+    let outcome = orchestrator.observe_members(10, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
     let cutover = match outcome {
         ObservationOutcome::Scheduled(cutover) => cutover,
         other => panic!("expected scheduled cutover, got {other:?}"),
@@ -49,13 +49,13 @@ fn respawn_waits_until_cutover_view() {
 
     assert!(
         orchestrator
-            .respawn_if_due(12, members(&["a", "b", "c", "d"]), no_pending())
+            .respawn_if_due(12, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>(), no_pending())
             .is_none()
     );
     assert_eq!(orchestrator.epoch(), 0);
 
     let respawn = orchestrator
-        .respawn_if_due(13, members(&["a", "b", "c", "d"]), no_pending())
+        .respawn_if_due(13, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>(), no_pending())
         .expect("cutover view should trigger the epoch respawn");
     assert_eq!(respawn.epoch(), 1);
     assert_eq!(respawn.epoch_base(), 13);
@@ -70,7 +70,7 @@ fn respawn_waits_until_cutover_view() {
 fn membership_change_schedules_one_cutover() {
     let mut orchestrator = ValsetOrchestrator::new(2, members(&["a", "b", "c"]));
 
-    let first = orchestrator.observe_members(7, members(&["a", "b", "c", "d"]));
+    let first = orchestrator.observe_members(7, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
     let cutover = match first {
         ObservationOutcome::Scheduled(cutover) => cutover,
         other => panic!("expected scheduled cutover, got {other:?}"),
@@ -78,7 +78,7 @@ fn membership_change_schedules_one_cutover() {
     assert_eq!(cutover.observed_view(), 7);
     assert_eq!(cutover.cutover_view(), 9);
 
-    let second = orchestrator.observe_members(8, members(&["a", "b", "c", "d"]));
+    let second = orchestrator.observe_members(8, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
     let pending = match second {
         ObservationOutcome::Pending(cutover) => cutover,
         other => panic!("expected existing pending cutover, got {other:?}"),
@@ -102,11 +102,11 @@ fn membership_change_schedules_one_cutover() {
 fn boundary_read_absorbs_a_second_change_inside_the_window() {
     let mut orchestrator = ValsetOrchestrator::new(3, members(&["a", "b", "c"]));
 
-    let armed = orchestrator.observe_members(10, members(&["a", "b", "c", "d"]));
+    let armed = orchestrator.observe_members(10, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
     assert!(matches!(armed, ObservationOutcome::Scheduled(_)));
 
     // view 11: "e" joins too. the boundary stays 13.
-    let second = orchestrator.observe_members(11, members(&["a", "b", "c", "d", "e"]));
+    let second = orchestrator.observe_members(11, members(&["a", "b", "c", "d", "e"]), std::iter::empty::<&str>());
     let pending = match second {
         ObservationOutcome::Pending(cutover) => cutover,
         other => panic!("expected pending, got {other:?}"),
@@ -114,7 +114,7 @@ fn boundary_read_absorbs_a_second_change_inside_the_window() {
     assert_eq!(pending.cutover_view(), 13);
 
     let respawn = orchestrator
-        .respawn_if_due(13, members(&["a", "b", "c", "d", "e"]), no_pending())
+        .respawn_if_due(13, members(&["a", "b", "c", "d", "e"]), std::iter::empty::<&str>(), no_pending())
         .expect("due at the armed boundary");
     assert_eq!(respawn.epoch(), 1);
     assert_eq!(
@@ -128,7 +128,7 @@ fn boundary_read_absorbs_a_second_change_inside_the_window() {
 
     // nothing further pending: the next identical observation is Unchanged.
     assert_eq!(
-        orchestrator.observe_members(14, members(&["a", "b", "c", "d", "e"])),
+        orchestrator.observe_members(14, members(&["a", "b", "c", "d", "e"]), std::iter::empty::<&str>()),
         ObservationOutcome::Unchanged
     );
 }
@@ -138,11 +138,11 @@ fn app_height_continues_across_respawn() {
     let mut orchestrator = ValsetOrchestrator::new(2, members(&["a", "b", "c"]));
 
     assert_eq!(orchestrator.app_height(8), 8);
-    orchestrator.observe_members(8, members(&["a", "b", "c", "d"]));
+    orchestrator.observe_members(8, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
     assert_eq!(orchestrator.app_height(9), 9);
 
     let respawn = orchestrator
-        .respawn_if_due(10, members(&["a", "b", "c", "d"]), no_pending())
+        .respawn_if_due(10, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>(), no_pending())
         .expect("cutover view should trigger the epoch respawn");
     assert_eq!(respawn.cutover_app_height(), 10);
     assert_eq!(orchestrator.epoch_base(), 10);
@@ -160,11 +160,11 @@ fn unchanged_valset_does_not_churn_epochs() {
         } else {
             members(&["a", "b", "c"])
         };
-        let outcome = orchestrator.observe_members(view, observed);
+        let outcome = orchestrator.observe_members(view, observed, std::iter::empty::<&str>());
         assert_eq!(outcome, ObservationOutcome::Unchanged);
         assert!(
             orchestrator
-                .respawn_if_due(view, members(&["a", "b", "c"]), no_pending())
+                .respawn_if_due(view, members(&["a", "b", "c"]), std::iter::empty::<&str>(), no_pending())
                 .is_none()
         );
     }
@@ -191,11 +191,11 @@ fn resume_rearms_a_pending_cutover() {
 
     // a further observation of the changed set stays Pending — the armed
     // boundary never moves.
-    let outcome = orchestrator.observe_members(12, members(&["a", "b", "c", "d"]));
+    let outcome = orchestrator.observe_members(12, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
     assert!(matches!(outcome, ObservationOutcome::Pending(_)));
 
     let respawn = orchestrator
-        .respawn_if_due(13, members(&["a", "b", "c", "d"]), no_pending())
+        .respawn_if_due(13, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>(), no_pending())
         .expect("resumed boundary triggers");
     assert_eq!(respawn.epoch(), 3);
     assert_eq!(respawn.epoch_base(), 113, "base 100 + cutover view 13");
@@ -240,7 +240,7 @@ fn boundary_read_flips_when_r_equals_n() {
 
     let boundary = pending_upgrade(1, "forge-multi-repo", 10, 2, &["a", "b", "c"]);
     let respawn = orchestrator
-        .respawn_if_due(10, members(&["a", "b", "c"]), boundary)
+        .respawn_if_due(10, members(&["a", "b", "c"]), std::iter::empty::<&str>(), boundary)
         .expect("version boundary crosses");
     assert_eq!(respawn.boundary_version(), 2, "R==n flips to to_version");
     assert_eq!(
@@ -264,7 +264,7 @@ fn straggler_aborts_upgrade_cleanly() {
     // only a, b signaled — c is a straggler.
     let boundary = pending_upgrade(1, "forge-multi-repo", 10, 2, &["a", "b"]);
     let respawn = orchestrator
-        .respawn_if_due(10, members(&["a", "b", "c"]), boundary)
+        .respawn_if_due(10, members(&["a", "b", "c"]), std::iter::empty::<&str>(), boundary)
         .expect("boundary still crosses (the membership/epoch boundary is real)");
     assert_eq!(
         respawn.boundary_version(),
@@ -289,7 +289,7 @@ fn non_member_ready_signals_are_dead_weight() {
     o1.observe_upgrade(6, 10);
     let boundary = pending_upgrade(1, "n", 10, 2, &["a", "b", "z"]);
     let respawn = o1
-        .respawn_if_due(10, members(&["a", "b", "c"]), boundary)
+        .respawn_if_due(10, members(&["a", "b", "c"]), std::iter::empty::<&str>(), boundary)
         .expect("crosses");
     assert_eq!(respawn.boundary_version(), 1);
     assert_eq!(
@@ -302,7 +302,7 @@ fn non_member_ready_signals_are_dead_weight() {
     o2.observe_upgrade(6, 10);
     let boundary = pending_upgrade(1, "n", 10, 2, &["a", "b", "c", "z"]);
     let respawn = o2
-        .respawn_if_due(10, members(&["a", "b", "c"]), boundary)
+        .respawn_if_due(10, members(&["a", "b", "c"]), std::iter::empty::<&str>(), boundary)
         .expect("crosses");
     assert_eq!(respawn.boundary_version(), 2, "dead keys don't block an armed set");
     assert_eq!(
@@ -321,7 +321,7 @@ fn coincident_membership_and_version_share_one_respawn() {
     let mut orchestrator = ValsetOrchestrator::new(3, members(&["a", "b", "c"]));
 
     // a membership change arms the single slot at view 13 (delay 3).
-    let armed = orchestrator.observe_members(10, members(&["a", "b", "c", "d"]));
+    let armed = orchestrator.observe_members(10, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
     assert!(matches!(armed, ObservationOutcome::Scheduled(_)));
 
     // a pending upgrade lands in the same window — it does NOT arm a competing
@@ -335,7 +335,7 @@ fn coincident_membership_and_version_share_one_respawn() {
     // carries the new valset AND the version flip.
     let boundary = pending_upgrade(1, "forge-multi-repo", 13, 2, &["a", "b", "c", "d"]);
     let respawn = orchestrator
-        .respawn_if_due(13, members(&["a", "b", "c", "d"]), boundary)
+        .respawn_if_due(13, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>(), boundary)
         .expect("coincident boundary crosses");
     assert_eq!(respawn.valset().consensus_members().len(), 4, "new valset");
     assert_eq!(respawn.boundary_version(), 2, "and the version flip");
@@ -359,13 +359,13 @@ fn version_cutover_absorbs_membership_change_inside_window() {
     assert!(matches!(scheduled, ObservationOutcome::Scheduled(_)));
 
     // a membership change inside the window rides the same boundary.
-    let absorbed = orchestrator.observe_members(11, members(&["a", "b", "c", "d"]));
+    let absorbed = orchestrator.observe_members(11, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
     assert!(matches!(absorbed, ObservationOutcome::Pending(_)));
 
     // boundary read: new members {a,b,c,d}, all ready ⇒ new valset + version flip.
     let boundary = pending_upgrade(1, "n", 13, 2, &["a", "b", "c", "d"]);
     let respawn = orchestrator
-        .respawn_if_due(13, members(&["a", "b", "c", "d"]), boundary)
+        .respawn_if_due(13, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>(), boundary)
         .expect("crosses");
     assert_eq!(respawn.valset().consensus_members().len(), 4);
     assert_eq!(respawn.boundary_version(), 2);
@@ -384,12 +384,12 @@ fn version_cutover_absorbs_membership_change_inside_window() {
 #[test]
 fn effective_version_pure_below_h() {
     let mut orchestrator = ValsetOrchestrator::new(3, members(&["a", "b", "c"]));
-    orchestrator.observe_members(10, members(&["a", "b", "c", "d"])); // cutover at 13
+    orchestrator.observe_members(10, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>()); // cutover at 13
 
     // pending activation is 20 — the membership boundary at app-height 13 is below it.
     let boundary = pending_upgrade(1, "n", 20, 2, &["a", "b", "c", "d"]);
     let respawn = orchestrator
-        .respawn_if_due(13, members(&["a", "b", "c", "d"]), boundary)
+        .respawn_if_due(13, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>(), boundary)
         .expect("membership boundary crosses");
     assert_eq!(respawn.cutover_app_height(), 13);
     assert_eq!(
@@ -408,10 +408,10 @@ fn abort_verdict_evaluated_exactly_once() {
     orchestrator.observe_upgrade(6, 10);
 
     let boundary = pending_upgrade(1, "n", 10, 2, &["a", "b"]); // straggler -> Abort
-    let first = orchestrator.respawn_if_due(10, members(&["a", "b", "c"]), boundary.clone());
+    let first = orchestrator.respawn_if_due(10, members(&["a", "b", "c"]), std::iter::empty::<&str>(), boundary.clone());
     assert!(first.is_some());
     // the slot is consumed — a second call yields nothing (no double-evaluation).
-    let second = orchestrator.respawn_if_due(10, members(&["a", "b", "c"]), boundary);
+    let second = orchestrator.respawn_if_due(10, members(&["a", "b", "c"]), std::iter::empty::<&str>(), boundary);
     assert!(second.is_none());
 }
 
@@ -427,7 +427,7 @@ fn resume_rearms_pending_upgrade() {
 
     let boundary = pending_upgrade(1, "n", 113, 2, &["a", "b", "c"]);
     let respawn = orchestrator
-        .respawn_if_due(13, members(&["a", "b", "c"]), boundary)
+        .respawn_if_due(13, members(&["a", "b", "c"]), std::iter::empty::<&str>(), boundary)
         .expect("resumed version boundary triggers");
     assert_eq!(respawn.cutover_app_height(), 113, "base 100 + view 13");
     assert_eq!(respawn.boundary_version(), 2, "re-armed upgrade flips at the same H");
@@ -446,10 +446,11 @@ fn resume_rearms_pending_upgrade() {
 fn boundary_decision_is_deterministic() {
     let build = || {
         let mut o = ValsetOrchestrator::new(3, members(&["a", "b", "c"]));
-        o.observe_members(10, members(&["a", "b", "c", "d"]));
+        o.observe_members(10, members(&["a", "b", "c", "d"]), std::iter::empty::<&str>());
         o.respawn_if_due(
             13,
             members(&["a", "b", "c", "d"]),
+            std::iter::empty::<&str>(),
             pending_upgrade(1, "forge-multi-repo", 13, 2, &["a", "b", "c", "d"]),
         )
         .expect("crosses")
@@ -464,5 +465,42 @@ fn boundary_decision_is_deterministic() {
             name: "forge-multi-repo".into(),
             to_version: 2
         }
+    );
+}
+
+/// a STANDBY-only registration arms a cutover — mesh re-tracking rides the
+/// same boundary discipline as quorum changes — but the respawned epoch's
+/// quorum is unchanged: the standby key appears only in transport
+/// membership. once it flips active (Online), the next observation arms the
+/// quorum change proper.
+#[test]
+fn standby_registration_arms_a_transport_only_cutover() {
+    let mut o = ValsetOrchestrator::new(3, members(&["a", "b", "c"]));
+    let outcome = o.observe_members(10, members(&["a", "b", "c"]), members(&["s"]));
+    assert!(matches!(outcome, ObservationOutcome::Scheduled(_)));
+    let plan = o
+        .respawn_if_due(13, members(&["a", "b", "c"]), members(&["s"]), no_pending())
+        .expect("crosses");
+    assert!(plan.valset().transport_members().contains("s"));
+    assert!(!plan.valset().consensus_members().contains("s"));
+    assert_eq!(plan.valset().consensus_members().len(), 3);
+
+    // the same picture re-observed is quiet — the transport baseline stuck.
+    assert!(matches!(
+        o.observe_members(14, members(&["a", "b", "c"]), members(&["s"])),
+        ObservationOutcome::Unchanged
+    ));
+
+    // activation: the key moves classes — a quorum change, new cutover.
+    let outcome = o.observe_members(15, members(&["a", "b", "c", "s"]), members(&[]));
+    assert!(matches!(outcome, ObservationOutcome::Scheduled(_)));
+    let plan = o
+        .respawn_if_due(18, members(&["a", "b", "c", "s"]), members(&[]), no_pending())
+        .expect("crosses");
+    assert!(plan.valset().consensus_members().contains("s"));
+    assert_eq!(
+        plan.valset().consensus_members(),
+        plan.valset().transport_members(),
+        "no standby left: the two projections coincide"
     );
 }

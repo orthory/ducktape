@@ -150,7 +150,7 @@ fn synced_store_reconstructs_source_root() {
 
         // JOINER: reconstruct on a FRESH context + namespace by pulling from
         // the resolver. no ops are applied in application order on this side.
-        let synced = Pages::sync_from(context.child("dst"), "dst", target, resolver).await;
+        let synced = Pages::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
 
         // THE PROPERTY: identical qmdb root — the app-hash linkage a joiner
         // needs at the boundary height.
@@ -201,7 +201,7 @@ fn synced_store_reproduces_the_page_index() {
 
         let target = src.sync_target().await;
         let resolver = src.into_resolver();
-        let synced = Pages::sync_from(context.child("dst"), "dst", target, resolver).await;
+        let synced = Pages::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
 
         assert_eq!(
             list_pages(&synced).await,

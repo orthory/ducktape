@@ -107,6 +107,7 @@ fn validator_count(host: &Host) -> usize {
         .expect("valset query");
     match valset_interface::decode_reply(&reply).expect("decode valset") {
         ValsetReply::Validators(v) => v.len(),
+        other => panic!("unexpected valset reply shape: {other:?}"),
     }
 }
 
@@ -270,9 +271,12 @@ fn boundary_with_optional_admission(admit_extra: bool) -> Host {
     apply(&mut host, 3, BASELINE_VERSION, Origin::External(m1.clone()), signal("forge-v2", TO_VERSION));
 
     if admit_extra {
-        // a fresh validator admitted DURING the open upgrade window — governance
-        // (module/system origin) drives valset membership. m2 runs an old binary
-        // (or simply hasn't signaled), so it is dead weight against R = n.
+        // a fresh validator ACTIVATED during the open upgrade window: the
+        // two-phase membership protocol registers it standby (Join), then
+        // its own online proof moves it into the quorum (Online) — upgrade
+        // readiness is measured over the ACTIVE set, so only the activated
+        // key counts. m2 runs an old binary (or simply hasn't signaled the
+        // upgrade), so it is dead weight against R = n.
         apply(
             &mut host,
             4,
@@ -283,7 +287,26 @@ fn boundary_with_optional_admission(admit_extra: bool) -> Host {
                 payload: valset_encode(&ValsetMsg::Join { key: m2.clone() }),
             },
         );
-        assert_eq!(validator_count(&host), 3, "m2 must be admitted before H");
+        let m2_signer = PrivateKey::from_seed(3);
+        let proof = m2_signer.sign(
+            valset_interface::ONLINE_PROOF_NS,
+            &valset_interface::online_proof_message(&m2, 5),
+        );
+        apply(
+            &mut host,
+            5,
+            BASELINE_VERSION,
+            Origin::System,
+            Msg {
+                target: "valset".into(),
+                payload: valset_encode(&ValsetMsg::Online {
+                    key: m2.clone(),
+                    signed_height: 5,
+                    signature: proof.as_ref().to_vec(),
+                }),
+            },
+        );
+        assert_eq!(validator_count(&host), 3, "m2 must be ACTIVE before H");
     } else {
         assert_eq!(validator_count(&host), 2, "no admission -> the schedule-time set");
     }

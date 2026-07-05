@@ -161,15 +161,21 @@ fn joiner_enters_through_a_sentry() {
     assert!(ok, "invite-accept failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
-    // the founder cuts over to epoch 1; epoch 1 stalls at its base (quorum
-    // 2-of-2) until the friend arrives — a frozen boundary at the genesis floor.
+    // two-phase activation. cutover #1 registers the friend as STANDBY
+    // (quorum stays 1, the founder keeps finalizing); the parked node then
+    // proves a sync, announces online through the sentry pipe, the founder
+    // relays the proof, and cutover #2 widens the quorum to 2 — epoch 2
+    // stalls at its base until the friend promotes there.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "standby: state verified", CONVERGE);
+    cluster.wait_marker(0, "online announce from standby", CONVERGE);
+    cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
 
     // the parked node syncs the boundary and promotes — every byte of that
     // handshake + state-sync crossed the sentry pipe.
-    cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "admitted at epoch 2", CONVERGE);
     cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
-    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch 2", CONVERGE);
     cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
 
     // sanity check that node 0 was reachable through the forwarder at all — a
