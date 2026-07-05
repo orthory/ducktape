@@ -13,17 +13,21 @@
 //
 // Skips (visibly) without a built binary: cargo build -p simnode.
 
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { WebSocket as WsWebSocket } from "ws";
 
+import { blocksText } from "../../domain/chat-client";
 import { remoteTransport } from "../../domain/transport";
+import type { SubmitReceipt } from "../../domain/transport";
 import {
   simnodeBinary,
   spawnSimnode,
   type SimNode,
   type SimSpawnOptions,
 } from "../../test/simnode-harness";
+import { ExplorerView } from "../views/explorer/ExplorerView";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { OP_STALE_MS, opKey } from "./finalization";
 import { useDucktape } from "./use-ducktape";
@@ -66,12 +70,13 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
     vi.unstubAllGlobals();
   });
 
-  const boot = async (options: SimSpawnOptions = {}) => {
+  const boot = async (options: SimSpawnOptions = {}, ui: ReactNode = null) => {
     live = await spawnSimnode(options);
     const transport = remoteTransport(live.base);
     render(
       <DucktapeProvider transport={transport}>
         <Probe />
+        {ui}
       </DucktapeProvider>,
     );
     await waitFor(() => expect(capturedState?.connected).toBe(true), {
@@ -211,6 +216,182 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       act(() => capturedActions!.openExplorerAt(1));
       expect(capturedState!.screen).toBe("explorer");
       expect(capturedState!.explorerFocus).toBe(1);
+    },
+  );
+
+  it(
+    "a genuinely rejected op fails its record with the module error and rolls back",
+    { timeout: 30_000 },
+    async () => {
+      const { sim } = await boot();
+
+      // a rival authors the channel and a message — peer blocks commit
+      // immediately, and with nothing pending the block-stream refresh is
+      // ungated, so committed truth reaches the app on its own.
+      await sim.peerBlock("chat", peerChannel("general", "General"), "rival");
+      await sim.peerBlock(
+        "chat",
+        {
+          PostMessage: {
+            channel_id: "general",
+            message_id: "m-rival",
+            blocks: [{ Paragraph: [{ text: "rival wrote this", marks: [] }] }],
+            thread: null,
+            as_agent: null,
+          },
+        },
+        "rival",
+      );
+      await waitFor(() =>
+        expect(capturedState!.channels.some((c) => c.id === "general")).toBe(true),
+      );
+      act(() => capturedActions!.selectChannel("general"));
+      await waitFor(() => expect(capturedState!.messages.length).toBe(1));
+      const seq = capturedState!.messages[0]!.seq;
+
+      // editing someone else's message: the optimistic projection applies
+      // first — chat's authorship check only runs at commit.
+      act(() => capturedActions!.editMessage(seq, "hijacked"));
+      await waitFor(() =>
+        expect(blocksText(capturedState!.messages[0]!.head.blocks)).toBe("hijacked"),
+      );
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+
+      // no synthetic rejection knob exists BY DESIGN — this is the real
+      // module saying no. the step commits nothing.
+      const report = await sim.step();
+      expect(report.committed).toBeNull();
+
+      const key = opKey.messageSeq("general", seq);
+      await waitFor(() => expect(capturedState!.ops[key]?.phase).toBe("failed"));
+      expect(capturedState!.ops[key]?.error).toMatch(/only the author may edit/);
+
+      // the failure refresh IS the rollback: committed truth replaces the
+      // optimistic edit...
+      await waitFor(() =>
+        expect(blocksText(capturedState!.messages[0]!.head.blocks)).toBe(
+          "rival wrote this",
+        ),
+      );
+      // ...and no block was minted — a rejected op never becomes a block in
+      // the sim (Host::submit_at aborts pre-commit).
+      expect((await sim.state()).height).toBe(2);
+    },
+  );
+
+  it(
+    "echo-oracle follow-ups queue behind the mention and drain one per step, over ws only",
+    { timeout: 30_000 },
+    async () => {
+      const { sim, transport } = await boot({ echoOracle: true });
+
+      // the daemon_e2e mention recipe, stepped through the held queue: each
+      // submit parks, a step releases it and returns its receipt.
+      const receipts: SubmitReceipt[] = [];
+      const submitStepped = async (target: string, payload: unknown, origin: string) => {
+        const pending = transport.submit(target, payload, origin);
+        await waitFor(async () => expect((await sim.state()).held).toBe(1));
+        await sim.step();
+        receipts.push(await pending);
+      };
+
+      await submitStepped(
+        "chat",
+        { CreateChannel: { channel_id: "general", name: "General", post_policy: "Open" } },
+        "owner",
+      );
+      await submitStepped(
+        "agent",
+        {
+          RegisterAgent: {
+            agent_id: "quackbot",
+            display_name: "Quackbot",
+            model_ref: "echo-model",
+            prompt_hash: Array(32).fill(7),
+            allowed_actions: ["chat.post"],
+          },
+        },
+        "owner",
+      );
+      await submitStepped(
+        "agent",
+        { WatchChannel: { channel_id: "general", policy: "Mention" } },
+        "owner",
+      );
+      await submitStepped(
+        "chat",
+        {
+          PostMessage: {
+            channel_id: "general",
+            message_id: "m1",
+            blocks: [
+              {
+                Paragraph: [
+                  { text: "hey ", marks: [] },
+                  {
+                    text: "@quackbot",
+                    marks: [{ Mention: { Agent: { module: "agent", agent_id: "quackbot" } } }],
+                  },
+                  { text: " can you handle this?", marks: [] },
+                ],
+              },
+            ],
+            thread: null,
+            as_agent: null,
+          },
+        },
+        "eddy",
+      );
+
+      // the mention's commit enqueued the echo worker's follow-up — parked
+      // as oracle work, not committed with the post.
+      expect(receipts.map((r) => r.height)).toEqual([1, 2, 3, 4]);
+      const parked = await sim.state();
+      expect(parked.oracleQueued).toBe(1);
+      expect(parked.height).toBe(4);
+
+      // a step drains exactly one follow-up as its own block.
+      const report = await sim.step();
+      expect(report.committed?.kind).toBe("oracle");
+      expect(report.committed?.height).toBe(5);
+
+      // the follow-up's height reaches the app over the ws stream ONLY —
+      // no submit receipt ever carries it, and no op record claims it.
+      await waitFor(() =>
+        expect(capturedState!.telemetry.some((f) => f.height === 5)).toBe(true),
+      );
+      await waitFor(() => expect(capturedState!.status?.height).toBe(5));
+      expect(receipts.some((r) => r.height === 5)).toBe(false);
+      expect(
+        Object.values(capturedState!.ops).some((op) => op.height === 5),
+      ).toBe(false);
+    },
+  );
+
+  it(
+    "explorer renders live ring data and consumes the cross-link focus",
+    { timeout: 30_000 },
+    async () => {
+      const { sim } = await boot({ persona: "networked" }, <ExplorerView />);
+
+      act(() => capturedActions!.createChannel("General", "Open"));
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      await sim.step();
+      await waitFor(() => expect(capturedState!.blocks.length).toBe(1));
+      const record = capturedState!.blocks[0]!;
+      expect(record.opHash).toMatch(/^[0-9a-f]{64}$/);
+
+      // the finalization-mark hand-off against the REAL view: focus lands,
+      // the detail opens on the block…
+      act(() => capturedActions!.openExplorerAt(1));
+      expect(capturedState!.screen).toBe("explorer");
+      await waitFor(() => expect(screen.getByText("OP HASH")).toBeInTheDocument());
+
+      // …the OP HASH digest line shows the record's full content address…
+      expect(screen.getByText(record.opHash!)).toBeInTheDocument();
+
+      // …and the focus was consumed, so re-entering won't replay the jump.
+      await waitFor(() => expect(capturedState!.explorerFocus).toBeNull());
     },
   );
 });

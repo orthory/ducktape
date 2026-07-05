@@ -323,6 +323,63 @@ fn personas_shape_receipts_and_ring() {
 }
 
 #[test]
+fn auto_and_step_commit_paths_walk_identical_app_hashes() {
+    // hold mode commits through step_once, auto mode through handle_submit's
+    // inline drain — two code paths, one logical clock. the same script must
+    // walk the same app-hashes through either, or a refactor of one path has
+    // quietly forked the sim's determinism contract.
+    let script = || {
+        [
+            ("chat", create_channel("general", "General")),
+            ("chat", post_message("general", "m-1", "hello determinism")),
+            ("tasks", serde_json::json!({ "CreateTask": { "task_id": "t-1", "title": "repeatable" } })),
+        ]
+    };
+
+    let stepped: Vec<String> = {
+        let storage = tempfile::tempdir().expect("storage dir");
+        let sim = Sim::spawn(storage.path(), &[]);
+        script()
+            .into_iter()
+            .map(|(target, payload)| {
+                let pending = sim.submit_in_background(target, payload);
+                sim.await_sim_state("held", 1);
+                let report = sim.step();
+                let (code, _) = pending.join().expect("submit thread");
+                assert_eq!(code, 200);
+                report["committed"]["appHash"]
+                    .as_str()
+                    .expect("step committed")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    let auto: Vec<String> = {
+        let storage = tempfile::tempdir().expect("storage dir");
+        let sim = Sim::spawn(storage.path(), &["--auto"]);
+        script()
+            .into_iter()
+            .map(|(target, payload)| {
+                // auto mode: the submit reply IS the commit receipt.
+                let (code, receipt) = sim.request(
+                    "POST",
+                    "/v1/submit",
+                    Some(&serde_json::json!({ "target": target, "payload": payload })),
+                );
+                assert_eq!(code, 200, "auto submit failed: {receipt}");
+                receipt["appHash"]
+                    .as_str()
+                    .expect("receipt app hash")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    assert_eq!(stepped, auto, "the two commit paths diverged");
+}
+
+#[test]
 fn peer_block_commits_past_a_parked_queue() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &[]);
