@@ -53,6 +53,7 @@ install-app: app
 test: app/node_modules
 	$(CARGO) test --workspace
 	$(CARGO) build -p noded
+	cd app && $(BUN) run typecheck
 	cd app && DUCKTAPE_NODED_BIN=$(abspath target/debug/ducktape-noded) $(BUN) run test
 
 clean:

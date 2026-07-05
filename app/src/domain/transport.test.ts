@@ -128,8 +128,10 @@ describe("remoteTransport", () => {
       { height: 1, consensusTime: 100, latencyUs: 42, dispatches: [], events: [] },
     ];
     // a Response body reads once, and this test fetches twice — hand back a
-    // fresh Response per call.
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, { frames })));
+    // fresh Response per call. the url param types mock.calls for assertions.
+    const fetchMock = vi.fn((_url: string) =>
+      Promise.resolve(jsonResponse(200, { frames })),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     const transport = remoteTransport("http://node.example:8844");
