@@ -81,16 +81,22 @@ fn solo_founder_invites_a_friend() {
     assert!(ok, "invite-accept failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
-    // the founder cuts over to epoch 1 (the nop pusher advances the views);
-    // epoch 1 then STALLS at its base — quorum is 2 of 2 — which is exactly
-    // what hands the joiner a frozen boundary at the epoch's genesis floor.
+    // two-phase activation (the nop pusher advances the views): cutover #1
+    // registers the friend as STANDBY with the quorum unchanged; the parked
+    // node proves a sync and announces online, the founder relays it, and
+    // cutover #2 widens the quorum to 2 — epoch 2 then STALLS at its base,
+    // which is exactly what hands the joiner a frozen boundary at the
+    // epoch's genesis floor.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "standby: state verified", CONVERGE);
+    cluster.wait_marker(0, "online announce from standby", CONVERGE);
+    cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
 
     // the parked node notices its admission, syncs the boundary, fabricates
     // its recovery checkpoint, and reboots into the restore path.
-    cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "admitted at epoch 2", CONVERGE);
     cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
-    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch 2", CONVERGE);
     cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
 
     // THE property: consensus is live again, and only because the friend
@@ -150,23 +156,30 @@ fn live_quorum_admits_a_fourth_validator() {
         assert!(ok, "invite-accept via member {member} failed:\n{out}");
     }
 
+    // two-phase activation: registration cutover, the joiner's online proof
+    // (relayed by an incumbent), then the activation cutover to epoch 2.
     for i in 0..3 {
         cluster.wait_marker(i, "cutover complete: epoch 1", CONVERGE);
     }
+    cluster.wait_marker(joiner, "standby: state verified", CONVERGE);
+    for i in 0..3 {
+        cluster.wait_marker(i, "cutover complete: epoch 2", CONVERGE);
+    }
 
     // advance the boundary PAST the epoch base while the joiner is still
-    // syncing-or-parked: the incumbents finalize without it, so the joiner
-    // must adopt a mid-epoch boundary plus its finalization floor.
+    // syncing-or-parked: quorum(4) = 3, so the incumbents finalize without
+    // it and the joiner must adopt a mid-epoch boundary plus its
+    // finalization floor.
     for n in 0..5 {
-        cluster.submit(0, "directory", &dir_set(&format!("epoch1-op-{n}"), "x"));
-        let _ = poll_until("epoch-1 filler to finalize", FINALIZE, || {
-            dir_value(&cluster, 1, &format!("epoch1-op-{n}"))
+        cluster.submit(0, "directory", &dir_set(&format!("epoch2-op-{n}"), "x"));
+        let _ = poll_until("epoch-2 filler to finalize", FINALIZE, || {
+            dir_value(&cluster, 1, &format!("epoch2-op-{n}"))
         });
     }
 
-    cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "admitted at epoch 2", CONVERGE);
     cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
-    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch 2", CONVERGE);
     cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
 
     // the promoted validator's own op finalizes and reads on an incumbent —

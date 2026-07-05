@@ -338,36 +338,61 @@ fn main() {
             println!("  app-hash       : {:?}", out.app_hash);
         }
 
-        // block 6: a NEW validator JOINs the permissionless ed25519 valset. derive
-        // the key deterministically from a fixed seed (any 32 bytes is a valid
-        // ed25519 seed) so the demo is reproducible. the valset root moves off
-        // ZERO and folds another module's commitment into the app-hash.
+        // block 6: a NEW validator runs the two-step membership protocol —
+        // Join registers the key as STANDBY, Online (the key's own signed
+        // proof) moves it into the ACTIVE quorum. derive the key
+        // deterministically from a fixed seed (any 32 bytes is a valid
+        // ed25519 seed) so the demo is reproducible. the valset root moves
+        // off ZERO and folds another module's commitment into the app-hash.
         let seed = [7u8; 32];
-        let new_validator = PrivateKey::decode(&seed[..])
-            .expect("32-byte seed is a valid ed25519 private key")
-            .public_key()
-            .as_ref()
-            .to_vec();
+        let new_validator_sk =
+            PrivateKey::decode(&seed[..]).expect("32-byte seed is a valid ed25519 private key");
+        let new_validator = new_validator_sk.public_key().as_ref().to_vec();
         // membership ops are governance-gated (external origins are refused);
         // the demo's direct join rides a SYSTEM-origin block — the same trusted
         // orchestration lane genesis seeding uses.
+        let system_ctx = || host::BlockContext {
+            protocol_version: 0,
+            height: 0,
+            consensus_time: 0,
+            origin: sdk::Origin::System,
+        };
+        host.submit_at(
+            system_ctx(),
+            Msg {
+                target: "valset".into(),
+                payload: valset_encode_msg(&ValsetMsg::Join {
+                    key: new_validator.clone(),
+                }),
+            },
+        )
+        .await
+        .expect("submit block 6 (join)");
+        let online_sig = {
+            use commonware_cryptography::Signer as _;
+            new_validator_sk.sign(
+                valset_interface::ONLINE_PROOF_NS,
+                &valset_interface::online_proof_message(&new_validator, 0),
+            )
+        };
         let out = host
             .submit_at(
-                host::BlockContext { protocol_version: 0,
-                    height: 0,
-                    consensus_time: 0,
-                    origin: sdk::Origin::System,
-                },
+                system_ctx(),
                 Msg {
                     target: "valset".into(),
-                    payload: valset_encode_msg(&ValsetMsg::Join {
+                    payload: valset_encode_msg(&ValsetMsg::Online {
                         key: new_validator.clone(),
+                        signed_height: 0,
+                        signature: online_sig.as_ref().to_vec(),
                     }),
                 },
             )
             .await
-            .expect("submit block 6");
-        println!("\n[block 6] valset <- Join(ed25519 pubkey) — a new validator joins");
+            .expect("submit block 6 (online)");
+        println!(
+            "\n[block 6] valset <- Join(ed25519 pubkey) + Online(self-signed proof) — a new \
+             validator registers standby, then activates"
+        );
         let reply = host
             .query("valset", &valset_encode_query(&ValsetQuery::Validators))
             .await

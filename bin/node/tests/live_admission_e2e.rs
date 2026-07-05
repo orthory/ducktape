@@ -1,6 +1,11 @@
 //! network-shape live admission: a fresh identity produced by `join` can start
-//! immediately, park as a read-only observer, and promote once a running member
-//! admits it through governance.
+//! immediately, park as a read-only observer, and promote through the
+//! TWO-PHASE membership protocol once a running member admits it through
+//! governance — registration lands it STANDBY (cutover #1, quorum unchanged),
+//! the parked node proves a full state sync and announces ONLINE with its own
+//! signed proof, a member relays that into the ordered lane, and the
+//! ACTIVATION cutover (#2) widens the quorum, at which point the joiner
+//! promotes.
 
 mod common;
 
@@ -54,9 +59,16 @@ fn network_shape_joiner_parks_until_invite_accept() {
     assert!(ok, "invite-accept failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
+    // cutover #1: standby registration re-tracks the mesh, quorum stays 1.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
-    cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
+    // the parked friend probes its registration, proves a full sync, and
+    // announces online; the founder relays the proof into the ordered lane.
+    cluster.wait_marker(1, "standby: state verified", CONVERGE);
+    cluster.wait_marker(0, "online announce from standby", CONVERGE);
+    // cutover #2: activation widens the quorum; the friend promotes there.
+    cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
+    cluster.wait_marker(1, "admitted at epoch 2", CONVERGE);
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);
     cluster.wait_marker(1, "shipped index staged", CONVERGE);
-    cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
+    cluster.wait_marker(1, "promoted: validator at epoch 2", CONVERGE);
 }

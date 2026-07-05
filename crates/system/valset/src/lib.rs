@@ -106,6 +106,16 @@ impl Valset {
         PublicKey::decode(key).map_err(|e| Error::Module(format!("invalid ed25519 public key: {e}")))
     }
 
+    /// the COMMITTED membership picture — `(active, standby)`, both sorted.
+    /// what a synced snapshot reader (a parked joiner probing its own
+    /// registration) needs without driving the async query surface.
+    pub fn membership(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (
+            self.active.iter().cloned().collect(),
+            self.standby.iter().cloned().collect(),
+        )
+    }
+
     /// the committed sets with this block's staged changes applied —
     /// read-your-writes, both sorted (order-independent).
     fn effective(&self) -> (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>) {

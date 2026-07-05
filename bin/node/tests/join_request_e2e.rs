@@ -45,10 +45,15 @@ fn a_tokened_join_delivers_the_pubkey_and_manual_approval_promotes() {
     assert!(ok, "invite-accept failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
+    // two-phase activation: registration cutover, then the joiner's own
+    // online proof (relayed by the founder) widens the quorum at cutover #2.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
-    cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
+    cluster.wait_marker(1, "standby: state verified", CONVERGE);
+    cluster.wait_marker(0, "online announce from standby", CONVERGE);
+    cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
+    cluster.wait_marker(1, "admitted at epoch 2", CONVERGE);
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);
-    cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
+    cluster.wait_marker(1, "promoted: validator at epoch 2", CONVERGE);
 
     // settled: the approved key is a member now, so the queue drains.
     let after = cluster.join_requests();
