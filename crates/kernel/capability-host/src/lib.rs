@@ -4,17 +4,28 @@
 //! crate is the machine-local counterpart that actually provides it. a
 //! [`Provider`] wraps one locally installed executor CLI, and [`discover`]
 //! probes the host for the executors the operator brought — BYO by
-//! construction: the node spawns `codex` / `claude` as child processes and
-//! never reads, writes, or refreshes any credential file. auth, token
-//! rotation, and endpoint choice are entirely the CLI's own business.
+//! construction: the node spawns child processes and never reads, writes, or
+//! refreshes any credential file. auth, token rotation, and endpoint choice
+//! are entirely the CLI's own business.
+//!
+//! ## executors are data: the capability spec
+//!
+//! WHICH executors exist, how to detect them, the argv to run them, how to
+//! parse their output, and which model refs route to them is all described by
+//! TOML capability specs (see [`spec`] and `docs/capability-spec.md`), not by
+//! Rust. the built-in codex/claude support is two embedded spec files parsed
+//! by the same code path as operator-provided specs under
+//! `$DUCKTAPE_CAPABILITY_DIR` (default `~/.ducktape/capabilities`). adding an
+//! executor — or retuning a built-in's flags — is a config change on the
+//! operator's machine, never a code change here.
 //!
 //! the CLIs are agentic, not plain inference endpoints, so a provider runs
-//! them fenced: non-interactive one-shot mode, most-restricted sandbox flags,
-//! and an empty scratch working directory — the child never sees the node's
-//! data directory. the fence is what turns "orchestrate a coding agent" into
-//! "use it as a text oracle".
+//! them fenced: non-interactive one-shot mode, most-restricted sandbox flags
+//! (as encoded in the spec's argv), and an empty scratch working directory —
+//! the child never sees the node's data directory. the fence is what turns
+//! "orchestrate a coding agent" into "use it as a text oracle".
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -22,19 +33,20 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 
-/// the capability tag served by a locally installed codex CLI.
+mod spec;
+pub use spec::{CapabilitySpec, OutputFormat, PromptMode, SpecSet, builtin_specs};
+
+/// the tag of the embedded codex spec — a convenience for tests and wiring;
+/// the authoritative source is `specs/codex.toml`.
 pub const CODEX: &str = "codex";
-/// the capability tag served by a locally installed claude code CLI.
+/// the tag of the embedded claude spec (see `specs/claude.toml`).
 pub const CLAUDE: &str = "claude";
 
-/// how long a provider may run one job before the child is killed. generous:
-/// a saga effect is already async and retried, but a hung CLI must never
-/// wedge the worker lane forever.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// one unit of provider work: the fully rendered prompt and the model to run
-/// it on. rendering (conversation -> text) is the CALLER's business — this
-/// crate is deliberately ignorant of chat shapes and saga specs.
+/// one unit of provider work: the fully rendered prompt and the RESOLVED
+/// model to run it on (resolution — pinned ref or spec default — happens in
+/// [`ProviderSet::resolve`]). rendering (conversation -> text) is the
+/// CALLER's business — this crate is deliberately ignorant of chat shapes
+/// and saga specs.
 pub struct ProviderJob {
     pub prompt: String,
     pub model_ref: String,
@@ -52,15 +64,26 @@ pub trait Provider {
     async fn run(&self, job: &ProviderJob) -> Result<String, String>;
 }
 
-/// the host's discovered provider set: what this node can actually serve, and
-/// therefore exactly what it should announce to the capability module.
+/// the host's provider surface: every LOADED spec (for routing — an
+/// uninstalled capability still routes, so errors can name it) plus the
+/// DISCOVERED providers (for execution — exactly what this node announces).
 pub struct ProviderSet {
+    specs: SpecSet,
     providers: Vec<Box<dyn Provider>>,
 }
 
 impl ProviderSet {
-    pub fn new(providers: Vec<Box<dyn Provider>>) -> Self {
-        Self { providers }
+    pub fn assemble(specs: SpecSet, providers: Vec<Box<dyn Provider>>) -> Self {
+        Self { specs, providers }
+    }
+
+    /// no specs, no providers — the "nothing installed, nothing loaded" test
+    /// seam. every resolve() fails with a clean error.
+    pub fn empty() -> Self {
+        Self {
+            specs: SpecSet::from_specs(Vec::new()),
+            providers: Vec::new(),
+        }
     }
 
     pub fn find(&self, capability: &str) -> Option<&dyn Provider> {
@@ -70,8 +93,8 @@ impl ProviderSet {
             .map(Box::as_ref)
     }
 
-    /// the sorted tag list — the truthful payload for a capability
-    /// announcement.
+    /// the sorted tag list of DISCOVERED providers — the truthful payload for
+    /// a capability announcement.
     pub fn capabilities(&self) -> Vec<String> {
         let mut tags: Vec<String> = self
             .providers
@@ -85,19 +108,51 @@ impl ProviderSet {
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
+
+    pub fn specs(&self) -> &SpecSet {
+        &self.specs
+    }
+
+    /// full model-ref resolution, the one entry point callers should use:
+    /// route the ref to a spec, resolve the effective model (pinned ref, else
+    /// the spec's default), and look up the local provider. every failure is
+    /// a distinct, actionable error naming what is missing — a mis-typed
+    /// model, a spec without a default, or a capability this node simply does
+    /// not provide.
+    pub fn resolve(&self, model_ref: &str) -> Result<(&dyn Provider, String), String> {
+        let Some(spec) = self.specs.route(model_ref) else {
+            let loaded: Vec<&str> = self.specs.iter().map(|s| s.tag.as_str()).collect();
+            return Err(format!(
+                "no capability spec matches model {model_ref:?}; loaded specs: {loaded:?}"
+            ));
+        };
+        let model = match model_ref.trim() {
+            "" => spec.default_model.clone().ok_or_else(|| {
+                format!(
+                    "capability '{}' has no default model; pin a model_ref",
+                    spec.tag
+                )
+            })?,
+            pinned => pinned.to_string(),
+        };
+        let Some(provider) = self.find(&spec.tag) else {
+            return Err(format!(
+                "capability '{}' (model {model:?}) is not provided by this node; \
+                 this node provides {:?}",
+                spec.tag,
+                self.capabilities()
+            ));
+        };
+        Ok((provider, model))
+    }
 }
 
-/// which CLI dialect a [`CliProvider`] speaks: argv shape and output parsing
-/// differ per executor, everything else (spawn, fence, timeout) is shared.
-enum Flavor {
-    Codex,
-    Claude,
-}
-
-/// a [`Provider`] backed by one locally installed CLI binary.
+/// a [`Provider`] that interprets one [`CapabilitySpec`] against one resolved
+/// binary: spawn `bin` with the spec's argv (`{model}` substituted), feed the
+/// prompt on stdin, parse stdout with the spec's named format.
 pub struct CliProvider {
+    spec: CapabilitySpec,
     bin: PathBuf,
-    flavor: Flavor,
     /// the child's working directory — an empty scratch dir, never the node's
     /// data directory, so an agentic CLI has nothing to wander into.
     workdir: PathBuf,
@@ -105,25 +160,39 @@ pub struct CliProvider {
 }
 
 impl CliProvider {
-    pub fn codex(bin: PathBuf) -> Self {
-        Self::new(bin, Flavor::Codex, CODEX)
-    }
-
-    pub fn claude(bin: PathBuf) -> Self {
-        Self::new(bin, Flavor::Claude, CLAUDE)
-    }
-
-    fn new(bin: PathBuf, flavor: Flavor, tag: &str) -> Self {
+    /// the general constructor: any spec, any resolved binary. the timeout
+    /// starts at the spec's `timeout_secs`.
+    pub fn from_spec(spec: CapabilitySpec, bin: PathBuf) -> Self {
         let workdir = std::env::temp_dir().join(format!(
-            "ducktape-provider-{tag}-{}",
+            "ducktape-provider-{}-{}",
+            spec.tag,
             std::process::id()
         ));
+        let timeout = Duration::from_secs(spec.timeout_secs);
         Self {
+            spec,
             bin,
-            flavor,
             workdir,
-            timeout: DEFAULT_TIMEOUT,
+            timeout,
         }
+    }
+
+    /// a provider from the embedded codex spec — test/wiring convenience.
+    pub fn codex(bin: PathBuf) -> Self {
+        Self::from_builtin(CODEX, bin)
+    }
+
+    /// a provider from the embedded claude spec.
+    pub fn claude(bin: PathBuf) -> Self {
+        Self::from_builtin(CLAUDE, bin)
+    }
+
+    fn from_builtin(tag: &str, bin: PathBuf) -> Self {
+        let spec = builtin_specs()
+            .into_iter()
+            .find(|s| s.tag == tag)
+            .expect("builtin spec tags are CI-validated");
+        Self::from_spec(spec, bin)
     }
 
     pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
@@ -138,35 +207,15 @@ impl CliProvider {
 
     fn command(&self, job: &ProviderJob) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.bin);
-        match self.flavor {
-            // one-shot non-interactive exec, most-restricted sandbox, prompt
-            // on stdin (`-`), machine-readable event stream on stdout.
-            Flavor::Codex => {
-                cmd.args([
-                    "exec",
-                    "--json",
-                    "--sandbox",
-                    "read-only",
-                    "--skip-git-repo-check",
-                    "--model",
-                    &job.model_ref,
-                    "-",
-                ]);
-            }
-            // print mode with a single json result object; one turn so the
-            // agent answers instead of embarking on tool-use loops.
-            Flavor::Claude => {
-                cmd.args([
-                    "-p",
-                    "--output-format",
-                    "json",
-                    "--max-turns",
-                    "1",
-                    "--model",
-                    &job.model_ref,
-                ]);
-            }
-        }
+        // argv straight from the spec, `{model}` substituted. args are passed
+        // verbatim to exec — never shell-interpreted, so a prompt or model
+        // ref cannot inject flags or commands.
+        cmd.args(
+            self.spec
+                .args
+                .iter()
+                .map(|a| a.replace("{model}", &job.model_ref)),
+        );
         cmd.current_dir(&self.workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -181,10 +230,7 @@ impl CliProvider {
 #[async_trait::async_trait(?Send)]
 impl Provider for CliProvider {
     fn capability(&self) -> &str {
-        match self.flavor {
-            Flavor::Codex => CODEX,
-            Flavor::Claude => CLAUDE,
-        }
+        &self.spec.tag
     }
 
     async fn run(&self, job: &ProviderJob) -> Result<String, String> {
@@ -201,7 +247,10 @@ impl Provider for CliProvider {
 
         // feed the prompt CONCURRENTLY with collecting output: a prompt larger
         // than the pipe buffer would deadlock a sequential write-then-wait if
-        // the CLI streams output before draining stdin.
+        // the CLI streams output before draining stdin. (PromptMode::Stdin is
+        // the only v1 mode; the irrefutable match fails loud in review when a
+        // second mode lands and this site needs a real branch.)
+        let PromptMode::Stdin = self.spec.prompt;
         let feed = async {
             stdin.write_all(job.prompt.as_bytes()).await?;
             stdin.shutdown().await?;
@@ -232,12 +281,16 @@ impl Provider for CliProvider {
             ));
         }
         if let Err(e) = fed {
-            return Err(format!("writing the prompt to {} failed: {e}", self.bin.display()));
+            return Err(format!(
+                "writing the prompt to {} failed: {e}",
+                self.bin.display()
+            ));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        match self.flavor {
-            Flavor::Codex => parse_codex_output(&stdout),
-            Flavor::Claude => parse_claude_output(&stdout),
+        match self.spec.output {
+            OutputFormat::CodexJsonl => parse_codex_output(&stdout),
+            OutputFormat::ClaudeJson => parse_claude_output(&stdout),
+            OutputFormat::Text => parse_text_output(&stdout),
         }
     }
 }
@@ -291,13 +344,28 @@ fn parse_claude_output(stdout: &str) -> Result<String, String> {
             continue;
         }
         if v.get("is_error").and_then(Value::as_bool) == Some(true) {
-            return Err(format!("claude reported an error result: {}", excerpt(candidate)));
+            return Err(format!(
+                "claude reported an error result: {}",
+                excerpt(candidate)
+            ));
         }
         if let Some(text) = v.get("result").and_then(Value::as_str) {
             return Ok(text.to_string());
         }
     }
     Err(format!("claude output carried no result: {}", excerpt(stdout)))
+}
+
+/// `format = "text"`: the CLI's trimmed stdout IS the answer — the generic
+/// escape hatch for wiring any plain-printing CLI with zero code. empty
+/// output on a zero exit is still an error: "ran fine, said nothing" is a
+/// broken executor, not an answer.
+fn parse_text_output(stdout: &str) -> Result<String, String> {
+    let text = stdout.trim();
+    if text.is_empty() {
+        return Err("executor exited successfully but produced no output".into());
+    }
+    Ok(text.to_string())
 }
 
 /// a bounded, char-boundary-safe slice of diagnostic output for error strings.
@@ -316,69 +384,91 @@ fn excerpt(s: &str) -> String {
 
 // ---- discovery --------------------------------------------------------------
 
-/// probe this host for installed executor CLIs and build the provider set.
-/// `DUCKTAPE_CODEX_BIN` / `DUCKTAPE_CLAUDE_BIN` override the `PATH` probe with
-/// an explicit binary; `DUCKTAPE_PROVIDER_TIMEOUT_SECS` tunes the per-job
-/// timeout. what discovery finds is exactly what the node announces — nothing
-/// configured is silently invented, nothing installed is silently dropped.
-pub fn discover() -> ProviderSet {
-    discover_with(
+/// load this host's capability specs and probe for their binaries.
+///
+/// spec sources: the embedded built-ins, then `$DUCKTAPE_CAPABILITY_DIR`
+/// (explicitly set and missing = hard error — the operator asked for a dir
+/// that is not there) or `~/.ducktape/capabilities` when it exists. a broken
+/// spec is a hard `Err`: an operator config error fails the boot loudly, it
+/// does not silently drop an executor.
+///
+/// per spec: the `detect.env` override wins (broken override = loud warning +
+/// absent capability), else the first executable `detect.bin` on `PATH`.
+/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides every spec's timeout at once.
+/// what discovery finds is exactly what the node announces.
+pub fn discover() -> Result<ProviderSet, String> {
+    let specs = SpecSet::load(operator_spec_dir().as_deref())?;
+    let timeout = std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs);
+    Ok(discover_with(
+        specs,
         std::env::var_os("PATH"),
-        std::env::var_os("DUCKTAPE_CODEX_BIN"),
-        std::env::var_os("DUCKTAPE_CLAUDE_BIN"),
-        std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_secs),
-    )
+        &|k| std::env::var_os(k),
+        timeout,
+    ))
 }
 
-/// the parameterized core of [`discover`], env-free so tests can drive it
-/// without mutating process state.
+/// the operator spec dir: an explicit `$DUCKTAPE_CAPABILITY_DIR` is returned
+/// even if absent (so the load errors loudly), the default location only when
+/// it actually exists (absent default = simply no operator specs).
+fn operator_spec_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("DUCKTAPE_CAPABILITY_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME")?;
+    let dir = PathBuf::from(home).join(".ducktape").join("capabilities");
+    dir.is_dir().then_some(dir)
+}
+
+/// the parameterized core of [`discover`]: specs in, providers out, all env
+/// access injected so tests never mutate process state.
 fn discover_with(
+    specs: SpecSet,
     path: Option<OsString>,
-    codex_override: Option<OsString>,
-    claude_override: Option<OsString>,
-    timeout: Option<Duration>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    global_timeout: Option<Duration>,
 ) -> ProviderSet {
-    let tune = |p: CliProvider| match timeout {
-        Some(t) => p.with_timeout(t),
-        None => p,
-    };
     let mut providers: Vec<Box<dyn Provider>> = Vec::new();
-    if let Some(bin) = resolve_bin(CODEX, codex_override, path.as_deref()) {
-        providers.push(Box::new(tune(CliProvider::codex(bin))));
+    for spec in specs.iter() {
+        let Some(bin) = resolve_bin(spec, path.as_deref(), env) else {
+            continue;
+        };
+        let mut provider = CliProvider::from_spec(spec.clone(), bin);
+        if let Some(t) = global_timeout {
+            provider = provider.with_timeout(t);
+        }
+        providers.push(Box::new(provider));
     }
-    if let Some(bin) = resolve_bin(CLAUDE, claude_override, path.as_deref()) {
-        providers.push(Box::new(tune(CliProvider::claude(bin))));
-    }
-    ProviderSet::new(providers)
+    ProviderSet::assemble(specs, providers)
 }
 
-/// resolve one executor binary: an explicit override wins (and a BROKEN
+/// resolve one spec's binary: the spec's env override wins (and a BROKEN
 /// override is a loud warning + absent capability, never a silent fallback to
-/// PATH — the operator said "use this", and this doesn't exist), else the
-/// first executable `name` on `path`.
+/// PATH — the operator said "use this", and this does not exist), else the
+/// first executable `detect.bin` on `path`.
 fn resolve_bin(
-    name: &str,
-    explicit: Option<OsString>,
-    path: Option<&std::ffi::OsStr>,
+    spec: &CapabilitySpec,
+    path: Option<&OsStr>,
+    env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
-    if let Some(explicit) = explicit {
+    if let Some(explicit) = spec.env.as_deref().and_then(env) {
         let p = PathBuf::from(&explicit);
         if is_executable(&p) {
             return Some(p);
         }
         eprintln!(
-            "[capability-host] override for '{name}' ({}) is not an executable file; \
+            "[capability-host] override for '{}' ({}) is not an executable file; \
              the capability will NOT be announced",
+            spec.tag,
             p.display()
         );
         return None;
     }
     let path = path?;
     std::env::split_paths(path)
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join(&spec.bin))
         .find(|candidate| is_executable(candidate))
 }
 
@@ -425,11 +515,21 @@ mod tests {
         }
     }
 
+    fn no_env(_: &str) -> Option<OsString> {
+        None
+    }
+
+    fn builtins() -> SpecSet {
+        SpecSet::load(None).unwrap()
+    }
+
+    // ---- discovery ----------------------------------------------------------
+
     #[test]
     fn discovery_finds_executables_on_path() {
         let dir = scratch("discovery-path");
         fake_cli(&dir, "codex", "exit 0");
-        let set = discover_with(Some(dir.clone().into_os_string()), None, None, None);
+        let set = discover_with(builtins(), Some(dir.clone().into_os_string()), &no_env, None);
         assert_eq!(set.capabilities(), vec![CODEX], "codex found, claude absent");
         assert!(set.find(CODEX).is_some());
         assert!(set.find(CLAUDE).is_none());
@@ -440,7 +540,7 @@ mod tests {
         let dir = scratch("discovery-both");
         fake_cli(&dir, "codex", "exit 0");
         fake_cli(&dir, "claude", "exit 0");
-        let set = discover_with(Some(dir.into_os_string()), None, None, None);
+        let set = discover_with(builtins(), Some(dir.into_os_string()), &no_env, None);
         assert_eq!(set.capabilities(), vec![CLAUDE, CODEX], "sorted tag list");
     }
 
@@ -448,17 +548,17 @@ mod tests {
     fn explicit_override_wins_and_a_broken_override_announces_nothing() {
         let dir = scratch("discovery-override");
         let real = fake_cli(&dir, "my-codex", "exit 0");
-        // override beats an empty PATH ...
-        let set = discover_with(None, Some(real.into_os_string()), None, None);
+        // the embedded codex spec names DUCKTAPE_CODEX_BIN as its override.
+        let real_os = real.into_os_string();
+        let env = move |k: &str| (k == "DUCKTAPE_CODEX_BIN").then(|| real_os.clone());
+        let set = discover_with(builtins(), None, &env, None);
         assert_eq!(set.capabilities(), vec![CODEX]);
+
         // ... and a dangling override is absent, not a silent PATH fallback.
-        let missing = dir.join("nope");
-        let set = discover_with(
-            Some(dir.clone().into_os_string()),
-            Some(missing.into_os_string()),
-            None,
-            None,
-        );
+        let missing = dir.join("nope").into_os_string();
+        let env = move |k: &str| (k == "DUCKTAPE_CODEX_BIN").then(|| missing.clone());
+        fake_cli(&dir, "codex", "exit 0");
+        let set = discover_with(builtins(), Some(dir.into_os_string()), &env, None);
         assert!(
             set.find(CODEX).is_none(),
             "broken override must not fall back to PATH"
@@ -472,9 +572,99 @@ mod tests {
         let path = dir.join("codex");
         std::fs::write(&path, "not a program").expect("write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        let set = discover_with(Some(dir.into_os_string()), None, None, None);
+        let set = discover_with(builtins(), Some(dir.into_os_string()), &no_env, None);
         assert!(set.find(CODEX).is_none(), "mode 644 is not executable");
     }
+
+    #[test]
+    fn an_operator_spec_discovers_a_custom_executor() {
+        // the whole point of the spec format: a third executor with ZERO code.
+        let dir = scratch("custom-exec");
+        fake_cli(&dir, "myllm", "cat > /dev/null\necho hi");
+        let custom = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "myllm"
+[detect]
+bin = "myllm"
+[invoke]
+args = ["{model}"]
+prompt = "stdin"
+[output]
+format = "text"
+[models]
+patterns = ["my-*"]
+"#,
+            "test",
+        )
+        .unwrap();
+        let specs = SpecSet::from_specs(vec![custom]);
+        let set = discover_with(specs, Some(dir.into_os_string()), &no_env, None);
+        assert_eq!(set.capabilities(), vec!["myllm"]);
+    }
+
+    // ---- resolve() ----------------------------------------------------------
+
+    #[test]
+    fn resolve_routes_resolves_defaults_and_names_every_failure() {
+        let dir = scratch("resolve");
+        fake_cli(&dir, "codex", "exit 0");
+        let set = discover_with(builtins(), Some(dir.into_os_string()), &no_env, None);
+
+        // pinned ref routes and keeps its model.
+        let (p, model) = set.resolve("gpt-5.5-codex").unwrap();
+        assert_eq!(p.capability(), CODEX);
+        assert_eq!(model, "gpt-5.5-codex");
+
+        // unpinned routes to the catch-all and takes ITS default model.
+        let (p, model) = set.resolve("").unwrap();
+        assert_eq!(p.capability(), CODEX);
+        assert_eq!(model, "gpt-5.3-codex-spark");
+
+        // routed-but-not-installed names the capability and what IS provided.
+        let err = set.resolve("claude-sonnet-5").err().expect("claude is not installed");
+        assert!(err.contains("capability 'claude'"), "got: {err}");
+        assert!(err.contains("codex"), "names what the node provides: {err}");
+
+        // an empty set fails with "no spec", not a panic.
+        let err = ProviderSet::empty().resolve("anything").err().expect("empty set");
+        assert!(err.contains("no capability spec matches"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_unpinned_without_a_default_model_is_a_clear_error() {
+        let dir = scratch("resolve-nodefault");
+        fake_cli(&dir, "x-cli", "exit 0");
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "x"
+[detect]
+bin = "x-cli"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+[models]
+patterns = ["*"]
+"#,
+            "test",
+        )
+        .unwrap();
+        let set = discover_with(
+            SpecSet::from_specs(vec![spec]),
+            Some(dir.into_os_string()),
+            &no_env,
+            None,
+        );
+        let err = set.resolve("").err().expect("no default model");
+        assert!(err.contains("no default model"), "got: {err}");
+    }
+
+    // ---- providers end-to-end ------------------------------------------------
 
     #[tokio::test]
     async fn codex_provider_round_trips_the_prompt() {
@@ -535,6 +725,77 @@ printf '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"b
     }
 
     #[tokio::test]
+    async fn text_format_returns_trimmed_stdout_and_rejects_empty() {
+        let dir = scratch("text-run");
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "plain"
+[detect]
+bin = "plain"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+[models]
+patterns = ["*"]
+"#,
+            "test",
+        )
+        .unwrap();
+        let bin = fake_cli(&dir, "plain", "cat > /dev/null\necho '  the answer  '");
+        let p = CliProvider::from_spec(spec.clone(), bin).with_workdir(scratch("text-run-wd"));
+        assert_eq!(p.run(&job("q")).await.unwrap(), "the answer");
+
+        // "ran fine, said nothing" is a broken executor, not an answer.
+        let silent = fake_cli(&dir, "silent", "cat > /dev/null");
+        let p = CliProvider::from_spec(spec, silent).with_workdir(scratch("text-silent-wd"));
+        let err = p.run(&job("q")).await.unwrap_err();
+        assert!(err.contains("no output"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn the_model_placeholder_is_substituted_into_argv() {
+        let dir = scratch("model-subst");
+        // the fake prints its FIRST ARG — which the spec routes {model} into.
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "argecho"
+[detect]
+bin = "argecho"
+[invoke]
+args = ["{model}"]
+prompt = "stdin"
+[output]
+format = "text"
+[models]
+patterns = ["*"]
+"#,
+            "test",
+        )
+        .unwrap();
+        let bin = fake_cli(
+            &dir,
+            "argecho",
+            r#"cat > /dev/null
+echo "model=$1""#,
+        );
+        let p = CliProvider::from_spec(spec, bin).with_workdir(scratch("model-subst-wd"));
+        let out = p
+            .run(&ProviderJob {
+                prompt: "q".into(),
+                model_ref: "my-model-9".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out, "model=my-model-9");
+    }
+
+    #[tokio::test]
     async fn a_failing_cli_surfaces_status_and_stderr() {
         let dir = scratch("cli-fail");
         let bin = fake_cli(&dir, "codex", "cat > /dev/null\necho 'auth missing' >&2\nexit 3");
@@ -585,5 +846,22 @@ cat > /dev/null"#,
             .with_timeout(Duration::from_secs(10));
         let big = "x".repeat(256 * 1024);
         assert_eq!(p.run(&job(&big)).await.unwrap(), "ok");
+    }
+
+    #[test]
+    fn spec_timeout_seeds_the_provider_and_global_override_wins() {
+        let spec = builtin_specs().into_iter().find(|s| s.tag == CODEX).unwrap();
+        let p = CliProvider::from_spec(spec.clone(), PathBuf::from("/x"));
+        assert_eq!(p.timeout, Duration::from_secs(spec.timeout_secs));
+
+        let dir = scratch("global-timeout");
+        fake_cli(&dir, "codex", "exit 0");
+        let set = discover_with(
+            builtins(),
+            Some(dir.into_os_string()),
+            &no_env,
+            Some(Duration::from_secs(7)),
+        );
+        assert_eq!(set.capabilities(), vec![CODEX], "override plumbed without error");
     }
 }
