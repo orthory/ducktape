@@ -146,6 +146,12 @@ const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
 const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
+/// pump drain cadence: how often the pump applies finalized frames (and runs
+/// everything that rides the drain arm — checkpoints, valset orchestration,
+/// the epoch cutover, the heartbeat). enforced as a FLOOR via an absolute
+/// deadline in the pump loop: ingress load can delay one drain by one
+/// request's service time, but can never starve the arm.
+const DRAIN_TICK: Duration = Duration::from_millis(100);
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 const CHANNEL_STATE_SYNC: u64 = 4;
@@ -4867,6 +4873,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let _ = node.sink_mut().sync().await;
             }};
         }
+        // the drain deadline (see the drain arm): ABSOLUTE, so the
+        // per-iteration select rebuild cannot reset it under ingress load.
+        let mut next_drain = context.current() + DRAIN_TICK;
         loop {
             // resolve on whichever signal stream installed; if neither did,
             // this arm simply never fires (pending forever) and the loop runs
@@ -4898,305 +4907,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     graceful_checkpoint!();
                     std::process::exit(0);
                 }
-                job = rpc_ingress.next() => {
-                    let Some((req, reply)) = job else { continue };
-                    let resp = match req {
-                        RpcRequest::Submit { target, payload_hex } => {
-                            match unhex(&payload_hex) {
-                                Ok(payload) => {
-                                    let seq = next_seq;
-                                    next_seq += 1;
-                                    match node
-                                        .submit(&signer, seq, Msg { target, payload })
-                                        .await
-                                    {
-                                        Ok(_) => RpcReply::ok(),
-                                        Err(e) => RpcReply::err(format!("submit failed: {e}")),
-                                    }
-                                }
-                                Err(e) => RpcReply::err(format!("bad payload_hex: {e}")),
-                            }
-                        }
-                        RpcRequest::Query { target, req_hex } => match unhex(&req_hex) {
-                            Ok(req_bytes) => match node.host().query(&target, &req_bytes).await {
-                                Ok(bytes) => RpcReply {
-                                    reply_hex: Some(hex_bytes(&bytes)),
-                                    ..RpcReply::ok()
-                                },
-                                Err(e) => RpcReply::err(format!("query failed: {e}")),
-                            },
-                            Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
-                        },
-                        RpcRequest::Status => {
-                            let mut modules = std::collections::BTreeMap::new();
-                            for m in MODULE_IDS {
-                                if let Some(root) = node.host().module_root(m) {
-                                    modules.insert(m.to_string(), hex(&root));
-                                }
-                            }
-                            RpcReply {
-                                status: Some(RpcStatus {
-                                    height: node.finalized().map(|f| f.height),
-                                    app_hash: hex(&node.app_hash()),
-                                    modules,
-                                }),
-                                ..RpcReply::ok()
-                            }
-                        }
-                        RpcRequest::JoinRequests => {
-                            // read-time hygiene: an approved joiner is a member
-                            // now — its request is settled, drop it.
-                            let members = read_members_from_host(node.host()).await;
-                            join_requests.retain(|joiner, _| !members.contains(joiner));
-                            let views = join_requests
-                                .iter()
-                                .map(|(joiner, r)| JoinRequestView {
-                                    joiner: hex_bytes(joiner),
-                                    issuer: hex_bytes(&r.issuer),
-                                    first_seen_ms: r.first_seen_ms,
-                                    last_seen_ms: r.last_seen_ms,
-                                })
-                                .collect();
-                            RpcReply {
-                                join_requests: Some(views),
-                                ..RpcReply::ok()
-                            }
-                        }
-                        RpcRequest::Shutdown => {
-                            // best-effort final checkpoint + journal barrier so
-                            // the restart replays a minimal suffix; a failure
-                            // here is just the crash path, which also recovers.
-                            // SAME sequence as the signal arm (shared macro).
-                            graceful_checkpoint!();
-                            let _ = reply.send(RpcReply::ok());
-                            println!("[node {label}] shutdown requested via rpc — exiting");
-                            std::process::exit(0);
-                        }
-                    };
-                    let _ = reply.send(resp);
-                }
-                announce = lobby_ingress.next() => {
-                    let Some((peer, bytes)) = announce else { continue };
-                    let mut send_reply = |recorded: bool, detail: String| {
-                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
-                        let _ = lobby_tx.send(
-                            Recipients::One(peer.clone()),
-                            IoBuf::from(lobby::encode_msg(&msg)),
-                            false,
-                        );
-                    };
-                    let msg = match lobby::decode_msg(&bytes) {
-                        Ok(m) => m,
-                        Err(_) => continue, // junk on the doorbell — drop.
-                    };
-                    // crypto first (pure, cheap): the token must verify for
-                    // THIS network and the announced key must prove itself.
-                    let verified = match lobby::verify_join_request(&msg, &namespace) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            send_reply(false, e);
-                            continue;
-                        }
-                    };
-                    // then membership: the issuer must still be a member (a
-                    // removed member's outstanding invites die with it), and a
-                    // joiner that is already a member has nothing pending.
-                    let members = read_members_from_host(node.host()).await;
-                    let joiner_bytes = verified.joiner.as_ref().to_vec();
-                    if members.contains(&joiner_bytes) {
-                        send_reply(false, "already a validator".into());
-                        continue;
-                    }
-                    if !members.contains(&verified.issuer.as_ref().to_vec()) {
-                        send_reply(
-                            false,
-                            "the inviting member is no longer part of this network".into(),
-                        );
-                        continue;
-                    }
-                    let now = unix_ms();
-                    let fresh = !join_requests.contains_key(&joiner_bytes);
-                    let record = join_requests
-                        .entry(joiner_bytes)
-                        .or_insert(JoinRequestRecord {
-                            issuer: verified.issuer.as_ref().to_vec(),
-                            first_seen_ms: now,
-                            last_seen_ms: now,
-                        });
-                    record.last_seen_ms = now;
-                    if fresh {
-                        println!(
-                            "[node {label}] join request: {} asks to join (invited by {}) — \
-                             approve in the app, or run `ducktape-node invite-accept {}`",
-                            hex_bytes(verified.joiner.as_ref()),
-                            hex_bytes(&record.issuer),
-                            hex_bytes(verified.joiner.as_ref())
-                        );
-                    }
-                    send_reply(
-                        true,
-                        "join request recorded — awaiting member approval".into(),
-                    );
-                }
-                cmd = http_ingress.next() => {
-                    let Some(cmd) = cmd else { continue };
-                    match cmd {
-                        // `origin` is the caller's CLAIMED submitter identity —
-                        // meaningful on the embedded daemon, but this lane signs
-                        // frames, and the signed origin IS this node's pubkey
-                        // (authenticated authorship that governance relies on).
-                        // a claimed origin cannot ride a signed frame without
-                        // making authorship forgeable, so it is ignored here;
-                        // display names resolve via the name registry instead.
-                        noded::NodeCommand::Submit { target, payload, origin: _, reply } => {
-                            let seq = next_seq;
-                            next_seq += 1;
-                            match node.submit(&signer, seq, Msg { target, payload }).await {
-                                // HOLD the reply: it lands when this frame
-                                // drains at a finalized boundary, so the app's
-                                // follow-up query reads the applied state.
-                                Ok(frame) => {
-                                    pending_submits.insert(
-                                        frame,
-                                        (reply, std::time::Instant::now() + SUBMIT_HOLD),
-                                    );
-                                }
-                                Err(e) => {
-                                    let _ = reply.send(Err(format!("submit failed: {e}")));
-                                }
-                            }
-                        }
-                        noded::NodeCommand::Query { target, req, reply } => {
-                            let result = node
-                                .host()
-                                .query(&target, &req)
-                                .await
-                                .map_err(|e| e.to_string());
-                            let _ = reply.send(result);
-                        }
-                        noded::NodeCommand::Status { reply } => {
-                            let modules = MODULE_IDS
-                                .iter()
-                                .map(|m| noded::ModuleStatus {
-                                    id: (*m).into(),
-                                    root: node
-                                        .host()
-                                        .module_root(m)
-                                        .map(|r| hex(&r))
-                                        .unwrap_or_default(),
-                                    category: noded::ModuleCategory::of(m),
-                                })
-                                .collect();
-                            let _ = reply.send(noded::NodeStatus {
-                                version: env!("CARGO_PKG_VERSION").into(),
-                                app_hash: hex(&node.app_hash()),
-                                height: node.finalized().map(|f| f.height).unwrap_or(0),
-                                modules,
-                            });
-                        }
-                        noded::NodeCommand::Metrics { reply } => {
-                            // the validator serves commonware's runtime registry;
-                            // the `ducktape_*` block series are the local daemon's
-                            // (noded's) surface, not wired into this consensus path.
-                            let _ = reply.send(context.encode());
-                        }
-                    }
-                }
-                msg = sync_ingress.next() => {
-                    let Some((peer, bytes)) = msg else {
-                        // the ingress task ended (network shutdown) — nothing
-                        // left to serve; keep draining consensus regardless.
-                        continue;
-                    };
-                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
-                        continue; // malformed rpc envelope: drop, never crash.
-                    };
-                    let resp = match statesync::decode_request(body) {
-                        Ok(statesync::SyncRequest::Frames {
-                            after_height,
-                            up_to_height,
-                        }) => {
-                            let response = match node
-                                .sink_mut()
-                                .read_finalized_frames(after_height, up_to_height)
-                                .await
-                            {
-                                Ok(frames) => {
-                                    let mut out = Vec::new();
-                                    let mut err = None;
-                                    for frame in frames
-                                        .into_iter()
-                                        .take(statesync::FRAME_BATCH_LEN)
-                                    {
-                                        match recovery_frame_to_sync(frame) {
-                                            Ok(frame) => out.push(frame),
-                                            Err(e) => {
-                                                err = Some(e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    match err {
-                                        Some(e) => statesync::SyncResponse::Error(e),
-                                        None => statesync::SyncResponse::Frames { frames: out },
-                                    }
-                                }
-                                Err(recovery::Error::RangePruned {
-                                    after_height,
-                                    retained_start,
-                                }) => statesync::SyncResponse::RangePruned {
-                                    requested_after: after_height,
-                                    retained_from: retained_start,
-                                },
-                                Err(e) => statesync::SyncResponse::Error(format!(
-                                    "recovery frame range: {e}"
-                                )),
-                            };
-                            statesync::encode_response(&response)
-                        }
-                        Ok(req) => {
-                            // the boundary's consensus coordinates ride the manifest.
-                            // the floor certificate is served only when it certifies
-                            // exactly the current boundary — a cert behind the
-                            // boundary would make a joiner skip history it needs.
-                            // stamp the served boundary's committed version fields from
-                            // live upgrade state (like epoch/view_base). a joiner installs
-                            // its dual-path modules at `current_version` and preflights
-                            // against `required_min_version` — both derived from these.
-                            let (bc_current, bc_pending) =
-                                read_upgrade_version_fields(node.host()).await;
-                            let coords = statesync::BoundaryCoords {
-                                epoch: orchestrator.epoch(),
-                                view_base: orchestrator.epoch_base(),
-                                participants: participant_bytes(&orchestrator),
-                                current_version: bc_current,
-                                pending_upgrade: bc_pending,
-                                floor_cert: latest_floor
-                                    .as_ref()
-                                    .filter(|fc| fc.epoch == orchestrator.epoch())
-                                    .filter(|fc| {
-                                        node.finalized().is_some_and(|f| f.height == fc.height)
-                                    })
-                                    .map(|fc| fc.cert.clone()),
-                            };
-                            let finalized_for_sync = node.finalized().filter(|f| {
-                                f.height <= coords.view_base || coords.floor_cert.is_some()
-                            });
-                            let response =
-                                sync_server.handle(node.host(), finalized_for_sync, &coords, req).await;
-                            statesync::encode_response(&response)
-                        }
-                        Err(e) => statesync::encode_response(&statesync::SyncResponse::Error(
-                            format!("bad request frame: {e}"),
-                        )),
-                    };
-                    let _ = sync_tx.send(
-                        Recipients::One(peer),
-                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                        false,
-                    );
-                }
-                _ = context.sleep(Duration::from_millis(100)).fuse() => {
+                // DRAIN CADENCE — an ABSOLUTE deadline, hoisted ABOVE the ingress
+                // arms. this select is rebuilt every loop iteration, so an
+                // arm-local `sleep(100ms)` restarts from zero whenever any other
+                // arm completes first — a saturating rpc-submit stream (requests
+                // landing well inside 100ms) then resets the timer forever and
+                // the drain NEVER runs: heights and status freeze, held submit
+                // replies starve, and the epoch cutover (`respawn_if_due` below
+                // is drain-driven) stalls for exactly as long as the flood lasts
+                // while the armed boundary's discard window swallows every
+                // accepted op. an absolute deadline survives the select rebuild,
+                // and sitting above the ingress arms makes `select_biased!` take
+                // it the moment it is due — load can delay one drain by one
+                // request's service time, never starve it.
+                _ = context.sleep_until(next_drain).fuse() => {
+                    next_drain = context.current() + DRAIN_TICK;
                     // FAIL-STOP: a drain error is a node-local block-boundary
                     // fault — this node's state is indeterminate relative to its
                     // peers, so applying even one more finalized op could
@@ -5768,6 +5493,304 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                         converged = true;
                     }
+                }
+                job = rpc_ingress.next() => {
+                    let Some((req, reply)) = job else { continue };
+                    let resp = match req {
+                        RpcRequest::Submit { target, payload_hex } => {
+                            match unhex(&payload_hex) {
+                                Ok(payload) => {
+                                    let seq = next_seq;
+                                    next_seq += 1;
+                                    match node
+                                        .submit(&signer, seq, Msg { target, payload })
+                                        .await
+                                    {
+                                        Ok(_) => RpcReply::ok(),
+                                        Err(e) => RpcReply::err(format!("submit failed: {e}")),
+                                    }
+                                }
+                                Err(e) => RpcReply::err(format!("bad payload_hex: {e}")),
+                            }
+                        }
+                        RpcRequest::Query { target, req_hex } => match unhex(&req_hex) {
+                            Ok(req_bytes) => match node.host().query(&target, &req_bytes).await {
+                                Ok(bytes) => RpcReply {
+                                    reply_hex: Some(hex_bytes(&bytes)),
+                                    ..RpcReply::ok()
+                                },
+                                Err(e) => RpcReply::err(format!("query failed: {e}")),
+                            },
+                            Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
+                        },
+                        RpcRequest::Status => {
+                            let mut modules = std::collections::BTreeMap::new();
+                            for m in MODULE_IDS {
+                                if let Some(root) = node.host().module_root(m) {
+                                    modules.insert(m.to_string(), hex(&root));
+                                }
+                            }
+                            RpcReply {
+                                status: Some(RpcStatus {
+                                    height: node.finalized().map(|f| f.height),
+                                    app_hash: hex(&node.app_hash()),
+                                    modules,
+                                }),
+                                ..RpcReply::ok()
+                            }
+                        }
+                        RpcRequest::JoinRequests => {
+                            // read-time hygiene: an approved joiner is a member
+                            // now — its request is settled, drop it.
+                            let members = read_members_from_host(node.host()).await;
+                            join_requests.retain(|joiner, _| !members.contains(joiner));
+                            let views = join_requests
+                                .iter()
+                                .map(|(joiner, r)| JoinRequestView {
+                                    joiner: hex_bytes(joiner),
+                                    issuer: hex_bytes(&r.issuer),
+                                    first_seen_ms: r.first_seen_ms,
+                                    last_seen_ms: r.last_seen_ms,
+                                })
+                                .collect();
+                            RpcReply {
+                                join_requests: Some(views),
+                                ..RpcReply::ok()
+                            }
+                        }
+                        RpcRequest::Shutdown => {
+                            // best-effort final checkpoint + journal barrier so
+                            // the restart replays a minimal suffix; a failure
+                            // here is just the crash path, which also recovers.
+                            // SAME sequence as the signal arm (shared macro).
+                            graceful_checkpoint!();
+                            let _ = reply.send(RpcReply::ok());
+                            println!("[node {label}] shutdown requested via rpc — exiting");
+                            std::process::exit(0);
+                        }
+                    };
+                    let _ = reply.send(resp);
+                }
+                announce = lobby_ingress.next() => {
+                    let Some((peer, bytes)) = announce else { continue };
+                    let mut send_reply = |recorded: bool, detail: String| {
+                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
+                        let _ = lobby_tx.send(
+                            Recipients::One(peer.clone()),
+                            IoBuf::from(lobby::encode_msg(&msg)),
+                            false,
+                        );
+                    };
+                    let msg = match lobby::decode_msg(&bytes) {
+                        Ok(m) => m,
+                        Err(_) => continue, // junk on the doorbell — drop.
+                    };
+                    // crypto first (pure, cheap): the token must verify for
+                    // THIS network and the announced key must prove itself.
+                    let verified = match lobby::verify_join_request(&msg, &namespace) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            send_reply(false, e);
+                            continue;
+                        }
+                    };
+                    // then membership: the issuer must still be a member (a
+                    // removed member's outstanding invites die with it), and a
+                    // joiner that is already a member has nothing pending.
+                    let members = read_members_from_host(node.host()).await;
+                    let joiner_bytes = verified.joiner.as_ref().to_vec();
+                    if members.contains(&joiner_bytes) {
+                        send_reply(false, "already a validator".into());
+                        continue;
+                    }
+                    if !members.contains(&verified.issuer.as_ref().to_vec()) {
+                        send_reply(
+                            false,
+                            "the inviting member is no longer part of this network".into(),
+                        );
+                        continue;
+                    }
+                    let now = unix_ms();
+                    let fresh = !join_requests.contains_key(&joiner_bytes);
+                    let record = join_requests
+                        .entry(joiner_bytes)
+                        .or_insert(JoinRequestRecord {
+                            issuer: verified.issuer.as_ref().to_vec(),
+                            first_seen_ms: now,
+                            last_seen_ms: now,
+                        });
+                    record.last_seen_ms = now;
+                    if fresh {
+                        println!(
+                            "[node {label}] join request: {} asks to join (invited by {}) — \
+                             approve in the app, or run `ducktape-node invite-accept {}`",
+                            hex_bytes(verified.joiner.as_ref()),
+                            hex_bytes(&record.issuer),
+                            hex_bytes(verified.joiner.as_ref())
+                        );
+                    }
+                    send_reply(
+                        true,
+                        "join request recorded — awaiting member approval".into(),
+                    );
+                }
+                cmd = http_ingress.next() => {
+                    let Some(cmd) = cmd else { continue };
+                    match cmd {
+                        // `origin` is the caller's CLAIMED submitter identity —
+                        // meaningful on the embedded daemon, but this lane signs
+                        // frames, and the signed origin IS this node's pubkey
+                        // (authenticated authorship that governance relies on).
+                        // a claimed origin cannot ride a signed frame without
+                        // making authorship forgeable, so it is ignored here;
+                        // display names resolve via the name registry instead.
+                        noded::NodeCommand::Submit { target, payload, origin: _, reply } => {
+                            let seq = next_seq;
+                            next_seq += 1;
+                            match node.submit(&signer, seq, Msg { target, payload }).await {
+                                // HOLD the reply: it lands when this frame
+                                // drains at a finalized boundary, so the app's
+                                // follow-up query reads the applied state.
+                                Ok(frame) => {
+                                    pending_submits.insert(
+                                        frame,
+                                        (reply, std::time::Instant::now() + SUBMIT_HOLD),
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                                }
+                            }
+                        }
+                        noded::NodeCommand::Query { target, req, reply } => {
+                            let result = node
+                                .host()
+                                .query(&target, &req)
+                                .await
+                                .map_err(|e| e.to_string());
+                            let _ = reply.send(result);
+                        }
+                        noded::NodeCommand::Status { reply } => {
+                            let modules = MODULE_IDS
+                                .iter()
+                                .map(|m| noded::ModuleStatus {
+                                    id: (*m).into(),
+                                    root: node
+                                        .host()
+                                        .module_root(m)
+                                        .map(|r| hex(&r))
+                                        .unwrap_or_default(),
+                                    category: noded::ModuleCategory::of(m),
+                                })
+                                .collect();
+                            let _ = reply.send(noded::NodeStatus {
+                                version: env!("CARGO_PKG_VERSION").into(),
+                                app_hash: hex(&node.app_hash()),
+                                height: node.finalized().map(|f| f.height).unwrap_or(0),
+                                modules,
+                            });
+                        }
+                        noded::NodeCommand::Metrics { reply } => {
+                            // the validator serves commonware's runtime registry;
+                            // the `ducktape_*` block series are the local daemon's
+                            // (noded's) surface, not wired into this consensus path.
+                            let _ = reply.send(context.encode());
+                        }
+                    }
+                }
+                msg = sync_ingress.next() => {
+                    let Some((peer, bytes)) = msg else {
+                        // the ingress task ended (network shutdown) — nothing
+                        // left to serve; keep draining consensus regardless.
+                        continue;
+                    };
+                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                        continue; // malformed rpc envelope: drop, never crash.
+                    };
+                    let resp = match statesync::decode_request(body) {
+                        Ok(statesync::SyncRequest::Frames {
+                            after_height,
+                            up_to_height,
+                        }) => {
+                            let response = match node
+                                .sink_mut()
+                                .read_finalized_frames(after_height, up_to_height)
+                                .await
+                            {
+                                Ok(frames) => {
+                                    let mut out = Vec::new();
+                                    let mut err = None;
+                                    for frame in frames
+                                        .into_iter()
+                                        .take(statesync::FRAME_BATCH_LEN)
+                                    {
+                                        match recovery_frame_to_sync(frame) {
+                                            Ok(frame) => out.push(frame),
+                                            Err(e) => {
+                                                err = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    match err {
+                                        Some(e) => statesync::SyncResponse::Error(e),
+                                        None => statesync::SyncResponse::Frames { frames: out },
+                                    }
+                                }
+                                Err(recovery::Error::RangePruned {
+                                    after_height,
+                                    retained_start,
+                                }) => statesync::SyncResponse::RangePruned {
+                                    requested_after: after_height,
+                                    retained_from: retained_start,
+                                },
+                                Err(e) => statesync::SyncResponse::Error(format!(
+                                    "recovery frame range: {e}"
+                                )),
+                            };
+                            statesync::encode_response(&response)
+                        }
+                        Ok(req) => {
+                            // the boundary's consensus coordinates ride the manifest.
+                            // the floor certificate is served only when it certifies
+                            // exactly the current boundary — a cert behind the
+                            // boundary would make a joiner skip history it needs.
+                            // stamp the served boundary's committed version fields from
+                            // live upgrade state (like epoch/view_base). a joiner installs
+                            // its dual-path modules at `current_version` and preflights
+                            // against `required_min_version` — both derived from these.
+                            let (bc_current, bc_pending) =
+                                read_upgrade_version_fields(node.host()).await;
+                            let coords = statesync::BoundaryCoords {
+                                epoch: orchestrator.epoch(),
+                                view_base: orchestrator.epoch_base(),
+                                participants: participant_bytes(&orchestrator),
+                                current_version: bc_current,
+                                pending_upgrade: bc_pending,
+                                floor_cert: latest_floor
+                                    .as_ref()
+                                    .filter(|fc| fc.epoch == orchestrator.epoch())
+                                    .filter(|fc| {
+                                        node.finalized().is_some_and(|f| f.height == fc.height)
+                                    })
+                                    .map(|fc| fc.cert.clone()),
+                            };
+                            let finalized_for_sync = node.finalized().filter(|f| {
+                                f.height <= coords.view_base || coords.floor_cert.is_some()
+                            });
+                            let response =
+                                sync_server.handle(node.host(), finalized_for_sync, &coords, req).await;
+                            statesync::encode_response(&response)
+                        }
+                        Err(e) => statesync::encode_response(&statesync::SyncResponse::Error(
+                            format!("bad request frame: {e}"),
+                        )),
+                    };
+                    let _ = sync_tx.send(
+                        Recipients::One(peer),
+                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
+                        false,
+                    );
                 }
             }
         }

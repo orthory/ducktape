@@ -683,7 +683,11 @@ where
 /// receipt does exactly one thing — `store.put`. `ContentStore::put` re-hashes
 /// the bytes as the key, so byzantine garbage stores under its own hash and can
 /// never match a finalized digest; content-addressing is the whole verification.
-fn spawn_payload_drain<E, R>(context: E, mut receiver: R, store: ContentStore)
+fn spawn_payload_drain<E, R>(
+    context: E,
+    mut receiver: R,
+    store: ContentStore,
+) -> commonware_runtime::Handle<()>
 where
     E: commonware_runtime::Spawner + Send + 'static,
     R: commonware_p2p::Receiver + Send + 'static,
@@ -694,7 +698,7 @@ where
             // store-ONLY: NO delivery. delivery stays the reporter's finalization arm.
             store.put(bytes);
         }
-    });
+    })
 }
 
 /// drain a payload-gossip channel to a BLACK HOLE: receive every message and
@@ -703,12 +707,12 @@ where
 /// — the deterministic knob behind [`SimplexOrderer::spawn_with_resolver`]'s
 /// `starve`. consuming (not dropping) the receiver keeps the channel from backing
 /// up while still leaving the store cold.
-fn spawn_blackhole_drain<E, R>(context: E, mut receiver: R)
+fn spawn_blackhole_drain<E, R>(context: E, mut receiver: R) -> commonware_runtime::Handle<()>
 where
     E: commonware_runtime::Spawner + Send + 'static,
     R: commonware_p2p::Receiver + Send + 'static,
 {
-    context.spawn(move |_ctx| async move { while receiver.recv().await.is_ok() {} });
+    context.spawn(move |_ctx| async move { while receiver.recv().await.is_ok() {} })
 }
 
 // ============================================================================
@@ -1059,7 +1063,7 @@ where
 
 /// the real commonware-simplex [`node::Orderer`]. `submit` stages a frame +
 /// queues its digest for this node's proposals; a live simplex `Engine` (started
-/// in [`SimplexOrderer::spawn`], kept alive by the `_engine` handle) BFT-orders
+/// in [`SimplexOrderer::spawn`], owned + Drop-aborted via the `engine` handle) BFT-orders
 /// it; `poll_delivered` non-blocking-drains the finalized frames in ascending-
 /// view (agreed) order. concrete (non-generic) so the `Orderer` impl is clean —
 /// the engine's scheme/context generics live only in `spawn`.
@@ -1068,11 +1072,36 @@ pub struct SimplexOrderer {
     inbox: FinalizedInbox,
     /// the shared latest-finalization slot (see [`LatestFinalization`]).
     latest_final: LatestFinalization,
-    /// the engine task keepalive: dropping the orderer aborts its engine.
-    _engine: commonware_runtime::Handle<()>,
-    /// the payload-fetch resolver engine keepalive — `Some` only when built via
-    /// [`SimplexOrderer::spawn_with_resolver`]. dropping it stops catch-up fetch.
-    _resolver: Option<commonware_runtime::Handle<()>>,
+    /// the engine task: ABORTED by this orderer's `Drop`. a
+    /// [`commonware_runtime::Handle`] does NOT abort on drop by itself, so
+    /// without the explicit abort an epoch cutover (which replaces the
+    /// orderer) would leak the old engine as a live zombie that keeps
+    /// voting and finalizing discard-land views forever.
+    engine: commonware_runtime::Handle<()>,
+    /// the payload-fetch resolver engine — `Some` only when built via
+    /// [`SimplexOrderer::spawn_with_resolver`]. aborted by `Drop` (same
+    /// no-abort-on-drop trap as the engine handle).
+    resolver_fetch: Option<commonware_runtime::Handle<()>>,
+    /// the eager payload-gossip drain (or its starve blackhole) — `Some` on
+    /// the relay/resolver paths. aborted by `Drop`: it would otherwise
+    /// outlive the epoch, pinned open by the network's sender side.
+    payload_drain: Option<commonware_runtime::Handle<()>>,
+}
+
+/// abort the engine and its side tasks when the orderer is replaced or
+/// dropped — the epoch-cutover teardown. `Handle::abort` is explicit in
+/// commonware-runtime (drop alone leaks the task), and this `Drop` is what
+/// makes "dropping the orderer tears down its engine" actually true.
+impl Drop for SimplexOrderer {
+    fn drop(&mut self) {
+        self.engine.abort();
+        if let Some(fetch) = &self.resolver_fetch {
+            fetch.abort();
+        }
+        if let Some(drain) = &self.payload_drain {
+            drain.abort();
+        }
+    }
 }
 
 impl SimplexOrderer {
@@ -1142,8 +1171,8 @@ impl SimplexOrderer {
     /// this crate keys on; only the vote/certificate signatures vary by scheme. also
     /// generic over the runtime `context` E, the `blocker` B, and the three engine
     /// channel pairs (forwarded to `engine.start`). config is the tuned legacy
-    /// default. the engine's keepalive handle lives inside the returned orderer —
-    /// dropping it aborts the engine.
+    /// default. the engine's handle lives inside the returned orderer, whose
+    /// `Drop` explicitly ABORTS it (a bare handle drop would leak the task).
     #[allow(clippy::too_many_arguments)]
     fn build<E, S, B, R, VS, VR, CS, CR, RS, RR>(
         context: E,
@@ -1155,6 +1184,7 @@ impl SimplexOrderer {
         floor: Option<Finalization<S, Digest>>,
         store: ContentStore,
         relay: R,
+        payload_drain: Option<commonware_runtime::Handle<()>>,
         vote: (VS, VR),
         certificate: (CS, CR),
         resolver: (RS, RR),
@@ -1252,15 +1282,17 @@ impl SimplexOrderer {
         };
 
         let engine = Engine::new(context.child("engine"), cfg);
-        // KEEP the handle alive inside the orderer — dropping it aborts the engine.
+        // the orderer owns the handle and ABORTS it in `Drop` — the handle
+        // alone would leak the task (no abort-on-drop in commonware-runtime).
         let engine_handle = engine.start(vote, certificate, resolver);
 
         SimplexOrderer {
             handle,
             inbox,
             latest_final,
-            _engine: engine_handle,
-            _resolver: None,
+            engine: engine_handle,
+            resolver_fetch: None,
+            payload_drain,
         }
     }
 
@@ -1314,6 +1346,7 @@ impl SimplexOrderer {
             None,
             store,
             relay,
+            None,
             vote,
             certificate,
             resolver,
@@ -1374,7 +1407,7 @@ impl SimplexOrderer {
     {
         let (payload_sender, payload_receiver) = payload;
         // store-ONLY drain: cache peer-relayed frames into THIS process's store.
-        spawn_payload_drain(
+        let drain_handle = spawn_payload_drain(
             context.child("payload_drain"),
             payload_receiver,
             store.clone(),
@@ -1393,6 +1426,7 @@ impl SimplexOrderer {
             None,
             store,
             relay,
+            Some(drain_handle),
             vote,
             certificate,
             resolver,
@@ -1492,15 +1526,15 @@ impl SimplexOrderer {
         // eager drain: cache peer-relayed frames store-only — UNLESS starved, in
         // which case receive+discard so the store stays cold and every
         // non-originated finalization routes through the resolver fetch path.
-        if starve {
-            spawn_blackhole_drain(context.child("payload_starve"), payload_receiver);
+        let drain_handle = if starve {
+            spawn_blackhole_drain(context.child("payload_starve"), payload_receiver)
         } else {
             spawn_payload_drain(
                 context.child("payload_drain"),
                 payload_receiver,
                 store.clone(),
-            );
-        }
+            )
+        };
 
         let relay = ConsensusRelay::<PS, ed25519::PublicKey>::new(payload_sender, store.clone());
 
@@ -1537,7 +1571,8 @@ impl SimplexOrderer {
         };
         let (fetch_engine, mailbox) =
             ResolverEngine::new(context.child("payload_fetch"), fetch_cfg);
-        // KEEP the fetch handle alive inside the orderer — dropping it stops catch-up.
+        // the orderer owns this handle and ABORTS it in `Drop` (a dropped
+        // handle alone would leak the fetch engine past the epoch).
         let fetch_handle = fetch_engine.start((fetch_sender, fetch_receiver));
 
         let latest_final = LatestFinalization::default();
@@ -1586,8 +1621,9 @@ impl SimplexOrderer {
             handle,
             inbox,
             latest_final,
-            _engine: engine_handle,
-            _resolver: Some(fetch_handle),
+            engine: engine_handle,
+            resolver_fetch: Some(fetch_handle),
+            payload_drain: Some(drain_handle),
         }
     }
 }

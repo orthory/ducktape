@@ -235,46 +235,73 @@ fn schedule_upgrade(cluster: &Cluster, name: &str, to_version: u32, start_lead: 
     );
 }
 
-/// push deterministically-applied idempotent directory fillers on node 0 until
-/// `done` — finalized views only advance with ops, so an idle net would park at
-/// the armed boundary. the rpc submit's reply is HELD until the frame drains at
-/// a finalized boundary, so this loop self-paces at the real block rate: with
-/// the gated heartbeat filling the other leader slots it sustains ~3 views/s
-/// ([`UPGRADE_LEAD`] is budgeted against that rate). do NOT parallelize the
-/// fillers across validators to cross faster — concurrent rpc submitters
-/// reproducibly livelock the engine mid-crossing (views stop finalizing while
-/// every node idles; see the fix/node-bin-dev-failures investigation).
+/// push deterministically-applied idempotent directory fillers until `done` —
+/// finalized views only advance with ops, so an idle net would park at the
+/// armed boundary. ONE FILLER LANE PER VALIDATOR (three concurrent rpc
+/// submitters, 25ms cadence each): concurrent submit pressure is exactly the
+/// load that used to freeze the pump — the drain arm starved behind the rpc
+/// arm's per-iteration timer reset, so heights froze and the cutover (drain-
+/// driven) never fired. with the pump's absolute drain deadline that wedge is
+/// fixed, and running the crossing under this load keeps it fixed: a
+/// regression starves the drain again and this pump times out loudly.
 fn push_until(cluster: &Cluster, what: &str, mut done: impl FnMut() -> bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let deadline = Instant::now() + CONVERGE;
-    let mut filler = 0u32;
-    let mut last = Instant::now() - Duration::from_secs(1);
-    loop {
-        if done() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {what};\n{}",
-            cluster.all_log_tails(60)
-        );
-        if last.elapsed() >= Duration::from_millis(200) {
-            last = Instant::now();
-            filler += 1;
-            let payload = directory_interface::encode_msg(&directory_interface::DirMsg::Set {
-                key: format!("upgrade-filler-{filler}"),
-                value: "x".into(),
+    let stop = AtomicBool::new(false);
+    let timed_out = std::thread::scope(|s| {
+        for lane in 0..3usize {
+            let stop = &stop;
+            s.spawn(move || {
+                let mut filler = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    filler += 1;
+                    let payload =
+                        directory_interface::encode_msg(&directory_interface::DirMsg::Set {
+                            key: format!("upgrade-filler-l{lane}-{filler}"),
+                            value: "x".into(),
+                        });
+                    let _ = cluster.rpc(
+                        lane,
+                        serde_json::json!({
+                            "cmd": "submit",
+                            "target": "directory",
+                            "payload_hex": common::hex(&payload),
+                        }),
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
             });
-            let _ = cluster.rpc(
-                0,
-                serde_json::json!({
-                    "cmd": "submit",
-                    "target": "directory",
-                    "payload_hex": common::hex(&payload),
-                }),
-            );
         }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        loop {
+            if done() {
+                stop.store(true, Ordering::Relaxed);
+                return false;
+            }
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::Relaxed);
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    });
+    assert!(
+        !timed_out,
+        "timed out waiting for {what};\n{}",
+        cluster.all_log_tails(60)
+    );
+}
+
+/// the cross-node app-hash agreement witness, robust to the concurrent push
+/// lanes: for a few seconds after [`push_until`] returns, each node is still
+/// draining its own lane's accepted-but-unfinalized backlog, so instantaneous
+/// app-hash reads legitimately skew. poll until every node reports the SAME
+/// hash — equality at a shared boundary IS the no-fork property — and return
+/// the agreed value.
+fn settled_app_hash(cluster: &Cluster, nodes: usize) -> String {
+    poll_until("cross-node app hashes to settle equal", FINALIZE, || {
+        let h0 = app_hash(cluster, 0);
+        ((!h0.is_empty()) && (1..nodes).all(|i| app_hash(cluster, i) == h0)).then_some(h0)
+    })
 }
 
 #[test]
@@ -391,18 +418,9 @@ fn cluster_upgrade() {
         "height {post_h} never reached activation height {activation_height} after the new epoch resumed"
     );
 
-    // quiesce so the app-hash settles identically on every node.
-    std::thread::sleep(Duration::from_secs(4));
-
-    // (a) NO FORK: every honest node agrees on the app-hash at/after H.
-    let boundary = app_hash(&cluster, 0);
-    for i in [1usize, 2] {
-        assert_eq!(
-            app_hash(&cluster, i),
-            boundary,
-            "cross-node app-hash fork at/after H (node {i})"
-        );
-    }
+    // (a) NO FORK: every honest node agrees on the app-hash at/after H (the
+    // settle poll rides out the push lanes' still-draining backlog).
+    settled_app_hash(&cluster, 3);
 
     // (b) THE UPGRADE DID SOMETHING: the forge module root recomputed under v2, so
     //     it differs from the byte-identical baseline captured before H (forge state
@@ -592,11 +610,9 @@ fn cluster_upgrade_aborts_on_unmet_quorum() {
         post >= abort_height,
         "height {post} never reached the aborted activation height {abort_height} — the net stalled at H"
     );
-    // quiesce, then confirm no honest node forked across the abort.
-    std::thread::sleep(Duration::from_secs(3));
-    let after = app_hash(&cluster, 0);
-    assert_eq!(app_hash(&cluster, 1), after, "cross-node app-hash fork across the abort (node 1)");
-    assert_eq!(app_hash(&cluster, 2), after, "cross-node app-hash fork across the abort (node 2)");
+    // confirm no honest node forked across the abort (settle poll rides out
+    // the push lanes' still-draining backlog).
+    settled_app_hash(&cluster, 3);
 
     // 4. RESCHEDULE: the slot is free and current_version is still 0, so a
     //    SUPPORTED to_version=2 upgrade now arms (R == n) and ACTIVATES — proving
@@ -625,9 +641,8 @@ fn cluster_upgrade_aborts_on_unmet_quorum() {
         assert_eq!(st.current_version, 2, "reschedule must activate to v2 (node {i})");
         assert!(st.pending.is_none(), "reschedule pending must clear on activation (node {i})");
     }
-    let recovered = app_hash(&cluster, 0);
-    assert_eq!(app_hash(&cluster, 1), recovered, "post-reschedule app-hash fork (node 1)");
-    assert_eq!(app_hash(&cluster, 2), recovered, "post-reschedule app-hash fork (node 2)");
+    // no fork across the reschedule activation (settle poll as above).
+    settled_app_hash(&cluster, 3);
     let post2 = height(&cluster, 0).expect("finalized height after the armed H");
     assert!(post2 >= arm_height, "height {post2} never reached the armed activation height {arm_height}");
 }
