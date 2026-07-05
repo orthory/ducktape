@@ -4178,6 +4178,7 @@ dependencies = [
  "pages",
  "profiles",
  "rand 0.8.6",
+ "reachability",
  "reactor",
  "recovery",
  "saga",
@@ -4195,6 +4196,8 @@ dependencies = [
  "valset",
  "valset-interface",
  "vaults",
+ "wireguard-effect",
+ "wireguard-upgrade",
 ]
 
 [[package]]

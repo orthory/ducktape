@@ -954,6 +954,10 @@ pub struct NodeToml {
     /// sealed blocks between recovery checkpoints (node-local operator
     /// policy — never part of the network descriptor). default 32.
     pub checkpoint_blocks: Option<u64>,
+    /// the UDP endpoint this node advertises for its WireGuard tunnel;
+    /// PRESENT stages the node-driven reachability plane (node-local
+    /// operator policy, like checkpoint_blocks). absent = plane off.
+    pub wireguard_listen: Option<String>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -1158,6 +1162,12 @@ pub struct Resolved {
     pub storage_dir: PathBuf,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
+    /// the staged WireGuard reachability plane's advertised UDP endpoint;
+    /// None = plane off.
+    pub wireguard_listen: Option<SocketAddr>,
+    /// where the node's X25519 WireGuard keypair persists (beside
+    /// identity.key in the network shape).
+    pub wireguard_key_file: PathBuf,
     /// dev-seed shape marker: gates the boot-time demo op + converged print
     /// (scaffolding a REAL network must not write into its genesis).
     pub dev_demo: bool,
@@ -1253,6 +1263,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         None => Ingress::Socket(listen),
     };
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
+    let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -1267,10 +1278,20 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         storage_dir: base.join(raw.storage_dir.as_deref().unwrap_or("storage")),
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
+        wireguard_listen,
+        wireguard_key_file: base.join("wireguard.key"),
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: load_invite_token(base)?,
     })
+}
+
+fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, String> {
+    raw.map(|a| {
+        a.parse::<SocketAddr>()
+            .map_err(|e| format!("wireguard_listen: {e}"))
+    })
+    .transpose()
 }
 
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
@@ -1334,6 +1355,11 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         None => Ingress::Socket(listen),
     };
 
+    let storage_dir = raw
+        .storage_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
+    let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -1345,12 +1371,13 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         coordinated: Vec::new(),
         listen,
         advertised,
-        storage_dir: raw
-            .storage_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}"))),
+        // the dev shape has no identity.key directory; the wireguard key
+        // lives with the node's other per-process state.
+        wireguard_key_file: storage_dir.join("wireguard.key"),
+        storage_dir,
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
+        wireguard_listen,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,

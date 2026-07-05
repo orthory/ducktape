@@ -7,7 +7,9 @@
 //! the mesh (its roots differ), which is the binding's whole job.
 
 use sha2::{Digest as _, Sha256};
-use wireguard_upgrade::{ActiveValidatorSet, AdmissionRoot, Root, UpgradeError, ValidatorIdentity};
+use wireguard_upgrade::{
+    ActiveValidatorSet, AdmissionRoot, PortPolicy, Root, UpgradeError, ValidatorIdentity,
+};
 
 use nat_traversal::NodeKey;
 
@@ -51,6 +53,24 @@ pub fn interface_name(chain_id: &str) -> String {
     let h: [u8; 32] = Sha256::digest(&pre).into();
     let hex: String = h[..4].iter().map(|b| format!("{b:02x}")).collect();
     format!("dt-{hex}")
+}
+
+/// The staged plane's endpoint policy: every port, loopback and private
+/// addresses allowed. It MUST be a uniform constant — `port_policy_hash` is
+/// cross-checked in every tunnel handshake, so two members constructing
+/// different policies (say, from their own local ports) could never
+/// handshake. Nodes advertise arbitrary operator-chosen ports and dev
+/// networks live on private/loopback addresses, hence open; pinning a
+/// descriptor-carried policy per network is the hardening follow-up.
+pub fn open_port_policy() -> PortPolicy {
+    let all_ports: Vec<u16> = (1..=u16::MAX).collect();
+    PortPolicy {
+        name: "ducktape-open".into(),
+        allowed_control_tcp_ports: all_ports.clone(),
+        allowed_wireguard_udp_ports: all_ports,
+        allow_loopback: true,
+        allow_private_ip: true,
+    }
 }
 
 /// A member's rendezvous key on the nat-traversal plane IS its ed25519

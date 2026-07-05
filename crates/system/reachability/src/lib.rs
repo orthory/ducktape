@@ -22,7 +22,10 @@ pub mod keys;
 pub mod msg;
 pub mod orchestrator;
 
-pub use binding::{active_set, admission_root, identity_of, interface_name, node_key, valset_root};
+pub use binding::{
+    active_set, admission_root, identity_of, interface_name, node_key, open_port_policy,
+    valset_root,
+};
 pub use keys::{KeyError, WireGuardKeypair};
 pub use msg::{MsgError, ReachabilityMsg};
 pub use orchestrator::{
