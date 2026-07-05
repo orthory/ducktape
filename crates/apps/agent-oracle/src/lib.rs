@@ -2,17 +2,29 @@
 //!
 //! the module state machine emits an opaque saga `WorkerRequest`. this crate is
 //! the impure host-side counterpart: it recognizes agent `LlmRequest` specs,
-//! runs them on a machine-local [`capability_host::Provider`] (the operator's
-//! own installed `codex` / `claude` CLI), and returns a saga `OracleResult` op.
+//! runs them on a machine-local [`capability_host::Provider`] (whichever
+//! executor CLI the operator brought), and returns a saga `OracleResult` op.
+//!
+//! this crate knows NOTHING about what it is running: the request names a
+//! capability tag, `ProviderSet::resolve` maps the tag to a local provider,
+//! and the provider's spec (operator data) says what execution means —
+//! binary, flags, model. no executor or model name appears here. a request
+//! for an uninstalled capability is a clean per-request error naming exactly
+//! what is missing.
 //!
 //! credentials are emphatically NOT this crate's concern: it never reads,
 //! writes, or refreshes any auth file. it renders a prompt, hands it to a BYO
-//! CLI, and parses the CLI's answer. which CLI runs — and which model an
-//! unpinned request gets — is decided by capability SPECS via
-//! `ProviderSet::resolve` (pattern routing + per-spec default models; see
-//! `docs/capability-spec.md`), so this crate carries no model-naming
-//! knowledge at all. a request for an uninstalled or unroutable capability is
-//! a clean per-request error naming exactly what is missing.
+//! CLI, and parses the CLI's answer.
+//!
+//! ## assignment-aware: run only what is leased to this node
+//!
+//! a `WorkerRequest` may carry an `assignee` — the node key whose lease this
+//! attempt is (rendezvous over the capability's providers). when the
+//! assignee is SOMEONE ELSE, this worker deliberately skips the spawn
+//! ([`reactor::WorkOutcome::Handled`] with no follow-up): under the strict
+//! lease policy a foreign result would be a no-op anyway, and not spawning
+//! is what turns N-nodes-each-paying-for-the-same-LLM-call into one call.
+//! an UNASSIGNED request (no providers announced) is run by anyone.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,9 +32,9 @@ use agent_interface::{
     AgentAction, AgentOutput, LlmRequest, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES,
     decode_llm_request, encode_output,
 };
-use capability_host::{ProviderJob, ProviderSet};
+use capability_host::ProviderSet;
 use chat_interface::{AuthorRef, Block, MessageView};
-use reactor::Worker;
+use reactor::{WorkOutcome, Worker};
 use saga_interface::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Effect, Msg};
 use serde::Deserialize;
@@ -36,31 +48,33 @@ Allowed reply block kinds are Paragraph, Heading, and Code. Heading is rendered 
 
 static MISSING_PROMPT_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Production LLM worker for agent `LlmRequest` saga effects. holds the host's
-/// provider surface (loaded specs + discovered providers); routing and
-/// default-model policy live in the specs, not here.
+/// Production LLM worker for agent `LlmRequest` saga effects. holds the
+/// host's provider surface (loaded specs + discovered providers) and this
+/// node's own key, so foreign-leased work is skipped instead of double-run.
 pub struct LlmWorker {
     blobs: files::BlobHandle,
     providers: ProviderSet,
+    /// this node's external submit key — compared against a request's
+    /// `assignee` to decide whether the lease is ours to execute.
+    node_key: Vec<u8>,
 }
 
 impl LlmWorker {
-    pub fn new(blobs: files::BlobHandle, providers: ProviderSet) -> Self {
-        Self { blobs, providers }
+    pub fn new(blobs: files::BlobHandle, providers: ProviderSet, node_key: Vec<u8>) -> Self {
+        Self {
+            blobs,
+            providers,
+            node_key,
+        }
     }
 
     async fn answer(&self, llm: &LlmRequest) -> Result<Vec<u8>, String> {
         let system = self.prompt_text(llm)?;
-        // spec-driven resolution: route the (possibly unpinned) model_ref to a
-        // capability, resolve the effective model, find the local provider.
-        let (provider, model) = self.providers.resolve(&llm.model_ref)?;
+        // explicit dispatch: the request names the capability, the spec
+        // behind the local provider decides everything else.
+        let provider = self.providers.resolve(&llm.capability)?;
         let prompt = render_prompt(&system, llm);
-        let text = provider
-            .run(&ProviderJob {
-                prompt,
-                model_ref: model,
-            })
-            .await?;
+        let text = provider.run(&prompt).await?;
         let output = agent_output_from_text(&text, llm.job_id.is_some());
         Ok(encode_output(&output))
     }
@@ -91,17 +105,26 @@ impl LlmWorker {
 
 #[async_trait::async_trait(?Send)]
 impl Worker for LlmWorker {
-    async fn run(&self, effect: &Effect) -> Result<Option<Msg>, reactor::Error> {
+    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, reactor::Error> {
         let request = match decode_worker_request(&effect.0) {
             Ok(request) => request,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(WorkOutcome::NotMine),
         };
         let llm = match decode_llm_request(&request.spec) {
             Ok(llm) => llm,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(WorkOutcome::NotMine),
         };
+        // the lease gate, host side: someone else's assignment is a
+        // deliberate skip — claimed (it IS our effect type), not run. the
+        // assignee submits the result; running it here would just burn an
+        // LLM call on a result strict would no-op.
+        if let Some(assignee) = &request.assignee {
+            if *assignee != self.node_key {
+                return Ok(WorkOutcome::Handled(None));
+            }
+        }
         let outcome = self.answer(&llm).await.map_err(clean_error);
-        Ok(Some(oracle_result(&request, outcome)))
+        Ok(WorkOutcome::Handled(Some(oracle_result(&request, outcome))))
     }
 }
 
@@ -338,16 +361,34 @@ mod tests {
     use super::*;
     use chat_interface::{MessageHead, ReactionSummary, Span};
 
-    // model-ref -> capability routing is spec-driven and lives in
-    // capability-host (spec::tests::routing_*); this crate no longer carries
-    // model-naming knowledge to test.
+    /// a provider surface with one loaded mock spec and NO installed
+    /// binaries — enough for every non-live test; no executor is named.
+    fn mock_specs_only() -> ProviderSet {
+        let spec = capability_host::CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "alpha"
+[detect]
+bin = "alpha-cli"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+"#,
+            "test",
+        )
+        .expect("mock spec parses");
+        ProviderSet::assemble(capability_host::SpecSet::from_specs(vec![spec]), Vec::new())
+    }
 
     #[test]
     fn prompt_renders_system_contract_and_transcript() {
         let llm = LlmRequest {
             run_id: "run-1".into(),
             agent_id: "bot".into(),
-            model_ref: String::new(),
+            capability: "alpha".into(),
             prompt_hash: vec![0; 32],
             channel_id: "general".into(),
             anchor_seq: 2,
@@ -381,7 +422,7 @@ mod tests {
         let llm = LlmRequest {
             run_id: "run-9".into(),
             agent_id: "bot".into(),
-            model_ref: "claude-sonnet-5".into(),
+            capability: "alpha".into(),
             prompt_hash: vec![0; 32],
             channel_id: "general".into(),
             anchor_seq: 0,
@@ -415,20 +456,16 @@ mod tests {
 
     #[test]
     fn a_missing_capability_is_a_clean_error_not_a_panic() {
-        // specs loaded but no CLIs installed: resolve() routes the request and
-        // then names the missing capability, rather than dispatching into the
-        // void — the operator learns WHAT to install.
+        // the spec is loaded but no binary is installed: resolve() names the
+        // missing capability rather than dispatching into the void — the
+        // operator learns WHAT to install.
         let blobs = files::BlobHandle::default();
         let prompt_hash = blobs.put_chunk(b"be helpful".to_vec());
-        let specs = capability_host::SpecSet::load(None).expect("builtin specs");
-        let worker = LlmWorker::new(
-            blobs,
-            ProviderSet::assemble(specs, Vec::new()),
-        );
+        let worker = LlmWorker::new(blobs, mock_specs_only(), b"me".to_vec());
         let llm = LlmRequest {
             run_id: "r".into(),
             agent_id: "bot".into(),
-            model_ref: String::new(),
+            capability: "alpha".into(),
             prompt_hash: prompt_hash.to_vec(),
             channel_id: "general".into(),
             anchor_seq: 1,
@@ -437,29 +474,73 @@ mod tests {
             transcript: vec![message(1, AuthorRef::User(b"h".to_vec()), "hi")],
         };
         let err = futures::executor::block_on(worker.answer(&llm)).unwrap_err();
-        assert!(err.contains("capability 'codex'"), "got: {err}");
-        assert!(err.contains("not provided"), "names the gap: {err}");
+        assert!(err.contains("\"alpha\" is not provided"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_foreign_lease_is_skipped_and_an_own_or_open_lease_is_run() {
+        use saga_interface::{WorkerRequest, encode_worker_request};
+
+        let blobs = files::BlobHandle::default();
+        let prompt_hash = blobs.put_chunk(b"be helpful".to_vec());
+        let worker = LlmWorker::new(blobs, mock_specs_only(), b"me".to_vec());
+        let llm = LlmRequest {
+            run_id: "r".into(),
+            agent_id: "bot".into(),
+            capability: "alpha".into(),
+            prompt_hash: prompt_hash.to_vec(),
+            channel_id: "general".into(),
+            anchor_seq: 1,
+            job_id: None,
+            context_hash: Vec::new(),
+            transcript: vec![message(1, AuthorRef::User(b"h".to_vec()), "hi")],
+        };
+        let effect_for = |assignee: Option<&[u8]>| {
+            Effect(encode_worker_request(&WorkerRequest {
+                saga_id: "s".into(),
+                attempt: 0,
+                spec: agent_interface::encode_llm_request(&llm),
+                deadline: None,
+                assignee: assignee.map(|a| a.to_vec()),
+            }))
+        };
+
+        // someone else's lease: claimed but deliberately not run — the skip
+        // that turns N spawns per effect into one.
+        match worker.run(&effect_for(Some(b"peer"))).await.unwrap() {
+            WorkOutcome::Handled(None) => {}
+            other => panic!("a foreign lease must be a claimed skip, got {other:?}"),
+        }
+
+        // our own lease and an unassigned request both execute (here: to the
+        // clean not-provided error, proving the spawn path was taken).
+        for assignee in [Some(b"me".as_slice()), None] {
+            match worker.run(&effect_for(assignee)).await.unwrap() {
+                WorkOutcome::Handled(Some(_)) => {}
+                other => panic!("an executable lease must produce an op, got {other:?}"),
+            }
+        }
     }
 
     /// live end-to-end against a REAL locally installed CLI (BYO auth). ignored
-    /// by default; run with the CLI on PATH and authenticated:
-    /// `cargo test -p agent-oracle -- --ignored live_run`.
-    /// unpinned routes to the codex catch-all; on a codex-less host pin a
-    /// model your installed CLI serves:
-    /// `DUCKTAPE_LIVE_MODEL=claude-sonnet-5 cargo test -p agent-oracle -- --ignored live_run`.
+    /// by default; name the capability tag your host provides:
+    /// `DUCKTAPE_LIVE_CAPABILITY=<tag> cargo test -p agent-oracle -- --ignored live_run`.
     #[tokio::test]
     #[ignore]
     async fn live_run_uses_a_local_cli() {
+        let capability = std::env::var("DUCKTAPE_LIVE_CAPABILITY")
+            .expect("set DUCKTAPE_LIVE_CAPABILITY to a capability this host provides");
         let blobs = files::BlobHandle::default();
         let prompt_hash = blobs.put_chunk(b"Reply with a tiny JSON AgentOutput.".to_vec());
         let worker = LlmWorker::new(
             blobs,
             capability_host::discover().expect("capability specs load"),
+            b"live".to_vec(),
         );
         let llm = LlmRequest {
             run_id: "live".into(),
             agent_id: "bot".into(),
-            model_ref: std::env::var("DUCKTAPE_LIVE_MODEL").unwrap_or_default(),
+            capability,
             prompt_hash: prompt_hash.to_vec(),
             channel_id: "general".into(),
             anchor_seq: 1,

@@ -68,11 +68,25 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// what a [`Worker`] did with an offered effect. three-way on purpose:
+/// "not my effect" (keep offering) and "mine, deliberately not run" (stop
+/// offering, nothing to submit) are different outcomes — collapsing them
+/// would misreport an assignment-skipped effect as an unclaimed drop.
+#[derive(Debug)]
+pub enum WorkOutcome {
+    /// try-decode failed: not this worker's effect — offer it to the next.
+    NotMine,
+    /// this worker's effect, handled: submit the follow-up op if present.
+    /// `None` is a deliberate no-op — e.g. the work is leased to another
+    /// node's key and this host must not spawn it.
+    Handled(Option<Msg>),
+}
+
 /// a host-owned, NON-DETERMINISTIC worker behind the effect seam. given an
 /// [`Effect`] it recognizes, it does the off-consensus work (an LLM call, a fetch,
 /// a commit) and returns the follow-up op that carries the result back through the
-/// NORMAL submit path — the oracle-as-transaction. `Ok(None)` means "not my
-/// effect": try-decode routing, so the reactor can offer each effect to every
+/// NORMAL submit path — the oracle-as-transaction. [`WorkOutcome::NotMine`] means
+/// try-decode routing failed, so the reactor can offer each effect to every
 /// worker until one claims it.
 ///
 /// the worker never gets a handle to any module: it CANNOT mutate state directly.
@@ -80,7 +94,7 @@ impl std::error::Error for Error {}
 /// reactor submits as an ordinary op. that is the oracle pattern enforced by type.
 #[async_trait::async_trait(?Send)]
 pub trait Worker {
-    async fn run(&self, effect: &Effect) -> Result<Option<Msg>, Error>;
+    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, Error>;
 }
 
 /// the settled outcome of driving a trigger op to a fixpoint: the final app-hash
@@ -137,12 +151,16 @@ impl Reactor {
             events.extend(outcome.events);
 
             // drain the effect sink the host itself ignores. try-decode routing:
-            // the first worker that claims an effect wins.
+            // the first worker that claims an effect wins, whether or not it
+            // produced a follow-up (a deliberate skip still claims).
             for eff in &outcome.effects {
                 for w in &self.workers {
-                    if let Some(follow) = w.run(eff).await? {
-                        queue.push_back(follow);
-                        break;
+                    match w.run(eff).await? {
+                        WorkOutcome::NotMine => continue,
+                        WorkOutcome::Handled(follow) => {
+                            queue.extend(follow);
+                            break;
+                        }
                     }
                 }
             }
@@ -166,8 +184,7 @@ mod tests {
     };
 
     /// a MOCK oracle standing in for the real (non-deterministic) worker. it
-    /// try-decodes a `WorkerRequest`; on anything else it returns `Ok(None)` ("not
-    /// my effect"). on a match it computes a stand-in result — reversing the spec
+    /// try-decodes a `WorkerRequest`; on anything else it answers `NotMine`. on a match it computes a stand-in result — reversing the spec
     /// bytes, a pure transform here but MODELING an opaque external computation —
     /// and returns the `OracleResult` op that carries it back through submit,
     /// echoing the request's `(saga_id, attempt)` idempotency key.
@@ -175,20 +192,20 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl Worker for MockOracle {
-        async fn run(&self, effect: &Effect) -> Result<Option<Msg>, Error> {
+        async fn run(&self, effect: &Effect) -> Result<WorkOutcome, Error> {
             let wr = match decode_worker_request(&effect.0) {
                 Ok(wr) => wr,
-                Err(_) => return Ok(None),
+                Err(_) => return Ok(WorkOutcome::NotMine),
             };
             let result: Vec<u8> = wr.spec.iter().rev().copied().collect();
-            Ok(Some(Msg {
+            Ok(WorkOutcome::Handled(Some(Msg {
                 target: "saga".into(),
                 payload: encode_msg(&SagaMsg::OracleResult {
                     saga_id: wr.saga_id,
                     attempt: wr.attempt,
                     outcome: Ok(result),
                 }),
-            }))
+            })))
         }
     }
 
@@ -198,24 +215,24 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl Worker for FlakyOracle {
-        async fn run(&self, effect: &Effect) -> Result<Option<Msg>, Error> {
+        async fn run(&self, effect: &Effect) -> Result<WorkOutcome, Error> {
             let wr = match decode_worker_request(&effect.0) {
                 Ok(wr) => wr,
-                Err(_) => return Ok(None),
+                Err(_) => return Ok(WorkOutcome::NotMine),
             };
             let outcome = if wr.attempt == 0 {
                 Err("first attempt always fails".to_string())
             } else {
                 Ok(wr.spec.iter().rev().copied().collect())
             };
-            Ok(Some(Msg {
+            Ok(WorkOutcome::Handled(Some(Msg {
                 target: "saga".into(),
                 payload: encode_msg(&SagaMsg::OracleResult {
                     saga_id: wr.saga_id,
                     attempt: wr.attempt,
                     outcome,
                 }),
-            }))
+            })))
         }
     }
 
@@ -230,6 +247,7 @@ mod tests {
                 deadline: None,
                 max_attempts,
                 lease_views: None,
+                capability: None,
             }),
         }
     }
@@ -248,6 +266,7 @@ mod tests {
             .unwrap();
         match decode_reply(&reply).unwrap() {
             SagaReply::Saga(v) => v,
+            other => panic!("expected Saga reply, got {other:?}"),
         }
     }
 
@@ -331,11 +350,10 @@ mod tests {
             // op is not available, so re-run the effect through the worker manually
             // to prove the ONLY thing missing was the oracle op.
             let mut reactor = Reactor::new(host, vec![Box::new(MockOracle)]);
-            let follow = MockOracle
-                .run(&out.effects[0])
-                .await
-                .unwrap()
-                .expect("worker claims the effect");
+            let follow = match MockOracle.run(&out.effects[0]).await.unwrap() {
+                WorkOutcome::Handled(Some(follow)) => follow,
+                other => panic!("worker must claim the effect, got {other:?}"),
+            };
             let settled = reactor.submit_and_settle(follow).await.expect("settle");
             assert_eq!(
                 get_saga(reactor.host(), "s1").await.unwrap().status,

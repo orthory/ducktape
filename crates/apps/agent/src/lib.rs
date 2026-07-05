@@ -101,6 +101,7 @@ use saga_interface::{
     SagaMsg, SagaOrigin, SagaOutcome, decode_callback as saga_decode_callback,
     encode_msg as saga_encode_msg,
 };
+use capability_interface::validate_tag;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use tasks_interface::{
@@ -202,7 +203,10 @@ struct AgentState {
     /// the registration origin — the owner capability for every mutation.
     owner: SagaOrigin,
     display_name: String,
-    model_ref: String,
+    /// the capability registry tag this agent's runs are dispatched on —
+    /// WHAT the run needs; how it executes (binary, flags, model) is host
+    /// policy in each provider's spec, invisible to consensus.
+    capability: String,
     /// sha256 of the prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
     prompt_hash: Vec<u8>,
     /// granted action names from the known vocabulary, deduped and sorted.
@@ -292,7 +296,7 @@ fn encode_committed(
         put_bytes(&mut out, id.as_bytes());
         put_origin(&mut out, &a.owner);
         put_bytes(&mut out, a.display_name.as_bytes());
-        put_bytes(&mut out, a.model_ref.as_bytes());
+        put_bytes(&mut out, a.capability.as_bytes());
         put_bytes(&mut out, &a.prompt_hash);
         out.extend_from_slice(&(a.allowed_actions.len() as u64).to_le_bytes());
         for action in &a.allowed_actions {
@@ -527,7 +531,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         }
         let owner = take_origin(&mut buf)?;
         let display_name = take_lp_string(&mut buf)?;
-        let model_ref = take_lp_string(&mut buf)?;
+        let capability = take_lp_string(&mut buf)?;
         let prompt_hash = take_lp_bytes(&mut buf)?;
         let mut allowed_actions: BTreeSet<String> = BTreeSet::new();
         let actions = take_count(&mut buf, 8, "action")?;
@@ -553,7 +557,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
             AgentState {
                 owner,
                 display_name,
-                model_ref,
+                capability,
                 prompt_hash,
                 allowed_actions,
                 active,
@@ -751,7 +755,7 @@ impl AgentModule {
             agent_id: agent_id.to_string(),
             owner: a.owner.clone(),
             display_name: a.display_name.clone(),
-            model_ref: a.model_ref.clone(),
+            capability: a.capability.clone(),
             prompt_hash: a.prompt_hash.clone(),
             allowed_actions: a.allowed_actions.iter().cloned().collect(),
             status: if a.active {
@@ -915,7 +919,7 @@ impl AgentModule {
         job_id: Option<String>,
         job_claim_height: u64,
         requester: SagaOrigin,
-        model_ref: String,
+        capability: String,
         prompt_hash: Vec<u8>,
         context_hash: Vec<u8>,
         transcript: Vec<MessageView>,
@@ -929,7 +933,7 @@ impl AgentModule {
                 spec: encode_llm_request(&LlmRequest {
                     run_id: run_id.clone(),
                     agent_id: agent_id.clone(),
-                    model_ref,
+                    capability: capability.clone(),
                     prompt_hash,
                     channel_id: channel_id.clone(),
                     anchor_seq,
@@ -942,6 +946,9 @@ impl AgentModule {
                 deadline: Some(now.saturating_add(RUN_DEADLINE_VIEWS)),
                 max_attempts: RUN_MAX_ATTEMPTS,
                 lease_views: None,
+                // the same tag, surfaced to the saga ledger so assignment
+                // draws from this capability's announced providers.
+                capability: Some(capability),
             }),
         });
         self.pending_runs.insert(
@@ -1031,7 +1038,7 @@ impl AgentModule {
             return Ok(());
         };
         let requester = canonical_origin(&ctx.env().origin);
-        let (model_ref, prompt_hash) = (agent.model_ref.clone(), agent.prompt_hash.clone());
+        let (capability, prompt_hash) = (agent.capability.clone(), agent.prompt_hash.clone());
         ctx.emit_msg(Msg {
             target: jobs,
             payload: jobs_encode_msg(&JobsMsg::Claim {
@@ -1049,7 +1056,7 @@ impl AgentModule {
             Some(job_id),
             claim_height,
             requester,
-            model_ref,
+            capability,
             prompt_hash,
             spec_hash,
             Vec::new(),
@@ -1132,11 +1139,11 @@ impl AgentModule {
                 // the turn claim: the first creation in consensus order won.
                 continue;
             }
-            let (model_ref, prompt_hash) = {
+            let (capability, prompt_hash) = {
                 let agent = self
                     .agent(&agent_id)
                     .expect("engaged agents are registered");
-                (agent.model_ref.clone(), agent.prompt_hash.clone())
+                (agent.capability.clone(), agent.prompt_hash.clone())
             };
             match self.pin_context(&*ctx, &channel_id, seq).await {
                 Ok((context_hash, thread_root, transcript)) => self.stage_run(
@@ -1149,7 +1156,7 @@ impl AgentModule {
                     None,
                     0,
                     requester.clone(),
-                    model_ref,
+                    capability,
                     prompt_hash,
                     context_hash,
                     transcript,
@@ -1516,7 +1523,7 @@ impl AgentModule {
             AgentMsg::RegisterAgent {
                 agent_id,
                 display_name,
-                model_ref,
+                capability,
                 prompt_hash,
                 allowed_actions,
             } => {
@@ -1524,7 +1531,7 @@ impl AgentModule {
                 Self::validate_non_empty("agent_id", &agent_id)?;
                 reject_run_separator("agent_id", &agent_id)?;
                 Self::validate_non_empty("display_name", &display_name)?;
-                Self::validate_non_empty("model_ref", &model_ref)?;
+                validate_tag(&capability).map_err(Error::Module)?;
                 Self::validate_prompt_hash(&prompt_hash)?;
                 let allowed_actions = Self::validate_actions(allowed_actions)?;
                 if self.agent(&agent_id).is_some() {
@@ -1533,7 +1540,7 @@ impl AgentModule {
                 let state = AgentState {
                     owner,
                     display_name,
-                    model_ref,
+                    capability,
                     prompt_hash,
                     allowed_actions,
                     active: true,
@@ -1547,7 +1554,7 @@ impl AgentModule {
             AgentMsg::UpdateAgent {
                 agent_id,
                 display_name,
-                model_ref,
+                capability,
                 prompt_hash,
                 allowed_actions,
             } => {
@@ -1556,9 +1563,9 @@ impl AgentModule {
                     Self::validate_non_empty("display_name", &display_name)?;
                     state.display_name = display_name;
                 }
-                if let Some(model_ref) = model_ref {
-                    Self::validate_non_empty("model_ref", &model_ref)?;
-                    state.model_ref = model_ref;
+                if let Some(capability) = capability {
+                    validate_tag(&capability).map_err(Error::Module)?;
+                    state.capability = capability;
                 }
                 if let Some(prompt_hash) = prompt_hash {
                     Self::validate_prompt_hash(&prompt_hash)?;
@@ -1659,7 +1666,7 @@ impl AgentModule {
                 if !agent.active {
                     return Err(Error::Module(format!("agent is paused: {agent_id}")));
                 }
-                let (model_ref, prompt_hash) = (agent.model_ref.clone(), agent.prompt_hash.clone());
+                let (capability, prompt_hash) = (agent.capability.clone(), agent.prompt_hash.clone());
                 // unlike the hook intake, an explicit request REJECTS on a
                 // failed pin: this is the root op of its own block, so an
                 // error poisons nothing but the request itself.
@@ -1677,7 +1684,7 @@ impl AgentModule {
                     None,
                     0,
                     requester,
-                    model_ref,
+                    capability,
                     prompt_hash,
                     context_hash,
                     transcript,
@@ -2108,7 +2115,7 @@ mod tests {
         AgentMsg::RegisterAgent {
             agent_id: agent_id.into(),
             display_name: agent_id.to_uppercase(),
-            model_ref: "model-1".into(),
+            capability: "model-1".into(),
             prompt_hash: vec![7u8; PROMPT_HASH_LEN],
             allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
         }
@@ -2262,7 +2269,7 @@ mod tests {
                 AgentMsg::RegisterAgent {
                     agent_id: "a".into(),
                     display_name: "A".into(),
-                    model_ref: "m".into(),
+                    capability: "m".into(),
                     prompt_hash: vec![7u8; 31],
                     allowed_actions: Vec::new(),
                 },
@@ -2273,7 +2280,7 @@ mod tests {
                 AgentMsg::RegisterAgent {
                     agent_id: "a".into(),
                     display_name: "A".into(),
-                    model_ref: "m".into(),
+                    capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: vec!["forge.push".into()],
                 },
@@ -2284,7 +2291,7 @@ mod tests {
                 AgentMsg::RegisterAgent {
                     agent_id: String::new(),
                     display_name: "A".into(),
-                    model_ref: "m".into(),
+                    capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
                 },
@@ -2294,7 +2301,7 @@ mod tests {
                 AgentMsg::RegisterAgent {
                     agent_id: "bad\u{1f}id".into(),
                     display_name: "A".into(),
-                    model_ref: "m".into(),
+                    capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
                 },
@@ -2304,7 +2311,7 @@ mod tests {
                 AgentMsg::RegisterAgent {
                     agent_id: "a".into(),
                     display_name: "A".into(),
-                    model_ref: String::new(),
+                    capability: String::new(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
                 },
@@ -2315,7 +2322,7 @@ mod tests {
                 AgentMsg::RegisterAgent {
                     agent_id: "a".into(),
                     display_name: "x".repeat(MAX_AGENT_RECORD_BYTES),
-                    model_ref: "m".into(),
+                    capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
                 },
@@ -2388,7 +2395,7 @@ mod tests {
             AgentMsg::UpdateAgent {
                 agent_id: "bot".into(),
                 display_name: Some("Stolen".into()),
-                model_ref: None,
+                capability: None,
                 prompt_hash: None,
                 allowed_actions: None,
             },
@@ -2413,7 +2420,7 @@ mod tests {
             &admin(&AgentMsg::UpdateAgent {
                 agent_id: "bot".into(),
                 display_name: None,
-                model_ref: Some("model-2".into()),
+                capability: Some("model-2".into()),
                 prompt_hash: None,
                 allowed_actions: Some(vec![ACTION_TASKS_CREATE.into()]),
             }),
@@ -2429,7 +2436,7 @@ mod tests {
         .unwrap();
         commit(&mut m);
         let record = get_agent(&m, "bot").unwrap();
-        assert_eq!(record.model_ref, "model-2");
+        assert_eq!(record.capability, "model-2");
         assert_eq!(record.display_name, "BOT", "unset fields keep their value");
         assert_eq!(
             record.allowed_actions,
@@ -2597,6 +2604,7 @@ mod tests {
             deadline,
             max_attempts,
             lease_views,
+            capability,
         } = &triggers[0]
         else {
             panic!("expected a trigger");
@@ -2607,13 +2615,18 @@ mod tests {
         assert_eq!(*deadline, Some(3 + RUN_DEADLINE_VIEWS));
         assert_eq!(*max_attempts, RUN_MAX_ATTEMPTS);
         assert_eq!(*lease_views, None);
+        assert_eq!(
+            capability.as_deref(),
+            Some("model-1"),
+            "the record's capability rides the trigger for provider assignment"
+        );
         let request = agent_interface::decode_llm_request(spec).unwrap();
         assert_eq!(
             request,
             LlmRequest {
                 run_id: run_id.clone(),
                 agent_id: "bot1".into(),
-                model_ref: "model-1".into(),
+                capability: "model-1".into(),
                 prompt_hash: vec![7u8; 32],
                 channel_id: "general".into(),
                 anchor_seq: 3,

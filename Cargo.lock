@@ -24,6 +24,7 @@ version = "0.1.0"
 dependencies = [
  "agent-interface",
  "async-trait",
+ "capability-interface",
  "chat",
  "chat-interface",
  "commonware-runtime",

@@ -141,7 +141,7 @@ fn register(agent_id: &str, actions: &[&str]) -> AgentMsg {
     AgentMsg::RegisterAgent {
         agent_id: agent_id.into(),
         display_name: agent_id.to_uppercase(),
-        model_ref: "model-1".into(),
+        capability: "model-1".into(),
         prompt_hash: vec![7u8; 32],
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
     }
@@ -495,7 +495,7 @@ fn minimal_snapshot() -> Vec<u8> {
         &AgentMsg::RegisterAgent {
             agent_id: "a".into(),
             display_name: "A".into(),
-            model_ref: "m".into(),
+            capability: "m".into(),
             prompt_hash: vec![7u8; 32],
             allowed_actions: Vec::new(),
         },
@@ -572,7 +572,7 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
             &AgentMsg::RegisterAgent {
                 agent_id: id.into(),
                 display_name: id.to_uppercase(),
-                model_ref: "m".into(),
+                capability: "m".into(),
                 prompt_hash: vec![7u8; 32],
                 allowed_actions: Vec::new(),
             },
