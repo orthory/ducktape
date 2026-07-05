@@ -3240,6 +3240,9 @@ async fn reachability_plane(
     chain_id: String,
     signer: ed25519::PrivateKey,
     wireguard_key_file: PathBuf,
+    // where the plane persists each applied epoch's verified mesh and
+    // re-applies it from at boot (the cold-restart path).
+    mesh_state_file: PathBuf,
     wireguard_listen: std::net::SocketAddr,
     effect_kind: WireGuardEffectKind,
     advertised: Ingress,
@@ -3328,6 +3331,7 @@ async fn reachability_plane(
         control_endpoint,
         coordinators: coords,
         port_policy: policy,
+        persist_file: Some(mesh_state_file),
     };
     // the boot `Retarget`'s record fan-out fires before the p2p actors have
     // a single live connection, and mesh sends are best-effort — when both
@@ -3482,8 +3486,52 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // keep the raw (key, addr) pairs for statesync source selection before
     // discovery's bootstrapper list converts to its own ingress address type.
     let sync_candidates = bootstrappers.clone();
+    // cold-restart dial seeding: the persisted mesh's control endpoints (the
+    // chain-derived ULAs for overlay-advertised members) join the dial
+    // hints, so a member restarting with every configured ingress gone
+    // still dials its peers over the tunnels the reachability plane
+    // re-applies at boot. Config hints win: a peer that already has a
+    // configured entry gets no seed, in case discovery keeps one ingress
+    // per key — a possibly-dead persisted address must never displace a
+    // live operator-provided one. Load refusals (tamper, format, chain) are
+    // the plane's to surface at its restore; here they just mean no seeds.
+    let chain_id = String::from_utf8_lossy(&namespace).to_string();
+    let mesh_state_file = storage.join("mesh-state.json");
+    let mesh_dial_seeds: Vec<(ed25519::PublicKey, Ingress)> =
+        match reachability::store::load(&mesh_state_file, &chain_id) {
+            Ok(Some(mesh)) => {
+                let me = reachability::identity_of(&signer.public_key());
+                let seeds: Vec<(ed25519::PublicKey, Ingress)> = mesh
+                    .adverts
+                    .iter()
+                    .map(|advert| &advert.record)
+                    .filter(|record| record.validator_identity != me)
+                    .filter_map(|record| {
+                        let pk = ed25519::PublicKey::decode(&record.validator_identity.0[..])
+                            .ok()?;
+                        if bootstrappers.iter().any(|(hinted, _)| *hinted == pk) {
+                            return None;
+                        }
+                        Some((
+                            pk,
+                            Ingress::Socket(record.control_endpoint.socket_addr()),
+                        ))
+                    })
+                    .collect();
+                if !seeds.is_empty() {
+                    println!(
+                        "[node {label}] {} mesh dial seed(s) from the persisted mesh (epoch {})",
+                        seeds.len(),
+                        mesh.epoch
+                    );
+                }
+                seeds
+            }
+            _ => Vec::new(),
+        };
     let bootstrappers: Vec<(ed25519::PublicKey, _)> = bootstrappers
         .into_iter()
+        .chain(mesh_dial_seeds)
         .map(|(k, a)| (k, a.into()))
         .collect();
 
@@ -3509,17 +3557,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // once tunnels apply the mesh dials the target's advertised overlay
     // address over the tunnel (the target sets `advertised = "overlay"`).
     // what still needs a TCP foothold is the gossip itself: with ZERO
-    // bootstrap links nothing carries this node's records anywhere, so a
-    // coordinated-ONLY config parks until the persisted-mesh/coordinator-
-    // carried-gossip seam ships — surface that loudly rather than park
-    // silently.
+    // bootstrap links nothing carries this node's records anywhere. a
+    // RESTART has one without config: the persisted mesh re-applies at boot
+    // and its ULA seeds joined `bootstrappers` above. what remains uncovered
+    // is the FIRST join (nothing persisted yet) on a coordinated-only
+    // config — surface that loudly rather than park silently.
     if !coordinated.is_empty() {
         if bootstrappers.is_empty() {
             println!(
                 "[node {label}] WARNING: {} coordinated reach target(s) but NO direct/fronted \
-                 bootstrap link — tunnel bring-up gossip has no path to ride, so these peers \
-                 stay unreachable. add at least one direct/fronted hint (an ephemeral ingress \
-                 is enough) for the join window.",
+                 bootstrap link and no persisted mesh — tunnel bring-up gossip has no path to \
+                 ride, so these peers stay unreachable. add at least one direct/fronted hint \
+                 (an ephemeral ingress is enough) for the join window; after the first \
+                 converged mesh, restarts ride the persisted state.",
                 coordinated.len()
             );
         } else {
@@ -4471,8 +4521,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         coordinated.iter().map(|(_, c, _)| c.clone()).collect();
                     let thread_label = label.clone();
                     let reach_signer = signer.clone();
-                    let chain_id = String::from_utf8_lossy(&namespace).to_string();
+                    let chain_id = chain_id.clone();
                     let key_file = wireguard_key_file.clone();
+                    let state_file = mesh_state_file.clone();
                     let nudge_tx = cmd_tx.clone();
                     std::thread::Builder::new()
                         .name("reachability".into())
@@ -4486,6 +4537,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     chain_id,
                                     reach_signer,
                                     key_file,
+                                    state_file,
                                     wg_addr,
                                     wireguard_effect,
                                     advertised_reach,
@@ -4557,6 +4609,29 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         "[node {pump_label}] reachability: epoch {epoch} failed: \
                                          {reason}"
                                     ),
+                                    reachability::ReachabilityEvent::MeshRestored {
+                                        epoch,
+                                        interface,
+                                        peers,
+                                    } => println!(
+                                        "[node {pump_label}] reachability: persisted mesh \
+                                         (epoch {epoch}) restored on {interface} ({peers} \
+                                         peer(s)) — awaiting live assembly"
+                                    ),
+                                    reachability::ReachabilityEvent::RestoreFailed { reason } => {
+                                        println!(
+                                            "[node {pump_label}] reachability: persisted mesh \
+                                             not restored ({reason}); continuing on live \
+                                             assembly only"
+                                        )
+                                    }
+                                    reachability::ReachabilityEvent::PersistFailed { reason } => {
+                                        println!(
+                                            "[node {pump_label}] reachability: WARNING: mesh \
+                                             state not persisted ({reason}) — a cold restart \
+                                             will not restore this epoch"
+                                        )
+                                    }
                                 }
                             }
                         });
