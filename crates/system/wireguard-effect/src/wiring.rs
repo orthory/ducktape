@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
-use wireguard_upgrade::{
-    DefguardInterfaceConfig, Endpoint, TunnelInstallPlan, ValidatorIdentity,
-};
+use defguard_wireguard_rs::{key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration};
+use wireguard_upgrade::{AllowedIp, Endpoint, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
 
 use crate::WireGuardEffect;
 
@@ -55,22 +54,93 @@ pub fn apply_tunnel_plans<E: WireGuardEffect>(
     plans: &[TunnelInstallPlan],
     endpoint_overrides: &BTreeMap<ValidatorIdentity, SocketAddr>,
 ) -> Result<(), E::Error> {
-    let mut iface = DefguardInterfaceConfig::from_plan(
+    let local_interface_ips: Vec<AllowedIp> = plans
+        .iter()
+        .flat_map(|plan| plan.local_interface_ips().iter().copied())
+        .collect();
+    let peers: Vec<PeerTunnelConfig> = plans
+        .iter()
+        .map(|plan| PeerTunnelConfig {
+            wireguard_public_key: plan.peer_wireguard_public_key(),
+            // the override is matched by the plan's peer identity, never by
+            // endpoint, so two peers advertising the same address can never
+            // cross-match.
+            endpoint: endpoint_overrides
+                .get(&plan.peer_identity())
+                .copied()
+                .unwrap_or_else(|| plan.peer_endpoint().socket_addr()),
+            allowed_ips: plan.allowed_ips().to_vec(),
+            keepalive_seconds: plan.keepalive_seconds(),
+        })
+        .collect();
+    apply_peer_tunnels(
+        effect,
         ifname,
         private_key_base64,
         listen_endpoint,
-        plans.to_vec(),
-    );
-    // `from_plan` emits peers in plan order — pair them back up by position,
-    // not by endpoint, so two peers advertising the same address can never
-    // cross-match.
-    for (plan, peer) in plans.iter().zip(iface.config.peers.iter_mut()) {
-        if let Some(addr) = endpoint_overrides.get(&plan.peer_identity()) {
-            peer.endpoint = Some(*addr);
-        }
-    }
+        &local_interface_ips,
+        &peers,
+    )
+}
+
+/// One peer relationship expressed as plain parts rather than a validated
+/// `TunnelInstallPlan` — everything a WireGuard peer entry needs, already
+/// resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerTunnelConfig {
+    pub wireguard_public_key: X25519PublicKey,
+    pub endpoint: SocketAddr,
+    pub allowed_ips: Vec<AllowedIp>,
+    pub keepalive_seconds: Option<u16>,
+}
+
+/// The parts-level core both appliers share: ONE interface (own overlay
+/// addresses, listen port, private key) carrying every peer relationship.
+/// [`apply_tunnel_plans`] reduces validated plans to these parts; a mesh
+/// restored from persisted state (whose plans were validated in a PREVIOUS
+/// process life and are re-derived, not re-validated) calls this directly.
+pub fn apply_peer_tunnels<E: WireGuardEffect>(
+    effect: &mut E,
+    ifname: impl Into<String>,
+    private_key_base64: impl Into<String>,
+    listen_endpoint: Endpoint,
+    local_interface_ips: &[AllowedIp],
+    peers: &[PeerTunnelConfig],
+) -> Result<(), E::Error> {
+    // every peer relationship carries the same local side — dedup while
+    // preserving first-seen order.
+    let mut seen = BTreeSet::new();
+    let addresses: Vec<IpAddrMask> = local_interface_ips
+        .iter()
+        .filter(|route| seen.insert((route.addr, route.cidr)))
+        .map(|route| IpAddrMask::new(route.addr, route.cidr))
+        .collect();
+    let peers = peers
+        .iter()
+        .map(|cfg| {
+            let mut peer = Peer::new(Key::new(cfg.wireguard_public_key.0));
+            peer.endpoint = Some(cfg.endpoint);
+            peer.persistent_keepalive_interval = cfg.keepalive_seconds;
+            peer.set_allowed_ips(
+                cfg.allowed_ips
+                    .iter()
+                    .map(|route| IpAddrMask::new(route.addr, route.cidr))
+                    .collect(),
+            );
+            peer
+        })
+        .collect();
+    let config = InterfaceConfiguration {
+        name: ifname.into(),
+        prvkey: private_key_base64.into(),
+        addresses,
+        port: listen_endpoint.port,
+        peers,
+        mtu: None,
+        fwmark: None,
+    };
     effect.create_interface()?;
-    if let Err(err) = effect.apply(&iface.config) {
+    if let Err(err) = effect.apply(&config) {
         // `create_interface` already stood up the interface (a real socket
         // at `/var/run/wireguard/<ifname>.sock` on the Defguard path); don't
         // leave it behind just because this config was rejected (e.g. a
