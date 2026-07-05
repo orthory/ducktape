@@ -11,6 +11,36 @@
 
 use serde::{Deserialize, Serialize};
 
+/// longest single capability tag, in bytes — a wire-format constant shared by
+/// everything that mints or checks a tag (the registry's Announce validation,
+/// host spec parsing, agent registration).
+pub const MAX_TAG_LEN: usize = 64;
+
+/// the ONE definition of a well-formed capability tag: non-empty, at most
+/// [`MAX_TAG_LEN`] bytes, charset `[a-z0-9._-]`. every layer that accepts a
+/// tag validates through this — a tag that passes here can never bounce off
+/// another layer's copy of the rule, because there are no copies.
+pub fn validate_tag(tag: &str) -> Result<(), String> {
+    if tag.is_empty() {
+        return Err("capability tag must be non-empty".into());
+    }
+    if tag.len() > MAX_TAG_LEN {
+        return Err(format!(
+            "capability tag exceeds {MAX_TAG_LEN} bytes: {} bytes",
+            tag.len()
+        ));
+    }
+    if !tag
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+    {
+        return Err(format!(
+            "capability tag has invalid characters (want [a-z0-9._-]): {tag:?}"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityMsg {
     /// declaratively replace the submitter's announced capability set. the

@@ -75,15 +75,21 @@ pub enum AgentStatus {
     Paused,
 }
 
-/// one registered agent — an ordered-op registration, so which model and
+/// one registered agent — an ordered-op registration, so which capability and
 /// prompt an agent runs is part of the app-hash and auditable. `owner` is the
 /// registration origin and gates every mutation of the record.
+///
+/// `capability` names WHAT the run needs (an open-set registry tag like
+/// "codex" — dispatch selects providers of that tag); HOW it runs — binary,
+/// flags, model — is host policy in each provider's capability spec, and
+/// consensus never sees it. the record is a recipe, not an executor config.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
     pub agent_id: String,
     pub owner: SagaOrigin,
     pub display_name: String,
-    pub model_ref: String,
+    /// the capability registry tag this agent's runs are dispatched on.
+    pub capability: String,
     /// sha256 of the agent's prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
     pub prompt_hash: Vec<u8>,
     /// granted action names, each from [`KNOWN_ACTIONS`], sorted and deduped.
@@ -178,7 +184,8 @@ pub struct RunView {
 pub struct LlmRequest {
     pub run_id: String,
     pub agent_id: String,
-    pub model_ref: String,
+    /// the capability tag the executing host resolves to a local provider.
+    pub capability: String,
     pub prompt_hash: Vec<u8>,
     pub channel_id: String,
     pub anchor_seq: u64,
@@ -237,7 +244,7 @@ pub enum AgentMsg {
     RegisterAgent {
         agent_id: String,
         display_name: String,
-        model_ref: String,
+        capability: String,
         prompt_hash: Vec<u8>,
         allowed_actions: Vec<String>,
     },
@@ -245,7 +252,7 @@ pub enum AgentMsg {
     UpdateAgent {
         agent_id: String,
         display_name: Option<String>,
-        model_ref: Option<String>,
+        capability: Option<String>,
         prompt_hash: Option<Vec<u8>>,
         allowed_actions: Option<Vec<String>>,
     },

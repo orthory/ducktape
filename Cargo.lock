@@ -755,6 +755,7 @@ name = "capability-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "capability-interface",
  "serde",
  "serde_json",
  "tokio",

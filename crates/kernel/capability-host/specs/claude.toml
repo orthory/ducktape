@@ -1,7 +1,8 @@
 # Capability spec: Claude Code CLI.
 #
 # Embedded built-in default — see codex.toml for the annotated reference and
-# docs/capability-spec.md for the full format.
+# docs/capability-spec.md for the full format. No --model flag by default:
+# which model runs is the operator's CLI configuration (host policy).
 
 spec = 1
 
@@ -22,18 +23,10 @@ args = [
     "json",
     "--max-turns",
     "1",
-    "--model",
-    "{model}",
 ]
 prompt = "stdin"
 timeout_secs = 300
 
 [output]
 # The single `{"type":"result",...}` object from --output-format json.
-format = "claude-json"
-
-[models]
-# claude-* model refs route here. More literal characters than codex's "*"
-# catch-all, so "claude-sonnet-5" prefers this spec deterministically.
-patterns = ["claude*"]
-default = "claude-sonnet-5"
+format = "json-result"

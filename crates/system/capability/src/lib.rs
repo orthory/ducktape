@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use capability_interface::{
     CapabilityMsg, CapabilityQuery, CapabilityReply, decode_msg, decode_query, encode_reply,
+    validate_tag,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
@@ -47,8 +48,6 @@ use valset_interface::{
 /// one announcement cannot bloat replicated state, while staying far above
 /// any real host's executor count.
 const MAX_CAPABILITIES: usize = 64;
-/// longest single tag, in bytes.
-const MAX_TAG_LEN: usize = 64;
 
 pub struct CapabilityRegistry {
     id: ModuleId,
@@ -87,23 +86,7 @@ impl CapabilityRegistry {
         }
         let mut set = BTreeSet::new();
         for tag in tags {
-            if tag.is_empty() {
-                return Err(Error::Module("capability tag must be non-empty".into()));
-            }
-            if tag.len() > MAX_TAG_LEN {
-                return Err(Error::Module(format!(
-                    "capability tag exceeds {MAX_TAG_LEN} bytes: {} bytes",
-                    tag.len()
-                )));
-            }
-            if !tag
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
-            {
-                return Err(Error::Module(format!(
-                    "capability tag has invalid characters (want [a-z0-9._-]): {tag:?}"
-                )));
-            }
+            validate_tag(&tag).map_err(Error::Module)?;
             set.insert(tag);
         }
         Ok(set)
@@ -391,7 +374,7 @@ impl Module for CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capability_interface::{encode_msg, encode_query};
+    use capability_interface::{MAX_TAG_LEN, encode_msg, encode_query};
     use valset_interface::encode_reply as valset_encode_reply;
 
     /// a minimal Ctx: origin-configurable, and (optionally) answers the valset

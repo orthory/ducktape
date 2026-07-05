@@ -48,6 +48,13 @@ pub const MAX_REPLY_PAYLOAD_BYTES: usize = 64 * 1024;
 /// error ABORTS its block, exactly like an oversized `Ok` result.
 pub const MAX_ERROR_BYTES: usize = 16 * 1024;
 
+/// hard cap on a trigger's `capability` tag — stored on the saga, in the root
+/// preimage. the saga module treats the tag as opaque (no charset rules; a
+/// tag no provider announced simply assigns nobody), but its SIZE is bounded
+/// like every other stored trigger field. matches the capability registry's
+/// own tag cap.
+pub const MAX_CAPABILITY_BYTES: usize = 64;
+
 /// the canonical, serializable, orderable mirror of `sdk::Origin`, recorded on
 /// every saga at trigger time. it gates `Cancel` and `Prune` (only the
 /// recorded trigger origin may act) and rides in the committed encoding —
@@ -89,6 +96,13 @@ pub enum SagaMsg {
         /// lease window in views for each attempt. `None` defaults to
         /// `DEFAULT_LEASE_VIEWS` when an assignee exists, else no lease.
         lease_views: Option<u64>,
+        /// the capability the work requires. when set (and the ledger is
+        /// configured with a capability registry) each attempt is
+        /// rendezvous-assigned over the tag's ANNOUNCED PROVIDERS instead of
+        /// the raw validator set — only nodes that can actually execute the
+        /// work hold its lease. `None` keeps valset assignment. an opaque
+        /// tag to this module: bounded, never interpreted.
+        capability: Option<String>,
     },
     /// worker completion for one attempt, submitted as an op. `outcome` is
     /// the agreed result (`Ok`, capped at [`MAX_RESULT_BYTES`]) or the
@@ -172,11 +186,17 @@ pub struct SagaCallback {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SagaQuery {
     Get { saga_id: SagaId },
+    /// the earliest lease-expiry or deadline view over all PENDING sagas
+    /// (committed state) — `None` when nothing pending carries one. the read
+    /// a host-side crank pump polls: when the committed next expiry is at or
+    /// past the current view, submitting a `Crank` will transition something.
+    NextExpiry,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SagaReply {
     Saga(Option<SagaView>),
+    NextExpiry(Option<u64>),
 }
 
 /// a saga's observable state — the full read projection.
@@ -186,6 +206,7 @@ pub struct SagaView {
     pub reply_to: Option<String>,
     pub reply_payload: Vec<u8>,
     pub spec: Vec<u8>,
+    pub capability: Option<String>,
     pub status: SagaStatus,
     pub attempt: u32,
     pub max_attempts: u32,
