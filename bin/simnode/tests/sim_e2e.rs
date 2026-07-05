@@ -301,7 +301,9 @@ fn personas_shape_receipts_and_ring() {
         "blob lane serves the committed payload back"
     );
 
-    // local: receipts carry opHash, the ring stays empty — real noded's shape.
+    // local: receipts carry opHash — and the blocks lane is served either
+    // way (both real daemons feed the durable block index; the persona only
+    // shapes the receipt).
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--persona", "local"]);
     let pending = sim.submit_in_background("chat", create_channel("general", "General"));
@@ -312,10 +314,11 @@ fn personas_shape_receipts_and_ring() {
     assert_eq!(receipt["opHash"].as_str().map(str::len), Some(64));
     let (code, body) = sim.request("GET", "/v1/blocks", None);
     assert_eq!(code, 200);
+    let records = body["blocks"].as_array().expect("blocks is an array");
+    assert_eq!(records.len(), 1, "the durable block index serves both personas: {body}");
     assert_eq!(
-        body["blocks"].as_array().map(Vec::len),
-        Some(0),
-        "local persona leaves the ring empty like the real daemon: {body}"
+        records[0]["hash"], "",
+        "nothing is framed on this lane — the frame hash stays empty: {body}"
     );
 }
 

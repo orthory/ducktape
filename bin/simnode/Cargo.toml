@@ -35,13 +35,19 @@ memory = { workspace = true }
 chat-interface = { workspace = true }
 reactor = { workspace = true }
 noded = { path = "../noded" }
+# the durable block index — /v1/blocks and /v1/index/* read it, the sim actor
+# feeds it block-by-block exactly like the real daemons.
+indexer = { workspace = true }
+chat-index = { workspace = true }
+tasks-index = { workspace = true }
+document-index = { workspace = true }
+pages-index = { workspace = true }
 
 commonware-runtime = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
-sha2 = { workspace = true }
 futures = "0.3"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }

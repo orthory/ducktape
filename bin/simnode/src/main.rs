@@ -19,11 +19,13 @@
 //! same app-hash here. reads (query/status) always serve committed state:
 //! held ops are invisible until stepped, which is consensus semantics.
 //!
-//! personas shape the wire like the two real nodes:
-//!   - `local`: submit receipts carry `opHash`, the block ring stays empty —
-//!     the embedded noded daemon's surface.
-//!   - `networked`: the ring fills (with `opHash`), receipts are height-only
-//!     (a response layer strips `opHash`) — the validator's surface.
+//! the blocks/index lane is the real daemons' exactly: every commit feeds the
+//! durable block index (`BlockOps.record` via [`noded::block_row`]), so
+//! `GET /v1/blocks` and `/v1/index/*` serve just like noded. personas shape
+//! the one wire difference left between the two real nodes — the receipt:
+//!   - `local`: submit receipts carry `opHash` (the embedded daemon's shape).
+//!   - `networked`: receipts are height-only — a response layer strips
+//!     `opHash`, the validator's shape until its ordered-node convergence.
 //!
 //! `POST /sim/peer-block` commits a block owned by no held submit — the
 //! "concurrent writer" for optimistic-projection race scenarios.
@@ -32,15 +34,16 @@
 //! genuinely rejectable ops, so module semantics stay real), no LlmWorker
 //! (an external llm call in a determinism tool is a contradiction; the echo
 //! worker behind `--echo-oracle` is the only oracle). storage should be a
-//! fresh dir per run: there is no height-resume watermark here, so reusing a
-//! dir would restart heights over persisted module state.
+//! fresh dir per run (the height resumes above the index watermark like
+//! noded's, but reused module state defeats the same-script reproducibility
+//! this tool exists for).
 //!
 //! run: `cargo run -p simnode -- [--listen 127.0.0.1:8845] [--storage <dir>]
 //!       [--auto] [--persona local|networked] [--echo-oracle]`
 //!
-//! v1 limits, by design: no `/v1/index/*` tier (routes answer 503), and a
-//! rejected op never reaches the ring (Host::submit_at aborts it pre-commit;
-//! only the ordered validator journals rejected frames as blocks).
+//! v1 limit, by design: a rejected op never becomes a block here
+//! (Host::submit_at aborts it pre-commit; only the ordered validator
+//! journals rejected frames as blocks).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -66,12 +69,13 @@ use futures::channel::{mpsc, oneshot};
 use futures::select;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use inbox::Inbox;
+use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
 use jobs::Jobs;
 use memory::Memory;
 use noded::{
-    BlockDisposition, BlockRecord, BlockRing, BlockSummary, DispatchInfo, ModuleCategory,
-    ModuleStatus, NodeCommand, NodeHandle, NodeStatus, TelemetryEvent, TelemetryFrame,
-    TelemetryRing, WsFrame, hex_bytes, hex_root, payload_preview,
+    BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
+    NodeCommand, NodeHandle, NodeStatus, TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame,
+    block_row, hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
 use profiles::Profiles;
@@ -79,7 +83,6 @@ use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Effect, Event, Msg, Origin};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tasks::Tasks;
 use tokio::sync::broadcast;
 
@@ -238,8 +241,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let forge_repo = storage.join("forge-git");
     let persona_label = format!("{persona:?}");
 
+    // the durable block index: /v1/blocks and /v1/index/* read it, the sim
+    // actor feeds it block-by-block — same wiring as the real daemons.
+    let index_dir = storage.join("index");
+    let index = IndexStore::open(&index_dir, &MODULE_IDS)
+        .map(|store| {
+            Arc::new(
+                store
+                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
+                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
+                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
+                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
+            )
+        })
+        .map_err(|err| {
+            format!(
+                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
+                index_dir.display()
+            )
+        })?;
+
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
-    let handle = handle.with_forge_repo(forge_repo.clone());
+    let handle = handle
+        .with_forge_repo(forge_repo.clone())
+        .with_index_store(index.clone());
     let (control_tx, control_rx) = mpsc::channel::<SimCommand>(16);
     let persona = Arc::new(Mutex::new(persona));
 
@@ -247,16 +272,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_persona = persona.clone();
     let blobs = handle.blob_handle();
     let telemetry = handle.telemetry_ring();
-    let blocks = handle.block_ring();
     std::thread::Builder::new()
         .name("sim-actor".into())
         .spawn(move || {
             run_sim(
                 actor_storage,
                 forge_repo,
+                index,
                 blobs,
                 telemetry,
-                blocks,
                 actor_persona,
                 auto,
                 echo_oracle,
@@ -323,7 +347,7 @@ struct Sim {
     workers: Vec<Box<dyn reactor::Worker>>,
     blobs: files::BlobHandle,
     telemetry: TelemetryRing,
-    blocks: BlockRing,
+    index: Arc<IndexStore>,
     events: broadcast::Sender<WsFrame>,
 }
 
@@ -331,9 +355,9 @@ struct Sim {
 fn run_sim(
     storage: PathBuf,
     forge_repo: PathBuf,
+    index: Arc<IndexStore>,
     blobs: files::BlobHandle,
     telemetry: TelemetryRing,
-    blocks: BlockRing,
     persona: Arc<Mutex<Persona>>,
     auto: bool,
     echo_oracle: bool,
@@ -385,9 +409,14 @@ fn run_sim(
 
         println!("[simnode] genesis app_hash={}", hex_root(&host.app_hash()));
 
+        // resume above the index watermark like noded — with the contractual
+        // fresh dir this is 0; on a (discouraged) reused dir it keeps op-log
+        // heights monotonic instead of silently skipping every new block.
+        let height = index.resume_height().expect("read index watermarks");
+
         let mut sim = Sim {
             host,
-            height: 0,
+            height,
             auto,
             persona,
             held: VecDeque::new(),
@@ -399,7 +428,7 @@ fn run_sim(
             },
             blobs,
             telemetry,
-            blocks,
+            index,
             events,
         };
 
@@ -539,19 +568,25 @@ impl Sim {
         Ok(())
     }
 
-    /// the one commit point: apply the op at the next height under the logical
-    /// clock, publish the same frames a real node publishes (telemetry ring,
-    /// ws block + telemetry), stage the payload (op hash == content address),
-    /// and — networked persona — push the explorer ring record.
+    /// the one commit point — noded's submit_one under the logical clock:
+    /// apply the op at the next height, publish the same frames a real node
+    /// publishes (telemetry ring, ws block + telemetry), stage the payload
+    /// (op hash == content address), and feed the durable block index that
+    /// serves GET /v1/blocks and /v1/index/*.
     async fn commit(&mut self, origin: Origin, msg: Msg) -> Result<Committed, String> {
         let target = msg.target.clone();
-        let payload = msg.payload.clone();
+        let payload = payload_preview(&msg.payload);
+        let proposer = proposer_hex(&origin);
         let consensus_time = SIM_EPOCH_MS + (self.height + 1) * SIM_BLOCK_MS;
+        // staging IS hashing (put_chunk keys by sha256), and every real
+        // surface stages committed payloads — the local daemon at submit, the
+        // validator at drain — so /v1/files/blob/{opHash} dereferences here too.
+        let op_hash = hex_bytes(&self.blobs.put_chunk(msg.payload.clone()));
         let ctx = BlockContext {
             protocol_version: 0,
             height: self.height + 1,
             consensus_time,
-            origin: origin.clone(),
+            origin,
         };
         let out = match self.host.submit_at(ctx, msg).await {
             Ok(out) => out,
@@ -570,6 +605,7 @@ impl Sim {
             height: self.height,
             app_hash: hex_root(&out.app_hash),
         };
+        let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
         let frame = TelemetryFrame {
             height: self.height,
             consensus_time,
@@ -577,29 +613,48 @@ impl Sim {
             // telemetry plane's one non-deterministic signal. the sim reports
             // zero instead of lying with a real measurement.
             latency_us: 0,
-            dispatches: out.dispatches.iter().map(dispatch_info).collect(),
+            dispatches: operations.clone(),
             events: out.events.iter().map(event_preview).collect(),
         };
-        // staging IS hashing (put_chunk keys by sha256), and every real
-        // surface stages committed payloads — the local daemon at submit, the
-        // validator at drain — so /v1/files/blob/{opHash} dereferences here too.
-        let op_hash = hex_bytes(&self.blobs.put_chunk(payload.clone()));
-        if *self.persona.lock().expect("persona poisoned") == Persona::Networked {
-            self.blocks.push(BlockRecord {
-                height: self.height,
-                hash: frame_hash(self.height, &payload),
-                commit_hash: block.app_hash.clone(),
-                proposer: proposer_hex(&origin),
-                disposition: BlockDisposition::Applied,
-                target: target.clone(),
-                operations: out.dispatches.iter().map(DispatchInfo::from).collect(),
-                payload: payload_preview(&payload),
-                op_hash: op_hash.clone(),
-            });
-        }
         self.telemetry.push(frame.clone());
         let _ = self.events.send(WsFrame::Block(block.clone()));
         let _ = self.events.send(WsFrame::Telemetry(frame));
+
+        // fold the block into the durable index LAST, like noded: canonical
+        // state is already committed, so an index failure degrades the read
+        // models, never the block. the frame hash stays empty — nothing is
+        // framed on this lane, same discipline as the real daemon.
+        let ops = out
+            .dispatches
+            .into_iter()
+            .map(|d| AppliedOp {
+                origin: index_origin(&d.origin),
+                module: d.module,
+                payload: d.payload,
+            })
+            .collect();
+        let block_ops = BlockOps {
+            height: self.height,
+            time: consensus_time,
+            ops,
+            record: Some(block_row(&BlockRecord {
+                height: self.height,
+                hash: String::new(),
+                commit_hash: block.app_hash.clone(),
+                proposer,
+                disposition: BlockDisposition::Applied,
+                target: target.clone(),
+                operations,
+                payload,
+                op_hash: op_hash.clone(),
+            })),
+        };
+        if let Err(err) = self.index.apply_block(&block_ops) {
+            eprintln!(
+                "[simnode] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
+                self.height
+            );
+        }
 
         offer_effects(&self.workers, out.effects, &mut self.oracle_queue).await;
         Ok(Committed {
@@ -651,14 +706,14 @@ fn committed_info(committed: &Committed, kind: &'static str) -> CommittedInfo {
     }
 }
 
-/// the sim has no consensus frames, so the ring's "block hash" is a labeled
-/// stand-in: sha256 over (height ‖ payload). deterministic, distinct from the
-/// op's content address, and honest about not being a real frame hash.
-fn frame_hash(height: u64, payload: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(height.to_be_bytes());
-    hasher.update(payload);
-    hex_bytes(&hasher.finalize())
+/// map a dispatch origin to the index's flattened origin tag — noded's exact
+/// mapping, so index rows read identically across the real and sim daemons.
+fn index_origin(origin: &Origin) -> OriginTag {
+    match origin {
+        Origin::External(id) => OriginTag::external(String::from_utf8_lossy(id)),
+        Origin::Module(id) => OriginTag::module(id.clone()),
+        Origin::System => OriginTag::system(),
+    }
 }
 
 fn proposer_hex(origin: &Origin) -> String {
