@@ -12,6 +12,12 @@ import {
 } from "react";
 
 import {
+  displayNameForKey,
+  normalizeKey,
+  sameKey,
+  shortKey,
+} from "../../../domain/names";
+import {
   isDesktop,
   joinRequests as fetchJoinRequests,
   type JoinRequest,
@@ -58,20 +64,6 @@ const STATUS_PILLS = {
   unavailable: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
 } as const;
 
-const normalizeKey = (key: string | null | undefined): string =>
-  (key ?? "").trim().replace(/^0x/i, "").toLowerCase();
-
-const sameKey = (left: string | null | undefined, right: string | null | undefined): boolean =>
-  Boolean(normalizeKey(left)) && normalizeKey(left) === normalizeKey(right);
-
-const shortKey = (hex: string, start = 10, end = 6): string => {
-  const clean = hex.trim();
-  if (!clean) return "—";
-  return clean.length > start + end + 1
-    ? `${clean.slice(0, start)}…${clean.slice(-end)}`
-    : clean;
-};
-
 const initialsOf = (name: string): string => {
   // Drop parenthetical qualifiers ("eddy (joined node)" → "eddy") and keep only
   // words that START alphanumeric, so an initial never becomes "(" or other
@@ -113,7 +105,7 @@ function makeMembers(
   const localKey = workspace?.pubkey ?? null;
   return members.map((key) => {
     const keyNorm = normalizeKey(key);
-    const profileName = authorNames[key] ?? authorNames[keyNorm] ?? null;
+    const profileName = displayNameForKey(key, authorNames);
     const isLocal = sameKey(key, localKey);
     const isFounder = Boolean(workspace?.founder && isLocal);
     const role = isFounder

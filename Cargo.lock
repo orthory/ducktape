@@ -1438,6 +1438,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinator-bin"
+version = "0.1.0"
+dependencies = [
+ "nat-traversal",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3993,6 +4001,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nat-traversal"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4132,6 +4149,7 @@ dependencies = [
  "automations",
  "base64 0.22.1",
  "chat",
+ "chat-index",
  "chat-interface",
  "commonware-codec",
  "commonware-consensus",
@@ -4144,6 +4162,7 @@ dependencies = [
  "directory",
  "directory-interface",
  "document",
+ "document-index",
  "files",
  "forge",
  "forge-interface",
@@ -4152,6 +4171,7 @@ dependencies = [
  "governance-interface",
  "host",
  "inbox",
+ "indexer",
  "jobs",
  "kv",
  "kv-interface",
@@ -4159,6 +4179,7 @@ dependencies = [
  "node",
  "noded",
  "pages",
+ "pages-index",
  "profiles",
  "rand 0.8.6",
  "reactor",
@@ -4169,6 +4190,7 @@ dependencies = [
  "serde_json",
  "statesync",
  "tasks",
+ "tasks-index",
  "tempfile",
  "tokio",
  "toml 0.8.23",
@@ -8451,6 +8473,16 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "wireguard-effect"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "defguard_wireguard_rs",
+ "nat-traversal",
+ "wireguard-upgrade",
 ]
 
 [[package]]

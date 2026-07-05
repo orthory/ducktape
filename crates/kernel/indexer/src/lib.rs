@@ -25,6 +25,11 @@
 //! - everything else — read-model keys owned by that module's registered
 //!   [`ModuleIndexer`]; the two prefixes above are reserved and refused.
 //!
+//! alongside the per-module databases the store keeps ONE internal blocks
+//! database (`<base>/_blocks/`, never a module): `blk/{height:016x}` holds the
+//! block's explorer row ([`BlockOps::record`], opaque node-layer json) with
+//! the same watermark discipline, so `GET /v1/blocks` survives a restart.
+//!
 //! writers: exactly one, the node's block loop, via [`IndexStore::apply_block`].
 //! readers: any thread, via MVCC snapshots ([`IndexStore::scan`] /
 //! [`IndexStore::get`]) — fluent31's `Db` is `Send + Sync`, so the http layer
@@ -53,6 +58,11 @@ use serde::{Deserialize, Serialize};
 pub const OP_PREFIX: &str = "op/";
 /// reserved prefix for store bookkeeping.
 pub const META_PREFIX: &str = "meta/";
+/// key prefix of the per-block explorer rows in the internal blocks database.
+pub const BLOCK_PREFIX: &str = "blk/";
+/// directory name of the store-internal blocks database — reserved, never a
+/// module id (the leading underscore keeps it out of the module namespace).
+const BLOCKS_DB: &str = "_blocks";
 /// the per-module watermark key: 8-byte big-endian height.
 const META_HEIGHT: &str = "meta/height";
 /// hard cap on one scan page; larger asks are clamped, mirroring the module
@@ -164,6 +174,11 @@ pub struct BlockOps {
     /// the block's agreed timestamp (consensus time, not wall clock).
     pub time: u64,
     pub ops: Vec<AppliedOp>,
+    /// the block's explorer row — opaque, node-layer-defined json (the wire
+    /// shape `GET /v1/blocks` serves), stored verbatim under
+    /// `blk/{height:016x}` in the internal blocks database. `None` for blocks
+    /// the explorer never shows (heartbeat nops, undecodable frames).
+    pub record: Option<Vec<u8>>,
 }
 
 // ============================================================================
@@ -216,6 +231,11 @@ fn hex(bytes: &[u8]) -> String {
 /// is 1024 dispatches per block).
 fn op_key(height: u64, seq: u32) -> String {
     format!("{OP_PREFIX}{height:016x}/{seq:04x}")
+}
+
+/// the key of one block's explorer row, same fixed-width-hex ordering rule.
+fn block_key(height: u64) -> String {
+    format!("{BLOCK_PREFIX}{height:016x}")
 }
 
 // ============================================================================
@@ -371,6 +391,10 @@ pub struct Page {
 pub struct IndexStore {
     base: PathBuf,
     modules: BTreeMap<String, Arc<Db>>,
+    /// the internal blocks database: `blk/…` explorer rows plus its own
+    /// `meta/height` watermark. never listed in `modules` — it is not a
+    /// module and must not surface on the per-module scan routes.
+    blocks: Arc<Db>,
     mappers: BTreeMap<String, Box<dyn ModuleIndexer>>,
     /// set on the first apply failure; writes refuse from then on. reads stay
     /// available — stale-but-consistent beats unavailable for a derived tier.
@@ -394,9 +418,11 @@ impl IndexStore {
             let db = Db::open(base.join(id), opts.clone())?;
             modules.insert(id.to_string(), Arc::new(db));
         }
+        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB), opts)?);
         Ok(Self {
             base,
             modules,
+            blocks,
             mappers: BTreeMap::new(),
             poisoned: AtomicBool::new(false),
         })
@@ -435,13 +461,19 @@ impl IndexStore {
 
     /// the height the node's block counter must resume ABOVE: the max
     /// watermark across all modules (a block only touches the modules it
-    /// dispatched, so quieter modules lag the max).
+    /// dispatched, so quieter modules lag the max) and the blocks database.
     pub fn resume_height(&self) -> Result<u64> {
-        let mut max = 0;
+        let mut max = read_height(&self.blocks)?;
         for db in self.modules.values() {
             max = max.max(read_height(db)?);
         }
         Ok(max)
+    }
+
+    /// the blocks-database watermark: every explorer row at or below this
+    /// height is durably stored.
+    pub fn blocks_height(&self) -> Result<u64> {
+        Ok(read_height(&self.blocks)?)
     }
 
     /// fold one finalized block into the per-module databases. idempotent per
@@ -495,7 +527,39 @@ impl IndexStore {
             batch.put(META_HEIGHT, block.height.to_be_bytes());
             db.write(batch)?;
         }
+        // the explorer row lands AFTER the module folds: a visible block row
+        // never precedes its op rows. same idempotent-skip and one-batch-with-
+        // watermark discipline, on the blocks database's own watermark.
+        if let Some(record) = &block.record {
+            if read_height(&self.blocks)? < block.height {
+                let mut batch = WriteBatch::new();
+                batch.put(block_key(block.height), record.clone());
+                batch.put(META_HEIGHT, block.height.to_be_bytes());
+                self.blocks.write(batch)?;
+            }
+        }
         Ok(())
+    }
+
+    /// the newest `limit` explorer rows, oldest-first — the durable equivalent
+    /// of an in-memory ring's "recent" read. rows return verbatim (their json
+    /// shape is the node layer's), at one MVCC snapshot. `limit` is clamped to
+    /// [`MAX_SCAN_LIMIT`].
+    pub fn recent_block_rows(&self, limit: usize) -> Result<Vec<Vec<u8>>> {
+        let limit = limit.clamp(1, MAX_SCAN_LIMIT);
+        let prefix = BLOCK_PREFIX.as_bytes();
+        let hi = prefix_successor(prefix);
+        let snap = self.blocks.snapshot();
+        let iter = self.blocks.iter_at(Some(prefix), hi.as_deref(), true, &snap)?;
+        let mut rows = Vec::new();
+        for kv in iter {
+            if rows.len() == limit {
+                break;
+            }
+            rows.push(kv?.1);
+        }
+        rows.reverse();
+        Ok(rows)
     }
 
     /// point read of one stored key at the current snapshot.
@@ -620,6 +684,14 @@ mod tests {
             height,
             time: 1_000 + height,
             ops,
+            record: None,
+        }
+    }
+
+    fn block_with_record(height: u64, ops: Vec<AppliedOp>) -> BlockOps {
+        BlockOps {
+            record: Some(format!(r#"{{"height":{height}}}"#).into_bytes()),
+            ..block(height, ops)
         }
     }
 
@@ -858,6 +930,53 @@ mod tests {
         // the refused block left nothing behind — the batch never committed.
         let page = store.scan("chat", b"", None, 10).unwrap();
         assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn block_records_serve_newest_first_tail_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        for h in 1..=5 {
+            store
+                .apply_block(&block_with_record(h, vec![chat_op(b"{}")]))
+                .unwrap();
+        }
+
+        let rows = store.recent_block_rows(3).unwrap();
+        assert_eq!(rows.len(), 3);
+        // the newest 3 (heights 3..=5), oldest-first — the ring's contract.
+        assert_eq!(rows[0], br#"{"height":3}"#.to_vec());
+        assert_eq!(rows[2], br#"{"height":5}"#.to_vec());
+        assert_eq!(store.recent_block_rows(100).unwrap().len(), 5);
+        assert_eq!(store.blocks_height().unwrap(), 5);
+    }
+
+    #[test]
+    fn block_record_lands_without_ops_and_advances_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // a block whose op stream is empty for the index (e.g. a finalized-
+        // but-rejected frame) still shows in the explorer.
+        store.apply_block(&block_with_record(9, Vec::new())).unwrap();
+
+        assert_eq!(store.recent_block_rows(10).unwrap().len(), 1);
+        assert_eq!(store.applied_height("chat").unwrap(), 0, "no op rows");
+        assert_eq!(store.resume_height().unwrap(), 9, "blocks watermark counts");
+    }
+
+    #[test]
+    fn block_records_are_idempotent_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = store(dir.path());
+            let b = block_with_record(1, vec![chat_op(b"{}")]);
+            store.apply_block(&b).unwrap();
+            store.apply_block(&b).expect("replay is a skip");
+        }
+        let store = store(dir.path());
+        let rows = store.recent_block_rows(10).unwrap();
+        assert_eq!(rows.len(), 1, "no duplicate rows; rows survive reopen");
+        assert_eq!(store.blocks_height().unwrap(), 1);
     }
 
     #[test]
