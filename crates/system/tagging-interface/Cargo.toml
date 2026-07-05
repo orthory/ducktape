@@ -1,0 +1,11 @@
+[package]
+name = "tagging-interface"
+edition.workspace = true
+version.workspace = true
+
+# types-only: the wire surface of the tagging plane. content modules map their
+# own author/mention shapes into these; the plane itself never imports a
+# content module's interface.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

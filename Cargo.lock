@@ -6398,6 +6398,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tagging"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "sdk",
+ "sha2",
+ "tagging-interface",
+]
+
+[[package]]
+name = "tagging-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tao"
 version = "0.35.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
