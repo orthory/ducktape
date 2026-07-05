@@ -79,7 +79,7 @@ use commonware_storage::metadata;
 use commonware_utils::sequence::U64;
 use futures::{StreamExt as _, pin_mut};
 
-use host::{BlockContext, Host, SubmitError};
+use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use node::{BlockSeal, BlockSink, Disposition, decode_frame};
 use sdk::{ModuleId, StateRoot, UpgradeCoords};
 
@@ -1003,6 +1003,25 @@ where
 // boot-time replay.
 // ============================================================================
 
+/// observer of every sealed block the journal replay walks, in height order —
+/// the seam a derived tier (the per-module read-model index) folds from, so a
+/// restart re-derives exactly what the live drain would have fed it.
+///
+/// two shapes, because replay cannot always reproduce a block's content:
+/// - a RE-EXECUTED block surfaces the deterministic dispatch trace consensus
+///   applied ([`ReplaySink::folded_block`]; empty for a rejected block);
+/// - a block replay SKIPS — its state already durable, or root-idempotent —
+///   has no reproducible trace ([`ReplaySink::opaque_block`]). the observer
+///   decides what an unreproducible height means for its tier (the index
+///   stops folding and lets its from-state rebuild repair the gap).
+///
+/// observation is best-effort by design: sink calls return nothing and MUST
+/// not fail — recovery's own verification never depends on them.
+pub trait ReplaySink {
+    fn folded_block(&mut self, height: u64, dispatches: &[DispatchRecord]);
+    fn opaque_block(&mut self, height: u64);
+}
+
 /// what a completed recovery hands back to the boot path.
 #[derive(Debug)]
 pub struct Recovered {
@@ -1047,6 +1066,18 @@ where
         &mut self,
         host: &mut Host,
         manifest: &Manifest,
+    ) -> Result<Recovered, Error> {
+        self.recover_with_sink(host, manifest, None).await
+    }
+
+    /// [`Recovery::recover`], additionally reporting every sealed block the
+    /// replay walks to `sink` (see [`ReplaySink`]). recovery's own behavior
+    /// and verification are identical with or without an observer.
+    pub async fn recover_with_sink(
+        &mut self,
+        host: &mut Host,
+        manifest: &Manifest,
+        mut sink: Option<&mut dyn ReplaySink>,
     ) -> Result<Recovered, Error> {
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
         let mut tip_height: Option<u64> = manifest.height;
@@ -1150,6 +1181,16 @@ where
                         // to redo (re-applying could MOVE a history-committed
                         // root and fork us).
                         skipped += 1;
+                        if let Some(sink) = sink.as_deref_mut() {
+                            match disposition {
+                                // a rejected block never had content anywhere.
+                                Disposition::Rejected => sink.folded_block(height, &[]),
+                                // an applied block whose ops moved no root:
+                                // its trace existed at runtime but is not
+                                // re-executed here — unreproducible.
+                                _ => sink.opaque_block(height),
+                            }
+                        }
                     } else {
                         // the PRE-apply state was sealed under the PREVIOUS height's
                         // effective version — it differs from this block's version
@@ -1171,9 +1212,16 @@ where
                             .all(|(id, root)| host.module_root(id) == Some(*root));
                         if at_post {
                             skipped += 1; // a disk substrate already holds it.
+                            if let Some(sink) = sink.as_deref_mut() {
+                                sink.opaque_block(height);
+                            }
                         } else if at_pre {
-                            apply_block(host, height, &frame, protocol_version, Some(disposition))
-                                .await?;
+                            let (_, dispatches) =
+                                apply_block(host, height, &frame, protocol_version, Some(disposition))
+                                    .await?;
+                            if let Some(sink) = sink.as_deref_mut() {
+                                sink.folded_block(height, &dispatches);
+                            }
                             for (id, root) in &changed {
                                 let live = host.module_root(id);
                                 if live != Some(*root) {
@@ -1259,7 +1307,7 @@ where
                                      journal)"
                                 )));
                             }
-                            apply_block_committing(
+                            let (_, dispatches) = apply_block_committing(
                                 host,
                                 height,
                                 &frame,
@@ -1268,6 +1316,12 @@ where
                                 &commit_only,
                             )
                             .await?;
+                            if let Some(sink) = sink.as_deref_mut() {
+                                // the dispatch trace is the full deterministic
+                                // re-execution; only the COMMIT scope was
+                                // selective.
+                                sink.folded_block(height, &dispatches);
+                            }
                             // every changed module — the re-committed cohort AND
                             // the already-durable ones left untouched — must now
                             // stand at its sealed post-root.
@@ -1310,11 +1364,19 @@ where
                 .all(|(id, root)| expected.get(id) == Some(root));
             host.set_active_version(protocol_version);
             let disposition = if at_pre {
-                apply_block(host, height, &frame, protocol_version, None).await?
+                let (disposition, dispatches) =
+                    apply_block(host, height, &frame, protocol_version, None).await?;
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.folded_block(height, &dispatches);
+                }
+                disposition
             } else {
                 // the apply completed before the crash; the roots that moved
                 // are its outcome. (single-disk-substrate blocks make this
                 // exact — see the crate doc on the multi-store limit.)
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.opaque_block(height);
+                }
                 Disposition::Applied
             };
             let seal = BlockSeal {
@@ -1370,13 +1432,17 @@ where
 /// re-apply one journaled frame through the host at its original block
 /// coordinate. when `expect` is given, the outcome must reproduce the sealed
 /// disposition (the drain is deterministic — anything else is divergence).
+/// alongside the disposition, hands back the block's dispatch trace (empty
+/// for a rejected block) so a [`ReplaySink`] can fold what the drain would
+/// have fed it live.
 async fn apply_block(
     host: &mut Host,
     height: u64,
     frame: &[u8],
     protocol_version: u32,
     expect: Option<Disposition>,
-) -> Result<Disposition, Error> {
+) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
+    let mut dispatches = Vec::new();
     let outcome = match decode_frame(frame) {
         Ok((origin, msg)) => {
             // `protocol_version` is the PURE `effective_version(height)` over the
@@ -1394,7 +1460,10 @@ async fn apply_block(
                 origin,
             };
             match host.submit_at(ctx, msg).await {
-                Ok(_) => Disposition::Applied,
+                Ok(outcome) => {
+                    dispatches = outcome.dispatches;
+                    Disposition::Applied
+                }
                 Err(SubmitError::Rejected(_)) => Disposition::Rejected,
                 Err(SubmitError::Fatal(f)) => {
                     return Err(Error::Torn(format!("boundary fault during replay: {f}")));
@@ -1411,7 +1480,7 @@ async fn apply_block(
             )));
         }
     }
-    Ok(outcome)
+    Ok((outcome, dispatches))
 }
 
 /// re-apply one journaled frame like [`apply_block`], but commit ONLY the
@@ -1426,7 +1495,8 @@ async fn apply_block_committing(
     protocol_version: u32,
     expect: Option<Disposition>,
     commit_only: &BTreeSet<ModuleId>,
-) -> Result<Disposition, Error> {
+) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
+    let mut dispatches = Vec::new();
     let outcome = match decode_frame(frame) {
         Ok((origin, msg)) => {
             // stamp the block's effective version exactly like `apply_block`, so a
@@ -1439,7 +1509,10 @@ async fn apply_block_committing(
                 origin,
             };
             match host.submit_at_committing(ctx, msg, commit_only).await {
-                Ok(_) => Disposition::Applied,
+                Ok(outcome) => {
+                    dispatches = outcome.dispatches;
+                    Disposition::Applied
+                }
                 Err(SubmitError::Rejected(_)) => Disposition::Rejected,
                 Err(SubmitError::Fatal(f)) => {
                     return Err(Error::Torn(format!("boundary fault during torn replay: {f}")));
@@ -1455,7 +1528,7 @@ async fn apply_block_committing(
             )));
         }
     }
-    Ok(outcome)
+    Ok((outcome, dispatches))
 }
 
 #[cfg(test)]

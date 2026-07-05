@@ -4158,6 +4158,7 @@ dependencies = [
  "governance-interface",
  "host",
  "inbox",
+ "indexer",
  "jobs",
  "kv",
  "kv-interface",

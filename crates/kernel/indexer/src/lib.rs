@@ -685,6 +685,36 @@ impl IndexStore {
         out
     }
 
+    /// stamp a module as backfilled at a boundary WITHOUT re-deriving rows:
+    /// clear the database and set the watermark + backfill floor. this is the
+    /// honest answer for a module whose mapper declares no from-state rebuild
+    /// (or that has no mapper at all) when canonical state advanced without
+    /// the op stream — its op log and views simply BEGIN at the boundary,
+    /// visibly via the floor, instead of a watermark that silently claims
+    /// pre-boundary coverage the fold never saw. same crash story as
+    /// [`IndexStore::rebuild_module`]: watermark falls first, failures poison.
+    pub fn mark_backfilled(&self, module: &str, meta: RebuildMeta) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let out = (|| -> Result<()> {
+            let mut drop_mark = WriteBatch::new();
+            drop_mark.delete(META_HEIGHT);
+            db.write(drop_mark)?;
+            clear_db(db)?;
+            let mut stamp = WriteBatch::new();
+            stamp.put(META_HEIGHT, meta.height.to_be_bytes());
+            stamp.put(META_BACKFILL, meta.height.to_be_bytes());
+            db.write(stamp)?;
+            Ok(())
+        })();
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
     async fn rebuild_inner(
         module: &str,
         db: &Db,
@@ -1294,6 +1324,34 @@ mod tests {
                 .await,
             Err(Error::RebuildUnsupported)
         ));
+    }
+
+    #[test]
+    fn mark_backfilled_clears_and_stamps_without_a_mapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // tasks has NO mapper here — only its op log. a boundary passing
+        // without the op stream stamps the floor where its content begins.
+        store
+            .apply_block(&block(
+                1,
+                vec![AppliedOp {
+                    module: "tasks".into(),
+                    origin: OriginTag::system(),
+                    payload: b"{}".to_vec(),
+                }],
+            ))
+            .unwrap();
+        store
+            .mark_backfilled("tasks", RebuildMeta { height: 7, time: 0 })
+            .unwrap();
+        assert!(
+            store.scan("tasks", OP_PREFIX.as_bytes(), None, 10).unwrap().entries.is_empty(),
+            "op history starts at the boundary"
+        );
+        assert_eq!(store.applied_height("tasks").unwrap(), 7);
+        assert_eq!(store.backfill_height("tasks").unwrap(), Some(7));
+        assert!(!store.is_poisoned());
     }
 
     #[tokio::test]

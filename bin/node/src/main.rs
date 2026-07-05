@@ -1072,11 +1072,102 @@ fn recovery_frame_to_sync(
     })
 }
 
+// ---------------------------------------------------------------------------
+// the derived-index boot fold. consensus never depends on it: fold errors
+// poison the store and log, heal errors log — recovery and the drain proceed
+// identically with or without the index.
+// ---------------------------------------------------------------------------
+
+/// folds sealed blocks into the derived per-module index during boot (journal
+/// replay + post-reboot frame catch-up), with the GAP DISCIPLINE: once one
+/// sealed height's content is unreproducible (opaque) above some module's
+/// watermark, folding stops for good. advancing watermarks past the hole
+/// would hide it from the post-boot heal, which re-derives from verified
+/// state exactly when a watermark trails the boot tip.
+struct IndexFold<'a> {
+    index: &'a indexer::IndexStore,
+    stopped: bool,
+}
+
+impl<'a> IndexFold<'a> {
+    fn new(index: &'a indexer::IndexStore) -> Self {
+        Self {
+            index,
+            stopped: false,
+        }
+    }
+
+    /// the LOWEST module watermark: an opaque height at or below it is
+    /// already reflected everywhere; above it, at least one module would be
+    /// folded past a hole.
+    fn min_watermark(&self) -> Option<u64> {
+        let mut min: Option<u64> = None;
+        for id in self.index.module_ids() {
+            match self.index.applied_height(id) {
+                Ok(h) => min = Some(min.map_or(h, |m| m.min(h))),
+                Err(_) => return None,
+            }
+        }
+        min
+    }
+}
+
+impl recovery::ReplaySink for IndexFold<'_> {
+    fn folded_block(&mut self, height: u64, dispatches: &[host::DispatchRecord]) {
+        if self.stopped {
+            return;
+        }
+        // the validator's consensus time IS the height (see BlockContext).
+        let ops = noded::index_block_ops(height, height, dispatches);
+        if let Err(err) = self.index.apply_block(&ops) {
+            eprintln!("[node] module index fold failed at height {height}: {err}");
+            self.stopped = true;
+        }
+    }
+
+    fn opaque_block(&mut self, height: u64) {
+        if self.stopped {
+            return;
+        }
+        match self.min_watermark() {
+            Some(watermark) if height <= watermark => {}
+            _ => self.stopped = true,
+        }
+    }
+}
+
+/// re-derive every index module whose watermark trails `boundary` from the
+/// host's VERIFIED canonical state (checkpoint-restored, state-synced, or
+/// replay-verified — every boot caller sits after a root/app-hash check).
+/// failures poison the store and log; the node boots regardless.
+async fn heal_index(index: &indexer::IndexStore, host: &Host, boundary: u64, label: &str) {
+    let meta = indexer::RebuildMeta {
+        height: boundary,
+        // the validator's consensus time IS the height.
+        time: boundary,
+    };
+    match noded::rebuild_stale_modules(index, host, meta).await {
+        Ok(rebuilt) => {
+            for (module, rows) in rebuilt {
+                println!(
+                    "[node {label}] index for {module} re-derived from state at height \
+                     {boundary} ({rows} rows)"
+                );
+            }
+        }
+        Err(err) => eprintln!(
+            "[node {label}] index heal at height {boundary} failed: {err} — wipe \
+             <storage>/index to rebuild"
+        ),
+    }
+}
+
 async fn apply_verified_suffix_frame(
     host: &mut Host,
     served: &statesync::FinalizedFrame,
-) -> Result<(), String> {
+) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
+    let mut dispatches = Vec::new();
     let outcome = match node::decode_frame(&served.frame) {
         Ok((origin, msg)) => {
             let protocol_version = host.effective_version(served.height).await;
@@ -1088,7 +1179,10 @@ async fn apply_verified_suffix_frame(
                 origin,
             };
             match host.submit_at(ctx, msg).await {
-                Ok(_) => node::Disposition::Applied,
+                Ok(outcome) => {
+                    dispatches = outcome.dispatches;
+                    node::Disposition::Applied
+                }
                 Err(host::SubmitError::Rejected(_)) => node::Disposition::Rejected,
                 Err(host::SubmitError::Fatal(f)) => {
                     return Err(format!("fatal host error applying suffix frame: {f}"));
@@ -1120,13 +1214,14 @@ async fn apply_verified_suffix_frame(
             hex(&served.app_hash)
         ));
     }
-    Ok(())
+    Ok(dispatches)
 }
 
 async fn apply_and_journal_verified_frame<E>(
     recovery: &mut Recovery<E>,
     host: &mut Host,
     frame: &statesync::FinalizedFrame,
+    fold: Option<&mut IndexFold<'_>>,
 ) -> Result<(), String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -1134,7 +1229,7 @@ where
     node::BlockSink::pre_apply(recovery, frame.height, &frame.frame)
         .await
         .map_err(|e| format!("catch-up WAL write: {e}"))?;
-    apply_verified_suffix_frame(host, frame).await?;
+    let dispatches = apply_verified_suffix_frame(host, frame).await?;
     let seal = node::BlockSeal {
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),
@@ -1144,6 +1239,10 @@ where
     node::BlockSink::seal(recovery, &seal)
         .await
         .map_err(|e| format!("catch-up seal write: {e}"))?;
+    if let Some(fold) = fold {
+        use recovery::ReplaySink as _;
+        fold.folded_block(frame.height, &dispatches);
+    }
     Ok(())
 }
 
@@ -1160,6 +1259,7 @@ async fn apply_post_reboot_catchup_frames<E>(
     from_height: u64,
     to_height: u64,
     frames: Vec<statesync::FinalizedFrame>,
+    mut fold: Option<&mut IndexFold<'_>>,
 ) -> Result<PostRebootCatchupApply, String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -1193,7 +1293,7 @@ where
                 frame.height
             ));
         }
-        apply_and_journal_verified_frame(recovery, host, &frame).await?;
+        apply_and_journal_verified_frame(recovery, host, &frame, fold.as_deref_mut()).await?;
         last = frame.height;
         applied.applied += 1;
         applied.frames.push(frame.frame.clone());
@@ -1296,6 +1396,7 @@ async fn catch_up_post_reboot_frames<C, E>(
     client: &C,
     recovery: &mut Recovery<E>,
     host: &mut Host,
+    fold: Option<&mut IndexFold<'_>>,
     recovered_height: u64,
     max_iterations: usize,
 ) -> Result<PostRebootCatchup, PostRebootCatchupError>
@@ -1303,6 +1404,7 @@ where
     C: statesync::SyncClient,
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
 {
+    let mut fold = fold;
     let mut current_height = recovered_height;
     let mut total_frames = 0usize;
     let mut target = None;
@@ -1356,10 +1458,16 @@ where
                 )));
             }
         };
-        let applied =
-            apply_post_reboot_catchup_frames(recovery, host, current_height, tip.height, frames)
-                .await
-                .map_err(PostRebootCatchupError::Fatal)?;
+        let applied = apply_post_reboot_catchup_frames(
+            recovery,
+            host,
+            current_height,
+            tip.height,
+            frames,
+            fold.as_deref_mut(),
+        )
+        .await
+        .map_err(PostRebootCatchupError::Fatal)?;
         if host.app_hash() != tip.app_hash {
             return Err(PostRebootCatchupError::Fatal(format!(
                 "catch-up frames landed at {}, target manifest {}",
@@ -2712,10 +2820,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    // the derived per-module index (noded's exact store, <storage>/index):
+    // the pump folds sealed blocks into it, boot heals it from verified state
+    // at sync/recovery boundaries, and the already-routed /v1/index/* lanes
+    // light up through the handle below.
+    let index = noded::open_index_store(&storage, &MODULE_IDS)?;
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
-    let http_handle = http_handle.with_forge_repo(storage.join("forge-repo"));
+    let http_handle = http_handle
+        .with_forge_repo(storage.join("forge-repo"))
+        .with_index_store(index.clone());
     let blobs = http_handle.blob_handle();
     // the explorer's backing store: the pump below pushes each non-empty
     // block as it drains; GET /v1/blocks reads it directly (never the actor).
@@ -3267,6 +3382,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             reboot_self();
         }
         // (host, recovered-state, next local submit seq, last checkpoint
+        // ONE index fold for the whole boot (journal replay + post-reboot
+        // catch-up + post-sync refreshes): its stop flag must persist across
+        // phases — a later phase folding past a gap an earlier phase detected
+        // would advance watermarks over the hole and hide it from the final
+        // heal below.
+        let mut boot_fold = IndexFold::new(&index);
         // (height, oplog position) for the pump's prune bookkeeping, and the
         // manifest that recovery used as its replay baseline).
         let (
@@ -3347,7 +3468,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         std::process::exit(1);
                     }
                 };
-                let rec = match recovery.recover(&mut host, &manifest).await {
+                // heal the derived index against the CHECKPOINT boundary
+                // BEFORE replay: a wiped or trailing per-module database
+                // re-derives from the verified checkpoint state, so the
+                // journal-suffix fold lands contiguously on top instead of
+                // folding forward over a pre-checkpoint hole.
+                if let Some(ckpt_height) = manifest.height {
+                    heal_index(&index, &host, ckpt_height, &label).await;
+                }
+                let rec = match recovery
+                    .recover_with_sink(&mut host, &manifest, Some(&mut boot_fold))
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!(
@@ -3489,6 +3621,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &client,
                     &mut recovery,
                     &mut host,
+                    Some(&mut boot_fold),
                     recovered_height,
                     POST_REBOOT_CATCHUP_MAX_ITERS,
                 )
@@ -3575,7 +3708,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         prev_ckpt = (ckpt.height, ckpt.oplog_pos);
-                        let refreshed = match recovery.recover(&mut host, &ckpt).await {
+                        let refreshed = match recovery
+                            .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
+                            .await
+                        {
                             Ok(rec) => rec,
                             Err(e) => {
                                 eprintln!(
@@ -3699,7 +3835,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         prev_ckpt = (ckpt.height, ckpt.oplog_pos);
-                        let refreshed = match recovery.recover(&mut host, &ckpt).await {
+                        let refreshed = match recovery
+                            .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
+                            .await
+                        {
                             Ok(rec) => rec,
                             Err(e) => {
                                 eprintln!(
@@ -3743,6 +3882,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     std::process::exit(1);
                 }
             }
+        }
+
+        // the FINAL index heal, at the boot tip every path converged on:
+        // whatever the replay/catch-up fold could not reproduce (opaque
+        // blocks, a state-sync jump, a stopped fold) re-derives here from
+        // state that has verified against the boundary app-hash.
+        drop(boot_fold);
+        if let Some(boot_height) = resumed.as_ref().and_then(|r| r.height) {
+            heal_index(&index, &host, boot_height, &label).await;
         }
 
         let member_keys = match resume_member_keys(resumed.as_ref(), &validators) {
@@ -4564,6 +4712,32 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         .iter()
                         .filter(|d| d.disposition != node::Disposition::Discarded)
                         .count() as u64;
+                    // fold every SEALED frame into the derived per-module
+                    // index: an applied frame contributes its dispatch trace,
+                    // a rejected one folds EMPTY (it still consumed its
+                    // height, and every module's watermark must track the
+                    // sealed tip or restart staleness checks would rebuild
+                    // spuriously). discarded frames never sealed a height.
+                    // canonical state committed above, so an index failure
+                    // degrades read models only — the store poisons itself
+                    // and stays loud until rebuilt.
+                    for d in &drained {
+                        if d.disposition == node::Disposition::Discarded {
+                            continue;
+                        }
+                        let dispatches: &[host::DispatchRecord] = match (&d.disposition, &d.op) {
+                            (node::Disposition::Applied, Some(op)) => &op.dispatches,
+                            _ => &[],
+                        };
+                        let ops = noded::index_block_ops(d.height, d.height, dispatches);
+                        if let Err(err) = index.apply_block(&ops) {
+                            eprintln!(
+                                "[node {label}] module index apply failed at height {}: {err} \
+                                 — wipe <storage>/index to rebuild",
+                                d.height
+                            );
+                        }
+                    }
                     // publish each NON-EMPTY block to the explorer ring: skip
                     // the heartbeat nop (the deliberately-empty block that only
                     // ticks an idle chain) and frames with no decoded op (a
@@ -5497,7 +5671,7 @@ mod tests {
                 .await
                 .expect("open recovery");
             let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone())
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
                     .await
                     .expect("catch up");
 
@@ -5560,7 +5734,7 @@ mod tests {
                 .await
                 .expect("write base manifest");
             let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served])
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
                     .await
                     .expect("catch up");
 
@@ -5571,13 +5745,24 @@ mod tests {
                 "disk cohort committed the catch-up block durably"
             );
 
+            // replaying from the OLD base sees the mixed-durability state —
+            // disk cohort already at its sealed post-root, memory rolled back
+            // — and HEALS it: the sealed frame re-runs with commit scoped to
+            // the still-at-pre memory cohort, never re-committing the durable
+            // disk store (a re-commit would move its op-log root and fork).
             let mut torn_host =
                 restore_mixed_durability_host(durable_store.clone(), &base_manifest);
-            let err = recovery
+            let healed = recovery
                 .recover(&mut torn_host, &base_manifest)
                 .await
-                .expect_err("old base replay should see torn mixed durability");
-            assert!(matches!(err, recovery::Error::Torn(_)));
+                .expect("old base replay heals torn mixed durability");
+            assert_eq!(healed.height, Some(1));
+            assert_eq!(healed.applied, 1);
+            assert_eq!(
+                durable_store.get(),
+                7,
+                "the already-durable disk cohort was not re-committed"
+            );
 
             let ckpt = write_post_reboot_catchup_checkpoint(
                 &mut recovery,
@@ -5619,7 +5804,7 @@ mod tests {
                 .await
                 .expect("open recovery");
             let err =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served])
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
                     .await
                     .expect_err("seal mismatch must abort");
 
@@ -5640,7 +5825,7 @@ mod tests {
                 .await
                 .expect("open recovery");
             let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 5, 5, Vec::new())
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
                     .await
                     .expect("noop catch up");
 
