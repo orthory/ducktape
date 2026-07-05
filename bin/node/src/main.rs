@@ -2742,14 +2742,36 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    // the per-module derived index: one fluent31 database per module under
+    // <storage>/index/<module>/, plus the blocks database the explorer reads —
+    // the pump below folds each non-empty block into it as it drains, and
+    // GET /v1/blocks + /v1/index/* serve snapshot reads (never the actor).
+    // an open failure is fatal-with-remedy rather than a silent no-index run:
+    // the tier is rebuildable, so the fix is always "delete <storage>/index".
+    let index_dir = storage.join("index");
+    let index = indexer::IndexStore::open(&index_dir, &MODULE_IDS)
+        .map(|store| {
+            std::sync::Arc::new(
+                store
+                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
+                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
+                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
+                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
+            )
+        })
+        .map_err(|err| {
+            format!(
+                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
+                index_dir.display()
+            )
+        })?;
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
-    let http_handle = http_handle.with_forge_repo(storage.join("forge-repo"));
+    let http_handle = http_handle
+        .with_forge_repo(storage.join("forge-repo"))
+        .with_index_store(index.clone());
     let blobs = http_handle.blob_handle();
-    // the explorer's backing store: the pump below pushes each non-empty
-    // block as it drains; GET /v1/blocks reads it directly (never the actor).
-    let http_blocks = http_handle.block_ring();
     match http_listen.as_deref() {
         Some(addr) if !sync_only && !joiner => {
             let listener = std::net::TcpListener::bind(addr)?;
@@ -4594,8 +4616,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         .iter()
                         .filter(|d| d.disposition != node::Disposition::Discarded)
                         .count() as u64;
-                    // publish each NON-EMPTY block to the explorer ring: skip
-                    // the heartbeat nop (the deliberately-empty block that only
+                    // fold each NON-EMPTY block into the derived index: the
+                    // explorer row (GET /v1/blocks) plus per-module op rows
+                    // (/v1/index/*), durable across restarts. skip the
+                    // heartbeat nop (the deliberately-empty block that only
                     // ticks an idle chain) and frames with no decoded op (a
                     // ceiling discard or a failed decode — nothing to show).
                     for d in &drained {
@@ -4611,7 +4635,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // observability lane rather than panic.
                             node::Disposition::Discarded => continue,
                         };
-                        http_blocks.push(noded::BlockRecord {
+                        let record = noded::BlockRecord {
                             height: d.height,
                             hash: noded::hex_bytes(&d.id),
                             commit_hash: hex(&d.app_hash),
@@ -4631,7 +4655,46 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // content address and makes it dereferencable via
                             // GET /v1/files/blob/{op_hash}.
                             op_hash: noded::hex_bytes(&blobs.put_chunk(op.payload.clone())),
-                        });
+                        };
+                        let ops = op
+                            .dispatches
+                            .iter()
+                            .map(|rec| indexer::AppliedOp {
+                                module: rec.module.clone(),
+                                origin: match &rec.origin {
+                                    // identities on this lane are ed25519 key
+                                    // bytes, not readable names — hex them,
+                                    // matching the proposer field and the
+                                    // profiles registry's key space.
+                                    sdk::Origin::External(key) => {
+                                        indexer::OriginTag::external(noded::hex_bytes(key))
+                                    }
+                                    sdk::Origin::Module(id) => {
+                                        indexer::OriginTag::module(id.clone())
+                                    }
+                                    sdk::Origin::System => indexer::OriginTag::system(),
+                                },
+                                payload: rec.payload.clone(),
+                            })
+                            .collect();
+                        // canonical state is already committed; an index
+                        // failure degrades the read models, never the block.
+                        // the store poisons itself on error (contiguity over
+                        // coverage) and stays loud until rebuilt.
+                        if let Err(err) = index.apply_block(&indexer::BlockOps {
+                            height: d.height,
+                            // this lane's agreed clock IS the height: the
+                            // drain stamps BlockContext { consensus_time:
+                            // height } for every frame.
+                            time: d.height,
+                            ops,
+                            record: Some(noded::block_row(&record)),
+                        }) {
+                            eprintln!(
+                                "[node {label}] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
+                                d.height
+                            );
+                        }
                     }
                     for d in drained {
                         let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
