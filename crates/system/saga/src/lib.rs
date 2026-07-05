@@ -555,7 +555,10 @@ impl SagaModule {
                     .query(valset, &valset_encode_query(&ValsetQuery::Validators))
                     .await
                     .ok()?;
-                let ValsetReply::Validators(validators) = valset_decode_reply(&reply).ok()?;
+                let ValsetReply::Validators(validators) = valset_decode_reply(&reply).ok()?
+                else {
+                    return None;
+                };
                 validators
             }
         };

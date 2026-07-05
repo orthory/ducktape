@@ -161,7 +161,7 @@ impl Valset {
         let mut out = Vec::with_capacity(
             sized(&self.validators) + if self.observers.is_empty() { 0 } else { sized(&self.observers) },
         );
-        let mut section = |out: &mut Vec<u8>, set: &BTreeSet<Vec<u8>>| {
+        let section = |out: &mut Vec<u8>, set: &BTreeSet<Vec<u8>>| {
             out.extend_from_slice(&(set.len() as u64).to_le_bytes());
             for k in set {
                 out.extend_from_slice(&(k.len() as u64).to_le_bytes());

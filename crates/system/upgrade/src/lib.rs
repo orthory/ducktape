@@ -121,6 +121,9 @@ impl Upgrade {
             .await?;
         match valset_decode_reply(&reply).map_err(Error::Module)? {
             ValsetReply::Validators(members) => Ok(members),
+            other => Err(Error::Module(format!(
+                "valset answered a Validators query with {other:?}"
+            ))),
         }
     }
 
