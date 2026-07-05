@@ -286,6 +286,24 @@ pub struct EndpointRecord {
     pub nonce: u64,
 }
 
+impl EndpointRecord {
+    /// The record-level validity checks [`MeshView::verify`] runs per
+    /// member advertisement — endpoint policy on both endpoints, a real
+    /// X25519 key, freshness — available standalone for records consumed
+    /// OUTSIDE a verified view (a standby's pre-warm record, whose owner is
+    /// not in the epoch's `ActiveValidatorSet` and therefore can never be
+    /// part of a `MeshView`). The caller still owns signature verification
+    /// and the epoch-tuple/membership binding.
+    pub fn check(&self, policy: &PortPolicy, current_view: u64) -> Result<(), UpgradeError> {
+        if current_view > self.expires_at_view {
+            return Err(UpgradeError::Expired);
+        }
+        policy.check_endpoint(&self.control_endpoint)?;
+        policy.check_endpoint(&self.wireguard_endpoint)?;
+        ensure_x25519(self.wireguard_public_key)
+    }
+}
+
 /// An [`EndpointRecord`] signed by its own validator, for gossip paths where
 /// the transport does not authenticate the record's OWNER — a record relayed
 /// through a third member arrives on a link authenticated to the forwarder,

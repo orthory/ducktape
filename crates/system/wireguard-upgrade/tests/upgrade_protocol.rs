@@ -644,3 +644,50 @@ fn ack_view_tolerates_cross_node_skew_within_the_lag() {
         UpgradeError::BadAckView
     );
 }
+
+#[test]
+fn record_check_mirrors_the_per_record_view_rules() {
+    // `EndpointRecord::check` is the standalone form of the per-record
+    // checks `MeshView::verify` runs — for records consumed outside a
+    // verified view (a standby's pre-warm record). Each rule must hold
+    // independently: freshness, endpoint policy on both endpoints, and a
+    // non-zero X25519 key.
+    let a = PrivateKey::from_seed(1);
+    let policy = prod_policy();
+    let set = active_set(id(&a), id(&PrivateKey::from_seed(2)));
+    let good = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
+
+    good.check(&policy, 10).expect("a fresh, policy-clean record checks");
+
+    // expired: current view past `expires_at_view` (50 in the fixture).
+    assert_eq!(good.check(&policy, 51).unwrap_err(), UpgradeError::Expired);
+
+    // an all-zero X25519 key can never be a real WireGuard peer key.
+    let zero_key = EndpointRecord {
+        wireguard_public_key: X25519PublicKey([0u8; 32]),
+        ..good.clone()
+    };
+    assert_eq!(
+        zero_key.check(&policy, 10).unwrap_err(),
+        UpgradeError::InvalidWireGuardKey
+    );
+
+    // an endpoint the policy forbids (private ip under production policy).
+    // built under a permissive policy so construction succeeds, refused by
+    // the strict one at check time — exactly the cross-policy gossip case.
+    let open = PortPolicy {
+        name: "open".into(),
+        allowed_control_tcp_ports: vec![443],
+        allowed_wireguard_udp_ports: vec![51820],
+        allow_loopback: true,
+        allow_private_ip: true,
+    };
+    let private_wg = EndpointRecord {
+        wireguard_endpoint: endpoint([10, 0, 0, 9], 51820, Transport::Udp, &open),
+        ..good.clone()
+    };
+    assert!(matches!(
+        private_wg.check(&policy, 10).unwrap_err(),
+        UpgradeError::InvalidEndpoint(_)
+    ));
+}
