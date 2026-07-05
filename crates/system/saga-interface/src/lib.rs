@@ -36,8 +36,11 @@ pub const MAX_RESULT_BYTES: usize = 256 * 1024;
 
 /// hard cap on a trigger's work spec — the same commit-into-the-root-preimage
 /// class as [`MAX_RESULT_BYTES`]: the spec is stored on the saga AND re-emitted
-/// inside every retry's `WorkerRequest`. enforced at trigger time.
-pub const MAX_SPEC_BYTES: usize = 256 * 1024;
+/// inside every retry's `WorkerRequest`. enforced at trigger time. sized to
+/// clear the largest inline module payload (dispatch's 10 MiB `Dispatch`
+/// payload) plus its spec envelope; specs are derived module-origin state, so
+/// this bounds saga state and snapshots, never a wire message.
+pub const MAX_SPEC_BYTES: usize = 12 * 1024 * 1024;
 
 /// hard cap on a trigger's `reply_payload` — stored on the saga and echoed in
 /// the terminal callback. enforced at trigger time.
@@ -103,6 +106,14 @@ pub enum SagaMsg {
         /// work hold its lease. `None` keeps valset assignment. an opaque
         /// tag to this module: bounded, never interpreted.
         capability: Option<String>,
+        /// static binding: when set, EVERY attempt leases to exactly this
+        /// node key — no rendezvous, no pool query; `capability` (if also
+        /// set) is recorded but does not influence assignment. a dark pinned
+        /// node burns attempts through lease expiry until the saga fails or
+        /// times out — that is what static binding means. must be non-empty
+        /// when set. defaults to `None` so pre-existing encodings decode.
+        #[serde(default)]
+        pinned_assignee: Option<Vec<u8>>,
     },
     /// worker completion for one attempt, submitted as an op. `outcome` is
     /// the agreed result (`Ok`, capped at [`MAX_RESULT_BYTES`]) or the
@@ -211,6 +222,9 @@ pub struct SagaView {
     pub attempt: u32,
     pub max_attempts: u32,
     pub assignee: Option<Vec<u8>>,
+    /// the trigger's static binding, echoed onto every attempt's lease.
+    #[serde(default)]
+    pub pinned_assignee: Option<Vec<u8>>,
     pub lease_views: Option<u64>,
     pub lease_expires_at: Option<u64>,
     pub deadline: Option<u64>,

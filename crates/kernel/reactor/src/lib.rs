@@ -240,6 +240,7 @@ mod tests {
         Msg {
             target: "saga".into(),
             payload: encode_msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: id.into(),
                 spec: spec.to_vec(),
                 reply_to: None,
