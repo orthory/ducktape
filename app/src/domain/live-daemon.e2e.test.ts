@@ -123,6 +123,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     expect(status.modules.map((m) => m.id)).toEqual([
       "chat",
       "saga",
+      "dispatch",
       "tasks",
       "inbox",
       "automations",

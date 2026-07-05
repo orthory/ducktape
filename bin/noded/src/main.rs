@@ -30,6 +30,8 @@ use automations::Automations;
 use chat::Chat;
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
+use dispatch::DispatchModule;
+use dispatch_oracle::DispatchWorker;
 use document::Document;
 use files::Files;
 use forge::Forge;
@@ -55,9 +57,10 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 13] = [
+const MODULE_IDS: [&str; 14] = [
     "chat",
     "saga",
+    "dispatch",
     "tasks",
     "inbox",
     "automations",
@@ -248,6 +251,9 @@ fn run_node(
         // reads — the bytes themselves never touch consensus.
         let chat = Chat::init(context.child("chat"), "chat").await;
         let saga = SagaModule::new("saga");
+        // the task plane: recipe manifests + capability dispatch with
+        // next-block result delivery.
+        let dispatch = DispatchModule::new("dispatch", "saga");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
@@ -279,6 +285,7 @@ fn run_node(
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
+            Box::new(dispatch),
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
@@ -411,18 +418,27 @@ fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
             return vec![Box::new(EchoWorker)];
         }
     }
-    vec![Box::new(LlmWorker::new(
-        blobs,
-        // BYO: run whatever executor CLIs the capability specs describe and
-        // this host has installed — no credential handling here (see
-        // docs/capability-spec.md). a broken operator spec is a boot error.
-        capability_host::discover()
-            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-        // the single-node daemon's saga ledger never assigns leases (no
-        // valset, no registry), so no WorkerRequest ever carries an assignee
-        // and this key is never consulted.
-        Vec::new(),
-    ))]
+    vec![
+        Box::new(LlmWorker::new(
+            blobs,
+            // BYO: run whatever executor CLIs the capability specs describe and
+            // this host has installed — no credential handling here (see
+            // docs/capability-spec.md). a broken operator spec is a boot error.
+            capability_host::discover()
+                .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
+            // the single-node daemon's saga ledger never assigns leases (no
+            // valset, no registry), so no WorkerRequest ever carries an assignee
+            // and this key is never consulted.
+            Vec::new(),
+        )),
+        Box::new(DispatchWorker::new(
+            // a second, identical discovery: ProviderSet owns its providers
+            // (not Clone); same specs + PATH at boot, so no drift.
+            capability_host::discover()
+                .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
+            Vec::new(),
+        )),
+    ]
 }
 
 /// commit the caller's op, then drain worker follow-ups (each its own block).
@@ -440,16 +456,18 @@ async fn submit_and_drain(
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
-    let (included, effects) =
-        match submit_one(host, height, index, blobs, events, telemetry, metrics, origin, msg).await
-        {
-            Ok(out) => out,
-            Err(SubmitError::Fatal(err)) => {
-                eprintln!("[noded] FATAL: {err} — halting");
-                std::process::exit(1);
-            }
-            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
-        };
+    let (included, effects) = match submit_one(
+        host, height, index, blobs, events, telemetry, metrics, origin, msg,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(SubmitError::Fatal(err)) => {
+            eprintln!("[noded] FATAL: {err} — halting");
+            std::process::exit(1);
+        }
+        Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+    };
 
     let mut queue = VecDeque::new();
     offer_effects(workers, effects, &mut queue).await;
@@ -518,7 +536,8 @@ async fn submit_one(
     // GET /v1/files/blob/{op_hash} — receipt-parity with the submit reply,
     // and coverage for worker follow-ups no client ever POSTed.
     let op_hash = hex_bytes(&blobs.put_chunk(msg.payload.clone()));
-    let ctx = BlockContext { protocol_version: 0,
+    let ctx = BlockContext {
+        protocol_version: 0,
         height: *height + 1,
         consensus_time,
         origin,

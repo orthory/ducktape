@@ -50,6 +50,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use agent::AgentModule;
+use automations::Automations;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -57,10 +59,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use agent::AgentModule;
-use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
+use dispatch::DispatchModule;
 use document::Document;
 use files::Files;
 use forge::Forge;
@@ -88,9 +89,10 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 13] = [
+const MODULE_IDS: [&str; 14] = [
     "chat",
     "saga",
+    "dispatch",
     "tasks",
     "inbox",
     "automations",
@@ -223,7 +225,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 persona = match args.next().as_deref() {
                     Some("local") => Persona::Local,
                     Some("networked") => Persona::Networked,
-                    other => return Err(format!("--persona wants local|networked, got {other:?}").into()),
+                    other => {
+                        return Err(format!("--persona wants local|networked, got {other:?}").into());
+                    }
                 }
             }
             "--echo-oracle" => echo_oracle = true,
@@ -304,12 +308,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?
         .block_on(async {
             let listener = tokio::net::TcpListener::bind(listen).await?;
-            let app = noded::router(handle)
-                .merge(sim_router(sim_handle))
-                .layer(axum::middleware::from_fn_with_state(
-                    persona,
-                    strip_receipt_op_hash,
-                ));
+            let app = noded::router(handle).merge(sim_router(sim_handle)).layer(
+                axum::middleware::from_fn_with_state(persona, strip_receipt_op_hash),
+            );
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
                 .await?;
@@ -373,6 +374,7 @@ fn run_sim(
         // app queries and status roots behave like a real daemon's.
         let chat = Chat::init(context.child("chat"), "chat").await;
         let saga = SagaModule::new("saga");
+        let dispatch = DispatchModule::new("dispatch", "saga");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
@@ -393,6 +395,7 @@ fn run_sim(
         let host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
+            Box::new(dispatch),
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
@@ -500,7 +503,8 @@ impl Sim {
                 if enabled {
                     while self.step_once().await.is_some()
                         || !(self.held.is_empty() && self.oracle_queue.is_empty())
-                    {}
+                    {
+                    }
                 }
                 let _ = reply.send(self.snapshot());
             }
@@ -531,7 +535,10 @@ impl Sim {
     /// the stepped op was rejected (the submitter got the rejection reply).
     async fn step_once(&mut self) -> Option<CommittedInfo> {
         if let Some(follow) = self.oracle_queue.pop_front() {
-            return match self.commit(Origin::External(ORACLE_ORIGIN.to_vec()), follow).await {
+            return match self
+                .commit(Origin::External(ORACLE_ORIGIN.to_vec()), follow)
+                .await
+            {
                 Ok(committed) => Some(committed_info(&committed, "oracle")),
                 Err(err) => {
                     eprintln!("[simnode] worker follow-up rejected: {err}");
@@ -851,10 +858,7 @@ async fn sim_step(State(handle): State<SimHandle>) -> Response {
     }
 }
 
-async fn sim_auto(
-    State(handle): State<SimHandle>,
-    Json(req): Json<AutoRequest>,
-) -> Response {
+async fn sim_auto(State(handle): State<SimHandle>, Json(req): Json<AutoRequest>) -> Response {
     match control(handle, |reply| SimCommand::SetAuto {
         enabled: req.enabled,
         reply,
@@ -866,10 +870,7 @@ async fn sim_auto(
     }
 }
 
-async fn sim_persona(
-    State(handle): State<SimHandle>,
-    Json(req): Json<PersonaRequest>,
-) -> Response {
+async fn sim_persona(State(handle): State<SimHandle>, Json(req): Json<PersonaRequest>) -> Response {
     match control(handle, |reply| SimCommand::SetPersona {
         persona: req.persona,
         reply,

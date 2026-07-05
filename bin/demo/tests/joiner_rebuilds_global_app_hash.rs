@@ -442,6 +442,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             &mut src_saga,
             0,
             saga_encode_msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "greet".into(),
                 spec: b"reverse hello".to_vec(),
                 reply_to: None,
@@ -468,6 +469,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             &mut src_saga,
             0,
             saga_encode_msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "translate".into(),
                 spec: b"hola".to_vec(),
                 reply_to: None,

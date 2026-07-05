@@ -329,6 +329,7 @@ fn full_surface_blocks_authorship_and_ws() {
         [
             "chat",
             "saga",
+            "dispatch",
             "tasks",
             "inbox",
             "automations",

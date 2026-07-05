@@ -28,7 +28,8 @@ struct TestCtx {
 impl TestCtx {
     fn new(height: u64, origin: Origin) -> Self {
         Self {
-            env: Env { protocol_version: 0,
+            env: Env {
+                protocol_version: 0,
                 height,
                 consensus_time: height,
                 origin,
@@ -74,6 +75,7 @@ fn get(m: &SagaModule, id: &str) -> Option<SagaView> {
 
 fn trigger(id: &str, reply_to: Option<&str>, max_attempts: u32, deadline: Option<u64>) -> SagaMsg {
     SagaMsg::Trigger {
+        pinned_assignee: None,
         saga_id: id.into(),
         spec: format!("spec:{id}").into_bytes(),
         reply_to: reply_to.map(String::from),
@@ -131,6 +133,7 @@ fn source() -> SagaModule {
         1,
         alice.clone(),
         &SagaMsg::Trigger {
+            pinned_assignee: None,
             saga_id: "s-tagged".into(),
             spec: b"tagged-spec".to_vec(),
             reply_to: None,
@@ -393,8 +396,10 @@ fn truncated_or_padded_snapshot_is_rejected() {
 /// payload, every option absent), with its id — the fixture the
 /// discriminant-tampering tests index into. the layout is pinned by the
 /// asserted length: count 8, id len 8 + 1, origin 1, reply_to tag 1,
-/// reply_payload len 8, spec len 8, status 1, attempt 4, max_attempts 4, six
-/// option tags at [44..50), created_at 8, updated_at 8 = 66 bytes.
+/// reply_payload len 8, spec len 8, capability tag 1, status 1, attempt 4,
+/// max_attempts 4, seven option tags at [45..52) (assignee, pinned_assignee,
+/// lease_views, lease_expires_at, deadline, result, error), created_at 8,
+/// updated_at 8 = 68 bytes.
 fn minimal_snapshot(id: &str) -> Vec<u8> {
     let mut m = SagaModule::new("saga");
     exec(
@@ -402,6 +407,7 @@ fn minimal_snapshot(id: &str) -> Vec<u8> {
         0,
         Origin::System,
         &SagaMsg::Trigger {
+            pinned_assignee: None,
             saga_id: id.into(),
             spec: Vec::new(),
             reply_to: None,
@@ -416,7 +422,7 @@ fn minimal_snapshot(id: &str) -> Vec<u8> {
     let snap = m.snapshot();
     assert_eq!(
         snap.len(),
-        67,
+        68,
         "the minimal-saga layout this test indexes into"
     );
     snap
@@ -482,6 +488,7 @@ fn non_ascending_or_duplicate_ids_are_rejected() {
                 0,
                 Origin::System,
                 &SagaMsg::Trigger {
+                    pinned_assignee: None,
                     saga_id: id.into(),
                     spec: Vec::new(),
                     reply_to: None,
