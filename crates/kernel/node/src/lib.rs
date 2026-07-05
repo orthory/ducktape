@@ -589,8 +589,10 @@ pub enum Disposition {
     /// a deterministic no-op: the frame failed to decode or a module rejected
     /// the op (host-lent rolled the block back).
     Rejected,
-    /// finalized at or past the cutover ceiling — never applied; the submitter
-    /// resubmits in the new epoch.
+    /// finalized at or past the cutover ceiling — never applied. NOT a final
+    /// outcome for a locally-accepted frame: the ACCEPTING node re-proposes
+    /// it into the new epoch at cutover (see [`OrderedNode::cutover`]), where
+    /// it resolves as applied or rejected under the same [`FrameId`].
     Discarded,
 }
 
@@ -760,7 +762,7 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// ENGINE view are DISCARDED, not applied. every honest node discards by
     /// the same agreed rule, so a straggler op that finalizes on only some
     /// nodes while engines are being torn down can never fork app state —
-    /// submitters resubmit in the new epoch.
+    /// the accepting node re-proposes its own discards at cutover.
     view_ceiling: Option<u64>,
     /// the recovery seam (see [`BlockSink`]); [`NullSink`] when recovery is off.
     sink: S,
@@ -785,6 +787,17 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// frames delivered by the orderer but deferred past an observation
     /// barrier — drained ahead of fresh deliveries on the next call.
     deferred: std::collections::VecDeque<(u64, Vec<u8>)>,
+    /// CUSTODY of locally-accepted frames: everything [`OrderedNode::submit`]
+    /// acked (pinned + proposed) that has not yet RESOLVED — drained below
+    /// the ceiling as applied or rejected. valued with the submit `seq` (the
+    /// carry order) and the frame bytes. [`OrderedNode::cutover`] resubmits
+    /// whatever is still here into the new engine, so the accept contract
+    /// ("Ok ⇒ ordered, or deterministically rejected — never silently lost")
+    /// survives the boundary instead of dying with the discard ceiling or
+    /// the torn-down engine's queue. in-memory by design: a crash already
+    /// loses accepted-but-unfinalized ops (the pre-existing crash window);
+    /// the cutover is the NON-crash path this closes.
+    outstanding: std::collections::HashMap<FrameId, (u64, Vec<u8>)>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -810,6 +823,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             applied_floor: None,
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
+            outstanding: std::collections::HashMap::new(),
         }
     }
 
@@ -838,6 +852,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             applied_floor: finalized.map(|f| f.height),
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
+            outstanding: std::collections::HashMap::new(),
         }
     }
 
@@ -858,26 +873,56 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// call this only after a final [`OrderedNode::drain_delivered`] under the
     /// ceiling — anything the old engine finalized past the ceiling was
     /// deterministically discarded on every honest node.
+    ///
+    /// THE BOUNDARY CARRY: every locally-accepted frame still unresolved —
+    /// finalized past the ceiling (discarded) or queued in the torn-down
+    /// engine — is re-pinned and resubmitted into the NEW engine here,
+    /// byte-identical (same `(origin, seq)`, same [`FrameId`], so a caller
+    /// holding a reply by frame id resolves when the carried frame finalizes
+    /// in the new epoch). this is what keeps the accept contract true across
+    /// the boundary; without it, a cutover under concurrent submit load
+    /// silently drops every acked-but-unresolved op. returns the carried
+    /// count. the re-pin is REQUIRED, not belt-and-braces: checkpoint pruning
+    /// can drop the old epoch's pin record while the carried frame is still
+    /// unfinalized, leaving a post-carry finalization unrecoverable. only the
+    /// accepting node carries (custody, not origin, gates it), and even a
+    /// duplicate byte-identical proposal collapses in the engine's
+    /// exactly-once digest gate — a carry can never double-apply.
     pub async fn cutover(
         &mut self,
         orderer: O,
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
-    ) -> Result<(), Error> {
+    ) -> Result<usize, Error> {
         self.sink.cutover(epoch, view_base, participants).await?;
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
         self.view_ceiling = None;
-        // effects of pre-cutover blocks remain takeable; frames buffered in
-        // the OLD orderer die with it (they were past the ceiling or already
-        // drained). deferred frames carry OLD-epoch views — stamping them
-        // under the new base would corrupt heights, and a caller only cuts
-        // over after draining under the ceiling, so any leftover here was
-        // past the ceiling (a discard) anyway.
+        // effects of pre-cutover blocks remain takeable. deferred frames
+        // carry OLD-epoch views — stamping them under the new base would
+        // corrupt heights, and a caller only cuts over after draining under
+        // the ceiling, so any leftover here was past the ceiling (a discard);
+        // the bytes of locally-accepted ones survive via the carry below.
         self.deferred.clear();
-        Ok(())
+        // resubmit in `seq` order so this origin's ops keep the order their
+        // submitter observed them acked in.
+        let mut carried: Vec<(FrameId, u64, Vec<u8>)> = self
+            .outstanding
+            .drain()
+            .map(|(id, (seq, frame))| (id, seq, frame))
+            .collect();
+        carried.sort_unstable_by_key(|(_, seq, _)| *seq);
+        let count = carried.len();
+        for (id, seq, frame) in carried {
+            self.sink.pin(&frame).await?;
+            self.orderer.submit(frame.clone()).await?;
+            // custody continues: a second cutover before this frame resolves
+            // carries it again.
+            self.outstanding.insert(id, (seq, frame));
+        }
+        Ok(count)
     }
 
     /// set the deterministic discard boundary for the CURRENT engine (see the
@@ -912,7 +957,12 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // (the content store is memory; the engine journals votes, not
         // payloads; a solo network has no peer to refetch from).
         self.sink.pin(&frame).await?;
-        self.orderer.submit(frame).await?;
+        self.orderer.submit(frame.clone()).await?;
+        // custody begins only on FULL acceptance (pinned + proposed): an
+        // errored submit is reported to the caller, who retries — tracking
+        // it would double the op when the retry lands and a cutover carries
+        // the failed original too.
+        self.outstanding.insert(id, (seq, frame));
         Ok(id)
     }
 
@@ -972,6 +1022,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // frame leaves no state for a restart to recover.
             if let Some(ceiling) = self.view_ceiling {
                 if view >= ceiling {
+                    // a locally-accepted discard stays in `outstanding`: it
+                    // never applied anywhere, so the cutover carries it into
+                    // the new epoch (see [`OrderedNode::cutover`]).
                     self.drained.push(DrainedFrame {
                         id,
                         height,
@@ -982,6 +1035,10 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     continue;
                 }
             }
+            // below the ceiling this frame RESOLVES here — applied, or
+            // rejected as a deterministic no-op — so custody ends (a frame
+            // this node never submitted is simply absent).
+            self.outstanding.remove(&id);
             // WAL discipline: the frame is finalized and about to mutate state
             // — journal its bytes FIRST, so a crash mid-apply rolls forward
             // from this record instead of losing a finalized op.

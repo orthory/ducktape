@@ -5232,6 +5232,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                     for d in drained {
+                        // a DISCARD is not this hold's outcome: the cutover
+                        // carries the frame into the new epoch under the SAME
+                        // FrameId, so the hold stays open until the carried
+                        // frame finalizes there (or SUBMIT_HOLD expires into
+                        // the truthful re-query reply).
+                        if d.disposition == node::Disposition::Discarded {
+                            continue;
+                        }
                         let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
                         let _ = reply.send(match d.disposition {
                             node::Disposition::Applied => Ok(noded::BlockSummary {
@@ -5244,9 +5252,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             node::Disposition::Rejected => {
                                 Err("op finalized but rejected (deterministic no-op)".into())
                             }
-                            node::Disposition::Discarded => {
-                                Err("op discarded at an epoch cutover — resubmit".into())
-                            }
+                            // unreachable — filtered at the loop top — but
+                            // stay total rather than panic.
+                            node::Disposition::Discarded => continue,
                         });
                     }
                     // expire holds the mesh never finalized in time. the op may
@@ -5475,7 +5483,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 ContentStore::new(),
                                 None,
                             );
-                            if let Err(e) = node
+                            match node
                                 .cutover(
                                     orderer,
                                     plan.epoch(),
@@ -5484,8 +5492,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 )
                                 .await
                             {
-                                eprintln!("[node {label}] FATAL: {e} — halting");
-                                std::process::exit(1);
+                                // the accept contract crossing the boundary:
+                                // every locally-accepted op the old epoch
+                                // never resolved was re-proposed into the
+                                // new engine.
+                                Ok(carried) if carried > 0 => println!(
+                                    "[node {label}] carried {carried} accepted ops across the cutover into epoch {}",
+                                    plan.epoch()
+                                ),
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!("[node {label}] FATAL: {e} — halting");
+                                    std::process::exit(1);
+                                }
                             }
                             // ACTIVATION (design §4): realize the agreed boundary
                             // protocol version into every dual-path module's
