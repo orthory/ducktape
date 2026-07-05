@@ -39,6 +39,7 @@ import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
+import { hasFreshPending } from "./finalization";
 import { reducer } from "./reducer";
 import {
   applySnapshot,
@@ -320,6 +321,11 @@ export function DucktapeProvider({
       });
 
     const offBlock = node.onBlock(() => {
+      // A block landing while one of OUR ops is still in flight would re-query
+      // state that predates the op and clobber its preconfirmed projection —
+      // and the op's own completion refresh follows immediately anyway. Stale
+      // pendings (a hung submit) stop gating so the stream can't be starved.
+      if (hasFreshPending(stateRef.current.ops, Date.now())) return;
       refresh();
     });
     const offTelemetry = node.onTelemetry((frame) => {

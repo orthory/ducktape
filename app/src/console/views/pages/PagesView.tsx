@@ -18,7 +18,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, FormEvent, KeyboardEvent, ReactNode } from "react";
 
 import type { BlockKind } from "../../../domain/pages-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 import {
@@ -185,12 +188,15 @@ function BlockRow({
   row,
   index,
   expanded,
+  op,
   handlers,
 }: {
   row: Row;
   index: number;
   /** Only meaningful for Toggle rows: whether children are shown. */
   expanded: boolean;
+  /** The block's finalization record — the action cell draws the inline mark. */
+  op: OpRecord | undefined;
   handlers: RowHandlers;
 }) {
   const { block, depth } = row;
@@ -486,6 +492,7 @@ function BlockRow({
           paddingTop: 3,
         }}
       >
+        <FinalizationMark op={op} />
         <button
           type="button"
           aria-label={`Copy id of block ${blockNumber}`}
@@ -1074,6 +1081,11 @@ export function PagesView() {
               >
                 <Icon name="hash" size={10} />
                 <span style={{ font: `500 10px ${font.mono}` }}>{shortId(root.id)}</span>
+                <FinalizationMark
+                  op={[state.ops[opKey.page(root.id)], state.ops[opKey.pageBlock(root.id)]]
+                    .filter((record): record is NonNullable<typeof record> => Boolean(record))
+                    .sort((a, b) => b.seq - a.seq)[0]}
+                />
               </div>
 
               {rows.map((row, index) => (
@@ -1082,6 +1094,7 @@ export function PagesView() {
                   row={row}
                   index={index}
                   expanded={!collapsed.has(row.block.id)}
+                  op={state.ops[opKey.pageBlock(row.block.id)]}
                   handlers={handlers}
                 />
               ))}

@@ -1,11 +1,14 @@
 // The tasks surface over the node's `tasks` module: a committed-state list,
 // a small composer, and explicit one-way status advancement.
 
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 
 import type { Task, TaskStatus } from "../../../domain/tasks-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -181,14 +184,17 @@ function AdvanceButton({
 function TaskRow({
   task,
   canAdvance,
-  pending,
+  op,
   onAdvance,
 }: {
   task: Task;
   canAdvance: boolean;
-  pending: boolean;
+  /** The row's finalization record — drives the Queued button state and the
+   *  inline mark (pending dot → checkmark with inclusion facts on hover). */
+  op: OpRecord | undefined;
   onAdvance: (taskId: string) => void;
 }) {
+  const pending = op?.phase === "pending";
   const [hover, setHover] = useState(false);
   const done = task.status === "Done";
   const pill = STATUS_PILLS[task.status];
@@ -250,7 +256,10 @@ function TaskRow({
             whiteSpace: "nowrap",
           }}
         >
-          #{shortId(task.id)} · created {taskDate(task.created_at)}
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            #{shortId(task.id)} · created {taskDate(task.created_at)}
+            <FinalizationMark op={op} />
+          </span>
         </div>
       </div>
 
@@ -342,28 +351,12 @@ export function TasksView() {
   const [draft, setDraft] = useState("");
   const [inputFocus, setInputFocus] = useState(false);
   const [buttonHover, setButtonHover] = useState(false);
-  const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
-  const pendingTimer = useRef<number | null>(null);
-
   const statusLoaded = state.status !== null;
   const tasksBacked = Boolean(state.status?.modules.some((mod) => mod.id === "tasks"));
   const loading = !statusLoaded;
   const writable = tasksBacked;
   const taskCount = state.tasks.length;
   const canSubmit = writable && draft.trim().length > 0;
-
-  useEffect(
-    () => () => {
-      if (pendingTimer.current !== null) window.clearTimeout(pendingTimer.current);
-    },
-    [],
-  );
-
-  useEffect(() => {
-    if (!pendingTaskId) return;
-    const task = state.tasks.find((item) => item.id === pendingTaskId);
-    if (!task || task.status === "Done") setPendingTaskId(null);
-  }, [pendingTaskId, state.tasks]);
 
   const add = (event: FormEvent) => {
     event.preventDefault();
@@ -377,12 +370,6 @@ export function TasksView() {
     if (!writable) return;
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task || task.status === "Done") return;
-    setPendingTaskId(taskId);
-    if (pendingTimer.current !== null) window.clearTimeout(pendingTimer.current);
-    pendingTimer.current = window.setTimeout(() => {
-      setPendingTaskId((current) => (current === taskId ? null : current));
-      pendingTimer.current = null;
-    }, 1200);
     actions.advanceTask(taskId);
   };
 
@@ -531,7 +518,7 @@ export function TasksView() {
                 key={task.id}
                 task={task}
                 canAdvance={writable}
-                pending={pendingTaskId === task.id}
+                op={state.ops[opKey.task(task.id)]}
                 onAdvance={advance}
               />
             ))

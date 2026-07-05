@@ -136,6 +136,50 @@ async fn submit_stamps_the_client_origin() {
 }
 
 #[tokio::test]
+async fn submit_receipt_op_hash_addresses_the_committed_payload() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let app = noded::router(handle);
+
+    let payload =
+        serde_json::json!({ "CreateChannel": { "channel_id": "general", "name": "General" } });
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/v1/submit",
+            serde_json::json!({ "target": "chat", "payload": payload }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let op_hash = body["opHash"].as_str().expect("receipt carries opHash");
+    assert_eq!(op_hash.len(), 64);
+    assert!(op_hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+
+    // the hash is ADDRESSABLE, not just informational: the blob lane serves the
+    // committed op bytes back under it.
+    let fetched = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/files/blob/{op_hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), StatusCode::OK);
+    let bytes = fetched.into_body().collect().await.unwrap().to_bytes();
+    let round_trip: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("blob is the op json");
+    assert_eq!(
+        round_trip,
+        serde_json::json!({ "CreateChannel": { "channel_id": "general", "name": "General" } })
+    );
+}
+
+#[tokio::test]
 async fn submit_maps_a_module_error_to_bad_request() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     spawn_fake_actor(cmd_rx, Some("module error: channel already exists"));

@@ -400,6 +400,7 @@ export function ChatView() {
               channelName={channel.name}
               messages={state.messages}
               names={state.authorNames}
+              ops={state.ops}
               selfKey={selfKey}
               workspaceId={workspaceId}
               hoverMsg={hoverMsg}
@@ -432,6 +433,7 @@ export function ChatView() {
           thread={state.activeThread}
           channelName={channel.name}
           names={state.authorNames}
+          ops={state.ops}
           selfKey={selfKey}
           workspaceId={workspaceId}
           hoverMsg={hoverMsg}

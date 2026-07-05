@@ -17,6 +17,15 @@ export interface BlockEvent {
   appHash: string;
 }
 
+/** What `/v1/submit` resolves to: the block that INCLUDED the op, plus the
+ *  op's content address — sha256 of the committed payload bytes, fetchable
+ *  back via the blob lane (`GET /v1/files/blob/{opHash}`). Optional on the
+ *  type because a node built before receipts shipped replies without it; the
+ *  ui then shows the inclusion height alone. */
+export interface SubmitReceipt extends BlockEvent {
+  opHash?: string;
+}
+
 /** How the app groups a module in the Modules view. The node attaches this by
  *  id in its status catalog; it is presentation metadata only, never consensus
  *  identity. Optional: a node built before categories shipped omits it, and the
@@ -107,7 +116,7 @@ export interface NodeTransport {
    * `Origin::External`; modules that derive authorship from origin (chat)
    * attribute the write to it. Omitted → the daemon's default identity.
    */
-  submit(target: string, payload: unknown, origin?: string): Promise<BlockEvent>;
+  submit(target: string, payload: unknown, origin?: string): Promise<SubmitReceipt>;
   /** Read committed state. The reply is the module's `*Reply` enum as json. */
   query(target: string, query: unknown): Promise<unknown>;
   /**
@@ -240,7 +249,7 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
     // JSON.stringify drops an undefined origin, so the field only crosses the
     // wire when a caller set one
     submit: (target, payload, origin) =>
-      postJson<BlockEvent>(`${base}/v1/submit`, { target, payload, origin }),
+      postJson<SubmitReceipt>(`${base}/v1/submit`, { target, payload, origin }),
     query: (target, query) =>
       postJson<unknown>(`${base}/v1/query`, { target, query }),
     view: (module, request) =>

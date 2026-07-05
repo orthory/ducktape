@@ -11,6 +11,8 @@ import type { KeyboardEvent } from "react";
 
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames, ChatThread } from "../../../domain/chat-client";
+import { opForMessage } from "../../store/finalization";
+import type { OpLedger } from "../../store/finalization";
 import { Icon } from "../../components/Icon";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
@@ -22,6 +24,7 @@ export function ThreadPanel({
   thread,
   channelName,
   names,
+  ops,
   selfKey,
   workspaceId,
   hoverMsg,
@@ -37,6 +40,8 @@ export function ThreadPanel({
   thread: ChatThread;
   channelName: string;
   names: AuthorNames;
+  /** The store's finalization ledger — root and replies draw their marks. */
+  ops: OpLedger;
   selfKey: string;
   workspaceId: string | null;
   hoverMsg: number | null;
@@ -158,6 +163,7 @@ export function ThreadPanel({
             onEdit={(text) => onEdit(thread.root.seq, text)}
             onDelete={() => onDelete(thread.root.seq)}
             threadable={false}
+            op={opForMessage(ops, thread.root)}
           />
         </div>
 
@@ -185,6 +191,7 @@ export function ThreadPanel({
                 onEdit={(text) => onEdit(reply.seq, text)}
                 onDelete={() => onDelete(reply.seq)}
                 threadable={false}
+                op={opForMessage(ops, reply)}
               />
             </div>
           ))}

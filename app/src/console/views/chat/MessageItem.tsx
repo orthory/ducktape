@@ -9,6 +9,8 @@ import type { CSSProperties, ReactNode } from "react";
 
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../../../domain/chat-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
+import type { OpRecord } from "../../store/finalization";
 import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
 import { blocksToInput } from "./chat-input";
 import { EmojiPicker } from "./EmojiPicker";
@@ -788,6 +790,7 @@ export function MessageItem({
   onEdit,
   onDelete,
   threadable = true,
+  op,
 }: {
   message: MessageView;
   names: AuthorNames;
@@ -811,6 +814,9 @@ export function MessageItem({
   /** False inside the ThreadPanel — a thread reply can't itself spawn a
    *  nested thread, so the thread affordances are hidden there. */
   threadable?: boolean;
+  /** This row's finalization record: pending dot → inline checkmark once the
+   *  write that produced/touched it is included (hover: height + op hash). */
+  op?: OpRecord;
 }) {
   const author = authorName(message.head.author, names);
   // An unresolved key handle ("4c3a9460…") reads better in mono + muted so it
@@ -861,6 +867,12 @@ export function MessageItem({
       <div style={{ width: 30, flexShrink: 0, display: "flex", justifyContent: "center", paddingTop: 1 }}>
         {groupStart ? (
           <Avatar author={message.head.author} name={author} size={30} />
+        ) : op ? (
+          // a grouped row has no meta line — its mark takes the time gutter
+          // (and must stay hoverable, so it outranks the hover timestamp)
+          <span style={{ marginTop: 4 }}>
+            <FinalizationMark op={op} />
+          </span>
         ) : hovered ? (
           <span style={{ font: `400 10px ${font.mono}`, color: color.muted2, marginTop: 4 }}>
             {timeOf(message.head.created_at)}
@@ -891,6 +903,7 @@ export function MessageItem({
             {message.head.edited_at !== null && (
               <span style={{ font: `400 10px ${font.sans}`, color: color.muted2 }}>(edited)</span>
             )}
+            <FinalizationMark op={op} />
           </div>
         )}
         <div

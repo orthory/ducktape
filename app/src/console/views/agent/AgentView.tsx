@@ -17,7 +17,10 @@ import type {
 } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
 import type { Channel } from "../../../domain/chat-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpLedger, OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -381,10 +384,13 @@ function Chip({ text, tone = statusTone.neutral }: { text: string; tone?: Tone }
 function AgentListButton({
   agent,
   selected,
+  op,
   onSelect,
 }: {
   agent: AgentRecord;
   selected: boolean;
+  /** The agent's finalization record — the status line draws the mark. */
+  op: OpRecord | undefined;
   onSelect: (agentId: string) => void;
 }) {
   const active = agent.status === "Active";
@@ -459,6 +465,7 @@ function AgentListButton({
           <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted3 }}>
             {active ? "Active" : "Paused"}
           </span>
+          <FinalizationMark op={op} />
         </span>
       </span>
     </button>
@@ -1124,11 +1131,14 @@ function WatchRow({
   watch,
   channels,
   agents,
+  op,
   onUnwatch,
 }: {
   watch: WatchView;
   channels: Channel[];
   agents: AgentRecord[];
+  /** The watch's finalization record (watch/unwatch key by channel). */
+  op: OpRecord | undefined;
   onUnwatch: (id: string) => void;
 }) {
   const label = channelLabel(channels, watch.channel_id);
@@ -1172,8 +1182,18 @@ function WatchRow({
         >
           {label}
         </div>
-        <div style={{ marginTop: 2, font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+        <div
+          style={{
+            marginTop: 2,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            font: `400 11.5px ${font.sans}`,
+            color: color.muted2,
+          }}
+        >
           {policyText(watch.policy, agents)}
+          <FinalizationMark op={op} />
         </div>
       </div>
       <button
@@ -1300,12 +1320,15 @@ function WatchesPanel({
   channels,
   agents,
   watches,
+  ops,
   onWatch,
   onUnwatch,
 }: {
   channels: Channel[];
   agents: AgentRecord[];
   watches: WatchView[];
+  /** The store's finalization ledger — watch rows draw their marks. */
+  ops: OpLedger;
   onWatch: (params: { channelId: string; policy: TurnPolicy }) => void;
   onUnwatch: (id: string) => void;
 }) {
@@ -1331,6 +1354,7 @@ function WatchesPanel({
               watch={watch}
               channels={channels}
               agents={agents}
+              op={ops[opKey.watch(watch.channel_id)]}
               onUnwatch={onUnwatch}
             />
           ))
@@ -1347,11 +1371,14 @@ function RunRow({
   run,
   agents,
   channels,
+  op,
   onCancel,
 }: {
   run: RunView;
   agents: AgentRecord[];
   channels: Channel[];
+  /** The run's finalization record (a cancel keys by run id). */
+  op: OpRecord | undefined;
   onCancel: (id: string) => void;
 }) {
   const tone = runTone(run.status);
@@ -1423,6 +1450,7 @@ function RunRow({
         <div style={{ padding: "11px 12px" }}>
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
             <Chip text={shortText(run.run_id)} />
+            <FinalizationMark op={op} />
             <Chip text={`${label} @${run.anchor_seq}`} tone={statusTone.blue} />
             {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
             {run.job_id && <Chip text={shortText(run.job_id)} tone={statusTone.agent} />}
@@ -1450,11 +1478,14 @@ function RunsTimeline({
   runs,
   agents,
   channels,
+  ops,
   onCancel,
 }: {
   runs: RunView[];
   agents: AgentRecord[];
   channels: Channel[];
+  /** The store's finalization ledger — run rows draw their marks. */
+  ops: OpLedger;
   onCancel: (id: string) => void;
 }) {
   return (
@@ -1491,6 +1522,7 @@ function RunsTimeline({
               run={run}
               agents={agents}
               channels={channels}
+              op={ops[opKey.run(run.run_id)]}
               onCancel={onCancel}
             />
           ))}
@@ -1580,6 +1612,7 @@ export function AgentView() {
                 opts the agent module into job-board work
               </span>
             </div>
+            <FinalizationMark op={state.ops[opKey.jobWorker()]} />
             <button
               type="button"
               role="switch"
@@ -1661,6 +1694,7 @@ export function AgentView() {
                   key={agent.agent_id}
                   agent={agent}
                   selected={selectedAgent?.agent_id === agent.agent_id}
+                  op={state.ops[opKey.agent(agent.agent_id)]}
                   onSelect={setSelectedAgentId}
                 />
               ))
@@ -1709,6 +1743,7 @@ export function AgentView() {
               channels={state.channels}
               agents={state.agents}
               watches={state.watches}
+              ops={state.ops}
               onWatch={actions.watchChannel}
               onUnwatch={actions.unwatchChannel}
             />
@@ -1716,6 +1751,7 @@ export function AgentView() {
               runs={state.runs}
               agents={state.agents}
               channels={state.channels}
+              ops={state.ops}
               onCancel={actions.cancelRun}
             />
           </div>

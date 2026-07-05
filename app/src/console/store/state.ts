@@ -25,6 +25,7 @@ import type {
 import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
 /** The two sidebar partitions the view-mode toggle switches between: the
@@ -162,6 +163,12 @@ export interface ConsoleState {
    *  node's ring on every refresh; empty on a node without the surface. */
   blocks: BlockRecord[];
 
+  /** Per-operation finalization ledger (entity key → newest op touching that
+   *  row): pending while a write is in flight, then finalized with the
+   *  inclusion height + addressable op hash from the submit receipt. Client
+   *  bookkeeping, never committed state — node switches reset it. */
+  ops: OpLedger;
+
   error: string | null;
 
   // ── Workspace / onboarding ──
@@ -289,6 +296,7 @@ export const createInitialState = (): ConsoleState => {
     files: [],
     telemetry: [],
     blocks: [],
+    ops: {},
     error: null,
     workspaces: [],
     workspace: null,

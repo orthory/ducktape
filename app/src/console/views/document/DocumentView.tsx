@@ -12,7 +12,10 @@ import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type { Block, BlockKind } from "../../../domain/document-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -513,6 +516,7 @@ function BlockRow({
   block,
   index,
   total,
+  op,
   onUpdate,
   onRemove,
   onMoveUp,
@@ -521,6 +525,8 @@ function BlockRow({
   block: Block;
   index: number;
   total: number;
+  /** The block's finalization record — the id footer draws the inline mark. */
+  op: OpRecord | undefined;
   onUpdate: (text: string) => void;
   onRemove: () => void;
   onMoveUp: () => void;
@@ -601,6 +607,7 @@ function BlockRow({
         >
           <Icon name="hash" size={11} />
           <span style={{ font: `500 10px ${font.mono}` }}>{shortId(block.id)}</span>
+          <FinalizationMark op={op} />
         </div>
       </div>
 
@@ -1144,6 +1151,11 @@ export function DocumentView() {
                         block={block}
                         index={index}
                         total={blocks.length}
+                        op={
+                          state.activeDoc
+                            ? state.ops[opKey.docBlock(state.activeDoc, block.id)]
+                            : undefined
+                        }
                         onUpdate={(text) => actions.updateBlock({ blockId: block.id, text })}
                         onRemove={() => actions.removeBlock(block.id)}
                         onMoveUp={() => moveUp(index)}

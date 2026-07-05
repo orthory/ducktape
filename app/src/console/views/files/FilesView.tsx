@@ -12,7 +12,10 @@ import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 
 import type { Manifest } from "../../../domain/files-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 
@@ -173,11 +176,14 @@ function RowButton({
 function FileRow({
   manifest,
   downloading,
+  op,
   onDownload,
   onDelete,
 }: {
   manifest: Manifest;
   downloading: boolean;
+  /** The manifest's finalization record — the meta line draws the mark. */
+  op: OpRecord | undefined;
   onDownload: () => void;
   onDelete: () => void;
 }) {
@@ -280,6 +286,7 @@ function FileRow({
             <span title={manifest.owner}>{shortOwner(manifest.owner)}</span>
             <span>·</span>
             <span>h{manifest.created_at_height}</span>
+            <FinalizationMark op={op} />
           </div>
         </div>
 
@@ -537,6 +544,7 @@ export function FilesView() {
                     key={manifest.file_id}
                     manifest={manifest}
                     downloading={downloadingId === manifest.file_id}
+                    op={state.ops[opKey.file(manifest.file_id)]}
                     onDownload={() => handleDownload(manifest.file_id)}
                     onDelete={() => actions.removeFile(manifest.file_id)}
                   />

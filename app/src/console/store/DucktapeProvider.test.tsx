@@ -4,7 +4,7 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { BlockEvent, NodeTransport } from "../../domain/transport";
+import type { BlockEvent, NodeTransport, SubmitReceipt } from "../../domain/transport";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
@@ -124,10 +124,12 @@ const makeFakeNode = () => {
 };
 
 let capturedActions: ConsoleActions | null = null;
+let capturedState: ReturnType<typeof useDucktape>["state"] | null = null;
 
 function Probe() {
   const { state, actions } = useDucktape();
   capturedActions = actions;
+  capturedState = state;
   return (
     <div>
       <span data-testid="height">{state.status?.height ?? -1}</span>
@@ -322,6 +324,74 @@ describe("DucktapeProvider", () => {
     expect(forgeCall).toBeTruthy();
     expect(forgeCall![1]).toEqual({
       Commit: { path: "README.md", content: "hello forge", message: "init" },
+    });
+  });
+});
+
+// ── Preconfirmed render + finalization ledger ───────────
+
+describe("submitTracked lifecycle", () => {
+  it("renders the op preconfirmed, then finalizes the ledger from the receipt", async () => {
+    const { transport } = makeFakeNode();
+    let settle!: (receipt: SubmitReceipt) => void;
+    vi.mocked(transport.submit).mockImplementation(
+      () => new Promise((resolve) => (settle = resolve)),
+    );
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+
+    await act(async () => {
+      capturedActions!.sendMessage("preconfirm me");
+    });
+
+    // BEFORE the node answers: the message already renders, and its ledger
+    // record is pending under the minted message-id key.
+    expect(screen.getByTestId("messages").textContent).toBe("2");
+    const pendingKeys = Object.keys(capturedState!.ops);
+    expect(pendingKeys).toHaveLength(1);
+    expect(pendingKeys[0]).toMatch(/^chat\/general\/id\//);
+    expect(capturedState!.ops[pendingKeys[0]].phase).toBe("pending");
+
+    await act(async () => {
+      settle({ height: 9, appHash: "dd".repeat(32), opHash: "ee".repeat(32) });
+    });
+
+    await waitFor(() => {
+      const record = capturedState!.ops[pendingKeys[0]];
+      expect(record.phase).toBe("finalized");
+      expect(record.height).toBe(9);
+      expect(record.opHash).toBe("ee".repeat(32));
+    });
+  });
+
+  it("rolls the preconfirmed render back and records the rejection on failure", async () => {
+    const { transport } = makeFakeNode();
+    let reject!: (err: Error) => void;
+    vi.mocked(transport.submit).mockImplementation(
+      () => new Promise((_resolve, rej) => (reject = rej)),
+    );
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+
+    await act(async () => {
+      capturedActions!.sendMessage("doomed");
+    });
+    expect(screen.getByTestId("messages").textContent).toBe("2");
+    const key = Object.keys(capturedState!.ops)[0];
+
+    await act(async () => {
+      reject(new Error("chat: channel is members-only"));
+    });
+
+    // the rollback refresh restores committed truth; the record keeps the why.
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toBe("1");
+      expect(capturedState!.ops[key].phase).toBe("failed");
+      expect(capturedState!.ops[key].error).toContain("members-only");
     });
   });
 });
