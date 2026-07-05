@@ -1,5 +1,7 @@
-/// <reference types="vitest" />
-import { defineConfig } from "vite";
+// defineConfig comes from vitest/config (not vite) so the `test` block below
+// is typed — vitest 4 dropped the `/// <reference types="vitest" />` module
+// augmentation. at runtime it is vite's own defineConfig, re-exported.
+import { defineConfig } from "vitest/config";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 
@@ -8,7 +10,6 @@ import react from "@vitejs/plugin-react";
 // sits on the default (e.g. another Tauri app's dev server). Pin it strictly and
 // fail loudly instead. 1430 is ducktape's own port; override with
 // DUCKTAPE_TAURI_DEV_PORT (keep tauri.conf.json's devUrl in sync).
-// @ts-expect-error process is a nodejs global
 const explicitDevPort = process.env.DUCKTAPE_TAURI_DEV_PORT;
 const devPort = Number(explicitDevPort || 1430);
 const strictPort = true;
