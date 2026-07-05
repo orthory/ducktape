@@ -18,6 +18,7 @@ members = [
     "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
+    "crates/kernel/capability-host",
     # system — consensus infrastructure modules
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
@@ -95,6 +96,7 @@ reactor = { path = "crates/kernel/reactor" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
+capability-host = { path = "crates/kernel/capability-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 chat-index = { path = "crates/apps/chat-index" }

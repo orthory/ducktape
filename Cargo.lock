@@ -750,6 +750,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "capability-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "capability-interface"
 version = "0.1.0"
 dependencies = [
