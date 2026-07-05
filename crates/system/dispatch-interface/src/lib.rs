@@ -207,7 +207,10 @@ pub enum DispatchQuery {
     Recipe {
         recipe_id: String,
     },
+    /// one dispatch, addressed the way its creator knows it: the receiving
+    /// module's id plus the receiver-local dispatch id.
     Dispatch {
+        receiver: String,
         dispatch_id: String,
     },
     /// count of mailbox events awaiting delivery — the host injection's read.

@@ -874,8 +874,14 @@ impl Module for DispatchModule {
             DispatchQuery::Recipe { recipe_id } => Ok(encode_reply(&DispatchReply::Recipe(
                 self.committed.recipes.get(&recipe_id).cloned(),
             ))),
-            DispatchQuery::Dispatch { dispatch_id } => Ok(encode_reply(&DispatchReply::Dispatch(
-                self.committed.dispatches.get(&dispatch_id).map(Self::view),
+            DispatchQuery::Dispatch {
+                receiver,
+                dispatch_id,
+            } => Ok(encode_reply(&DispatchReply::Dispatch(
+                self.committed
+                    .dispatches
+                    .get(&dispatch_key(&receiver, &dispatch_id))
+                    .map(Self::view),
             ))),
             DispatchQuery::PendingDeliveries => Ok(encode_reply(
                 &DispatchReply::PendingDeliveries(self.committed.mailbox.len() as u64),
@@ -1026,9 +1032,13 @@ mod tests {
         block_on(m.execute(&mut ctx, &msg))
     }
     fn get_dispatch(m: &DispatchModule, key: &str) -> Option<DispatchView> {
+        // the tests address dispatches by their composite state key; split it
+        // back into the wire query's (receiver, local id) coordinates.
+        let (receiver, dispatch_id) = key.split_once(SEP).expect("composite key");
         let reply = block_on(m.query(&dispatch_interface::encode_query(
             &DispatchQuery::Dispatch {
-                dispatch_id: key.into(),
+                receiver: receiver.into(),
+                dispatch_id: dispatch_id.into(),
             },
         )))
         .unwrap();
