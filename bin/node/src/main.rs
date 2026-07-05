@@ -3236,22 +3236,32 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     );
     // coordinated reach targets are split OUT of the TCP mesh dialer (a
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
-    // there was a silent no-op). reaching them needs the nat client to
-    // hole-punch/relay through the coordinator and bring up a WireGuard tunnel
-    // — the reachability data plane. that plane runs behind the
-    // `wireguard_listen` key and drives a real interface by default
-    // (`wireguard_effect = "fake"` opts out), but the TCP mesh dialer does
-    // not route over the tunnel yet, so a coordinated-only invite still
-    // cannot carry mesh traffic; surface it loudly rather than park silently.
-    // see docs/deploy/private-cutover-integration-gap.md.
+    // there was a silent no-op). reaching them is the reachability plane's
+    // job: gossip relays through whatever mesh links exist, the nat client
+    // hole-punches/relays the WireGuard path through the coordinator, and
+    // once tunnels apply the mesh dials the target's advertised overlay
+    // address over the tunnel (the target sets `advertised = "overlay"`).
+    // what still needs a TCP foothold is the gossip itself: with ZERO
+    // bootstrap links nothing carries this node's records anywhere, so a
+    // coordinated-ONLY config parks until the persisted-mesh/coordinator-
+    // carried-gossip seam ships — surface that loudly rather than park
+    // silently.
     if !coordinated.is_empty() {
-        println!(
-            "[node {label}] WARNING: {} coordinated reach target(s) need mesh traffic to flow \
-             over a WireGuard tunnel, but the mesh dialer does not route over tunnels yet — \
-             these peers are UNREACHABLE for mesh traffic. use a direct/fronted invite for \
-             now.",
-            coordinated.len()
-        );
+        if bootstrappers.is_empty() {
+            println!(
+                "[node {label}] WARNING: {} coordinated reach target(s) but NO direct/fronted \
+                 bootstrap link — tunnel bring-up gossip has no path to ride, so these peers \
+                 stay unreachable. add at least one direct/fronted hint (an ephemeral ingress \
+                 is enough) for the join window.",
+                coordinated.len()
+            );
+        } else {
+            println!(
+                "[node {label}] {} coordinated reach target(s): mesh traffic flows over the \
+                 WireGuard tunnel once the reachability plane converges.",
+                coordinated.len()
+            );
+        }
         for (target, coord, _coord_key) in &coordinated {
             println!(
                 "[node {label}]   coordinated target {} via coordinator {coord:?}",
