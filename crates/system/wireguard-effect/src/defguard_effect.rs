@@ -41,7 +41,30 @@ impl WireGuardEffect for DefguardWireGuardEffect {
     }
 
     fn apply(&mut self, config: &InterfaceConfiguration) -> Result<(), Self::Error> {
-        self.api.configure_interface(config)
+        self.api.configure_interface(config)?;
+        // The userspace `configure_interface` assigns addresses and writes
+        // the UAPI config but neither flips IFF_UP nor installs allowed-ip
+        // routes — the kernel path gets its UP flag inside defguard's
+        // (crate-private) `netlink::create_interface`, and peer routing is a
+        // separate trait call. Without both, the "applied" tunnel cannot
+        // carry a single packet (the two-container smoke surfaced the
+        // interface sitting in `state DOWN` with no route to the peer's
+        // overlay address). `ip` is the same external tool defguard's own
+        // peer routing shells out to on this path.
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::process::Command::new("ip")
+                .args(["link", "set", "up", "dev", &config.name])
+                .status()?;
+            if !status.success() {
+                return Err(WireguardInterfaceError::Interface(format!(
+                    "`ip link set up dev {}` exited with {status}",
+                    config.name
+                )));
+            }
+            self.api.configure_peer_routing(&config.peers)?;
+        }
+        Ok(())
     }
 
     fn remove_interface(&mut self) -> Result<(), Self::Error> {
@@ -94,6 +117,29 @@ mod tests {
             fwmark: None,
         };
         effect.apply(&config).unwrap();
+
+        // `apply` must leave a USABLE tunnel: link up (the flags string
+        // gains `UP`; down is bare `<POINTOPOINT,MULTICAST,NOARP>`) and a
+        // route to the peer's allowed ip via this interface.
+        #[cfg(target_os = "linux")]
+        {
+            let link = std::process::Command::new("ip")
+                .args(["-o", "link", "show", "dt-smoke0"])
+                .output()
+                .unwrap();
+            let link = String::from_utf8_lossy(&link.stdout).to_string();
+            assert!(link.contains("UP"), "link is not up: {link}");
+            let route = std::process::Command::new("ip")
+                .args(["-4", "route", "get", "100.64.0.2"])
+                .output()
+                .unwrap();
+            let route = String::from_utf8_lossy(&route.stdout).to_string();
+            assert!(
+                route.contains("dt-smoke0"),
+                "peer allowed-ip does not route via the tunnel: {route}"
+            );
+        }
+
         effect.remove_interface().unwrap();
     }
 }
