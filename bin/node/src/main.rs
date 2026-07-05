@@ -1382,6 +1382,26 @@ fn sealed_frame_block_row(
     ))
 }
 
+/// the observer's explorer row: a followed BOUNDARY, not a sealed frame. the
+/// populated fields are verified truth — the boundary height and the
+/// app-hash the manifest check passed — and every frame-derived field stays
+/// honestly empty, because an observer never sees the frames between
+/// boundaries (the same degradation rule that keeps the frameless daemon
+/// lane's `hash` empty rather than fabricated).
+fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
+    noded::block_row(&noded::BlockRecord {
+        height,
+        hash: String::new(),
+        commit_hash: hex(app_hash),
+        proposer: String::new(),
+        disposition: noded::BlockDisposition::Applied,
+        target: String::new(),
+        operations: Vec::new(),
+        payload: String::new(),
+        op_hash: String::new(),
+    })
+}
+
 /// folds sealed blocks into the derived per-module index during boot (journal
 /// replay + post-reboot frame catch-up), with the GAP DISCIPLINE: once one
 /// sealed height's content is unreproducible (opaque) above some module's
@@ -3660,10 +3680,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // the derived per-module index (noded's exact store, <storage>/index),
     // plus the blocks database the explorer reads: the pump folds sealed
     // blocks into it, boot heals it from verified state at sync/recovery
-    // boundaries, and the already-routed GET /v1/blocks + /v1/index/* lanes
-    // light up through the handle below. an open failure is fatal-with-remedy
-    // rather than a silent no-index run: the tier is rebuildable, so the fix
-    // is always "delete <storage>/index".
+    // boundaries, an observer's follow arm heals it at every state-changing
+    // boundary it serves, and the already-routed GET /v1/blocks +
+    // /v1/index/* lanes light up through the handle below. an open failure
+    // is fatal-with-remedy rather than a silent no-index run: the tier is
+    // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
@@ -4034,6 +4055,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // exist — the sync path reopens the same on-disk partitions, so
             // this is dropped before every re-sync.
             let mut serving: Option<(u64, Host)> = None;
+            // the app-hash of the last boundary the derived tier followed:
+            // the index feed (heal + explorer row + ws event) fires only when
+            // the verified app-hash MOVED. an unchanged hash is an idle
+            // stride — state is byte-identical, the read models are already
+            // exact, and the explorer stays as quiet as the validator's nop
+            // gate keeps it. in-memory on purpose: after a restart the first
+            // boundary re-fires and every write below is idempotent.
+            let mut last_indexed_root: Option<StateRoot> = None;
             let not_serving = |standing: bool| -> String {
                 if standing {
                     "observer: no boundary pre-synced yet — retry shortly".into()
@@ -4279,11 +4308,46 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 .await
                             {
                                 Ok(host) => {
+                                    let root = host.app_hash();
                                     println!(
                                         "[node {label}] observer: pre-synced boundary {} app_hash={}",
                                         m.height,
-                                        hex(&host.app_hash())
+                                        hex(&root)
                                     );
+                                    // the DERIVED tier follows the boundary
+                                    // too: read models re-derive from the
+                                    // verified state (an observer folds no
+                                    // blocks, so every module's watermark
+                                    // trails), the explorer records the one
+                                    // thing an observer observes — the
+                                    // boundary — and ws subscribers learn
+                                    // the advance. index failures poison and
+                                    // log; canonical reads keep serving.
+                                    if last_indexed_root.as_ref() != Some(&root) {
+                                        heal_index(&index, &host, m.height, &label).await;
+                                        if let Err(err) = index.apply_block_record(
+                                            m.height,
+                                            boundary_block_row(m.height, &root),
+                                        ) {
+                                            eprintln!(
+                                                "[node {label}] observer: explorer row at \
+                                                 boundary {} refused: {err}",
+                                                m.height
+                                            );
+                                        }
+                                        let _ = http_events.send(noded::WsFrame::Block(
+                                            noded::BlockSummary {
+                                                height: m.height,
+                                                app_hash: hex(&root),
+                                            },
+                                        ));
+                                        println!(
+                                            "[node {label}] observer: derived index follows \
+                                             boundary {}",
+                                            m.height
+                                        );
+                                        last_indexed_root = Some(root);
+                                    }
                                     serving = Some((m.height, host));
                                 }
                                 Err(e) => println!(

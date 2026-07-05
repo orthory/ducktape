@@ -780,37 +780,7 @@ impl Cluster {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> (u16, serde_json::Value) {
-        use std::io::Read as _;
-        let port = self.http_ports[idx];
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("app-surface read timeout");
-        let body_bytes = body
-            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
-            .unwrap_or_default();
-        let req = format!(
-            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body_bytes.len()
-        );
-        stream.write_all(req.as_bytes()).expect("app-surface write");
-        stream
-            .write_all(&body_bytes)
-            .expect("app-surface write body");
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("app-surface read");
-        let text = String::from_utf8_lossy(&raw);
-        let status: u16 = text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let payload = text
-            .split("\r\n\r\n")
-            .nth(1)
-            .and_then(|b| serde_json::from_str(b.trim()).ok())
-            .unwrap_or(serde_json::Value::Null);
-        (status, payload)
+        http_request(self.http_ports[idx], method, path, body)
     }
 
     /// every running node's log tail — the panic payload that makes a stalled
@@ -848,6 +818,49 @@ fn command_output(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// one request against an http/ws APP SURFACE port (the noded wire contract)
+/// — raw http/1.1 over std TCP, returning (status, json body). the port-keyed
+/// twin of [`Cluster::http`], for harnesses that hold ports without a
+/// `Cluster` (e.g. [`NetworkShapeCluster`]). the surface trusts localhost
+/// callers, so a hand-rolled client is a full citizen by design.
+pub fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    use std::io::Read as _;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("app-surface read timeout");
+    let body_bytes = body
+        .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    stream.write_all(req.as_bytes()).expect("app-surface write");
+    stream
+        .write_all(&body_bytes)
+        .expect("app-surface write body");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("app-surface read");
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let payload = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .and_then(|b| serde_json::from_str(b.trim()).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, payload)
 }
 
 /// poll `probe` every 300ms until it returns `Some`, or panic with `what`

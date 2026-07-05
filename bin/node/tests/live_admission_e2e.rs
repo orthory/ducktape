@@ -330,6 +330,34 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             .and_then(|raw| directory_interface::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
     }));
+    //     …and the DERIVED tier follows the boundary too: the explorer
+    //     records the followed boundary (an honest boundary row — verified
+    //     height + app-hash, frame-derived fields empty)…
+    poll("the observer explorer to record a followed boundary", Box::new(|| {
+        let (status, body) = common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
+        status == 200
+            && body["blocks"].as_array().is_some_and(|rows| {
+                rows.iter().any(|b| {
+                    b["hash"] == serde_json::json!("")
+                        && b["height"].as_u64().is_some_and(|h| h > 0)
+                        && !b["commitHash"].as_str().unwrap_or_default().is_empty()
+                })
+            })
+    }));
+    //     …and /v1/index/* answers from boundary-healed read models: every
+    //     watermark sits at a followed boundary, visibly boundary-stamped
+    //     (the backfill floor), with the store healthy. polled: a heal drops
+    //     the watermark FIRST (crash-safety by re-trigger), so a read racing
+    //     an in-flight heal legitimately sees 0 for a moment.
+    poll("the observer index to report boundary-stamped watermarks", Box::new(|| {
+        let (status, index_status) =
+            common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
+        let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
+        status == 200
+            && index_status["poisoned"] == serde_json::json!(false)
+            && watermark > 0
+            && index_status["backfilled"]["directory"].as_u64() == Some(watermark)
+    }));
 
     // (3) quorum untouched: kill the observer; the founder keeps finalizing.
     cluster.kill(1);
