@@ -5,14 +5,19 @@ use defguard_wireguard_rs::{
 use crate::WireGuardEffect;
 
 /// Real `WireGuardEffect` backed by `defguard_wireguard_rs`'s userspace
-/// (BoringTun) implementation. Not exercised by the automated test suite —
-/// CI has no WireGuard userspace runtime, and `create_interface`/`apply`
-/// require a privileged host (root or `CAP_NET_ADMIN`) with BoringTun
-/// reachable at `/var/run/wireguard/<ifname>.sock`. Verify this path
-/// manually, cross-machine, using the `real_userspace_lifecycle_smoke`
-/// `#[ignore]`d test below: `cargo test -p wireguard-effect --
-/// --ignored real_userspace_lifecycle_smoke` on a Linux box with root, then
-/// confirm with `ip addr show <ifname>` and `wg show <ifname>`.
+/// (BoringTun) implementation. BoringTun runs in-process
+/// (`defguard_boringtun::device::DeviceHandle`): `create_interface` opens
+/// the TUN device and binds the UAPI socket at
+/// `/var/run/wireguard/<ifname>.sock` itself — there is no external runtime
+/// to install or start. Not exercised by the automated test suite:
+/// `create_interface`/`apply` need a privileged unix host (root or
+/// `CAP_NET_ADMIN`, plus `/dev/net/tun`), and `remove_interface` shells out
+/// to `resolvconf` for DNS cleanup — missing binary = `IoError(NotFound)`
+/// at teardown. Verify manually with the `real_userspace_lifecycle_smoke`
+/// `#[ignore]`d test below: `cargo test -p wireguard-effect -- --ignored
+/// real_userspace_lifecycle_smoke` on such a host (a privileged Linux
+/// container works), then confirm with `ip addr show <ifname>` and
+/// `wg show <ifname>`.
 pub struct DefguardWireGuardEffect {
     api: WGApi<Userspace>,
 }
@@ -62,7 +67,10 @@ mod tests {
         use defguard_wireguard_rs::{key::Key, net::IpAddrMask, peer::Peer};
         use std::net::{IpAddr, Ipv4Addr};
 
-        let mut effect = DefguardWireGuardEffect::new("ducktape-wg-smoke0").unwrap();
+        // The name must fit IFNAMSIZ - 1 (15 chars) or BoringTun rejects it
+        // with `InvalidTunnelName`; production names ("dt-" + 8 hex) always
+        // do, so keep the fixture inside the same bound.
+        let mut effect = DefguardWireGuardEffect::new("dt-smoke0").unwrap();
         effect.create_interface().unwrap();
 
         let mut peer = Peer::new(Key::new([9u8; 32]));
@@ -71,8 +79,11 @@ mod tests {
             32,
         )]);
         let config = InterfaceConfiguration {
-            name: "ducktape-wg-smoke0".into(),
-            prvkey: "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy".into(),
+            name: "dt-smoke0".into(),
+            // A real 32-byte key: `Key::try_from(&str)` rejects anything
+            // else, so a shorter placeholder would fail `apply` before the
+            // UAPI socket is ever touched.
+            prvkey: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=".into(),
             addresses: vec![IpAddrMask::new(
                 IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
                 32,
