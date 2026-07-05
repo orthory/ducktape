@@ -3891,11 +3891,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         epoch,
                                         interface,
                                         peers,
-                                    } => println!(
-                                        "[node {pump_label}] reachability: epoch {epoch} tunnel \
-                                         config staged on {interface} ({peers} peer(s); fake \
-                                         effect — no real interface yet)"
-                                    ),
+                                    } => match wireguard_effect {
+                                        WireGuardEffectKind::Real => println!(
+                                            "[node {pump_label}] reachability: epoch {epoch} \
+                                             tunnels applied on {interface} ({peers} peer(s))"
+                                        ),
+                                        WireGuardEffectKind::Fake => println!(
+                                            "[node {pump_label}] reachability: epoch {epoch} \
+                                             tunnel config staged on {interface} ({peers} \
+                                             peer(s); fake effect — no real interface)"
+                                        ),
+                                    },
                                     reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
                                         println!(
                                             "[node {pump_label}] reachability: peer {}: {reason}",
