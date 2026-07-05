@@ -614,6 +614,23 @@ impl OverlayPolicy {
         }
     }
 
+    /// View-free [`OverlayPolicy::allowed_ips_for`], available only in modes
+    /// whose addresses are pure functions of identity (`ula_v6`). Exists for
+    /// re-deriving a PREVIOUSLY validated mesh from persisted records at
+    /// boot, where no live `MeshView` can exist yet — the caller owns the
+    /// membership gate the view would otherwise supply. `IndexedV4`
+    /// addresses depend on a validator's index in a live set, so deriving
+    /// one without a view would be a guess: `None`.
+    pub fn identity_allowed_ips(&self, identity: ValidatorIdentity) -> Option<Vec<AllowedIp>> {
+        match &self.mode {
+            OverlayMode::IndexedV4 { .. } => None,
+            OverlayMode::UlaV6 { chain_id } => Some(vec![AllowedIp {
+                addr: IpAddr::V6(ula_v6_member_addr(chain_id, identity)),
+                cidr: 128,
+            }]),
+        }
+    }
+
     fn validate_for(
         &self,
         view: &MeshView,
