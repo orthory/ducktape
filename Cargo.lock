@@ -5628,6 +5628,7 @@ name = "saga"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "capability-interface",
  "futures",
  "host",
  "saga-interface",
