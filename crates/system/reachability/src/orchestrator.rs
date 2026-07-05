@@ -916,12 +916,11 @@ where
                 // member: its single job is being installable, and member
                 // gossip flows back through the members' own re-offers.
                 let own = ReachabilityMsg::Record(state.own_record.clone());
-                let sends = state
+                state
                     .peers
                     .iter()
                     .map(|peer| (*peer, own.clone()))
-                    .collect();
-                sends
+                    .collect()
             } else if state.view_state.is_none() {
                 // gossip stages: everything known to everyone (an advert
                 // doubles as a record carrier for members whose record
@@ -1469,20 +1468,18 @@ where
                 true
             }
         };
-        if accepted {
-            if let Some(path) = &self.config.persist_file {
-                let state = self.state.as_ref().expect("still in epoch");
-                let mesh = PersistedMesh::new(
-                    self.config.chain_id.clone(),
-                    state.epoch,
-                    state.adverts.values().cloned().collect(),
-                );
-                if let Err(err) = store::save(path, &mesh) {
-                    self.emit(ReachabilityEvent::PersistFailed {
-                        reason: err.to_string(),
-                    })
-                    .await?;
-                }
+        if accepted && let Some(path) = &self.config.persist_file {
+            let state = self.state.as_ref().expect("still in epoch");
+            let mesh = PersistedMesh::new(
+                self.config.chain_id.clone(),
+                state.epoch,
+                state.adverts.values().cloned().collect(),
+            );
+            if let Err(err) = store::save(path, &mesh) {
+                self.emit(ReachabilityEvent::PersistFailed {
+                    reason: err.to_string(),
+                })
+                .await?;
             }
         }
         let record = advert.record.clone();
@@ -1655,16 +1652,15 @@ where
                 // all-peers-failed epoch must not clobber the last mesh that
                 // actually carried member tunnels (pre-warm peers alone are
                 // not it — their owners persist their own side).
-                if !plans.is_empty() {
-                    if let Some(path) = &self.config.persist_file {
-                        let mesh =
-                            PersistedMesh::new(self.config.chain_id.clone(), epoch, adverts);
-                        if let Err(err) = store::save(path, &mesh) {
-                            self.emit(ReachabilityEvent::PersistFailed {
-                                reason: err.to_string(),
-                            })
-                            .await?;
-                        }
+                if !plans.is_empty()
+                    && let Some(path) = &self.config.persist_file
+                {
+                    let mesh = PersistedMesh::new(self.config.chain_id.clone(), epoch, adverts);
+                    if let Err(err) = store::save(path, &mesh) {
+                        self.emit(ReachabilityEvent::PersistFailed {
+                            reason: err.to_string(),
+                        })
+                        .await?;
                     }
                 }
             }
