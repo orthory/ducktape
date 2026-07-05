@@ -1215,21 +1215,98 @@ fn recovery_frame_to_sync(
 // identically with or without the index.
 // ---------------------------------------------------------------------------
 
+/// build one explorer row ([`noded::BlockRecord`] json) from a block's
+/// decoded parts — THE row construction seam, shared by the live drain and
+/// the boot fold so both writers produce byte-identical rows. staging the
+/// payload IS computing `op_hash` (put_chunk keys the blob by sha256), and
+/// on the fold path the re-staging is load-bearing: the blob store is
+/// in-memory, so the live drain's staging dies with the process and this is
+/// what makes `GET /v1/files/blob/{op_hash}` answer again after a restart.
+#[allow(clippy::too_many_arguments)]
+fn explorer_block_row(
+    blobs: &files::BlobHandle,
+    height: u64,
+    frame_hash: &node::FrameId,
+    app_hash: &StateRoot,
+    origin: &sdk::Origin,
+    target: &str,
+    payload: &[u8],
+    dispatches: &[host::DispatchRecord],
+    disposition: noded::BlockDisposition,
+) -> Vec<u8> {
+    noded::block_row(&noded::BlockRecord {
+        height,
+        hash: noded::hex_bytes(frame_hash),
+        commit_hash: hex(app_hash),
+        proposer: match origin {
+            sdk::Origin::External(key) => noded::hex_bytes(key),
+            // frames only carry verified External authorship; label the
+            // impossible rest.
+            sdk::Origin::Module(id) => format!("module:{id}"),
+            sdk::Origin::System => "system".into(),
+        },
+        disposition,
+        target: target.to_string(),
+        operations: dispatches.iter().map(noded::DispatchInfo::from).collect(),
+        payload: noded::payload_preview(payload),
+        op_hash: noded::hex_bytes(&blobs.put_chunk(payload.to_vec())),
+    })
+}
+
+/// rebuild the explorer row for a replayed sealed frame — the boot fold's
+/// equivalent of the drain's row construction, fed from the journal instead
+/// of the live decode. `None` mirrors the drain's gates exactly: an
+/// undecodable frame never had a row (its drain `op` was `None`), the
+/// heartbeat nop is the deliberately-empty block the explorer hides, and a
+/// discarded frame is never journaled (the arm keeps this total anyway).
+fn sealed_frame_block_row(
+    blobs: &files::BlobHandle,
+    block: &recovery::FoldedBlock<'_>,
+) -> Option<Vec<u8>> {
+    let (origin, msg) = node::decode_frame(block.frame).ok()?;
+    if msg.target == NOP_TARGET {
+        return None;
+    }
+    let disposition = match block.disposition {
+        node::Disposition::Applied => noded::BlockDisposition::Applied,
+        node::Disposition::Rejected => noded::BlockDisposition::Rejected,
+        node::Disposition::Discarded => return None,
+    };
+    Some(explorer_block_row(
+        blobs,
+        block.height,
+        &node::frame_id(block.frame),
+        &block.app_hash,
+        &origin,
+        &msg.target,
+        &msg.payload,
+        block.dispatches,
+        disposition,
+    ))
+}
+
 /// folds sealed blocks into the derived per-module index during boot (journal
 /// replay + post-reboot frame catch-up), with the GAP DISCIPLINE: once one
 /// sealed height's content is unreproducible (opaque) above some module's
 /// watermark, folding stops for good. advancing watermarks past the hole
 /// would hide it from the post-boot heal, which re-derives from verified
-/// state exactly when a watermark trails the boot tip.
+/// state exactly when a watermark trails the boot tip. a re-executed block
+/// carries its sealed frame, so the fold also rebuilds the explorer row the
+/// live drain wrote — the blocks database is the one derived tier a
+/// from-state rebuild can NOT repair (rows are node-layer observations, not
+/// canonical state), so the crash-window suffix must be re-derived here or
+/// `GET /v1/blocks` loses those heights for good.
 struct IndexFold<'a> {
     index: &'a indexer::IndexStore,
+    blobs: files::BlobHandle,
     stopped: bool,
 }
 
 impl<'a> IndexFold<'a> {
-    fn new(index: &'a indexer::IndexStore) -> Self {
+    fn new(index: &'a indexer::IndexStore, blobs: files::BlobHandle) -> Self {
         Self {
             index,
+            blobs,
             stopped: false,
         }
     }
@@ -1250,12 +1327,16 @@ impl<'a> IndexFold<'a> {
 }
 
 impl recovery::ReplaySink for IndexFold<'_> {
-    fn folded_block(&mut self, height: u64, dispatches: &[host::DispatchRecord]) {
+    fn folded_block(&mut self, block: &recovery::FoldedBlock<'_>) {
         if self.stopped {
             return;
         }
-        // the validator's consensus time IS the height (see BlockContext).
-        let ops = noded::index_block_ops(height, height, dispatches);
+        let height = block.height;
+        let ops = indexer::BlockOps {
+            record: sealed_frame_block_row(&self.blobs, block),
+            // the validator's consensus time IS the height (see BlockContext).
+            ..noded::index_block_ops(height, height, block.dispatches)
+        };
         if let Err(err) = self.index.apply_block(&ops) {
             eprintln!("[node] module index fold failed at height {height}: {err}");
             self.stopped = true;
@@ -1471,7 +1552,13 @@ where
         .map_err(|e| format!("catch-up seal write: {e}"))?;
     if let Some(fold) = fold {
         use recovery::ReplaySink as _;
-        fold.folded_block(frame.height, &dispatches);
+        fold.folded_block(&recovery::FoldedBlock {
+            height: frame.height,
+            frame: &frame.frame,
+            disposition: seal.disposition,
+            app_hash: seal.app_hash,
+            dispatches: &dispatches,
+        });
     }
     Ok(())
 }
@@ -3883,7 +3970,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // phases — a later phase folding past a gap an earlier phase detected
         // would advance watermarks over the hole and hide it from the final
         // heal below.
-        let mut boot_fold = IndexFold::new(&index);
+        let mut boot_fold = IndexFold::new(&index, blobs.clone());
         // (height, oplog position) for the pump's prune bookkeeping, and the
         // manifest that recovery used as its replay baseline).
         let (
@@ -5113,32 +5200,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     // lane rather than panic.
                                     node::Disposition::Discarded => continue,
                                 };
-                                Some(noded::block_row(&noded::BlockRecord {
-                                    height: d.height,
-                                    hash: noded::hex_bytes(&d.id),
-                                    commit_hash: hex(&d.app_hash),
-                                    proposer: match &op.origin {
-                                        sdk::Origin::External(key) => noded::hex_bytes(key),
-                                        // frames only carry verified External
-                                        // authorship; label the impossible rest.
-                                        sdk::Origin::Module(id) => format!("module:{id}"),
-                                        sdk::Origin::System => "system".into(),
-                                    },
+                                Some(explorer_block_row(
+                                    &blobs,
+                                    d.height,
+                                    &d.id,
+                                    &d.app_hash,
+                                    &op.origin,
+                                    &op.target,
+                                    &op.payload,
+                                    // == op.dispatches: a rejected frame's
+                                    // trace is empty on both bindings.
+                                    dispatches,
                                     disposition,
-                                    target: op.target.clone(),
-                                    operations: op
-                                        .dispatches
-                                        .iter()
-                                        .map(noded::DispatchInfo::from)
-                                        .collect(),
-                                    payload: noded::payload_preview(&op.payload),
-                                    // staging IS hashing: put_chunk keys the
-                                    // blob by sha256, so this one call both
-                                    // computes the op's content address and
-                                    // makes it dereferencable via
-                                    // GET /v1/files/blob/{op_hash}.
-                                    op_hash: noded::hex_bytes(&blobs.put_chunk(op.payload.clone())),
-                                }))
+                                ))
                             }
                             _ => None,
                         };
@@ -6728,5 +6802,142 @@ mod tests {
                 sdk::check_required_version(MAX_PROTOCOL_VERSION - 1, MAX_PROTOCOL_VERSION).is_ok()
             );
         }
+    }
+
+    // ---- explorer-row rebuild (boot fold == live drain) ---------------------
+
+    fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRecord> {
+        vec![host::DispatchRecord {
+            module: "directory".into(),
+            origin: origin.clone(),
+            payload: payload.to_vec(),
+            emitted_msgs: 0,
+            emitted_events: 0,
+        }]
+    }
+
+    /// the fold's row (rebuilt from sealed frame bytes) must be byte-identical
+    /// to the drain's row (built from its live decode) — GET /v1/blocks reads
+    /// one shape regardless of which writer survived the crash.
+    #[test]
+    fn boot_fold_rebuilds_the_drain_row_byte_identical() {
+        let signer = ed25519::PrivateKey::from_seed(42);
+        let payload = br#"{"set":{"key":"who","value":"ducktape"}}"#.to_vec();
+        let msg = Msg {
+            target: "directory".into(),
+            payload: payload.clone(),
+        };
+        let frame = node::encode_frame(&signer, 1, &msg);
+        let (origin, decoded) = node::decode_frame(&frame).expect("frame decodes");
+        let dispatches = row_dispatches(&payload, &origin);
+        let app_hash = test_root(9);
+
+        // the drain's construction: decoded parts straight from its DrainedOp.
+        let drain_blobs = files::BlobHandle::default();
+        let drain_row = explorer_block_row(
+            &drain_blobs,
+            7,
+            &node::frame_id(&frame),
+            &app_hash,
+            &origin,
+            &decoded.target,
+            &decoded.payload,
+            &dispatches,
+            noded::BlockDisposition::Applied,
+        );
+
+        // the boot fold's construction: nothing but what the journal seals.
+        let fold_blobs = files::BlobHandle::default();
+        let fold_row = sealed_frame_block_row(
+            &fold_blobs,
+            &recovery::FoldedBlock {
+                height: 7,
+                frame: &frame,
+                disposition: node::Disposition::Applied,
+                app_hash,
+                dispatches: &dispatches,
+            },
+        )
+        .expect("an applied non-nop frame rebuilds its row");
+        assert_eq!(fold_row, drain_row, "fold row must equal the drain row byte-for-byte");
+
+        // field spot-checks through the served json shape.
+        let row: serde_json::Value = serde_json::from_slice(&fold_row).expect("row json");
+        assert_eq!(row["height"], 7);
+        assert_eq!(row["hash"], noded::hex_bytes(&node::frame_id(&frame)));
+        assert_eq!(row["commitHash"], hex(&app_hash));
+        assert_eq!(
+            row["proposer"],
+            noded::hex_bytes(signer.public_key().as_ref())
+        );
+        assert_eq!(row["target"], "directory");
+
+        // the rebuild re-staged the payload: op_hash is dereferencable again
+        // from the FOLD's (fresh, post-restart) blob store.
+        let op_digest = drain_blobs.put_chunk(payload.clone());
+        assert_eq!(row["opHash"], noded::hex_bytes(&op_digest));
+        assert!(fold_blobs.has_chunk(&op_digest));
+    }
+
+    /// the fold's `None` gates mirror the drain's: a heartbeat nop and an
+    /// undecodable frame produce no explorer row (the drain's `op` is `None` /
+    /// nop-filtered for exactly these).
+    #[test]
+    fn boot_fold_skips_nop_and_undecodable_frames() {
+        let blobs = files::BlobHandle::default();
+        let signer = ed25519::PrivateKey::from_seed(43);
+        let nop = node::encode_frame(
+            &signer,
+            1,
+            &Msg {
+                target: NOP_TARGET.into(),
+                payload: Vec::new(),
+            },
+        );
+        for frame in [nop.as_slice(), b"not a frame".as_slice()] {
+            assert!(
+                sealed_frame_block_row(
+                    &blobs,
+                    &recovery::FoldedBlock {
+                        height: 3,
+                        frame,
+                        disposition: node::Disposition::Applied,
+                        app_hash: test_root(1),
+                        dispatches: &[],
+                    },
+                )
+                .is_none()
+            );
+        }
+    }
+
+    /// a REJECTED sealed frame still gets its row (the drain writes one for a
+    /// decoded non-nop reject), with an empty dispatch trace.
+    #[test]
+    fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
+        let blobs = files::BlobHandle::default();
+        let signer = ed25519::PrivateKey::from_seed(44);
+        let frame = node::encode_frame(
+            &signer,
+            2,
+            &Msg {
+                target: "directory".into(),
+                payload: b"garbage-the-module-rejects".to_vec(),
+            },
+        );
+        let row = sealed_frame_block_row(
+            &blobs,
+            &recovery::FoldedBlock {
+                height: 5,
+                frame: &frame,
+                disposition: node::Disposition::Rejected,
+                app_hash: test_root(2),
+                dispatches: &[],
+            },
+        )
+        .expect("a decoded non-nop reject still shows in the explorer");
+        let row: serde_json::Value = serde_json::from_slice(&row).expect("row json");
+        assert_eq!(row["disposition"], "rejected");
+        assert_eq!(row["operations"].as_array().map(Vec::len), Some(0));
     }
 }
