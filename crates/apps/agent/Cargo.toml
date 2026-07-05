@@ -10,6 +10,8 @@ sdk = { workspace = true }
 agent-interface = { workspace = true }
 chat-interface = { workspace = true }
 saga-interface = { workspace = true }
+# the shared capability-tag shape rule for AgentRecord.capability validation.
+capability-interface = { workspace = true }
 tasks-interface = { workspace = true }
 jobs-interface = { workspace = true }
 sha2 = { workspace = true }

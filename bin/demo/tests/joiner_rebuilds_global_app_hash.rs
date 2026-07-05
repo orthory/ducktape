@@ -449,6 +449,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .await;
@@ -474,6 +475,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .await;
@@ -497,7 +499,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             agent_encode_msg(&AgentMsg::RegisterAgent {
                 agent_id: "quackbot".into(),
                 display_name: "Quackbot".into(),
-                model_ref: "mock-llm-1".into(),
+                capability: "mock-llm-1".into(),
                 prompt_hash: vec![7u8; 32],
                 allowed_actions: vec![ACTION_CHAT_POST.into()],
             }),
@@ -510,7 +512,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             agent_encode_msg(&AgentMsg::RegisterAgent {
                 agent_id: "sleepy".into(),
                 display_name: "Sleepy".into(),
-                model_ref: "mock-llm-1".into(),
+                capability: "mock-llm-1".into(),
                 prompt_hash: vec![8u8; 32],
                 allowed_actions: Vec::new(),
             }),

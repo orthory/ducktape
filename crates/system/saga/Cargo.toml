@@ -7,6 +7,7 @@ version.workspace = true
 sdk = { workspace = true }
 saga-interface = { workspace = true }
 valset-interface = { workspace = true }
+capability-interface = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 

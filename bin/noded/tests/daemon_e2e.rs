@@ -452,7 +452,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
             "RegisterAgent": {
                 "agent_id": "quackbot",
                 "display_name": "Quackbot",
-                "model_ref": "echo-model",
+                "capability": "echo-model",
                 "prompt_hash": prompt_hash,
                 "allowed_actions": ["chat.post"]
             }

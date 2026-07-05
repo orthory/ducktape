@@ -10,6 +10,9 @@ version.workspace = true
 # that actually provides it.
 [dependencies]
 async-trait = { workspace = true }
+# the shared capability-tag shape rule: a tag that validates at spec-parse
+# time can never bounce off the consensus registry's Announce validation.
+capability-interface = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # the capability spec format: executors are described by TOML files (embedded

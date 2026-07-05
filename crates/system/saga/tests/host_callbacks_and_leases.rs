@@ -110,6 +110,7 @@ fn trigger(id: &str, reply_to: Option<&str>) -> Msg {
             deadline: None,
             max_attempts: 1,
             lease_views: None,
+            capability: None,
         }),
     }
 }
@@ -135,6 +136,7 @@ async fn saga_view(host: &Host, id: &str) -> Option<SagaView> {
         .unwrap();
     match decode_reply(&reply).unwrap() {
         SagaReply::Saga(v) => v,
+        other => panic!("expected Saga reply, got {other:?}"),
     }
 }
 

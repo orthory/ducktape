@@ -42,7 +42,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         agent_id: "summarizer",
         owner: "System" as const,
         display_name: "Summary Agent",
-        model_ref: "gpt-5.5",
+        capability: "alpha",
         prompt_hash: bytes(0xab),
         allowed_actions: ["chat.post", "tasks.create"],
         status: "Active" as const,
@@ -53,7 +53,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         agent_id: "qa-agent",
         owner: "System" as const,
         display_name: "QA Agent",
-        model_ref: "gpt-5.5-codex",
+        capability: "beta",
         prompt_hash: bytes(0xcd),
         allowed_actions: ["chat.post"],
         status: "Paused" as const,
@@ -116,7 +116,7 @@ describe("AgentView", () => {
     const detail = screen.getByRole("region", { name: /agent detail/i });
     expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
     expect(within(detail).getByText("summarizer")).toBeInTheDocument();
-    expect(within(detail).getByText("gpt-5.5")).toBeInTheDocument();
+    expect(within(detail).getByText("alpha")).toBeInTheDocument();
     expect(within(detail).getByText("Post to chat")).toBeInTheDocument();
     expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
 
@@ -164,8 +164,8 @@ describe("AgentView", () => {
     fireEvent.change(screen.getByLabelText("Agent ID"), {
       target: { value: "Triage Agent" },
     });
-    fireEvent.change(screen.getByLabelText("Model reference"), {
-      target: { value: "gpt-5.5-codex" },
+    fireEvent.change(screen.getByLabelText("Capability"), {
+      target: { value: "beta" },
     });
     fireEvent.change(screen.getByLabelText("System prompt"), {
       target: { value: "Summarize incoming incidents." },
@@ -174,7 +174,7 @@ describe("AgentView", () => {
     expect(spies.registerAgent).toHaveBeenCalledWith({
       displayName: "Triage Agent",
       agentId: "triage-agent",
-      modelRef: "gpt-5.5-codex",
+      capability: "beta",
       prompt: "Summarize incoming incidents.",
       allowedActions: ["chat.post"],
     });
@@ -198,7 +198,7 @@ describe("AgentView", () => {
     expect(spies.updateAgent).toHaveBeenCalledWith({
       agentId: "summarizer",
       displayName: "Renamed Agent",
-      modelRef: "gpt-5.5",
+      capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
     });
   });

@@ -315,11 +315,13 @@ fn cluster_upgrade() {
     cluster.spawn(1);
     cluster.spawn(2);
 
-    let converged: Vec<String> = (0..3)
-        .map(|i| cluster.wait_marker(i, "converged app_hash=", CONVERGE))
-        .collect();
-    assert_eq!(converged[0], converged[1], "genesis/converge fork 0 vs 1");
-    assert_eq!(converged[0], converged[2], "genesis/converge fork 0 vs 2");
+    // liveness: every validator applied the startup ops. the marker samples
+    // its hash at a node-local drain boundary (announces on a provider host
+    // skew the sample point), so the no-fork witness is settled_app_hash.
+    for i in 0..3 {
+        cluster.wait_marker(i, "converged app_hash=", CONVERGE);
+    }
+    settled_app_hash(&cluster, 3);
 
     // 1. seed committed FORGE state so the module root is NON-ZERO — only then is
     //    the v2 recomposition at H observable (an empty forge namespace roots to
@@ -524,11 +526,12 @@ fn cluster_upgrade_aborts_on_unmet_quorum() {
     cluster.spawn(1);
     cluster.spawn(2);
 
-    let converged: Vec<String> = (0..3)
-        .map(|i| cluster.wait_marker(i, "converged app_hash=", CONVERGE))
-        .collect();
-    assert_eq!(converged[0], converged[1], "genesis/converge fork 0 vs 1");
-    assert_eq!(converged[0], converged[2], "genesis/converge fork 0 vs 2");
+    // liveness via the markers; the no-fork witness is settled_app_hash
+    // (the marker samples at a node-local drain boundary — see cluster_upgrade).
+    for i in 0..3 {
+        cluster.wait_marker(i, "converged app_hash=", CONVERGE);
+    }
+    settled_app_hash(&cluster, 3);
 
     // 1. schedule an upgrade to a to_version STRICTLY ABOVE MAX_PROTOCOL_VERSION
     //    (=2 in bin/node), so NO truthful node can ever signal ready for it. the

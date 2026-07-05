@@ -5,6 +5,11 @@
 # reference example of the format. An operator spec with `tag = "codex"` in
 # $DUCKTAPE_CAPABILITY_DIR overrides this file entirely (no field merging).
 #
+# Which MODEL codex runs is host policy, not consensus data: this default
+# spec passes no --model flag, so the CLI uses whatever the operator
+# configured in codex itself. Pinning a model = overriding this spec (or
+# adding a finer-tagged one) with a literal `"--model", "<name>"` in args.
+#
 # Format reference: docs/capability-spec.md
 
 spec = 1
@@ -22,16 +27,14 @@ env = "DUCKTAPE_CODEX_BIN"
 
 [invoke]
 # One-shot exec, most-restricted sandbox, machine-readable event stream.
-# "{model}" is replaced with the job's resolved model ref; the trailing "-"
-# tells codex to read the prompt from stdin (fed concurrently, then EOF).
+# The trailing "-" tells codex to read the prompt from stdin (fed
+# concurrently, then EOF). Args are fully literal — no placeholders.
 args = [
     "exec",
     "--json",
     "--sandbox",
     "read-only",
     "--skip-git-repo-check",
-    "--model",
-    "{model}",
     "-",
 ]
 prompt = "stdin"
@@ -39,12 +42,4 @@ timeout_secs = 300
 
 [output]
 # The `codex exec --json` JSONL event stream: the LAST agent_message wins.
-format = "codex-jsonl"
-
-[models]
-# Model refs this capability serves. Codex is also the catch-all ("*"): an
-# unrecognized model ref routes here and fails loud on a codex-less node
-# rather than silently picking a different CLI.
-patterns = ["gpt-*", "*codex*", "*"]
-# The model used when a request pins no model_ref and routing lands here.
-default = "gpt-5.3-codex-spark"
+format = "jsonl-events"

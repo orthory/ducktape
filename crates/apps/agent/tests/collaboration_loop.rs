@@ -59,22 +59,22 @@ struct MockLlmWorker {
 
 #[async_trait::async_trait(?Send)]
 impl Worker for MockLlmWorker {
-    async fn run(&self, effect: &Effect) -> Result<Option<Msg>, reactor::Error> {
+    async fn run(&self, effect: &Effect) -> Result<reactor::WorkOutcome, reactor::Error> {
         let Ok(request) = decode_worker_request(&effect.0) else {
-            return Ok(None);
+            return Ok(reactor::WorkOutcome::NotMine);
         };
         let Ok(llm) = decode_llm_request(&request.spec) else {
-            return Ok(None);
+            return Ok(reactor::WorkOutcome::NotMine);
         };
         *self.calls.borrow_mut() += 1;
-        Ok(Some(Msg {
+        Ok(reactor::WorkOutcome::Handled(Some(Msg {
             target: "saga".into(),
             payload: saga_encode_msg(&SagaMsg::OracleResult {
                 saga_id: request.saga_id,
                 attempt: request.attempt,
                 outcome: Ok(canned_output(&llm.run_id)),
             }),
-        }))
+        })))
     }
 }
 
@@ -135,7 +135,7 @@ fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
                 payload: encode_msg(&AgentMsg::RegisterAgent {
                     agent_id: "quackbot".into(),
                     display_name: "Quackbot".into(),
-                    model_ref: "mock-llm-1".into(),
+                    capability: "mock-llm-1".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                 }),
@@ -222,6 +222,7 @@ async fn saga_status(host: &Host, saga_id: &str) -> Option<SagaStatus> {
         .unwrap();
     match saga_decode_reply(&reply).unwrap() {
         SagaReply::Saga(view) => view.map(|v| v.status),
+        other => panic!("expected Saga reply, got {other:?}"),
     }
 }
 
@@ -356,7 +357,7 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
         let llm: LlmRequest = decode_llm_request(&request.spec).unwrap();
         assert_eq!(llm.run_id, run_id);
         assert_eq!(llm.agent_id, "quackbot");
-        assert_eq!(llm.model_ref, "mock-llm-1");
+        assert_eq!(llm.capability, "mock-llm-1");
         assert_eq!(llm.channel_id, "general");
         assert_eq!(llm.anchor_seq, 1);
         let reply = host
@@ -394,11 +395,10 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
         let worker = MockLlmWorker {
             calls: calls.clone(),
         };
-        let oracle_op = worker
-            .run(&outcome.effects[0])
-            .await
-            .unwrap()
-            .expect("the worker claims the LlmRequest effect");
+        let oracle_op = match worker.run(&outcome.effects[0]).await.unwrap() {
+            reactor::WorkOutcome::Handled(Some(op)) => op,
+            other => panic!("the worker must claim the LlmRequest effect, got {other:?}"),
+        };
         let calls_before_settle = *calls.borrow();
 
         // settle through the REACTOR: the oracle op is one block, and its
@@ -473,7 +473,7 @@ fn a_mention_flows_through_hook_saga_oracle_and_lands_reply_and_task_in_one_bloc
             panic!("agent record expected");
         };
         assert_eq!(record.status, AgentStatus::Active);
-        assert_eq!(record.model_ref, "mock-llm-1");
+        assert_eq!(record.capability, "mock-llm-1");
 
         assert_eq!(settled.app_hash, reactor.app_hash());
         (settled.app_hash, oracle_op)
@@ -521,7 +521,7 @@ fn an_agent_job_is_claimed_and_records_a_run_in_the_submit_cascade() {
                 payload: encode_msg(&AgentMsg::RegisterAgent {
                     agent_id: "duck".into(),
                     display_name: "Duck".into(),
-                    model_ref: "mock-llm-1".into(),
+                    capability: "mock-llm-1".into(),
                     prompt_hash: vec![9u8; 32],
                     allowed_actions: vec![ACTION_TASKS_CREATE.into()],
                 }),
@@ -592,7 +592,7 @@ fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_output() {
                 payload: encode_msg(&AgentMsg::RegisterAgent {
                     agent_id: "duck".into(),
                     display_name: "Duck".into(),
-                    model_ref: "mock-llm-1".into(),
+                    capability: "mock-llm-1".into(),
                     prompt_hash: vec![9u8; 32],
                     allowed_actions: vec![ACTION_TASKS_CREATE.into()],
                 }),
@@ -656,7 +656,7 @@ fn a_pruned_and_resubmitted_job_id_gets_a_fresh_episode_run() {
                 payload: encode_msg(&AgentMsg::RegisterAgent {
                     agent_id: "duck".into(),
                     display_name: "Duck".into(),
-                    model_ref: "mock-llm-1".into(),
+                    capability: "mock-llm-1".into(),
                     prompt_hash: vec![9u8; 32],
                     allowed_actions: vec![ACTION_TASKS_CREATE.into()],
                 }),
@@ -731,7 +731,7 @@ fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
                 payload: encode_msg(&AgentMsg::RegisterAgent {
                     agent_id: "duck".into(),
                     display_name: "Duck".into(),
-                    model_ref: "mock-llm-1".into(),
+                    capability: "mock-llm-1".into(),
                     prompt_hash: vec![9u8; 32],
                     allowed_actions: vec![ACTION_TASKS_CREATE.into()],
                 }),
@@ -800,7 +800,7 @@ fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
                 payload: encode_msg(&AgentMsg::RegisterAgent {
                     agent_id: "duck".into(),
                     display_name: "Duck".into(),
-                    model_ref: "mock-llm-1".into(),
+                    capability: "mock-llm-1".into(),
                     prompt_hash: vec![9u8; 32],
                     allowed_actions: vec![ACTION_TASKS_CREATE.into()],
                 }),
@@ -913,7 +913,7 @@ fn an_output_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
                     payload: encode_msg(&AgentMsg::RegisterAgent {
                         agent_id: "quackbot".into(),
                         display_name: "Quackbot".into(),
-                        model_ref: "mock-llm-1".into(),
+                        capability: "mock-llm-1".into(),
                         prompt_hash: vec![7u8; 32],
                         allowed_actions: vec![ACTION_CHAT_POST.into()],
                     }),

@@ -146,7 +146,7 @@ export interface ConsoleActions {
   registerAgent(params: {
     displayName: string;
     agentId: string;
-    modelRef: string;
+    capability: string;
     prompt: string;
     allowedActions: string[];
   }): void;
@@ -166,7 +166,7 @@ export interface ConsoleActions {
   updateAgent(params: {
     agentId: string;
     displayName?: string;
-    modelRef?: string;
+    capability?: string;
     prompt?: string;
     allowedActions?: string[];
   }): void;
@@ -917,11 +917,11 @@ export function createActions({
     },
 
     // ── Agents ──
-    registerAgent: ({ displayName, agentId, modelRef, prompt, allowedActions }) => {
+    registerAgent: ({ displayName, agentId, capability, prompt, allowedActions }) => {
       const id = agentId.trim();
       const name = displayName.trim();
-      const model = modelRef.trim();
-      if (!id || !name || !model) return;
+      const tag = capability.trim();
+      if (!id || !name || !tag) return;
       submitTracked(opKey.agent(id), (live) =>
         // stage the prompt in the node's blob store, then register with its
         // digest as prompt_hash — the blob is keyed by sha256(bytes), which
@@ -932,7 +932,7 @@ export function createActions({
             agentClient.registerAgent(live, {
               agentId: id,
               displayName: name,
-              modelRef: model,
+              capability: tag,
               promptHash: agentClient.hexToBytes(digest),
               allowedActions,
               origin: getState().author,
@@ -1007,7 +1007,7 @@ export function createActions({
       );
     },
 
-    updateAgent: ({ agentId, displayName, modelRef, prompt, allowedActions }) => {
+    updateAgent: ({ agentId, displayName, capability, prompt, allowedActions }) => {
       const id = agentId.trim();
       if (!id) return;
       submitTracked(
@@ -1027,7 +1027,7 @@ export function createActions({
             agentClient.updateAgent(live, {
               agentId: id,
               displayName: displayName?.trim() || null,
-              modelRef: modelRef?.trim() || null,
+              capability: capability?.trim() || null,
               promptHash,
               allowedActions: allowedActions ?? null,
               origin: getState().author,
@@ -1036,7 +1036,7 @@ export function createActions({
         (prev) =>
           optimistic.agentPatched(prev, id, {
             ...(displayName?.trim() ? { display_name: displayName.trim() } : {}),
-            ...(modelRef?.trim() ? { model_ref: modelRef.trim() } : {}),
+            ...(capability?.trim() ? { capability: capability.trim() } : {}),
           }),
       );
     },

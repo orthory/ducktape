@@ -1,10 +1,10 @@
 //! the capability spec: a TOML file describing one executor capability.
 //!
 //! everything capability-host used to hardcode in Rust — which binary to
-//! probe, the argv to invoke it, how to parse its output, which model refs
-//! route to it — is data in a spec file. the two built-in executors (codex,
-//! claude) are embedded specs parsed by this exact module, so an operator
-//! adding a THIRD executor writes a TOML file, not Rust:
+//! probe, the argv to invoke it, how to parse its output — is data in a spec
+//! file. the built-in executors are embedded spec FILES (globbed by build.rs
+//! — no Rust source names an executor) parsed by this exact module, so an
+//! operator adding another executor writes a TOML file, not Rust:
 //!
 //! ```toml
 //! spec = 1
@@ -14,14 +14,19 @@
 //! [detect]
 //! bin = "ollama"
 //! [invoke]
-//! args = ["run", "{model}"]
+//! args = ["run", "llama4"]
 //! prompt = "stdin"
 //! [output]
 //! format = "text"
-//! [models]
-//! patterns = ["llama*", "qwen*"]
-//! default = "llama4"
 //! ```
+//!
+//! dispatch is by EXPLICIT capability tag — nothing is ever inferred from a
+//! model name. a job names the tag it needs ("ollama"); the spec's argv says,
+//! literally and completely, what running that tag means on this host (which
+//! binary, which flags, which model — all operator policy). a finer-grained
+//! need ("this executor, but with these exact flags") is a finer tag with its own
+//! spec, not a routing rule. no executor name appears anywhere in this
+//! crate's code or tests — executors exist only as spec data.
 //!
 //! ## trust model — read this before adding spec sources
 //!
@@ -35,24 +40,6 @@
 //! non-deterministic input; the consensus capability module sees only the
 //! announced TAGS, never the specs behind them).
 //!
-//! ## routing
-//!
-//! `[models].patterns` are `*`-glob patterns over model refs. one model ref is
-//! routed to ONE spec, deterministically:
-//!
-//! 1. every loaded spec's patterns are tried; the spec with the matching
-//!    pattern carrying the MOST literal (non-`*`) characters wins — a more
-//!    specific pattern beats a more generic one, so `claude*` (6 literals)
-//!    beats the `*` catch-all (0) for `claude-sonnet-5`;
-//! 2. ties break to the lexicographically smaller tag, so routing never
-//!    depends on file order or discovery order.
-//!
-//! an UNPINNED request (empty model ref) routes like the empty string, which
-//! only a `*` catch-all matches — the catch-all spec's `[models].default`
-//! then supplies the model. routing is over ALL loaded specs, including ones
-//! whose binary was not found on this host: `claude-x` on a codex-only node
-//! errors "capability 'claude' is not provided", not "unknown model".
-//!
 //! ## override precedence
 //!
 //! embedded specs load first; operator specs load second and REPLACE an
@@ -64,17 +51,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use capability_interface::validate_tag;
 use serde::Deserialize;
 
 /// the one spec format version this build understands. parsing rejects any
 /// other value loudly — an operator on a newer format gets "unsupported spec
 /// version", never silently misread fields.
 const SPEC_VERSION: u64 = 1;
-
-/// consensus-mirrored tag shape: the capability module rejects tags longer
-/// than this, so validating here means an announce built from a loaded spec
-/// can never bounce off consensus.
-const MAX_TAG_LEN: usize = 64;
 
 /// bounds for `[invoke].timeout_secs` — a zero timeout would kill every job
 /// at spawn; anything over an hour is a hang, not a job.
@@ -96,10 +79,10 @@ pub struct CapabilitySpec {
     /// points at nothing is a loud warning + absent capability, never a
     /// silent fallback to the `PATH` probe.
     pub env: Option<String>,
-    /// argv template (after the binary). every element is passed verbatim
-    /// except the `{model}` placeholder, which is replaced with the job's
-    /// resolved model ref. args are NEVER shell-interpreted — no quoting, no
-    /// expansion, no injection surface.
+    /// argv (after the binary), passed verbatim to exec — fully literal, no
+    /// placeholders, NEVER shell-interpreted: no quoting, no expansion, no
+    /// injection surface. which model (if any) the executor runs is encoded
+    /// here as ordinary flags — operator policy, invisible to consensus.
     pub args: Vec<String>,
     /// how the prompt reaches the child. v1 supports stdin only: the prompt
     /// is fed concurrently with output collection, then EOF.
@@ -109,11 +92,6 @@ pub struct CapabilitySpec {
     pub timeout_secs: u64,
     /// which named stdout parser extracts the assistant's final text.
     pub output: OutputFormat,
-    /// `*`-glob patterns over model refs this capability serves. at least one.
-    pub patterns: Vec<String>,
-    /// the model used when an unpinned request routes here. optional: a spec
-    /// without one refuses unpinned requests with a clear error.
-    pub default_model: Option<String>,
 }
 
 /// how the prompt is delivered to the child process.
@@ -129,10 +107,11 @@ pub enum PromptMode {
 /// adding a name is a code change with tests — that is the point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// `codex exec --json` JSONL event stream; the LAST agent message wins.
-    CodexJsonl,
-    /// `claude -p --output-format json`: one `{"type":"result",...}` object.
-    ClaudeJson,
+    /// a JSONL event stream; the LAST `agent_message` item wins.
+    JsonlEvents,
+    /// a single `{"type":"result",...}` object (the contract of
+    /// `--output-format json`-style print modes).
+    JsonResult,
     /// raw stdout, trimmed. the generic escape hatch: any CLI that prints
     /// the answer plainly is wireable with this and zero code.
     Text,
@@ -150,7 +129,6 @@ struct RawSpec {
     detect: RawDetect,
     invoke: RawInvoke,
     output: RawOutput,
-    models: RawModels,
 }
 
 #[derive(Deserialize)]
@@ -189,14 +167,6 @@ struct RawOutput {
     format: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawModels {
-    patterns: Vec<String>,
-    #[serde(default)]
-    default: Option<String>,
-}
-
 impl CapabilitySpec {
     /// parse and validate one spec's TOML. `origin` names the source (a file
     /// path or "embedded:<tag>") so every error says WHICH spec is broken.
@@ -212,22 +182,9 @@ impl CapabilitySpec {
             ));
         }
         let tag = raw.capability.tag;
-        if tag.is_empty() || tag.len() > MAX_TAG_LEN {
-            return Err(format!(
-                "{origin}: tag must be 1..={MAX_TAG_LEN} bytes, got {}",
-                tag.len()
-            ));
-        }
-        // mirror the consensus module exactly: a tag that validates here must
-        // never bounce off the capability registry's Announce validation.
-        if !tag
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
-        {
-            return Err(format!(
-                "{origin}: tag has invalid characters (want [a-z0-9._-]): {tag:?}"
-            ));
-        }
+        // THE consensus tag rule (shared, not mirrored): a tag that validates
+        // here can never bounce off the capability registry's Announce.
+        validate_tag(&tag).map_err(|e| format!("{origin}: {e}"))?;
         if raw.detect.bin.is_empty() {
             return Err(format!("{origin}: detect.bin must be non-empty"));
         }
@@ -246,28 +203,16 @@ impl CapabilitySpec {
             ));
         }
         let output = match raw.output.format.as_str() {
-            "codex-jsonl" => OutputFormat::CodexJsonl,
-            "claude-json" => OutputFormat::ClaudeJson,
+            "jsonl-events" => OutputFormat::JsonlEvents,
+            "json-result" => OutputFormat::JsonResult,
             "text" => OutputFormat::Text,
             other => {
                 return Err(format!(
                     "{origin}: output.format {other:?} is not a known parser \
-                     (want codex-jsonl | claude-json | text)"
+                     (want jsonl-events | json-result | text)"
                 ));
             }
         };
-        if raw.models.patterns.is_empty() {
-            return Err(format!(
-                "{origin}: models.patterns must name at least one pattern"
-            ));
-        }
-        if let Some(p) = raw.models.patterns.iter().find(|p| p.is_empty()) {
-            let _ = p;
-            return Err(format!("{origin}: models.patterns entries must be non-empty"));
-        }
-        if raw.models.default.as_deref() == Some("") {
-            return Err(format!("{origin}: models.default must be non-empty when set"));
-        }
         Ok(Self {
             tag,
             description: raw.capability.description,
@@ -277,8 +222,6 @@ impl CapabilitySpec {
             prompt,
             timeout_secs: raw.invoke.timeout_secs,
             output,
-            patterns: raw.models.patterns,
-            default_model: raw.models.default,
         })
     }
 }
@@ -286,29 +229,27 @@ impl CapabilitySpec {
 // ---- the loaded spec set -----------------------------------------------------
 
 /// every spec this host loaded — embedded built-ins plus the operator dir —
-/// keyed by tag, override already applied. routing happens HERE (over all
-/// specs), provider lookup happens in the ProviderSet (over the discovered
-/// subset): a model ref for an installed-nowhere capability still routes, so
-/// the error can name the missing capability instead of shrugging.
+/// keyed by tag, override already applied. the LOADED set is wider than the
+/// DISCOVERED one (a spec whose binary is absent still loads), so a request
+/// for an uninstalled capability errors by name instead of shrugging.
 #[derive(Debug, Clone)]
 pub struct SpecSet {
     specs: BTreeMap<String, CapabilitySpec>,
 }
 
-/// the built-in specs compiled into this binary. parsed at runtime through
-/// the same [`CapabilitySpec::parse`] path as operator files; a unit test
-/// asserts validity so a broken embedded spec fails CI, not a node boot —
-/// the `expect` here is unreachable past that test.
+/// the built-in specs compiled into this binary — every `specs/*.toml`,
+/// globbed and embedded by build.rs, so no Rust source names an executor.
+/// parsed at runtime through the same [`CapabilitySpec::parse`] path as
+/// operator files; a unit test asserts validity so a broken embedded spec
+/// fails CI, not a node boot — the `expect` here is unreachable past that
+/// test.
 pub fn builtin_specs() -> Vec<CapabilitySpec> {
-    [
-        ("embedded:codex", include_str!("../specs/codex.toml")),
-        ("embedded:claude", include_str!("../specs/claude.toml")),
-    ]
-    .into_iter()
-    .map(|(origin, text)| {
-        CapabilitySpec::parse(text, origin).expect("embedded specs are CI-validated")
-    })
-    .collect()
+    include!(concat!(env!("OUT_DIR"), "/builtin_specs.rs"))
+        .into_iter()
+        .map(|(origin, text): (&str, &str)| {
+            CapabilitySpec::parse(text, origin).expect("embedded specs are CI-validated")
+        })
+        .collect()
 }
 
 impl SpecSet {
@@ -322,7 +263,7 @@ impl SpecSet {
         if let Some(dir) = operator_dir {
             for spec in load_dir(dir)? {
                 // operator overrides embedded silently by design — replacing a
-                // built-in is the documented way to retune codex/claude flags.
+                // built-in is the documented way to retune its flags.
                 specs.insert(spec.tag.clone(), spec);
             }
         }
@@ -342,31 +283,6 @@ impl SpecSet {
 
     pub fn iter(&self) -> impl Iterator<Item = &CapabilitySpec> {
         self.specs.values()
-    }
-
-    /// route a model ref to a spec — the ONE place model naming meets
-    /// capability selection (see the module docs for the precedence rule).
-    /// an unpinned request routes as the empty string, matched only by a
-    /// `*` catch-all. `None` means no loaded spec claims this model ref.
-    pub fn route(&self, model_ref: &str) -> Option<&CapabilitySpec> {
-        let model = model_ref.trim();
-        let mut best: Option<(usize, &CapabilitySpec)> = None;
-        // BTreeMap iteration is tag-ascending, so a STRICTLY-greater update
-        // keeps the lexicographically smallest tag among equal scores.
-        for spec in self.specs.values() {
-            let score = spec
-                .patterns
-                .iter()
-                .filter(|p| glob_match(p, model))
-                .map(|p| literal_len(p))
-                .max();
-            if let Some(score) = score
-                && best.is_none_or(|(b, _)| score > b)
-            {
-                best = Some((score, spec));
-            }
-        }
-        best.map(|(_, spec)| spec)
     }
 }
 
@@ -398,52 +314,11 @@ fn load_dir(dir: &Path) -> Result<Vec<CapabilitySpec>, String> {
     Ok(specs)
 }
 
-/// `*`-only glob: `*` matches any run of characters (including empty), all
-/// other characters match themselves. no `?`, no classes — model refs are
-/// simple names and the restraint keeps precedence (literal count) obvious.
-pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == text;
-    }
-    let mut rest = text;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            // anchored head: the pattern does not start with '*'.
-            let Some(after) = rest.strip_prefix(part) else {
-                return false;
-            };
-            rest = after;
-        } else if i == parts.len() - 1 {
-            // anchored tail: the pattern does not end with '*'.
-            let Some(before) = rest.strip_suffix(part) else {
-                return false;
-            };
-            rest = before;
-        } else {
-            // greedy-enough middle: take the first occurrence left to right.
-            let Some(at) = rest.find(part) else {
-                return false;
-            };
-            rest = &rest[at + part.len()..];
-        }
-    }
-    true
-}
-
-/// the routing specificity score: literal (non-`*`) characters in a pattern.
-fn literal_len(pattern: &str) -> usize {
-    pattern.chars().filter(|c| *c != '*').count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn spec_toml(tag: &str, patterns: &str) -> String {
+    fn spec_toml(tag: &str) -> String {
         format!(
             r#"
 spec = 1
@@ -452,89 +327,46 @@ tag = "{tag}"
 [detect]
 bin = "{tag}-cli"
 [invoke]
-args = ["run", "{{model}}"]
+args = ["run"]
 prompt = "stdin"
 [output]
 format = "text"
-[models]
-patterns = {patterns}
 "#
         )
     }
 
     #[test]
-    fn embedded_specs_are_valid_and_cover_codex_and_claude() {
+    fn embedded_specs_parse_with_valid_unique_tags() {
         // the CI gate for the expect() in builtin_specs(): a broken embedded
-        // spec fails HERE, never at node boot.
+        // spec fails HERE, never at node boot. deliberately tag-agnostic —
+        // WHICH executors ship as built-ins is data, and no test hardcodes
+        // executor names.
         let specs = builtin_specs();
-        let tags: Vec<&str> = specs.iter().map(|s| s.tag.as_str()).collect();
-        assert_eq!(tags, vec!["codex", "claude"]);
-        assert_eq!(specs[0].output, OutputFormat::CodexJsonl);
-        assert_eq!(specs[1].output, OutputFormat::ClaudeJson);
-        assert!(specs[0].default_model.is_some(), "codex carries the unpinned default");
+        assert!(!specs.is_empty(), "the crate ships built-in specs");
+        let tags: std::collections::BTreeSet<&str> =
+            specs.iter().map(|s| s.tag.as_str()).collect();
+        assert_eq!(tags.len(), specs.len(), "embedded tags are unique");
     }
 
     #[test]
-    fn routing_prefers_literal_specificity_over_catchall() {
-        let set = SpecSet::load(None).unwrap();
-        assert_eq!(set.route("claude-sonnet-5").unwrap().tag, "claude");
-        assert_eq!(set.route("gpt-5.3-codex-spark").unwrap().tag, "codex");
-        assert_eq!(set.route("some-unknown-model").unwrap().tag, "codex", "catch-all");
-        assert_eq!(set.route("").unwrap().tag, "codex", "unpinned routes to catch-all");
-        assert_eq!(set.route("  ").unwrap().tag, "codex", "whitespace = unpinned");
-    }
-
-    #[test]
-    fn routing_ties_break_to_the_smaller_tag() {
-        let a = CapabilitySpec::parse(&spec_toml("bbb", r#"["m-*"]"#), "t").unwrap();
-        let b = CapabilitySpec::parse(&spec_toml("aaa", r#"["m-*"]"#), "t").unwrap();
-        let set = SpecSet::from_specs(vec![a, b]);
-        assert_eq!(set.route("m-1").unwrap().tag, "aaa", "deterministic tie-break");
-    }
-
-    #[test]
-    fn routing_none_when_no_pattern_matches() {
-        let only = CapabilitySpec::parse(&spec_toml("x", r#"["x-*"]"#), "t").unwrap();
-        let set = SpecSet::from_specs(vec![only]);
-        assert!(set.route("y-model").is_none());
-        assert!(set.route("").is_none(), "no catch-all, no unpinned route");
-    }
-
-    #[test]
-    fn glob_semantics() {
-        assert!(glob_match("*", ""));
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("claude*", "claude-sonnet-5"));
-        assert!(!glob_match("claude*", "xclaude"));
-        assert!(glob_match("*codex*", "gpt-5.3-codex-spark"));
-        assert!(glob_match("gpt-*", "gpt-5.5"));
-        assert!(!glob_match("gpt-*x", "gpt-5.5"));
-        assert!(glob_match("a*b*c", "aXXbYYc"));
-        assert!(!glob_match("exact", "exactx"));
-        assert!(glob_match("exact", "exact"));
-    }
-
-    #[test]
-    fn version_tag_prompt_format_timeout_and_patterns_validate() {
-        let base = spec_toml("ok", r#"["*"]"#);
+    fn version_tag_prompt_format_and_timeout_validate() {
+        let base = spec_toml("ok");
         assert!(CapabilitySpec::parse(&base, "t").is_ok());
 
         for (needle, replacement, expect) in [
             ("spec = 1", "spec = 2", "unsupported spec version"),
             (r#"tag = "ok""#, r#"tag = "OK""#, "invalid characters"),
-            (r#"tag = "ok""#, r#"tag = """#, "1..=64 bytes"),
+            (r#"tag = "ok""#, r#"tag = """#, "non-empty"),
             (r#"prompt = "stdin""#, r#"prompt = "argv""#, "not supported"),
             (r#"format = "text""#, r#"format = "yaml""#, "not a known parser"),
-            (r#"patterns = ["*"]"#, r#"patterns = []"#, "at least one pattern"),
-            (r#"patterns = ["*"]"#, r#"patterns = [""]"#, "non-empty"),
         ] {
             let broken = base.replace(needle, replacement);
             let err = CapabilitySpec::parse(&broken, "t").unwrap_err();
             assert!(err.contains(expect), "wanted {expect:?} in {err:?}");
         }
 
-        let long_tag = spec_toml(&"x".repeat(65), r#"["*"]"#);
-        assert!(CapabilitySpec::parse(&long_tag, "t").unwrap_err().contains("1..=64"));
+        let long_tag = spec_toml(&"x".repeat(65));
+        assert!(CapabilitySpec::parse(&long_tag, "t").unwrap_err().contains("64 bytes"));
 
         let bad_timeout = base.replace(r#"prompt = "stdin""#, "prompt = \"stdin\"\ntimeout_secs = 0");
         assert!(CapabilitySpec::parse(&bad_timeout, "t").unwrap_err().contains("timeout_secs"));
@@ -542,10 +374,15 @@ patterns = {patterns}
 
     #[test]
     fn unknown_fields_fail_loud() {
-        // a typo must never silently change routing.
-        let typo = spec_toml("ok", r#"["*"]"#).replace("[models]", "[models]\npatern = 1");
-        // (inserted BEFORE patterns so it lands in the models table)
+        // a typo — or a field from the retired [models] routing era — must
+        // never be silently ignored: the operator wrote config that does
+        // nothing, and the boot error is what tells them.
+        let typo = spec_toml("ok").replace("[invoke]", "[invoke]\ntimeout_sec = 1");
         let err = CapabilitySpec::parse(&typo, "t").unwrap_err();
+        assert!(err.contains("not a valid spec"), "got {err:?}");
+
+        let stale = format!("{}\n[models]\npatterns = [\"*\"]\n", spec_toml("ok"));
+        let err = CapabilitySpec::parse(&stale, "t").unwrap_err();
         assert!(err.contains("not a valid spec"), "got {err:?}");
     }
 
@@ -555,14 +392,21 @@ patterns = {patterns}
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // override the embedded codex spec wholesale.
-        std::fs::write(dir.join("my-codex.toml"), spec_toml("codex", r#"["*"]"#)).unwrap();
+        // override SOME embedded spec wholesale — the tag is discovered from
+        // the built-in set, never hardcoded.
+        let builtins = builtin_specs();
+        let (first, rest) = (&builtins[0].tag, &builtins[1].tag);
+        std::fs::write(dir.join("my-override.toml"), spec_toml(first)).unwrap();
         let set = SpecSet::load(Some(&dir)).unwrap();
-        assert_eq!(set.get("codex").unwrap().bin, "codex-cli", "operator spec won");
-        assert!(set.get("claude").is_some(), "untouched built-in remains");
+        assert_eq!(
+            set.get(first).unwrap().bin,
+            format!("{first}-cli"),
+            "operator spec won"
+        );
+        assert!(set.get(rest).is_some(), "untouched built-in remains");
 
         // two operator files claiming one tag: hard error naming both files.
-        std::fs::write(dir.join("zz-codex.toml"), spec_toml("codex", r#"["*"]"#)).unwrap();
+        std::fs::write(dir.join("zz-dup.toml"), spec_toml(first)).unwrap();
         let err = SpecSet::load(Some(&dir)).unwrap_err();
         assert!(err.contains("duplicate capability tag"), "got {err:?}");
 

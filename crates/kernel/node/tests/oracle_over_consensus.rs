@@ -45,6 +45,7 @@ fn trigger(id: &str, spec: &[u8]) -> Msg {
             deadline: None,
             max_attempts: 1,
             lease_views: None,
+            capability: None,
         }),
     }
 }
@@ -97,6 +98,7 @@ async fn saga_view<O: Orderer>(n: &OrderedNode<O>, id: &str) -> Option<SagaView>
         .expect("saga query");
     match decode_reply(&reply).expect("decode reply") {
         SagaReply::Saga(v) => v,
+        other => panic!("expected Saga reply, got {other:?}"),
     }
 }
 
