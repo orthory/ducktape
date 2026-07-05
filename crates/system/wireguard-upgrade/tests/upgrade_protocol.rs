@@ -521,3 +521,38 @@ fn mesh_view_rejects_a_zero_wireguard_key() {
         UpgradeError::InvalidWireGuardKey
     );
 }
+
+/// A gossiped record relayed by a third member carries its OWNER's signature
+/// — verification binds to `record.validator_identity`, so neither a tampered
+/// field, a wrong signer, nor a grafted advertisement signature (different
+/// domain) can pass.
+#[test]
+fn signed_record_verifies_owner_and_rejects_tamper_and_cross_domain() {
+    let a = PrivateKey::from_seed(1);
+    let b = PrivateKey::from_seed(2);
+    let set = active_set(id(&a), id(&b));
+    let record = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
+
+    let signed = SignedEndpointRecord::sign(record.clone(), &a);
+    signed.verify().expect("own signature verifies");
+
+    // any signed field mutated after signing breaks verification — the
+    // forwarder-forgery the signature exists to prevent.
+    let mut forged = signed.clone();
+    forged.record.wireguard_public_key = xkey(9);
+    assert_eq!(forged.verify().unwrap_err(), UpgradeError::BadSignature);
+
+    // signed by someone other than its claimed owner: never verifies.
+    let cross = SignedEndpointRecord::sign(record.clone(), &b);
+    assert_eq!(cross.verify().unwrap_err(), UpgradeError::BadSignature);
+
+    // an advertisement signature over the same record must not verify under
+    // the record domain.
+    let version = compute_mesh_version(&[record.clone()]).unwrap();
+    let ad = EndpointAdvertisement::sign(record.clone(), version, &a);
+    let grafted = SignedEndpointRecord {
+        record,
+        signature: ad.signature,
+    };
+    assert_eq!(grafted.verify().unwrap_err(), UpgradeError::BadSignature);
+}

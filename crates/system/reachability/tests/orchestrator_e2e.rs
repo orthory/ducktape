@@ -649,3 +649,89 @@ async fn every_message_kind_dropped_once_still_converges() {
         })
         .await;
 }
+
+/// The joiner topology: node 2 has a live link ONLY to node 0 (its inviter's
+/// ingress) — nodes 1 and 2 have no transport path in either direction, the
+/// exact shape of a coordinated-only joiner parked through one ephemeral
+/// ingress. Gossip must relay through node 0 (records, adverts, and the 1<->2
+/// handshake alike) and the full mesh must still converge on every node.
+#[tokio::test]
+async fn star_topology_relays_gossip_through_the_hub() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let filter: DeliveryFilter = Rc::new(|from, to, _| {
+                usize::from(!matches!((from, to), (1, 2) | (2, 1)))
+            });
+            let (nodes, mut collected) =
+                spawn_mesh_filtered(&local, dir.path(), &[1, 2, 3], vec![], filter);
+            retarget_all(&nodes, &[0, 1, 2], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            let versions = await_applied(&mut collected, &[0, 1, 2], 1).await;
+            assert_eq!(versions[&0], versions[&1]);
+            assert_eq!(versions[&0], versions[&2]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.applied.len(), 1, "node {i}: exactly one apply");
+                assert_eq!(fake.applied[0].peers.len(), 2, "node {i}: full mesh");
+            }
+        })
+        .await;
+}
+
+/// With relaying, a record's authenticity comes from its OWNER's signature,
+/// not the delivering link: a member forwarding a record whose signature
+/// does not verify (tampered in flight, or outright forged) is refused
+/// loudly, attributed to the DELIVERING member.
+#[tokio::test]
+async fn forged_relayed_record_is_refused() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2], vec![]);
+            retarget_all(&nodes, &[0, 1], 1, 10).await;
+
+            let policy = PortPolicy::production();
+            let forged = wireguard_upgrade::SignedEndpointRecord {
+                record: wireguard_upgrade::EndpointRecord {
+                    namespace: CHAIN.into(),
+                    epoch: 1,
+                    valset_root: wireguard_upgrade::Root([1; 32]),
+                    admission_root: wireguard_upgrade::AdmissionRoot([2; 32]),
+                    validator_identity: nodes[1].identity,
+                    wireguard_public_key: wireguard_upgrade::X25519PublicKey([4; 32]),
+                    control_endpoint: endpoint(&policy, 20, 443, Transport::Tcp),
+                    wireguard_endpoint: endpoint(&policy, 20, 51820, Transport::Udp),
+                    capabilities: vec![],
+                    expires_at_view: 100,
+                    nonce: 9,
+                },
+                signature: wireguard_upgrade::SignatureBytes(vec![0; 64]),
+            };
+            nodes[0]
+                .cmd
+                .send(ReachabilityCommand::Deliver {
+                    from: nodes[1].signer.public_key(),
+                    bytes: ReachabilityMsg::Record(forged).encode(),
+                })
+                .await
+                .unwrap();
+
+            let (peer, reason) = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some((0, ReachabilityEvent::PeerFailed { peer, reason })) =
+                        collected.recv().await
+                    {
+                        break (peer, reason);
+                    }
+                }
+            })
+            .await
+            .expect("forged record surfaced");
+            assert!(reason.contains("record signature invalid"), "{reason}");
+            assert_eq!(peer, nodes[1].signer.public_key());
+        })
+        .await;
+}

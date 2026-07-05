@@ -15,6 +15,13 @@
 //! never shows up stalls its epoch's bring-up exactly like
 //! `MeshView::verify`'s all-members rule says it must; the previous epoch's
 //! tunnels stay up meanwhile.
+//!
+//! Transport reach is NOT assumed pairwise: two members with no direct mesh
+//! link (a coordinated-only joiner parked through one ingress) still
+//! assemble, because every message is relayed by the members that do have
+//! links — records/adverts flood with nonce dedup, handshake messages ride
+//! per-pair relay slots — and every message authenticates by its OWNER's
+//! content signature, never by the link it arrived on.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -27,8 +34,8 @@ use tokio::sync::mpsc;
 use wireguard_effect::{WireGuardEffect, apply_tunnel_plans};
 use wireguard_upgrade::{
     ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, Endpoint, MeshVersion, MeshView,
-    OverlayPolicy, Perspective, PortPolicy, ReplayCache, TunnelInstallPlan, TunnelUpgradeAck,
-    TunnelUpgradeAckFields, TunnelUpgradeRequest, TunnelUpgradeRequestFields,
+    OverlayPolicy, Perspective, PortPolicy, ReplayCache, SignedEndpointRecord, TunnelInstallPlan,
+    TunnelUpgradeAck, TunnelUpgradeAckFields, TunnelUpgradeRequest, TunnelUpgradeRequestFields,
     TunnelUpgradeResponse, TunnelUpgradeResponseFields, UpgradeError, ValidatorIdentity,
     compute_mesh_version,
 };
@@ -324,6 +331,22 @@ enum PeerHandshake {
     },
 }
 
+/// A foreign handshake message this node carries between two OTHER members
+/// that share no direct link: the latest-STAGE signed message per ordered
+/// `(initiator, responder)` pair, re-offered on nudge until superseded or
+/// expired. Signature-verified before acceptance, so a malicious member
+/// cannot evict a real in-flight message by poisoning the slot.
+struct RelaySlot {
+    /// Request=0 < Response=1 < Ack=2 — a later stage proves the earlier
+    /// one arrived, so it supersedes the slot.
+    stage: u8,
+    /// The member whose signature the slot's message carries — the one peer
+    /// a re-offer never needs to reach (it already has its own message).
+    signer: ValidatorIdentity,
+    msg: ReachabilityMsg,
+    expires_at_view: u64,
+}
+
 /// Everything one epoch accumulates on the way to its `apply` call.
 struct EpochState {
     epoch: u64,
@@ -334,7 +357,9 @@ struct EpochState {
     /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
     /// advert duplicate rule wants strictly-increasing nonces too.
     nonce: u64,
-    records: BTreeMap<ValidatorIdentity, EndpointRecord>,
+    /// Owner-signed records as they arrived (our own included) — the form
+    /// that can be re-gossiped to peers the owner has no link to.
+    records: BTreeMap<ValidatorIdentity, SignedEndpointRecord>,
     adverts: BTreeMap<ValidatorIdentity, EndpointAdvertisement>,
     own_advert_sent: bool,
     view_state: Option<MeshView>,
@@ -344,6 +369,9 @@ struct EpochState {
     /// nudged re-offers of the same request collapse to one entry.
     pending_requests: BTreeMap<ValidatorIdentity, TunnelUpgradeRequest>,
     handshakes: HashMap<ValidatorIdentity, PeerHandshake>,
+    /// Relay slots keyed by `(initiator, responder)` for handshakes between
+    /// two OTHER members.
+    relayed: BTreeMap<(ValidatorIdentity, ValidatorIdentity), RelaySlot>,
     plans: BTreeMap<ValidatorIdentity, TunnelInstallPlan>,
     overrides: BTreeMap<ValidatorIdentity, SocketAddr>,
     failed: HashSet<ValidatorIdentity>,
@@ -354,6 +382,28 @@ impl EpochState {
     fn next_nonce(&mut self) -> u64 {
         self.nonce += 1;
         self.nonce
+    }
+
+    /// Every record this epoch holds, whether it arrived as signed record
+    /// gossip or embedded in a member's (signed) advertisement — per member
+    /// the higher nonce wins. The advance gate and the mesh version compute
+    /// over THIS merged set, so a member whose record only ever reached us
+    /// inside its advertisement still counts.
+    fn known_records(&self) -> BTreeMap<ValidatorIdentity, EndpointRecord> {
+        let mut out: BTreeMap<ValidatorIdentity, EndpointRecord> = self
+            .records
+            .iter()
+            .map(|(id, signed)| (*id, signed.record.clone()))
+            .collect();
+        for (id, advert) in &self.adverts {
+            match out.get(id) {
+                Some(prev) if advert.record.nonce <= prev.nonce => {}
+                _ => {
+                    out.insert(*id, advert.record.clone());
+                }
+            }
+        }
+        out
     }
 }
 
@@ -472,6 +522,22 @@ where
         .await
     }
 
+    /// Fan one of OUR handshake messages to every peer: the addressee
+    /// processes it, everyone else is a candidate relay toward an addressee
+    /// we may share no direct link with. Mesh sends are best-effort, so the
+    /// sender cannot know which links exist — all paths carry the message
+    /// and receivers dedup.
+    async fn fan_msg(&self, msg: &ReachabilityMsg) -> Result<(), ReachabilityError> {
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        let peers = state.peers.clone();
+        for peer in peers {
+            self.send_msg(peer, msg).await?;
+        }
+        Ok(())
+    }
+
     async fn retarget(&mut self, event: MeshEpochEvent) -> Result<(), ReachabilityError> {
         self.view = self.view.max(event.current_view);
         let identities: Vec<ValidatorIdentity> =
@@ -515,24 +581,28 @@ where
             replay: ReplayCache::default(),
             pending_requests: BTreeMap::new(),
             handshakes: HashMap::new(),
+            relayed: BTreeMap::new(),
             plans: BTreeMap::new(),
             overrides: BTreeMap::new(),
             failed: HashSet::new(),
             applied: false,
         };
-        let own = EndpointRecord {
-            namespace: self.config.chain_id.clone(),
-            epoch: state.epoch,
-            valset_root: state.set.valset_root,
-            admission_root: state.set.admission_root,
-            validator_identity: self.me,
-            wireguard_public_key: self.keypair.public_key(),
-            control_endpoint: self.config.control_endpoint,
-            wireguard_endpoint: self.config.wireguard_listen,
-            capabilities: vec![],
-            expires_at_view: self.view + ADVERT_TTL_VIEWS,
-            nonce: state.next_nonce(),
-        };
+        let own = SignedEndpointRecord::sign(
+            EndpointRecord {
+                namespace: self.config.chain_id.clone(),
+                epoch: state.epoch,
+                valset_root: state.set.valset_root,
+                admission_root: state.set.admission_root,
+                validator_identity: self.me,
+                wireguard_public_key: self.keypair.public_key(),
+                control_endpoint: self.config.control_endpoint,
+                wireguard_endpoint: self.config.wireguard_listen,
+                capabilities: vec![],
+                expires_at_view: self.view + ADVERT_TTL_VIEWS,
+                nonce: state.next_nonce(),
+            },
+            &self.config.signer,
+        );
         state.records.insert(self.me, own.clone());
         let peers = state.peers.clone();
         self.state = Some(state);
@@ -550,46 +620,73 @@ where
     /// re-signed handshake message would desynchronize the hash-pinned
     /// triple and mint nonces the peer's replay validation has not burnt.
     ///
-    /// Gossip stages re-offer our record/advert to EVERY peer (receivers
-    /// dedup by nonce). The handshake stage re-offers per stalled peer: the
-    /// pending request while we await its response, our response while we
-    /// await its ack. The completed side never re-offers — a `Done`
-    /// initiator re-sends its stored ack only when the peer's re-delivered
-    /// response proves the ack was lost (see `on_response`), so retries
-    /// terminate the moment both sides are done.
+    /// Gossip stages re-offer EVERY record and advert this node holds — not
+    /// only its own — to every peer (receivers dedup by nonce): a peer with
+    /// no link to some member receives that member's gossip from us, which
+    /// is what assembles a star topology. The handshake stage re-offers per
+    /// stalled peer (the pending request while we await its response, our
+    /// response while we await its ack) plus every live relay slot this node
+    /// carries for pairs that share no direct link. The completed side never
+    /// re-offers — a `Done` initiator re-sends its stored ack only when the
+    /// peer's re-delivered response proves the ack was lost (see
+    /// `on_response`), so retries terminate once both sides are done and the
+    /// relay slots expire by view.
     async fn nudge(&mut self) -> Result<(), ReachabilityError> {
+        let view = self.view;
         let sends: Vec<(ValidatorIdentity, ReachabilityMsg)> = {
-            let Some(state) = &self.state else {
+            let Some(state) = &mut self.state else {
                 return Ok(());
             };
-            if !state.own_advert_sent {
-                let own = state.records.get(&self.me).cloned().expect("own record");
+            if state.view_state.is_none() {
+                // gossip stages: everything known to everyone (an advert
+                // doubles as a record carrier for members whose record
+                // gossip never reached a peer directly).
+                let msgs: Vec<ReachabilityMsg> = state
+                    .records
+                    .values()
+                    .map(|record| ReachabilityMsg::Record(record.clone()))
+                    .chain(
+                        state
+                            .adverts
+                            .values()
+                            .map(|advert| ReachabilityMsg::Advert(advert.clone())),
+                    )
+                    .collect();
                 state
                     .peers
                     .iter()
-                    .map(|peer| (*peer, ReachabilityMsg::Record(own.clone())))
-                    .collect()
-            } else if state.view_state.is_none() {
-                let own = state.adverts.get(&self.me).cloned().expect("own advert");
-                state
-                    .peers
-                    .iter()
-                    .map(|peer| (*peer, ReachabilityMsg::Advert(own.clone())))
+                    .flat_map(|peer| msgs.iter().map(|msg| (*peer, msg.clone())))
                     .collect()
             } else {
-                state
+                state.relayed.retain(|_, slot| slot.expires_at_view >= view);
+                // our own stalled halves fan to EVERY peer, not only the
+                // counterparty: the direct link may be the one that does not
+                // exist, and any other peer can relay.
+                let own: Vec<(ValidatorIdentity, ReachabilityMsg)> = state
                     .handshakes
-                    .iter()
-                    .filter_map(|(peer, handshake)| match handshake {
+                    .values()
+                    .filter_map(|handshake| match handshake {
                         PeerHandshake::AwaitingResponse { request } => {
-                            Some((*peer, ReachabilityMsg::Request(request.clone())))
+                            Some(ReachabilityMsg::Request(request.clone()))
                         }
                         PeerHandshake::AwaitingAck { response, .. } => {
-                            Some((*peer, ReachabilityMsg::Response(response.clone())))
+                            Some(ReachabilityMsg::Response(response.clone()))
                         }
                         PeerHandshake::Done { .. } => None,
                     })
-                    .collect()
+                    .flat_map(|msg| state.peers.iter().map(move |peer| (*peer, msg.clone())))
+                    .collect();
+                // relay slots fan to every peer except the message's own
+                // signer: this node cannot know which peer has the working
+                // link to the addressee, so all candidate paths carry it.
+                let relayed = state.relayed.values().flat_map(|slot| {
+                    state
+                        .peers
+                        .iter()
+                        .filter(|peer| **peer != slot.signer)
+                        .map(|peer| (*peer, slot.msg.clone()))
+                });
+                own.into_iter().chain(relayed).collect()
             }
         };
         for (peer, msg) in sends {
@@ -598,17 +695,22 @@ where
         Ok(())
     }
 
+    /// Route one delivered message. `via` is the transport-authenticated
+    /// DELIVERING member — with relaying it need not be the message's owner,
+    /// so every handler authenticates the content signature and binds
+    /// protocol state to the identity INSIDE the message; `via` only gates
+    /// membership and takes the blame for undecodable/unverifiable junk.
     async fn deliver(
         &mut self,
         from: ed25519::PublicKey,
         bytes: Vec<u8>,
     ) -> Result<(), ReachabilityError> {
-        let sender = binding::identity_of(&from);
+        let via = binding::identity_of(&from);
         let Some(state) = &mut self.state else {
             // no active epoch (pre-boot traffic) — nothing to bind it to.
             return Ok(());
         };
-        if !state.pk_of.contains_key(&sender) {
+        if !state.pk_of.contains_key(&via) {
             return self
                 .emit(ReachabilityEvent::PeerFailed {
                     peer: from,
@@ -628,66 +730,229 @@ where
             }
         };
         match msg {
-            ReachabilityMsg::Record(record) => self.on_record(sender, record).await,
-            ReachabilityMsg::Advert(advert) => self.on_advert(sender, advert).await,
-            ReachabilityMsg::Request(request) => self.on_request(sender, request).await,
-            ReachabilityMsg::Response(response) => self.on_response(sender, response).await,
-            ReachabilityMsg::Ack(ack) => self.on_ack(sender, ack).await,
+            ReachabilityMsg::Record(record) => self.on_record(via, record).await,
+            ReachabilityMsg::Advert(advert) => self.on_advert(via, advert).await,
+            ReachabilityMsg::Request(request) => {
+                let initiator = request.fields.initiator_identity;
+                let responder = request.fields.responder_identity;
+                if responder == self.me {
+                    return self.on_request(via, request).await;
+                }
+                if initiator == self.me {
+                    // our own message relayed back around — nothing to do.
+                    return Ok(());
+                }
+                let expires = request.fields.expires_at_view;
+                let verified = request.verify_signature().is_ok();
+                self.relay(
+                    via,
+                    (initiator, responder),
+                    0,
+                    initiator,
+                    expires,
+                    verified,
+                    ReachabilityMsg::Request(request),
+                )
+                .await
+            }
+            ReachabilityMsg::Response(response) => {
+                let responder = response.fields.responder_identity;
+                let initiator = response.fields.initiator_identity;
+                if initiator == self.me {
+                    return self.on_response(via, response).await;
+                }
+                if responder == self.me {
+                    return Ok(());
+                }
+                let expires = response.fields.expires_at_view;
+                let verified = response.verify_signature().is_ok();
+                self.relay(
+                    via,
+                    (initiator, responder),
+                    1,
+                    responder,
+                    expires,
+                    verified,
+                    ReachabilityMsg::Response(response),
+                )
+                .await
+            }
+            ReachabilityMsg::Ack(ack) => {
+                let initiator = ack.fields.initiator_identity;
+                let responder = ack.fields.responder_identity;
+                if responder == self.me {
+                    return self.on_ack(via, ack).await;
+                }
+                if initiator == self.me {
+                    return Ok(());
+                }
+                let expires = ack.fields.expires_at_view;
+                let verified = ack.verify_signature().is_ok();
+                self.relay(
+                    via,
+                    (initiator, responder),
+                    2,
+                    initiator,
+                    expires,
+                    verified,
+                    ReachabilityMsg::Ack(ack),
+                )
+                .await
+            }
         }
+    }
+
+    /// Carry a handshake message between two OTHER members: verify, slot by
+    /// `(initiator, responder)` with stage supersession, and fan out to every
+    /// peer except the delivering one and the message's signer — this node
+    /// cannot know which peer holds the working link to the addressee.
+    async fn relay(
+        &mut self,
+        via: ValidatorIdentity,
+        pair: (ValidatorIdentity, ValidatorIdentity),
+        stage: u8,
+        signer: ValidatorIdentity,
+        expires_at_view: u64,
+        verified: bool,
+        msg: ReachabilityMsg,
+    ) -> Result<(), ReachabilityError> {
+        if !verified {
+            return self.fail_peer(via, "relayed an unverifiable handshake message").await;
+        }
+        let state = self.state.as_mut().expect("deliver checked state");
+        if !state.pk_of.contains_key(&pair.0) || !state.pk_of.contains_key(&pair.1) {
+            return self.fail_peer(via, "relayed a handshake for a non-member pair").await;
+        }
+        if expires_at_view < self.view {
+            return Ok(());
+        }
+        match state.relayed.get(&pair) {
+            // same or later stage already carried — this sighting adds
+            // nothing, and dropping it is what terminates the flood.
+            Some(slot) if stage <= slot.stage => return Ok(()),
+            _ => {}
+        }
+        state.relayed.insert(pair, RelaySlot {
+            stage,
+            signer,
+            msg: msg.clone(),
+            expires_at_view,
+        });
+        let targets: Vec<ValidatorIdentity> = state
+            .peers
+            .iter()
+            .copied()
+            .filter(|peer| *peer != via && *peer != signer)
+            .collect();
+        for peer in targets {
+            self.send_msg(peer, &msg).await?;
+        }
+        Ok(())
     }
 
     async fn on_record(
         &mut self,
-        sender: ValidatorIdentity,
-        record: EndpointRecord,
+        via: ValidatorIdentity,
+        signed: SignedEndpointRecord,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
-        if record.validator_identity != sender || record.epoch != state.epoch {
-            return self.fail_peer(sender, "record identity/epoch mismatch").await;
+        let owner = signed.record.validator_identity;
+        // content authentication: the record may have been relayed, so the
+        // delivering link proves nothing about the record's owner.
+        if signed.verify().is_err() {
+            return self.fail_peer(via, "record signature invalid").await;
+        }
+        if !state.pk_of.contains_key(&owner) || signed.record.epoch != state.epoch {
+            return self.fail_peer(via, "record identity/epoch mismatch").await;
+        }
+        if owner == self.me {
+            // our own record echoed back around the relay ring.
+            return Ok(());
         }
         // phase A: the set locks at version time — later (higher-nonce)
         // re-advertisements retunnel at the next cutover.
         if state.own_advert_sent {
             return Ok(());
         }
-        let first_contact = !state.records.contains_key(&sender);
-        match state.records.get(&sender) {
-            Some(prev) if record.nonce <= prev.nonce => {}
+        let first_contact = !state.records.contains_key(&owner);
+        let accepted = match state.records.get(&owner) {
+            Some(prev) if signed.record.nonce <= prev.record.nonce => false,
             _ => {
-                state.records.insert(sender, record);
+                state.records.insert(owner, signed.clone());
+                true
             }
-        }
+        };
         if first_contact {
-            // heal join-order: the peer that just appeared may have missed
+            // heal join-order: the member that just appeared may have missed
             // our initial fan-out.
             let own = state.records.get(&self.me).cloned().expect("own record");
-            self.send_msg(sender, &ReachabilityMsg::Record(own)).await?;
+            self.send_msg(owner, &ReachabilityMsg::Record(own)).await?;
+        }
+        if accepted {
+            // relay the news: peers with no link to the owner only ever see
+            // its record through us. Accept-gated, so the flood terminates.
+            let targets: Vec<ValidatorIdentity> = self
+                .state
+                .as_ref()
+                .expect("still in epoch")
+                .peers
+                .iter()
+                .copied()
+                .filter(|peer| *peer != owner && *peer != via)
+                .collect();
+            for peer in targets {
+                self.send_msg(peer, &ReachabilityMsg::Record(signed.clone()))
+                    .await?;
+            }
         }
         self.advance().await
     }
 
     async fn on_advert(
         &mut self,
-        sender: ValidatorIdentity,
+        via: ValidatorIdentity,
         advert: EndpointAdvertisement,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
-        if advert.record.validator_identity != sender || advert.record.epoch != state.epoch {
-            return self.fail_peer(sender, "advert identity/epoch mismatch").await;
+        let owner = advert.record.validator_identity;
+        if advert.verify_signature().is_err() {
+            return self.fail_peer(via, "advert signature invalid").await;
+        }
+        if !state.pk_of.contains_key(&owner) || advert.record.epoch != state.epoch {
+            return self.fail_peer(via, "advert identity/epoch mismatch").await;
+        }
+        if owner == self.me {
+            return Ok(());
         }
         if state.view_state.is_some() {
             return Ok(());
         }
-        let first_contact = !state.adverts.contains_key(&sender);
-        match state.adverts.get(&sender) {
-            Some(prev) if advert.record.nonce <= prev.record.nonce => {}
+        let first_contact = !state.adverts.contains_key(&owner);
+        let accepted = match state.adverts.get(&owner) {
+            Some(prev) if advert.record.nonce <= prev.record.nonce => false,
             _ => {
-                state.adverts.insert(sender, advert);
+                state.adverts.insert(owner, advert.clone());
+                true
             }
-        }
+        };
         if first_contact && state.own_advert_sent {
             let own = state.adverts.get(&self.me).cloned().expect("own advert");
-            self.send_msg(sender, &ReachabilityMsg::Advert(own)).await?;
+            self.send_msg(owner, &ReachabilityMsg::Advert(own)).await?;
+        }
+        if accepted {
+            let targets: Vec<ValidatorIdentity> = self
+                .state
+                .as_ref()
+                .expect("still in epoch")
+                .peers
+                .iter()
+                .copied()
+                .filter(|peer| *peer != owner && *peer != via)
+                .collect();
+            for peer in targets {
+                self.send_msg(peer, &ReachabilityMsg::Advert(advert.clone()))
+                    .await?;
+            }
         }
         self.advance().await
     }
@@ -699,11 +964,19 @@ where
     async fn advance(&mut self) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("advance without epoch");
 
-        // records -> our signed advert
-        if !state.own_advert_sent && state.records.len() == state.set.validators().len() {
-            let records: Vec<EndpointRecord> = state.records.values().cloned().collect();
+        // records -> our signed advert. The gate counts records however
+        // they arrived — direct gossip, relayed gossip, or embedded in a
+        // faster member's advertisement.
+        let known = state.known_records();
+        if !state.own_advert_sent && known.len() == state.set.validators().len() {
+            let records: Vec<EndpointRecord> = known.into_values().collect();
             let version = compute_mesh_version(&records)?;
-            let own_record = state.records.get(&self.me).cloned().expect("own record");
+            let own_record = state
+                .records
+                .get(&self.me)
+                .cloned()
+                .expect("own record")
+                .record;
             let advert = EndpointAdvertisement::sign(own_record, version, &self.config.signer);
             state.adverts.insert(self.me, advert.clone());
             state.own_advert_sent = true;
@@ -825,8 +1098,7 @@ where
                 .insert(peer, PeerHandshake::AwaitingResponse {
                     request: request.clone(),
                 });
-            self.send_msg(peer, &ReachabilityMsg::Request(request))
-                .await?;
+            self.fan_msg(&ReachabilityMsg::Request(request)).await?;
         }
         Ok(())
     }
@@ -873,22 +1145,27 @@ where
     /// duplicate of the request we already answered (the initiator nudging —
     /// our single-shot response may be lost) re-sends the STORED response:
     /// re-signing would orphan the initiator's eventual ack, which pins ONE
-    /// response by hash.
+    /// response by hash. `via` is the delivering member (possibly a relay);
+    /// the counterparty is the request's SIGNED initiator.
     async fn on_request(
         &mut self,
-        sender: ValidatorIdentity,
+        via: ValidatorIdentity,
         request: TunnelUpgradeRequest,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
+        let sender = request.fields.initiator_identity;
+        if request.verify_signature().is_err() {
+            return self.fail_peer(via, "request signature invalid").await;
+        }
+        if !state.pk_of.contains_key(&sender) {
+            return self.fail_peer(via, "request from a non-member initiator").await;
+        }
         if state.failed.contains(&sender) {
             // the pair already failed this epoch — its nonces are burnt in
             // the replay cache, so no retry can revive it; stay quiet.
             return Ok(());
         }
-        if request.fields.initiator_identity != sender
-            || request.fields.epoch != state.epoch
-            || !initiates(sender, self.me)
-        {
+        if request.fields.epoch != state.epoch || !initiates(sender, self.me) {
             return self.fail_peer(sender, "request from the wrong side").await;
         }
         match state.handshakes.get(&sender) {
@@ -896,9 +1173,7 @@ where
                 if stored.hash() == request.hash() =>
             {
                 let response = response.clone();
-                return self
-                    .send_msg(sender, &ReachabilityMsg::Response(response))
-                    .await;
+                return self.fan_msg(&ReachabilityMsg::Response(response)).await;
             }
             // stale in-flight duplicate: our ack receipt proves the
             // initiator completed long ago — nothing left to answer.
@@ -948,8 +1223,7 @@ where
                 request,
                 response: response.clone(),
             });
-        self.send_msg(sender, &ReachabilityMsg::Response(response))
-            .await
+        self.fan_msg(&ReachabilityMsg::Response(response)).await
     }
 
     /// Initiator side: the peer responded — ack, then validate our plan.
@@ -957,12 +1231,21 @@ where
     /// never received our single-shot ack: re-send the stored ack VERBATIM,
     /// and never re-validate — each side runs `validate_upgrade_as` exactly
     /// once per peer, so the shared replay cache never sees a nonce twice.
+    /// `via` is the delivering member (possibly a relay); the counterparty
+    /// is the response's SIGNED responder.
     async fn on_response(
         &mut self,
-        sender: ValidatorIdentity,
+        via: ValidatorIdentity,
         response: TunnelUpgradeResponse,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
+        let sender = response.fields.responder_identity;
+        if response.verify_signature().is_err() {
+            return self.fail_peer(via, "response signature invalid").await;
+        }
+        if !state.pk_of.contains_key(&sender) {
+            return self.fail_peer(via, "response from a non-member responder").await;
+        }
         if state.failed.contains(&sender) {
             // failed pairs stay failed for the epoch — see `on_request`.
             return Ok(());
@@ -973,15 +1256,13 @@ where
                 if *response_hash == response.hash() =>
             {
                 let ack = ack.clone();
-                return self.send_msg(sender, &ReachabilityMsg::Ack(ack)).await;
+                return self.fan_msg(&ReachabilityMsg::Ack(ack)).await;
             }
             _ => {
                 return self.fail_peer(sender, "unsolicited handshake response").await;
             }
         };
-        if response.fields.responder_identity != sender
-            || response.fields.request_hash != request.hash()
-        {
+        if response.fields.request_hash != request.hash() {
             return self.fail_peer(sender, "response does not match our request").await;
         }
         let view = state.view_state.as_ref().expect("mesh verified").clone();
@@ -1022,7 +1303,7 @@ where
                     ack: Some(ack.clone()),
                 });
                 state.plans.insert(sender, plan);
-                self.send_msg(sender, &ReachabilityMsg::Ack(ack)).await?;
+                self.fan_msg(&ReachabilityMsg::Ack(ack)).await?;
                 self.advance().await
             }
             Err(err) => {
@@ -1037,13 +1318,22 @@ where
 
     /// Responder side: the initiator acked — validate our plan. A duplicate
     /// of the ack that already completed this handshake is dropped without
-    /// re-validation (see `on_response` for the replay argument).
+    /// re-validation (see `on_response` for the replay argument). `via` is
+    /// the delivering member (possibly a relay); the counterparty is the
+    /// ack's SIGNED initiator.
     async fn on_ack(
         &mut self,
-        sender: ValidatorIdentity,
+        via: ValidatorIdentity,
         ack: TunnelUpgradeAck,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
+        let sender = ack.fields.initiator_identity;
+        if ack.verify_signature().is_err() {
+            return self.fail_peer(via, "ack signature invalid").await;
+        }
+        if !state.pk_of.contains_key(&sender) {
+            return self.fail_peer(via, "ack from a non-member initiator").await;
+        }
         if state.failed.contains(&sender) {
             // failed pairs stay failed for the epoch — see `on_request`.
             return Ok(());
@@ -1062,8 +1352,7 @@ where
                 return self.fail_peer(sender, "unsolicited handshake ack").await;
             }
         };
-        if ack.fields.initiator_identity != sender
-            || ack.fields.request_hash != request.hash()
+        if ack.fields.request_hash != request.hash()
             || ack.fields.response_hash != response.hash()
         {
             return self.fail_peer(sender, "ack does not match the handshake").await;
