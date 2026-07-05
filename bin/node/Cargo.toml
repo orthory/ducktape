@@ -70,14 +70,11 @@ base64 = "0.22"
 # the http/ws app surface, shared with the embedded daemon: NodeCommand lane,
 # axum router, and serve() — this binary only owns the pump-side of the lane.
 noded = { path = "../noded" }
-# the derived read-model tier: the drain pump folds each finalized block's ops
-# and explorer row into per-module fluent31 indexes; /v1/index/* and /v1/blocks
-# serve snapshot reads of them.
+# the derived read-model tier: bin/node reuses noded's store construction and
+# /v1/index/* + /v1/blocks lanes, folds each sealed block (ops + explorer row)
+# in its drain/replay, and re-derives views from verified state at
+# sync/recovery boundaries.
 indexer = { workspace = true }
-chat-index = { workspace = true }
-tasks-index = { workspace = true }
-document-index = { workspace = true }
-pages-index = { workspace = true }
 # the app-surface thread runs plain tokio (axum); the node itself stays on
 # commonware's runner. the promoted-validator boot catch-up also uses Tokio's
 # bounded mutex/timeout around the temporary statesync client; `signal` drives

@@ -132,6 +132,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// enough to let discovery links warm, but bounded so boot cannot hang forever
 /// before the statesync server bridge is installed.
 const BOOT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+/// how often the reachability plane re-offers its un-acked gossip
+/// (`ReachabilityCommand::Nudge`). fast enough that a boot-window record loss
+/// costs one beat of mesh convergence, slow enough to be noise-free — the
+/// nudge is a no-op once the epoch has assembled.
+const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
 /// post-reboot catch-up should close the reboot gap, not chase a live chain
 /// forever. any tiny lag left after this cap is handled by the normal engine.
 const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
@@ -141,6 +146,12 @@ const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
 const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
+/// pump drain cadence: how often the pump applies finalized frames (and runs
+/// everything that rides the drain arm — checkpoints, valset orchestration,
+/// the epoch cutover, the heartbeat). enforced as a FLOOR via an absolute
+/// deadline in the pump loop: ingress load can delay one drain by one
+/// request's service time, but can never starve the arm.
+const DRAIN_TICK: Duration = Duration::from_millis(100);
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 const CHANNEL_STATE_SYNC: u64 = 4;
@@ -1197,11 +1208,195 @@ fn recovery_frame_to_sync(
     })
 }
 
+// ---------------------------------------------------------------------------
+// the derived-index boot fold. consensus never depends on it: fold errors
+// poison the store and log, heal errors log — recovery and the drain proceed
+// identically with or without the index.
+// ---------------------------------------------------------------------------
+
+/// folds sealed blocks into the derived per-module index during boot (journal
+/// replay + post-reboot frame catch-up), with the GAP DISCIPLINE: once one
+/// sealed height's content is unreproducible (opaque) above some module's
+/// watermark, folding stops for good. advancing watermarks past the hole
+/// would hide it from the post-boot heal, which re-derives from verified
+/// state exactly when a watermark trails the boot tip.
+struct IndexFold<'a> {
+    index: &'a indexer::IndexStore,
+    stopped: bool,
+}
+
+impl<'a> IndexFold<'a> {
+    fn new(index: &'a indexer::IndexStore) -> Self {
+        Self {
+            index,
+            stopped: false,
+        }
+    }
+
+    /// the LOWEST module watermark: an opaque height at or below it is
+    /// already reflected everywhere; above it, at least one module would be
+    /// folded past a hole.
+    fn min_watermark(&self) -> Option<u64> {
+        let mut min: Option<u64> = None;
+        for id in self.index.module_ids() {
+            match self.index.applied_height(id) {
+                Ok(h) => min = Some(min.map_or(h, |m| m.min(h))),
+                Err(_) => return None,
+            }
+        }
+        min
+    }
+}
+
+impl recovery::ReplaySink for IndexFold<'_> {
+    fn folded_block(&mut self, height: u64, dispatches: &[host::DispatchRecord]) {
+        if self.stopped {
+            return;
+        }
+        // the validator's consensus time IS the height (see BlockContext).
+        let ops = noded::index_block_ops(height, height, dispatches);
+        if let Err(err) = self.index.apply_block(&ops) {
+            eprintln!("[node] module index fold failed at height {height}: {err}");
+            self.stopped = true;
+        }
+    }
+
+    fn opaque_block(&mut self, height: u64) {
+        if self.stopped {
+            return;
+        }
+        match self.min_watermark() {
+            Some(watermark) if height <= watermark => {}
+            _ => self.stopped = true,
+        }
+    }
+}
+
+/// re-derive every index module whose watermark trails `boundary` from the
+/// host's VERIFIED canonical state (checkpoint-restored, state-synced, or
+/// replay-verified — every boot caller sits after a root/app-hash check).
+/// failures poison the store and log; the node boots regardless.
+async fn heal_index(index: &indexer::IndexStore, host: &Host, boundary: u64, label: &str) {
+    let meta = indexer::RebuildMeta {
+        height: boundary,
+        // the validator's consensus time IS the height.
+        time: boundary,
+    };
+    match noded::rebuild_stale_modules(index, host, meta).await {
+        Ok(rebuilt) => {
+            for (module, rows) in rebuilt {
+                println!(
+                    "[node {label}] index for {module} re-derived from state at height \
+                     {boundary} ({rows} rows)"
+                );
+            }
+        }
+        Err(err) => eprintln!(
+            "[node {label}] index heal at height {boundary} failed: {err} — wipe \
+             <storage>/index to rebuild"
+        ),
+    }
+}
+
+/// cut and frame every derived-index database (modules + the blocks db) for
+/// the shipped-index lane (indexable spec §7 lane 2). a database that fails
+/// to cut is skipped — whatever a joiner does not receive, its staleness
+/// heal re-derives — and a poisoned store cuts nothing, so the shipment
+/// comes back empty and the joiner falls back entirely.
+fn ship_index_blobs(
+    index: &indexer::IndexStore,
+    label: &str,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut blobs = std::collections::BTreeMap::new();
+    let dbs: Vec<String> = index
+        .module_ids()
+        .map(str::to_string)
+        .chain(std::iter::once(indexer::BLOCKS_DB_ID.to_string()))
+        .collect();
+    for db in dbs {
+        match index.checkpoint_files(&db) {
+            Ok(files) => {
+                blobs.insert(db, statesync::encode_index_archive(&files));
+            }
+            Err(err) => eprintln!("[node {label}] shipped index skips {db}: {err}"),
+        }
+    }
+    blobs
+}
+
+/// fetch the sync source's shipped-index checkpoints and stage them for
+/// adoption at the promoted reboot — the OPTIONAL, UNVERIFIED warm start
+/// over the from-state rebuild (indexable spec §7 lane 2). every outcome
+/// short of a staged-and-committed install converges on the same fallback:
+/// the boot heal re-derives whatever the watermarks say is missing, so
+/// failures here log and fall through, never abort the promotion.
+async fn stage_shipped_index<C: statesync::SyncClient>(
+    client: &C,
+    boundary: statesync::BoundaryId,
+    storage: &std::path::Path,
+    label: &str,
+) {
+    let index_base = storage.join("index");
+    let known: std::collections::BTreeSet<&str> = MODULE_IDS
+        .iter()
+        .copied()
+        .chain(std::iter::once(indexer::BLOCKS_DB_ID))
+        .collect();
+    let staged: Result<usize, String> = async {
+        // a retry of the promotion loop may have staged a partial set
+        // already; start clean so attempts never interleave.
+        indexer::discard_staged(&index_base).map_err(|e| e.to_string())?;
+        let entries = statesync::fetch_index_modules(client, boundary)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut staged = 0usize;
+        for (db, _) in &entries {
+            // a db this binary does not know (version skew) would sit
+            // unopened on disk forever — skip it, its module heals instead.
+            if !known.contains(db.as_str()) {
+                println!("[node {label}] shipped index skips unknown db {db:?}");
+                continue;
+            }
+            let blob = statesync::fetch_index_db(client, boundary, db)
+                .await
+                .map_err(|e| format!("{db}: {e}"))?;
+            let files =
+                statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
+            indexer::stage_shipped_db(&index_base, db, &files).map_err(|e| e.to_string())?;
+            staged += 1;
+        }
+        if staged > 0 {
+            indexer::commit_staged(&index_base).map_err(|e| e.to_string())?;
+        }
+        Ok(staged)
+    }
+    .await;
+    match staged {
+        Ok(0) => println!(
+            "[node {label}] source ships no index — views heal from verified state"
+        ),
+        Ok(n) => println!(
+            "[node {label}] shipped index staged ({n} databases) — adopted at the promoted \
+             reboot; contents are trusted from the source, not verified (spec §7 lane 2)"
+        ),
+        Err(e) => {
+            eprintln!(
+                "[node {label}] shipped index fetch failed: {e} — views heal from verified \
+                 state instead"
+            );
+            if let Err(e) = indexer::discard_staged(&index_base) {
+                eprintln!("[node {label}] shipped index staging cleanup failed: {e}");
+            }
+        }
+    }
+}
+
 async fn apply_verified_suffix_frame(
     host: &mut Host,
     served: &statesync::FinalizedFrame,
-) -> Result<(), String> {
+) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
+    let mut dispatches = Vec::new();
     let outcome = match node::decode_frame(&served.frame) {
         Ok((origin, msg)) => {
             let protocol_version = host.effective_version(served.height).await;
@@ -1213,7 +1408,10 @@ async fn apply_verified_suffix_frame(
                 origin,
             };
             match host.submit_at(ctx, msg).await {
-                Ok(_) => node::Disposition::Applied,
+                Ok(outcome) => {
+                    dispatches = outcome.dispatches;
+                    node::Disposition::Applied
+                }
                 Err(host::SubmitError::Rejected(_)) => node::Disposition::Rejected,
                 Err(host::SubmitError::Fatal(f)) => {
                     return Err(format!("fatal host error applying suffix frame: {f}"));
@@ -1245,13 +1443,14 @@ async fn apply_verified_suffix_frame(
             hex(&served.app_hash)
         ));
     }
-    Ok(())
+    Ok(dispatches)
 }
 
 async fn apply_and_journal_verified_frame<E>(
     recovery: &mut Recovery<E>,
     host: &mut Host,
     frame: &statesync::FinalizedFrame,
+    fold: Option<&mut IndexFold<'_>>,
 ) -> Result<(), String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -1259,7 +1458,7 @@ where
     node::BlockSink::pre_apply(recovery, frame.height, &frame.frame)
         .await
         .map_err(|e| format!("catch-up WAL write: {e}"))?;
-    apply_verified_suffix_frame(host, frame).await?;
+    let dispatches = apply_verified_suffix_frame(host, frame).await?;
     let seal = node::BlockSeal {
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),
@@ -1269,6 +1468,10 @@ where
     node::BlockSink::seal(recovery, &seal)
         .await
         .map_err(|e| format!("catch-up seal write: {e}"))?;
+    if let Some(fold) = fold {
+        use recovery::ReplaySink as _;
+        fold.folded_block(frame.height, &dispatches);
+    }
     Ok(())
 }
 
@@ -1285,6 +1488,7 @@ async fn apply_post_reboot_catchup_frames<E>(
     from_height: u64,
     to_height: u64,
     frames: Vec<statesync::FinalizedFrame>,
+    mut fold: Option<&mut IndexFold<'_>>,
 ) -> Result<PostRebootCatchupApply, String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -1318,7 +1522,7 @@ where
                 frame.height
             ));
         }
-        apply_and_journal_verified_frame(recovery, host, &frame).await?;
+        apply_and_journal_verified_frame(recovery, host, &frame, fold.as_deref_mut()).await?;
         last = frame.height;
         applied.applied += 1;
         applied.frames.push(frame.frame.clone());
@@ -1421,6 +1625,7 @@ async fn catch_up_post_reboot_frames<C, E>(
     client: &C,
     recovery: &mut Recovery<E>,
     host: &mut Host,
+    fold: Option<&mut IndexFold<'_>>,
     recovered_height: u64,
     max_iterations: usize,
 ) -> Result<PostRebootCatchup, PostRebootCatchupError>
@@ -1428,6 +1633,7 @@ where
     C: statesync::SyncClient,
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
 {
+    let mut fold = fold;
     let mut current_height = recovered_height;
     let mut total_frames = 0usize;
     let mut target = None;
@@ -1481,10 +1687,16 @@ where
                 )));
             }
         };
-        let applied =
-            apply_post_reboot_catchup_frames(recovery, host, current_height, tip.height, frames)
-                .await
-                .map_err(PostRebootCatchupError::Fatal)?;
+        let applied = apply_post_reboot_catchup_frames(
+            recovery,
+            host,
+            current_height,
+            tip.height,
+            frames,
+            fold.as_deref_mut(),
+        )
+        .await
+        .map_err(PostRebootCatchupError::Fatal)?;
         if host.app_hash() != tip.app_hash {
             return Err(PostRebootCatchupError::Fatal(format!(
                 "catch-up frames landed at {}, target manifest {}",
@@ -2765,6 +2977,8 @@ async fn reachability_plane(
     advertised: Ingress,
     coordinators: Vec<Ingress>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
+    // a clone of the `commands` sender, for the plane's own nudge ticker.
+    nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
 ) {
     use std::net::ToSocketAddrs as _;
@@ -2847,6 +3061,35 @@ async fn reachability_plane(
         coordinators: coords,
         port_policy: policy,
     };
+    // the boot `Retarget`'s record fan-out fires before the p2p actors have
+    // a single live connection, and mesh sends are best-effort — when both
+    // sides of a link lose that first datagram the plane deadlocks in record
+    // gossip. the nudge re-offers un-acked gossip until the epoch assembles
+    // (a no-op afterwards). the ticker holds only a WEAK sender: the plane's
+    // exit is "every command sender dropped", and a strong clone here would
+    // keep its own channel alive forever.
+    let nudges = {
+        let weak = nudges.downgrade();
+        // the strong param must die NOW — holding it for the plane's
+        // lifetime would itself keep the channel open.
+        drop(nudges);
+        weak
+    };
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(NUDGE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(tx) = nudges.upgrade() else { break };
+            if tx
+                .send(reachability::ReachabilityCommand::Nudge)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     match effect_kind {
         WireGuardEffectKind::Fake => {
             println!(
@@ -2929,6 +3172,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         dev_demo,
         checkpoint_blocks,
         invite_token,
+        sync_index,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -2993,17 +3237,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
     // there was a silent no-op). reaching them needs the nat client to
     // hole-punch/relay through the coordinator and bring up a WireGuard tunnel
-    // — the reachability data plane. that plane now runs STAGED behind the
-    // `wireguard_listen` key (rendezvous + handshakes are real, the interface
-    // effect is the recording fake), so a coordinated-only invite still
+    // — the reachability data plane. that plane runs behind the
+    // `wireguard_listen` key and drives a real interface by default
+    // (`wireguard_effect = "fake"` opts out), but the TCP mesh dialer does
+    // not route over the tunnel yet, so a coordinated-only invite still
     // cannot carry mesh traffic; surface it loudly rather than park silently.
     // see docs/deploy/private-cutover-integration-gap.md.
     if !coordinated.is_empty() {
         println!(
-            "[node {label}] WARNING: {} coordinated reach target(s) require a live WireGuard \
-             tunnel, which this build only STAGES (fake interface effect) — these peers are \
-             UNREACHABLE for mesh traffic until the real effect lands. use a direct/fronted \
-             invite for now.",
+            "[node {label}] WARNING: {} coordinated reach target(s) need mesh traffic to flow \
+             over a WireGuard tunnel, but the mesh dialer does not route over tunnels yet — \
+             these peers are UNREACHABLE for mesh traffic. use a direct/fronted invite for \
+             now.",
             coordinated.len()
         );
         for (target, coord, _coord_key) in &coordinated {
@@ -3014,11 +3259,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         }
     }
     if let Some(wg) = &wireguard_listen {
-        println!(
-            "[node {label}] reachability plane: STAGED — advertising WireGuard endpoint \
-             udp/{wg}; records, advertisements, and tunnel handshakes run for real, the \
-             interface effect is the phase-A recording fake (no root, no real tunnel)."
-        );
+        match wireguard_effect {
+            WireGuardEffectKind::Real => println!(
+                "[node {label}] reachability plane: advertising WireGuard endpoint udp/{wg}"
+            ),
+            WireGuardEffectKind::Fake => println!(
+                "[node {label}] reachability plane: advertising WireGuard endpoint udp/{wg}; \
+                 records, advertisements, and tunnel handshakes run for real, the interface \
+                 effect is the in-memory fake (no real tunnel)."
+            ),
+        }
     }
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
@@ -3033,29 +3283,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
-    // the per-module derived index: one fluent31 database per module under
-    // <storage>/index/<module>/, plus the blocks database the explorer reads —
-    // the pump below folds each non-empty block into it as it drains, and
-    // GET /v1/blocks + /v1/index/* serve snapshot reads (never the actor).
-    // an open failure is fatal-with-remedy rather than a silent no-index run:
-    // the tier is rebuildable, so the fix is always "delete <storage>/index".
-    let index_dir = storage.join("index");
-    let index = indexer::IndexStore::open(&index_dir, &MODULE_IDS)
-        .map(|store| {
-            std::sync::Arc::new(
-                store
-                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
-                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
-                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
-            )
-        })
-        .map_err(|err| {
-            format!(
-                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
-                index_dir.display()
-            )
-        })?;
+    // the derived per-module index (noded's exact store, <storage>/index),
+    // plus the blocks database the explorer reads: the pump folds sealed
+    // blocks into it, boot heals it from verified state at sync/recovery
+    // boundaries, and the already-routed GET /v1/blocks + /v1/index/* lanes
+    // light up through the handle below. an open failure is fatal-with-remedy
+    // rather than a silent no-index run: the tier is rebuildable, so the fix
+    // is always "delete <storage>/index".
+    let index = noded::open_index_store(&storage, &MODULE_IDS)?;
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
@@ -3574,6 +3809,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             };
             println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
 
+            // the optional shipped-index warm start rides the same sync
+            // connection, staged BEFORE the promotion checkpoint lands: a
+            // crash mid-fetch reboots back into joiner mode and refetches,
+            // and a torn staging directory is discarded at adoption. the
+            // promoted reboot's IndexStore::open adopts what committed here.
+            if sync_index {
+                stage_shipped_index(&client, boundary.boundary_id(), &storage_for_sync, &label)
+                    .await;
+            }
+
             // fabricate the checkpoint a restart would have left; the normal
             // recovery boot turns it into a live validator. next_seq starts
             // at 1 — this identity never framed ops on this network. (a
@@ -3632,6 +3877,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             reboot_self();
         }
         // (host, recovered-state, next local submit seq, last checkpoint
+        // ONE index fold for the whole boot (journal replay + post-reboot
+        // catch-up + post-sync refreshes): its stop flag must persist across
+        // phases — a later phase folding past a gap an earlier phase detected
+        // would advance watermarks over the hole and hide it from the final
+        // heal below.
+        let mut boot_fold = IndexFold::new(&index);
         // (height, oplog position) for the pump's prune bookkeeping, and the
         // manifest that recovery used as its replay baseline).
         let (
@@ -3712,7 +3963,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         std::process::exit(1);
                     }
                 };
-                let rec = match recovery.recover(&mut host, &manifest).await {
+                // heal the derived index against the CHECKPOINT boundary
+                // BEFORE replay: a wiped or trailing per-module database
+                // re-derives from the verified checkpoint state, so the
+                // journal-suffix fold lands contiguously on top instead of
+                // folding forward over a pre-checkpoint hole.
+                if let Some(ckpt_height) = manifest.height {
+                    heal_index(&index, &host, ckpt_height, &label).await;
+                }
+                let rec = match recovery
+                    .recover_with_sink(&mut host, &manifest, Some(&mut boot_fold))
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!(
@@ -3856,6 +4118,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let reach_signer = signer.clone();
                     let chain_id = String::from_utf8_lossy(&namespace).to_string();
                     let key_file = wireguard_key_file.clone();
+                    let nudge_tx = cmd_tx.clone();
                     std::thread::Builder::new()
                         .name("reachability".into())
                         .spawn(move || {
@@ -3873,6 +4136,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     advertised_reach,
                                     coordinators,
                                     cmd_rx,
+                                    nudge_tx,
                                     ev_tx,
                                 ));
                         })
@@ -3914,11 +4178,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         epoch,
                                         interface,
                                         peers,
-                                    } => println!(
-                                        "[node {pump_label}] reachability: epoch {epoch} tunnel \
-                                         config staged on {interface} ({peers} peer(s); fake \
-                                         effect — no real interface yet)"
-                                    ),
+                                    } => match wireguard_effect {
+                                        WireGuardEffectKind::Real => println!(
+                                            "[node {pump_label}] reachability: epoch {epoch} \
+                                             tunnels applied on {interface} ({peers} peer(s))"
+                                        ),
+                                        WireGuardEffectKind::Fake => println!(
+                                            "[node {pump_label}] reachability: epoch {epoch} \
+                                             tunnel config staged on {interface} ({peers} \
+                                             peer(s); fake effect — no real interface)"
+                                        ),
+                                    },
                                     reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
                                         println!(
                                             "[node {pump_label}] reachability: peer {}: {reason}",
@@ -3983,6 +4253,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &client,
                     &mut recovery,
                     &mut host,
+                    Some(&mut boot_fold),
                     recovered_height,
                     POST_REBOOT_CATCHUP_MAX_ITERS,
                 )
@@ -4069,7 +4340,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         prev_ckpt = (ckpt.height, ckpt.oplog_pos);
-                        let refreshed = match recovery.recover(&mut host, &ckpt).await {
+                        let refreshed = match recovery
+                            .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
+                            .await
+                        {
                             Ok(rec) => rec,
                             Err(e) => {
                                 eprintln!(
@@ -4193,7 +4467,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         prev_ckpt = (ckpt.height, ckpt.oplog_pos);
-                        let refreshed = match recovery.recover(&mut host, &ckpt).await {
+                        let refreshed = match recovery
+                            .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
+                            .await
+                        {
                             Ok(rec) => rec,
                             Err(e) => {
                                 eprintln!(
@@ -4237,6 +4514,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     std::process::exit(1);
                 }
             }
+        }
+
+        // the FINAL index heal, at the boot tip every path converged on:
+        // whatever the replay/catch-up fold could not reproduce (opaque
+        // blocks, a state-sync jump, a stopped fold) re-derives here from
+        // state that has verified against the boundary app-hash.
+        drop(boot_fold);
+        if let Some(boot_height) = resumed.as_ref().and_then(|r| r.height) {
+            heal_index(&index, &host, boot_height, &label).await;
         }
 
         let member_keys = match resume_member_keys(resumed.as_ref(), &validators) {
@@ -4721,6 +5007,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let _ = node.sink_mut().sync().await;
             }};
         }
+        // the drain deadline (see the drain arm): ABSOLUTE, so the
+        // per-iteration select rebuild cannot reset it under ingress load.
+        let mut next_drain = context.current() + DRAIN_TICK;
         loop {
             // resolve on whichever signal stream installed; if neither did,
             // this arm simply never fires (pending forever) and the loop runs
@@ -4752,305 +5041,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     graceful_checkpoint!();
                     std::process::exit(0);
                 }
-                job = rpc_ingress.next() => {
-                    let Some((req, reply)) = job else { continue };
-                    let resp = match req {
-                        RpcRequest::Submit { target, payload_hex } => {
-                            match unhex(&payload_hex) {
-                                Ok(payload) => {
-                                    let seq = next_seq;
-                                    next_seq += 1;
-                                    match node
-                                        .submit(&signer, seq, Msg { target, payload })
-                                        .await
-                                    {
-                                        Ok(_) => RpcReply::ok(),
-                                        Err(e) => RpcReply::err(format!("submit failed: {e}")),
-                                    }
-                                }
-                                Err(e) => RpcReply::err(format!("bad payload_hex: {e}")),
-                            }
-                        }
-                        RpcRequest::Query { target, req_hex } => match unhex(&req_hex) {
-                            Ok(req_bytes) => match node.host().query(&target, &req_bytes).await {
-                                Ok(bytes) => RpcReply {
-                                    reply_hex: Some(hex_bytes(&bytes)),
-                                    ..RpcReply::ok()
-                                },
-                                Err(e) => RpcReply::err(format!("query failed: {e}")),
-                            },
-                            Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
-                        },
-                        RpcRequest::Status => {
-                            let mut modules = std::collections::BTreeMap::new();
-                            for m in MODULE_IDS {
-                                if let Some(root) = node.host().module_root(m) {
-                                    modules.insert(m.to_string(), hex(&root));
-                                }
-                            }
-                            RpcReply {
-                                status: Some(RpcStatus {
-                                    height: node.finalized().map(|f| f.height),
-                                    app_hash: hex(&node.app_hash()),
-                                    modules,
-                                }),
-                                ..RpcReply::ok()
-                            }
-                        }
-                        RpcRequest::JoinRequests => {
-                            // read-time hygiene: an approved joiner is a member
-                            // now — its request is settled, drop it.
-                            let members = read_members_from_host(node.host()).await;
-                            join_requests.retain(|joiner, _| !members.contains(joiner));
-                            let views = join_requests
-                                .iter()
-                                .map(|(joiner, r)| JoinRequestView {
-                                    joiner: hex_bytes(joiner),
-                                    issuer: hex_bytes(&r.issuer),
-                                    first_seen_ms: r.first_seen_ms,
-                                    last_seen_ms: r.last_seen_ms,
-                                })
-                                .collect();
-                            RpcReply {
-                                join_requests: Some(views),
-                                ..RpcReply::ok()
-                            }
-                        }
-                        RpcRequest::Shutdown => {
-                            // best-effort final checkpoint + journal barrier so
-                            // the restart replays a minimal suffix; a failure
-                            // here is just the crash path, which also recovers.
-                            // SAME sequence as the signal arm (shared macro).
-                            graceful_checkpoint!();
-                            let _ = reply.send(RpcReply::ok());
-                            println!("[node {label}] shutdown requested via rpc — exiting");
-                            std::process::exit(0);
-                        }
-                    };
-                    let _ = reply.send(resp);
-                }
-                announce = lobby_ingress.next() => {
-                    let Some((peer, bytes)) = announce else { continue };
-                    let mut send_reply = |recorded: bool, detail: String| {
-                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
-                        let _ = lobby_tx.send(
-                            Recipients::One(peer.clone()),
-                            IoBuf::from(lobby::encode_msg(&msg)),
-                            false,
-                        );
-                    };
-                    let msg = match lobby::decode_msg(&bytes) {
-                        Ok(m) => m,
-                        Err(_) => continue, // junk on the doorbell — drop.
-                    };
-                    // crypto first (pure, cheap): the token must verify for
-                    // THIS network and the announced key must prove itself.
-                    let verified = match lobby::verify_join_request(&msg, &namespace) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            send_reply(false, e);
-                            continue;
-                        }
-                    };
-                    // then membership: the issuer must still be a member (a
-                    // removed member's outstanding invites die with it), and a
-                    // joiner that is already a member has nothing pending.
-                    let members = read_members_from_host(node.host()).await;
-                    let joiner_bytes = verified.joiner.as_ref().to_vec();
-                    if members.contains(&joiner_bytes) {
-                        send_reply(false, "already a validator".into());
-                        continue;
-                    }
-                    if !members.contains(&verified.issuer.as_ref().to_vec()) {
-                        send_reply(
-                            false,
-                            "the inviting member is no longer part of this network".into(),
-                        );
-                        continue;
-                    }
-                    let now = unix_ms();
-                    let fresh = !join_requests.contains_key(&joiner_bytes);
-                    let record = join_requests
-                        .entry(joiner_bytes)
-                        .or_insert(JoinRequestRecord {
-                            issuer: verified.issuer.as_ref().to_vec(),
-                            first_seen_ms: now,
-                            last_seen_ms: now,
-                        });
-                    record.last_seen_ms = now;
-                    if fresh {
-                        println!(
-                            "[node {label}] join request: {} asks to join (invited by {}) — \
-                             approve in the app, or run `ducktape-node invite-accept {}`",
-                            hex_bytes(verified.joiner.as_ref()),
-                            hex_bytes(&record.issuer),
-                            hex_bytes(verified.joiner.as_ref())
-                        );
-                    }
-                    send_reply(
-                        true,
-                        "join request recorded — awaiting member approval".into(),
-                    );
-                }
-                cmd = http_ingress.next() => {
-                    let Some(cmd) = cmd else { continue };
-                    match cmd {
-                        // `origin` is the caller's CLAIMED submitter identity —
-                        // meaningful on the embedded daemon, but this lane signs
-                        // frames, and the signed origin IS this node's pubkey
-                        // (authenticated authorship that governance relies on).
-                        // a claimed origin cannot ride a signed frame without
-                        // making authorship forgeable, so it is ignored here;
-                        // display names resolve via the name registry instead.
-                        noded::NodeCommand::Submit { target, payload, origin: _, reply } => {
-                            let seq = next_seq;
-                            next_seq += 1;
-                            match node.submit(&signer, seq, Msg { target, payload }).await {
-                                // HOLD the reply: it lands when this frame
-                                // drains at a finalized boundary, so the app's
-                                // follow-up query reads the applied state.
-                                Ok(frame) => {
-                                    pending_submits.insert(
-                                        frame,
-                                        (reply, std::time::Instant::now() + SUBMIT_HOLD),
-                                    );
-                                }
-                                Err(e) => {
-                                    let _ = reply.send(Err(format!("submit failed: {e}")));
-                                }
-                            }
-                        }
-                        noded::NodeCommand::Query { target, req, reply } => {
-                            let result = node
-                                .host()
-                                .query(&target, &req)
-                                .await
-                                .map_err(|e| e.to_string());
-                            let _ = reply.send(result);
-                        }
-                        noded::NodeCommand::Status { reply } => {
-                            let modules = MODULE_IDS
-                                .iter()
-                                .map(|m| noded::ModuleStatus {
-                                    id: (*m).into(),
-                                    root: node
-                                        .host()
-                                        .module_root(m)
-                                        .map(|r| hex(&r))
-                                        .unwrap_or_default(),
-                                    category: noded::ModuleCategory::of(m),
-                                })
-                                .collect();
-                            let _ = reply.send(noded::NodeStatus {
-                                version: env!("CARGO_PKG_VERSION").into(),
-                                app_hash: hex(&node.app_hash()),
-                                height: node.finalized().map(|f| f.height).unwrap_or(0),
-                                modules,
-                            });
-                        }
-                        noded::NodeCommand::Metrics { reply } => {
-                            // the validator serves commonware's runtime registry;
-                            // the `ducktape_*` block series are the local daemon's
-                            // (noded's) surface, not wired into this consensus path.
-                            let _ = reply.send(context.encode());
-                        }
-                    }
-                }
-                msg = sync_ingress.next() => {
-                    let Some((peer, bytes)) = msg else {
-                        // the ingress task ended (network shutdown) — nothing
-                        // left to serve; keep draining consensus regardless.
-                        continue;
-                    };
-                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
-                        continue; // malformed rpc envelope: drop, never crash.
-                    };
-                    let resp = match statesync::decode_request(body) {
-                        Ok(statesync::SyncRequest::Frames {
-                            after_height,
-                            up_to_height,
-                        }) => {
-                            let response = match node
-                                .sink_mut()
-                                .read_finalized_frames(after_height, up_to_height)
-                                .await
-                            {
-                                Ok(frames) => {
-                                    let mut out = Vec::new();
-                                    let mut err = None;
-                                    for frame in frames
-                                        .into_iter()
-                                        .take(statesync::FRAME_BATCH_LEN)
-                                    {
-                                        match recovery_frame_to_sync(frame) {
-                                            Ok(frame) => out.push(frame),
-                                            Err(e) => {
-                                                err = Some(e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    match err {
-                                        Some(e) => statesync::SyncResponse::Error(e),
-                                        None => statesync::SyncResponse::Frames { frames: out },
-                                    }
-                                }
-                                Err(recovery::Error::RangePruned {
-                                    after_height,
-                                    retained_start,
-                                }) => statesync::SyncResponse::RangePruned {
-                                    requested_after: after_height,
-                                    retained_from: retained_start,
-                                },
-                                Err(e) => statesync::SyncResponse::Error(format!(
-                                    "recovery frame range: {e}"
-                                )),
-                            };
-                            statesync::encode_response(&response)
-                        }
-                        Ok(req) => {
-                            // the boundary's consensus coordinates ride the manifest.
-                            // the floor certificate is served only when it certifies
-                            // exactly the current boundary — a cert behind the
-                            // boundary would make a joiner skip history it needs.
-                            // stamp the served boundary's committed version fields from
-                            // live upgrade state (like epoch/view_base). a joiner installs
-                            // its dual-path modules at `current_version` and preflights
-                            // against `required_min_version` — both derived from these.
-                            let (bc_current, bc_pending) =
-                                read_upgrade_version_fields(node.host()).await;
-                            let coords = statesync::BoundaryCoords {
-                                epoch: orchestrator.epoch(),
-                                view_base: orchestrator.epoch_base(),
-                                participants: participant_bytes(&orchestrator),
-                                current_version: bc_current,
-                                pending_upgrade: bc_pending,
-                                floor_cert: latest_floor
-                                    .as_ref()
-                                    .filter(|fc| fc.epoch == orchestrator.epoch())
-                                    .filter(|fc| {
-                                        node.finalized().is_some_and(|f| f.height == fc.height)
-                                    })
-                                    .map(|fc| fc.cert.clone()),
-                            };
-                            let finalized_for_sync = node.finalized().filter(|f| {
-                                f.height <= coords.view_base || coords.floor_cert.is_some()
-                            });
-                            let response =
-                                sync_server.handle(node.host(), finalized_for_sync, &coords, req).await;
-                            statesync::encode_response(&response)
-                        }
-                        Err(e) => statesync::encode_response(&statesync::SyncResponse::Error(
-                            format!("bad request frame: {e}"),
-                        )),
-                    };
-                    let _ = sync_tx.send(
-                        Recipients::One(peer),
-                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                        false,
-                    );
-                }
-                _ = context.sleep(Duration::from_millis(100)).fuse() => {
+                // DRAIN CADENCE — an ABSOLUTE deadline, hoisted ABOVE the ingress
+                // arms. this select is rebuilt every loop iteration, so an
+                // arm-local `sleep(100ms)` restarts from zero whenever any other
+                // arm completes first — a saturating rpc-submit stream (requests
+                // landing well inside 100ms) then resets the timer forever and
+                // the drain NEVER runs: heights and status freeze, held submit
+                // replies starve, and the epoch cutover (`respawn_if_due` below
+                // is drain-driven) stalls for exactly as long as the flood lasts
+                // while the armed boundary's discard window swallows every
+                // accepted op. an absolute deadline survives the select rebuild,
+                // and sitting above the ingress arms makes `select_biased!` take
+                // it the moment it is due — load can delay one drain by one
+                // request's service time, never starve it.
+                _ = context.sleep_until(next_drain).fuse() => {
+                    next_drain = context.current() + DRAIN_TICK;
                     // FAIL-STOP: a drain error is a node-local block-boundary
                     // fault — this node's state is indeterminate relative to its
                     // peers, so applying even one more finalized op could
@@ -5073,82 +5078,77 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         .iter()
                         .filter(|d| d.disposition != node::Disposition::Discarded)
                         .count() as u64;
-                    // fold each NON-EMPTY block into the derived index: the
-                    // explorer row (GET /v1/blocks) plus per-module op rows
-                    // (/v1/index/*), durable across restarts. skip the
-                    // heartbeat nop (the deliberately-empty block that only
-                    // ticks an idle chain) and frames with no decoded op (a
-                    // ceiling discard or a failed decode — nothing to show).
+                    // fold every SEALED frame into the derived per-module
+                    // index: an applied frame contributes its dispatch trace,
+                    // a rejected one folds EMPTY (it still consumed its
+                    // height, and every module's watermark must track the
+                    // sealed tip or restart staleness checks would rebuild
+                    // spuriously). discarded frames never sealed a height.
+                    // a frame the explorer shows — a decoded op that isn't
+                    // the heartbeat nop (the deliberately-empty block that
+                    // only ticks an idle chain) — additionally carries its
+                    // explorer row, so GET /v1/blocks survives restarts.
+                    // canonical state committed above, so an index failure
+                    // degrades read models only — the store poisons itself
+                    // and stays loud until rebuilt.
                     for d in &drained {
-                        let Some(op) = &d.op else { continue };
-                        if op.target == NOP_TARGET {
+                        if d.disposition == node::Disposition::Discarded {
                             continue;
                         }
-                        let disposition = match d.disposition {
-                            node::Disposition::Applied => noded::BlockDisposition::Applied,
-                            node::Disposition::Rejected => noded::BlockDisposition::Rejected,
-                            // unreachable — a discard carries no op and was
-                            // skipped above — but stay total on this
-                            // observability lane rather than panic.
-                            node::Disposition::Discarded => continue,
+                        let dispatches: &[host::DispatchRecord] = match (&d.disposition, &d.op) {
+                            (node::Disposition::Applied, Some(op)) => &op.dispatches,
+                            _ => &[],
                         };
-                        let record = noded::BlockRecord {
-                            height: d.height,
-                            hash: noded::hex_bytes(&d.id),
-                            commit_hash: hex(&d.app_hash),
-                            proposer: match &op.origin {
-                                sdk::Origin::External(key) => noded::hex_bytes(key),
-                                // frames only carry verified External
-                                // authorship; label the impossible rest.
-                                sdk::Origin::Module(id) => format!("module:{id}"),
-                                sdk::Origin::System => "system".into(),
-                            },
-                            disposition,
-                            target: op.target.clone(),
-                            operations: op.dispatches.iter().map(noded::DispatchInfo::from).collect(),
-                            payload: noded::payload_preview(&op.payload),
-                            // staging IS hashing: put_chunk keys the blob by
-                            // sha256, so this one call both computes the op's
-                            // content address and makes it dereferencable via
-                            // GET /v1/files/blob/{op_hash}.
-                            op_hash: noded::hex_bytes(&blobs.put_chunk(op.payload.clone())),
+                        let record = match &d.op {
+                            Some(op) if op.target != NOP_TARGET => {
+                                let disposition = match d.disposition {
+                                    node::Disposition::Applied => noded::BlockDisposition::Applied,
+                                    node::Disposition::Rejected => noded::BlockDisposition::Rejected,
+                                    // unreachable — filtered at the loop top —
+                                    // but stay total on this observability
+                                    // lane rather than panic.
+                                    node::Disposition::Discarded => continue,
+                                };
+                                Some(noded::block_row(&noded::BlockRecord {
+                                    height: d.height,
+                                    hash: noded::hex_bytes(&d.id),
+                                    commit_hash: hex(&d.app_hash),
+                                    proposer: match &op.origin {
+                                        sdk::Origin::External(key) => noded::hex_bytes(key),
+                                        // frames only carry verified External
+                                        // authorship; label the impossible rest.
+                                        sdk::Origin::Module(id) => format!("module:{id}"),
+                                        sdk::Origin::System => "system".into(),
+                                    },
+                                    disposition,
+                                    target: op.target.clone(),
+                                    operations: op
+                                        .dispatches
+                                        .iter()
+                                        .map(noded::DispatchInfo::from)
+                                        .collect(),
+                                    payload: noded::payload_preview(&op.payload),
+                                    // staging IS hashing: put_chunk keys the
+                                    // blob by sha256, so this one call both
+                                    // computes the op's content address and
+                                    // makes it dereferencable via
+                                    // GET /v1/files/blob/{op_hash}.
+                                    op_hash: noded::hex_bytes(&blobs.put_chunk(op.payload.clone())),
+                                }))
+                            }
+                            _ => None,
                         };
-                        let ops = op
-                            .dispatches
-                            .iter()
-                            .map(|rec| indexer::AppliedOp {
-                                module: rec.module.clone(),
-                                origin: match &rec.origin {
-                                    // identities on this lane are ed25519 key
-                                    // bytes, not readable names — hex them,
-                                    // matching the proposer field and the
-                                    // profiles registry's key space.
-                                    sdk::Origin::External(key) => {
-                                        indexer::OriginTag::external(noded::hex_bytes(key))
-                                    }
-                                    sdk::Origin::Module(id) => {
-                                        indexer::OriginTag::module(id.clone())
-                                    }
-                                    sdk::Origin::System => indexer::OriginTag::system(),
-                                },
-                                payload: rec.payload.clone(),
-                            })
-                            .collect();
-                        // canonical state is already committed; an index
-                        // failure degrades the read models, never the block.
-                        // the store poisons itself on error (contiguity over
-                        // coverage) and stays loud until rebuilt.
-                        if let Err(err) = index.apply_block(&indexer::BlockOps {
-                            height: d.height,
+                        let ops = indexer::BlockOps {
+                            record,
                             // this lane's agreed clock IS the height: the
                             // drain stamps BlockContext { consensus_time:
                             // height } for every frame.
-                            time: d.height,
-                            ops,
-                            record: Some(noded::block_row(&record)),
-                        }) {
+                            ..noded::index_block_ops(d.height, d.height, dispatches)
+                        };
+                        if let Err(err) = index.apply_block(&ops) {
                             eprintln!(
-                                "[node {label}] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
+                                "[node {label}] module index apply failed at height {}: {err} \
+                                 — wipe <storage>/index to rebuild",
                                 d.height
                             );
                         }
@@ -5673,6 +5673,317 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         converged = true;
                     }
                 }
+                job = rpc_ingress.next() => {
+                    let Some((req, reply)) = job else { continue };
+                    let resp = match req {
+                        RpcRequest::Submit { target, payload_hex } => {
+                            match unhex(&payload_hex) {
+                                Ok(payload) => {
+                                    let seq = next_seq;
+                                    next_seq += 1;
+                                    match node
+                                        .submit(&signer, seq, Msg { target, payload })
+                                        .await
+                                    {
+                                        Ok(_) => RpcReply::ok(),
+                                        Err(e) => RpcReply::err(format!("submit failed: {e}")),
+                                    }
+                                }
+                                Err(e) => RpcReply::err(format!("bad payload_hex: {e}")),
+                            }
+                        }
+                        RpcRequest::Query { target, req_hex } => match unhex(&req_hex) {
+                            Ok(req_bytes) => match node.host().query(&target, &req_bytes).await {
+                                Ok(bytes) => RpcReply {
+                                    reply_hex: Some(hex_bytes(&bytes)),
+                                    ..RpcReply::ok()
+                                },
+                                Err(e) => RpcReply::err(format!("query failed: {e}")),
+                            },
+                            Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
+                        },
+                        RpcRequest::Status => {
+                            let mut modules = std::collections::BTreeMap::new();
+                            for m in MODULE_IDS {
+                                if let Some(root) = node.host().module_root(m) {
+                                    modules.insert(m.to_string(), hex(&root));
+                                }
+                            }
+                            RpcReply {
+                                status: Some(RpcStatus {
+                                    height: node.finalized().map(|f| f.height),
+                                    app_hash: hex(&node.app_hash()),
+                                    modules,
+                                }),
+                                ..RpcReply::ok()
+                            }
+                        }
+                        RpcRequest::JoinRequests => {
+                            // read-time hygiene: an approved joiner is a member
+                            // now — its request is settled, drop it.
+                            let members = read_members_from_host(node.host()).await;
+                            join_requests.retain(|joiner, _| !members.contains(joiner));
+                            let views = join_requests
+                                .iter()
+                                .map(|(joiner, r)| JoinRequestView {
+                                    joiner: hex_bytes(joiner),
+                                    issuer: hex_bytes(&r.issuer),
+                                    first_seen_ms: r.first_seen_ms,
+                                    last_seen_ms: r.last_seen_ms,
+                                })
+                                .collect();
+                            RpcReply {
+                                join_requests: Some(views),
+                                ..RpcReply::ok()
+                            }
+                        }
+                        RpcRequest::Shutdown => {
+                            // best-effort final checkpoint + journal barrier so
+                            // the restart replays a minimal suffix; a failure
+                            // here is just the crash path, which also recovers.
+                            // SAME sequence as the signal arm (shared macro).
+                            graceful_checkpoint!();
+                            let _ = reply.send(RpcReply::ok());
+                            println!("[node {label}] shutdown requested via rpc — exiting");
+                            std::process::exit(0);
+                        }
+                    };
+                    let _ = reply.send(resp);
+                }
+                announce = lobby_ingress.next() => {
+                    let Some((peer, bytes)) = announce else { continue };
+                    let mut send_reply = |recorded: bool, detail: String| {
+                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
+                        let _ = lobby_tx.send(
+                            Recipients::One(peer.clone()),
+                            IoBuf::from(lobby::encode_msg(&msg)),
+                            false,
+                        );
+                    };
+                    let msg = match lobby::decode_msg(&bytes) {
+                        Ok(m) => m,
+                        Err(_) => continue, // junk on the doorbell — drop.
+                    };
+                    // crypto first (pure, cheap): the token must verify for
+                    // THIS network and the announced key must prove itself.
+                    let verified = match lobby::verify_join_request(&msg, &namespace) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            send_reply(false, e);
+                            continue;
+                        }
+                    };
+                    // then membership: the issuer must still be a member (a
+                    // removed member's outstanding invites die with it), and a
+                    // joiner that is already a member has nothing pending.
+                    let members = read_members_from_host(node.host()).await;
+                    let joiner_bytes = verified.joiner.as_ref().to_vec();
+                    if members.contains(&joiner_bytes) {
+                        send_reply(false, "already a validator".into());
+                        continue;
+                    }
+                    if !members.contains(&verified.issuer.as_ref().to_vec()) {
+                        send_reply(
+                            false,
+                            "the inviting member is no longer part of this network".into(),
+                        );
+                        continue;
+                    }
+                    let now = unix_ms();
+                    let fresh = !join_requests.contains_key(&joiner_bytes);
+                    let record = join_requests
+                        .entry(joiner_bytes)
+                        .or_insert(JoinRequestRecord {
+                            issuer: verified.issuer.as_ref().to_vec(),
+                            first_seen_ms: now,
+                            last_seen_ms: now,
+                        });
+                    record.last_seen_ms = now;
+                    if fresh {
+                        println!(
+                            "[node {label}] join request: {} asks to join (invited by {}) — \
+                             approve in the app, or run `ducktape-node invite-accept {}`",
+                            hex_bytes(verified.joiner.as_ref()),
+                            hex_bytes(&record.issuer),
+                            hex_bytes(verified.joiner.as_ref())
+                        );
+                    }
+                    send_reply(
+                        true,
+                        "join request recorded — awaiting member approval".into(),
+                    );
+                }
+                cmd = http_ingress.next() => {
+                    let Some(cmd) = cmd else { continue };
+                    match cmd {
+                        // `origin` is the caller's CLAIMED submitter identity —
+                        // meaningful on the embedded daemon, but this lane signs
+                        // frames, and the signed origin IS this node's pubkey
+                        // (authenticated authorship that governance relies on).
+                        // a claimed origin cannot ride a signed frame without
+                        // making authorship forgeable, so it is ignored here;
+                        // display names resolve via the name registry instead.
+                        noded::NodeCommand::Submit { target, payload, origin: _, reply } => {
+                            let seq = next_seq;
+                            next_seq += 1;
+                            match node.submit(&signer, seq, Msg { target, payload }).await {
+                                // HOLD the reply: it lands when this frame
+                                // drains at a finalized boundary, so the app's
+                                // follow-up query reads the applied state.
+                                Ok(frame) => {
+                                    pending_submits.insert(
+                                        frame,
+                                        (reply, std::time::Instant::now() + SUBMIT_HOLD),
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                                }
+                            }
+                        }
+                        noded::NodeCommand::Query { target, req, reply } => {
+                            let result = node
+                                .host()
+                                .query(&target, &req)
+                                .await
+                                .map_err(|e| e.to_string());
+                            let _ = reply.send(result);
+                        }
+                        noded::NodeCommand::Status { reply } => {
+                            let modules = MODULE_IDS
+                                .iter()
+                                .map(|m| noded::ModuleStatus {
+                                    id: (*m).into(),
+                                    root: node
+                                        .host()
+                                        .module_root(m)
+                                        .map(|r| hex(&r))
+                                        .unwrap_or_default(),
+                                    category: noded::ModuleCategory::of(m),
+                                })
+                                .collect();
+                            let _ = reply.send(noded::NodeStatus {
+                                version: env!("CARGO_PKG_VERSION").into(),
+                                app_hash: hex(&node.app_hash()),
+                                height: node.finalized().map(|f| f.height).unwrap_or(0),
+                                modules,
+                            });
+                        }
+                        noded::NodeCommand::Metrics { reply } => {
+                            // the validator serves commonware's runtime registry;
+                            // the `ducktape_*` block series are the local daemon's
+                            // (noded's) surface, not wired into this consensus path.
+                            let _ = reply.send(context.encode());
+                        }
+                    }
+                }
+                msg = sync_ingress.next() => {
+                    let Some((peer, bytes)) = msg else {
+                        // the ingress task ended (network shutdown) — nothing
+                        // left to serve; keep draining consensus regardless.
+                        continue;
+                    };
+                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                        continue; // malformed rpc envelope: drop, never crash.
+                    };
+                    let resp = match statesync::decode_request(body) {
+                        Ok(statesync::SyncRequest::Frames {
+                            after_height,
+                            up_to_height,
+                        }) => {
+                            let response = match node
+                                .sink_mut()
+                                .read_finalized_frames(after_height, up_to_height)
+                                .await
+                            {
+                                Ok(frames) => {
+                                    let mut out = Vec::new();
+                                    let mut err = None;
+                                    for frame in frames
+                                        .into_iter()
+                                        .take(statesync::FRAME_BATCH_LEN)
+                                    {
+                                        match recovery_frame_to_sync(frame) {
+                                            Ok(frame) => out.push(frame),
+                                            Err(e) => {
+                                                err = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    match err {
+                                        Some(e) => statesync::SyncResponse::Error(e),
+                                        None => statesync::SyncResponse::Frames { frames: out },
+                                    }
+                                }
+                                Err(recovery::Error::RangePruned {
+                                    after_height,
+                                    retained_start,
+                                }) => statesync::SyncResponse::RangePruned {
+                                    requested_after: after_height,
+                                    retained_from: retained_start,
+                                },
+                                Err(e) => statesync::SyncResponse::Error(format!(
+                                    "recovery frame range: {e}"
+                                )),
+                            };
+                            statesync::encode_response(&response)
+                        }
+                        Ok(req) => {
+                            // the shipped-index lane cuts lazily: the FIRST
+                            // index request for a boundary checkpoints the
+                            // derived databases and attaches the archives to
+                            // that capture, so joiners that never opt in cost
+                            // nothing. an unleased boundary cannot hold an
+                            // attachment — handle() below answers it with the
+                            // proper refetch error either way.
+                            if let statesync::SyncRequest::IndexModules { boundary } = &req {
+                                if !sync_server.index_attached(*boundary) {
+                                    let _ = sync_server
+                                        .attach_index(*boundary, ship_index_blobs(&index, &label));
+                                }
+                            }
+                            // the boundary's consensus coordinates ride the manifest.
+                            // the floor certificate is served only when it certifies
+                            // exactly the current boundary — a cert behind the
+                            // boundary would make a joiner skip history it needs.
+                            // stamp the served boundary's committed version fields from
+                            // live upgrade state (like epoch/view_base). a joiner installs
+                            // its dual-path modules at `current_version` and preflights
+                            // against `required_min_version` — both derived from these.
+                            let (bc_current, bc_pending) =
+                                read_upgrade_version_fields(node.host()).await;
+                            let coords = statesync::BoundaryCoords {
+                                epoch: orchestrator.epoch(),
+                                view_base: orchestrator.epoch_base(),
+                                participants: participant_bytes(&orchestrator),
+                                current_version: bc_current,
+                                pending_upgrade: bc_pending,
+                                floor_cert: latest_floor
+                                    .as_ref()
+                                    .filter(|fc| fc.epoch == orchestrator.epoch())
+                                    .filter(|fc| {
+                                        node.finalized().is_some_and(|f| f.height == fc.height)
+                                    })
+                                    .map(|fc| fc.cert.clone()),
+                            };
+                            let finalized_for_sync = node.finalized().filter(|f| {
+                                f.height <= coords.view_base || coords.floor_cert.is_some()
+                            });
+                            let response =
+                                sync_server.handle(node.host(), finalized_for_sync, &coords, req).await;
+                            statesync::encode_response(&response)
+                        }
+                        Err(e) => statesync::encode_response(&statesync::SyncResponse::Error(
+                            format!("bad request frame: {e}"),
+                        )),
+                    };
+                    let _ = sync_tx.send(
+                        Recipients::One(peer),
+                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
+                        false,
+                    );
+                }
             }
         }
     });
@@ -6135,7 +6446,7 @@ mod tests {
                 .await
                 .expect("open recovery");
             let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone())
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
                     .await
                     .expect("catch up");
 
@@ -6198,7 +6509,7 @@ mod tests {
                 .await
                 .expect("write base manifest");
             let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served])
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
                     .await
                     .expect("catch up");
 
@@ -6268,7 +6579,7 @@ mod tests {
                 .await
                 .expect("open recovery");
             let err =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served])
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
                     .await
                     .expect_err("seal mismatch must abort");
 
@@ -6289,7 +6600,7 @@ mod tests {
                 .await
                 .expect("open recovery");
             let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 5, 5, Vec::new())
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
                     .await
                     .expect("noop catch up");
 

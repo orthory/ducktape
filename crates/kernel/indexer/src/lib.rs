@@ -18,7 +18,13 @@
 //!
 //! - `meta/height` — the watermark: every finalized block at or below this
 //!   height is fully reflected (contiguity holds because a block's rows and
-//!   the watermark move in ONE atomic [`WriteBatch`]);
+//!   the watermark move in ONE atomic [`WriteBatch`]). EVERY module's
+//!   watermark advances on EVERY applied block — not only the dispatched
+//!   modules' — so `watermark < H` always means "blocks are missing", never
+//!   "the module was quiet";
+//! - `meta/backfill` — present when the read model was re-derived from
+//!   canonical state ([`IndexStore::rebuild_module`]): rows derived that way
+//!   carry boundary-stamped coordinates and the op log starts above it;
 //! - `op/{height:016x}/{seq:04x}` — one [`OpRow`] json envelope per dispatch
 //!   the block applied to this module, in drain order (`seq` is the block-wide
 //!   dispatch index, so cross-module ordering survives the per-module split);
@@ -39,6 +45,16 @@
 //! serving) rather than skipping a block — a silent gap would break the
 //! watermark's contiguity promise, and a derived tier's honest recovery is a
 //! rebuild, not a patch.
+//!
+//! when canonical state advances WITHOUT the op stream — state-sync installs
+//! a boundary, an index directory is wiped, a crash tears the index tail off
+//! a suffix recovery re-execution skipped — a module's read model is
+//! re-derived from VERIFIED canonical state instead:
+//! [`IndexStore::rebuild_module`] clears the module's database, streams the
+//! mapper's [`ModuleIndexer::rebuild_from_state`] rows back in, and stamps
+//! the watermark at the boundary height, LAST. a crash mid-rebuild leaves no
+//! watermark, so the caller's staleness check (`watermark < boundary`)
+//! re-fires on the next boot — the rebuild is idempotent by re-trigger.
 //!
 //! the full "indexable" contract a per-module mapper must satisfy (fold
 //! rules, view rules, when NOT to index) is `docs/indexable-spec.md`.
@@ -62,9 +78,29 @@ pub const META_PREFIX: &str = "meta/";
 pub const BLOCK_PREFIX: &str = "blk/";
 /// directory name of the store-internal blocks database — reserved, never a
 /// module id (the leading underscore keeps it out of the module namespace).
-const BLOCKS_DB: &str = "_blocks";
+/// public because the shipping lane (spec §7 lane 2) addresses it by name:
+/// a source ships it alongside the module databases so a joiner's explorer
+/// history starts warm too.
+pub const BLOCKS_DB_ID: &str = "_blocks";
+/// directory name of a staged shipped-index install awaiting adoption at the
+/// next [`IndexStore::open`] — same underscore convention as [`BLOCKS_DB_ID`].
+const STAGING_DIR: &str = "_staging";
+/// marker file inside [`STAGING_DIR`], written LAST (after every staged file
+/// is durable): a staging directory without it is a torn fetch and is
+/// discarded at open instead of adopted.
+const STAGING_COMPLETE: &str = ".complete";
+/// fixed archive name for a shipping cut. one cut is in flight per database
+/// at a time (the block loop serializes them), so a constant name suffices —
+/// a stale same-name leftover from a crash is deleted before the fresh cut.
+const SHIP_CHECKPOINT: &str = "ship";
 /// the per-module watermark key: 8-byte big-endian height.
 const META_HEIGHT: &str = "meta/height";
+/// the backfill floor: 8-byte big-endian height, present only after a
+/// from-state rebuild — everything derived at or below it is boundary-stamped.
+const META_BACKFILL: &str = "meta/backfill";
+/// how many staged rows a from-state rebuild accumulates before flushing a
+/// batch: bounds memory while a mapper enumerates a large module's state.
+const BACKFILL_FLUSH_EVERY: usize = 1024;
 /// hard cap on one scan page; larger asks are clamped, mirroring the module
 /// query convention (chat's MAX_QUERY_LIMIT) rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
@@ -97,9 +133,23 @@ pub enum Error {
     /// a [`ModuleIndexer`] tried to write into a reserved key space.
     #[error("indexer: derived write into reserved key {key:?} for module {module:?}")]
     ReservedKey { module: String, key: String },
+    /// the module's mapper declares no from-state rebuild (or no mapper at
+    /// all) — the module's views stay empty until new ops fold, which the
+    /// spec treats as a first-class, documented degradation.
+    #[error("indexer: module has no from-state rebuild")]
+    RebuildUnsupported,
+    /// a canonical-state read failed during a from-state rebuild — the node
+    /// layer's [`StateReader`] adapter surfaces module/query errors here.
+    #[error("indexer: state read: {0}")]
+    State(String),
     /// a previous apply failed; the store refuses further writes until rebuilt.
     #[error("indexer: store is poisoned by an earlier apply failure — rebuild the index")]
     Poisoned,
+    /// filesystem io in the shipping lane (checkpoint file reads, staged
+    /// installs) — io this crate performs itself, outside the engine's own
+    /// error surface.
+    #[error("indexer: index shipping: {0}")]
+    Shipping(String),
     /// the storage engine failed.
     #[error("indexer: engine: {0}")]
     Engine(#[from] fluent31::Error),
@@ -249,17 +299,21 @@ fn block_key(height: u64) -> String {
 /// never be half a block ahead of or behind the op log.
 #[derive(Default)]
 pub struct Derived {
-    puts: Vec<(String, Vec<u8>)>,
-    deletes: Vec<String>,
+    /// staged actions in mapper CALL ORDER — `Some` puts, `None` deletes. the
+    /// order is load-bearing: when one op deletes and re-puts the same key (a
+    /// retokenize whose old and new text share a token), the last action must
+    /// win exactly as it would against the database; segregating puts from
+    /// deletes would let a stale delete erase a fresh put.
+    ops: Vec<(String, Option<Vec<u8>>)>,
 }
 
 impl Derived {
     pub fn put(&mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) {
-        self.puts.push((key.into(), value.into()));
+        self.ops.push((key.into(), Some(value.into())));
     }
 
     pub fn delete(&mut self, key: impl Into<String>) {
-        self.deletes.push(key.into());
+        self.ops.push((key.into(), None));
     }
 
     /// drain into the block batch AND the block's read overlay, refusing
@@ -271,24 +325,23 @@ impl Derived {
         batch: &mut WriteBatch,
         overlay: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     ) -> Result<()> {
-        let check = |key: &str| -> Result<()> {
+        for (key, action) in self.ops {
             if key.starts_with(OP_PREFIX) || key.starts_with(META_PREFIX) {
                 return Err(Error::ReservedKey {
                     module: module.to_string(),
-                    key: key.to_string(),
+                    key,
                 });
             }
-            Ok(())
-        };
-        for (key, value) in self.puts {
-            check(&key)?;
-            overlay.insert(key.clone().into_bytes(), Some(value.clone()));
-            batch.put(key, value);
-        }
-        for key in self.deletes {
-            check(&key)?;
-            overlay.insert(key.clone().into_bytes(), None);
-            batch.delete(key);
+            match action {
+                Some(value) => {
+                    overlay.insert(key.clone().into_bytes(), Some(value.clone()));
+                    batch.put(key, value);
+                }
+                None => {
+                    overlay.insert(key.clone().into_bytes(), None);
+                    batch.delete(key);
+                }
+            }
         }
         Ok(())
     }
@@ -342,11 +395,79 @@ impl ViewReader<'_> {
     }
 }
 
+/// read access to a module's VERIFIED canonical state during a from-state
+/// rebuild: the module's own query wire, bytes in / bytes out. the node layer
+/// adapts the module's sdk query surface onto this (mapping its errors into
+/// [`Error::State`]); the mapper speaks its module's json request shapes
+/// through it via the types-only interface crate it already depends on. this
+/// keeps the crate domain-agnostic — no sdk, host, or module dep — and keeps
+/// the derivation rooted in state that verified against the app-hash.
+#[async_trait::async_trait(?Send)]
+pub trait StateReader {
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// the boundary a from-state rebuild derives at. rows are stamped with these
+/// coordinates because per-op coordinates do not survive a state transfer —
+/// state carries values, not history. the spec calls this the documented
+/// degradation: heights (and, where the module's state keeps no timestamps,
+/// times) collapse to the boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct RebuildMeta {
+    pub height: u64,
+    /// the boundary's consensus time when the caller knows it; 0 otherwise.
+    pub time: u64,
+}
+
+/// streaming writer for a from-state rebuild. rows land in bounded batches as
+/// the mapper enumerates state, so a large module never buffers its whole
+/// read model in memory. puts only — a rebuild starts from a cleared
+/// database. the watermark is stamped by the store AFTER the mapper returns,
+/// riding the final batch, so an interrupted rebuild leaves no watermark and
+/// the staleness trigger re-fires on the next boot.
+pub struct Backfill<'a> {
+    module: &'a str,
+    db: &'a Db,
+    batch: WriteBatch,
+    staged: usize,
+    written: u64,
+}
+
+impl Backfill<'_> {
+    pub fn put(&mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Result<()> {
+        let key = key.into();
+        if key.starts_with(OP_PREFIX) || key.starts_with(META_PREFIX) {
+            return Err(Error::ReservedKey {
+                module: self.module.to_string(),
+                key,
+            });
+        }
+        self.batch.put(key, value.into());
+        self.staged += 1;
+        self.written += 1;
+        if self.staged >= BACKFILL_FLUSH_EVERY {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.staged == 0 {
+            return Ok(());
+        }
+        let batch = std::mem::replace(&mut self.batch, WriteBatch::new());
+        self.db.write(batch)?;
+        self.staged = 0;
+        Ok(())
+    }
+}
+
 /// a per-module read-model mapper: it folds the module's applied ops into
 /// derived index keys (the WRITE side) and serves the module's materialized
 /// view over them (the READ side — the module's own endpoint on the derived
 /// tier). pure data-in/data-out — no IO of its own, no clock; writes go
 /// through [`Derived`], reads through the handed-in ctx/reader.
+#[async_trait::async_trait(?Send)]
 pub trait ModuleIndexer: Send + Sync {
     /// the module whose ops this mapper consumes.
     fn module(&self) -> &str;
@@ -366,6 +487,28 @@ pub trait ModuleIndexer: Send + Sync {
     /// that never register a mapper at all.
     fn serve_view(&self, _reader: &ViewReader, _req: &[u8]) -> Result<Vec<u8>> {
         Err(Error::ViewUnsupported)
+    }
+
+    /// whether this mapper can re-derive its read model from canonical state
+    /// alone. checked BEFORE the store clears anything, so a mapper that
+    /// cannot rebuild (default) leaves its database untouched.
+    fn supports_rebuild(&self) -> bool {
+        false
+    }
+
+    /// re-derive the module's read model from VERIFIED canonical state at a
+    /// boundary: enumerate the module through `state` (its own query wire)
+    /// and stream every derived row into `out`, stamped from `meta`. same
+    /// determinism rules as the fold — no IO of its own, no clock; the only
+    /// inputs are `state` and `meta`. a mapper that overrides this MUST also
+    /// override [`ModuleIndexer::supports_rebuild`] to return true.
+    async fn rebuild_from_state(
+        &self,
+        _state: &dyn StateReader,
+        _meta: &RebuildMeta,
+        _out: &mut Backfill<'_>,
+    ) -> Result<()> {
+        Err(Error::RebuildUnsupported)
     }
 }
 
@@ -403,8 +546,15 @@ pub struct IndexStore {
 
 impl IndexStore {
     /// open (creating if missing) one database per module id under `base`.
+    ///
+    /// a COMPLETE staged shipped-index install under `<base>/_staging` (see
+    /// [`stage_shipped_db`]) is adopted first — database directories swap in
+    /// before any engine open, so adoption always precedes open by
+    /// construction. a torn staging directory (no completion marker) is
+    /// discarded, falling back to whatever the databases already hold.
     pub fn open<S: AsRef<str>>(base: impl AsRef<Path>, module_ids: &[S]) -> Result<Self> {
         let base = base.as_ref().to_path_buf();
+        adopt_staged(&base)?;
         let opts = Options {
             sync: SyncMode::Periodic { every: SYNC_EVERY },
             // portable positioned IO: the index shares its box with the node's
@@ -418,7 +568,7 @@ impl IndexStore {
             let db = Db::open(base.join(id), opts.clone())?;
             modules.insert(id.to_string(), Arc::new(db));
         }
-        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB), opts)?);
+        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB_ID), opts)?);
         Ok(Self {
             base,
             modules,
@@ -460,8 +610,11 @@ impl IndexStore {
     }
 
     /// the height the node's block counter must resume ABOVE: the max
-    /// watermark across all modules (a block only touches the modules it
-    /// dispatched, so quieter modules lag the max) and the blocks database.
+    /// watermark across all modules and the blocks database. every module
+    /// advances on every applied block, so the max only differs per module
+    /// when a database was wiped or added — exactly the modules
+    /// [`IndexStore::rebuild_module`] repairs. the blocks watermark can lag
+    /// them all: it only advances when a block carries an explorer row.
     pub fn resume_height(&self) -> Result<u64> {
         let mut max = read_height(&self.blocks)?;
         for db in self.modules.values() {
@@ -474,6 +627,17 @@ impl IndexStore {
     /// height is durably stored.
     pub fn blocks_height(&self) -> Result<u64> {
         Ok(read_height(&self.blocks)?)
+    }
+
+    /// the backfill floor: when present, the module's read model was
+    /// re-derived from canonical state at this height — rows derived that way
+    /// carry boundary-stamped coordinates and the op log starts above it.
+    pub fn backfill_height(&self, module: &str) -> Result<Option<u64>> {
+        let db = self.db(module)?;
+        Ok(db
+            .get(META_BACKFILL.as_bytes())?
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map(u64::from_be_bytes))
     }
 
     /// fold one finalized block into the per-module databases. idempotent per
@@ -492,36 +656,46 @@ impl IndexStore {
     }
 
     fn apply_inner(&self, block: &BlockOps) -> Result<()> {
-        // group by module, keeping the block-wide dispatch index as seq.
+        // group by module, keeping the block-wide dispatch index as seq. an
+        // unknown module refuses BEFORE any batch commits — a block folded
+        // into some databases and refused for the rest would be torn.
         let mut per: BTreeMap<&str, Vec<(u32, &AppliedOp)>> = BTreeMap::new();
         for (seq, op) in block.ops.iter().enumerate() {
+            if !self.modules.contains_key(op.module.as_str()) {
+                return Err(Error::UnknownModule(op.module.clone()));
+            }
             per.entry(op.module.as_str())
                 .or_default()
                 .push((seq as u32, op));
         }
-        for (module, ops) in per {
-            let db = self.db(module)?;
+        // EVERY module's watermark advances, ops or not: `watermark < H` must
+        // mean "blocks are missing", never "the module was quiet" — that is
+        // what lets the rebuild trigger tell a wiped database from a lagging
+        // one. a quiet module's batch is the watermark key alone.
+        for (module, db) in &self.modules {
             if read_height(db)? >= block.height {
                 continue; // replay of an already-folded block — idempotent skip
             }
             let mut batch = WriteBatch::new();
-            let mut overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-            for (seq, op) in ops {
-                batch.put(
-                    op_key(block.height, seq),
-                    encode_row(block.height, seq, block.time, op)?,
-                );
-                if let Some(mapper) = self.mappers.get(module) {
-                    let mut derived = Derived::default();
-                    let meta = OpMeta {
-                        height: block.height,
-                        time: block.time,
-                        seq,
-                        origin: &op.origin,
-                    };
-                    let ctx = ApplyCtx { db, overlay: &overlay };
-                    mapper.index_op(&ctx, &meta, &op.payload, &mut derived)?;
-                    derived.drain_into(module, &mut batch, &mut overlay)?;
+            if let Some(ops) = per.get(module.as_str()) {
+                let mut overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+                for &(seq, op) in ops {
+                    batch.put(
+                        op_key(block.height, seq),
+                        encode_row(block.height, seq, block.time, op)?,
+                    );
+                    if let Some(mapper) = self.mappers.get(module.as_str()) {
+                        let mut derived = Derived::default();
+                        let meta = OpMeta {
+                            height: block.height,
+                            time: block.time,
+                            seq,
+                            origin: &op.origin,
+                        };
+                        let ctx = ApplyCtx { db, overlay: &overlay };
+                        mapper.index_op(&ctx, &meta, &op.payload, &mut derived)?;
+                        derived.drain_into(module, &mut batch, &mut overlay)?;
+                    }
                 }
             }
             batch.put(META_HEIGHT, block.height.to_be_bytes());
@@ -562,6 +736,109 @@ impl IndexStore {
         Ok(rows)
     }
 
+    /// re-derive one module's read model from VERIFIED canonical state at a
+    /// boundary. the sequence is crash-safe by re-trigger:
+    ///
+    /// 1. drop the watermark (its own batch, FIRST) — any interruption from
+    ///    here on leaves `applied_height` at 0, so the caller's staleness
+    ///    check re-fires on the next boot;
+    /// 2. clear the database in bounded batches, op log included — per-op
+    ///    history cannot be re-derived from state, so it honestly starts at
+    ///    the boundary;
+    /// 3. stream the mapper's rows in via [`Backfill`];
+    /// 4. stamp the watermark and the backfill floor at `meta.height`, LAST,
+    ///    riding the final row batch.
+    ///
+    /// a mapper that declares no rebuild refuses up front, before anything is
+    /// touched. any later failure poisons the store — the database is part
+    /// way between two states and only a rebuild is honest. returns the
+    /// number of derived rows written.
+    pub async fn rebuild_module(
+        &self,
+        module: &str,
+        state: &dyn StateReader,
+        meta: RebuildMeta,
+    ) -> Result<u64> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let mapper = self
+            .mappers
+            .get(module)
+            .ok_or(Error::RebuildUnsupported)?;
+        if !mapper.supports_rebuild() {
+            return Err(Error::RebuildUnsupported);
+        }
+        let out = Self::rebuild_inner(module, db, mapper.as_ref(), state, meta).await;
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// stamp a module as backfilled at a boundary WITHOUT re-deriving rows:
+    /// clear the database and set the watermark + backfill floor. this is the
+    /// honest answer for a module whose mapper declares no from-state rebuild
+    /// (or that has no mapper at all) when canonical state advanced without
+    /// the op stream — its op log and views simply BEGIN at the boundary,
+    /// visibly via the floor, instead of a watermark that silently claims
+    /// pre-boundary coverage the fold never saw. same crash story as
+    /// [`IndexStore::rebuild_module`]: watermark falls first, failures poison.
+    pub fn mark_backfilled(&self, module: &str, meta: RebuildMeta) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let out = (|| -> Result<()> {
+            let mut drop_mark = WriteBatch::new();
+            drop_mark.delete(META_HEIGHT);
+            db.write(drop_mark)?;
+            clear_db(db)?;
+            let mut stamp = WriteBatch::new();
+            stamp.put(META_HEIGHT, meta.height.to_be_bytes());
+            stamp.put(META_BACKFILL, meta.height.to_be_bytes());
+            db.write(stamp)?;
+            Ok(())
+        })();
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
+    async fn rebuild_inner(
+        module: &str,
+        db: &Db,
+        mapper: &dyn ModuleIndexer,
+        state: &dyn StateReader,
+        meta: RebuildMeta,
+    ) -> Result<u64> {
+        // the watermark falls first so an interrupted rebuild re-triggers;
+        // clearing sweeps whatever key order the database holds, and the
+        // watermark must not be the key a crash happens to leave behind.
+        let mut drop_mark = WriteBatch::new();
+        drop_mark.delete(META_HEIGHT);
+        db.write(drop_mark)?;
+        clear_db(db)?;
+
+        let mut out = Backfill {
+            module,
+            db,
+            batch: WriteBatch::new(),
+            staged: 0,
+            written: 0,
+        };
+        mapper.rebuild_from_state(state, &meta, &mut out).await?;
+        let Backfill {
+            mut batch, written, ..
+        } = out;
+        batch.put(META_HEIGHT, meta.height.to_be_bytes());
+        batch.put(META_BACKFILL, meta.height.to_be_bytes());
+        db.write(batch)?;
+        Ok(written)
+    }
+
     /// point read of one stored key at the current snapshot.
     pub fn get(&self, module: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.db(module)?.get(key)?)
@@ -598,6 +875,165 @@ impl IndexStore {
         };
         mapper.serve_view(&reader, req)
     }
+
+    /// cut a point-in-time checkpoint of one database (a module id or
+    /// [`BLOCKS_DB_ID`]) and return its complete file set, for the shipping
+    /// lane (spec §7 lane 2): a checkpoint is a self-contained database
+    /// directory, so these files written verbatim to a fresh directory open
+    /// as an identical database — watermark, backfill floor, and rows
+    /// included. the on-disk archive is transient: cut, read into memory,
+    /// deleted — nothing to sweep after a normal return. safe against the
+    /// live writer (fluent31 cuts are crash-atomic and pin their view).
+    ///
+    /// a poisoned store refuses: shipping a torn read model would hand the
+    /// joiner exactly the state a rebuild exists to replace.
+    pub fn checkpoint_files(&self, db: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let handle = if db == BLOCKS_DB_ID {
+            &self.blocks
+        } else {
+            self.db(db)?
+        };
+        // a same-name leftover means an earlier cut crashed between create
+        // and delete; deleting a checkpoint that does not exist is the normal
+        // case and not an error worth surfacing.
+        if handle
+            .list_checkpoints()?
+            .iter()
+            .any(|c| c.name == SHIP_CHECKPOINT)
+        {
+            handle.delete_checkpoint(SHIP_CHECKPOINT)?;
+        }
+        let info = handle.checkpoint(SHIP_CHECKPOINT)?;
+        let read = (|| -> std::io::Result<Vec<(String, Vec<u8>)>> {
+            let mut files = Vec::new();
+            for entry in std::fs::read_dir(&info.path)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name == "LOCK" {
+                    continue; // never present in an archive; skip defensively
+                }
+                files.push((name.to_string(), std::fs::read(entry.path())?));
+            }
+            files.sort_by(|(a, _), (b, _)| a.cmp(b));
+            Ok(files)
+        })();
+        let files = read.map_err(|e| Error::Shipping(format!("read {db} archive: {e}")))?;
+        handle.delete_checkpoint(SHIP_CHECKPOINT)?;
+        Ok(files)
+    }
+}
+
+// ============================================================================
+// shipped-index staging — the joiner side of the shipping lane. a fetched
+// database lands here file by file, is committed with a marker once every
+// byte is durable, and is adopted by the next [`IndexStore::open`]. the
+// ordering mirrors the rebuild's crash story inverted: the rebuild drops its
+// watermark FIRST so interruption re-triggers; staging writes its marker
+// LAST so interruption discards. free functions, not methods — the writer (a
+// syncing joiner) stages against a base whose store is still open elsewhere
+// in the process, and never needs a handle of its own.
+// ============================================================================
+
+/// one path component: non-empty, no separators or traversal, no hidden
+/// files, and never the engine's lock file. shipped names cross a trust
+/// boundary (an unverified server chose them), so anything else is refused.
+fn valid_component(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with('.')
+        && name != "LOCK"
+        && !name.contains(['/', '\\'])
+        && !name.contains('\0')
+}
+
+/// stage one shipped database's file set under `<base>/_staging/<db>` for
+/// adoption at the next [`IndexStore::open`]. every file is fsynced before
+/// return — the completion marker ([`commit_staged`]) must never become
+/// durable ahead of the bytes it vouches for, or a crash could adopt garbage
+/// and turn the next open into a boot failure.
+pub fn stage_shipped_db(base: &Path, db: &str, files: &[(String, Vec<u8>)]) -> Result<()> {
+    if !valid_component(db) || db == STAGING_DIR {
+        return Err(Error::Shipping(format!("invalid shipped db name {db:?}")));
+    }
+    if let Some((name, _)) = files.iter().find(|(name, _)| !valid_component(name)) {
+        return Err(Error::Shipping(format!(
+            "invalid shipped file name {name:?} for {db}"
+        )));
+    }
+    let dir = base.join(STAGING_DIR).join(db);
+    (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        for (name, bytes) in files {
+            let file = std::fs::File::create(dir.join(name)).and_then(|mut f| {
+                use std::io::Write as _;
+                f.write_all(bytes)?;
+                Ok(f)
+            })?;
+            file.sync_all()?;
+        }
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    })()
+    .map_err(|e| Error::Shipping(format!("stage {db}: {e}")))
+}
+
+/// mark a staged install complete. written LAST: only a marked staging
+/// directory is adopted; everything else is discarded as a torn fetch.
+pub fn commit_staged(base: &Path) -> Result<()> {
+    let staging = base.join(STAGING_DIR);
+    (|| -> std::io::Result<()> {
+        std::fs::write(staging.join(STAGING_COMPLETE), b"")?;
+        std::fs::File::open(&staging)?.sync_all()?;
+        Ok(())
+    })()
+    .map_err(|e| Error::Shipping(format!("commit staged install: {e}")))
+}
+
+/// drop any staged install — the fetch failed partway and lane 1's heal is
+/// the fallback. missing staging is a no-op, so callers can clean
+/// unconditionally.
+pub fn discard_staged(base: &Path) -> Result<()> {
+    let staging = base.join(STAGING_DIR);
+    if !staging.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&staging)
+        .map_err(|e| Error::Shipping(format!("discard staged install: {e}")))
+}
+
+/// adopt a complete staged install: swap each staged database directory into
+/// place, then remove the staging root (marker included) LAST. re-entrant
+/// across crashes — each directory rename is atomic, an interrupted sweep
+/// leaves the marker and the not-yet-adopted remainder for the next open,
+/// and a marker-less staging directory is discarded wholesale.
+fn adopt_staged(base: &Path) -> Result<()> {
+    let staging = base.join(STAGING_DIR);
+    if !staging.exists() {
+        return Ok(());
+    }
+    if !staging.join(STAGING_COMPLETE).exists() {
+        return discard_staged(base);
+    }
+    (|| -> std::io::Result<()> {
+        for entry in std::fs::read_dir(&staging)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue; // the marker file
+            }
+            let dest = base.join(entry.file_name());
+            if dest.exists() {
+                std::fs::remove_dir_all(&dest)?;
+            }
+            std::fs::rename(entry.path(), &dest)?;
+        }
+        std::fs::remove_dir_all(&staging)?;
+        Ok(())
+    })()
+    .map_err(|e| Error::Shipping(format!("adopt staged install: {e}")))
 }
 
 /// lo/hi iteration bounds for a prefix scan resuming strictly after `after`:
@@ -635,6 +1071,30 @@ fn collect_page(iter: fluent31::DbIterator, limit: usize) -> Result<Page> {
         has_more,
         next_after,
     })
+}
+
+/// delete every key in the database, in bounded batches, off one MVCC
+/// snapshot — readers holding older snapshots keep serving while the sweep
+/// runs. the caller has already dropped the watermark, so a crash mid-sweep
+/// re-triggers the rebuild rather than leaving a half-empty index live.
+fn clear_db(db: &Db) -> Result<()> {
+    let snap = db.snapshot();
+    let iter = db.iter_at(None, None, false, &snap)?;
+    let mut batch = WriteBatch::new();
+    let mut staged = 0usize;
+    for kv in iter {
+        let (key, _) = kv?;
+        batch.delete(key);
+        staged += 1;
+        if staged >= BACKFILL_FLUSH_EVERY {
+            db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
+            staged = 0;
+        }
+    }
+    if staged > 0 {
+        db.write(batch)?;
+    }
+    Ok(())
 }
 
 fn read_height(db: &Db) -> fluent31::Result<u64> {
@@ -758,7 +1218,12 @@ mod tests {
         }
         let store = store(dir.path());
         assert_eq!(store.applied_height("chat").unwrap(), 2);
-        assert_eq!(store.applied_height("tasks").unwrap(), 0, "tasks saw no block");
+        assert_eq!(
+            store.applied_height("tasks").unwrap(),
+            2,
+            "a quiet module's watermark advances with every block — watermark \
+             lag must mean missing blocks, not missing ops"
+        );
         assert_eq!(store.resume_height().unwrap(), 2, "resume from the max watermark");
         let page = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
         assert_eq!(page.entries.len(), 2);
@@ -932,6 +1397,50 @@ mod tests {
         assert!(page.entries.is_empty());
     }
 
+    /// a mapper that deletes then re-puts ONE key inside a single op — the
+    /// retokenize shape. the last staged action must win; if the drain
+    /// segregated puts from deletes, the stale delete would erase the fresh
+    /// put and a still-present posting would vanish.
+    struct DeleteThenPut;
+
+    impl ModuleIndexer for DeleteThenPut {
+        fn module(&self) -> &str {
+            "chat"
+        }
+        fn index_op(
+            &self,
+            _ctx: &ApplyCtx,
+            _meta: &OpMeta,
+            payload: &[u8],
+            out: &mut Derived,
+        ) -> Result<()> {
+            out.delete("kept");
+            out.put("kept", payload.to_vec());
+            out.put("dropped", b"old".to_vec());
+            out.delete("dropped");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn derived_actions_apply_in_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_indexer(Box::new(DeleteThenPut));
+        store
+            .apply_block(&block(1, vec![chat_op(b"fresh")]))
+            .unwrap();
+        assert_eq!(
+            store.get("chat", b"kept").unwrap(),
+            Some(b"fresh".to_vec()),
+            "delete-then-put keeps the put"
+        );
+        assert_eq!(
+            store.get("chat", b"dropped").unwrap(),
+            None,
+            "put-then-delete keeps the delete"
+        );
+    }
+
     #[test]
     fn block_records_serve_newest_first_tail_oldest_first() {
         let dir = tempfile::tempdir().unwrap();
@@ -960,7 +1469,11 @@ mod tests {
         store.apply_block(&block_with_record(9, Vec::new())).unwrap();
 
         assert_eq!(store.recent_block_rows(10).unwrap().len(), 1);
-        assert_eq!(store.applied_height("chat").unwrap(), 0, "no op rows");
+        // every module's watermark advances — quiet is not stale — but no op
+        // rows were written.
+        assert_eq!(store.applied_height("chat").unwrap(), 9);
+        let ops = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
+        assert!(ops.entries.is_empty(), "no op rows");
         assert_eq!(store.resume_height().unwrap(), 9, "blocks watermark counts");
     }
 
@@ -985,5 +1498,324 @@ mod tests {
         assert_eq!(prefix_successor(&[0x01, 0xff]), Some(vec![0x02]));
         assert_eq!(prefix_successor(&[0xff, 0xff]), None);
         assert_eq!(prefix_successor(b""), None);
+    }
+
+    // ------------------------------------------------------------------------
+    // from-state rebuild
+    // ------------------------------------------------------------------------
+
+    /// canonical state standing in for a module: a fixed item list the mapper
+    /// re-derives from, or a read failure when `fail` is set.
+    struct FakeState {
+        items: Vec<String>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl StateReader for FakeState {
+        async fn query(&self, _req: &[u8]) -> Result<Vec<u8>> {
+            if self.fail {
+                return Err(Error::State("boom".into()));
+            }
+            Ok(serde_json::to_vec(&self.items)?)
+        }
+    }
+
+    /// a mapper whose fold writes one `row/…` key per op and whose rebuild
+    /// re-derives `row/…` keys from [`FakeState`], boundary-stamped.
+    struct RebuildMapper {
+        reserved_on_rebuild: bool,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ModuleIndexer for RebuildMapper {
+        fn module(&self) -> &str {
+            "chat"
+        }
+
+        fn index_op(
+            &self,
+            _ctx: &ApplyCtx,
+            meta: &OpMeta,
+            payload: &[u8],
+            out: &mut Derived,
+        ) -> Result<()> {
+            out.put(
+                format!("row/{:016x}/{:04x}", meta.height, meta.seq),
+                payload.to_vec(),
+            );
+            Ok(())
+        }
+
+        fn supports_rebuild(&self) -> bool {
+            true
+        }
+
+        async fn rebuild_from_state(
+            &self,
+            state: &dyn StateReader,
+            meta: &RebuildMeta,
+            out: &mut Backfill<'_>,
+        ) -> Result<()> {
+            if self.reserved_on_rebuild {
+                out.put("op/evil", b"nope".to_vec())?;
+                return Ok(());
+            }
+            let items: Vec<String> = serde_json::from_slice(&state.query(b"list").await?)?;
+            for item in items {
+                out.put(format!("row/{item}"), meta.height.to_be_bytes().to_vec())?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_replaces_rows_and_stamps_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_indexer(Box::new(RebuildMapper {
+            reserved_on_rebuild: false,
+        }));
+        // a folded history: op rows + derived rows through height 2.
+        store.apply_block(&block(1, vec![chat_op(b"{}")])).unwrap();
+        store.apply_block(&block(2, vec![chat_op(b"{}")])).unwrap();
+
+        let state = FakeState {
+            items: vec!["a".into(), "b".into()],
+            fail: false,
+        };
+        let written = store
+            .rebuild_module("chat", &state, RebuildMeta { height: 10, time: 0 })
+            .await
+            .expect("rebuild");
+        assert_eq!(written, 2);
+
+        // the old fold's rows AND its op log are gone — op history starts at
+        // the boundary — and the re-derived rows are in.
+        assert!(store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap().entries.is_empty());
+        let rows = store.scan("chat", b"row/", None, 10).unwrap();
+        let keys: Vec<_> = rows.entries.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(keys, vec![b"row/a".as_slice(), b"row/b".as_slice()]);
+
+        assert_eq!(store.applied_height("chat").unwrap(), 10);
+        assert_eq!(store.backfill_height("chat").unwrap(), Some(10));
+        assert_eq!(store.resume_height().unwrap(), 10);
+        assert!(!store.is_poisoned());
+
+        // the fold continues above the boundary as if it had always run.
+        store.apply_block(&block(11, vec![chat_op(b"{}")])).unwrap();
+        assert_eq!(store.applied_height("chat").unwrap(), 11);
+        assert_eq!(store.backfill_height("chat").unwrap(), Some(10), "floor survives folding");
+    }
+
+    #[tokio::test]
+    async fn rebuild_unsupported_leaves_the_database_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // TestMapper declares no rebuild (the trait default).
+        let store = store(dir.path()).with_indexer(Box::new(TestMapper { reserved: false }));
+        store.apply_block(&block(1, vec![chat_op(b"{}")])).unwrap();
+
+        let state = FakeState { items: vec![], fail: false };
+        assert!(matches!(
+            store
+                .rebuild_module("chat", &state, RebuildMeta { height: 5, time: 0 })
+                .await,
+            Err(Error::RebuildUnsupported)
+        ));
+        // refused up front: nothing cleared, nothing poisoned.
+        assert!(!store.is_poisoned());
+        assert_eq!(store.applied_height("chat").unwrap(), 1);
+        assert_eq!(store.backfill_height("chat").unwrap(), None);
+        assert_eq!(store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap().entries.len(), 1);
+
+        // no mapper at all refuses the same way.
+        assert!(matches!(
+            store
+                .rebuild_module("tasks", &state, RebuildMeta { height: 5, time: 0 })
+                .await,
+            Err(Error::RebuildUnsupported)
+        ));
+    }
+
+    #[test]
+    fn mark_backfilled_clears_and_stamps_without_a_mapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // tasks has NO mapper here — only its op log. a boundary passing
+        // without the op stream stamps the floor where its content begins.
+        store
+            .apply_block(&block(
+                1,
+                vec![AppliedOp {
+                    module: "tasks".into(),
+                    origin: OriginTag::system(),
+                    payload: b"{}".to_vec(),
+                }],
+            ))
+            .unwrap();
+        store
+            .mark_backfilled("tasks", RebuildMeta { height: 7, time: 0 })
+            .unwrap();
+        assert!(
+            store.scan("tasks", OP_PREFIX.as_bytes(), None, 10).unwrap().entries.is_empty(),
+            "op history starts at the boundary"
+        );
+        assert_eq!(store.applied_height("tasks").unwrap(), 7);
+        assert_eq!(store.backfill_height("tasks").unwrap(), Some(7));
+        assert!(!store.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn rebuild_failure_poisons_and_drops_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_indexer(Box::new(RebuildMapper {
+            reserved_on_rebuild: false,
+        }));
+        store.apply_block(&block(3, vec![chat_op(b"{}")])).unwrap();
+
+        let state = FakeState { items: vec![], fail: true };
+        assert!(matches!(
+            store
+                .rebuild_module("chat", &state, RebuildMeta { height: 9, time: 0 })
+                .await,
+            Err(Error::State(_))
+        ));
+        assert!(store.is_poisoned());
+        // the watermark fell before the failure, so a fresh process (poison
+        // is in-memory only) re-detects staleness and re-triggers.
+        assert_eq!(store.applied_height("chat").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_reserved_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_indexer(Box::new(RebuildMapper {
+            reserved_on_rebuild: true,
+        }));
+        let state = FakeState { items: vec![], fail: false };
+        assert!(matches!(
+            store
+                .rebuild_module("chat", &state, RebuildMeta { height: 4, time: 0 })
+                .await,
+            Err(Error::ReservedKey { .. })
+        ));
+        assert!(store.is_poisoned());
+    }
+
+    // ------------------------------------------------------------------------
+    // shipping: checkpoint file sets + staged installs
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_ships_and_staged_install_opens_identically() {
+        // source: a LIVE store with folded history — derived rows, op rows,
+        // explorer records — cut mid-life exactly like a serving node would.
+        let src = tempfile::tempdir().unwrap();
+        let source = store(src.path()).with_indexer(Box::new(TestMapper { reserved: false }));
+        for h in 1..=3 {
+            source
+                .apply_block(&block_with_record(h, vec![chat_op(br#"{"post":"hi"}"#)]))
+                .unwrap();
+        }
+
+        let dest = tempfile::tempdir().unwrap();
+        for db in ["chat", "tasks", BLOCKS_DB_ID] {
+            let files = source.checkpoint_files(db).expect("cut");
+            assert!(!files.is_empty(), "{db} archive has files");
+            stage_shipped_db(dest.path(), db, &files).expect("stage");
+        }
+        commit_staged(dest.path()).expect("commit");
+        // the archive is transient: cut, read, deleted.
+        assert!(!src.path().join("chat/archive").join(SHIP_CHECKPOINT).exists());
+
+        let shipped = store(dest.path());
+        assert!(!dest.path().join(STAGING_DIR).exists(), "staging consumed");
+        assert_eq!(shipped.applied_height("chat").unwrap(), 3);
+        assert_eq!(shipped.applied_height("tasks").unwrap(), 3);
+        assert_eq!(shipped.blocks_height().unwrap(), 3);
+        // every key — rows, op log, meta — byte-identical to the source.
+        let full = |s: &IndexStore, m: &str| s.scan(m, b"", None, 1024).unwrap().entries;
+        assert_eq!(full(&source, "chat"), full(&shipped, "chat"));
+        assert_eq!(full(&source, "tasks"), full(&shipped, "tasks"));
+        assert_eq!(
+            source.recent_block_rows(10).unwrap(),
+            shipped.recent_block_rows(10).unwrap()
+        );
+        // the shipped store folds on above the shipped watermark.
+        shipped.apply_block(&block(4, vec![chat_op(b"{}")])).unwrap();
+        assert_eq!(shipped.applied_height("chat").unwrap(), 4);
+    }
+
+    #[test]
+    fn unmarked_staging_is_discarded_marked_staging_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = store(dir.path());
+            s.apply_block(&block(5, vec![chat_op(b"{}")])).unwrap();
+        }
+        // a torn fetch: staged bytes, no completion marker → swept at open,
+        // the database the node already had stays live.
+        stage_shipped_db(dir.path(), "chat", &[("torn.tbl".into(), vec![1, 2, 3])]).unwrap();
+        {
+            let s = store(dir.path());
+            assert_eq!(s.applied_height("chat").unwrap(), 5, "existing db kept");
+            assert!(!dir.path().join(STAGING_DIR).exists(), "torn staging swept");
+        }
+
+        // a COMPLETE staged install replaces the database wholesale.
+        let other = tempfile::tempdir().unwrap();
+        let donor = store(other.path());
+        for h in 1..=7 {
+            donor.apply_block(&block(h, vec![chat_op(b"{}")])).unwrap();
+        }
+        let files = donor.checkpoint_files("chat").unwrap();
+        stage_shipped_db(dir.path(), "chat", &files).unwrap();
+        commit_staged(dir.path()).unwrap();
+        let s = store(dir.path());
+        assert_eq!(s.applied_height("chat").unwrap(), 7, "staged content adopted");
+        assert_eq!(s.applied_height("tasks").unwrap(), 5, "unstaged db untouched");
+    }
+
+    #[test]
+    fn stage_refuses_hostile_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |db: &str, file: &str| {
+            stage_shipped_db(dir.path(), db, &[(file.to_string(), vec![0])])
+        };
+        assert!(matches!(put("../evil", "a.tbl"), Err(Error::Shipping(_))));
+        assert!(matches!(put("a/b", "a.tbl"), Err(Error::Shipping(_))));
+        assert!(matches!(put(STAGING_DIR, "a.tbl"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", "../../x"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", "b\\c"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", ".hidden"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", "LOCK"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", ""), Err(Error::Shipping(_))));
+        // the blocks database is a legitimate shipped name.
+        assert!(put(BLOCKS_DB_ID, "a.tbl").is_ok());
+    }
+
+    #[test]
+    fn checkpoint_files_sweeps_its_stale_archive_and_refuses_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.apply_block(&block(1, vec![chat_op(b"{}")])).unwrap();
+        // back-to-back cuts: the second must not trip over a leftover —
+        // and here the first archive was already deleted, so this also
+        // exercises the delete-if-present guard both ways.
+        store.checkpoint_files("chat").expect("first cut");
+        store.checkpoint_files("chat").expect("second cut");
+
+        let bad = block(
+            2,
+            vec![AppliedOp {
+                module: "ghost".into(),
+                origin: OriginTag::system(),
+                payload: b"{}".to_vec(),
+            }],
+        );
+        assert!(store.apply_block(&bad).is_err());
+        assert!(matches!(
+            store.checkpoint_files("chat"),
+            Err(Error::Poisoned)
+        ));
     }
 }

@@ -37,7 +37,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use inbox::Inbox;
-use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
+use indexer::IndexStore;
 use jobs::Jobs;
 use memory::Memory;
 use noded::{
@@ -175,23 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // <storage>/index/<module>/, with each module's view mapper registered.
     // an open failure is fatal-with-remedy rather than a silent no-index run:
     // the tier is rebuildable, so the fix is always "delete <storage>/index".
-    let index_dir = storage.join("index");
-    let index = IndexStore::open(&index_dir, &MODULE_IDS)
-        .map(|store| {
-            Arc::new(
-                store
-                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
-                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
-                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
-            )
-        })
-        .map_err(|err| {
-            format!(
-                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
-                index_dir.display()
-            )
-        })?;
+    let index = noded::open_index_store(&storage, &MODULE_IDS)?;
 
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
     let handle = handle
@@ -323,6 +307,34 @@ fn run_node(
         let mut height = index.resume_height().expect("read index watermarks");
         if height > 0 {
             println!("[noded] module index resumes at height {height}");
+        }
+        // heal modules whose watermark trails the resume floor — a wiped (or
+        // torn) per-module database that forward folding can never refill,
+        // because its heights are already spent above it. views re-derive
+        // from local canonical state at the floor; module-level op history
+        // below it starts over at the boundary, visibly via /v1/index/status.
+        match noded::rebuild_stale_modules(
+            &index,
+            &host,
+            indexer::RebuildMeta { height, time: 0 },
+        )
+        .await
+        {
+            Ok(rebuilt) => {
+                for (module, rows) in rebuilt {
+                    println!(
+                        "[noded] module index for {module} re-derived from state at height {height} ({rows} rows)"
+                    );
+                }
+            }
+            Err(err) => {
+                // poisoned, not fatal: reads stay up, writes refuse, and the
+                // wipe-to-rebuild remedy is the same one the fold error names.
+                eprintln!(
+                    "[noded] module index rebuild failed: {err} — wipe {} to rebuild",
+                    index.base().display()
+                );
+            }
         }
         while let Some(cmd) = cmds.next().await {
             match cmd {
@@ -544,19 +556,7 @@ async fn submit_one(
     // is already committed, so an index failure degrades the read models and
     // never the block. the store poisons itself on error (contiguity over
     // coverage) and stays loud on every later block until rebuilt.
-    let ops = out
-        .dispatches
-        .into_iter()
-        .map(|d| AppliedOp {
-            origin: index_origin(&d.origin),
-            module: d.module,
-            payload: d.payload,
-        })
-        .collect();
-    let block_ops = BlockOps {
-        height: *height,
-        time: consensus_time,
-        ops,
+    let block_ops = indexer::BlockOps {
         // the explorer row. every block on this lane is applied — a rejected
         // submit never increments the height, so it never was a block. the
         // frame hash stays empty: nothing is framed on this lane, and an
@@ -572,6 +572,7 @@ async fn submit_one(
             payload,
             op_hash,
         })),
+        ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
     };
     if let Err(err) = index.apply_block(&block_ops) {
         eprintln!(
@@ -581,15 +582,6 @@ async fn submit_one(
     }
 
     Ok((block, out.effects))
-}
-
-/// map a dispatch origin to the index's flattened origin tag.
-fn index_origin(origin: &Origin) -> OriginTag {
-    match origin {
-        Origin::External(id) => OriginTag::external(String::from_utf8_lossy(id)),
-        Origin::Module(id) => OriginTag::module(id.clone()),
-        Origin::System => OriginTag::system(),
-    }
 }
 
 /// map a deterministic dispatch record to its telemetry wire twin.

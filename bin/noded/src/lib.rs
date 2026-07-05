@@ -615,6 +615,135 @@ async fn telemetry(
 }
 
 // ---------------------------------------------------------------------------
+// the derived-index tier: shared construction + from-state rebuild triggers.
+// noded and the consensus validator (bin/node) both reuse this router, so
+// they share the store setup too — one construction site, identical
+// /v1/index/* behavior, each binary passing its own genesis module list.
+// ---------------------------------------------------------------------------
+
+/// open the per-module index store under `<storage>/index` with every view
+/// mapper registered. an open failure is fatal-with-remedy for the caller:
+/// the tier is rebuildable, so the fix is always "delete the directory".
+pub fn open_index_store<S: AsRef<str>>(
+    storage: &std::path::Path,
+    module_ids: &[S],
+) -> Result<Arc<indexer::IndexStore>, String> {
+    let index_dir = storage.join("index");
+    indexer::IndexStore::open(&index_dir, module_ids)
+        .map(|store| {
+            Arc::new(
+                store
+                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
+                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
+                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
+                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
+            )
+        })
+        .map_err(|err| {
+            format!(
+                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
+                index_dir.display()
+            )
+        })
+}
+
+/// flatten a dispatch origin into the index's plain origin tag: external
+/// submitter identities render lossily as utf-8, exactly what the mappers'
+/// author rendering assumes — on BOTH lanes. the validator's key-byte
+/// identities render the same way, because a mapper's from-state rebuild
+/// re-renders authors from canonical state with this exact convention
+/// (see chat-index `author_from_ref`): folded and rebuilt rows must match
+/// byte-for-byte. hex-keyed identity belongs to the explorer row's
+/// `proposer`, not the index op rows.
+pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {
+    match origin {
+        sdk::Origin::External(id) => indexer::OriginTag::external(String::from_utf8_lossy(id)),
+        sdk::Origin::Module(id) => indexer::OriginTag::module(id.clone()),
+        sdk::Origin::System => indexer::OriginTag::system(),
+    }
+}
+
+/// one sealed block's dispatch trace as the indexer's fold input. `time` is
+/// the block's consensus time — noded passes its submit context's clock, the
+/// consensus validator stamps `consensus_time = height`. an empty trace is a
+/// real block (a rejected frame consumed its height): folding it advances
+/// every module's watermark so staleness checks stay exact.
+///
+/// `record` starts [`None`]: a caller holding a block the explorer shows
+/// grafts its [`block_row`] on via struct update. boot folds (journal replay,
+/// frame catch-up) leave it `None` — the node-layer row is not reproducible
+/// from the dispatch trace, and the blocks database keeps whatever rows the
+/// live drain already made durable.
+pub fn index_block_ops(
+    height: u64,
+    time: u64,
+    dispatches: &[host::DispatchRecord],
+) -> indexer::BlockOps {
+    indexer::BlockOps {
+        height,
+        time,
+        ops: dispatches
+            .iter()
+            .map(|d| indexer::AppliedOp {
+                origin: index_origin(&d.origin),
+                module: d.module.clone(),
+                payload: d.payload.clone(),
+            })
+            .collect(),
+        record: None,
+    }
+}
+
+/// one module's canonical state as the indexer's [`indexer::StateReader`]:
+/// [`host::Host::query`] adapted onto the bytes-in/bytes-out rebuild surface,
+/// module errors mapped into [`indexer::Error::State`].
+pub struct HostStateReader<'a> {
+    pub host: &'a host::Host,
+    pub module: &'a str,
+}
+
+#[async_trait::async_trait(?Send)]
+impl indexer::StateReader for HostStateReader<'_> {
+    async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
+        self.host
+            .query(self.module, req)
+            .await
+            .map_err(|err| indexer::Error::State(err.to_string()))
+    }
+}
+
+/// heal every module whose watermark trails `boundary` from VERIFIED
+/// canonical state: a mapper that declares a from-state rebuild re-derives
+/// its read model; a module without one is stamped backfilled, its content
+/// visibly beginning at the boundary. call wherever canonical state advanced
+/// without the op stream — after state-sync installs a boundary, after
+/// recovery skipped re-executing durable blocks, or over a wiped index
+/// directory. returns `(module, rows)` per re-derived view.
+pub async fn rebuild_stale_modules(
+    index: &indexer::IndexStore,
+    host: &host::Host,
+    boundary: indexer::RebuildMeta,
+) -> Result<Vec<(String, u64)>, indexer::Error> {
+    let modules: Vec<String> = index.module_ids().map(str::to_string).collect();
+    let mut rebuilt = Vec::new();
+    for module in modules {
+        if index.applied_height(&module)? >= boundary.height {
+            continue;
+        }
+        let state = HostStateReader {
+            host,
+            module: &module,
+        };
+        match index.rebuild_module(&module, &state, boundary).await {
+            Ok(rows) => rebuilt.push((module, rows)),
+            Err(indexer::Error::RebuildUnsupported) => index.mark_backfilled(&module, boundary)?,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(rebuilt)
+}
+
+// ---------------------------------------------------------------------------
 // the derived-index read lane. like the blob and telemetry lanes these
 // handlers never cross the actor: the store is `Send + Sync` and every read
 // runs at its own MVCC snapshot, concurrent with the actor's block writes.
@@ -688,13 +817,17 @@ fn index_error(err: indexer::Error) -> Response {
 
 /// GET /v1/index/status — each module's applied watermark plus the poison
 /// flag. a poisoned index keeps serving (stale but consistent) reads; the
-/// remedy is a rebuild, which this surface makes visible.
+/// remedy is a rebuild, which this surface makes visible. modules re-derived
+/// from canonical state also report their backfill floor: content below it
+/// was never folded from ops (heights are boundary-stamped, the op log
+/// starts above it) — the gap stays visible instead of papered over.
 async fn index_status(State(handle): State<NodeHandle>) -> Response {
     let store = match index_store(&handle) {
         Ok(store) => store,
         Err(resp) => return resp,
     };
     let mut modules = serde_json::Map::new();
+    let mut backfilled = serde_json::Map::new();
     for id in store.module_ids() {
         match store.applied_height(id) {
             Ok(height) => {
@@ -702,10 +835,18 @@ async fn index_status(State(handle): State<NodeHandle>) -> Response {
             }
             Err(err) => return index_error(err),
         }
+        match store.backfill_height(id) {
+            Ok(Some(floor)) => {
+                backfilled.insert(id.to_string(), floor.into());
+            }
+            Ok(None) => {}
+            Err(err) => return index_error(err),
+        }
     }
     Json(serde_json::json!({
         "poisoned": store.is_poisoned(),
         "modules": modules,
+        "backfilled": backfilled,
     }))
     .into_response()
 }

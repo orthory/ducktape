@@ -398,3 +398,24 @@ fn quorum_tolerates_one_fault() {
         assert_eq!(value, "alive", "node {reader} read a wrong value");
     }
 }
+
+/// the staged reachability plane must converge a mesh on a FRESH boot: both
+/// nodes fire their boot `Retarget` (and the initial `EndpointRecord` send it
+/// triggers) before the p2p actors have any live connection, so the plane's
+/// liveness may not depend on that first datagram surviving. fake effect —
+/// the protocol (records -> adverts -> verified mesh -> handshakes -> apply)
+/// is identical to the real path right up to the interface call, and two
+/// same-host nodes with the real effect would fight over one dt-* name.
+#[test]
+fn reachability_plane_converges_mesh_on_boot() {
+    let _serial = serial();
+    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    cluster.wireguard = true;
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+    cluster.spawn(1);
+    for i in 0..2 {
+        cluster.wait_marker(i, "mesh verified", Duration::from_secs(60));
+        cluster.wait_marker(i, "tunnel config staged on", Duration::from_secs(60));
+    }
+}

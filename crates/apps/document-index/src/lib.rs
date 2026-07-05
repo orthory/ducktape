@@ -10,10 +10,18 @@
 //! - `blk/{doc_id}/{block_id}`          — the block's current [`BlockRow`].
 //! - `tok/{token}/{doc_id}/{block_id}`  — one posting per (token, block),
 //!   value = [`TokRef`]; rewritten whole on every text change.
+//!
+//! from-state rebuild: canonical `ListDocs`/`GetDoc` enumerate every block, so
+//! rows and postings re-derive with an exact hit set. what canonical `Block`
+//! does NOT carry is per-block coordinates — `height` and `time` collapse to
+//! the boundary, so ranking among rebuilt rows degrades to id order.
 
-use document_interface::{BlockKind, DocMsg, decode_msg};
+use document_interface::{BlockKind, DocMsg, DocQuery, DocReply, decode_msg, decode_reply, encode_query};
 use indexer::search::{self, DEFAULT_POSTING_CAP};
-use indexer::{ApplyCtx, Derived, Error, ModuleIndexer, OpMeta, Result, ViewReader};
+use indexer::{
+    ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, RebuildMeta, Result, StateReader,
+    ViewReader,
+};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -91,15 +99,14 @@ fn read_row(ctx: &ApplyCtx, doc: &str, block: &str) -> Result<Option<BlockRow>> 
     }
 }
 
-fn put_row(out: &mut Derived, row: &BlockRow) -> Result<()> {
-    out.put(
+/// every entry one block row materializes to — the row itself plus one
+/// posting per token. fold and rebuild both write THROUGH this, so the two
+/// paths produce byte-identical rows.
+fn row_entries(row: &BlockRow) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut entries = vec![(
         blk_key(&row.doc_id, &row.block_id),
         serde_json::to_vec(row).map_err(|e| Error::Mapper(e.to_string()))?,
-    );
-    Ok(())
-}
-
-fn put_toks(out: &mut Derived, row: &BlockRow) -> Result<()> {
+    )];
     let tok_ref = serde_json::to_vec(&TokRef {
         doc_id: row.doc_id.clone(),
         block_id: row.block_id.clone(),
@@ -107,10 +114,17 @@ fn put_toks(out: &mut Derived, row: &BlockRow) -> Result<()> {
     })
     .map_err(|e| Error::Mapper(e.to_string()))?;
     for token in search::tokens(&row.text) {
-        out.put(
+        entries.push((
             tok_key(&token, &row.doc_id, &row.block_id),
             tok_ref.clone(),
-        );
+        ));
+    }
+    Ok(entries)
+}
+
+fn put_row_and_toks(out: &mut Derived, row: &BlockRow) -> Result<()> {
+    for (key, value) in row_entries(row)? {
+        out.put(key, value);
     }
     Ok(())
 }
@@ -121,6 +135,7 @@ fn delete_toks(out: &mut Derived, row: &BlockRow) {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl ModuleIndexer for DocumentIndex {
     fn module(&self) -> &str {
         &self.module
@@ -143,8 +158,7 @@ impl ModuleIndexer for DocumentIndex {
                     height: meta.height,
                     time: meta.time,
                 };
-                put_toks(out, &row)?;
-                put_row(out, &row)
+                put_row_and_toks(out, &row)
             }
             DocMsg::UpdateBlock {
                 doc_id,
@@ -155,12 +169,13 @@ impl ModuleIndexer for DocumentIndex {
                 let Some(mut row) = read_row(ctx, &doc_id, &block_id)? else {
                     return Ok(());
                 };
+                // delete BEFORE re-putting: tokens shared by the old and new
+                // text stage a delete then a put, and the last action wins.
                 delete_toks(out, &row);
                 row.text = text;
                 row.height = meta.height;
                 row.time = meta.time;
-                put_toks(out, &row)?;
-                put_row(out, &row)
+                put_row_and_toks(out, &row)
             }
             DocMsg::RemoveBlock { doc_id, block_id } => {
                 let Some(row) = read_row(ctx, &doc_id, &block_id)? else {
@@ -209,6 +224,54 @@ impl ModuleIndexer for DocumentIndex {
             }
         }
         serde_json::to_vec(&DocViewReply::Hits(hits)).map_err(|e| Error::View(e.to_string()))
+    }
+
+    fn supports_rebuild(&self) -> bool {
+        true
+    }
+
+    /// re-derive rows and postings from canonical `ListDocs`/`GetDoc`. the
+    /// documented degradation: canonical `Block` keeps no per-block
+    /// coordinates, so every rebuilt row is boundary-stamped — hit sets stay
+    /// exact, ranking among rebuilt rows falls back to id order.
+    async fn rebuild_from_state(
+        &self,
+        state: &dyn StateReader,
+        meta: &RebuildMeta,
+        out: &mut Backfill<'_>,
+    ) -> Result<()> {
+        let reply = state.query(&encode_query(&DocQuery::ListDocs)).await?;
+        let doc_ids = match decode_reply(&reply).map_err(Error::State)? {
+            DocReply::DocList(ids) => ids,
+            other => return Err(Error::State(format!("ListDocs answered {other:?}"))),
+        };
+        for doc_id in doc_ids {
+            let reply = state
+                .query(&encode_query(&DocQuery::GetDoc {
+                    doc_id: doc_id.clone(),
+                }))
+                .await?;
+            let blocks = match decode_reply(&reply).map_err(Error::State)? {
+                DocReply::Doc(blocks) => blocks,
+                other => return Err(Error::State(format!("GetDoc answered {other:?}"))),
+            };
+            // a listed doc always answers Some — state cannot change under a
+            // rebuild — but an empty doc is real (created, no blocks yet).
+            for block in blocks.unwrap_or_default() {
+                let row = BlockRow {
+                    doc_id: doc_id.clone(),
+                    block_id: block.id,
+                    kind: block.kind,
+                    text: block.text,
+                    height: meta.height,
+                    time: meta.time,
+                };
+                for (key, value) in row_entries(&row)? {
+                    out.put(key, value)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -301,6 +364,13 @@ mod tests {
             search(&store, serde_json::json!({"search": {"text": "polished"}})).len(),
             1
         );
+        // a token in BOTH the old and new text stages delete-then-put on one
+        // key inside one op; the posting must survive the retokenize.
+        assert_eq!(
+            search(&store, serde_json::json!({"search": {"text": "wording"}})).len(),
+            1,
+            "retained token survives a retokenize"
+        );
 
         apply(
             &store,
@@ -311,5 +381,93 @@ mod tests {
             })],
         );
         assert!(search(&store, serde_json::json!({"search": {"text": "polished"}})).is_empty());
+    }
+
+    /// canonical document state standing in for the module's query surface:
+    /// doc id → ordered blocks.
+    struct CanonicalDocs(Vec<(String, Vec<Block>)>);
+
+    #[async_trait::async_trait(?Send)]
+    impl indexer::StateReader for CanonicalDocs {
+        async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
+            let reply = match document_interface::decode_query(req).map_err(Error::State)? {
+                DocQuery::ListDocs => {
+                    DocReply::DocList(self.0.iter().map(|(id, _)| id.clone()).collect())
+                }
+                DocQuery::GetDoc { doc_id } => DocReply::Doc(
+                    self.0
+                        .iter()
+                        .find(|(id, _)| *id == doc_id)
+                        .map(|(_, blocks)| blocks.clone()),
+                ),
+                other => return Err(Error::State(format!("unexpected query {other:?}"))),
+            };
+            Ok(document_interface::encode_reply(&reply))
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_rederives_search_from_canonical_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // folded rows the rebuild must throw away.
+        apply(&store, 1, vec![insert("stale", "b0", "vanishing text")]);
+
+        let state = CanonicalDocs(vec![
+            (
+                "spec".into(),
+                vec![
+                    Block {
+                        id: "b1".into(),
+                        kind: BlockKind::Paragraph,
+                        text: "consensus design notes".into(),
+                    },
+                    Block {
+                        id: "b2".into(),
+                        kind: BlockKind::Paragraph,
+                        text: "derived tier rebuild".into(),
+                    },
+                ],
+            ),
+            ("empty".into(), vec![]),
+        ]);
+        let written = store
+            .rebuild_module(
+                "document",
+                &state,
+                indexer::RebuildMeta { height: 33, time: 0 },
+            )
+            .await
+            .expect("rebuild");
+        assert!(written >= 2, "two rows plus their postings");
+
+        assert!(
+            search(&store, serde_json::json!({"search": {"text": "vanishing"}})).is_empty(),
+            "pre-rebuild rows do not survive"
+        );
+        let hits = search(&store, serde_json::json!({"search": {"text": "consensus"}}));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].block_id, "b1");
+        // the documented degradation: coordinates collapse to the boundary.
+        assert_eq!(hits[0].height, 33);
+
+        assert_eq!(store.applied_height("document").unwrap(), 33);
+        assert_eq!(store.backfill_height("document").unwrap(), Some(33));
+
+        // rebuilt rows fold forward like originals: an update retokenizes.
+        apply(
+            &store,
+            34,
+            vec![op(&DocMsg::UpdateBlock {
+                doc_id: "spec".into(),
+                block_id: "b2".into(),
+                text: "warm views".into(),
+            })],
+        );
+        assert!(search(&store, serde_json::json!({"search": {"text": "rebuild"}})).is_empty());
+        assert_eq!(
+            search(&store, serde_json::json!({"search": {"text": "warm"}})).len(),
+            1
+        );
     }
 }

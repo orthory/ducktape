@@ -1,8 +1,11 @@
 # Indexable — the per-module materialized-view contract
 
-Status: shipped with the first indexer slice (chat, tasks, document, pages).
+Status: shipped — the fold/view contract (chat, tasks, document, pages), the
+from-state rebuild (§7 lane 1), and the consensus-validator wiring.
 Code: `crates/kernel/indexer` (the contract + store), `crates/apps/*-index`
-(per-module implementations), `bin/noded` (the feed and the HTTP lanes).
+(per-module implementations), `bin/noded` (the feed, the HTTP lanes, and the
+shared store construction), `bin/node` (the validator: live fold, replay
+fold, boundary heals).
 
 ## 1. Position: the derived tier
 
@@ -34,6 +37,13 @@ Two things exist for every module with zero module code:
   drain order survives the per-module split);
 - the **watermark** — `meta/height`, moved in the same atomic batch as the
   block's rows: every block at or below it is fully reflected, no gaps.
+  EVERY module's watermark advances on EVERY applied block — not only the
+  dispatched modules' — so `watermark < H` always means "blocks are missing",
+  never "the module was quiet". that exactness is what the rebuild triggers
+  (§7) key off;
+- the **backfill floor** — `meta/backfill`, present only after a from-state
+  rebuild: rows derived that way carry boundary-stamped coordinates and the
+  op log starts above it. `GET /v1/index/status` reports it per module.
 
 A module becomes **indexable** by shipping a mapper; that is what turns raw
 storage into *its* materialized view with *its own endpoint*.
@@ -104,7 +114,7 @@ snapshots, like the blob and telemetry lanes.
 
 | route | serves |
 | --- | --- |
-| `GET /v1/index/status` | per-module watermarks + the poison flag |
+| `GET /v1/index/status` | per-module watermarks, backfill floors (§7), the poison flag |
 | `GET /v1/index/{module}/ops?after=&limit=` | the op log, paged, envelopes verbatim |
 | `GET /v1/index/{module}/scan?prefix=&after=&limit=` | raw derived keys (debugging, generic consumers) |
 | `POST /v1/index/{module}/view` | **the module's own endpoint** — its mapper's `serve_view` |
@@ -136,40 +146,88 @@ The first shipped mappers and why they exist:
 ## 6. Rebuild and failure story
 
 - The index directory is disposable: delete `<storage>/index` (or one
-  module's subdirectory) and the folds repopulate from new blocks.
+  module's subdirectory) and the tier heals — mappers that declare a
+  from-state rebuild (§7) re-derive at the next boot's boundary, everything
+  else repopulates from new blocks behind a visible backfill floor.
 - noded resumes its local block counter **above** the index watermark so
   op-log heights stay monotonic across restarts; wiping the index therefore
-  also resets the counter's floor. On a consensus node the op stream replays
-  from the journal/state-sync instead — same fold, same contract.
+  also resets the counter's floor. At startup noded heals any module whose
+  watermark trails the resume floor from local canonical state.
+- The consensus validator folds the identical contract from three feeds: the
+  live drain (every SEALED frame — a rejected frame folds empty, it still
+  consumed its height), the journal replay (`recovery::ReplaySink` — blocks
+  replay re-executes fold their dispatch trace; blocks it skips as
+  already-durable are unreproducible and STOP the fold), and post-reboot
+  frame catch-up. Whatever the fold could not reproduce is healed by a
+  from-state rebuild at the verified boundary: after checkpoint restore
+  (pre-replay) and again at the boot tip once every path converged.
 - Poisoned means poisoned: no gap-skipping, no partial patching. Reads stay
-  up; the operator wipes and rebuilds. `GET /v1/index/status` is the
-  observable.
+  up; the remedy is a rebuild — automatic at the next boot's heal, or an
+  operator wipe. `GET /v1/index/status` is the observable.
 - Durability is `SyncMode::Periodic` (bounded loss window, torn tails
   truncate on recovery) — correct for a tier whose worst case is a rebuild.
 
-## 7. State-sync (the next slice — design fixed, implementation pending)
+## 7. State-sync and the from-state rebuild (both lanes shipped)
 
 A joiner state-syncs **state**, not op history, so the fold has nothing to
 consume — and a synced node with empty views renders its modules poorly. The
-index must come together with the sync. Two lanes, in preference order:
+index comes together with the sync. Two lanes, in preference order:
 
-1. **State backfill (the contract extension).** The mapper trait grows an
-   optional `rebuild_from_state`: after canonical state installs and verifies
-   at a boundary, each mapper re-derives its rows from its module's committed
-   state (the same read surface `Module::query`/`serve_sync` already exposes),
-   stamped at the boundary height. This keeps the derivation local and rooted
-   in *verified* state, works identically for a wiped index on a live node,
-   and stays per-module: a mapper that can rebuild from state declares it; one
-   that cannot (chat's per-height rows lose their original heights) documents
-   the degradation — rows backfill at the boundary height, op history starts
-   there.
-2. **Index checkpoint shipping (the optimization).** fluent31 checkpoints are
-   complete database directories; a source node can ship them alongside
-   state-sync for instant warm views. Contents are NOT root-verifiable (the
-   derived tier has no root by design), so this lane trusts the serving node
-   and must stay optional — a verifying joiner backfills via lane 1 and
-   compares nothing.
+1. **State backfill (the contract extension — SHIPPED).** The mapper trait
+   grew `supports_rebuild` + `rebuild_from_state(state, meta, out)`: after
+   canonical state installs and verifies at a boundary, each mapper
+   re-derives its rows from its module's committed state through
+   `indexer::StateReader` — a domain-agnostic bytes-in/bytes-out adapter over
+   `Module::query` (never `serve_sync`, whose wire is qmdb op-range transfer,
+   not logical rows) — streamed through a bounded-batch `Backfill` writer and
+   stamped at the boundary. The derivation stays local, rooted in *verified*
+   state, and works identically for a wiped index on a live node.
 
-Until that slice ships: a state-synced node serves empty views (canonical
-queries still answer everything they answered before this tier existed), and
-`GET /v1/index/status` makes the gap visible rather than papered over.
+   The store side is `IndexStore::rebuild_module`: watermark drops FIRST
+   (an interrupted rebuild re-triggers — crash-safe by re-trigger), the
+   database clears (op history starts at the boundary), rows stream in, and
+   the watermark + backfill floor stamp LAST. A module whose mapper declares
+   no rebuild is stamped backfilled instead (`mark_backfilled`) — its content
+   visibly begins at the boundary rather than silently claiming coverage.
+
+   Per-module degradations, documented at each mapper: heights collapse to
+   the boundary everywhere; document/pages also lose per-row time (hit sets
+   exact, ranking falls to id order); tasks loses `created_by` and both
+   heights; chat — the named case — recovers time from `created_at`, so its
+   ranking survives intact.
+
+   Triggered wherever `watermark < boundary` (exact, because every module's
+   watermark advances on every applied block): noded startup against the
+   resume floor, the validator after checkpoint restore and at the boot tip
+   (state-sync install, replay gaps, wiped directories all converge there).
+
+2. **Index checkpoint shipping (the optimization — SHIPPED).** fluent31
+   checkpoints are complete database directories; a source node ships them
+   alongside state-sync for instant warm views. Contents are NOT
+   root-verifiable (the derived tier has no root by design), so this lane
+   trusts the serving node and stays optional — `sync_index = true` in
+   node.toml (node-local operator policy, default off); a verifying joiner
+   backfills via lane 1 and compares nothing.
+
+   The mechanics: the serving pump answers the first `IndexModules` request
+   per leased boundary by cutting a transient checkpoint of every module
+   database plus `_blocks` (`IndexStore::checkpoint_files` — cut, read into
+   memory, archive deleted) and attaching the framed blobs to that capture,
+   so their lifetime rides the existing lease/evict lifecycle and joiners
+   that never ask cost nothing. The joiner fetches the set in chunks over
+   the same sync connection, stages it under `<storage>/index/_staging`
+   (every file fsynced, a `.complete` marker LAST), and the promoted
+   reboot's `IndexStore::open` adopts the staging directory before any
+   engine open — a torn fetch is discarded, never adopted.
+
+   Composition with lane 1 is a single comparison, the one that already
+   exists: shipped watermarks land at the source's fold tip, so a module
+   whose watermark reaches the joiner's boundary skips its heal (warm), and
+   anything stale, missing, or refused falls to `watermark < boundary` and
+   rebuilds exactly as if nothing was shipped. Cross-binary skew degrades
+   the same way: unknown shipped databases are skipped at staging, old
+   servers answer the new request tags with an error, and the joiner treats
+   every failure as "heal instead", never as an abort. The blocks database
+   rides along verbatim — the only path by which a joiner ever gets
+   pre-boundary `/v1/blocks` history, since `_blocks` is deliberately
+   outside the rebuild story.

@@ -78,6 +78,14 @@ pub struct Cluster {
     /// `None` -> `127.0.0.1:p2p_ports[0]` (identical to today); `Some(addr)`
     /// points bootstrap at a forwarder in front of node 0.
     pub bootstrap_addr_override: Option<String>,
+    /// when true every config gets `wireguard_listen` (the node's own p2p
+    /// port, UDP — distinct per node, never actually bound) plus
+    /// `wireguard_effect = "fake"`, so the reachability plane runs its full
+    /// rendezvous/handshake protocol without needing privilege. several
+    /// same-host nodes with the REAL effect would fight over the one
+    /// `dt-<chainid>` interface name, so the fake is the only correct
+    /// same-host shape.
+    pub wireguard: bool,
     /// declared BEFORE `dir` so drop order kills + reaps every child first —
     /// removing the tempdir under live processes races their qmdb/journal
     /// writes and silently leaks the subtree.
@@ -316,6 +324,7 @@ impl Cluster {
             http_ports: http_ports.to_vec(),
             advertised: peer_ids.iter().map(|_| None).collect(),
             bootstrap_addr_override: None,
+            wireguard: false,
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
         }
@@ -360,6 +369,13 @@ impl Cluster {
             "http_listen = \"127.0.0.1:{}\"\n",
             self.http_ports[idx]
         ));
+        if self.wireguard {
+            cfg.push_str(&format!(
+                "wireguard_listen = \"127.0.0.1:{}\"\n",
+                self.p2p_ports[idx]
+            ));
+            cfg.push_str("wireguard_effect = \"fake\"\n");
+        }
         std::fs::write(&path, cfg).expect("write node config");
         path
     }
