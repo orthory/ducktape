@@ -2706,13 +2706,28 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         String::from_utf8_lossy(&namespace),
         storage.display()
     );
-    // coordinated reach targets need the nat client to rendezvous/hole-punch
-    // through their coordinator; it drives them below once the mesh is up.
-    for (target, coord, _coord_key) in &coordinated {
+    // coordinated reach targets are split OUT of the TCP mesh dialer (a
+    // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
+    // there was a silent no-op). reaching them needs the nat client to
+    // hole-punch/relay through the coordinator and bring up a WireGuard tunnel
+    // — the reachability data plane. that wiring (and its inviter-signed
+    // rendezvous auth) is the node-reachability follow-on; until it lands a
+    // coordinated-only invite CANNOT connect, so surface it loudly rather than
+    // park silently. see docs/deploy/private-cutover-integration-gap.md.
+    if !coordinated.is_empty() {
         println!(
-            "[node {label}] coordinated reach: target {} via coordinator {coord:?}",
-            hex_bytes(&target.as_ref()[..4])
+            "[node {label}] WARNING: {} coordinated reach target(s) require the WireGuard \
+             reachability plane, which this build does not yet drive — these peers are \
+             UNREACHABLE until the node-reachability wiring lands. use a direct/fronted \
+             invite for now.",
+            coordinated.len()
         );
+        for (target, coord, _coord_key) in &coordinated {
+            println!(
+                "[node {label}]   coordinated target {} via coordinator {coord:?}",
+                hex_bytes(&target.as_ref()[..4])
+            );
+        }
     }
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
