@@ -1,30 +1,36 @@
-//! snapshot/install round-trip for the agent orchestrator: committed state
-//! covering both owner origin shapes, every turn policy, and every run status
-//! — built through the real ordered-op path — crosses to a fresh module as
-//! canonical bytes and re-derives the identical root, with query parity on
-//! agents, watches, and runs. the bytes arrive UNTRUSTED (a byzantine peer
-//! serves them), so the flip side is exercised too: tampered, truncated,
-//! padded, misordered, and bad-discriminant snapshots are rejected and the
-//! target module is left byte-identical to before the call.
+//! snapshot/install round-trip for the agent module: committed state covering
+//! both owner origin shapes, every turn policy, and pending entries in both
+//! keyspaces (chat + job, threaded and plain) — built through the real
+//! ordered-op path — crosses to a fresh module as canonical bytes and
+//! re-derives the identical root, with query parity on agents, watches, and
+//! pending runs. the bytes arrive UNTRUSTED (a byzantine peer serves them),
+//! so the flip side is exercised too: tampered, truncated, padded,
+//! misordered, and bad-discriminant snapshots are rejected and the target
+//! module is left byte-identical to before the call.
 
 use std::collections::BTreeMap;
 
-use agent::{AgentModule, dispatch_id_for, recipe_id_for, run_id_for};
+use agent::{AgentModule, dispatch_id_for, job_run_id_for, job_spec_hash, run_id_for};
 use agent_interface::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentOutput, AgentQuery, AgentReply,
-    AgentStatus, RunStatus, TurnPolicy, decode_reply, encode_msg, encode_output, encode_query,
+    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, AgentStatus,
+    PendingRun, TurnPolicy, decode_reply, encode_msg, encode_query,
 };
 use chat_interface::{
     AuthorRef, Block, ChatQuery, ChatReply, MessageHead, MessageView,
     decode_query as chat_decode_query, encode_reply as chat_encode_reply,
 };
-use dispatch_interface::{ResultEvent, encode_result_event};
+use dispatch_interface::{
+    DispatchQuery, DispatchReply, decode_query as dispatch_decode_query,
+    encode_reply as dispatch_encode_reply,
+};
 use futures::executor::block_on;
+use jobs_interface::{JobsEvent, encode_event as jobs_encode_event};
 use saga_interface::SagaOrigin;
 use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
 
-/// a minimal `Ctx`: drives `execute` with a controllable env and serves
-/// canned chat transcripts (context pins + reply probes read through it).
+/// a minimal `Ctx`: drives `execute` with a controllable env, serves canned
+/// chat transcripts (context pins + reply probes), and answers the dispatch
+/// module's turn-claim probe with "not taken".
 struct TestCtx {
     env: Env,
     transcripts: BTreeMap<String, Vec<MessageView>>,
@@ -32,7 +38,8 @@ struct TestCtx {
 impl TestCtx {
     fn new(height: u64, origin: Origin) -> Self {
         Self {
-            env: Env { protocol_version: 0,
+            env: Env {
+                protocol_version: 0,
                 height,
                 consensus_time: height,
                 origin,
@@ -55,36 +62,42 @@ impl Ctx for TestCtx {
         None
     }
     async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
-        if target != "chat" {
-            return Err(Error::UnknownModule(target.into()));
-        }
-        match chat_decode_query(req).map_err(Error::Module)? {
-            ChatQuery::MessagesRange {
-                channel_id,
-                from_seq,
-                limit,
-            } => {
-                let transcript = self
-                    .transcripts
-                    .get(&channel_id)
-                    .ok_or_else(|| Error::Module(format!("unknown channel: {channel_id}")))?;
-                let head = transcript.len() as u64;
-                let from = from_seq.max(1);
-                let mut window = Vec::new();
-                if limit > 0 && from <= head {
-                    let to = head.min(from + limit - 1);
-                    window = transcript[(from - 1) as usize..to as usize].to_vec();
+        match target {
+            "dispatch" => match dispatch_decode_query(req).map_err(Error::Module)? {
+                DispatchQuery::Dispatch { .. } => {
+                    Ok(dispatch_encode_reply(&DispatchReply::Dispatch(None)))
                 }
-                Ok(chat_encode_reply(&ChatReply::Messages(window)))
-            }
-            ChatQuery::Message { message_id } => Ok(chat_encode_reply(&ChatReply::Message(
-                self.transcripts
-                    .values()
-                    .flatten()
-                    .find(|v| v.head.message_id == message_id)
-                    .cloned(),
-            ))),
-            _ => Err(Error::QueryUnsupported),
+                _ => Err(Error::QueryUnsupported),
+            },
+            "chat" => match chat_decode_query(req).map_err(Error::Module)? {
+                ChatQuery::MessagesRange {
+                    channel_id,
+                    from_seq,
+                    limit,
+                } => {
+                    let transcript = self
+                        .transcripts
+                        .get(&channel_id)
+                        .ok_or_else(|| Error::Module(format!("unknown channel: {channel_id}")))?;
+                    let head = transcript.len() as u64;
+                    let from = from_seq.max(1);
+                    let mut window = Vec::new();
+                    if limit > 0 && from <= head {
+                        let to = head.min(from + limit - 1);
+                        window = transcript[(from - 1) as usize..to as usize].to_vec();
+                    }
+                    Ok(chat_encode_reply(&ChatReply::Messages(window)))
+                }
+                ChatQuery::Message { message_id } => Ok(chat_encode_reply(&ChatReply::Message(
+                    self.transcripts
+                        .values()
+                        .flatten()
+                        .find(|v| v.head.message_id == message_id)
+                        .cloned(),
+                ))),
+                _ => Err(Error::QueryUnsupported),
+            },
+            other => Err(Error::UnknownModule(other.into())),
         }
     }
     fn emit_msg(&mut self, _m: Msg) {}
@@ -141,21 +154,17 @@ fn exec(m: &mut AgentModule, mut ctx: TestCtx, op: &AgentMsg) {
     block_on(m.execute(&mut ctx, &msg)).unwrap();
 }
 
-/// deliver a dispatch-plane result for a chat run — the completion path.
-fn exec_result(
-    m: &mut AgentModule,
-    mut ctx: TestCtx,
-    run_id: &str,
-    agent_id: &str,
-    outcome: Result<Vec<u8>, String>,
-) {
-    ctx.env.origin = Origin::Module("dispatch".into());
+/// drive the jobs intake — the job-keyspace pending entry's real op path.
+fn exec_jobs_event(m: &mut AgentModule, mut ctx: TestCtx, job_id: &str, kind: &str, spec: &str) {
+    ctx.env.origin = Origin::Module("jobs".into());
     let msg = Msg {
         target: "agent".into(),
-        payload: encode_result_event(&ResultEvent {
-            dispatch_id: dispatch_id_for(run_id),
-            recipe_id: recipe_id_for(agent_id),
-            outcome,
+        payload: jobs_encode_event(&JobsEvent::Submitted {
+            job_id: job_id.into(),
+            kind: kind.into(),
+            submitter: "ext:01".into(),
+            spec: spec.into(),
+            spec_hash: job_spec_hash(spec.as_bytes()),
         }),
     };
     block_on(m.execute(&mut ctx, &msg)).unwrap();
@@ -180,23 +189,18 @@ fn query_reply(m: &AgentModule, q: &AgentQuery) -> AgentReply {
     decode_reply(&block_on(m.query(&encode_query(q))).unwrap()).unwrap()
 }
 
-fn run_status(m: &AgentModule, run_id: &str) -> Option<RunStatus> {
-    match query_reply(
-        m,
-        &AgentQuery::Run {
-            run_id: run_id.into(),
-        },
-    ) {
-        AgentReply::Run(view) => view.map(|v| v.status),
+fn pending(m: &AgentModule, run_id: &str) -> Option<PendingRun> {
+    match query_reply(m, &AgentQuery::PendingRuns) {
+        AgentReply::PendingRuns(runs) => runs.into_iter().find(|p| p.run_id == run_id),
         other => panic!("unexpected reply: {other:?}"),
     }
 }
 
 /// a source holding: agents under both owner shapes (external + module, one
-/// paused), a watch per turn policy, and one committed run in EVERY status
-/// (with a threaded anchor on the awaiting one so the option field is
-/// populated somewhere) — all built through the real execute path, never by
-/// poking internals.
+/// paused), a watch per turn policy, and pending entries in BOTH keyspaces —
+/// two chat runs (one with a threaded anchor so the option field is
+/// populated) and one job-backed run — all built through the real execute
+/// path, never by poking internals.
 fn source() -> AgentModule {
     let alice = Origin::External(b"alice".to_vec());
     let mut m = module();
@@ -247,13 +251,13 @@ fn source() -> AgentModule {
     }
     commit(&mut m);
 
-    // four runs, one per terminal-or-not status.
+    // three pending entries: a threaded chat run, a plain chat run, and a
+    // job-backed run.
     let request = |agent: &str, channel: &str, anchor_seq: u64| AgentMsg::RequestRun {
         agent_id: agent.into(),
         channel_id: channel.into(),
         anchor_seq,
     };
-    // stays AwaitingResult; its anchor is threaded, so thread_root = Some(1).
     exec(
         &mut m,
         TestCtx::new(2, alice.clone()).with_transcript("general", general.clone()),
@@ -261,60 +265,30 @@ fn source() -> AgentModule {
     );
     exec(
         &mut m,
-        TestCtx::new(2, alice.clone()).with_transcript("general", general.clone()),
-        &request("ext-bot", "general", 2),
-    );
-    exec(
-        &mut m,
-        TestCtx::new(2, alice.clone()).with_transcript("general", general.clone()),
-        &request("ext-bot", "general", 1),
-    );
-    exec(
-        &mut m,
         TestCtx::new(2, alice.clone()).with_transcript("dev", dev.clone()),
         &request("mod-bot", "dev", 1),
     );
-    commit(&mut m);
-
-    // general/2 -> Done (a valid reply output), general/1 -> Failed,
-    // dev/1 -> Cancelled by its requester.
-    exec_result(
+    exec_jobs_event(
         &mut m,
-        TestCtx::new(3, Origin::System).with_transcript("general", general.clone()),
-        &run_id_for("general", 2, "ext-bot"),
-        "ext-bot",
-        Ok(encode_output(&AgentOutput {
-            reply_blocks: vec![Block::paragraph("answered")],
-            actions: Vec::new(),
-        })),
-    );
-    exec_result(
-        &mut m,
-        TestCtx::new(3, Origin::System),
-        &run_id_for("general", 1, "ext-bot"),
-        "ext-bot",
-        Err("worker crashed".into()),
-    );
-    exec(
-        &mut m,
-        TestCtx::new(3, alice.clone()),
-        &AgentMsg::CancelRun {
-            run_id: run_id_for("dev", 1, "mod-bot"),
-        },
+        TestCtx::new(2, Origin::System),
+        "job-1",
+        "agent/mod-bot",
+        "summarize",
     );
     commit(&mut m);
     m
 }
 
 #[test]
-fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
+fn installed_snapshot_reconstructs_root_and_reads_across_both_keyspaces() {
     let src = source();
     let src_root = src.root();
     assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
     let snap = src.snapshot();
 
     // the source really covers the space: three agents (one paused, both
-    // owner shapes), four policies, four run statuses, a threaded anchor.
+    // owner shapes), four policies, chat + job pending entries, a threaded
+    // anchor.
     let AgentReply::Agents(agents) = query_reply(&src, &AgentQuery::Agents) else {
         panic!("agents reply expected");
     };
@@ -326,35 +300,12 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
         panic!("watches reply expected");
     };
     assert_eq!(watches.len(), 4);
-    assert!(matches!(
-        run_status(&src, &run_id_for("general", 3, "ext-bot")),
-        Some(RunStatus::AwaitingResult { .. })
-    ));
-    assert_eq!(
-        run_status(&src, &run_id_for("general", 2, "ext-bot")),
-        Some(RunStatus::Done)
-    );
-    assert!(matches!(
-        run_status(&src, &run_id_for("general", 1, "ext-bot")),
-        Some(RunStatus::Failed { .. })
-    ));
-    assert_eq!(
-        run_status(&src, &run_id_for("dev", 1, "mod-bot")),
-        Some(RunStatus::Cancelled)
-    );
-    let AgentReply::Run(Some(awaiting)) = query_reply(
-        &src,
-        &AgentQuery::Run {
-            run_id: run_id_for("general", 3, "ext-bot"),
-        },
-    ) else {
-        panic!("awaiting run expected");
-    };
-    assert_eq!(
-        awaiting.thread_root,
-        Some(1),
-        "the option field is populated"
-    );
+    let threaded = pending(&src, &run_id_for("general", 3, "ext-bot")).expect("threaded entry");
+    assert_eq!(threaded.thread_root, Some(1), "the option field is populated");
+    assert!(pending(&src, &run_id_for("dev", 1, "mod-bot")).is_some());
+    let job = pending(&src, &job_run_id_for("job-1", "mod-bot", 2)).expect("job entry");
+    assert_eq!(job.job_id, Some("job-1".into()));
+    assert_eq!(job.job_claim_height, 2);
 
     // the joiner has UNCOMMITTED staged work of its own: install must drop it
     // — a snapshot describes a block boundary, nothing staged may shadow it.
@@ -371,25 +322,13 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
     assert_eq!(dst.root(), src_root, "installed root must equal the source");
 
     // query parity across every surface.
-    for q in [AgentQuery::Agents, AgentQuery::Watches] {
+    for q in [
+        AgentQuery::Agents,
+        AgentQuery::Watches,
+        AgentQuery::PendingRuns,
+    ] {
         assert_eq!(query_reply(&dst, &q), query_reply(&src, &q));
     }
-    assert_eq!(
-        query_reply(
-            &dst,
-            &AgentQuery::Runs {
-                channel_id: None,
-                limit: 100,
-            },
-        ),
-        query_reply(
-            &src,
-            &AgentQuery::Runs {
-                channel_id: None,
-                limit: 100,
-            },
-        )
-    );
     let AgentReply::Agent(staged) = query_reply(
         &dst,
         &AgentQuery::Agent {
@@ -483,18 +422,16 @@ fn truncated_or_padded_snapshot_is_rejected() {
     assert_eq!(dst.root(), empty_root);
 }
 
-/// the canonical bytes of a minimal one-agent / one-watch / one-run state,
-/// built through the real op path. the layout is pinned by the asserted
-/// length so the discriminant-tampering test can index into it:
+/// the canonical bytes of a minimal one-agent / one-watch / one-pending-run
+/// state, built through the real op path. the layout is pinned by the
+/// asserted length so the discriminant-tampering test can index into it:
 /// agents:  count 8 | id 8+1 | owner disc 1 + key 8+1 | display 8+1
 ///          | model 8+1 | prompt 8+32 | prompt-doc tag 1 | action count 8
 ///          | status 1 | times 16
 /// watches: count 8 | channel 8+1 | policy 1
-/// runs:    count 8 | run id 8+10 | agent 8+1 | channel 8+1 | anchor 8
+/// pending: count 8 | dispatch id 8+64 | agent 8+1 | channel 8+1 | anchor 8
 ///          | thread tag 1 | job id tag 1 | job claim height 8
-///          | requester disc 1 + key 8+1 | status disc 1
-///          + dispatch id 8+64 | ctx hash 8+32 | times 16
-/// index:   count 8 | dispatch id 8+64 | run id 8+10
+///          | requester disc 1 + key 8+1 | created_at 8
 fn minimal_snapshot() -> Vec<u8> {
     let owner = Origin::External(vec![5]);
     let mut m = bare_module();
@@ -529,7 +466,7 @@ fn minimal_snapshot() -> Vec<u8> {
     );
     commit(&mut m);
     let snap = m.snapshot();
-    assert_eq!(snap.len(), 428, "the minimal layout this test indexes into");
+    assert_eq!(snap.len(), 263, "the minimal layout this test indexes into");
     snap
 }
 
@@ -538,18 +475,17 @@ fn unknown_discriminants_and_tags_are_rejected() {
     let empty_root = bare_module().root();
     let snap = minimal_snapshot();
 
-    // owner origin disc (17), agent status (94), watch policy (128), the run's
-    // thread-root option tag (181), job-id option tag (182), requester origin
-    // disc (191), and run status disc (201) each admit exactly their known
-    // values — a state has ONE valid encoding.
+    // owner origin disc (17), agent status (94), watch policy (128), the
+    // pending entry's thread-root option tag (235), job-id option tag (236),
+    // and requester origin disc (245) each admit exactly their known values —
+    // a state has ONE valid encoding.
     for (index, what) in [
         (17usize, "owner origin discriminant"),
         (94, "agent status"),
         (128, "watch policy"),
-        (181, "thread-root option tag"),
-        (182, "job-id option tag"),
-        (191, "requester origin discriminant"),
-        (201, "run status discriminant"),
+        (235, "thread-root option tag"),
+        (236, "job-id option tag"),
+        (245, "requester origin discriminant"),
     ] {
         let mut bad = snap.clone();
         bad[index] = 9;
@@ -566,13 +502,19 @@ fn unknown_discriminants_and_tags_are_rejected() {
         );
     }
 
-    // the dispatch index is DERIVED state: an entry whose id is not the
-    // run's own dispatch id must be rejected, not adopted.
+    // the pending key is DERIVED state: an entry whose dispatch id is not
+    // the hex sha256 of the run id its fields produce must be rejected, not
+    // adopted. the id's first hex char sits right after the section count
+    // and the length prefix.
     let mut bad = snap.clone();
-    let index_id_start = snap.len() - (8 + 64 + 8 + 10) + 8;
-    bad[index_id_start] = bad[index_id_start].wrapping_add(1);
+    let dispatch_id_start = 129 + 8 + 8;
+    bad[dispatch_id_start] = bad[dispatch_id_start].wrapping_add(1);
     let mut dst = bare_module();
-    assert!(dst.install(&bad, StateRoot::ZERO).is_err());
+    let err = dst.install(&bad, StateRoot::ZERO).unwrap_err();
+    assert!(
+        matches!(err, Error::Module(reason) if reason.contains("dispatch id")),
+        "a mismatched dispatch id must be rejected"
+    );
     assert_eq!(dst.root(), empty_root);
 }
 
@@ -601,9 +543,9 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     commit(&mut m);
     let snap = m.snapshot();
     let good_root = m.root();
-    // agents section: count 8, then two 103-byte bodies; watches + runs +
-    // dispatch-index counts trail.
-    assert_eq!(snap.len(), 8 + 103 * 2 + 8 + 8 + 8);
+    // agents section: count 8, then two 103-byte bodies; watches + pending
+    // counts trail.
+    assert_eq!(snap.len(), 8 + 103 * 2 + 8 + 8);
     let body_a = snap[8..111].to_vec();
     let body_b = snap[111..214].to_vec();
 

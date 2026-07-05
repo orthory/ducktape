@@ -1,25 +1,27 @@
 //! the collaboration loop end-to-end under a real host (design §3), on the
 //! tagging + dispatch planes: a human posts with a mention → chat reports the
-//! post to the TAGGING plane → the plane's engagement event, the run record,
-//! the dispatch, and its saga trigger all commit IN THE SAME BLOCK as the
-//! post (P2) → the mock worker answers the WorkerRequest effect as an
+//! post to the TAGGING plane → the plane's engagement event, the pending
+//! entry, the dispatch, and its saga trigger all commit IN THE SAME BLOCK as
+//! the post (P2) → the mock worker answers the WorkerRequest effect as an
 //! ordinary oracle op → the saga's terminal transition and the dispatch
 //! module's contract-checked mailbox write commit in that op's block — and
 //! NOTHING reaches the agent yet (the never-pop-stack rule) → the NEXT block
 //! injects the delivery, and the agent's validated reply (authored as the
-//! AGENT) plus the task action commit in that delivery block → a second
+//! AGENT) plus the task action commit in that delivery block (pruning the
+//! pending entry — the dispatch module keeps the history) → a second
 //! composition replaying the identical op sequence lands on the
 //! byte-identical app-hash — the oracle-as-op laundering that makes a
 //! non-deterministic LLM consensus-safe (N2).
+//!
+//! the JOBS lane rides the same plane: a submitted `agent/{id}` job is
+//! claimed and dispatched in the submit cascade, and the delivery block
+//! finalizes the board item with the validated response.
 
-use agent::{
-    AgentModule, dispatch_id_for, job_run_id_for, job_spec_hash, reply_message_id, run_id_for,
-    saga_id_for,
-};
+use agent::{AgentModule, dispatch_id_for, job_run_id_for, reply_message_id, run_id_for};
 use agent_interface::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentOutput, AgentQuery,
-    AgentReply, AgentStatus, RunStatus, TurnPolicy, decode_reply, encode_msg, encode_output,
-    encode_query,
+    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentQuery, AgentReply,
+    AgentResponse, AgentStatus, PendingRun, ReplyBlock, TurnPolicy, decode_reply, encode_msg,
+    encode_query, encode_response,
 };
 use chat::Chat;
 use chat_interface::{
@@ -51,14 +53,29 @@ use tasks_interface::{
     TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
 };
 
-/// the mock oracle's answer: RAW model text (here: a strict AgentOutput JSON
-/// — the agent module's in-consensus normalization accepts it as-is).
-fn canned_output(run_id: &str) -> Vec<u8> {
-    encode_output(&AgentOutput {
-        reply_blocks: vec![Block::paragraph(format!("quack: handling {run_id}"))],
+/// the mock oracle's answer: RAW model text (here: a strict AgentResponse
+/// JSON — the agent module's in-consensus normalization accepts it as-is).
+fn canned_response(run_id: &str) -> Vec<u8> {
+    encode_response(&AgentResponse {
+        reply_blocks: vec![ReplyBlock {
+            kind: "Paragraph".into(),
+            text: format!("quack: handling {run_id}"),
+            lang: None,
+        }],
         actions: vec![AgentAction::CreateTask {
             task_id: "task-1".into(),
             title: "follow up on the mention".into(),
+        }],
+    })
+}
+
+/// an actions-only response — what a JOB run is expected to answer with.
+fn job_response(task_id: &str, title: &str) -> Vec<u8> {
+    encode_response(&AgentResponse {
+        reply_blocks: Vec::new(),
+        actions: vec![AgentAction::CreateTask {
+            task_id: task_id.into(),
+            title: title.into(),
         }],
     })
 }
@@ -85,7 +102,8 @@ fn alice() -> Origin {
 }
 
 fn at(height: u64, origin: Origin) -> BlockContext {
-    BlockContext { protocol_version: 0,
+    BlockContext {
+        protocol_version: 0,
         height,
         consensus_time: height,
         origin,
@@ -209,20 +227,22 @@ async fn genesis(context: deterministic::Context) -> Host {
     .expect("genesis")
 }
 
-async fn run_view(host: &Host, run_id: &str) -> Option<agent_interface::RunView> {
+async fn pending_runs(host: &Host) -> Vec<PendingRun> {
     let reply = host
-        .query(
-            "agent",
-            &encode_query(&AgentQuery::Run {
-                run_id: run_id.into(),
-            }),
-        )
+        .query("agent", &encode_query(&AgentQuery::PendingRuns))
         .await
         .unwrap();
     match decode_reply(&reply).unwrap() {
-        AgentReply::Run(view) => view,
+        AgentReply::PendingRuns(runs) => runs,
         other => panic!("unexpected reply: {other:?}"),
     }
+}
+
+async fn pending_run(host: &Host, run_id: &str) -> Option<PendingRun> {
+    pending_runs(host)
+        .await
+        .into_iter()
+        .find(|p| p.run_id == run_id)
 }
 
 async fn saga_status(host: &Host, saga_id: &str) -> Option<SagaStatus> {
@@ -241,8 +261,8 @@ async fn saga_status(host: &Host, saga_id: &str) -> Option<SagaStatus> {
     }
 }
 
-/// the agent's chat-run dispatch as the dispatch module sees it — including
-/// the INTERNAL saga id the failure tests feed oracle results to.
+/// a run's dispatch as the dispatch module sees it — the lifecycle ledger,
+/// including the INTERNAL saga id the failure tests feed oracle results to.
 async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch_interface::DispatchView {
     let reply = host
         .query(
@@ -257,6 +277,14 @@ async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch_interface::Dispat
     match dispatch_interface::decode_reply(&reply).unwrap() {
         DispatchReply::Dispatch(Some(view)) => view,
         other => panic!("expected the run's dispatch, got {other:?}"),
+    }
+}
+
+/// the saga id a still-awaiting run's work rides on.
+async fn dispatch_saga_id(host: &Host, run_id: &str) -> String {
+    match agent_dispatch(host, run_id).await.status {
+        DispatchStatus::AwaitingResult { saga_id } => saga_id,
+        other => panic!("the run's dispatch must await its saga, got {other:?}"),
     }
 }
 
@@ -357,6 +385,24 @@ fn register_duck() -> Msg {
     }
 }
 
+/// feed an oracle result to a run's dispatch saga — the off-consensus seam.
+async fn oracle_result(host: &mut Host, run_id: &str, height: u64, outcome: Result<Vec<u8>, String>) {
+    let saga_id = dispatch_saga_id(host, run_id).await;
+    host.submit_at(
+        at(height, Origin::External(b"oracle".to_vec())),
+        Msg {
+            target: "saga".into(),
+            payload: saga_encode_msg(&SagaMsg::OracleResult {
+                saga_id,
+                attempt: 0,
+                outcome,
+            }),
+        },
+    )
+    .await
+    .expect("oracle block");
+}
+
 #[test]
 fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_block() {
     let run_id = run_id_for("general", 1, "quackbot");
@@ -376,7 +422,7 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
         }
 
         // block 4: the user post. THE SAME BLOCK must carry the message, the
-        // tag report, the plane's engagement delivery, the run record, the
+        // tag report, the plane's engagement delivery, the pending entry, the
         // dispatch, and its saga trigger (P2) — and emit exactly one
         // WorkerRequest effect for the off-consensus seam.
         let (height, origin, post) = &ops[3];
@@ -384,18 +430,13 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
             .submit_at(at(*height, origin.clone()), post.clone())
             .await
             .expect("post block");
-        let run = run_view(&host, &run_id).await.expect("run created");
+        let entry = pending_run(&host, &run_id).await.expect("entry staged");
         assert_eq!(
-            run.status,
-            RunStatus::AwaitingResult {
-                dispatch_id: dispatch_id_for(&run_id),
-            },
-            "the run awaits its dispatch result in the SAME block as the post"
+            entry.dispatch_id,
+            dispatch_id_for(&run_id),
+            "the entry correlates the dispatch staged in the SAME block as the post"
         );
-        let dispatch_view = agent_dispatch(&host, &run_id).await;
-        let DispatchStatus::AwaitingResult { saga_id } = dispatch_view.status.clone() else {
-            panic!("the dispatch awaits its saga, got {:?}", dispatch_view.status);
-        };
+        let saga_id = dispatch_saga_id(&host, &run_id).await;
         assert_eq!(
             saga_status(&host, &saga_id).await,
             Some(SagaStatus::Pending),
@@ -413,15 +454,15 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
         assert!(payload_text.contains("Return ONLY a JSON object"));
         assert!(payload_text.contains("@quackbot"));
 
-        // nothing downstream exists yet: the reply, the task, and the
-        // terminal states all wait on the oracle op.
+        // nothing downstream exists yet: the reply and the task wait on the
+        // oracle op.
         assert_eq!(chat_message(&host, &reply_message_id(&run_id)).await, None);
         assert_eq!(task_ids(&host).await, Vec::<String>::new());
 
         // block 5: the worker's oracle op. the saga settles, the dispatch
         // module judges the Text contract and commits the outcome into its
         // MAILBOX — and the agent sees NOTHING this block (never pop-stack).
-        let oracle_op = oracle_op_for(&outcome.effects[0], canned_output(&run_id));
+        let oracle_op = oracle_op_for(&outcome.effects[0], canned_response(&run_id));
         host.submit_at(
             at(5, Origin::External(b"oracle".to_vec())),
             oracle_op.clone(),
@@ -433,10 +474,10 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
             agent_dispatch(&host, &run_id).await.status,
             DispatchStatus::AwaitingDelivery
         );
-        assert!(matches!(
-            run_view(&host, &run_id).await.unwrap().status,
-            RunStatus::AwaitingResult { .. }
-        ));
+        assert!(
+            pending_run(&host, &run_id).await.is_some(),
+            "the entry stays pending until the delivery block"
+        );
         assert_eq!(
             chat_message(&host, &reply_message_id(&run_id)).await,
             None,
@@ -445,14 +486,14 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
 
         // block 6: ANY next block injects the delivery. the ResultEvent, the
         // validated reply (authored as the AGENT), and the task action all
-        // commit in this one delivery block.
+        // commit in this one delivery block — and the pending entry prunes.
         host.submit_at(at(6, alice()), noop_block(6))
             .await
             .expect("delivery block");
         assert_eq!(
-            run_view(&host, &run_id).await.unwrap().status,
-            RunStatus::Done,
-            "the run settled Done in the delivery block"
+            pending_run(&host, &run_id).await,
+            None,
+            "the delivered entry pruned — the dispatch module holds the history"
         );
         assert_eq!(
             agent_dispatch(&host, &run_id).await.status,
@@ -473,21 +514,13 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
         assert_eq!(task_ids(&host).await, vec!["task-1".to_string()]);
 
         // loop prevention held PLANE-SIDE: the agent's reply was reported to
-        // the tagging plane too, but an entity-authored post fires nothing.
-        let runs = host
-            .query(
-                "agent",
-                &encode_query(&AgentQuery::Runs {
-                    channel_id: None,
-                    limit: 100,
-                }),
-            )
-            .await
-            .unwrap();
-        let AgentReply::Runs(runs) = decode_reply(&runs).unwrap() else {
-            panic!("runs reply expected");
-        };
-        assert_eq!(runs.len(), 1, "exactly one run — the reply spawned none");
+        // the tagging plane too, but an entity-authored post fires nothing —
+        // no new pending entry, no second dispatch.
+        assert_eq!(
+            pending_runs(&host).await,
+            Vec::<PendingRun>::new(),
+            "the reply spawned no new run"
+        );
 
         // the registry commits WHICH model+prompt answered (auditability).
         let record = host
@@ -526,10 +559,7 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
             .submit_at(at(6, alice()), noop_block(6))
             .await
             .expect("replayed delivery block");
-        assert_eq!(
-            run_view(&host, &replay_run_id).await.unwrap().status,
-            RunStatus::Done
-        );
+        assert_eq!(pending_run(&host, &replay_run_id).await, None);
         outcome.app_hash
     });
 
@@ -541,7 +571,7 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
 }
 
 #[test]
-fn an_agent_job_is_claimed_and_records_a_run_in_the_submit_cascade() {
+fn an_agent_job_is_claimed_and_dispatched_in_the_submit_cascade() {
     deterministic::Runner::default().start(|context| async move {
         let mut host = genesis(context).await;
         host.submit_at(as_user(1, 1), enable_job_worker())
@@ -552,9 +582,10 @@ fn an_agent_job_is_claimed_and_records_a_run_in_the_submit_cascade() {
             .expect("register duck");
 
         let spec = "summarize this work item";
-        host.submit_at(as_user(2, 3), submit_job("job-1", "duck", spec))
+        let outcome = host
+            .submit_at(as_user(2, 3), submit_job("job-1", "duck", spec))
             .await
-            .expect("submit cascades to agent claim + run");
+            .expect("submit cascades to agent claim + dispatch");
 
         let job = job_view(&host, "job-1").await.expect("job exists");
         assert_eq!(job.status, JobStatus::Processing);
@@ -564,16 +595,19 @@ fn an_agent_job_is_claimed_and_records_a_run_in_the_submit_cascade() {
         );
 
         let run_id = job_run_id_for("job-1", "duck", 3);
-        let run = run_view(&host, &run_id).await.expect("job run exists");
-        assert_eq!(run.job_id, Some("job-1".into()));
-        assert_eq!(run.agent_id, "duck");
-        assert_eq!(run.context_hash, job_spec_hash(spec.as_bytes()));
-        assert_eq!(
-            run.status,
-            RunStatus::AwaitingOracle {
-                saga_id: saga_id_for(&run_id),
-            }
-        );
+        let entry = pending_run(&host, &run_id).await.expect("job entry exists");
+        assert_eq!(entry.job_id, Some("job-1".into()));
+        assert_eq!(entry.job_claim_height, 3);
+        assert_eq!(entry.agent_id, "duck");
+
+        // the submit cascade emitted the dispatch's WorkerRequest effect, and
+        // its payload carries the FULL job spec — composed in consensus.
+        assert_eq!(outcome.effects.len(), 1, "one WorkerRequest effect");
+        let request = decode_worker_request(&outcome.effects[0].0).unwrap();
+        let work = decode_work_spec(&request.spec).unwrap();
+        assert_eq!(work.dispatch_id, dispatch_id_for(&run_id));
+        let payload_text = String::from_utf8(work.payload).unwrap();
+        assert!(payload_text.contains(spec), "the job spec rides the payload");
     });
 }
 
@@ -593,14 +627,14 @@ fn an_agent_job_for_an_unknown_agent_commits_without_a_claim() {
         assert_eq!(job.status, JobStatus::Pending);
         assert!(job.claim.is_none());
         assert_eq!(
-            run_view(&host, &job_run_id_for("job-ghost", "ghost", 2)).await,
+            pending_run(&host, &job_run_id_for("job-ghost", "ghost", 2)).await,
             None
         );
     });
 }
 
 #[test]
-fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_output() {
+fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_response() {
     deterministic::Runner::default().start(|context| async move {
         let mut host = genesis(context).await;
         host.submit_at(as_user(1, 1), enable_job_worker())
@@ -614,38 +648,25 @@ fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_output() {
             .expect("submit job");
 
         let run_id = job_run_id_for("job-1", "duck", 3);
-        let output = AgentOutput {
-            reply_blocks: Vec::new(),
-            actions: vec![AgentAction::CreateTask {
-                task_id: "job-task".into(),
-                title: "complete job".into(),
-            }],
-        };
-        host.submit_at(
-            at(10, Origin::External(b"oracle".to_vec())),
-            Msg {
-                target: "saga".into(),
-                payload: saga_encode_msg(&SagaMsg::OracleResult {
-                    saga_id: saga_id_for(&run_id),
-                    attempt: 0,
-                    outcome: Ok(encode_output(&output)),
-                }),
-            },
-        )
-        .await
-        .expect("oracle result finalizes the job");
+        let raw = job_response("job-task", "complete job");
+        oracle_result(&mut host, &run_id, 10, Ok(raw.clone())).await;
 
-        assert_eq!(
-            run_view(&host, &run_id).await.unwrap().status,
-            RunStatus::Done
-        );
+        // the oracle block only committed the mailbox; the NEXT block's
+        // delivery finalizes the board and emits the task action.
+        assert_eq!(job_view(&host, "job-1").await.unwrap().status, JobStatus::Processing);
+        host.submit_at(at(11, alice()), noop_block(11))
+            .await
+            .expect("delivery block");
+
+        assert_eq!(pending_run(&host, &run_id).await, None, "entry pruned");
         let job = job_view(&host, "job-1").await.expect("job exists");
         assert_eq!(job.status, JobStatus::Done);
         let result = job.result.expect("finalize result");
         assert!(result.ok);
         assert_eq!(
             result.payload,
-            String::from_utf8(encode_output(&output)).expect("json output is utf8")
+            String::from_utf8(raw).expect("json response is utf8"),
+            "the normalized response JSON is the finalize payload"
         );
         assert_eq!(task_ids(&host).await, vec!["job-task".to_string()]);
     });
@@ -666,26 +687,21 @@ fn a_pruned_and_resubmitted_job_id_gets_a_fresh_episode_run() {
             .await
             .expect("first submit");
         let first_run_id = job_run_id_for("repeat", "duck", 3);
-        host.submit_at(
-            at(10, Origin::External(b"oracle".to_vec())),
-            Msg {
-                target: "saga".into(),
-                payload: saga_encode_msg(&SagaMsg::OracleResult {
-                    saga_id: saga_id_for(&first_run_id),
-                    attempt: 0,
-                    outcome: Ok(encode_output(&AgentOutput {
-                        reply_blocks: Vec::new(),
-                        actions: vec![AgentAction::CreateTask {
-                            task_id: "first-task".into(),
-                            title: "finish first".into(),
-                        }],
-                    })),
-                }),
-            },
+        oracle_result(
+            &mut host,
+            &first_run_id,
+            10,
+            Ok(job_response("first-task", "finish first")),
         )
-        .await
-        .expect("finish first episode");
-        host.submit_at(as_user(2, 11), prune_job("repeat"))
+        .await;
+        host.submit_at(at(11, alice()), noop_block(11))
+            .await
+            .expect("first episode delivery");
+        assert_eq!(
+            job_view(&host, "repeat").await.unwrap().status,
+            JobStatus::Done
+        );
+        host.submit_at(as_user(2, 12), prune_job("repeat"))
             .await
             .expect("prune first episode");
 
@@ -694,14 +710,15 @@ fn a_pruned_and_resubmitted_job_id_gets_a_fresh_episode_run() {
             .expect("resubmit same job id");
         let second_run_id = job_run_id_for("repeat", "duck", 20);
         assert_ne!(first_run_id, second_run_id);
-        assert!(
-            run_view(&host, &first_run_id).await.is_some(),
-            "the terminal first run remains in agent history"
+        assert_eq!(
+            pending_run(&host, &first_run_id).await,
+            None,
+            "the delivered first episode left no pending entry behind"
         );
-        let second = run_view(&host, &second_run_id)
-            .await
-            .expect("fresh run for second job episode");
-        assert_eq!(second.context_hash, job_spec_hash(b"second"));
+        assert!(
+            pending_run(&host, &second_run_id).await.is_some(),
+            "fresh entry for the second job episode"
+        );
 
         let job = job_view(&host, "repeat")
             .await
@@ -737,29 +754,21 @@ fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
             .await
             .expect("agent reclaims a new episode");
 
-        host.submit_at(
-            at(1010, Origin::External(b"oracle".to_vec())),
-            Msg {
-                target: "saga".into(),
-                payload: saga_encode_msg(&SagaMsg::OracleResult {
-                    saga_id: saga_id_for(&stale_run_id),
-                    attempt: 0,
-                    outcome: Ok(encode_output(&AgentOutput {
-                        reply_blocks: Vec::new(),
-                        actions: vec![AgentAction::CreateTask {
-                            task_id: "stale-task".into(),
-                            title: "late stale output".into(),
-                        }],
-                    })),
-                }),
-            },
+        oracle_result(
+            &mut host,
+            &stale_run_id,
+            1010,
+            Ok(job_response("stale-task", "late stale output")),
         )
-        .await
-        .expect("late stale run closes agent state without finalizing the job");
+        .await;
+        host.submit_at(at(1011, alice()), noop_block(1011))
+            .await
+            .expect("stale delivery block");
 
         assert_eq!(
-            run_view(&host, &stale_run_id).await.unwrap().status,
-            RunStatus::Done
+            pending_run(&host, &stale_run_id).await,
+            None,
+            "the stale entry pruned without finalizing anything"
         );
         let job = job_view(&host, "lease").await.expect("job remains");
         assert_eq!(job.status, JobStatus::Processing);
@@ -786,6 +795,7 @@ fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
             .expect("submit job");
 
         let run_id = job_run_id_for("job-fail", "duck", 3);
+        let saga_id = dispatch_saga_id(&host, &run_id).await;
         for attempt in 0..2u32 {
             host.submit_at(
                 at(
@@ -795,7 +805,7 @@ fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
                 Msg {
                     target: "saga".into(),
                     payload: saga_encode_msg(&SagaMsg::OracleResult {
-                        saga_id: saga_id_for(&run_id),
+                        saga_id: saga_id.clone(),
                         attempt,
                         outcome: Err("model unavailable".into()),
                     }),
@@ -804,13 +814,11 @@ fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
             .await
             .expect("failing oracle result");
         }
+        host.submit_at(at(20, alice()), noop_block(20))
+            .await
+            .expect("delivery block");
 
-        assert_eq!(
-            run_view(&host, &run_id).await.unwrap().status,
-            RunStatus::Failed {
-                reason: "model unavailable".into(),
-            }
-        );
+        assert_eq!(pending_run(&host, &run_id).await, None);
         let job = job_view(&host, "job-fail").await.expect("job exists");
         assert_eq!(job.status, JobStatus::Failed);
         let result = job.result.expect("finalize result");
@@ -827,11 +835,7 @@ fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
             host.submit_at(at(height, origin), op).await.expect("block");
         }
         let run_id = run_id_for("general", 1, "quackbot");
-        let DispatchStatus::AwaitingResult { saga_id } =
-            agent_dispatch(&host, &run_id).await.status
-        else {
-            panic!("the run's dispatch must await its saga");
-        };
+        let saga_id = dispatch_saga_id(&host, &run_id).await;
 
         // the oracle reports a hard failure after saga retries are exhausted:
         // the recipe grants one retry (max_attempts = 2), so two failing
@@ -861,10 +865,9 @@ fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
             .expect("delivery block");
 
         assert_eq!(
-            run_view(&host, &run_id).await.unwrap().status,
-            RunStatus::Failed {
-                reason: "model unavailable".into(),
-            }
+            pending_run(&host, &run_id).await,
+            None,
+            "the failed run's entry pruned"
         );
         assert_eq!(
             chat_message(&host, &reply_message_id(&run_id)).await,
@@ -880,7 +883,7 @@ fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
 }
 
 #[test]
-fn an_output_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
+fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
     deterministic::Runner::default().start(|context| async move {
         let mut host = genesis(context).await;
         // same script, but quackbot may ONLY post to chat — no task grants.
@@ -893,13 +896,9 @@ fn an_output_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
             host.submit_at(at(height, origin), op).await.expect("block");
         }
         let run_id = run_id_for("general", 1, "quackbot");
-        let DispatchStatus::AwaitingResult { saga_id } =
-            agent_dispatch(&host, &run_id).await.status
-        else {
-            panic!("the run's dispatch must await its saga");
-        };
+        let saga_id = dispatch_saga_id(&host, &run_id).await;
 
-        // the oracle answers with an output that includes a task action the
+        // the oracle answers with a response that includes a task action the
         // agent was never granted: the delivery block commits (no-fail rule),
         // the run fails deterministically, and NOTHING was written to chat
         // or tasks.
@@ -910,20 +909,21 @@ fn an_output_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
                     saga_id: saga_id.clone(),
                     attempt: 0,
-                    outcome: Ok(canned_output(&run_id)),
+                    outcome: Ok(canned_response(&run_id)),
                 }),
             },
         )
         .await
-        .expect("the disallowed output must NOT abort the oracle block");
+        .expect("the disallowed response must NOT abort the oracle block");
         host.submit_at(at(11, alice()), noop_block(11))
             .await
-            .expect("the disallowed output must NOT abort the delivery block");
+            .expect("the disallowed response must NOT abort the delivery block");
 
-        let RunStatus::Failed { reason } = run_view(&host, &run_id).await.unwrap().status else {
-            panic!("the run must fail");
-        };
-        assert!(reason.contains(ACTION_TASKS_CREATE));
+        assert_eq!(
+            pending_run(&host, &run_id).await,
+            None,
+            "the failed run's entry pruned"
+        );
         assert_eq!(
             agent_dispatch(&host, &run_id).await.status,
             DispatchStatus::Delivered,

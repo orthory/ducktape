@@ -52,7 +52,6 @@ dependencies = [
 name = "agent-interface"
 version = "0.1.0"
 dependencies = [
- "chat-interface",
  "saga-interface",
  "serde",
  "serde_json",
