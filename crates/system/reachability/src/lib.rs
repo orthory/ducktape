@@ -21,6 +21,7 @@ pub mod binding;
 pub mod keys;
 pub mod msg;
 pub mod orchestrator;
+pub mod store;
 
 pub use binding::{
     active_set, admission_root, identity_of, interface_name, node_key, open_port_policy,
@@ -33,3 +34,4 @@ pub use orchestrator::{
     ReachabilityError, ReachabilityEvent, Resolution, StaticResolver, initiates,
     ADVERT_TTL_VIEWS, HANDSHAKE_TTL_VIEWS, KEEPALIVE_SECONDS,
 };
+pub use store::{MESH_STORE_FORMAT, PersistedMesh, StoreError};

@@ -57,26 +57,36 @@ registered-but-absent node costs consensus nothing.
    punched/relayed via the coordinator); the mesh dials its overlay ULA.
 4. The ingress can die: mesh traffic rides the tunnels.
 
+## Cold restart (shipped)
+
+A member restarting with zero TCP links (ingress gone, tunnels torn down at
+exit) — and the whole-network cold start — heals from disk. Every applied
+epoch persists its verified advert set (`<storage>/mesh-state.json`,
+signature-verified on load); the first boot `Retarget` re-applies that mesh
+purely locally — peer WireGuard keys and advertised endpoints from the
+persisted records, overlay ULAs re-derived from `(chain_id, identity)`,
+NATed endpoints re-resolved FRESH through the coordinator (`NatResolver`
+needs no gossip; one-sided resolution suffices because WireGuard roams on
+authenticated inbound) — and the dialer is seeded with the persisted control
+ULAs for peers without a configured hint. The restored mesh is purely a
+gossip carrier: the boot epoch's own live assembly replaces it at its apply.
+What it deliberately does NOT cover: the FIRST join on a coordinated-only
+config (nothing persisted yet — the throwaway fronted hint in the join
+recipe above remains required for the join window).
+
 ## What remains (this seam's follow-ons)
 
-1. **Cold assembly / restart.** A NATed member restarting with zero TCP links
-   (ingress gone, tunnels torn down) has no path for plane gossip. Fix
-   sketch: persist the verified mesh (records + tunnel plans) and re-apply at
-   boot with fresh coordinator-resolved endpoint overrides, seeding the
-   dialer from the persisted control ULAs. Until then: keep one fronted hint
-   alive, or restart members one at a time (live peers re-establish tunnels
-   to a restarted member via relayed gossip).
-2. **Standby tunnel pre-warming.** The reachability plane's epochs cover
+1. **Standby tunnel pre-warming.** The reachability plane's epochs cover
    ACTIVE members only: phase A's all-members rule means a registered-but-
    absent standby key would stall every epoch's bring-up, so standby nodes
    join the plane at activation instead — tunnels assemble in the seconds
    after the activation cutover (relayed gossip + coordinator punch), not
    before. Pre-warming standby tunnels wants phase B (live re-advertisement
    / partial-mesh applies).
-3. **Coordinator-auth (§3.5 of the original doc).** Rendezvous messages still
+2. **Coordinator-auth (§3.5 of the original doc).** Rendezvous messages still
    carry no inviter-signed token; a compromised coordinator can deny service
    (never substitute keys — records pin WireGuard keys under the owner's
    ed25519 signature). The token design remains open.
-4. **Relay-bind caveat.** A coordinator behind `0.0.0.0` must advertise a
+3. **Relay-bind caveat.** A coordinator behind `0.0.0.0` must advertise a
    routable relay IP — `run_coordinator_advertised` exists; operator guidance
    in [`coordinator.md`](coordinator.md).
