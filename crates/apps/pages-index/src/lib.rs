@@ -14,10 +14,20 @@
 //! - `blk/{block_id}`         — the block's current [`PageBlockRow`].
 //! - `tok/{token}/{block_id}` — one posting per (token, block), value =
 //!   [`TokRef`]; rewritten whole on every text change.
+//!
+//! from-state rebuild: canonical `ListPages`/`GetPage` enumerate every block
+//! WITH its tree shape (`parent`/`page`/`children` are canonical), so rows,
+//! postings, and the subtree-removal membership mirror all re-derive exactly.
+//! the one degradation: canonical blocks keep no per-block coordinates, so
+//! `height` and `time` collapse to the boundary — hit sets stay exact,
+//! ranking among rebuilt rows falls back to id order.
 
 use indexer::search::{self, DEFAULT_POSTING_CAP};
-use indexer::{ApplyCtx, Derived, Error, ModuleIndexer, OpMeta, Result, ViewReader};
-use pages_interface::{BlockKind, PageMsg, decode_msg};
+use indexer::{
+    ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, RebuildMeta, Result, StateReader,
+    ViewReader,
+};
+use pages_interface::{BlockKind, PageMsg, PageQuery, PageReply, decode_msg, decode_reply, encode_query};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -109,7 +119,14 @@ fn put_row(out: &mut Derived, row: &PageBlockRow) -> Result<()> {
     Ok(())
 }
 
-fn put_toks(out: &mut Derived, row: &PageBlockRow) -> Result<()> {
+/// every entry one row materializes to — the row itself plus one posting per
+/// token. fold and rebuild both write THROUGH this, so the two paths produce
+/// byte-identical rows.
+fn row_entries(row: &PageBlockRow) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut entries = vec![(
+        blk_key(&row.block_id),
+        serde_json::to_vec(row).map_err(|e| Error::Mapper(e.to_string()))?,
+    )];
     let tok_ref = serde_json::to_vec(&TokRef {
         block_id: row.block_id.clone(),
         page_id: row.page_id.clone(),
@@ -117,7 +134,14 @@ fn put_toks(out: &mut Derived, row: &PageBlockRow) -> Result<()> {
     })
     .map_err(|e| Error::Mapper(e.to_string()))?;
     for token in search::tokens(&row.text) {
-        out.put(tok_key(&token, &row.block_id), tok_ref.clone());
+        entries.push((tok_key(&token, &row.block_id), tok_ref.clone()));
+    }
+    Ok(entries)
+}
+
+fn put_row_and_toks(out: &mut Derived, row: &PageBlockRow) -> Result<()> {
+    for (key, value) in row_entries(row)? {
+        out.put(key, value);
     }
     Ok(())
 }
@@ -128,6 +152,7 @@ fn delete_toks(out: &mut Derived, row: &PageBlockRow) {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl ModuleIndexer for PagesIndex {
     fn module(&self) -> &str {
         &self.module
@@ -157,8 +182,7 @@ impl ModuleIndexer for PagesIndex {
                     height: meta.height,
                     time: meta.time,
                 };
-                put_toks(out, &row)?;
-                put_row(out, &row)
+                put_row_and_toks(out, &row)
             }
             PageMsg::InsertBlock { parent, block, .. } => {
                 // the page is derived from the parent — a parent this index
@@ -176,8 +200,7 @@ impl ModuleIndexer for PagesIndex {
                     height: meta.height,
                     time: meta.time,
                 };
-                put_toks(out, &row)?;
-                put_row(out, &row)?;
+                put_row_and_toks(out, &row)?;
                 parent_row.children.push(block.id);
                 put_row(out, &parent_row)
             }
@@ -185,12 +208,13 @@ impl ModuleIndexer for PagesIndex {
                 let Some(mut row) = read_row(ctx, &block_id)? else {
                     return Ok(());
                 };
+                // delete BEFORE re-putting: tokens shared by the old and new
+                // text stage a delete then a put, and the last action wins.
                 delete_toks(out, &row);
                 row.text = text;
                 row.height = meta.height;
                 row.time = meta.time;
-                put_toks(out, &row)?;
-                put_row(out, &row)
+                put_row_and_toks(out, &row)
             }
             PageMsg::SetKind { block_id, kind } => {
                 let Some(mut row) = read_row(ctx, &block_id)? else {
@@ -278,6 +302,54 @@ impl ModuleIndexer for PagesIndex {
             }
         }
         serde_json::to_vec(&PagesViewReply::Hits(hits)).map_err(|e| Error::View(e.to_string()))
+    }
+
+    fn supports_rebuild(&self) -> bool {
+        true
+    }
+
+    /// re-derive rows and postings from canonical `ListPages`/`GetPage`.
+    /// `parent`/`page`/`children` are canonical, so the whole tree mirror —
+    /// including the membership set subtree removal depends on — rebuilds
+    /// exactly; only `height`/`time` collapse to the boundary.
+    async fn rebuild_from_state(
+        &self,
+        state: &dyn StateReader,
+        meta: &RebuildMeta,
+        out: &mut Backfill<'_>,
+    ) -> Result<()> {
+        let reply = state.query(&encode_query(&PageQuery::ListPages)).await?;
+        let pages = match decode_reply(&reply).map_err(Error::State)? {
+            PageReply::PageList(pages) => pages,
+            other => return Err(Error::State(format!("ListPages answered {other:?}"))),
+        };
+        for page in pages {
+            let reply = state
+                .query(&encode_query(&PageQuery::GetPage {
+                    page_id: page.id.clone(),
+                }))
+                .await?;
+            let blocks = match decode_reply(&reply).map_err(Error::State)? {
+                PageReply::Page(blocks) => blocks,
+                other => return Err(Error::State(format!("GetPage answered {other:?}"))),
+            };
+            for block in blocks.unwrap_or_default() {
+                let row = PageBlockRow {
+                    block_id: block.id,
+                    page_id: block.page,
+                    parent: block.parent,
+                    kind: block.kind,
+                    text: block.text,
+                    children: block.children,
+                    height: meta.height,
+                    time: meta.time,
+                };
+                for (key, value) in row_entries(&row)? {
+                    out.put(key, value)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -447,6 +519,108 @@ mod tests {
         assert!(search(&store, serde_json::json!({"search": {"text": "alpha"}})).is_empty());
         assert_eq!(
             search(&store, serde_json::json!({"search": {"text": "gamma"}})).len(),
+            1
+        );
+    }
+
+    /// canonical pages state standing in for the module's query surface:
+    /// page id → preorder blocks (roots first, complete tree shape).
+    struct CanonicalPages(Vec<(pages_interface::PageMeta, Vec<pages_interface::Block>)>);
+
+    #[async_trait::async_trait(?Send)]
+    impl indexer::StateReader for CanonicalPages {
+        async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
+            let reply = match pages_interface::decode_query(req).map_err(Error::State)? {
+                PageQuery::ListPages => {
+                    PageReply::PageList(self.0.iter().map(|(meta, _)| meta.clone()).collect())
+                }
+                PageQuery::GetPage { page_id } => PageReply::Page(
+                    self.0
+                        .iter()
+                        .find(|(meta, _)| meta.id == page_id)
+                        .map(|(_, blocks)| blocks.clone()),
+                ),
+                other => return Err(Error::State(format!("unexpected query {other:?}"))),
+            };
+            Ok(pages_interface::encode_reply(&reply))
+        }
+    }
+
+    fn canonical_block(
+        id: &str,
+        parent: Option<&str>,
+        page: &str,
+        kind: BlockKind,
+        text: &str,
+        children: &[&str],
+    ) -> pages_interface::Block {
+        pages_interface::Block {
+            id: id.into(),
+            parent: parent.map(Into::into),
+            page: page.into(),
+            kind,
+            text: text.into(),
+            checked: false,
+            children: children.iter().map(|c| (*c).into()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_rederives_tree_and_survives_subtree_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // folded rows the rebuild must throw away.
+        apply(
+            &store,
+            1,
+            vec![op(&PageMsg::CreatePage {
+                page_id: "stale".into(),
+                title: "vanishing title".into(),
+            })],
+        );
+
+        // one page: root p1 → b1 (toggle section) → b2 (inner), plus b3.
+        let state = CanonicalPages(vec![(
+            pages_interface::PageMeta {
+                id: "p1".into(),
+                title: "roadmap".into(),
+            },
+            vec![
+                canonical_block("p1", None, "p1", BlockKind::Page, "roadmap", &["b1", "b3"]),
+                canonical_block("b1", Some("p1"), "p1", BlockKind::Paragraph, "toggle section", &["b2"]),
+                canonical_block("b2", Some("b1"), "p1", BlockKind::Paragraph, "hidden inner text", &[]),
+                canonical_block("b3", Some("p1"), "p1", BlockKind::Paragraph, "sibling survivor", &[]),
+            ],
+        )]);
+        store
+            .rebuild_module("pages", &state, indexer::RebuildMeta { height: 20, time: 0 })
+            .await
+            .expect("rebuild");
+
+        assert!(
+            search(&store, serde_json::json!({"search": {"text": "vanishing"}})).is_empty(),
+            "pre-rebuild rows do not survive"
+        );
+        let hits = search(&store, serde_json::json!({"search": {"text": "roadmap"}}));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].page_id, "p1");
+        assert_eq!(hits[0].height, 20, "coordinates collapse to the boundary");
+        assert_eq!(store.applied_height("pages").unwrap(), 20);
+        assert_eq!(store.backfill_height("pages").unwrap(), Some(20));
+
+        // the rebuilt membership mirror carries the fold forward: removing b1
+        // above the boundary unindexes its whole subtree, sibling untouched.
+        apply(
+            &store,
+            21,
+            vec![op(&PageMsg::RemoveBlock {
+                block_id: "b1".into(),
+            })],
+        );
+        assert!(search(&store, serde_json::json!({"search": {"text": "toggle"}})).is_empty());
+        assert!(search(&store, serde_json::json!({"search": {"text": "hidden"}})).is_empty());
+        assert_eq!(
+            search(&store, serde_json::json!({"search": {"text": "survivor"}})).len(),
             1
         );
     }

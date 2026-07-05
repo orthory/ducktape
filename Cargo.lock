@@ -874,11 +874,13 @@ dependencies = [
 name = "chat-index"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chat-interface",
  "indexer",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2078,11 +2080,13 @@ dependencies = [
 name = "document-index"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "document-interface",
  "indexer",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -4677,11 +4681,13 @@ dependencies = [
 name = "pages-index"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "indexer",
  "pages-interface",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -6416,11 +6422,13 @@ dependencies = [
 name = "tasks-index"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "indexer",
  "serde",
  "serde_json",
  "tasks-interface",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

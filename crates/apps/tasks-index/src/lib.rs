@@ -12,10 +12,19 @@
 //! the fold mirrors module semantics exactly: duplicate creates and updates
 //! of unknown tasks ERROR in the module, which aborts the block — an applied
 //! op is always a clean create or a real transition.
+//!
+//! from-state rebuild: canonical `TaskQuery::List` enumerates every task with
+//! its status and timestamps, so both key spaces re-derive faithfully. what
+//! canonical state does NOT carry is per-op provenance — `created_by` rebuilds
+//! empty and the two heights collapse to the boundary; the listing itself
+//! (id, title, status, created_at, updated_at) is exact.
 
-use indexer::{ApplyCtx, Derived, Error, ModuleIndexer, OpMeta, Result, ViewReader};
+use indexer::{
+    ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, RebuildMeta, Result, StateReader,
+    ViewReader,
+};
 use serde::{Deserialize, Serialize};
-use tasks_interface::{TaskMsg, TaskStatus, decode_msg};
+use tasks_interface::{TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_msg, decode_reply, encode_query};
 
 /// default and max page size for by-status listing.
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -101,13 +110,25 @@ fn encode_row(row: &TaskRow) -> Result<Vec<u8>> {
     serde_json::to_vec(row).map_err(|e| Error::Mapper(e.to_string()))
 }
 
-fn put_row(out: &mut Derived, row: &TaskRow) -> Result<()> {
+/// the two entries one row materializes to — point lookup + status
+/// partition. fold and rebuild both write THROUGH this, so the two paths
+/// produce byte-identical rows.
+fn row_entries(row: &TaskRow) -> Result<[(String, Vec<u8>); 2]> {
     let bytes = encode_row(row)?;
-    out.put(task_key(&row.task_id), bytes.clone());
-    out.put(by_status_key(&row.status, &row.task_id), bytes);
+    Ok([
+        (task_key(&row.task_id), bytes.clone()),
+        (by_status_key(&row.status, &row.task_id), bytes),
+    ])
+}
+
+fn put_row(out: &mut Derived, row: &TaskRow) -> Result<()> {
+    for (key, value) in row_entries(row)? {
+        out.put(key, value);
+    }
     Ok(())
 }
 
+#[async_trait::async_trait(?Send)]
 impl ModuleIndexer for TasksIndex {
     fn module(&self) -> &str {
         &self.module
@@ -188,6 +209,40 @@ impl ModuleIndexer for TasksIndex {
             }
         };
         serde_json::to_vec(&reply).map_err(|e| Error::View(e.to_string()))
+    }
+
+    fn supports_rebuild(&self) -> bool {
+        true
+    }
+
+    /// re-derive both key spaces from canonical `TaskQuery::List`. the
+    /// documented degradation: `created_by` is not canonical state (it only
+    /// ever existed in `OpMeta`) and rebuilds empty; both heights collapse to
+    /// the boundary. timestamps are canonical and survive exactly.
+    async fn rebuild_from_state(
+        &self,
+        state: &dyn StateReader,
+        meta: &RebuildMeta,
+        out: &mut Backfill<'_>,
+    ) -> Result<()> {
+        let reply = state.query(&encode_query(&TaskQuery::List)).await?;
+        let TaskReply::Tasks(tasks) = decode_reply(&reply).map_err(Error::State)?;
+        for task in tasks {
+            let row = TaskRow {
+                task_id: task.id,
+                title: task.title,
+                status: task.status,
+                created_by: String::new(),
+                created_height: meta.height,
+                created_at: task.created_at,
+                updated_height: meta.height,
+                updated_at: task.updated_at,
+            };
+            for (key, value) in row_entries(&row)? {
+                out.put(key, value)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -326,5 +381,105 @@ mod tests {
             panic!("wrong reply shape")
         };
         assert_eq!(tasks.len(), 3);
+    }
+
+    /// canonical tasks state standing in for the module's query surface.
+    struct CanonicalTasks(Vec<tasks_interface::Task>);
+
+    #[async_trait::async_trait(?Send)]
+    impl indexer::StateReader for CanonicalTasks {
+        async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
+            assert!(matches!(
+                tasks_interface::decode_query(req),
+                Ok(TaskQuery::List)
+            ));
+            Ok(tasks_interface::encode_reply(&TaskReply::Tasks(
+                self.0.clone(),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_rederives_partitions_with_boundary_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // a folded history whose rows will be thrown away by the rebuild.
+        apply(
+            &store,
+            1,
+            vec![op(&TaskMsg::CreateTask {
+                task_id: "stale".into(),
+                title: "gone after rebuild".into(),
+            })],
+        );
+
+        let state = CanonicalTasks(vec![
+            tasks_interface::Task {
+                id: "t1".into(),
+                title: "ship the indexer".into(),
+                status: TaskStatus::Done,
+                created_at: 1_001,
+                updated_at: 1_003,
+            },
+            tasks_interface::Task {
+                id: "t2".into(),
+                title: "write the spec".into(),
+                status: TaskStatus::Open,
+                created_at: 1_002,
+                updated_at: 1_002,
+            },
+        ]);
+        let written = store
+            .rebuild_module("tasks", &state, indexer::RebuildMeta { height: 40, time: 0 })
+            .await
+            .expect("rebuild");
+        assert_eq!(written, 4, "two rows, two entries each");
+
+        // the stale fold row is gone; both partitions match canonical state.
+        let TasksViewReply::Task(row) =
+            view(&store, serde_json::json!({"task": {"taskId": "stale"}}))
+        else {
+            panic!("wrong reply shape")
+        };
+        assert!(row.is_none(), "pre-rebuild rows do not survive");
+
+        let TasksViewReply::Tasks { tasks, .. } =
+            view(&store, serde_json::json!({"byStatus": {"status": "Open"}}))
+        else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, "t2");
+        // canonical fields survive exactly; provenance is boundary-stamped.
+        assert_eq!(tasks[0].created_at, 1_002);
+        assert_eq!(tasks[0].created_by, "");
+        assert_eq!(tasks[0].created_height, 40);
+
+        let TasksViewReply::Tasks { tasks, .. } =
+            view(&store, serde_json::json!({"byStatus": {"status": "Done"}}))
+        else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, "t1");
+        assert_eq!(store.applied_height("tasks").unwrap(), 40);
+        assert_eq!(store.backfill_height("tasks").unwrap(), Some(40));
+
+        // the fold continues above the boundary.
+        apply(
+            &store,
+            41,
+            vec![op(&TaskMsg::UpdateStatus {
+                task_id: "t2".into(),
+                status: TaskStatus::InProgress,
+            })],
+        );
+        let TasksViewReply::Tasks { tasks, .. } = view(
+            &store,
+            serde_json::json!({"byStatus": {"status": "InProgress"}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(tasks.len(), 1, "rebuilt rows fold forward like originals");
     }
 }

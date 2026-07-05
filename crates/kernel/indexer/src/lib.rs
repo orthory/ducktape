@@ -260,17 +260,21 @@ fn op_key(height: u64, seq: u32) -> String {
 /// never be half a block ahead of or behind the op log.
 #[derive(Default)]
 pub struct Derived {
-    puts: Vec<(String, Vec<u8>)>,
-    deletes: Vec<String>,
+    /// staged actions in mapper CALL ORDER — `Some` puts, `None` deletes. the
+    /// order is load-bearing: when one op deletes and re-puts the same key (a
+    /// retokenize whose old and new text share a token), the last action must
+    /// win exactly as it would against the database; segregating puts from
+    /// deletes would let a stale delete erase a fresh put.
+    ops: Vec<(String, Option<Vec<u8>>)>,
 }
 
 impl Derived {
     pub fn put(&mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) {
-        self.puts.push((key.into(), value.into()));
+        self.ops.push((key.into(), Some(value.into())));
     }
 
     pub fn delete(&mut self, key: impl Into<String>) {
-        self.deletes.push(key.into());
+        self.ops.push((key.into(), None));
     }
 
     /// drain into the block batch AND the block's read overlay, refusing
@@ -282,24 +286,23 @@ impl Derived {
         batch: &mut WriteBatch,
         overlay: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     ) -> Result<()> {
-        let check = |key: &str| -> Result<()> {
+        for (key, action) in self.ops {
             if key.starts_with(OP_PREFIX) || key.starts_with(META_PREFIX) {
                 return Err(Error::ReservedKey {
                     module: module.to_string(),
-                    key: key.to_string(),
+                    key,
                 });
             }
-            Ok(())
-        };
-        for (key, value) in self.puts {
-            check(&key)?;
-            overlay.insert(key.clone().into_bytes(), Some(value.clone()));
-            batch.put(key, value);
-        }
-        for key in self.deletes {
-            check(&key)?;
-            overlay.insert(key.clone().into_bytes(), None);
-            batch.delete(key);
+            match action {
+                Some(value) => {
+                    overlay.insert(key.clone().into_bytes(), Some(value.clone()));
+                    batch.put(key, value);
+                }
+                None => {
+                    overlay.insert(key.clone().into_bytes(), None);
+                    batch.delete(key);
+                }
+            }
         }
         Ok(())
     }
@@ -1103,6 +1106,50 @@ mod tests {
         // the refused block left nothing behind — the batch never committed.
         let page = store.scan("chat", b"", None, 10).unwrap();
         assert!(page.entries.is_empty());
+    }
+
+    /// a mapper that deletes then re-puts ONE key inside a single op — the
+    /// retokenize shape. the last staged action must win; if the drain
+    /// segregated puts from deletes, the stale delete would erase the fresh
+    /// put and a still-present posting would vanish.
+    struct DeleteThenPut;
+
+    impl ModuleIndexer for DeleteThenPut {
+        fn module(&self) -> &str {
+            "chat"
+        }
+        fn index_op(
+            &self,
+            _ctx: &ApplyCtx,
+            _meta: &OpMeta,
+            payload: &[u8],
+            out: &mut Derived,
+        ) -> Result<()> {
+            out.delete("kept");
+            out.put("kept", payload.to_vec());
+            out.put("dropped", b"old".to_vec());
+            out.delete("dropped");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn derived_actions_apply_in_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_indexer(Box::new(DeleteThenPut));
+        store
+            .apply_block(&block(1, vec![chat_op(b"fresh")]))
+            .unwrap();
+        assert_eq!(
+            store.get("chat", b"kept").unwrap(),
+            Some(b"fresh".to_vec()),
+            "delete-then-put keeps the put"
+        );
+        assert_eq!(
+            store.get("chat", b"dropped").unwrap(),
+            None,
+            "put-then-delete keeps the delete"
+        );
     }
 
     #[test]
