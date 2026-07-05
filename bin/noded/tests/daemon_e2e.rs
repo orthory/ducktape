@@ -497,10 +497,26 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     );
 
     let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
-    let run = daemon.query("agent", serde_json::json!({ "Run": { "run_id": run_id } }));
+    // the run's lifecycle lives in the dispatch module; the agent module's
+    // pending entry pruned when the delivery landed.
+    let pending = daemon.query("agent", serde_json::json!("PendingRuns"));
     assert_eq!(
-        run["Run"]["status"], "Done",
-        "run should settle Done: {run}"
+        pending["PendingRuns"].as_array().map(Vec::len),
+        Some(0),
+        "the delivered run must leave no pending entry: {pending}"
+    );
+    let dispatch = daemon.query(
+        "dispatch",
+        serde_json::json!({
+            "Dispatch": {
+                "receiver": "agent",
+                "dispatch_id": agent::dispatch_id_for(run_id),
+            }
+        }),
+    );
+    assert_eq!(
+        dispatch["Dispatch"]["status"], "Delivered",
+        "the dispatch record is the run's history: {dispatch}"
     );
 
     let reply = daemon.query(

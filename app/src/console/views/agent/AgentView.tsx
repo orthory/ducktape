@@ -1,6 +1,8 @@
-// The agents surface over the node's `agent` module — the collaboration-loop
-// orchestrator. It stays render-only over useDucktape: roster, watches, recent
-// runs, and composers all submit through the store action facade.
+// The agents surface over the node's `agent` module — the collaboration
+// loop's dispatch-plane consumer. It stays render-only over useDucktape:
+// roster, watches, pending runs, and composers all submit through the store
+// action facade. Run lifecycle lives in the dispatch module; this surface
+// shows only the in-flight entries (pruned when a result delivers).
 //
 // No optimistic state: every write goes through the store's submit-then-refresh.
 
@@ -9,8 +11,7 @@ import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type {
   AgentRecord,
-  RunStatus,
-  RunView,
+  PendingRun,
   SagaOrigin,
   TurnPolicy,
   WatchView,
@@ -150,37 +151,10 @@ const policyText = (policy: TurnPolicy, agents: AgentRecord[]): string => {
   return `Assigned · ${agentLabel(agents, policy.Assigned)}`;
 };
 
-const isAwaiting = (
-  status: RunStatus,
-): status is
-  | { AwaitingOracle: { saga_id: string } }
-  | { AwaitingResult: { dispatch_id: string } } =>
-  typeof status === "object" &&
-  ("AwaitingOracle" in status || "AwaitingResult" in status);
-
-const runTone = (status: RunStatus): Tone => {
-  if (status === "Done") return statusTone.success;
-  if (status === "Cancelled") return statusTone.neutral;
-  if (isAwaiting(status)) return statusTone.warning;
-  return statusTone.danger;
-};
-
-const runLabel = (status: RunStatus): string => {
-  if (status === "Done") return "DONE";
-  if (status === "Cancelled") return "CANCELLED";
-  if (isAwaiting(status)) return "AWAITING RESULT";
-  return "FAILED";
-};
-
-const runDetail = (status: RunStatus): string => {
-  if (status === "Done") return "completed";
-  if (status === "Cancelled") return "cancelled";
-  if (isAwaiting(status))
-    return "AwaitingOracle" in status
-      ? `saga ${status.AwaitingOracle.saga_id}`
-      : `dispatch ${status.AwaitingResult.dispatch_id.slice(0, 12)}…`;
-  return status.Failed.reason;
-};
+/** Every listed entry is by definition awaiting its dispatch delivery — the
+ *  node prunes entries the moment a result lands. */
+const runDetail = (run: PendingRun): string =>
+  `dispatch ${run.dispatch_id.slice(0, 12)}…`;
 
 // ── Shared UI atoms ─────────────────────────────────────
 
@@ -1371,7 +1345,7 @@ function WatchesPanel({
   );
 }
 
-// ── Runs timeline ───────────────────────────────────────
+// ── Pending runs timeline ───────────────────────────────
 
 function RunRow({
   run,
@@ -1380,17 +1354,17 @@ function RunRow({
   op,
   onCancel,
 }: {
-  run: RunView;
+  run: PendingRun;
   agents: AgentRecord[];
   channels: Channel[];
   /** The run's finalization record (a cancel keys by run id). */
   op: OpRecord | undefined;
   onCancel: (id: string) => void;
 }) {
-  const tone = runTone(run.status);
-  const awaiting = isAwaiting(run.status);
   const agentName = agentLabel(agents, run.agent_id);
-  const label = channelLabel(channels, run.channel_id);
+  const label = run.job_id
+    ? `job ${run.job_id}`
+    : `${channelLabel(channels, run.channel_id)} @${run.anchor_seq}`;
   return (
     <div
       style={{
@@ -1440,29 +1414,26 @@ function RunRow({
           >
             {agentName}
           </span>
-          <StatusPill label={runLabel(run.status)} tone={tone} />
+          <StatusPill label="AWAITING RESULT" tone={statusTone.warning} />
           <StatusPill label={run.job_id ? "JOB" : "CHAT"} tone={run.job_id ? statusTone.agent : statusTone.blue} />
-          {awaiting && (
-            <button
-              type="button"
-              onClick={() => onCancel(run.run_id)}
-              aria-label={`Cancel run ${run.run_id}`}
-              style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28, color: color.red }}
-            >
-              Cancel
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => onCancel(run.run_id)}
+            aria-label={`Cancel run ${run.run_id}`}
+            style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28, color: color.red }}
+          >
+            Cancel
+          </button>
         </div>
         <div style={{ padding: "11px 12px" }}>
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
             <Chip text={shortText(run.run_id)} />
             <FinalizationMark op={op} />
-            <Chip text={`${label} @${run.anchor_seq}`} tone={statusTone.blue} />
+            <Chip text={label} tone={statusTone.blue} />
             {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
-            {run.job_id && <Chip text={shortText(run.job_id)} tone={statusTone.agent} />}
           </div>
           <div
-            title={runDetail(run.status)}
+            title={runDetail(run)}
             style={{
               marginTop: 7,
               font: `400 11px ${font.mono}`,
@@ -1472,7 +1443,7 @@ function RunRow({
               whiteSpace: "nowrap",
             }}
           >
-            {runDetail(run.status)} · updated {run.updated_at}
+            {runDetail(run)} · created {run.created_at}
           </div>
         </div>
       </GroupCard>
@@ -1487,7 +1458,7 @@ function RunsTimeline({
   ops,
   onCancel,
 }: {
-  runs: RunView[];
+  runs: PendingRun[];
   agents: AgentRecord[];
   channels: Channel[];
   /** The store's finalization ledger — run rows draw their marks. */
@@ -1495,9 +1466,9 @@ function RunsTimeline({
   onCancel: (id: string) => void;
 }) {
   return (
-    <section aria-label="Runs timeline" style={{ minWidth: 0 }}>
+    <section aria-label="Pending runs" style={{ minWidth: 0 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <SectionLabel>RUNS TIMELINE</SectionLabel>
+        <SectionLabel>PENDING RUNS</SectionLabel>
         <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
           {runs.length}
         </span>
@@ -1506,8 +1477,8 @@ function RunsTimeline({
         <GroupCard style={{ marginTop: 9 }}>
           <EmptyState
             icon="agent"
-            title="No runs yet"
-            body="Watched channels and explicit requests will appear here newest-first."
+            title="No runs in flight"
+            body="Engagements and explicit requests appear here until their result delivers; history lives on the dispatch plane."
           />
         </GroupCard>
       ) : (
@@ -1656,7 +1627,7 @@ export function AgentView() {
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <StatusPill label={`${activeCount} ACTIVE`} tone={statusTone.success} />
             <StatusPill label={`${state.watches.length} WATCHES`} tone={statusTone.neutral} />
-            <StatusPill label={`${state.runs.length} RUNS`} tone={statusTone.warning} />
+            <StatusPill label={`${state.pendingRuns.length} PENDING`} tone={statusTone.warning} />
           </div>
         </div>
       </div>
@@ -1754,7 +1725,7 @@ export function AgentView() {
               onUnwatch={actions.unwatchChannel}
             />
             <RunsTimeline
-              runs={state.runs}
+              runs={state.pendingRuns}
               agents={state.agents}
               channels={state.channels}
               ops={state.ops}

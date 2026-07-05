@@ -64,9 +64,10 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
       },
     ],
     watches: [{ channel_id: "general", policy: { Assigned: "summarizer" } }],
-    runs: [
+    pendingRuns: [
       {
         run_id: "general/42/summarizer",
+        dispatch_id: "ef".repeat(32),
         agent_id: "summarizer",
         channel_id: "general",
         anchor_seq: 42,
@@ -74,10 +75,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         job_id: null,
         job_claim_height: 0,
         requester: "System" as const,
-        status: { AwaitingOracle: { saga_id: "saga-1" } },
-        context_hash: bytes(0xef),
         created_at: 30,
-        updated_at: 40,
       },
     ],
     ...patch,

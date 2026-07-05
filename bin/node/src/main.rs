@@ -50,7 +50,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent::AgentModule;
-use agent_oracle::LlmWorker;
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
@@ -5642,24 +5641,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let providers = capability_host::discover()
             .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
-        // a second, identical discovery for the dispatch worker: ProviderSet
-        // owns its providers (not Clone), and both discoveries read the same
-        // specs + PATH at boot, so the two surfaces cannot drift.
-        let dispatch_providers = capability_host::discover()
-            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
-        let workers: Vec<Box<dyn reactor::Worker>> = vec![
-            Box::new(LlmWorker::new(
-                blobs.clone(),
-                providers,
-                // this node's submit key: WorkerRequests leased to another
-                // node's key are skipped, not double-run.
-                signer.public_key().as_ref().to_vec(),
-            )),
-            Box::new(DispatchWorker::new(
-                dispatch_providers,
-                signer.public_key().as_ref().to_vec(),
-            )),
-        ];
+        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(DispatchWorker::new(
+            providers,
+            // this node's submit key: WorkerRequests leased to another
+            // node's key are skipped, not double-run.
+            signer.public_key().as_ref().to_vec(),
+        ))];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
         // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
         // this binary can execute. survives restart/late-join (state-driven, not a

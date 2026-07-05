@@ -10,8 +10,8 @@
 //! the entire input — the dispatcher composed it), NO output shape is parsed
 //! here (the dispatch module judges the recipe's output contract in
 //! consensus), and NO credentials are touched (BYO CLI auth). foreign leases
-//! are skipped exactly like `agent-oracle`: under the strict policy someone
-//! else's assignment would be a no-op result, so not spawning is what turns
+//! are skipped: under the strict policy someone else's assignment would be a
+//! no-op result, so not spawning is what turns
 //! N-nodes-each-paying-for-the-same-call into one call.
 
 use capability_host::ProviderSet;
@@ -54,8 +54,8 @@ impl Worker for DispatchWorker {
             Ok(request) => request,
             Err(_) => return Ok(WorkOutcome::NotMine),
         };
-        // the kind-gated decode: foreign spec shapes (e.g. the legacy agent
-        // LlmRequest) are NotMine, never a guessed execution.
+        // the kind-gated decode: foreign spec shapes are NotMine, never a
+        // guessed execution.
         let work = match decode_work_spec(&request.spec) {
             Ok(work) => work,
             Err(_) => return Ok(WorkOutcome::NotMine),
@@ -175,8 +175,7 @@ format = "text"
     async fn foreign_specs_are_not_mine_and_foreign_leases_are_skipped() {
         let worker = DispatchWorker::new(mock_specs_only(), b"me".to_vec());
 
-        // an agent-shaped spec (no kind field) is NotMine — the legacy
-        // worker's work, never guessed at.
+        // a foreign spec shape (no kind field) is NotMine, never guessed at.
         let foreign = effect_for(br#"{"run_id":"r","agent_id":"a"}"#.to_vec(), None);
         assert!(matches!(
             worker.run(&foreign).await.unwrap(),

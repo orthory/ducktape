@@ -383,9 +383,9 @@ export const runCancelled = (
   prev: ConsoleState,
   runId: string,
 ): Partial<ConsoleState> => ({
-  runs: prev.runs.map((r) =>
-    r.run_id === runId ? { ...r, status: "Cancelled" as const } : r,
-  ),
+  // a cancel resolves through the dispatch plane's Err("cancelled") delivery,
+  // which prunes the entry node-side a block later — mirror that prune.
+  pendingRuns: prev.pendingRuns.filter((r) => r.run_id !== runId),
 });
 
 // ── Inbox ───────────────────────────────────────────────

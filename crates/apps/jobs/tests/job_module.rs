@@ -282,6 +282,7 @@ fn jobs_event_codec_round_trips_submitted() {
         job_id: "j1".into(),
         kind: "agent/duck".into(),
         submitter: actor("submitter"),
+        spec: "summarize this".into(),
         spec_hash: vec![7u8; 32],
     };
     assert_eq!(

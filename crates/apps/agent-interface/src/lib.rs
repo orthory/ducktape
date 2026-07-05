@@ -1,25 +1,26 @@
 //! the agent module's public wire surface — types only.
 //!
-//! the agent module is the collaboration-loop orchestrator (design §3, §5):
-//! it registers agents, watches chat channels through the tagging plane's
-//! engagement events, turns engaged posts into dispatch-plane runs, pins each
-//! run to the exact transcript prefix it saw, and validates the model's
-//! output before any cross-module write happens. four payload families cross
-//! this surface:
+//! the agent module is the collaboration-loop consumer on the tagging and
+//! dispatch planes: it registers agents, watches chat channels through the
+//! tagging plane's engagement events, composes each engaged post's model
+//! input in consensus, dispatches it under the agent's own recipe, and
+//! validates the model's response before any cross-module write happens.
+//! run LIFECYCLE is not this module's state — a dispatched task's lifecycle
+//! lives in the dispatch module (and its saga); this surface only exposes the
+//! module's own correlation entries for still-pending work. three payload
+//! families cross this surface:
 //!
 //! - [`AgentMsg`] — writes: registry admin, channel watches, explicit run
 //!   requests, and run cancellation.
-//! - [`LlmRequest`] — the saga work spec a JOB-BACKED run's trigger carries:
-//!   everything an off-consensus LLM worker needs to re-derive the prompt
-//!   input (P4) and answer under the right idempotency key. chat-engaged runs
-//!   do not use it — they ride the dispatch plane, whose payload the agent
-//!   module composes in-consensus.
-//! - [`AgentOutput`] — the agreed oracle result: reply blocks for chat plus a
-//!   bounded list of [`AgentAction`]s. it is DATA until the agent module
-//!   deterministically validates it against the agent's allowed-action set.
-//! - [`AgentQuery`] -> [`AgentReply`] — reads over agents, watches, and runs.
+//! - [`AgentResponse`] — the formal response wire spec: what a model's raw
+//!   answer is normalized into, and what the strict-output instruction asks
+//!   for. reply blocks are this module's OWN vocabulary (kind + text), not
+//!   another module's — the agent module maps them to chat blocks when it
+//!   emits the reply. it is DATA until the module deterministically validates
+//!   it against the agent's allowed-action set.
+//! - [`AgentQuery`] -> [`AgentReply`] — reads over agents, watches, and the
+//!   pending (not-yet-delivered) runs.
 
-use chat_interface::{Block, MessageView};
 use saga_interface::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -27,28 +28,25 @@ pub const DEFAULT_AGENT_TARGET: &str = "agent";
 
 // ---- consensus constants ----------------------------------------------------
 
-/// hard cap on the actions one run's output may carry — the blast-radius
-/// bound on the follow-up fan-out a single oracle result can cause.
+/// hard cap on the actions one run's response may carry — the blast-radius
+/// bound on the follow-up fan-out a single delivery can cause.
 pub const MAX_ACTIONS_PER_RUN: usize = 8;
 
 /// hard cap on a serialized [`AgentRecord`] — registry entries live in the
 /// root preimage and every snapshot, so registration is size-gated up front.
 pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 
-/// hard cap on the serialized `reply_blocks` of one output. deliberately well
-/// under chat's `MAX_MESSAGE_HEAD_BYTES`: the reply is re-emitted as a chat
-/// post in the SAME block as the saga's terminal transition, and a post that
-/// chat rejects would abort that block and wedge the saga (the no-fail rule) —
-/// so the agent module must be able to prove the post will fit BEFORE emitting.
+/// hard cap on the serialized CHAT blocks a response's `reply_blocks` map to.
+/// deliberately well under chat's `MAX_MESSAGE_HEAD_BYTES`: the reply is
+/// emitted as a chat post inside the delivery block, and a post that chat
+/// rejects would abort that block (the no-fail rule) — so the agent module
+/// must be able to prove the post will fit BEFORE emitting.
 pub const MAX_REPLY_BLOCKS_BYTES: usize = 32 * 1024;
 
 /// required byte length of an agent's prompt hash (a sha256 digest). prompt
 /// CONTENT lives off-registry (e.g. in `document`); consensus commits to the
 /// hash, so which prompt an agent runs is part of the app-hash.
 pub const PROMPT_HASH_LEN: usize = 32;
-
-/// query page bound; larger limits are clamped down to this.
-pub const MAX_QUERY_LIMIT: u64 = 256;
 
 // ---- the action vocabulary ---------------------------------------------------
 
@@ -71,7 +69,7 @@ pub const KNOWN_ACTIONS: [&str; 3] = [
 // ---- registry ----------------------------------------------------------------
 
 /// whether an agent may engage new runs. a paused agent never engages — but
-/// pausing does not cancel runs already awaiting their oracle.
+/// pausing does not cancel work already dispatched.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
     Active,
@@ -99,8 +97,7 @@ pub struct AgentRecord {
     /// consensus-resident. the canonical rendering (block texts joined by
     /// blank lines) must hash to `prompt_hash` — verified at dispatch time,
     /// so a drifted document fails the run's staging, never the block.
-    /// `None` = no stored prompt; dispatch-plane runs use generic
-    /// instructions.
+    /// `None` = no stored prompt; runs use generic instructions.
     pub prompt_doc: Option<String>,
     /// granted action names, each from [`KNOWN_ACTIONS`], sorted and deduped.
     pub allowed_actions: Vec<String>,
@@ -122,100 +119,76 @@ pub enum TurnPolicy {
     RoundRobin,
 }
 
-/// one channel watch — the agent-module-side mirror of the chat hook it was
-/// registered with (the two are staged atomically, P2).
+/// one channel watch — the agent-module-side mirror of the tagging-plane
+/// subscription it was registered with (the two are staged atomically, P2).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WatchView {
     pub channel_id: String,
     pub policy: TurnPolicy,
 }
 
-// ---- runs ---------------------------------------------------------------------
+// ---- pending runs ---------------------------------------------------------------
 
-/// where a run is in its lifecycle. a run is created already awaiting its
-/// oracle (the saga trigger is staged in the same dispatch) and only ordered
-/// ops move it to a terminal state.
+/// one in-flight run's correlation entry: everything the module needs to act
+/// on the dispatch plane's eventual `ResultEvent` — and NOTHING more. this is
+/// not a lifecycle record: the entry exists exactly while the dispatch is
+/// outstanding and is pruned when the result delivers. status and outcome
+/// live in the dispatch module (`DispatchQuery::Dispatch`), keyed by
+/// `dispatch_id` under receiver "agent".
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum RunStatus {
-    /// a JOB-BACKED run's saga, awaited for its callback.
-    AwaitingOracle { saga_id: String },
-    /// a chat-engaged run's dispatch, awaited for its next-block
-    /// `ResultEvent` from the dispatch plane.
-    AwaitingResult { dispatch_id: String },
-    /// the output validated and its follow-ups were emitted.
-    Done,
-    /// the work failed / timed out, or the output failed validation.
-    Failed { reason: String },
-    /// cancelled by the run's creator or the agent's owner.
-    Cancelled,
-}
-
-impl RunStatus {
-    /// true for every state a run can never leave.
-    pub fn is_terminal(&self) -> bool {
-        !matches!(
-            self,
-            RunStatus::AwaitingOracle { .. } | RunStatus::AwaitingResult { .. }
-        )
-    }
-}
-
-/// a run's observable state — the full read projection.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct RunView {
+pub struct PendingRun {
     /// `"chat\x1f{channel_id}\x1f{anchor_seq}\x1f{agent_id}"` for chat runs
-    /// and `"job\x1f{job_id}\x1f{agent_id}\x1f{job_claim_height}"` for job runs:
-    /// the first creation in consensus order wins, duplicates are no-ops.
+    /// and `"job\x1f{job_id}\x1f{agent_id}\x1f{job_claim_height}"` for job
+    /// runs — the turn-claim key; the first creation in consensus order wins.
     pub run_id: String,
+    /// hex sha256 of `run_id` — the dispatch-plane id this entry correlates.
+    pub dispatch_id: String,
     pub agent_id: String,
+    /// empty for job-backed runs.
     pub channel_id: String,
-    /// the message sequence this run answers; the reply is never presented as
-    /// ordered before it (P4).
+    /// 0 for job-backed runs.
     pub anchor_seq: u64,
     /// the anchor's thread root, if the anchor was a thread reply — the reply
     /// posts into the same thread.
     pub thread_root: Option<u64>,
     /// present for jobs-board runs. chat-triggered runs leave this `None`.
     pub job_id: Option<String>,
-    /// the jobs claim height for job-backed runs. chat-triggered runs use 0.
+    /// the jobs claim height a job-backed run is bound to; chat runs use 0.
     pub job_claim_height: u64,
-    /// the run-creating origin (the hook's chat module, or the explicit
+    /// the run-creating origin (the tagging plane, or the explicit
     /// `RequestRun` submitter) — a cancel capability alongside the owner.
     pub requester: SagaOrigin,
-    pub status: RunStatus,
-    /// sha256 over the pinned transcript window up to `anchor_seq` — any
-    /// validator can re-derive the prompt input from the log (P4).
-    pub context_hash: Vec<u8>,
     pub created_at: u64,
-    pub updated_at: u64,
 }
 
-// ---- the saga spec + the oracle result ----------------------------------------
+// ---- the response wire spec ----------------------------------------------------
 
-/// the work spec an agent run's saga trigger carries — what the off-consensus
-/// LLM worker decodes. `context_hash` pins the exact transcript prefix the
-/// prompt must be built from: the worker re-derives the window from its
-/// replica and verifies it hashes to this value before calling the model.
+/// one reply block in the module's OWN vocabulary — exactly the shape the
+/// strict-output instruction asks the model for. `kind` is one of
+/// "Paragraph", "Heading", or "Code" (anything else drops in normalization);
+/// the agent module maps these to chat blocks at emission.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct LlmRequest {
-    pub run_id: String,
-    pub agent_id: String,
-    /// the capability tag the executing host resolves to a local provider.
-    pub capability: String,
-    pub prompt_hash: Vec<u8>,
-    pub channel_id: String,
-    pub anchor_seq: u64,
-    /// present for jobs-board runs. for those runs `context_hash` pins the
-    /// submitted job spec bytes instead of a chat transcript prefix.
-    pub job_id: Option<String>,
-    pub context_hash: Vec<u8>,
-    /// the pinned chat transcript window the run was staged from. older specs
-    /// decode with an empty transcript; job-backed runs also leave this empty.
-    #[serde(default)]
-    pub transcript: Vec<MessageView>,
+pub struct ReplyBlock {
+    pub kind: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
-/// one validated cross-module write an agent's output may request.
+/// the formal agent response: reply blocks plus a bounded list of
+/// [`AgentAction`]s. lenient by construction — both fields default, unknown
+/// JSON fields are ignored — so a model answer either IS this shape or the
+/// module wraps it as one; validation (grants, caps, probes) is a separate,
+/// strict step.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentResponse {
+    #[serde(default)]
+    pub reply_blocks: Vec<ReplyBlock>,
+    #[serde(default)]
+    pub actions: Vec<AgentAction>,
+}
+
+/// one validated cross-module write an agent's response may request.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
     CreateTask {
@@ -238,16 +211,6 @@ impl AgentAction {
             AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
         }
     }
-}
-
-/// the oracle result payload of an agent run: what the LLM answered, as data.
-/// the agent module validates it DETERMINISTICALLY (non-empty, caps, the
-/// agent's allowed actions) before emitting any follow-up; an invalid output
-/// fails the run and writes nothing.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct AgentOutput {
-    pub reply_blocks: Vec<Block>,
-    pub actions: Vec<AgentAction>,
 }
 
 // ---- ops ----------------------------------------------------------------------
@@ -281,27 +244,29 @@ pub enum AgentMsg {
     PauseAgent { agent_id: String },
     /// owner-gated: resume engagement.
     ResumeAgent { agent_id: String },
-    /// watch a channel under `policy` AND register the agent module as a chat
-    /// hook — one atomic block (P2), so the watch and the hook cannot drift.
+    /// watch a channel under `policy` AND subscribe on the tagging plane —
+    /// one atomic block (P2), so the watch and the subscription cannot drift.
     WatchChannel {
         channel_id: String,
         policy: TurnPolicy,
     },
-    /// drop the watch and unregister the hook, atomically.
+    /// drop the watch and the plane subscription, atomically.
     UnwatchChannel { channel_id: String },
     /// opt the agent module into or out of jobs-board submit notifications.
     /// the jobs module derives the worker id from this module's follow-up origin.
     EnableJobWorker { enabled: bool },
-    /// explicitly run `agent_id` against `channel_id`/`anchor_seq` without a
-    /// hook. the duplicate of an existing run is a deterministic no-op — the
-    /// turn claim: first creation in consensus order wins.
+    /// explicitly run `agent_id` against `channel_id`/`anchor_seq` without an
+    /// engagement. the duplicate of a pending or already-dispatched turn is a
+    /// deterministic no-op — the turn claim: first in consensus order wins.
     RequestRun {
         agent_id: String,
         channel_id: String,
         anchor_seq: u64,
     },
-    /// cancel an awaiting run — only the run-creating origin or the agent's
-    /// owner. cancels the underlying saga in the same block.
+    /// cancel a PENDING run — only the run-creating origin or the agent's
+    /// owner. cancels the underlying dispatch in the same block; the plane's
+    /// Err("cancelled") delivery then prunes the entry (and finalizes a
+    /// job-backed run's job) through the one result path.
     CancelRun { run_id: String },
 }
 
@@ -310,18 +275,10 @@ pub enum AgentMsg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum AgentQuery {
     Agents,
-    Agent {
-        agent_id: String,
-    },
-    /// runs, ascending by run id, optionally filtered to one channel; `limit`
-    /// is clamped to [`MAX_QUERY_LIMIT`].
-    Runs {
-        channel_id: Option<String>,
-        limit: u64,
-    },
-    Run {
-        run_id: String,
-    },
+    Agent { agent_id: String },
+    /// every in-flight correlation entry, ascending by dispatch id. bounded:
+    /// entries prune on delivery, and every dispatch has a deadline.
+    PendingRuns,
     Watches,
 }
 
@@ -329,8 +286,7 @@ pub enum AgentQuery {
 pub enum AgentReply {
     Agents(Vec<AgentRecord>),
     Agent(Option<AgentRecord>),
-    Runs(Vec<RunView>),
-    Run(Option<RunView>),
+    PendingRuns(Vec<PendingRun>),
     Watches(Vec<WatchView>),
 }
 
@@ -342,16 +298,10 @@ pub fn encode_msg(m: &AgentMsg) -> Vec<u8> {
 pub fn decode_msg(b: &[u8]) -> Result<AgentMsg, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }
-pub fn encode_llm_request(r: &LlmRequest) -> Vec<u8> {
+pub fn encode_response(r: &AgentResponse) -> Vec<u8> {
     serde_json::to_vec(r).expect("serializable")
 }
-pub fn decode_llm_request(b: &[u8]) -> Result<LlmRequest, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
-}
-pub fn encode_output(o: &AgentOutput) -> Vec<u8> {
-    serde_json::to_vec(o).expect("serializable")
-}
-pub fn decode_output(b: &[u8]) -> Result<AgentOutput, String> {
+pub fn decode_response(b: &[u8]) -> Result<AgentResponse, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }
 pub fn encode_query(q: &AgentQuery) -> Vec<u8> {
