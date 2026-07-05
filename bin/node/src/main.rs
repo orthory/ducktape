@@ -868,8 +868,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await
-    .expect("sync_from");
+    .await?;
 
     let (target, resolver) = fetch_target("document").await?;
     let document = Document::sync_from(
@@ -878,8 +877,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await
-    .expect("sync_from");
+    .await?;
 
     let (target, resolver) = fetch_target("pages").await?;
     let pages = Pages::sync_from(
@@ -888,8 +886,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await
-    .expect("sync_from");
+    .await?;
 
     let (target, resolver) = fetch_target("chat").await?;
     let chat = Chat::sync_from(
@@ -898,8 +895,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await
-    .expect("sync_from");
+    .await?;
 
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
