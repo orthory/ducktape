@@ -185,6 +185,13 @@ pub struct BlockRecord {
     /// best-effort utf-8 preview of the root op's payload (module `*Msg` json
     /// on this lane), capped at [`PAYLOAD_PREVIEW_MAX`] chars.
     pub payload: String,
+    /// hex of the root op's content address — sha256 of the exact payload
+    /// bytes the host committed, staged in the node-local blob store as the
+    /// record is ringed, so `GET /v1/files/blob/{op_hash}` serves the full
+    /// bytes back. same semantics as [`SubmitReceipt::op_hash`]; this is the
+    /// only place the NETWORKED surface exposes it (its submit reply carries
+    /// height only until the noded→ordered-node convergence).
+    pub op_hash: String,
 }
 
 /// the explorer's wire rendering of one dispatch. `Origin::External` renders
@@ -1606,6 +1613,7 @@ mod tests {
             target: "directory".into(),
             operations: Vec::new(),
             payload: String::new(),
+            op_hash: String::new(),
         }
     }
 

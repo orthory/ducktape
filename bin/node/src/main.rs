@@ -4596,6 +4596,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             target: op.target.clone(),
                             operations: op.dispatches.iter().map(noded::DispatchInfo::from).collect(),
                             payload: noded::payload_preview(&op.payload),
+                            // staging IS hashing: put_chunk keys the blob by
+                            // sha256, so this one call both computes the op's
+                            // content address and makes it dereferencable via
+                            // GET /v1/files/blob/{op_hash}.
+                            op_hash: noded::hex_bytes(&blobs.put_chunk(op.payload.clone())),
                         });
                     }
                     for d in drained {

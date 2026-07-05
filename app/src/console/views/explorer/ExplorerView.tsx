@@ -5,7 +5,7 @@
 // transactions inside (the deterministic dispatch trace + the root op's
 // payload). Read-only; records re-pull from the node's ring on every block.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { BlockRecord, TelemetryDispatch } from "../../../domain/transport";
 import { useDucktape } from "../../store/use-ducktape";
@@ -175,6 +175,7 @@ function BlockDetail({ block, onBack }: { block: BlockRecord; onBack: () => void
         <DigestLine label="HASH" value={block.hash} />
         <DigestLine label="COMMIT" value={block.commitHash} />
         <DigestLine label="PROPOSER" value={block.proposer} />
+        <DigestLine label="OP HASH" value={block.opHash ?? ""} />
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -219,13 +220,26 @@ function BlockDetail({ block, onBack }: { block: BlockRecord; onBack: () => void
 }
 
 export function ExplorerView() {
-  const { state } = useDucktape();
+  const { state, actions } = useDucktape();
   // The open block is held as the record itself, not a height lookup: a
   // finalized block is immutable, and holding the snapshot keeps the detail
   // stable even if the ring evicts the record mid-view.
   const [open, setOpen] = useState<BlockRecord | null>(null);
   // State keeps blocks oldest-first; the explorer reads newest-first.
   const blocks = [...state.blocks].reverse();
+
+  // Consume a cross-link hand-off (openExplorerAt): open the focused block and
+  // clear the focus so re-entering the explorer later doesn't replay the jump.
+  // While `blocks` is still empty the focus is left pending — the landing
+  // refresh may not have delivered the ring yet; once data exists, a missing
+  // height means the ring evicted it, and the list is the honest fallback.
+  const { explorerFocus } = state;
+  useEffect(() => {
+    if (explorerFocus === null || state.blocks.length === 0) return;
+    const match = state.blocks.find((block) => block.height === explorerFocus);
+    if (match) setOpen(match);
+    actions.clearExplorerFocus();
+  }, [explorerFocus, state.blocks, actions]);
 
   return (
     <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>

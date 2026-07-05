@@ -163,6 +163,11 @@ export interface ConsoleState {
    *  node's ring on every refresh; empty on a node without the surface. */
   blocks: BlockRecord[];
 
+  /** Height the explorer should open on next render — the finalization-mark
+   *  cross-link's hand-off (openExplorerAt sets it, the explorer consumes it
+   *  once `blocks` has data and clears it). Null when nothing is pending. */
+  explorerFocus: number | null;
+
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
    *  inclusion height + addressable op hash from the submit receipt. Client
@@ -296,6 +301,7 @@ export const createInitialState = (): ConsoleState => {
     files: [],
     telemetry: [],
     blocks: [],
+    explorerFocus: null,
     ops: {},
     error: null,
     workspaces: [],
