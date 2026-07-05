@@ -5669,13 +5669,24 @@ mod tests {
                 "disk cohort committed the catch-up block durably"
             );
 
+            // an old-base replay reconciles the torn sealed block via selective
+            // replay (the still-at-pre memory cohort recommits, the already-
+            // durable disk cohort aborts) rather than fail-stopping; the
+            // checkpoint's value below is recovering WITHOUT that replay.
             let mut torn_host =
                 restore_mixed_durability_host(durable_store.clone(), &base_manifest);
-            let err = recovery
+            let healed = recovery
                 .recover(&mut torn_host, &base_manifest)
                 .await
-                .expect_err("old base replay should see torn mixed durability");
-            assert!(matches!(err, recovery::Error::Torn(_)));
+                .expect("old base replay heals the torn sealed block selectively");
+            assert_eq!(healed.height, Some(1));
+            assert_eq!(healed.app_hash, target.app_hash);
+            assert_eq!(healed.applied, 1, "the torn suffix frame was replayed");
+            assert_eq!(
+                durable_store.get(),
+                7,
+                "disk cohort stays at its durable post-state"
+            );
 
             let ckpt = write_post_reboot_catchup_checkpoint(
                 &mut recovery,
