@@ -2049,6 +2049,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-interface",
+ "dispatch-interface",
+ "futures",
+ "saga-interface",
+ "sdk",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "dispatch-interface"
+version = "0.1.0"
+dependencies = [
+ "saga-interface",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dispatch-oracle"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-host",
+ "dispatch-interface",
+ "futures",
+ "reactor",
+ "saga-interface",
+ "sdk",
+ "tokio",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

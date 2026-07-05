@@ -1,0 +1,12 @@
+[package]
+name = "dispatch-interface"
+edition.workspace = true
+version.workspace = true
+
+# types-only: the wire surface of the dispatch module. a Recipe is the
+# consensus-registered what-to-run manifest (capability, routing, output
+# contract); the payload is dispatch data, never static text.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+saga-interface = { workspace = true }

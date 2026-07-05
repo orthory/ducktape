@@ -313,7 +313,8 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
     // one origin discriminant, nine option tags, three length prefixes,
     // status, two u32s, and two u64s — so a count the input cannot possibly
     // hold is rejected before the loop builds anything.
-    const MIN_SAGA_BYTES: u64 = 8 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
+    const MIN_SAGA_BYTES: u64 =
+        8 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
     if count
         .checked_mul(MIN_SAGA_BYTES)
         .map_or(true, |need| need > buf.len() as u64)
@@ -1014,7 +1015,8 @@ mod tests {
     impl CaptureCtx {
         fn new() -> Self {
             Self {
-                env: Env { protocol_version: 0,
+                env: Env {
+                    protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: Origin::System,
@@ -2250,10 +2252,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("pinned_assignee"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("pinned_assignee"), "got: {err}");
     }
 
     #[test]

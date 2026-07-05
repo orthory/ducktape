@@ -196,7 +196,9 @@ pub struct SagaCallback {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SagaQuery {
-    Get { saga_id: SagaId },
+    Get {
+        saga_id: SagaId,
+    },
     /// the earliest lease-expiry or deadline view over all PENDING sagas
     /// (committed state) — `None` when nothing pending carries one. the read
     /// a host-side crank pump polls: when the committed next expiry is at or
