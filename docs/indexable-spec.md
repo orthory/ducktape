@@ -167,7 +167,7 @@ The first shipped mappers and why they exist:
 - Durability is `SyncMode::Periodic` (bounded loss window, torn tails
   truncate on recovery) — correct for a tier whose worst case is a rebuild.
 
-## 7. State-sync and the from-state rebuild (lane 1 — shipped)
+## 7. State-sync and the from-state rebuild (both lanes shipped)
 
 A joiner state-syncs **state**, not op history, so the fold has nothing to
 consume — and a synced node with empty views renders its modules poorly. The
@@ -201,9 +201,33 @@ index comes together with the sync. Two lanes, in preference order:
    resume floor, the validator after checkpoint restore and at the boot tip
    (state-sync install, replay gaps, wiped directories all converge there).
 
-2. **Index checkpoint shipping (the optimization — future).** fluent31
-   checkpoints are complete database directories; a source node can ship them
+2. **Index checkpoint shipping (the optimization — SHIPPED).** fluent31
+   checkpoints are complete database directories; a source node ships them
    alongside state-sync for instant warm views. Contents are NOT
    root-verifiable (the derived tier has no root by design), so this lane
-   trusts the serving node and must stay optional — a verifying joiner
+   trusts the serving node and stays optional — `sync_index = true` in
+   node.toml (node-local operator policy, default off); a verifying joiner
    backfills via lane 1 and compares nothing.
+
+   The mechanics: the serving pump answers the first `IndexModules` request
+   per leased boundary by cutting a transient checkpoint of every module
+   database plus `_blocks` (`IndexStore::checkpoint_files` — cut, read into
+   memory, archive deleted) and attaching the framed blobs to that capture,
+   so their lifetime rides the existing lease/evict lifecycle and joiners
+   that never ask cost nothing. The joiner fetches the set in chunks over
+   the same sync connection, stages it under `<storage>/index/_staging`
+   (every file fsynced, a `.complete` marker LAST), and the promoted
+   reboot's `IndexStore::open` adopts the staging directory before any
+   engine open — a torn fetch is discarded, never adopted.
+
+   Composition with lane 1 is a single comparison, the one that already
+   exists: shipped watermarks land at the source's fold tip, so a module
+   whose watermark reaches the joiner's boundary skips its heal (warm), and
+   anything stale, missing, or refused falls to `watermark < boundary` and
+   rebuilds exactly as if nothing was shipped. Cross-binary skew degrades
+   the same way: unknown shipped databases are skipped at staging, old
+   servers answer the new request tags with an error, and the joiner treats
+   every failure as "heal instead", never as an abort. The blocks database
+   rides along verbatim — the only path by which a joiner ever gets
+   pre-boundary `/v1/blocks` history, since `_blocks` is deliberately
+   outside the rebuild story.

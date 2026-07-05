@@ -143,6 +143,99 @@ fn server_rejects_chunk_for_unleased_boundary() {
 }
 
 #[test]
+fn shipped_index_serves_only_attached_leased_boundaries() {
+    let mut srv = SyncServer::new();
+    let boundary = BoundaryId {
+        height: 12,
+        app_hash: StateRoot([6u8; 32]),
+    };
+    let host = Host::genesis(vec![]).unwrap();
+    let coords = BoundaryCoords::default();
+    let ask = |srv: &mut SyncServer, req| block_on(srv.handle(&host, None, &coords, req));
+
+    // unleased boundary: refused like every other per-boundary request.
+    let resp = ask(
+        &mut srv,
+        SyncRequest::IndexModules { boundary },
+    );
+    assert!(matches!(resp, SyncResponse::Error(_)));
+
+    srv.insert_capture_for_test(boundary);
+    srv.lease(boundary);
+
+    // leased but unattached: an EMPTY list — the joiner falls back to the
+    // from-state rebuild, no error.
+    let resp = ask(&mut srv, SyncRequest::IndexModules { boundary });
+    assert!(matches!(
+        resp,
+        SyncResponse::IndexModules { ref entries } if entries.is_empty()
+    ));
+    assert!(!srv.index_attached(boundary));
+
+    // attach two blobs; one larger than a chunk to exercise offset paging.
+    let big = vec![0xEE; statesync::CHUNK_LEN + 7];
+    let mut blobs = std::collections::BTreeMap::new();
+    blobs.insert("chat".to_string(), big.clone());
+    blobs.insert("_blocks".to_string(), vec![1, 2, 3]);
+    srv.attach_index(boundary, blobs).expect("attach");
+    assert!(srv.index_attached(boundary));
+
+    let resp = ask(&mut srv, SyncRequest::IndexModules { boundary });
+    match resp {
+        SyncResponse::IndexModules { entries } => assert_eq!(
+            entries,
+            vec![
+                ("_blocks".to_string(), 3),
+                ("chat".to_string(), big.len() as u64)
+            ]
+        ),
+        other => panic!("want IndexModules, got {}", other.kind_name()),
+    }
+
+    // chunked fetch reassembles the exact blob.
+    let mut out = Vec::new();
+    loop {
+        let resp = ask(
+            &mut srv,
+            SyncRequest::IndexChunk {
+                boundary,
+                db: "chat".into(),
+                offset: out.len() as u64,
+            },
+        );
+        match resp {
+            SyncResponse::Chunk { total, bytes } => {
+                assert_eq!(total, big.len() as u64);
+                out.extend_from_slice(&bytes);
+                if out.len() as u64 >= total {
+                    break;
+                }
+            }
+            other => panic!("want Chunk, got {}", other.kind_name()),
+        }
+    }
+    assert_eq!(out, big);
+
+    // a database the source never attached is a loud error.
+    let resp = ask(
+        &mut srv,
+        SyncRequest::IndexChunk {
+            boundary,
+            db: "ghost".into(),
+            offset: 0,
+        },
+    );
+    assert!(matches!(resp, SyncResponse::Error(_)));
+
+    // attaching to an unleased boundary is refused.
+    let stale = BoundaryId {
+        height: 99,
+        app_hash: StateRoot([7u8; 32]),
+    };
+    assert!(srv.attach_index(stale, Default::default()).is_err());
+}
+
+#[test]
 fn pruned_pinned_range_errors_for_refetch() {
     let err = statesync::qmdb::module_lane_error(
         "kv",

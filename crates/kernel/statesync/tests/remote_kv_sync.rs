@@ -337,3 +337,124 @@ fn byzantine_op_batches_fail_verification_not_installation() {
         assert!(decode_ops_envelope(&forged).is_err());
     });
 }
+
+// ============================================================================
+// the shipped-index lane: real fluent31 databases round-trip the wire.
+// ============================================================================
+
+/// the crate-level proof of indexable spec §7 lane 2: a source's derived
+/// index databases — cut as fluent31 checkpoints from a LIVE store — cross
+/// the wire as archive blobs, stage on the joiner, and adopt at the next
+/// open as byte-identical read models that keep folding. the server side
+/// mirrors bin/node's pump exactly: the FIRST IndexModules request for a
+/// boundary cuts and attaches lazily.
+#[test]
+fn shipped_index_round_trips_over_the_wire_protocol() {
+    // no runtime context: the index store is plain-fs, the wire is a channel.
+    futures::executor::block_on(async {
+        let src_dir = tempfile::tempdir().expect("src dir");
+        let source =
+            indexer::IndexStore::open(src_dir.path(), &["chat", "tasks"]).expect("open source");
+        for h in 1..=4u64 {
+            source
+                .apply_block(&indexer::BlockOps {
+                    height: h,
+                    time: 1_000 + h,
+                    ops: vec![indexer::AppliedOp {
+                        module: "chat".into(),
+                        origin: indexer::OriginTag::external("jess"),
+                        payload: br#"{"post":"hi"}"#.to_vec(),
+                    }],
+                    record: Some(format!(r#"{{"height":{h}}}"#).into_bytes()),
+                })
+                .expect("fold");
+        }
+
+        let host = Host::genesis(vec![]).expect("genesis");
+        let finalized = FinalizedBlock {
+            height: 4,
+            app_hash: host.app_hash(),
+        };
+        let (tx, rx) = mpsc::channel::<RpcPair>(16);
+        let client = ChannelClient { tx };
+        let mut server = SyncServer::new();
+
+        let client_for_join = client.clone();
+        let join_side = async move {
+            let manifest = fetch_manifest(&client_for_join).await.expect("manifest");
+            let boundary = manifest.boundary_id();
+            let entries = statesync::fetch_index_modules(&client_for_join, boundary)
+                .await
+                .expect("index modules");
+            assert_eq!(
+                entries.iter().map(|(db, _)| db.as_str()).collect::<Vec<_>>(),
+                vec!["_blocks", "chat", "tasks"],
+            );
+            // the joiner's exact sequence: fetch, decode, stage, commit.
+            let dest_dir = tempfile::tempdir().expect("dest dir");
+            let dest_base = dest_dir.path().join("index");
+            for (db, len) in &entries {
+                let blob = statesync::fetch_index_db(&client_for_join, boundary, db)
+                    .await
+                    .expect("index blob");
+                assert_eq!(blob.len() as u64, *len, "{db} blob length matches");
+                let files = statesync::decode_index_archive(&blob).expect("archive decodes");
+                indexer::stage_shipped_db(&dest_base, db, &files).expect("stage");
+            }
+            indexer::commit_staged(&dest_base).expect("commit");
+            dest_dir
+        };
+
+        let source_for_serve = &source;
+        let server_side = async {
+            let coords = statesync::BoundaryCoords::default();
+            let mut rx = rx;
+            while let Some((frame, reply)) = rx.next().await {
+                if let Ok(SyncRequest::IndexModules { boundary }) =
+                    statesync::decode_request(&frame)
+                {
+                    if !server.index_attached(boundary) {
+                        let mut blobs = std::collections::BTreeMap::new();
+                        for db in ["chat", "tasks", indexer::BLOCKS_DB_ID] {
+                            let files = source_for_serve.checkpoint_files(db).expect("cut");
+                            blobs.insert(
+                                db.to_string(),
+                                statesync::encode_index_archive(&files),
+                            );
+                        }
+                        server.attach_index(boundary, blobs).expect("attach");
+                    }
+                }
+                let resp = server
+                    .handle_frame(&host, Some(finalized), &coords, &frame)
+                    .await;
+                let _ = reply.send(resp);
+            }
+        };
+        drop(client);
+        let (dest_dir, ()) = futures::join!(join_side, server_side);
+
+        // adoption at open: the shipped store equals the source and folds on.
+        let shipped = indexer::IndexStore::open(dest_dir.path().join("index"), &["chat", "tasks"])
+            .expect("open adopted store");
+        assert_eq!(shipped.applied_height("chat").expect("chat wm"), 4);
+        assert_eq!(shipped.applied_height("tasks").expect("tasks wm"), 4);
+        assert_eq!(shipped.blocks_height().expect("blocks wm"), 4);
+        let rows =
+            |s: &indexer::IndexStore| s.scan("chat", b"", None, 1024).expect("scan").entries;
+        assert_eq!(rows(&source), rows(&shipped), "chat keys byte-identical");
+        assert_eq!(
+            source.recent_block_rows(10).expect("source rows"),
+            shipped.recent_block_rows(10).expect("shipped rows"),
+        );
+        shipped
+            .apply_block(&indexer::BlockOps {
+                height: 5,
+                time: 1_005,
+                ops: vec![],
+                record: None,
+            })
+            .expect("fold continues above the shipped watermark");
+        assert_eq!(shipped.applied_height("chat").expect("chat wm"), 5);
+    });
+}

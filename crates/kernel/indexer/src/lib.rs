@@ -78,7 +78,21 @@ pub const META_PREFIX: &str = "meta/";
 pub const BLOCK_PREFIX: &str = "blk/";
 /// directory name of the store-internal blocks database — reserved, never a
 /// module id (the leading underscore keeps it out of the module namespace).
-const BLOCKS_DB: &str = "_blocks";
+/// public because the shipping lane (spec §7 lane 2) addresses it by name:
+/// a source ships it alongside the module databases so a joiner's explorer
+/// history starts warm too.
+pub const BLOCKS_DB_ID: &str = "_blocks";
+/// directory name of a staged shipped-index install awaiting adoption at the
+/// next [`IndexStore::open`] — same underscore convention as [`BLOCKS_DB_ID`].
+const STAGING_DIR: &str = "_staging";
+/// marker file inside [`STAGING_DIR`], written LAST (after every staged file
+/// is durable): a staging directory without it is a torn fetch and is
+/// discarded at open instead of adopted.
+const STAGING_COMPLETE: &str = ".complete";
+/// fixed archive name for a shipping cut. one cut is in flight per database
+/// at a time (the block loop serializes them), so a constant name suffices —
+/// a stale same-name leftover from a crash is deleted before the fresh cut.
+const SHIP_CHECKPOINT: &str = "ship";
 /// the per-module watermark key: 8-byte big-endian height.
 const META_HEIGHT: &str = "meta/height";
 /// the backfill floor: 8-byte big-endian height, present only after a
@@ -131,6 +145,11 @@ pub enum Error {
     /// a previous apply failed; the store refuses further writes until rebuilt.
     #[error("indexer: store is poisoned by an earlier apply failure — rebuild the index")]
     Poisoned,
+    /// filesystem io in the shipping lane (checkpoint file reads, staged
+    /// installs) — io this crate performs itself, outside the engine's own
+    /// error surface.
+    #[error("indexer: index shipping: {0}")]
+    Shipping(String),
     /// the storage engine failed.
     #[error("indexer: engine: {0}")]
     Engine(#[from] fluent31::Error),
@@ -527,8 +546,15 @@ pub struct IndexStore {
 
 impl IndexStore {
     /// open (creating if missing) one database per module id under `base`.
+    ///
+    /// a COMPLETE staged shipped-index install under `<base>/_staging` (see
+    /// [`stage_shipped_db`]) is adopted first — database directories swap in
+    /// before any engine open, so adoption always precedes open by
+    /// construction. a torn staging directory (no completion marker) is
+    /// discarded, falling back to whatever the databases already hold.
     pub fn open<S: AsRef<str>>(base: impl AsRef<Path>, module_ids: &[S]) -> Result<Self> {
         let base = base.as_ref().to_path_buf();
+        adopt_staged(&base)?;
         let opts = Options {
             sync: SyncMode::Periodic { every: SYNC_EVERY },
             // portable positioned IO: the index shares its box with the node's
@@ -542,7 +568,7 @@ impl IndexStore {
             let db = Db::open(base.join(id), opts.clone())?;
             modules.insert(id.to_string(), Arc::new(db));
         }
-        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB), opts)?);
+        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB_ID), opts)?);
         Ok(Self {
             base,
             modules,
@@ -849,6 +875,165 @@ impl IndexStore {
         };
         mapper.serve_view(&reader, req)
     }
+
+    /// cut a point-in-time checkpoint of one database (a module id or
+    /// [`BLOCKS_DB_ID`]) and return its complete file set, for the shipping
+    /// lane (spec §7 lane 2): a checkpoint is a self-contained database
+    /// directory, so these files written verbatim to a fresh directory open
+    /// as an identical database — watermark, backfill floor, and rows
+    /// included. the on-disk archive is transient: cut, read into memory,
+    /// deleted — nothing to sweep after a normal return. safe against the
+    /// live writer (fluent31 cuts are crash-atomic and pin their view).
+    ///
+    /// a poisoned store refuses: shipping a torn read model would hand the
+    /// joiner exactly the state a rebuild exists to replace.
+    pub fn checkpoint_files(&self, db: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let handle = if db == BLOCKS_DB_ID {
+            &self.blocks
+        } else {
+            self.db(db)?
+        };
+        // a same-name leftover means an earlier cut crashed between create
+        // and delete; deleting a checkpoint that does not exist is the normal
+        // case and not an error worth surfacing.
+        if handle
+            .list_checkpoints()?
+            .iter()
+            .any(|c| c.name == SHIP_CHECKPOINT)
+        {
+            handle.delete_checkpoint(SHIP_CHECKPOINT)?;
+        }
+        let info = handle.checkpoint(SHIP_CHECKPOINT)?;
+        let read = (|| -> std::io::Result<Vec<(String, Vec<u8>)>> {
+            let mut files = Vec::new();
+            for entry in std::fs::read_dir(&info.path)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name == "LOCK" {
+                    continue; // never present in an archive; skip defensively
+                }
+                files.push((name.to_string(), std::fs::read(entry.path())?));
+            }
+            files.sort_by(|(a, _), (b, _)| a.cmp(b));
+            Ok(files)
+        })();
+        let files = read.map_err(|e| Error::Shipping(format!("read {db} archive: {e}")))?;
+        handle.delete_checkpoint(SHIP_CHECKPOINT)?;
+        Ok(files)
+    }
+}
+
+// ============================================================================
+// shipped-index staging — the joiner side of the shipping lane. a fetched
+// database lands here file by file, is committed with a marker once every
+// byte is durable, and is adopted by the next [`IndexStore::open`]. the
+// ordering mirrors the rebuild's crash story inverted: the rebuild drops its
+// watermark FIRST so interruption re-triggers; staging writes its marker
+// LAST so interruption discards. free functions, not methods — the writer (a
+// syncing joiner) stages against a base whose store is still open elsewhere
+// in the process, and never needs a handle of its own.
+// ============================================================================
+
+/// one path component: non-empty, no separators or traversal, no hidden
+/// files, and never the engine's lock file. shipped names cross a trust
+/// boundary (an unverified server chose them), so anything else is refused.
+fn valid_component(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with('.')
+        && name != "LOCK"
+        && !name.contains(['/', '\\'])
+        && !name.contains('\0')
+}
+
+/// stage one shipped database's file set under `<base>/_staging/<db>` for
+/// adoption at the next [`IndexStore::open`]. every file is fsynced before
+/// return — the completion marker ([`commit_staged`]) must never become
+/// durable ahead of the bytes it vouches for, or a crash could adopt garbage
+/// and turn the next open into a boot failure.
+pub fn stage_shipped_db(base: &Path, db: &str, files: &[(String, Vec<u8>)]) -> Result<()> {
+    if !valid_component(db) || db == STAGING_DIR {
+        return Err(Error::Shipping(format!("invalid shipped db name {db:?}")));
+    }
+    if let Some((name, _)) = files.iter().find(|(name, _)| !valid_component(name)) {
+        return Err(Error::Shipping(format!(
+            "invalid shipped file name {name:?} for {db}"
+        )));
+    }
+    let dir = base.join(STAGING_DIR).join(db);
+    (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        for (name, bytes) in files {
+            let file = std::fs::File::create(dir.join(name)).and_then(|mut f| {
+                use std::io::Write as _;
+                f.write_all(bytes)?;
+                Ok(f)
+            })?;
+            file.sync_all()?;
+        }
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    })()
+    .map_err(|e| Error::Shipping(format!("stage {db}: {e}")))
+}
+
+/// mark a staged install complete. written LAST: only a marked staging
+/// directory is adopted; everything else is discarded as a torn fetch.
+pub fn commit_staged(base: &Path) -> Result<()> {
+    let staging = base.join(STAGING_DIR);
+    (|| -> std::io::Result<()> {
+        std::fs::write(staging.join(STAGING_COMPLETE), b"")?;
+        std::fs::File::open(&staging)?.sync_all()?;
+        Ok(())
+    })()
+    .map_err(|e| Error::Shipping(format!("commit staged install: {e}")))
+}
+
+/// drop any staged install — the fetch failed partway and lane 1's heal is
+/// the fallback. missing staging is a no-op, so callers can clean
+/// unconditionally.
+pub fn discard_staged(base: &Path) -> Result<()> {
+    let staging = base.join(STAGING_DIR);
+    if !staging.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&staging)
+        .map_err(|e| Error::Shipping(format!("discard staged install: {e}")))
+}
+
+/// adopt a complete staged install: swap each staged database directory into
+/// place, then remove the staging root (marker included) LAST. re-entrant
+/// across crashes — each directory rename is atomic, an interrupted sweep
+/// leaves the marker and the not-yet-adopted remainder for the next open,
+/// and a marker-less staging directory is discarded wholesale.
+fn adopt_staged(base: &Path) -> Result<()> {
+    let staging = base.join(STAGING_DIR);
+    if !staging.exists() {
+        return Ok(());
+    }
+    if !staging.join(STAGING_COMPLETE).exists() {
+        return discard_staged(base);
+    }
+    (|| -> std::io::Result<()> {
+        for entry in std::fs::read_dir(&staging)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue; // the marker file
+            }
+            let dest = base.join(entry.file_name());
+            if dest.exists() {
+                std::fs::remove_dir_all(&dest)?;
+            }
+            std::fs::rename(entry.path(), &dest)?;
+        }
+        std::fs::remove_dir_all(&staging)?;
+        Ok(())
+    })()
+    .map_err(|e| Error::Shipping(format!("adopt staged install: {e}")))
 }
 
 /// lo/hi iteration bounds for a prefix scan resuming strictly after `after`:
@@ -1514,5 +1699,123 @@ mod tests {
             Err(Error::ReservedKey { .. })
         ));
         assert!(store.is_poisoned());
+    }
+
+    // ------------------------------------------------------------------------
+    // shipping: checkpoint file sets + staged installs
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_ships_and_staged_install_opens_identically() {
+        // source: a LIVE store with folded history — derived rows, op rows,
+        // explorer records — cut mid-life exactly like a serving node would.
+        let src = tempfile::tempdir().unwrap();
+        let source = store(src.path()).with_indexer(Box::new(TestMapper { reserved: false }));
+        for h in 1..=3 {
+            source
+                .apply_block(&block_with_record(h, vec![chat_op(br#"{"post":"hi"}"#)]))
+                .unwrap();
+        }
+
+        let dest = tempfile::tempdir().unwrap();
+        for db in ["chat", "tasks", BLOCKS_DB_ID] {
+            let files = source.checkpoint_files(db).expect("cut");
+            assert!(!files.is_empty(), "{db} archive has files");
+            stage_shipped_db(dest.path(), db, &files).expect("stage");
+        }
+        commit_staged(dest.path()).expect("commit");
+        // the archive is transient: cut, read, deleted.
+        assert!(!src.path().join("chat/archive").join(SHIP_CHECKPOINT).exists());
+
+        let shipped = store(dest.path());
+        assert!(!dest.path().join(STAGING_DIR).exists(), "staging consumed");
+        assert_eq!(shipped.applied_height("chat").unwrap(), 3);
+        assert_eq!(shipped.applied_height("tasks").unwrap(), 3);
+        assert_eq!(shipped.blocks_height().unwrap(), 3);
+        // every key — rows, op log, meta — byte-identical to the source.
+        let full = |s: &IndexStore, m: &str| s.scan(m, b"", None, 1024).unwrap().entries;
+        assert_eq!(full(&source, "chat"), full(&shipped, "chat"));
+        assert_eq!(full(&source, "tasks"), full(&shipped, "tasks"));
+        assert_eq!(
+            source.recent_block_rows(10).unwrap(),
+            shipped.recent_block_rows(10).unwrap()
+        );
+        // the shipped store folds on above the shipped watermark.
+        shipped.apply_block(&block(4, vec![chat_op(b"{}")])).unwrap();
+        assert_eq!(shipped.applied_height("chat").unwrap(), 4);
+    }
+
+    #[test]
+    fn unmarked_staging_is_discarded_marked_staging_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = store(dir.path());
+            s.apply_block(&block(5, vec![chat_op(b"{}")])).unwrap();
+        }
+        // a torn fetch: staged bytes, no completion marker → swept at open,
+        // the database the node already had stays live.
+        stage_shipped_db(dir.path(), "chat", &[("torn.tbl".into(), vec![1, 2, 3])]).unwrap();
+        {
+            let s = store(dir.path());
+            assert_eq!(s.applied_height("chat").unwrap(), 5, "existing db kept");
+            assert!(!dir.path().join(STAGING_DIR).exists(), "torn staging swept");
+        }
+
+        // a COMPLETE staged install replaces the database wholesale.
+        let other = tempfile::tempdir().unwrap();
+        let donor = store(other.path());
+        for h in 1..=7 {
+            donor.apply_block(&block(h, vec![chat_op(b"{}")])).unwrap();
+        }
+        let files = donor.checkpoint_files("chat").unwrap();
+        stage_shipped_db(dir.path(), "chat", &files).unwrap();
+        commit_staged(dir.path()).unwrap();
+        let s = store(dir.path());
+        assert_eq!(s.applied_height("chat").unwrap(), 7, "staged content adopted");
+        assert_eq!(s.applied_height("tasks").unwrap(), 5, "unstaged db untouched");
+    }
+
+    #[test]
+    fn stage_refuses_hostile_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |db: &str, file: &str| {
+            stage_shipped_db(dir.path(), db, &[(file.to_string(), vec![0])])
+        };
+        assert!(matches!(put("../evil", "a.tbl"), Err(Error::Shipping(_))));
+        assert!(matches!(put("a/b", "a.tbl"), Err(Error::Shipping(_))));
+        assert!(matches!(put(STAGING_DIR, "a.tbl"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", "../../x"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", "b\\c"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", ".hidden"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", "LOCK"), Err(Error::Shipping(_))));
+        assert!(matches!(put("chat", ""), Err(Error::Shipping(_))));
+        // the blocks database is a legitimate shipped name.
+        assert!(put(BLOCKS_DB_ID, "a.tbl").is_ok());
+    }
+
+    #[test]
+    fn checkpoint_files_sweeps_its_stale_archive_and_refuses_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.apply_block(&block(1, vec![chat_op(b"{}")])).unwrap();
+        // back-to-back cuts: the second must not trip over a leftover —
+        // and here the first archive was already deleted, so this also
+        // exercises the delete-if-present guard both ways.
+        store.checkpoint_files("chat").expect("first cut");
+        store.checkpoint_files("chat").expect("second cut");
+
+        let bad = block(
+            2,
+            vec![AppliedOp {
+                module: "ghost".into(),
+                origin: OriginTag::system(),
+                payload: b"{}".to_vec(),
+            }],
+        );
+        assert!(store.apply_block(&bad).is_err());
+        assert!(matches!(
+            store.checkpoint_files("chat"),
+            Err(Error::Poisoned)
+        ));
     }
 }
