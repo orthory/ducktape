@@ -211,6 +211,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                     deadline: None,
                     max_attempts: 1,
                     lease_views: None,
+                    capability: None,
                 }),
             },
         ];

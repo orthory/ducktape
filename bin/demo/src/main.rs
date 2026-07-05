@@ -471,7 +471,7 @@ fn main() {
                 payload: agent_encode_msg(&AgentMsg::RegisterAgent {
                     agent_id: "quackbot".into(),
                     display_name: "Quackbot".into(),
-                    model_ref: "mock-llm-1".into(),
+                    capability: "mock-llm-1".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                 }),

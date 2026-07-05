@@ -355,7 +355,7 @@ export const pageBlockRemoved = (
 export const agentPatched = (
   prev: ConsoleState,
   agentId: string,
-  patch: Partial<Pick<ConsoleState["agents"][number], "status" | "display_name" | "model_ref">>,
+  patch: Partial<Pick<ConsoleState["agents"][number], "status" | "display_name" | "capability">>,
 ): Partial<ConsoleState> => ({
   agents: prev.agents.map((a) =>
     a.agent_id === agentId ? { ...a, ...patch } : a,

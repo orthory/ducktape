@@ -760,12 +760,12 @@ async fn offer_effects(
         let mut claimed = false;
         for w in workers {
             match w.run(&eff).await {
-                Ok(Some(follow)) => {
-                    queue.push_back(follow);
+                Ok(reactor::WorkOutcome::Handled(follow)) => {
+                    queue.extend(follow);
                     claimed = true;
                     break;
                 }
-                Ok(None) => {}
+                Ok(reactor::WorkOutcome::NotMine) => {}
                 Err(err) => {
                     eprintln!("[simnode] worker error: {err}");
                     claimed = true;
@@ -788,16 +788,16 @@ struct EchoWorker;
 
 #[async_trait::async_trait(?Send)]
 impl reactor::Worker for EchoWorker {
-    async fn run(&self, effect: &Effect) -> Result<Option<Msg>, reactor::Error> {
+    async fn run(&self, effect: &Effect) -> Result<reactor::WorkOutcome, reactor::Error> {
         let request = match saga_interface::decode_worker_request(&effect.0) {
             Ok(request) => request,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
         };
         let llm = match agent_interface::decode_llm_request(&request.spec) {
             Ok(llm) => llm,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
         };
-        Ok(Some(Msg {
+        Ok(reactor::WorkOutcome::Handled(Some(Msg {
             target: "saga".into(),
             payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
                 saga_id: request.saga_id,
@@ -812,7 +812,7 @@ impl reactor::Worker for EchoWorker {
                     },
                 )),
             }),
-        }))
+        })))
     }
 }
 

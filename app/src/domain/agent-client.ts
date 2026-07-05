@@ -39,7 +39,7 @@ export interface AgentRecord {
   /** The registration origin — gates every mutation of the record. */
   owner: SagaOrigin;
   display_name: string;
-  model_ref: string;
+  capability: string;
   /** sha256 of the agent's prompt content — exactly 32 bytes. */
   prompt_hash: number[];
   /** Granted action names, each from `KNOWN_ACTIONS`; sorted and deduped. */
@@ -111,7 +111,7 @@ export const registerAgent = (
   params: {
     agentId: string;
     displayName: string;
-    modelRef: string;
+    capability: string;
     /** Exactly 32 bytes — see hexToBytes / the prompt-upload flow. */
     promptHash: number[];
     allowedActions: string[];
@@ -124,7 +124,7 @@ export const registerAgent = (
       RegisterAgent: {
         agent_id: params.agentId,
         display_name: params.displayName,
-        model_ref: params.modelRef,
+        capability: params.capability,
         prompt_hash: params.promptHash,
         allowed_actions: params.allowedActions,
       },
@@ -138,7 +138,7 @@ export const updateAgent = (
   params: {
     agentId: string;
     displayName?: string | null;
-    modelRef?: string | null;
+    capability?: string | null;
     promptHash?: number[] | null;
     allowedActions?: string[] | null;
     origin: string;
@@ -150,7 +150,7 @@ export const updateAgent = (
       UpdateAgent: {
         agent_id: params.agentId,
         display_name: params.displayName ?? null,
-        model_ref: params.modelRef ?? null,
+        capability: params.capability ?? null,
         prompt_hash: params.promptHash ?? null,
         allowed_actions: params.allowedActions ?? null,
       },

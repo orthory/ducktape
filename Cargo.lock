@@ -4201,6 +4201,7 @@ dependencies = [
  "reactor",
  "recovery",
  "saga",
+ "saga-interface",
  "sdk",
  "serde",
  "serde_json",

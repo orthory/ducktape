@@ -487,7 +487,7 @@ function AgentDetail({
   onUpdate: (params: {
     agentId: string;
     displayName?: string;
-    modelRef?: string;
+    capability?: string;
     prompt?: string;
     allowedActions?: string[];
   }) => void;
@@ -581,7 +581,7 @@ function AgentDetail({
               gap: 8,
             }}
           >
-            <InfoRow label="model" value={agent.model_ref} />
+            <InfoRow label="capability" value={agent.capability} />
             <InfoRow label="owner" value={ownerText(agent.owner)} />
             <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
             <InfoRow label="updated" value={String(agent.updated_at)} />
@@ -630,14 +630,14 @@ function AgentEditForm({
   onUpdate: (params: {
     agentId: string;
     displayName?: string;
-    modelRef?: string;
+    capability?: string;
     prompt?: string;
     allowedActions?: string[];
   }) => void;
   onClose: () => void;
 }) {
   const [displayName, setDisplayName] = useState(agent.display_name);
-  const [modelRef, setModelRef] = useState(agent.model_ref);
+  const [capability, setCapability] = useState(agent.capability);
   const [prompt, setPrompt] = useState("");
   const [allowedActions, setAllowedActions] = useState<string[]>(agent.allowed_actions);
 
@@ -651,7 +651,7 @@ function AgentEditForm({
     onUpdate({
       agentId: agent.agent_id,
       displayName: displayName.trim(),
-      modelRef: modelRef.trim(),
+      capability: capability.trim(),
       allowedActions,
       ...(prompt.trim() ? { prompt } : {}),
     });
@@ -692,15 +692,15 @@ function AgentEditForm({
           />
         </div>
         <div>
-          <FieldLabel htmlFor="agent-edit-model-ref">Edit model reference</FieldLabel>
+          <FieldLabel htmlFor="agent-edit-capability">Edit capability</FieldLabel>
           <input
-            id="agent-edit-model-ref"
-            name="agent-edit-model-ref"
+            id="agent-edit-capability"
+            name="agent-edit-capability"
             type="text"
             autoComplete="off"
             spellCheck={false}
-            value={modelRef}
-            onChange={(event) => setModelRef(event.target.value)}
+            value={capability}
+            onChange={(event) => setCapability(event.target.value)}
             style={monoInputStyle}
           />
         </div>
@@ -903,14 +903,14 @@ function RegisterAgentForm({
   onRegister: (params: {
     displayName: string;
     agentId: string;
-    modelRef: string;
+    capability: string;
     prompt: string;
     allowedActions: string[];
   }) => void;
 }) {
   const [displayName, setDisplayName] = useState("");
   const [agentIdInput, setAgentIdInput] = useState("");
-  const [modelRef, setModelRef] = useState("gpt-5.5-codex");
+  const [capability, setCapability] = useState("");
   const [prompt, setPrompt] = useState("");
   const [allowedActions, setAllowedActions] = useState<string[]>(["chat.post"]);
 
@@ -918,7 +918,7 @@ function RegisterAgentForm({
   const ready =
     displayName.trim() !== "" &&
     agentId !== "" &&
-    modelRef.trim() !== "" &&
+    capability.trim() !== "" &&
     prompt.trim() !== "" &&
     allowedActions.length > 0;
 
@@ -933,13 +933,13 @@ function RegisterAgentForm({
     onRegister({
       displayName: displayName.trim(),
       agentId,
-      modelRef: modelRef.trim(),
+      capability: capability.trim(),
       prompt,
       allowedActions,
     });
     setDisplayName("");
     setAgentIdInput("");
-    setModelRef("gpt-5.5-codex");
+    setCapability("");
     setPrompt("");
     setAllowedActions(["chat.post"]);
   };
@@ -1005,16 +1005,16 @@ function RegisterAgentForm({
               />
             </div>
             <div>
-              <FieldLabel htmlFor="agent-model-ref">Model reference</FieldLabel>
+              <FieldLabel htmlFor="agent-capability">Capability</FieldLabel>
               <input
-                id="agent-model-ref"
-                name="agent-model-ref"
+                id="agent-capability"
+                name="agent-capability"
                 type="text"
                 autoComplete="off"
                 spellCheck={false}
-                value={modelRef}
-                onChange={(event) => setModelRef(event.target.value)}
-                placeholder="model…"
+                value={capability}
+                onChange={(event) => setCapability(event.target.value)}
+                placeholder="capability tag…"
                 style={monoInputStyle}
               />
             </div>

@@ -97,7 +97,7 @@ use node::OrderedNode;
 use pages::Pages;
 use profiles::Profiles;
 use recovery::{Manifest, Recovery};
-use saga::SagaModule;
+use saga::{LeasePolicy, SagaModule};
 use sdk::{ModuleId, Msg, StateRoot};
 use statesync::p2p::P2pSyncClient;
 use statesync::qmdb::RemoteQmdbResolver;
@@ -511,6 +511,21 @@ impl CapabilityAnnouncer {
     }
 }
 
+/// the committed saga ledger's earliest pending lease-expiry/deadline — the
+/// crank pump's read. `None` when the module is absent or nothing pending
+/// carries one.
+async fn saga_next_expiry(host: &Host) -> Option<u64> {
+    use saga_interface::{SagaQuery, SagaReply, decode_reply, encode_query};
+    let reply = host
+        .query("saga", &encode_query(&SagaQuery::NextExpiry))
+        .await
+        .ok()?;
+    match decode_reply(&reply).ok()? {
+        SagaReply::NextExpiry(v) => v,
+        _ => None,
+    }
+}
+
 /// hex-encode a state root for a stable, greppable log line.
 fn hex(root: &StateRoot) -> String {
     hex_bytes(&root.0)
@@ -556,7 +571,15 @@ async fn genesis_host(
         // upgrade + per-validator readiness set (valset-gated). its mere
         // presence in the registry is its genesis app-hash contribution.
         Box::new(Upgrade::new("upgrade", "valset")),
-        Box::new(SagaModule::new("saga")),
+        // capability-aware strict leases: a saga whose trigger names a
+        // capability is assigned over that tag's announced providers, and
+        // only the assignee's result lands (no assignee = accept-any).
+        Box::new(SagaModule::with_assignment(
+            "saga",
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        )),
         // the network-wide registry of node host capabilities ("codex",
         // "claude", ...): member-gated self-announcements, so every node holds
         // an identical view of who can run what. its genesis contribution is an
@@ -648,7 +671,7 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("upgrade install: {e}"))?;
 
-    let mut saga = SagaModule::new("saga");
+    let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
     let (bytes, root) = snapshot_of("saga")?;
     saga.install(bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
@@ -867,7 +890,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("valset install: {e}"))?;
 
     let (bytes, root) = snapshot_of("saga").await?;
-    let mut saga = SagaModule::new("saga");
+    let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
     saga.install(&bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
@@ -4593,6 +4616,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut blocks_since_checkpoint: u64 = 0;
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
+        // throttle for the saga crank pump below.
+        let mut last_crank = std::time::Instant::now();
         // the host-owned worker set (reactor seam): effects of finalized
         // blocks are offered here, and claimed follow-ups re-enter the ordered
         // lane as their own blocks.
@@ -4605,8 +4630,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let providers = capability_host::discover()
             .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
-        let workers: Vec<Box<dyn reactor::Worker>> =
-            vec![Box::new(LlmWorker::new(blobs.clone(), providers))];
+        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
+            blobs.clone(),
+            providers,
+            // this node's submit key: WorkerRequests leased to another
+            // node's key are skipped, not double-run.
+            signer.public_key().as_ref().to_vec(),
+        ))];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
         // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
         // this binary can execute. survives restart/late-join (state-driven, not a
@@ -5516,6 +5546,45 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
 
+                    // SAGA CRANK (P7 liveness, host side): nothing else ever
+                    // submits `SagaMsg::Crank`, and under strict leases a
+                    // saga whose assignee went dark advances ONLY via a crank
+                    // (lease re-lease or deadline timeout). state-driven:
+                    // when the committed next expiry is at or past the latest
+                    // finalized height, push one permissionless crank —
+                    // throttled like the heartbeat, since a backlog wider
+                    // than CRANK_BUDGET legitimately needs several. duplicate
+                    // cranks from other nodes are deterministic no-ops.
+                    if last_crank.elapsed() >= HEARTBEAT_INTERVAL
+                        && let Some(finalized_height) = node.finalized().map(|f| f.height)
+                        && let Some(expiry) = saga_next_expiry(node.host()).await
+                        && expiry <= finalized_height
+                    {
+                        last_crank = std::time::Instant::now();
+                        let seq = next_seq;
+                        next_seq += 1;
+                        if let Err(e) = node
+                            .submit(
+                                &signer,
+                                seq,
+                                Msg {
+                                    target: "saga".into(),
+                                    payload: saga_interface::encode_msg(
+                                        &saga_interface::SagaMsg::Crank {},
+                                    ),
+                                },
+                            )
+                            .await
+                        {
+                            eprintln!("[node {label}] saga crank submit failed: {e}");
+                        } else {
+                            println!(
+                                "[node {label}] saga crank submitted \
+                                 (next expiry {expiry} <= height {finalized_height})"
+                            );
+                        }
+                    }
+
                     // UPGRADE TRANSITION MARKERS (one-shot, committed-state driven):
                     // the greppable proof surface the e2e keys on. `armed` is the
                     // module's own R==n verdict (pending set, boundary non-empty,
@@ -5554,7 +5623,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         let mut claimed = false;
                         for w in &workers {
                             match w.run(&eff).await {
-                                Ok(Some(follow)) => {
+                                Ok(reactor::WorkOutcome::Handled(Some(follow))) => {
                                     let seq = next_seq;
                                     next_seq += 1;
                                     if let Err(e) =
@@ -5565,7 +5634,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     claimed = true;
                                     break;
                                 }
-                                Ok(None) => {}
+                                // a deliberate skip (e.g. leased to another
+                                // node): claimed, nothing to submit.
+                                Ok(reactor::WorkOutcome::Handled(None)) => {
+                                    claimed = true;
+                                    break;
+                                }
+                                Ok(reactor::WorkOutcome::NotMine) => {}
                                 Err(e) => {
                                     eprintln!("[node {label}] worker error: {e}");
                                     claimed = true; // errored ≠ unclaimed; don't double-log

@@ -58,7 +58,7 @@ describe("agent msgs", () => {
     await registerAgent(transport, {
       agentId: "helper",
       displayName: "Helper",
-      modelRef: "gpt-5.1",
+      capability: "alpha",
       promptHash,
       allowedActions: ["chat.post"],
       origin: "operator",
@@ -69,7 +69,7 @@ describe("agent msgs", () => {
         RegisterAgent: {
           agent_id: "helper",
           display_name: "Helper",
-          model_ref: "gpt-5.1",
+          capability: "alpha",
           prompt_hash: promptHash,
           allowed_actions: ["chat.post"],
         },
@@ -91,7 +91,7 @@ describe("agent msgs", () => {
         UpdateAgent: {
           agent_id: "helper",
           display_name: "Helper 2",
-          model_ref: null,
+          capability: null,
           prompt_hash: null,
           allowed_actions: null,
         },
@@ -180,7 +180,7 @@ describe("agent queries", () => {
     agent_id: "helper",
     owner: { External: [1, 2, 3] },
     display_name: "Helper",
-    model_ref: "gpt-5.1",
+    capability: "alpha",
     prompt_hash: hexToBytes("cd".repeat(32)),
     allowed_actions: ["chat.post"],
     status: "Active",

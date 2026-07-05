@@ -128,20 +128,32 @@ fn cluster_lifecycle() {
     assert_eq!(genesis[0], genesis[1], "genesis fork between nodes 0 and 1");
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
 
-    // 2-4. convergence: each validator's startup op crossed the wire, every
-    // process applied all three in agreed order, no fork, state advanced.
+    // 2. convergence (LIVENESS): each validator's startup op crossed the
+    // wire and every process applied at least all three. the marker samples
+    // its hash at a node-local drain-batch boundary, so with concurrent
+    // startup traffic (capability announces on a host with an executor CLI
+    // installed) the three lines can legitimately sample different heights —
+    // per the harness contract it proves liveness, never hash equality.
     let converged: Vec<String> = (0..3)
         .map(|i| cluster.wait_marker(i, "converged app_hash=", CONVERGE))
         .collect();
-    assert_eq!(
-        converged[0], converged[1],
-        "cross-process fork at convergence"
-    );
-    assert_eq!(
-        converged[0], converged[2],
-        "cross-process fork at convergence"
-    );
-    assert_ne!(converged[0], genesis[0], "converged but nothing applied");
+
+    // 3. no cross-process fork: the state assertion goes through the rpc
+    // (the harness-documented pattern) — poll until every validator reports
+    // the same status app-hash. a real fork never reconciles, so it fails
+    // this poll's budget; sampling skew settles within a block or two.
+    poll_until("status app-hashes to agree across validators", FINALIZE, || {
+        let hashes: Vec<serde_json::Value> = (0..3)
+            .map(|i| cluster.status(i)["app_hash"].clone())
+            .collect();
+        (!hashes[0].is_null() && hashes[0] == hashes[1] && hashes[0] == hashes[2]).then_some(())
+    });
+
+    // 4. ops actually applied: every node's own sampled hash moved off its
+    // (agreed) genesis hash.
+    for (i, c) in converged.iter().enumerate() {
+        assert_ne!(*c, genesis[i], "node {i} converged but nothing applied");
+    }
 
     // 5. the rpc product loop: post chat via node 0, read it on node 1 —
     // rpc ingress -> ordered lane -> finalization -> cross-node apply -> query.

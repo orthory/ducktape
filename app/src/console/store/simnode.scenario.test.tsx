@@ -306,7 +306,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
           RegisterAgent: {
             agent_id: "quackbot",
             display_name: "Quackbot",
-            model_ref: "echo-model",
+            capability: "echo",
             prompt_hash: Array(32).fill(7),
             allowed_actions: ["chat.post"],
           },
