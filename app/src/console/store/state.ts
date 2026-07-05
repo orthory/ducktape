@@ -3,7 +3,7 @@
 // state that must survive screen boundaries (screen, accent, author identity,
 // thread panel).
 
-import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client";
+import type { AgentRecord, PendingRun, WatchView } from "../../domain/agent-client";
 import type { Rule } from "../../domain/automations-client";
 import type {
   Channel,
@@ -111,8 +111,9 @@ export interface ConsoleState {
   agents: AgentRecord[];
   /** Every channel watch and its turn policy. */
   watches: WatchView[];
-  /** Recent runs across all channels, newest-first for the timeline. */
-  runs: RunView[];
+  /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
+   *  history lives in the dispatch module, not here. */
+  pendingRuns: PendingRun[];
 
   // ── Inbox ──
   /** This member's notification queue (List for the local author identity),
@@ -286,7 +287,7 @@ export const createInitialState = (): ConsoleState => {
     activePageBlocks: [],
     agents: [],
     watches: [],
-    runs: [],
+    pendingRuns: [],
     inbox: [],
     inboxUnread: 0,
     jobs: [],
@@ -331,7 +332,7 @@ export interface ConsoleSnapshot {
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
   watches: WatchView[];
-  runs: RunView[];
+  pendingRuns: PendingRun[];
   inbox: Notification[];
   inboxUnread: number;
   jobs: Job[];
@@ -362,7 +363,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
   watches: snapshot.watches,
-  runs: snapshot.runs,
+  pendingRuns: snapshot.pendingRuns,
   inbox: snapshot.inbox,
   inboxUnread: snapshot.inboxUnread,
   jobs: snapshot.jobs,

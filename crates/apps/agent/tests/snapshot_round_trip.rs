@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use agent::{AgentModule, dispatch_id_for, job_run_id_for, job_spec_hash, run_id_for};
+use agent::{AgentModule, job_run_id_for, job_spec_hash, run_id_for};
 use agent_interface::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, AgentStatus,
     PendingRun, TurnPolicy, decode_reply, encode_msg, encode_query,

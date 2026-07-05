@@ -1,8 +1,11 @@
 // Typed client for the node's `agent` module — the TS mirror of
-// `crates/apps/agent-interface`. The agent module is the collaboration-loop
-// orchestrator: it registers agents, watches chat channels, turns engaged
-// posts into runs, and validates each run's oracle output before any
-// cross-module write.
+// `crates/apps/agent-interface`. The agent module is the collaboration loop's
+// dispatch-plane consumer: it registers agents, watches chat channels, turns
+// engaged posts into dispatches, and validates each run's response before any
+// cross-module write. Run LIFECYCLE is not agent state — a run is a
+// dispatched task whose status and outcome live in the dispatch module; the
+// agent module only exposes its in-flight correlation entries (PendingRuns),
+// pruned when a result delivers.
 //
 // This file plays the interface crate's role on the client side. Key contract
 // points mirrored here:
@@ -13,9 +16,8 @@
 //   - prompt CONTENT lives off-registry: RegisterAgent/UpdateAgent commit a
 //     32-byte `prompt_hash` pin plus an optional `prompt_doc` — a document
 //     module doc id whose canonical rendering (block texts joined by blank
-//     lines) must hash to the pin. chat-engaged runs compose the prompt
-//     in-consensus from that doc; the legacy blob-store lane remains for the
-//     jobs path's oracle worker.
+//     lines) must hash to the pin. every run composes its prompt in-consensus
+//     from that doc.
 //
 // Everything is a pure function over an injected NodeTransport.
 
@@ -59,21 +61,18 @@ export interface WatchView {
   policy: TurnPolicy;
 }
 
-/** Where a run is in its lifecycle. `AwaitingOracle` (a job-backed run's
- *  saga) and `AwaitingResult` (a chat run's dispatch-plane delivery) are the
- *  non-terminal states. */
-export type RunStatus =
-  | { AwaitingOracle: { saga_id: string } }
-  | { AwaitingResult: { dispatch_id: string } }
-  | "Done"
-  | { Failed: { reason: string } }
-  | "Cancelled";
-
-export interface RunView {
+/** One in-flight run's correlation entry — everything the module keeps while
+ *  its dispatch is outstanding. NOT a lifecycle record: the entry prunes when
+ *  the result delivers; status and outcome live in the dispatch module under
+ *  receiver "agent" + `dispatch_id`. */
+export interface PendingRun {
   run_id: string;
+  /** hex sha256 of `run_id` — the dispatch-plane id this entry correlates. */
+  dispatch_id: string;
   agent_id: string;
+  /** Empty for job-backed runs. */
   channel_id: string;
-  /** The message sequence this run answers. */
+  /** The message sequence this run answers; 0 for job-backed runs. */
   anchor_seq: number;
   /** The anchor's thread root, if it was a thread reply. */
   thread_root: number | null;
@@ -82,17 +81,10 @@ export interface RunView {
   job_claim_height: number;
   /** The run-creating origin — a cancel capability alongside the owner. */
   requester: SagaOrigin;
-  status: RunStatus;
-  /** sha256 over the pinned transcript window up to `anchor_seq`. */
-  context_hash: number[];
   created_at: number;
-  updated_at: number;
 }
 
 const TARGET = "agent";
-
-/** Query page bound mirrored from the interface crate (MAX_QUERY_LIMIT). */
-export const MAX_QUERY_LIMIT = 256;
 
 /** Every action name an agent can be granted (KNOWN_ACTIONS). A RegisterAgent /
  *  UpdateAgent rejects an `allowed_actions` entry outside this set. */
@@ -253,28 +245,13 @@ export const agent = (
     .then(() => transport.query(TARGET, { Agent: { agent_id: agentId } }))
     .then((reply) => replyVariant<AgentRecord | null>(reply, "Agent"));
 
-/** Runs ascending by run id, optionally filtered to one channel (null = all);
- *  `limit` is clamped node-side to MAX_QUERY_LIMIT. */
-export const runs = (
-  transport: NodeTransport,
-  params: { channelId: string | null; limit: number },
-): Promise<RunView[]> =>
+/** Every in-flight correlation entry, ascending by dispatch id. Bounded:
+ *  entries prune on delivery and every dispatch has a deadline.
+ *  `PendingRuns` is a unit-variant query — the bare string. */
+export const pendingRuns = (transport: NodeTransport): Promise<PendingRun[]> =>
   Promise.resolve()
-    .then(() =>
-      transport.query(TARGET, {
-        Runs: { channel_id: params.channelId, limit: params.limit },
-      }),
-    )
-    .then((reply) => replyVariant<RunView[]>(reply, "Runs"));
-
-/** One run by id, or null when absent. */
-export const run = (
-  transport: NodeTransport,
-  runId: string,
-): Promise<RunView | null> =>
-  Promise.resolve()
-    .then(() => transport.query(TARGET, { Run: { run_id: runId } }))
-    .then((reply) => replyVariant<RunView | null>(reply, "Run"));
+    .then(() => transport.query(TARGET, "PendingRuns"))
+    .then((reply) => replyVariant<PendingRun[]>(reply, "PendingRuns"));
 
 /** Every channel watch. `Watches` is a unit-variant query — the bare string. */
 export const watches = (transport: NodeTransport): Promise<WatchView[]> =>

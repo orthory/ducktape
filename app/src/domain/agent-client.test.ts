@@ -1,7 +1,7 @@
 // The agent client mirrors agent-interface: AgentMsg encoding (ownership from
 // the block origin, never in a payload; snake_case fields) + AgentReply
-// decoding for the Agents / Agent / Runs / Run / Watches queries, including the
-// null (absent agent/run) cases. The prompt-upload flow itself lives in the
+// decoding for the Agents / Agent / PendingRuns / Watches queries, including
+// the null (absent agent) case. The prompt-upload flow itself lives in the
 // store; here we only prove the wire shapes and the hex→bytes hash helper.
 
 import { describe, expect, it, vi } from "vitest";
@@ -13,16 +13,15 @@ import {
   hexToBytes,
   pauseAgent,
   registerAgent,
+  pendingRuns,
   requestRun,
   resumeAgent,
-  run,
-  runs,
   unwatchChannel,
   updateAgent,
   watchChannel,
   watches,
 } from "./agent-client";
-import type { AgentRecord, RunView, WatchView } from "./agent-client";
+import type { AgentRecord, PendingRun, WatchView } from "./agent-client";
 import type { NodeTransport } from "./transport";
 
 const stubTransport = (reply?: unknown): NodeTransport => ({
@@ -208,9 +207,10 @@ describe("agent queries", () => {
     await expect(agent(absent, "ghost")).resolves.toBeNull();
   });
 
-  it("sends Runs{channel_id,limit} and decodes the timeline", async () => {
-    const view: RunView = {
+  it("sends the bare string PendingRuns and decodes the in-flight entries", async () => {
+    const view: PendingRun = {
       run_id: "run-1",
+      dispatch_id: "ab".repeat(32),
       agent_id: "helper",
       channel_id: "general",
       anchor_seq: 4,
@@ -218,26 +218,11 @@ describe("agent queries", () => {
       job_id: null,
       job_claim_height: 0,
       requester: { External: [1] },
-      status: { AwaitingOracle: { saga_id: "s1" } },
-      context_hash: hexToBytes("ef".repeat(32)),
       created_at: 1,
-      updated_at: 1,
     };
-    const transport = stubTransport({ Runs: [view] });
-    await expect(
-      runs(transport, { channelId: null, limit: 50 }),
-    ).resolves.toEqual([view]);
-    expect(transport.query).toHaveBeenCalledWith("agent", {
-      Runs: { channel_id: null, limit: 50 },
-    });
-  });
-
-  it("sends Run{run_id} and decodes Run:null as an absent run", async () => {
-    const transport = stubTransport({ Run: null });
-    await expect(run(transport, "ghost")).resolves.toBeNull();
-    expect(transport.query).toHaveBeenCalledWith("agent", {
-      Run: { run_id: "ghost" },
-    });
+    const transport = stubTransport({ PendingRuns: [view] });
+    await expect(pendingRuns(transport)).resolves.toEqual([view]);
+    expect(transport.query).toHaveBeenCalledWith("agent", "PendingRuns");
   });
 
   it("sends the bare string Watches and decodes the watches", async () => {
