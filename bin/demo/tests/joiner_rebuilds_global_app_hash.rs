@@ -491,8 +491,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            None,
         );
         commit_op_as(
             &mut src_agent,
@@ -503,6 +506,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 display_name: "Quackbot".into(),
                 capability: "mock-llm-1".into(),
                 prompt_hash: vec![7u8; 32],
+                prompt_doc: None,
                 allowed_actions: vec![ACTION_CHAT_POST.into()],
             }),
         )
@@ -516,6 +520,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 display_name: "Sleepy".into(),
                 capability: "mock-llm-1".into(),
                 prompt_hash: vec![8u8; 32],
+                prompt_doc: None,
                 allowed_actions: Vec::new(),
             }),
         )
@@ -708,8 +713,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            None,
         );
         join_agent
             .install(&agent_bytes, src_agent_root)

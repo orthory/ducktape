@@ -124,6 +124,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       "chat",
       "saga",
       "dispatch",
+      "tagging",
       "tasks",
       "inbox",
       "automations",

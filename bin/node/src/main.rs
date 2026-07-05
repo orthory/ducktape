@@ -189,7 +189,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 20] = [
+const MODULE_IDS: [&str; 22] = [
     "kv",
     "document",
     "pages",
@@ -200,6 +200,8 @@ const MODULE_IDS: [&str; 20] = [
     "upgrade",
     "saga",
     "capability",
+    "dispatch",
+    "tagging",
     "tasks",
     "vaults",
     "profiles",

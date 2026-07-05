@@ -13,7 +13,7 @@
 //!
 //! run: `cargo run -p demo`
 
-use agent::{AgentModule, run_id_for, saga_id_for};
+use agent::{AgentModule, run_id_for};
 use agent_interface::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, TurnPolicy,
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
@@ -77,9 +77,13 @@ fn main() {
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
         let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
-        let chat = Chat::init(context.child("chat"), "chat").await;
+        let chat = Chat::init(context.child("chat"), "chat")
+            .await
+            .with_tagging("tagging");
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");
+        let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
+        let tagging = tagging::TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let profiles = Profiles::new("profiles");
         let inbox = Inbox::new("inbox");
@@ -90,8 +94,11 @@ fn main() {
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         );
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let mut host = Host::genesis(vec![
@@ -103,6 +110,8 @@ fn main() {
             Box::new(chat),
             Box::new(valset),
             Box::new(saga),
+            Box::new(dispatch),
+            Box::new(tagging),
             Box::new(tasks),
             Box::new(profiles),
             Box::new(inbox),
@@ -114,7 +123,7 @@ fn main() {
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 16 registered modules over one host ===");
+        println!("=== super-app demo — 18 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -473,6 +482,7 @@ fn main() {
                     display_name: "Quackbot".into(),
                     capability: "mock-llm-1".into(),
                     prompt_hash: vec![7u8; 32],
+                    prompt_doc: None,
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                 }),
             },
@@ -551,7 +561,26 @@ fn main() {
                 run.run_id, run.status, run.anchor_seq
             );
         }
-        let saga_id = saga_id_for(&run_id);
+        let reply = host
+            .query(
+                "dispatch",
+                &dispatch_interface::encode_query(&dispatch_interface::DispatchQuery::Dispatch {
+                    receiver: "agent".into(),
+                    dispatch_id: agent::dispatch_id_for(&run_id),
+                }),
+            )
+            .await
+            .expect("query dispatch");
+        let dispatch_interface::DispatchReply::Dispatch(Some(dispatch_view)) =
+            dispatch_interface::decode_reply(&reply).unwrap()
+        else {
+            panic!("the run's dispatch must exist");
+        };
+        let dispatch_interface::DispatchStatus::AwaitingResult { saga_id } =
+            dispatch_view.status.clone()
+        else {
+            panic!("the dispatch awaits its saga");
+        };
         let reply = host
             .query(
                 "saga",
@@ -568,7 +597,9 @@ fn main() {
             "  saga           : {} {:?} (deadline view {:?})",
             saga_id, saga_view.status, saga_view.deadline
         );
-        println!("  (post + hook + run + trigger: ONE block — the P2 atomic cascade)");
+        println!(
+            "  (post + tag + engagement + run + dispatch + trigger: ONE block — the P2 cascade)"
+        );
         println!("  app-hash       : {:?}", out.app_hash);
 
         // block 9: the INBOX notification queue. modules deliver to a member as
