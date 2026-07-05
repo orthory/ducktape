@@ -47,8 +47,11 @@
 //! hold its lease, and a tag nobody provides assigns nobody (never the raw
 //! valset). under [`LeasePolicy::Strict`] a result is accepted only from the
 //! assignee's external origin. when the pool is empty or unavailable the
-//! assignee is `None` and strict degrades to accept-any for that attempt —
-//! the honest fallback until membership is authenticated.
+//! assignee is `None` and the emitted [`WorkerRequest`] is an ANNOUNCEMENT:
+//! no result can land for it under strict — a capable node claims it with
+//! `Accept` (first in consensus order wins the lease, and the re-emitted
+//! request names the winner), so N capable nodes never each pay for the
+//! same execution.
 //!
 //! ## GC
 //!
@@ -98,8 +101,9 @@ pub enum LeasePolicy {
     /// signature-verified.
     Open,
     /// a result is accepted only from the assignee's external origin; a
-    /// non-assignee result is a deterministic no-op. degrades to accept-any
-    /// for an attempt whose assignee is `None` (empty/unavailable set).
+    /// non-assignee result is a deterministic no-op. an attempt whose
+    /// assignee is `None` (empty/unavailable set) accepts NO result until a
+    /// node claims it via `Accept` — the announcement lane.
     Strict,
 }
 
@@ -808,18 +812,24 @@ impl Module for SagaModule {
                 if current.status.is_terminal() || attempt != current.attempt {
                     return Ok(());
                 }
-                // the lease gate: under Strict an ASSIGNED attempt accepts a
-                // result only from the assignee's external origin; anyone
-                // else is a no-op (never an error — a finalized foreign
-                // result must not abort the block). an unassigned attempt
-                // degrades to accept-any even under Strict.
+                // the lease gate: under Strict a result lands only from the
+                // assignee's external origin; anyone else is a no-op (never
+                // an error — a finalized foreign result must not abort the
+                // block). an UNASSIGNED attempt accepts no result at all
+                // under Strict: its request was an announcement, and the
+                // work is claimed via Accept first.
                 if self.policy == LeasePolicy::Strict {
-                    if let Some(assignee) = &current.assignee {
-                        let held =
-                            matches!(&ctx.env().origin, Origin::External(key) if key == assignee);
-                        if !held {
-                            return Ok(());
+                    match &current.assignee {
+                        Some(assignee) => {
+                            let held = matches!(
+                                &ctx.env().origin,
+                                Origin::External(key) if key == assignee
+                            );
+                            if !held {
+                                return Ok(());
+                            }
                         }
+                        None => return Ok(()),
                     }
                 }
                 // an oversized error string is the same abort-don't-commit
@@ -863,6 +873,48 @@ impl Module for SagaModule {
                         self.stage(saga_id, saga);
                     }
                 }
+            }
+            SagaMsg::Accept { saga_id, attempt } => {
+                // the claim lane for UNASSIGNED attempts: first accept in
+                // consensus order wins the lease; everything else — unknown
+                // or terminal saga, stale attempt, an attempt someone (or
+                // rendezvous) already assigned — is a deterministic no-op,
+                // never an error (a finalized late accept must not abort
+                // the block).
+                let Origin::External(key) = &ctx.env().origin else {
+                    return Err(Error::Module(
+                        "Accept requires an external origin (the accepting node's key)".into(),
+                    ));
+                };
+                if key.is_empty() {
+                    return Err(Error::Module(
+                        "Accept requires a non-empty submitter id".into(),
+                    ));
+                }
+                let Some(current) = self.get(&saga_id) else {
+                    return Ok(());
+                };
+                if current.status.is_terminal()
+                    || attempt != current.attempt
+                    || current.assignee.is_some()
+                {
+                    return Ok(());
+                }
+                let height = ctx.env().height;
+                let mut saga = current.clone();
+                saga.assignee = Some(key.clone());
+                saga.lease_expires_at = lease_expiry(height, &saga.assignee, saga.lease_views);
+                saga.updated_at = ctx.env().consensus_time;
+                // the actual work order: the announcement's request, re-emitted
+                // naming the winner — every other node's worker skips it.
+                ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
+                    saga_id: saga_id.clone(),
+                    attempt: saga.attempt,
+                    spec: saga.spec.clone(),
+                    deadline: saga.deadline,
+                    assignee: saga.assignee.clone(),
+                })));
+                self.stage(saga_id, saga);
             }
             SagaMsg::Crank {} => {
                 // PERMISSIONLESS: any origin may crank — P7's liveness comes
@@ -2047,9 +2099,11 @@ mod tests {
     }
 
     #[test]
-    fn strict_policy_degrades_to_accept_any_without_an_assignee() {
-        // valset configured but EMPTY: assignee is None, and strict must
-        // degrade to accept-any for the attempt — the documented fallback.
+    fn strict_unassigned_attempts_are_announcements_claimed_by_accept() {
+        // valset configured but EMPTY: assignee is None. under strict the
+        // emitted request is an ANNOUNCEMENT — no result lands until a node
+        // claims the attempt, first accept in consensus order wins, and only
+        // the winner's result counts.
         let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
         let mut ctx = CaptureCtx::new().with_validators(Vec::new());
         exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
@@ -2061,12 +2115,135 @@ mod tests {
             "no assignee and no window -> no lease"
         );
 
+        // an unclaimed result is a no-op — the accept-any hole is closed.
+        let pending_root = m.root();
         let mut ctx = CaptureCtx::new()
             .from_origin(Origin::External(b"anyone".to_vec()))
             .with_validators(Vec::new());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Done);
+        assert_eq!(m.root(), pending_root, "no result lands unclaimed");
+        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+
+        // the FIRST accept claims the attempt: assignee + lease + the actual
+        // work order re-emitted naming the winner.
+        let mut ctx = CaptureCtx::new()
+            .at(7)
+            .from_origin(Origin::External(b"node-a".to_vec()))
+            .with_validators(Vec::new());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        let requests = ctx.worker_requests();
+        assert_eq!(requests.len(), 1, "the accept re-emits the work order");
+        assert_eq!(requests[0].assignee, Some(b"node-a".to_vec()));
+        assert_eq!(requests[0].attempt, 0);
+        commit(&mut m);
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.assignee, Some(b"node-a".to_vec()));
+        assert_eq!(
+            v.lease_expires_at,
+            Some(7 + DEFAULT_LEASE_VIEWS),
+            "the claim starts the lease clock"
+        );
+
+        // a late accept loses quietly: nothing staged, no second work order.
+        let claimed_root = m.root();
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"node-b".to_vec()))
+            .with_validators(Vec::new());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        assert!(ctx.worker_requests().is_empty(), "a late accept is a no-op");
+        commit(&mut m);
+        assert_eq!(m.root(), claimed_root);
+
+        // the loser's result is a no-op; the winner's lands.
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"node-b".to_vec()))
+            .with_validators(Vec::new());
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stolen".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"node-a".to_vec()))
+            .with_validators(Vec::new());
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
+        commit(&mut m);
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.status, SagaStatus::Done);
+        assert_eq!(v.result, Some(b"legit".to_vec()));
+    }
+
+    #[test]
+    fn accept_rejects_bad_origins_and_no_ops_on_assigned_or_stale_targets() {
+        let validators = vec![vec![1u8; 32]];
+        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new().with_validators(validators.clone());
+        exec(&mut m, &mut ctx, &trigger("assigned", b"w")).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get(&m, "assigned").unwrap().assignee,
+            Some(validators[0].clone()),
+            "a one-node pool rendezvous-assigns that node"
+        );
+
+        // module / system / empty-key origins have no claim surface.
+        for origin in [
+            Origin::Module("dispatch".into()),
+            Origin::System,
+            Origin::External(Vec::new()),
+        ] {
+            let mut ctx = CaptureCtx::new()
+                .from_origin(origin)
+                .with_validators(validators.clone());
+            assert!(
+                exec(
+                    &mut m,
+                    &mut ctx,
+                    &msg(&SagaMsg::Accept {
+                        saga_id: "assigned".into(),
+                        attempt: 0,
+                    }),
+                )
+                .is_err()
+            );
+            block_on(m.abort_block()).unwrap();
+        }
+
+        // an already-assigned attempt, an unknown saga, and a stale attempt
+        // are all quiet no-ops.
+        let before = m.root();
+        for (saga_id, attempt) in [("assigned", 0u32), ("ghost", 0), ("assigned", 9)] {
+            let mut ctx = CaptureCtx::new()
+                .from_origin(Origin::External(b"node-x".to_vec()))
+                .with_validators(validators.clone());
+            exec(
+                &mut m,
+                &mut ctx,
+                &msg(&SagaMsg::Accept {
+                    saga_id: saga_id.into(),
+                    attempt,
+                }),
+            )
+            .unwrap();
+            assert!(ctx.worker_requests().is_empty(), "{saga_id}/{attempt}");
+            commit(&mut m);
+            assert_eq!(m.root(), before, "{saga_id}/{attempt} staged nothing");
+        }
     }
 
     /// a trigger that names a capability; assignment must draw from the
@@ -2133,7 +2310,7 @@ mod tests {
     }
 
     #[test]
-    fn a_capability_nobody_provides_assigns_nobody_and_degrades_to_accept_any() {
+    fn a_capability_nobody_provides_assigns_nobody_and_waits_for_a_claim() {
         let mut m =
             SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
         let mut ctx = CaptureCtx::new()
@@ -2147,17 +2324,37 @@ mod tests {
             "no providers -> no assignee (the valset is NOT a fallback pool)"
         );
 
+        // unclaimed: no result lands under strict.
         let mut ctx = CaptureCtx::new()
             .from_origin(Origin::External(b"anyone".to_vec()))
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(Vec::new());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
-        assert_eq!(
-            get(&m, "s1").unwrap().status,
-            SagaStatus::Done,
-            "strict degraded to accept-any for the unassigned attempt"
-        );
+        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+
+        // a node that CAN run the capability claims it, then its result lands.
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"provider".to_vec()))
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(Vec::new());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"provider".to_vec()))
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(Vec::new());
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Done);
     }
 
     #[test]

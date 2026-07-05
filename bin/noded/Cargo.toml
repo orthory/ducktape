@@ -35,6 +35,7 @@ agent-oracle = { workspace = true }
 capability-host = { workspace = true }
 saga = { workspace = true }
 saga-interface = { workspace = true }
+dispatch-interface = { workspace = true }
 document = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }
