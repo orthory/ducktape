@@ -160,9 +160,17 @@ fn run_ceremony(cluster: &Cluster, proposal_id: &str, action: GovAction) {
             voting_period: 600_000, // consensus-time ms; far past test end
         }),
     );
-    poll_until("proposal to open", FINALIZE, || {
-        proposal_status(cluster, 1, proposal_id).filter(|(s, _)| *s == ProposalStatus::Open)
+    // wait_pred + assert (not poll_until) so a timeout SHOWS the node logs —
+    // "proposal never opened" is otherwise blind to which lane wedged.
+    let opened = wait_pred(FINALIZE, || {
+        proposal_status(cluster, 1, proposal_id)
+            .is_some_and(|(s, _)| s == ProposalStatus::Open)
     });
+    assert!(
+        opened,
+        "proposal {proposal_id} never opened;\n{}",
+        cluster.all_log_tails(60)
+    );
     let vote = governance_interface::encode_msg(&GovMsg::Vote {
         proposal_id: proposal_id.into(),
         approve: true,
@@ -467,19 +475,19 @@ fn cluster_upgrade() {
     //     fresh blocks — push a directory op and require it to apply past the
     //     boundary on ANOTHER node (proves the post-H engine finalizes, and
     //     drives height past H).
-    poll_until("the new epoch to finalize a post-H op", CONVERGE, || {
-        let payload = directory_interface::encode_msg(&DirMsg::Set {
+    //     submit ONCE, then poll reads only: an acked op SURVIVES the boundary
+    //     now (the cutover carries it), so the old defensive resubmit-per-poll
+    //     loop is just spam that deepens the post-cutover queue the carried
+    //     backlog is already draining through (one frame per block).
+    cluster.submit(
+        0,
+        "directory",
+        &directory_interface::encode_msg(&DirMsg::Set {
             key: "post-h-liveness".into(),
             value: "alive".into(),
-        });
-        let _ = cluster.rpc(
-            0,
-            serde_json::json!({
-                "cmd": "submit",
-                "target": "directory",
-                "payload_hex": common::hex(&payload),
-            }),
-        );
+        }),
+    );
+    poll_until("the new epoch to finalize a post-H op", CONVERGE, || {
         dir_value(&cluster, 2, "post-h-liveness")
     });
     let post_h = height(&cluster, 0).expect("finalized height after H");
@@ -683,19 +691,18 @@ fn cluster_upgrade_aborts_on_unmet_quorum() {
 
     // 3. NO DOWNTIME: the network keeps finalizing across the aborted boundary — a
     //    fresh op applies on ANOTHER node and height advances past H.
-    poll_until("a post-abort op to finalize across H", CONVERGE, || {
-        let payload = directory_interface::encode_msg(&DirMsg::Set {
+    //    submit ONCE, then poll reads only (see the post-h-liveness note in
+    //    cluster_upgrade: acked ops survive the boundary now, and the carried
+    //    backlog drains one frame per block — resubmit-per-poll just spams it).
+    cluster.submit(
+        0,
+        "directory",
+        &directory_interface::encode_msg(&DirMsg::Set {
             key: "post-abort-liveness".into(),
             value: "alive".into(),
-        });
-        let _ = cluster.rpc(
-            0,
-            serde_json::json!({
-                "cmd": "submit",
-                "target": "directory",
-                "payload_hex": common::hex(&payload),
-            }),
-        );
+        }),
+    );
+    poll_until("a post-abort op to finalize across H", CONVERGE, || {
         dir_value(&cluster, 2, "post-abort-liveness")
     });
     let post = height(&cluster, 0).expect("finalized height after the aborted H");
