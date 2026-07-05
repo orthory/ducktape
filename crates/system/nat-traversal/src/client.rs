@@ -292,13 +292,34 @@ pub async fn run_coordinator(sock: UdpSocket) {
     run_coordinator_with_idle(sock, std::time::Duration::from_secs(30)).await
 }
 
-/// As [`run_coordinator`], but with a caller-chosen relay idle timeout. Split
-/// out so tests can force fast teardown; production calls `run_coordinator`.
+/// As [`run_coordinator`], but with a caller-chosen relay idle timeout. The
+/// relay endpoint advertised to peers is derived from the listen IP — correct
+/// only when that IP is concrete (tests bind loopback). A coordinator on the
+/// wildcard MUST use [`run_coordinator_advertised`] with an explicit reachable
+/// IP, or it would hand peers an unroutable `0.0.0.0:<port>` relay endpoint.
 pub async fn run_coordinator_with_idle(sock: UdpSocket, relay_idle: std::time::Duration) {
+    let advertise_ip = sock
+        .local_addr()
+        .map(|a| a.ip())
+        .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
+    run_coordinator_advertised(sock, advertise_ip, relay_idle).await
+}
+
+/// The coordinator loop with an explicit relay-advertise IP: relay sockets bind
+/// the wildcard (to receive from any peer), but the address handed back in
+/// `RelayGrant` uses `advertise_ip` so a coordinator behind `0.0.0.0` still
+/// gives peers a routable relay endpoint.
+pub async fn run_coordinator_advertised(
+    sock: UdpSocket,
+    advertise_ip: std::net::IpAddr,
+    relay_idle: std::time::Duration,
+) {
     use std::collections::HashMap;
 
     let mut coord = Coordinator::new();
     let mut buf = [0u8; 64];
+    // relay sockets bind on the same interface the control socket did (the
+    // wildcard is fine for RECEIVING); the port is ephemeral.
     let bind_ip = sock
         .local_addr()
         .map(|a| a.ip())
@@ -365,8 +386,13 @@ pub async fn run_coordinator_with_idle(sock: UdpSocket, relay_idle: std::time::D
                             Ok(s) => s,
                             Err(_) => continue,
                         };
+                        // peers dial the ADVERTISE ip at the socket's bound port
+                        // — never the bind ip, which may be the wildcard.
                         let (a_addr, b_addr) = match (a.local_addr(), b.local_addr()) {
-                            (Ok(x), Ok(y)) => (x, y),
+                            (Ok(x), Ok(y)) => (
+                                SocketAddr::new(advertise_ip, x.port()),
+                                SocketAddr::new(advertise_ip, y.port()),
+                            ),
                             _ => continue,
                         };
                         // Spawn the opaque splice INTO the coordinator-owned
@@ -477,11 +503,14 @@ mod tests {
         let client_addr = client.local_addr().await.unwrap();
 
         // A forger — some socket that is not the coordinator — races the
-        // real coordinator reply with a bogus BindResponse.
+        // real coordinator reply with a bogus BindResponse. The client binds
+        // the wildcard, so target its port on loopback (macOS refuses a send
+        // to a 0.0.0.0 destination; the on-path forger is loopback here).
         let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_addr.port());
         let forged = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5555);
         forger
-            .send_to(&Msg::BindResponse { reflexive: forged }.encode(), client_addr)
+            .send_to(&Msg::BindResponse { reflexive: forged }.encode(), client_dst)
             .await
             .unwrap();
 

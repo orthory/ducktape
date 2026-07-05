@@ -31,6 +31,15 @@ pub enum AdvertOutcome {
 /// so a NAT-rebound node re-advertises under a strictly-higher nonce to
 /// supersede its stale mapping — WITHOUT this crate depending on
 /// `wireguard-upgrade` or any validator-identity type (the Slice 2 invariant).
+/// Cap on distinct advertised keys the coordinator will hold. The `NodeKey` in
+/// a `Register` is fully attacker-chosen, so an UNBOUNDED map is a trivial
+/// memory-exhaustion vector: a stranger sprays millions of random keys and the
+/// resident set grows without limit. At the cap, a first-seen key evicts the
+/// key with the LOWEST nonce (a still-at-baseline entry the sender can always
+/// re-advertise) rather than accepting unbounded growth. Generous for any real
+/// validator mesh; a DoS backstop, not a working limit.
+const MAX_ADVERTS: usize = 4096;
+
 #[derive(Default)]
 pub struct AdvertBook {
     latest: HashMap<NodeKey, ReflexiveAdvert>,
@@ -51,8 +60,27 @@ impl AdvertBook {
             // stale by construction and cannot roll it back.
             Some(prev) if prev.nonce > 0 => {}
             _ => {
+                self.evict_if_full(&key);
                 self.latest.insert(key, ReflexiveAdvert { reflexive: src, nonce: 0 });
             }
+        }
+    }
+
+    /// Before inserting a NEW key at the cap, drop the lowest-nonce entry so an
+    /// attacker spraying fresh random keys cannot grow the map without bound.
+    /// A no-op when the key already exists (an update, not growth) or there is
+    /// room.
+    fn evict_if_full(&mut self, incoming: &NodeKey) {
+        if self.latest.contains_key(incoming) || self.latest.len() < MAX_ADVERTS {
+            return;
+        }
+        if let Some(victim) = self
+            .latest
+            .iter()
+            .min_by_key(|(_, a)| a.nonce)
+            .map(|(k, _)| *k)
+        {
+            self.latest.remove(&victim);
         }
     }
 
@@ -64,6 +92,7 @@ impl AdvertBook {
         match self.latest.get(&key) {
             Some(prev) if nonce <= prev.nonce => AdvertOutcome::Stale,
             _ => {
+                self.evict_if_full(&key);
                 self.latest.insert(key, ReflexiveAdvert { reflexive: src, nonce });
                 AdvertOutcome::Superseded
             }
@@ -159,5 +188,29 @@ mod tests {
     fn unknown_key_has_no_current() {
         let book = AdvertBook::default();
         assert_eq!(book.current(NodeKey([0xcc; 32])), None);
+    }
+
+    #[test]
+    fn the_book_is_capped_against_key_spray() {
+        // an attacker registering random keys must not grow the map without
+        // bound: at the cap a new key evicts the lowest-nonce (baseline) entry.
+        let mut book = AdvertBook::default();
+        for i in 0..(MAX_ADVERTS as u64) {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&i.to_le_bytes());
+            book.observe(NodeKey(k), addr(1, 4000));
+        }
+        assert_eq!(book.latest.len(), MAX_ADVERTS);
+        // promote one entry above the baseline so it survives eviction.
+        let mut kept = [0u8; 32];
+        kept[..8].copy_from_slice(&7u64.to_le_bytes());
+        assert_eq!(
+            book.readvertise(NodeKey(kept), addr(2, 5000), 9),
+            AdvertOutcome::Superseded
+        );
+        // one more spray key stays at the cap and does not evict the promoted one.
+        book.observe(NodeKey([0xff; 32]), addr(3, 6000));
+        assert_eq!(book.latest.len(), MAX_ADVERTS);
+        assert_eq!(book.current(NodeKey(kept)), Some(addr(2, 5000)));
     }
 }

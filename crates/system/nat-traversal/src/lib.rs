@@ -16,7 +16,10 @@ pub mod simnat;
 pub mod wire;
 
 pub use advert::{AdvertBook, AdvertOutcome, ReflexiveAdvert};
-pub use client::{NatClient, run_coordinator, run_coordinator_with_idle, run_relay_pair};
+pub use client::{
+    NatClient, run_coordinator, run_coordinator_advertised, run_coordinator_with_idle,
+    run_relay_pair,
+};
 pub use coordinator::{Coordinator, Side};
 pub use relay::{Forward, RelaySplice};
 #[cfg(any(test, feature = "simnat"))]
