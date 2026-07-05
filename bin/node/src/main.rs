@@ -4549,19 +4549,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the host-owned worker set (reactor seam): effects of finalized
         // blocks are offered here, and claimed follow-ups re-enter the ordered
         // lane as their own blocks.
-        // discover this host's installed executor CLIs (BYO — no credential
-        // handling here). the discovered tag set is BOTH what the oracle worker
-        // can run and what this node announces to the capability registry, so
-        // the two can never drift.
-        let providers = capability_host::discover();
+        // load capability specs and discover this host's installed executor
+        // CLIs (BYO — no credential handling here). the discovered tag set is
+        // BOTH what the oracle worker can run and what this node announces to
+        // the capability registry, so the two can never drift. routing and
+        // default models live in the specs (docs/capability-spec.md); a broken
+        // operator spec is a boot error, not a silently dropped executor.
+        let providers = capability_host::discover()
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
-        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
-            blobs.clone(),
-            providers,
-            // default codex model when a request pins none; a claude model_ref
-            // routes to the claude provider instead (see agent_oracle::capability_for).
-            "gpt-5.3-codex-spark".into(),
-        ))];
+        let workers: Vec<Box<dyn reactor::Worker>> =
+            vec![Box::new(LlmWorker::new(blobs.clone(), providers))];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
         // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
         // this binary can execute. survives restart/late-join (state-driven, not a

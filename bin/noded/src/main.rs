@@ -401,14 +401,13 @@ fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
     }
     vec![Box::new(LlmWorker::new(
         blobs,
-        // BYO: run whatever executor CLIs (codex/claude) are installed on this
-        // host — no credential handling here. the single-node daemon carries no
-        // capability registry (its "network" is one node); the worker looks up
-        // the local provider by the request's model_ref directly.
-        capability_host::discover(),
-        // default codex model when a request pins none; a claude model_ref
-        // routes to the claude provider instead (see agent_oracle::capability_for).
-        "gpt-5.3-codex-spark".into(),
+        // BYO: run whatever executor CLIs the capability specs describe and
+        // this host has installed — no credential handling here. the
+        // single-node daemon carries no capability registry (its "network" is
+        // one node); model_ref routing and default models come from the specs
+        // (docs/capability-spec.md). a broken operator spec is a boot error.
+        capability_host::discover()
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
     ))]
 }
 
