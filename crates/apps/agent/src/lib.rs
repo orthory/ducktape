@@ -1,27 +1,33 @@
-//! the agent orchestrator — the collaboration loop's deterministic core.
+//! the agent module — the collaboration loop's dispatch-plane consumer.
 //!
 //! a pure state-machine module (in the app-hash) holding the agent registry,
-//! channel watches, and run records. it keeps saga's shape — committed
-//! `BTreeMap`s with a `pending` overlay staged during a block and merged at
-//! the boundary, a state-based `root()` over a canonical encoding, and
-//! snapshot/install joiner support — and implements three of the platform's
-//! ordering-contract promises (docs/agent-collaboration-design.md §2, §3, §5):
+//! channel watches, and the correlation entries for still-pending dispatches.
+//! run LIFECYCLE is deliberately NOT here: a run is a dispatched task, and
+//! its status, outcome, and history live in the dispatch module (and its
+//! saga) — per-dispatched-task, never agent-owned. what this module keeps per
+//! run is exactly what acting on the eventual `ResultEvent` needs (where the
+//! reply goes, which job to finalize, who may cancel), pruned when the result
+//! delivers.
 //!
-//! - **P2 — atomic causal cascades.** a user post, the hook notification, the
-//!   run record, and the saga trigger commit in ONE block; a watch and its
-//!   chat hook registration commit in one block; a validated output's chat
-//!   reply and task writes commit in the block the oracle result lands.
-//! - **P4 — anchored generation.** every run pins the exact transcript prefix
-//!   the prompt is built from: a bounded window (the [`CONTEXT_WINDOW`] newest
-//!   messages up to and including the anchor) is canonically encoded and
-//!   hashed into `context_hash`, which rides in the [`LlmRequest`] spec and
-//!   the run record — any validator can re-derive the prompt input from the
-//!   log, and the reply is never presented as ordered before its anchor.
-//! - **P6 — callback adjacency.** the saga's terminal callback, the run's
-//!   terminal transition, and every validated follow-up commit in the same
+//! the module implements the platform's ordering-contract promises where they
+//! touch agents (docs/agent-collaboration-design.md §2, §3, §5):
+//!
+//! - **P2 — atomic causal cascades.** a user post, the tagging plane's
+//!   engagement delivery, the pending entry, and the dispatch commit in ONE
+//!   block; a watch and its plane subscription commit in one block; a
+//!   validated response's chat reply and task writes commit in the delivery
+//!   block.
+//! - **P4 — anchored generation.** the ENTIRE model input is composed in
+//!   consensus — transcript window, prompt document, output contract — and
+//!   rides the dispatch as committed payload data, so any validator holds the
+//!   exact prompt input as ordered state, and the reply is never presented as
+//!   ordered before its anchor.
+//! - **P6 — callback adjacency.** on the dispatch plane this becomes
+//!   next-block delivery: the ResultEvent, the validated reply, the task
+//!   writes, and a job-backed run's finalize all commit in the one delivery
 //!   block.
 //!
-//! ## execute routing — four payload namespaces, keyed by ORIGIN
+//! ## execute routing — payload namespaces, keyed by ORIGIN
 //!
 //! the dispatch origin is host-assigned and cannot be chosen by a submitter,
 //! so routing on it makes every privileged intake spoof-proof by
@@ -30,43 +36,42 @@
 //! - `Origin::Module(tagging)` → an `EngagementEvent` (the engagement
 //!   intake): the tagging plane's routed report of a user post in a watched
 //!   channel, tags included;
-//! - `Origin::Module(dispatch)` → a `ResultEvent` (the dispatch-plane result
-//!   intake for chat-engaged runs);
-//! - `Origin::Module(saga)` → a [`SagaCallback`] (the completion intake for
-//!   JOB-BACKED runs, which still ride the saga directly);
+//! - `Origin::Module(dispatch)` → a `ResultEvent` (the dispatch plane's
+//!   next-block delivery — the ONLY result intake);
 //! - `Origin::Module(jobs)` → a [`JobsEvent`] (the jobs-board intake);
-//! - `Origin::Module(chat)` → a dead-letter no-op (chat no longer notifies
-//!   this module directly; the tombstone keeps a stray follow-up from ever
-//!   aborting a posting block);
+//! - `Origin::Module(saga)` → a dead-letter no-op. nothing here rides the
+//!   saga directly anymore, but any submitter can point a saga trigger's
+//!   `reply_to` at this module — the tombstone keeps that callback from ever
+//!   aborting the saga's terminal block (the callback-poison rule);
+//! - `Origin::Module(chat)` → a dead-letter no-op (chat never notifies this
+//!   module directly; the tombstone keeps a stray follow-up from aborting a
+//!   posting block);
 //! - anything else → an [`AgentMsg`] (admin ops and explicit runs). an
 //!   external submitter shipping intake-shaped bytes lands HERE and fails the
 //!   `AgentMsg` decode — it can never fake an intake.
 //!
-//! ## the NO-FAIL arms (design §4, the callback-poison rule)
+//! ## the NO-FAIL arms (design §4)
 //!
 //! every privileged intake MUST NEVER return `Err`:
 //!
-//! - the saga callback commits in the same block as the saga's terminal
-//!   transition. an `Err` here aborts that block; the saga wedges at Pending
-//!   and every retry of the result aborts again. malformed or unknown
-//!   callbacks are staged no-ops (plus an observability event), and an output
-//!   that fails validation FAILS THE RUN, never the block. anything the
-//!   emitted follow-ups could make chat or tasks reject (a squatted reply
-//!   message id, an oversized reply, a duplicate task id, a full thread) is
-//!   probed deterministically first — an emitted follow-up must be valid by
-//!   construction.
-//! - the dispatch-plane result intake runs inside the delivery block; an
-//!   `Err` would abort it, the committed mailbox would re-inject next block,
-//!   and every subsequent block would abort (the permanent-abort loop the
-//!   dispatch module documents). same discipline, same staging.
+//! - the result intake runs inside the delivery block; an `Err` would abort
+//!   it, the committed mailbox would re-inject next block, and every
+//!   subsequent block would abort (the permanent-abort loop the dispatch
+//!   module documents). malformed events and unknown dispatch ids are staged
+//!   no-ops (plus an observability event); a response that fails validation
+//!   FAILS THE RUN — a breadcrumb and a pruned entry — never the block.
+//!   anything the emitted follow-ups could make chat, tasks, or jobs reject
+//!   (a squatted reply message id, a full thread, a duplicate task id, a
+//!   stale job claim) is probed deterministically first — an emitted
+//!   follow-up must be valid by construction.
 //! - the engagement intake runs in the same block as the user's post. an
-//!   `Err` here would abort the post (and every other subscriber's
-//!   delivery), so a malformed event, a failed context pin, a broken prompt
-//!   document, or an oversized payload is equally a staged no-op.
-//! - the jobs intake runs in the same block as the job submit. jobs queries are
-//!   committed-only, so the just-staged job is invisible to `JobsQuery::Get`;
-//!   this path skips that blind probe and relies on the documented single
-//!   claiming-worker cascade rule before emitting its `Claim`.
+//!   `Err` would abort the post (and every other subscriber's delivery), so
+//!   a malformed event, a failed context pin, a broken prompt document, or
+//!   an oversized payload is equally a staged no-op.
+//! - the jobs intake runs in the same block as the job submit. the event
+//!   carries the full spec (committed-only jobs queries cannot see the
+//!   just-staged job), and the documented single claiming-worker cascade
+//!   rule is what makes the emitted `Claim` safe for this slice.
 //!
 //! ## loop prevention
 //!
@@ -77,13 +82,15 @@
 //!
 //! ## the turn claim
 //!
-//! chat run ids and job run ids use disjoint `0x1f`-delimited keyspaces.
-//! creating a run that already exists (staged or committed) is a deterministic
-//! no-op, so however many paths race to claim a turn — the hook and an explicit
-//! `RequestRun`, or two identical requests — the first in consensus order wins
-//! and the rest fall through silently.
+//! chat run ids and job run ids use disjoint `0x1f`-delimited keyspaces, and
+//! a run's dispatch id is the hex sha256 of its run id — deterministic on
+//! every path that could race to claim a turn. the claim itself is settled in
+//! TWO layers, both first-in-consensus-order-wins: the staged pending map
+//! settles same-block races, and the dispatch module's permanent dispatch
+//! record (probed committed-only) settles everything after — a turn whose
+//! dispatch exists is taken forever, even after its pending entry pruned.
 //!
-//! `root()` folds in every field of all three maps, so any transition moves
+//! `root()` folds in every field of the three maps, so any transition moves
 //! the app-hash. a joiner rebuilds this module from a peer via
 //! [`AgentModule::snapshot`] / [`AgentModule::install`]: the snapshot ships
 //! the committed maps in the exact canonical encoding `root()` hashes, and
@@ -93,20 +100,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent_interface::{
-    ACTION_CHAT_POST, AgentAction, AgentMsg, AgentOutput, AgentQuery, AgentRecord, AgentReply,
-    AgentStatus, KNOWN_ACTIONS, LlmRequest, MAX_ACTIONS_PER_RUN, MAX_AGENT_RECORD_BYTES,
-    MAX_QUERY_LIMIT, MAX_REPLY_BLOCKS_BYTES, PROMPT_HASH_LEN, RunStatus, RunView, TurnPolicy,
-    WatchView, decode_msg, decode_output, decode_query, encode_llm_request, encode_output,
-    encode_reply,
+    ACTION_CHAT_POST, AgentAction, AgentMsg, AgentQuery, AgentRecord, AgentReply, AgentResponse,
+    AgentStatus, KNOWN_ACTIONS, MAX_ACTIONS_PER_RUN, MAX_AGENT_RECORD_BYTES,
+    MAX_REPLY_BLOCKS_BYTES, PROMPT_HASH_LEN, PendingRun, ReplyBlock, TurnPolicy, WatchView,
+    decode_msg, decode_query, encode_reply, encode_response,
 };
+use capability_interface::validate_tag;
 use chat_interface::{
     AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
 use dispatch_interface::{
-    DispatchMsg, MAX_PAYLOAD_BYTES, OutputContract, ResultEvent, Routing,
-    decode_result_event, encode_msg as dispatch_encode_msg,
+    DispatchMsg, DispatchQuery, DispatchReply, MAX_PAYLOAD_BYTES, OutputContract, ResultEvent,
+    Routing, decode_reply as dispatch_decode_reply, decode_result_event,
+    encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
 use document_interface::{
     DocQuery, DocReply, decode_reply as doc_decode_reply, encode_query as doc_encode_query,
@@ -116,13 +124,8 @@ use jobs_interface::{
     decode_reply as jobs_decode_reply, encode_msg as jobs_encode_msg,
     encode_query as jobs_encode_query,
 };
-use saga_interface::{
-    SagaMsg, SagaOrigin, SagaOutcome, decode_callback as saga_decode_callback,
-    encode_msg as saga_encode_msg,
-};
-use capability_interface::validate_tag;
+use saga_interface::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tagging_interface::{
     EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
@@ -134,10 +137,11 @@ use tasks_interface::{
 };
 
 /// how many transcript messages (newest-first, ending at the anchor) one run
-/// pins into its context hash — the bounded prompt window (P4).
+/// embeds into its composed payload — the bounded prompt window (P4).
 pub const CONTEXT_WINDOW: u64 = 64;
 
-/// whole-saga deadline granted to a run's LLM work, in views past the trigger.
+/// whole-dispatch deadline granted to a run's LLM work, in views past the
+/// dispatching block.
 pub const RUN_DEADLINE_VIEWS: u64 = 1024;
 
 /// oracle attempts per run: one retry after a failed or expired attempt.
@@ -165,15 +169,9 @@ pub fn job_run_id_for(job_id: &str, agent_id: &str, claim_height: u64) -> String
     )
 }
 
-/// canonical job-spec pin used by job-backed runs.
+/// canonical pin over submitted job-spec bytes — the jobs event's `spec_hash`.
 pub fn job_spec_hash(spec: &[u8]) -> Vec<u8> {
     Sha256::digest(spec).to_vec()
-}
-
-/// the saga a run rides on — namespaced so agent sagas cannot collide with
-/// other requesters' ids.
-pub fn saga_id_for(run_id: &str) -> String {
-    format!("agent/{run_id}")
 }
 
 /// the chat message id of a run's reply — one run posts at most one reply.
@@ -181,16 +179,16 @@ pub fn reply_message_id(run_id: &str) -> String {
     format!("agent/{run_id}")
 }
 
-/// the dispatch-plane recipe an agent's chat runs execute under — registered
+/// the dispatch-plane recipe an agent's runs execute under — registered
 /// (module-owned) in the same block as the agent itself.
 pub fn recipe_id_for(agent_id: &str) -> String {
     format!("agent/{agent_id}")
 }
 
-/// the dispatch-plane id of a chat run's dispatch. run ids carry the
-/// reserved `\x1f` separator the dispatch module rejects in caller-chosen
-/// ids, so the dispatch id is the run id's hex sha256 — fixed-width, always
-/// within the dispatch id cap; the `dispatch_runs` index maps it back.
+/// the dispatch-plane id of a run's dispatch. run ids carry the reserved
+/// `\x1f` separator the dispatch module rejects in caller-chosen ids, so the
+/// dispatch id is the run id's hex sha256 — fixed-width, always within the
+/// dispatch id cap; the pending map is keyed by it.
 pub fn dispatch_id_for(run_id: &str) -> String {
     hex(&Sha256::digest(run_id.as_bytes()))
 }
@@ -202,14 +200,13 @@ fn hex(bytes: &[u8]) -> String {
 // ---- dispatch payload composition ------------------------------------------------
 // the dispatch plane's rule: the DISPATCHER composes the entire model input,
 // in consensus, and the host-side worker feeds it to the provider verbatim.
-// this framing is that composition for chat-engaged runs. (job-backed runs
-// still ride the saga + agent-oracle path, which keeps its own framing.)
 
 /// generic instructions when the agent has no consensus-resident prompt.
 const DEFAULT_PROMPT: &str =
     "You are a Ducktape agent. Reply helpfully and return only the requested JSON output.";
 
-/// the strict output contract appended to every composed payload.
+/// the strict output contract appended to every composed payload — exactly
+/// the [`AgentResponse`] wire shape.
 const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"Paragraph","text":"..."}],"actions":[]}
 Allowed reply block kinds are Paragraph, Heading, and Code. Heading is rendered as a paragraph in Ducktape chat. Code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
@@ -225,8 +222,8 @@ pub fn render_prompt_doc(blocks: &[document_interface::Block]) -> String {
         .join("\n\n")
 }
 
-/// flatten a run into the single payload a non-interactive CLI takes: the
-/// system instructions, the strict-output contract, then the conversation.
+/// flatten a chat run into the single payload a non-interactive CLI takes:
+/// the system instructions, the strict-output contract, then the conversation.
 fn render_payload(
     system: Option<&str>,
     module_id: &str,
@@ -255,6 +252,19 @@ fn render_payload(
         out.push_str(&format!("[{speaker}] {}\n", render_message(message)));
     }
     out.push_str("\nReply as the agent.");
+    out
+}
+
+/// flatten a job-backed run the same way: instructions, contract, then the
+/// job's coordinates and its FULL submitted spec.
+fn render_job_payload(system: Option<&str>, job_id: &str, spec: &str) -> String {
+    let mut out = String::new();
+    out.push_str(system.unwrap_or(DEFAULT_PROMPT));
+    out.push_str("\n\n");
+    out.push_str(STRICT_OUTPUT_INSTRUCTION);
+    out.push_str(&format!(
+        "\n\nJob {job_id} — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\n{spec}"
+    ));
     out
 }
 
@@ -300,89 +310,95 @@ fn render_block(block: &Block) -> String {
     }
 }
 
-// ---- output normalization ---------------------------------------------------------
+// ---- response normalization ---------------------------------------------------------
 // the dispatch-plane oracle returns the model's RAW text (opinion-free, Text
-// contract); shaping it into an [`AgentOutput`] is deterministic string
+// contract); shaping it into an [`AgentResponse`] is deterministic string
 // processing and therefore consensus work, done here in the result intake.
 
-/// the model's raw answer as an [`AgentOutput`]: strict shape first, a
-/// lenient mirror second, and a plain paragraph reply as the fallback.
-fn agent_output_from_text(text: &str) -> AgentOutput {
-    let parsed = serde_json::from_str::<AgentOutput>(text)
-        .or_else(|_| serde_json::from_str::<ModelOutput>(text).map(ModelOutput::into_agent_output));
-    let output = parsed.unwrap_or_else(|_| AgentOutput {
-        reply_blocks: vec![Block::paragraph(non_empty_text(text))],
+/// the reply-block kinds normalization keeps — the closed vocabulary the
+/// strict-output instruction names.
+const REPLY_KIND_PARAGRAPH: &str = "Paragraph";
+const REPLY_KIND_HEADING: &str = "Heading";
+const REPLY_KIND_CODE: &str = "Code";
+
+/// the model's raw answer as a NORMALIZED [`AgentResponse`]: the wire shape
+/// when it parses (unknown kinds and empty texts drop), a plain paragraph
+/// reply as the fallback for prose. job runs never carry reply blocks — there
+/// is no channel to deliver them to.
+fn agent_response_from_text(text: &str, job_run: bool) -> AgentResponse {
+    let parsed = serde_json::from_str::<AgentResponse>(text).unwrap_or_else(|_| AgentResponse {
+        reply_blocks: if job_run {
+            Vec::new()
+        } else {
+            vec![paragraph_block(non_empty_text(text))]
+        },
         actions: Vec::new(),
     });
-    normalize_output(output, text)
+    normalize_response(parsed, text, job_run)
 }
 
-/// a lenient mirror of the model-facing output shape: unknown block kinds and
-/// empty texts drop instead of failing the whole answer.
-#[derive(Debug, Deserialize)]
-struct ModelOutput {
-    #[serde(default)]
-    reply_blocks: Vec<ModelBlock>,
-    #[serde(default)]
-    actions: Vec<AgentAction>,
-}
-
-impl ModelOutput {
-    fn into_agent_output(self) -> AgentOutput {
-        AgentOutput {
-            reply_blocks: self
-                .reply_blocks
-                .into_iter()
-                .filter_map(ModelBlock::into_block)
-                .collect(),
-            actions: self.actions,
-        }
+fn paragraph_block(text: String) -> ReplyBlock {
+    ReplyBlock {
+        kind: REPLY_KIND_PARAGRAPH.into(),
+        text,
+        lang: None,
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ModelBlock {
-    #[allow(dead_code)]
-    #[serde(default)]
-    id: Option<String>,
-    kind: String,
-    text: String,
-    #[serde(default)]
-    lang: Option<String>,
+/// map a NORMALIZED response's reply blocks into chat blocks — the only place
+/// the response vocabulary meets chat's. normalization guarantees only known
+/// kinds and non-empty texts remain.
+fn to_chat_blocks(blocks: &[ReplyBlock]) -> Vec<Block> {
+    blocks
+        .iter()
+        .map(|block| match block.kind.as_str() {
+            REPLY_KIND_CODE => Block::Code {
+                lang: block.lang.clone().filter(|l| !l.is_empty()),
+                text: block.text.clone(),
+            },
+            _ => Block::paragraph(block.text.clone()),
+        })
+        .collect()
 }
 
-impl ModelBlock {
-    fn into_block(self) -> Option<Block> {
-        let text = self.text.trim().to_string();
-        if text.is_empty() {
-            return None;
-        }
-        match self.kind.as_str() {
-            "Paragraph" | "Heading" => Some(Block::paragraph(text)),
-            "Code" => Some(Block::Code {
-                lang: self.lang.filter(|l| !l.is_empty()),
-                text,
-            }),
-            _ => None,
-        }
+fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool) -> AgentResponse {
+    response.actions.truncate(MAX_ACTIONS_PER_RUN);
+    response.reply_blocks = response
+        .reply_blocks
+        .into_iter()
+        .filter_map(|block| {
+            let text = block.text.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            match block.kind.as_str() {
+                REPLY_KIND_PARAGRAPH | REPLY_KIND_HEADING => Some(paragraph_block(text)),
+                REPLY_KIND_CODE => Some(ReplyBlock {
+                    kind: REPLY_KIND_CODE.into(),
+                    text,
+                    lang: block.lang.filter(|l| !l.is_empty()),
+                }),
+                _ => None,
+            }
+        })
+        .collect();
+    if job_run {
+        response.reply_blocks.clear();
+        return response;
     }
-}
-
-fn normalize_output(mut output: AgentOutput, raw_text: &str) -> AgentOutput {
-    output.actions.truncate(MAX_ACTIONS_PER_RUN);
-    if output.reply_blocks.is_empty() {
-        output
+    if response.reply_blocks.is_empty() {
+        response
             .reply_blocks
-            .push(Block::paragraph(non_empty_text(raw_text)));
+            .push(paragraph_block(non_empty_text(raw_text)));
     }
-    let bytes = serde_json::to_vec(&output.reply_blocks).expect("blocks serialize");
+    let bytes = serde_json::to_vec(&to_chat_blocks(&response.reply_blocks)).expect("blocks serialize");
     if bytes.len() > MAX_REPLY_BLOCKS_BYTES {
-        output.reply_blocks = vec![Block::paragraph(truncate_utf8(
+        response.reply_blocks = vec![paragraph_block(truncate_utf8(
             &non_empty_text(raw_text),
             MAX_REPLY_BLOCKS_BYTES / 4,
         ))];
     }
-    output
+    response
 }
 
 fn non_empty_text(text: &str) -> String {
@@ -403,27 +419,6 @@ fn truncate_utf8(text: &str, max: usize) -> String {
         keep -= 1;
     }
     format!("{}…", &text[..keep])
-}
-
-/// canonical digest of a pinned transcript window: u64-le message count, then
-/// per message ascending by sequence — u64-le seq, length-prefixed canonical
-/// author bytes, length-prefixed canonical block bytes, and a deleted flag.
-/// shared by the module, its tests, and any worker that re-derives the prompt
-/// input from a replica to verify the pin (P4).
-pub fn context_hash(window: &[MessageView]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(window.len() as u64).to_le_bytes());
-    for view in window {
-        out.extend_from_slice(&view.seq.to_le_bytes());
-        let author = serde_json::to_vec(&view.head.author).expect("author is serializable");
-        out.extend_from_slice(&(author.len() as u64).to_le_bytes());
-        out.extend_from_slice(&author);
-        let blocks = serde_json::to_vec(&view.head.blocks).expect("blocks are serializable");
-        out.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
-        out.extend_from_slice(&blocks);
-        out.push(view.head.deleted as u8);
-    }
-    Sha256::digest(&out).to_vec()
 }
 
 /// the canonical state form of a dispatch origin (see [`SagaOrigin`]).
@@ -468,11 +463,16 @@ struct AgentState {
     updated_at: u64,
 }
 
-/// one run. the id (`run_id_for`) is the map key, so it isn't repeated here.
+/// one in-flight dispatch's correlation entry. the dispatch id is the map
+/// key; the run id is derivable from the fields. NOT a lifecycle record: it
+/// exists exactly while the dispatch is outstanding and is pruned when the
+/// result delivers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RunState {
+struct PendingState {
     agent_id: String,
+    /// empty for job-backed runs.
     channel_id: String,
+    /// 0 for job-backed runs.
     anchor_seq: u64,
     /// the anchor's thread root, if the anchor was a thread reply.
     thread_root: Option<u64>,
@@ -482,17 +482,23 @@ struct RunState {
     job_claim_height: u64,
     /// the run-creating origin — a cancel capability alongside the owner.
     requester: SagaOrigin,
-    status: RunStatus,
-    context_hash: Vec<u8>,
     created_at: u64,
-    updated_at: u64,
+}
+
+impl PendingState {
+    /// the run id these fields derive — chat- or job-keyed.
+    fn run_id(&self) -> String {
+        match &self.job_id {
+            Some(job_id) => job_run_id_for(job_id, &self.agent_id, self.job_claim_height),
+            None => run_id_for(&self.channel_id, self.anchor_seq, &self.agent_id),
+        }
+    }
 }
 
 /// a chat run's read-only dispatch preparation: the pinned context plus the
 /// fully composed payload, gathered before anything is staged.
 struct PreparedDispatch {
     thread_root: Option<u64>,
-    context_hash: Vec<u8>,
     payload: Vec<u8>,
 }
 
@@ -546,8 +552,7 @@ fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
 fn encode_committed(
     agents: &BTreeMap<String, AgentState>,
     watches: &BTreeMap<String, TurnPolicy>,
-    runs: &BTreeMap<String, RunState>,
-    dispatch_runs: &BTreeMap<String, String>,
+    pending: &BTreeMap<String, PendingState>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -582,41 +587,17 @@ fn encode_committed(
         }
     }
 
-    out.extend_from_slice(&(runs.len() as u64).to_le_bytes());
-    for (id, r) in runs {
-        put_bytes(&mut out, id.as_bytes());
-        put_bytes(&mut out, r.agent_id.as_bytes());
-        put_bytes(&mut out, r.channel_id.as_bytes());
-        out.extend_from_slice(&r.anchor_seq.to_le_bytes());
-        put_opt_u64(&mut out, r.thread_root);
-        put_opt_string(&mut out, &r.job_id);
-        out.extend_from_slice(&r.job_claim_height.to_le_bytes());
-        put_origin(&mut out, &r.requester);
-        match &r.status {
-            RunStatus::AwaitingOracle { saga_id } => {
-                out.push(0);
-                put_bytes(&mut out, saga_id.as_bytes());
-            }
-            RunStatus::Done => out.push(1),
-            RunStatus::Failed { reason } => {
-                out.push(2);
-                put_bytes(&mut out, reason.as_bytes());
-            }
-            RunStatus::Cancelled => out.push(3),
-            RunStatus::AwaitingResult { dispatch_id } => {
-                out.push(4);
-                put_bytes(&mut out, dispatch_id.as_bytes());
-            }
-        }
-        put_bytes(&mut out, &r.context_hash);
-        out.extend_from_slice(&r.created_at.to_le_bytes());
-        out.extend_from_slice(&r.updated_at.to_le_bytes());
-    }
-
-    out.extend_from_slice(&(dispatch_runs.len() as u64).to_le_bytes());
-    for (dispatch_id, run_id) in dispatch_runs {
+    out.extend_from_slice(&(pending.len() as u64).to_le_bytes());
+    for (dispatch_id, p) in pending {
         put_bytes(&mut out, dispatch_id.as_bytes());
-        put_bytes(&mut out, run_id.as_bytes());
+        put_bytes(&mut out, p.agent_id.as_bytes());
+        put_bytes(&mut out, p.channel_id.as_bytes());
+        out.extend_from_slice(&p.anchor_seq.to_le_bytes());
+        put_opt_u64(&mut out, p.thread_root);
+        put_opt_string(&mut out, &p.job_id);
+        out.extend_from_slice(&p.job_claim_height.to_le_bytes());
+        put_origin(&mut out, &p.requester);
+        out.extend_from_slice(&p.created_at.to_le_bytes());
     }
 
     out
@@ -628,10 +609,9 @@ fn encode_committed(
 fn committed_root(
     agents: &BTreeMap<String, AgentState>,
     watches: &BTreeMap<String, TurnPolicy>,
-    runs: &BTreeMap<String, RunState>,
-    dispatch_runs: &BTreeMap<String, String>,
+    pending: &BTreeMap<String, PendingState>,
 ) -> StateRoot {
-    StateRoot(Sha256::digest(encode_committed(agents, watches, runs, dispatch_runs)).into())
+    StateRoot(Sha256::digest(encode_committed(agents, watches, pending)).into())
 }
 
 // ---- canonical decoding (UNTRUSTED input) ---------------------------------
@@ -741,39 +721,33 @@ fn reject_run_separator(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_decoded_run_key(
-    id: &str,
-    agent_id: &str,
-    channel_id: &str,
-    anchor_seq: u64,
-    job_id: &Option<String>,
-    job_claim_height: u64,
-) -> Result<(), String> {
-    if contains_run_separator(agent_id) {
+/// a decoded pending entry must derive exactly its own key: the dispatch id
+/// is the hex sha256 of the run id its fields produce, and the field shapes
+/// must match the chat/job keyspace they claim.
+fn validate_decoded_pending(dispatch_id: &str, p: &PendingState) -> Result<(), String> {
+    if contains_run_separator(&p.agent_id) {
         return Err("snapshot agent_id contains reserved unit separator".into());
     }
-    match job_id {
+    match &p.job_id {
         Some(job_id) => {
             if contains_run_separator(job_id) {
                 return Err("snapshot job_id contains reserved unit separator".into());
             }
-            let expected = job_run_id_for(job_id, agent_id, job_claim_height);
-            if id != expected {
-                return Err("snapshot job run id does not match its fields".into());
+            if !p.channel_id.is_empty() || p.anchor_seq != 0 || p.thread_root.is_some() {
+                return Err("snapshot job entry carries chat coordinates".into());
             }
         }
         None => {
-            if job_claim_height != 0 {
-                return Err("snapshot chat run has non-zero job claim height".into());
+            if p.job_claim_height != 0 {
+                return Err("snapshot chat entry has non-zero job claim height".into());
             }
-            if contains_run_separator(channel_id) {
+            if contains_run_separator(&p.channel_id) {
                 return Err("snapshot channel_id contains reserved unit separator".into());
             }
-            let expected = run_id_for(channel_id, anchor_seq, agent_id);
-            if id != expected {
-                return Err("snapshot chat run id does not match its fields".into());
-            }
         }
+    }
+    if dispatch_id != dispatch_id_for(&p.run_id()) {
+        return Err("snapshot dispatch id does not match its run fields".into());
     }
     Ok(())
 }
@@ -781,21 +755,18 @@ fn validate_decoded_run_key(
 type Committed = (
     BTreeMap<String, AgentState>,
     BTreeMap<String, TurnPolicy>,
-    BTreeMap<String, RunState>,
-    BTreeMap<String, String>,
+    BTreeMap<String, PendingState>,
 );
 
 fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     // per-entry minimum sizes: an agent costs its id prefix, one origin
     // discriminant, three length prefixes, a prompt-doc tag, an action
     // count, a status byte, and two u64s; a watch its id prefix and a policy
-    // discriminant; a run its four length prefixes, anchor, option tag, two
-    // discriminants, and two u64s; a dispatch-run index entry its two
-    // length prefixes.
+    // discriminant; a pending entry its three length prefixes, anchor, two
+    // option tags, claim height, origin discriminant, and created_at.
     const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 1 + 8 + 1 + 8 + 8;
     const MIN_WATCH_BYTES: u64 = 8 + 1;
-    const MIN_RUN_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 1 + 1 + 8 + 8 + 8;
-    const MIN_DISPATCH_RUN_BYTES: u64 = 8 + 8;
+    const MIN_PENDING_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 1 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
@@ -861,10 +832,10 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         insert_ascending(&mut watches, channel, policy)?;
     }
 
-    let mut runs: BTreeMap<String, RunState> = BTreeMap::new();
-    let count = take_count(&mut buf, MIN_RUN_BYTES, "run")?;
+    let mut pending: BTreeMap<String, PendingState> = BTreeMap::new();
+    let count = take_count(&mut buf, MIN_PENDING_BYTES, "pending")?;
     for _ in 0..count {
-        let id = take_lp_string(&mut buf)?;
+        let dispatch_id = take_lp_string(&mut buf)?;
         let agent_id = take_lp_string(&mut buf)?;
         let channel_id = take_lp_string(&mut buf)?;
         let anchor_seq = take_u64(&mut buf)?;
@@ -872,70 +843,25 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         let job_id = take_opt_string(&mut buf)?;
         let job_claim_height = take_u64(&mut buf)?;
         let requester = take_origin(&mut buf)?;
-        let status = match take(&mut buf, 1)?[0] {
-            0 => RunStatus::AwaitingOracle {
-                saga_id: take_lp_string(&mut buf)?,
-            },
-            1 => RunStatus::Done,
-            2 => RunStatus::Failed {
-                reason: take_lp_string(&mut buf)?,
-            },
-            3 => RunStatus::Cancelled,
-            4 => RunStatus::AwaitingResult {
-                dispatch_id: take_lp_string(&mut buf)?,
-            },
-            d => return Err(format!("snapshot has unknown run status {d}")),
-        };
-        let context_hash = take_lp_bytes(&mut buf)?;
         let created_at = take_u64(&mut buf)?;
-        let updated_at = take_u64(&mut buf)?;
-        validate_decoded_run_key(
-            &id,
-            &agent_id,
-            &channel_id,
+        let entry = PendingState {
+            agent_id,
+            channel_id,
             anchor_seq,
-            &job_id,
+            thread_root,
+            job_id,
             job_claim_height,
-        )?;
-        insert_ascending(
-            &mut runs,
-            id,
-            RunState {
-                agent_id,
-                channel_id,
-                anchor_seq,
-                thread_root,
-                job_id,
-                job_claim_height,
-                requester,
-                status,
-                context_hash,
-                created_at,
-                updated_at,
-            },
-        )?;
-    }
-
-    let mut dispatch_runs: BTreeMap<String, String> = BTreeMap::new();
-    let count = take_count(&mut buf, MIN_DISPATCH_RUN_BYTES, "dispatch run")?;
-    for _ in 0..count {
-        let dispatch_id = take_lp_string(&mut buf)?;
-        let run_id = take_lp_string(&mut buf)?;
-        // the index is derived state: each entry must be exactly the run's
-        // own dispatch id, and the run must exist.
-        if dispatch_id != dispatch_id_for(&run_id) {
-            return Err("snapshot dispatch id does not match its run id".into());
-        }
-        if !runs.contains_key(&run_id) {
-            return Err("snapshot dispatch index names an unknown run".into());
-        }
-        insert_ascending(&mut dispatch_runs, dispatch_id, run_id)?;
+            requester,
+            created_at,
+        };
+        validate_decoded_pending(&dispatch_id, &entry)?;
+        insert_ascending(&mut pending, dispatch_id, entry)?;
     }
 
     if !buf.is_empty() {
         return Err("snapshot has trailing bytes".into());
     }
-    Ok((agents, watches, runs, dispatch_runs))
+    Ok((agents, watches, pending))
 }
 
 // ---- the module -----------------------------------------------------------
@@ -944,11 +870,14 @@ pub struct AgentModule {
     id: ModuleId,
     /// genesis config, not state: which module ids the origin router trusts.
     chat: ModuleId,
+    /// dead-letter routing only: a saga callback pointed here by a foreign
+    /// trigger's `reply_to` must be swallowed, never abort its block.
     saga: ModuleId,
     /// the tagging plane — the engagement intake's trusted origin and the
     /// target of watch subscriptions.
     tagging: ModuleId,
-    /// the dispatch plane — chat-engaged runs' recipe registry and executor.
+    /// the dispatch plane — every run's recipe registry, executor, and
+    /// lifecycle ledger.
     dispatch: ModuleId,
     tasks: Option<ModuleId>,
     jobs: Option<ModuleId>,
@@ -957,22 +886,20 @@ pub struct AgentModule {
     /// committed state — what `root()` and the app-hash commit to.
     agents: BTreeMap<String, AgentState>,
     watches: BTreeMap<String, TurnPolicy>,
-    runs: BTreeMap<String, RunState>,
-    /// derived index: a chat run's dispatch id → its run id, so a
-    /// `ResultEvent` (which only carries the dispatch id) finds its run.
-    dispatch_runs: BTreeMap<String, String>,
+    /// in-flight correlation entries keyed by dispatch id — pruned on
+    /// delivery; the dispatch module owns lifecycle and history.
+    pending: BTreeMap<String, PendingState>,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
-    /// `commit_block`. agents, runs, and the dispatch index are upsert-only
-    /// (nothing deletes them); a watch stages `None` for removal (unwatch).
+    /// `commit_block`. agents are upsert-only; a watch stages `None` for
+    /// removal (unwatch); a pending entry stages `None` for its prune.
     pending_agents: BTreeMap<String, AgentState>,
     pending_watches: BTreeMap<String, Option<TurnPolicy>>,
-    pending_runs: BTreeMap<String, RunState>,
-    pending_dispatch_runs: BTreeMap<String, String>,
+    pending_overlay: BTreeMap<String, Option<PendingState>>,
 }
 
 impl AgentModule {
-    /// wire the orchestrator to its collaborators. the ids must be pairwise
+    /// wire the module to its collaborators. the ids must be pairwise
     /// distinct — origin routing is what makes the privileged intakes
     /// spoof-proof, and colliding ids would collapse those namespaces.
     #[allow(clippy::too_many_arguments)]
@@ -1021,12 +948,10 @@ impl AgentModule {
             document,
             agents: BTreeMap::new(),
             watches: BTreeMap::new(),
-            runs: BTreeMap::new(),
-            dispatch_runs: BTreeMap::new(),
+            pending: BTreeMap::new(),
             pending_agents: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
-            pending_runs: BTreeMap::new(),
-            pending_dispatch_runs: BTreeMap::new(),
+            pending_overlay: BTreeMap::new(),
         }
     }
 
@@ -1045,16 +970,11 @@ impl AgentModule {
         }
     }
 
-    fn run(&self, run_id: &str) -> Option<&RunState> {
-        self.pending_runs
-            .get(run_id)
-            .or_else(|| self.runs.get(run_id))
-    }
-
-    fn dispatch_run(&self, dispatch_id: &str) -> Option<&String> {
-        self.pending_dispatch_runs
-            .get(dispatch_id)
-            .or_else(|| self.dispatch_runs.get(dispatch_id))
+    fn pending_entry(&self, dispatch_id: &str) -> Option<&PendingState> {
+        match self.pending_overlay.get(dispatch_id) {
+            Some(staged) => staged.as_ref(),
+            None => self.pending.get(dispatch_id),
+        }
     }
 
     fn visible_ids<'a, V, W>(
@@ -1100,20 +1020,18 @@ impl AgentModule {
         }
     }
 
-    fn run_view(run_id: &str, r: &RunState) -> RunView {
-        RunView {
-            run_id: run_id.to_string(),
-            agent_id: r.agent_id.clone(),
-            channel_id: r.channel_id.clone(),
-            anchor_seq: r.anchor_seq,
-            thread_root: r.thread_root,
-            job_id: r.job_id.clone(),
-            job_claim_height: r.job_claim_height,
-            requester: r.requester.clone(),
-            status: r.status.clone(),
-            context_hash: r.context_hash.clone(),
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+    fn pending_view(dispatch_id: &str, p: &PendingState) -> PendingRun {
+        PendingRun {
+            run_id: p.run_id(),
+            dispatch_id: dispatch_id.to_string(),
+            agent_id: p.agent_id.clone(),
+            channel_id: p.channel_id.clone(),
+            anchor_seq: p.anchor_seq,
+            thread_root: p.thread_root,
+            job_id: p.job_id.clone(),
+            job_claim_height: p.job_claim_height,
+            requester: p.requester.clone(),
+            created_at: p.created_at,
         }
     }
 
@@ -1190,20 +1108,49 @@ impl AgentModule {
         Ok(agent)
     }
 
+    // ---- the turn claim --------------------------------------------------------
+
+    /// whether this dispatch id's turn is already taken: a staged/committed
+    /// pending entry settles same-block races; the dispatch module's
+    /// PERMANENT dispatch record (committed-only query) settles everything
+    /// after — including turns whose pending entry already pruned. without
+    /// the second layer a repeat request would re-stage an entry no
+    /// `ResultEvent` will ever prune (the dispatch module no-ops duplicate
+    /// dispatch ids without telling the dispatcher).
+    async fn turn_taken(&self, ctx: &dyn Ctx, dispatch_id: &str) -> Result<bool, String> {
+        if self.pending_entry(dispatch_id).is_some() {
+            return Ok(true);
+        }
+        let reply = ctx
+            .query(
+                &self.dispatch,
+                &dispatch_encode_query(&DispatchQuery::Dispatch {
+                    receiver: self.id.clone(),
+                    dispatch_id: dispatch_id.to_string(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("dispatch lookup failed: {e}"))?;
+        match dispatch_decode_reply(&reply) {
+            Ok(DispatchReply::Dispatch(view)) => Ok(view.is_some()),
+            _ => Err("unexpected dispatch reply for a dispatch lookup".into()),
+        }
+    }
+
     // ---- context pinning (P4) --------------------------------------------------
 
     /// pin the transcript window ending at `anchor_seq`: query chat for the
     /// (at most [`CONTEXT_WINDOW`]) newest messages up to and including the
-    /// anchor and hash them canonically. staged same-block writes are visible
-    /// through the host's live query routing, so a hook fired by a post sees
-    /// the post itself — deterministically, on every validator. also returns
-    /// the anchor's thread root so the reply can join the same thread.
+    /// anchor. staged same-block writes are visible through the host's live
+    /// query routing, so an engagement fired by a post sees the post itself —
+    /// deterministically, on every validator. also returns the anchor's
+    /// thread root so the reply can join the same thread.
     async fn pin_context(
         &self,
         ctx: &dyn Ctx,
         channel_id: &str,
         anchor_seq: u64,
-    ) -> Result<(Vec<u8>, Option<u64>, Vec<MessageView>), String> {
+    ) -> Result<(Option<u64>, Vec<MessageView>), String> {
         if anchor_seq == 0 {
             return Err("anchor_seq must be >= 1".into());
         }
@@ -1229,8 +1176,7 @@ impl AgentModule {
             return Err(format!("anchor does not exist: {channel_id}/{anchor_seq}"));
         };
         let thread_root = anchor.head.thread;
-        let hash = context_hash(&window);
-        Ok((hash, thread_root, window))
+        Ok((thread_root, window))
     }
 
     // ---- prompt + payload preparation (the dispatch plane's composition rule) -----
@@ -1283,8 +1229,7 @@ impl AgentModule {
         let agent = self
             .agent(agent_id)
             .ok_or_else(|| format!("agent is not registered: {agent_id}"))?;
-        let (context_hash, thread_root, transcript) =
-            self.pin_context(ctx, channel_id, anchor_seq).await?;
+        let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let prompt = self.prompt_text(ctx, agent).await?;
         let payload =
             render_payload(prompt.as_deref(), &self.id, agent_id, &transcript).into_bytes();
@@ -1296,19 +1241,18 @@ impl AgentModule {
         }
         Ok(PreparedDispatch {
             thread_root,
-            context_hash,
             payload,
         })
     }
 
-    /// stage a chat run and dispatch it through the dispatch plane — one
-    /// atomic unit with whatever op caused it (P2). the recipe is the
-    /// agent's own (`agent/{agent_id}`, registered with the agent); the
-    /// result lands as a next-block `ResultEvent` keyed by the dispatch id.
+    /// stage a chat run's dispatch — one atomic unit with whatever op caused
+    /// it (P2). the recipe is the agent's own (`agent/{agent_id}`, registered
+    /// with the agent); the result lands as a next-block `ResultEvent` keyed
+    /// by the dispatch id, which prunes the entry staged here.
     fn stage_dispatch_run(
         &mut self,
         ctx: &mut dyn Ctx,
-        run_id: String,
+        run_id: &str,
         agent_id: String,
         channel_id: String,
         anchor_seq: u64,
@@ -1316,7 +1260,7 @@ impl AgentModule {
         prepared: PreparedDispatch,
     ) {
         let now = ctx.env().consensus_time;
-        let dispatch_id = dispatch_id_for(&run_id);
+        let dispatch_id = dispatch_id_for(run_id);
         ctx.emit_msg(Msg {
             target: self.dispatch.clone(),
             payload: dispatch_encode_msg(&DispatchMsg::Dispatch {
@@ -1325,11 +1269,9 @@ impl AgentModule {
                 payload: prepared.payload,
             }),
         });
-        self.pending_dispatch_runs
-            .insert(dispatch_id.clone(), run_id.clone());
-        self.pending_runs.insert(
-            run_id,
-            RunState {
+        self.pending_overlay.insert(
+            dispatch_id,
+            Some(PendingState {
                 agent_id,
                 channel_id,
                 anchor_seq,
@@ -1337,92 +1279,14 @@ impl AgentModule {
                 job_id: None,
                 job_claim_height: 0,
                 requester,
-                status: RunStatus::AwaitingResult { dispatch_id },
-                context_hash: prepared.context_hash,
                 created_at: now,
-                updated_at: now,
-            },
-        );
-    }
-
-    // ---- run creation (job-backed runs — the remaining direct-saga lane) ----------
-
-    /// stage a JOB-BACKED run and trigger its saga — one atomic unit with
-    /// whatever op caused it (P2). the trigger asks for a callback to this
-    /// module with the run id as the correlation payload, a view-denominated
-    /// deadline, and one retry. chat-engaged runs do not come through here —
-    /// they ride the dispatch plane ([`AgentModule::stage_dispatch_run`]).
-    #[allow(clippy::too_many_arguments)]
-    fn stage_run(
-        &mut self,
-        ctx: &mut dyn Ctx,
-        run_id: String,
-        agent_id: String,
-        channel_id: String,
-        anchor_seq: u64,
-        thread_root: Option<u64>,
-        job_id: Option<String>,
-        job_claim_height: u64,
-        requester: SagaOrigin,
-        capability: String,
-        prompt_hash: Vec<u8>,
-        context_hash: Vec<u8>,
-        transcript: Vec<MessageView>,
-    ) {
-        let now = ctx.env().consensus_time;
-        let saga_id = saga_id_for(&run_id);
-        ctx.emit_msg(Msg {
-            target: self.saga.clone(),
-            payload: saga_encode_msg(&SagaMsg::Trigger {
-                pinned_assignee: None,
-                saga_id: saga_id.clone(),
-                spec: encode_llm_request(&LlmRequest {
-                    run_id: run_id.clone(),
-                    agent_id: agent_id.clone(),
-                    capability: capability.clone(),
-                    prompt_hash,
-                    channel_id: channel_id.clone(),
-                    anchor_seq,
-                    job_id: job_id.clone(),
-                    context_hash: context_hash.clone(),
-                    transcript,
-                }),
-                reply_to: Some(ctx.env().me.clone()),
-                reply_payload: run_id.clone().into_bytes(),
-                deadline: Some(now.saturating_add(RUN_DEADLINE_VIEWS)),
-                max_attempts: RUN_MAX_ATTEMPTS,
-                lease_views: None,
-                // the same tag, surfaced to the saga ledger so assignment
-                // draws from this capability's announced providers.
-                capability: Some(capability),
             }),
-        });
-        self.pending_runs.insert(
-            run_id,
-            RunState {
-                agent_id,
-                channel_id,
-                anchor_seq,
-                thread_root,
-                job_id,
-                job_claim_height,
-                requester,
-                status: RunStatus::AwaitingOracle { saga_id },
-                context_hash,
-                created_at: now,
-                updated_at: now,
-            },
         );
     }
 
-    fn stage_run_status(&mut self, run_id: String, mut run: RunState, status: RunStatus, now: u64) {
-        run.status = status;
-        run.updated_at = now;
-        self.pending_runs.insert(run_id, run);
-    }
-
-    /// an observability breadcrumb for the no-fail arms: dropped payloads and
-    /// skipped engagements leave the state machine as events, never as errors.
+    /// an observability breadcrumb for the no-fail arms: dropped payloads,
+    /// skipped engagements, and failed runs leave the state machine as
+    /// events, never as errors.
     fn note(&self, ctx: &mut dyn Ctx, what: String) {
         ctx.emit_event(Event {
             source: self.id.clone(),
@@ -1432,10 +1296,11 @@ impl AgentModule {
 
     // ---- the jobs intake (origin == jobs) -----------------------------------------
 
-    /// NO-FAIL ARM. jobs submit fan-out runs in the submitter's block. jobs
-    /// queries are committed-only, so this in-cascade receiver cannot prove the
-    /// just-staged job via `JobsQuery::Get`; the single claiming-worker mode is
-    /// what makes the emitted claim safe for this slice.
+    /// NO-FAIL ARM. jobs submits fan out in the submitter's block; the event
+    /// carries the full spec because committed-only jobs queries cannot see
+    /// the just-staged job. the claim and the dispatch are staged together:
+    /// the single claiming-worker cascade rule makes the emitted claim safe,
+    /// and the dispatch rides the agent's own recipe like every other run.
     async fn on_jobs_event(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
         let Ok(event) = jobs_decode_event(payload) else {
             self.note(ctx, "dropped undecodable jobs event".into());
@@ -1444,6 +1309,7 @@ impl AgentModule {
         let JobsEvent::Submitted {
             job_id,
             kind,
+            spec,
             spec_hash,
             ..
         } = event;
@@ -1470,12 +1336,6 @@ impl AgentModule {
         if !agent.active {
             return Ok(());
         }
-        let claim_height = ctx.env().height;
-        let run_id = job_run_id_for(&job_id, agent_id, claim_height);
-        if self.run(&run_id).is_some() {
-            return Ok(());
-        }
-
         let Some(jobs) = self.jobs.clone() else {
             self.note(
                 ctx,
@@ -1483,8 +1343,46 @@ impl AgentModule {
             );
             return Ok(());
         };
+        if job_spec_hash(spec.as_bytes()) != spec_hash {
+            self.note(
+                ctx,
+                format!("dropped jobs event for {job_id}: spec does not hash to spec_hash"),
+            );
+            return Ok(());
+        }
+
+        let claim_height = ctx.env().height;
+        let run_id = job_run_id_for(&job_id, agent_id, claim_height);
+        let dispatch_id = dispatch_id_for(&run_id);
+        match self.turn_taken(&*ctx, &dispatch_id).await {
+            Ok(false) => {}
+            Ok(true) => return Ok(()),
+            Err(reason) => {
+                self.note(ctx, format!("job run skipped for {run_id}: {reason}"));
+                return Ok(());
+            }
+        }
+        // compose BEFORE claiming: a job whose payload cannot be composed
+        // (drifted prompt doc, oversized spec) is left unclaimed on the
+        // board, not claimed into a run that could never execute.
+        let prompt = match self.prompt_text(&*ctx, agent).await {
+            Ok(prompt) => prompt,
+            Err(reason) => {
+                self.note(ctx, format!("job run skipped for {run_id}: {reason}"));
+                return Ok(());
+            }
+        };
+        let payload = render_job_payload(prompt.as_deref(), &job_id, &spec).into_bytes();
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            self.note(
+                ctx,
+                format!("job run skipped for {run_id}: payload exceeds the dispatch cap"),
+            );
+            return Ok(());
+        }
+
+        let now = ctx.env().consensus_time;
         let requester = canonical_origin(&ctx.env().origin);
-        let (capability, prompt_hash) = (agent.capability.clone(), agent.prompt_hash.clone());
         ctx.emit_msg(Msg {
             target: jobs,
             payload: jobs_encode_msg(&JobsMsg::Claim {
@@ -1492,20 +1390,26 @@ impl AgentModule {
                 lease_views: JOB_RUN_LEASE_VIEWS,
             }),
         });
-        self.stage_run(
-            ctx,
-            run_id,
-            agent_id.to_string(),
-            String::new(),
-            0,
-            None,
-            Some(job_id),
-            claim_height,
-            requester,
-            capability,
-            prompt_hash,
-            spec_hash,
-            Vec::new(),
+        ctx.emit_msg(Msg {
+            target: self.dispatch.clone(),
+            payload: dispatch_encode_msg(&DispatchMsg::Dispatch {
+                dispatch_id: dispatch_id.clone(),
+                recipe_id: recipe_id_for(agent_id),
+                payload,
+            }),
+        });
+        self.pending_overlay.insert(
+            dispatch_id,
+            Some(PendingState {
+                agent_id: agent_id.to_string(),
+                channel_id: String::new(),
+                anchor_seq: 0,
+                thread_root: None,
+                job_id: Some(job_id),
+                job_claim_height: claim_height,
+                requester,
+                created_at: now,
+            }),
         );
         Ok(())
     }
@@ -1578,9 +1482,15 @@ impl AgentModule {
         let requester = canonical_origin(&ctx.env().origin);
         for agent_id in self.engaged_agents(&policy, &tags, seq) {
             let run_id = run_id_for(&channel_id, seq, &agent_id);
-            if self.run(&run_id).is_some() {
+            let dispatch_id = dispatch_id_for(&run_id);
+            match self.turn_taken(&*ctx, &dispatch_id).await {
                 // the turn claim: the first creation in consensus order won.
-                continue;
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(reason) => {
+                    self.note(ctx, format!("run skipped for {run_id}: {reason}"));
+                    continue;
+                }
             }
             match self
                 .prepare_dispatch(&*ctx, &agent_id, &channel_id, seq)
@@ -1588,7 +1498,7 @@ impl AgentModule {
             {
                 Ok(prepared) => self.stage_dispatch_run(
                     ctx,
-                    run_id,
+                    &run_id,
                     agent_id,
                     channel_id.clone(),
                     seq,
@@ -1596,204 +1506,110 @@ impl AgentModule {
                     prepared,
                 ),
                 // a failed preparation must not poison the posting block —
-                // same no-fail reasoning as the callback arm.
+                // same no-fail reasoning as the result intake.
                 Err(reason) => self.note(ctx, format!("run skipped for {run_id}: {reason}")),
             }
         }
         Ok(())
     }
 
-    // ---- the callback intake (origin == saga) ---------------------------------------
+    // ---- the result intake (origin == dispatch) ------------------------------------
 
-    /// NO-FAIL ARM. the saga's terminal transition commits in this same block
-    /// (P6); an `Err` here would abort it and wedge the saga at Pending
-    /// forever (the callback-poison rule, design §4). malformed and unknown
-    /// callbacks are staged no-ops; an invalid output fails the RUN with no
-    /// follow-ups, never the block.
-    async fn on_saga_callback(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
-        let Ok(callback) = saga_decode_callback(payload) else {
-            self.note(ctx, "dropped undecodable saga callback".into());
-            return Ok(());
-        };
-        let Ok(run_id) = String::from_utf8(callback.payload) else {
-            self.note(ctx, "dropped saga callback with a non-utf8 run id".into());
-            return Ok(());
-        };
-        let Some(run) = self.run(&run_id).cloned() else {
-            self.note(
-                ctx,
-                format!("dropped saga callback for unknown run {run_id}"),
-            );
-            return Ok(());
-        };
-        // only the saga this run is actually awaiting may transition it — a
-        // terminal run's late/duplicate callback is a no-op, and a different
-        // saga echoing our run id is ignored.
-        let RunStatus::AwaitingOracle { saga_id } = &run.status else {
-            return Ok(());
-        };
-        if *saga_id != callback.saga_id {
-            return Ok(());
-        }
-
-        let now = ctx.env().consensus_time;
-        match callback.outcome {
-            SagaOutcome::Done(bytes) => {
-                match self.validate_output_bytes(&*ctx, &run_id, &run, &bytes).await {
-                    Ok(output) => {
-                        let payload = String::from_utf8(encode_output(&output))
-                            .expect("AgentOutput JSON is utf-8");
-                        self.emit_output(ctx, &run_id, &run, output);
-                        self.emit_job_finalize_if_current_claimant(ctx, &run, true, payload)
-                            .await;
-                        self.stage_run_status(run_id, run, RunStatus::Done, now);
-                    }
-                    // deterministically invalid output: the run fails, the
-                    // block (and the saga's Done transition) commits.
-                    Err(reason) => {
-                        self.emit_job_finalize_if_current_claimant(
-                            ctx,
-                            &run,
-                            false,
-                            reason.clone(),
-                        )
-                        .await;
-                        self.stage_run_status(run_id, run, RunStatus::Failed { reason }, now)
-                    }
-                }
-            }
-            SagaOutcome::Failed(reason) => {
-                self.emit_job_finalize_if_current_claimant(ctx, &run, false, reason.clone())
-                    .await;
-                self.stage_run_status(run_id, run, RunStatus::Failed { reason }, now)
-            }
-            SagaOutcome::TimedOut => {
-                self.emit_job_finalize_if_current_claimant(ctx, &run, false, "timed out".into())
-                    .await;
-                self.stage_run_status(
-                    run_id,
-                    run,
-                    RunStatus::Failed {
-                        reason: "timed out".into(),
-                    },
-                    now,
-                )
-            }
-            SagaOutcome::Cancelled => {
-                self.emit_job_finalize_if_current_claimant(ctx, &run, false, "cancelled".into())
-                    .await;
-                self.stage_run_status(run_id, run, RunStatus::Cancelled, now)
-            }
-        }
-        Ok(())
-    }
-
-    // ---- the dispatch-plane result intake (origin == dispatch) ---------------------
-
-    /// NO-FAIL ARM. the dispatch plane delivers a chat run's outcome here
-    /// inside its delivery block; an `Err` would abort that block, the
-    /// committed mailbox would re-inject next block, and every block after
-    /// would abort (the permanent-abort loop). unknown dispatch ids and
-    /// terminal runs are staged no-ops; the model's raw text is normalized
-    /// deterministically, and an output that fails validation FAILS THE RUN,
-    /// never the block.
+    /// NO-FAIL ARM. the dispatch plane delivers a run's outcome here inside
+    /// its delivery block; an `Err` would abort that block, the committed
+    /// mailbox would re-inject next block, and every block after would abort
+    /// (the permanent-abort loop). unknown dispatch ids are staged no-ops;
+    /// the model's raw text is normalized deterministically, and a response
+    /// that fails validation FAILS THE RUN — breadcrumb + pruned entry —
+    /// never the block. the entry prunes on EVERY matched delivery: the
+    /// dispatch module is the lifecycle ledger, this map is only the
+    /// correlation for work still in flight.
     async fn on_result_event(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
         let Ok(event) = decode_result_event(payload) else {
             self.note(ctx, "dropped undecodable dispatch result event".into());
             return Ok(());
         };
-        let Some(run_id) = self.dispatch_run(&event.dispatch_id).cloned() else {
+        let Some(entry) = self.pending_entry(&event.dispatch_id).cloned() else {
             self.note(
                 ctx,
                 format!("dropped result for unknown dispatch {}", event.dispatch_id),
             );
             return Ok(());
         };
-        let Some(run) = self.run(&run_id).cloned() else {
-            self.note(ctx, format!("dropped result for unknown run {run_id}"));
-            return Ok(());
-        };
-        // only the dispatch this run is actually awaiting may transition it —
-        // a terminal run's late delivery is a no-op.
-        let RunStatus::AwaitingResult { dispatch_id } = &run.status else {
-            return Ok(());
-        };
-        if *dispatch_id != event.dispatch_id {
-            return Ok(());
-        }
+        let run_id = entry.run_id();
+        let ResultEvent {
+            dispatch_id,
+            outcome,
+            ..
+        } = event;
+        self.pending_overlay.insert(dispatch_id, None);
 
-        let now = ctx.env().consensus_time;
-        let ResultEvent { outcome, .. } = event;
         match outcome {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
-                let output = agent_output_from_text(&text);
-                match self.validate_output(&*ctx, &run_id, &run, output).await {
-                    Ok(output) => {
-                        self.emit_output(ctx, &run_id, &run, output);
-                        self.stage_run_status(run_id, run, RunStatus::Done, now);
+                let response = agent_response_from_text(&text, entry.job_id.is_some());
+                match self.validate_response(&*ctx, &run_id, &entry, response).await {
+                    Ok(response) => {
+                        let payload = String::from_utf8(encode_response(&response))
+                            .expect("AgentResponse JSON is utf-8");
+                        self.emit_response(ctx, &run_id, &entry, response);
+                        self.emit_job_finalize_if_current_claimant(ctx, &entry, true, payload)
+                            .await;
                     }
-                    // deterministically invalid output: the run fails, the
-                    // delivery block commits.
+                    // deterministically invalid response: the run fails —
+                    // breadcrumb, job finalize, pruned entry — the delivery
+                    // block commits.
                     Err(reason) => {
-                        self.stage_run_status(run_id, run, RunStatus::Failed { reason }, now)
+                        self.note(ctx, format!("run {run_id} failed: {reason}"));
+                        self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
+                            .await;
                     }
                 }
             }
-            Err(reason) => self.stage_run_status(run_id, run, RunStatus::Failed { reason }, now),
+            Err(reason) => {
+                self.note(ctx, format!("run {run_id} failed: {reason}"));
+                self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
+                    .await;
+            }
         }
         Ok(())
     }
 
-    /// deterministic output validation — THE safety boundary (design §5). the
-    /// output is data until every check here passes; only then do its
-    /// follow-ups exist. beyond schema and caps, this probes everything the
+    /// deterministic response validation — THE safety boundary (design §5).
+    /// the response is data until every check here passes; only then do its
+    /// follow-ups exist. beyond grants and caps, this probes everything the
     /// emitted follow-ups could make chat or tasks REJECT (which would abort
-    /// the terminal block — the poison rule): a squatted reply message id, a
+    /// the delivery block — the no-fail rule): a squatted reply message id, a
     /// full thread, a duplicate or unknown task id.
-    async fn validate_output_bytes(
+    async fn validate_response(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
-        run: &RunState,
-        bytes: &[u8],
-    ) -> Result<AgentOutput, String> {
-        let output = decode_output(bytes).map_err(|e| format!("undecodable AgentOutput: {e}"))?;
-        self.validate_output(ctx, run_id, run, output).await
-    }
-
-    async fn validate_output(
-        &self,
-        ctx: &dyn Ctx,
-        run_id: &str,
-        run: &RunState,
-        output: AgentOutput,
-    ) -> Result<AgentOutput, String> {
+        entry: &PendingState,
+        response: AgentResponse,
+    ) -> Result<AgentResponse, String> {
         let agent = self
-            .agent(&run.agent_id)
-            .ok_or_else(|| format!("agent is not registered: {}", run.agent_id))?;
-        if output.reply_blocks.is_empty() && output.actions.is_empty() {
-            return Err("output carries neither reply blocks nor actions".into());
+            .agent(&entry.agent_id)
+            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
+        if response.reply_blocks.is_empty() && response.actions.is_empty() {
+            return Err("response carries neither reply blocks nor actions".into());
         }
-        if output.actions.len() > MAX_ACTIONS_PER_RUN {
+        if response.actions.len() > MAX_ACTIONS_PER_RUN {
             return Err(format!(
                 "{} actions exceed the cap of {MAX_ACTIONS_PER_RUN}",
-                output.actions.len()
+                response.actions.len()
             ));
         }
 
-        if !output.reply_blocks.is_empty() {
-            if run.job_id.is_some() {
-                return Err("job runs cannot emit chat replies".into());
-            }
+        if !response.reply_blocks.is_empty() {
             if !agent.allowed_actions.contains(ACTION_CHAT_POST) {
                 return Err(format!(
                     "agent {} is not allowed to {ACTION_CHAT_POST}",
-                    run.agent_id
+                    entry.agent_id
                 ));
             }
-            let reply_bytes =
-                serde_json::to_vec(&output.reply_blocks).expect("blocks are serializable");
+            let reply_bytes = serde_json::to_vec(&to_chat_blocks(&response.reply_blocks))
+                .expect("blocks are serializable");
             if reply_bytes.len() > MAX_REPLY_BLOCKS_BYTES {
                 return Err(format!(
                     "reply blocks are {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
@@ -1821,12 +1637,12 @@ impl AgentModule {
                 _ => return Err("unexpected chat reply for a message lookup".into()),
             }
             // a threaded reply must still fit under chat's thread cap.
-            if let Some(root_seq) = run.thread_root {
+            if let Some(root_seq) = entry.thread_root {
                 let reply = ctx
                     .query(
                         &self.chat,
                         &chat_encode_query(&ChatQuery::MessagesRange {
-                            channel_id: run.channel_id.clone(),
+                            channel_id: entry.channel_id.clone(),
                             from_seq: root_seq,
                             limit: 1,
                         }),
@@ -1843,22 +1659,22 @@ impl AgentModule {
                 if root.head.reply_count >= MAX_THREAD_REPLIES as u64 {
                     return Err(format!(
                         "thread reply cap reached: {}/{root_seq}",
-                        run.channel_id
+                        entry.channel_id
                     ));
                 }
             }
         }
 
-        if !output.actions.is_empty() {
+        if !response.actions.is_empty() {
             let Some(tasks) = self.tasks.clone() else {
                 return Err("no tasks module is configured".into());
             };
             let existing = self.task_ids(ctx, &tasks).await?;
             let mut created: BTreeSet<&str> = BTreeSet::new();
-            for action in &output.actions {
+            for action in &response.actions {
                 let name = action.vocabulary_name();
                 if !agent.allowed_actions.contains(name) {
-                    return Err(format!("agent {} is not allowed to {name}", run.agent_id));
+                    return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
                 }
                 match action {
                     AgentAction::CreateTask { task_id, title } => {
@@ -1866,7 +1682,7 @@ impl AgentModule {
                             return Err("task actions require a non-empty task_id and title".into());
                         }
                         // duplicates — committed or earlier in this very
-                        // output — would make tasks reject the follow-up.
+                        // response — would make tasks reject the follow-up.
                         if existing.contains(task_id) || !created.insert(task_id) {
                             return Err(format!("task already exists: {task_id}"));
                         }
@@ -1883,7 +1699,7 @@ impl AgentModule {
             }
         }
 
-        Ok(output)
+        Ok(response)
     }
 
     async fn task_ids(&self, ctx: &dyn Ctx, tasks: &str) -> Result<BTreeSet<String>, String> {
@@ -1941,18 +1757,21 @@ impl AgentModule {
         }))
     }
 
+    /// finalize a job-backed run's board item — but only while this module is
+    /// still the claimant of exactly the claim episode the run was bound to
+    /// (a reclaimed/re-claimed job must not be finalized by a stale run).
     async fn emit_job_finalize_if_current_claimant(
         &self,
         ctx: &mut dyn Ctx,
-        run: &RunState,
+        entry: &PendingState,
         ok: bool,
         payload: String,
     ) {
-        let Some(job_id) = &run.job_id else {
+        let Some(job_id) = &entry.job_id else {
             return;
         };
         match self
-            .job_claimed_by_run(&*ctx, job_id, run.job_claim_height)
+            .job_claimed_by_run(&*ctx, job_id, entry.job_claim_height)
             .await
         {
             Ok(true) => {
@@ -1980,23 +1799,29 @@ impl AgentModule {
         }
     }
 
-    /// hand a VALIDATED output its follow-ups: the chat reply (authored as
+    /// hand a VALIDATED response its follow-ups: the chat reply (authored as
     /// the agent, threaded like its anchor) and the task writes — all drained
-    /// in this same block (P2, P6).
-    fn emit_output(&self, ctx: &mut dyn Ctx, run_id: &str, run: &RunState, output: AgentOutput) {
-        if !output.reply_blocks.is_empty() {
+    /// in this same delivery block (P2, P6).
+    fn emit_response(
+        &self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        response: AgentResponse,
+    ) {
+        if !response.reply_blocks.is_empty() {
             ctx.emit_msg(Msg {
                 target: self.chat.clone(),
                 payload: chat_encode_msg(&ChatMsg::PostMessage {
-                    channel_id: run.channel_id.clone(),
+                    channel_id: entry.channel_id.clone(),
                     message_id: reply_message_id(run_id),
-                    blocks: output.reply_blocks,
-                    thread: run.thread_root,
-                    as_agent: Some(run.agent_id.clone()),
+                    blocks: to_chat_blocks(&response.reply_blocks),
+                    thread: entry.thread_root,
+                    as_agent: Some(entry.agent_id.clone()),
                 }),
             });
         }
-        for action in output.actions {
+        for action in response.actions {
             let target = self
                 .tasks
                 .clone()
@@ -2057,7 +1882,7 @@ impl AgentModule {
                     target: self.dispatch.clone(),
                     payload: dispatch_encode_msg(&DispatchMsg::RegisterRecipe {
                         recipe_id: recipe_id_for(&agent_id),
-                        description: format!("chat runs for agent {agent_id}"),
+                        description: format!("runs for agent {agent_id}"),
                         capability: capability.clone(),
                         routing: Routing::Rendezvous,
                         // Text on purpose: the oracle returns the model's raw
@@ -2199,8 +2024,9 @@ impl AgentModule {
                 channel_id,
                 anchor_seq,
             } => {
-                // an explicit turn claim: same run id, same dedup as the hook
-                // path — first in consensus order wins, the loser no-ops.
+                // an explicit turn claim: same run id, same dedup as the
+                // engagement path — first in consensus order wins, the loser
+                // no-ops.
                 let requester = match &ctx.env().origin {
                     Origin::External(key) if key.is_empty() => {
                         return Err(Error::Module(
@@ -2214,7 +2040,11 @@ impl AgentModule {
                 };
                 reject_run_separator("channel_id", &channel_id)?;
                 let run_id = run_id_for(&channel_id, anchor_seq, &agent_id);
-                if self.run(&run_id).is_some() {
+                if self
+                    .turn_taken(&*ctx, &dispatch_id_for(&run_id))
+                    .await
+                    .map_err(Error::Module)?
+                {
                     return Ok(());
                 }
                 if !agent.active {
@@ -2229,7 +2059,7 @@ impl AgentModule {
                     .map_err(Error::Module)?;
                 self.stage_dispatch_run(
                     ctx,
-                    run_id,
+                    &run_id,
                     agent_id,
                     channel_id,
                     anchor_seq,
@@ -2240,35 +2070,33 @@ impl AgentModule {
             }
             AgentMsg::CancelRun { run_id } => {
                 let submitter = canonical_origin(&ctx.env().origin);
-                let Some(run) = self.run(&run_id).cloned() else {
-                    return Err(Error::Module(format!("unknown run: {run_id}")));
+                let dispatch_id = dispatch_id_for(&run_id);
+                let Some(entry) = self.pending_entry(&dispatch_id).cloned() else {
+                    // not pending: a run whose dispatch already exists is
+                    // terminal (delivered and pruned) — cancelling it is an
+                    // idempotent no-op; anything else is unknown.
+                    return match self.turn_taken(&*ctx, &dispatch_id).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(Error::Module(format!("unknown run: {run_id}"))),
+                        Err(reason) => Err(Error::Module(reason)),
+                    };
                 };
-                let owner = self.agent(&run.agent_id).map(|a| a.owner.clone());
+                let owner = self.agent(&entry.agent_id).map(|a| a.owner.clone());
                 // the empty external default can never match: requesters and
                 // owners are always non-empty by construction.
-                if submitter != run.requester && Some(&submitter) != owner.as_ref() {
+                if submitter != entry.requester && Some(&submitter) != owner.as_ref() {
                     return Err(Error::Module(
                         "only the run creator or the agent owner may cancel a run".into(),
                     ));
                 }
-                match run.status.clone() {
-                    // a job-backed run: cancel its saga in the same block;
-                    // the Cancelled callback echoes back next dispatch and
-                    // no-ops against the (by then terminal) run.
-                    RunStatus::AwaitingOracle { saga_id } => ctx.emit_msg(Msg {
-                        target: self.saga.clone(),
-                        payload: saga_encode_msg(&SagaMsg::Cancel { saga_id }),
-                    }),
-                    // a chat run: cancel through the dispatch plane; its
-                    // Err("cancelled") ResultEvent later no-ops the same way.
-                    RunStatus::AwaitingResult { dispatch_id } => ctx.emit_msg(Msg {
-                        target: self.dispatch.clone(),
-                        payload: dispatch_encode_msg(&DispatchMsg::CancelDispatch { dispatch_id }),
-                    }),
-                    // terminal: an idempotent no-op.
-                    _ => return Ok(()),
-                }
-                self.stage_run_status(run_id, run, RunStatus::Cancelled, now);
+                // cancel through the dispatch plane; the entry stays pending
+                // and the plane's Err("cancelled") delivery prunes it (and
+                // finalizes a job-backed run's job) through the ONE result
+                // path — no second lifecycle machine here.
+                ctx.emit_msg(Msg {
+                    target: self.dispatch.clone(),
+                    payload: dispatch_encode_msg(&DispatchMsg::CancelDispatch { dispatch_id }),
+                });
                 Ok(())
             }
         }
@@ -2301,7 +2129,7 @@ impl AgentModule {
     /// into the canonical encoding `root()` commits to. deterministic across
     /// nodes.
     pub fn snapshot(&self) -> Vec<u8> {
-        encode_committed(&self.agents, &self.watches, &self.runs, &self.dispatch_runs)
+        encode_committed(&self.agents, &self.watches, &self.pending)
     }
 
     /// adopt a peer's snapshot as own committed state — but only after the
@@ -2312,21 +2140,18 @@ impl AgentModule {
     /// dropped — a snapshot describes a block boundary, and nothing
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (agents, watches, runs, dispatch_runs) =
-            decode_committed(bytes).map_err(Error::Module)?;
-        if committed_root(&agents, &watches, &runs, &dispatch_runs) != expected {
+        let (agents, watches, pending) = decode_committed(bytes).map_err(Error::Module)?;
+        if committed_root(&agents, &watches, &pending) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
             ));
         }
         self.agents = agents;
         self.watches = watches;
-        self.runs = runs;
-        self.dispatch_runs = dispatch_runs;
+        self.pending = pending;
         self.pending_agents.clear();
         self.pending_watches.clear();
-        self.pending_runs.clear();
-        self.pending_dispatch_runs.clear();
+        self.pending_overlay.clear();
         Ok(())
     }
 }
@@ -2338,11 +2163,11 @@ impl Module for AgentModule {
     }
 
     /// state-based commitment: sha256 over the canonical committed encoding —
-    /// a length-prefixed fold of every agent, watch, and run field in
-    /// sorted-key order. sensitive to every field, so any transition moves
+    /// a length-prefixed fold of every agent, watch, and pending-entry field
+    /// in sorted-key order. sensitive to every field, so any transition moves
     /// the root. the preimage IS the snapshot encoding.
     fn root(&self) -> StateRoot {
-        committed_root(&self.agents, &self.watches, &self.runs, &self.dispatch_runs)
+        committed_root(&self.agents, &self.watches, &self.pending)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -2350,11 +2175,12 @@ impl Module for AgentModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        // four payload namespaces, routed by the HOST-ASSIGNED origin —
-        // spoof-proof by construction: only the tagging plane's follow-ups
-        // reach the engagement intake, only dispatch's reach the result
-        // intake, only saga's reach the callback intake, and everything else
-        // (external submitters included) must decode as an AgentMsg.
+        // payload namespaces routed by the HOST-ASSIGNED origin — spoof-proof
+        // by construction: only the tagging plane's follow-ups reach the
+        // engagement intake, only dispatch's reach the result intake, and
+        // everything else (external submitters included) must decode as an
+        // AgentMsg. saga and chat origins are dead-lettered: neither may ever
+        // abort the block that carried them.
         let origin = ctx.env().origin.clone();
         match origin {
             Origin::Module(module) if module == self.tagging => {
@@ -2363,15 +2189,19 @@ impl Module for AgentModule {
             Origin::Module(module) if module == self.dispatch => {
                 self.on_result_event(ctx, &msg.payload).await
             }
-            Origin::Module(module) if module == self.saga => {
-                self.on_saga_callback(ctx, &msg.payload).await
-            }
             Origin::Module(module) if self.jobs.as_ref() == Some(&module) => {
                 self.on_jobs_event(ctx, &msg.payload).await
             }
+            Origin::Module(module) if module == self.saga => {
+                // dead letter: nothing here rides the saga anymore, but any
+                // trigger's reply_to can point a callback at this module —
+                // it must never abort the saga's terminal block.
+                self.note(ctx, "dropped a direct saga callback".into());
+                Ok(())
+            }
             Origin::Module(module) if module == self.chat => {
-                // dead letter: chat no longer notifies this module directly.
-                // a stray follow-up must never abort a posting block.
+                // dead letter: chat never notifies this module directly. a
+                // stray follow-up must never abort a posting block.
                 self.note(ctx, "dropped a direct chat follow-up".into());
                 Ok(())
             }
@@ -2392,23 +2222,16 @@ impl Module for AgentModule {
                 self.agent(&agent_id)
                     .map(|a| Self::agent_view(&agent_id, a)),
             ))),
-            AgentQuery::Runs { channel_id, limit } => {
-                let limit = usize::try_from(limit.min(MAX_QUERY_LIMIT)).expect("small limit");
-                let runs = Self::visible_ids(&self.runs, &self.pending_runs)
+            AgentQuery::PendingRuns => {
+                let runs = Self::visible_ids(&self.pending, &self.pending_overlay)
                     .into_iter()
-                    .filter_map(|id| self.run(&id).map(|r| Self::run_view(&id, r)))
-                    .filter(|view| {
-                        channel_id
-                            .as_ref()
-                            .is_none_or(|channel| *channel == view.channel_id)
+                    .filter_map(|dispatch_id| {
+                        self.pending_entry(&dispatch_id)
+                            .map(|p| Self::pending_view(&dispatch_id, p))
                     })
-                    .take(limit)
                     .collect();
-                Ok(encode_reply(&AgentReply::Runs(runs)))
+                Ok(encode_reply(&AgentReply::PendingRuns(runs)))
             }
-            AgentQuery::Run { run_id } => Ok(encode_reply(&AgentReply::Run(
-                self.run(&run_id).map(|r| Self::run_view(&run_id, r)),
-            ))),
             AgentQuery::Watches => {
                 let watches = Self::visible_ids(&self.watches, &self.pending_watches)
                     .into_iter()
@@ -2438,11 +2261,15 @@ impl Module for AgentModule {
                 }
             }
         }
-        for (id, run) in std::mem::take(&mut self.pending_runs) {
-            self.runs.insert(id, run);
-        }
-        for (dispatch_id, run_id) in std::mem::take(&mut self.pending_dispatch_runs) {
-            self.dispatch_runs.insert(dispatch_id, run_id);
+        for (dispatch_id, staged) in std::mem::take(&mut self.pending_overlay) {
+            match staged {
+                Some(entry) => {
+                    self.pending.insert(dispatch_id, entry);
+                }
+                None => {
+                    self.pending.remove(&dispatch_id);
+                }
+            }
         }
         Ok(())
     }
@@ -2450,8 +2277,7 @@ impl Module for AgentModule {
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending_agents.clear();
         self.pending_watches.clear();
-        self.pending_runs.clear();
-        self.pending_dispatch_runs.clear();
+        self.pending_overlay.clear();
         Ok(())
     }
 }
@@ -2460,19 +2286,19 @@ impl Module for AgentModule {
 mod tests {
     use super::*;
     use agent_interface::{
-        ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, decode_reply, encode_msg, encode_output,
-        encode_query,
+        ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, decode_reply, encode_msg, encode_query,
     };
-    use chat_interface::{
-        MessageHead, decode_msg as chat_decode_msg, decode_query as chat_decode_query,
-        encode_reply as chat_encode_reply,
-    };
+    use chat_interface::{MessageHead, decode_msg as chat_decode_msg};
     use dispatch_interface::{
-        decode_msg as dispatch_decode_msg, encode_result_event,
+        DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
+        encode_reply as dispatch_encode_reply, encode_result_event,
     };
     use document_interface::{BlockKind, decode_query as doc_decode_query, encode_reply as doc_encode_reply};
     use futures::executor::block_on;
-    use saga_interface::{SagaCallback, encode_callback as saga_encode_callback};
+    use jobs_interface::{
+        Claim as JobClaim, Job, encode_event as jobs_encode_event,
+        encode_reply as jobs_encode_reply,
+    };
     use sdk::{Effect, Env};
     use tagging_interface::{Author, encode_event as tagging_encode_event};
     use tasks_interface::{
@@ -2480,8 +2306,9 @@ mod tests {
     };
 
     /// a minimal `Ctx` that captures emitted msgs/effects/events and serves
-    /// canned chat transcripts and task lists — enough to unit-test `execute`
-    /// in isolation (the host provides the real routing in integration).
+    /// canned chat transcripts, task lists, job records, and dispatch
+    /// records — enough to unit-test `execute` in isolation (the host
+    /// provides the real routing in integration).
     struct CaptureCtx {
         env: Env,
         /// channel -> messages with contiguous seqs starting at 1.
@@ -2489,6 +2316,11 @@ mod tests {
         tasks: Vec<Task>,
         /// doc_id -> prompt document blocks served by the document arm.
         docs: BTreeMap<String, Vec<document_interface::Block>>,
+        /// dispatch ids the dispatch module already has a record for — the
+        /// committed turn-claim layer the module probes.
+        taken_dispatches: BTreeSet<String>,
+        /// job_id -> board record served by the jobs arm (finalize guard).
+        jobs: BTreeMap<String, Job>,
         msgs: Vec<Msg>,
         #[allow(dead_code)]
         effects: Vec<Effect>,
@@ -2497,7 +2329,8 @@ mod tests {
     impl CaptureCtx {
         fn new() -> Self {
             Self {
-                env: Env { protocol_version: 0,
+                env: Env {
+                    protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: Origin::System,
@@ -2506,6 +2339,8 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 tasks: Vec::new(),
                 docs: BTreeMap::new(),
+                taken_dispatches: BTreeSet::new(),
+                jobs: BTreeMap::new(),
                 msgs: Vec::new(),
                 effects: Vec::new(),
                 events: Vec::new(),
@@ -2525,9 +2360,6 @@ mod tests {
         }
         fn from_dispatch(self) -> Self {
             self.from_origin(Origin::Module("dispatch".into()))
-        }
-        fn from_saga(self) -> Self {
-            self.from_origin(Origin::Module("saga".into()))
         }
         fn from_jobs(self) -> Self {
             self.from_origin(Origin::Module("jobs".into()))
@@ -2557,13 +2389,32 @@ mod tests {
             );
             self
         }
-        /// decoded saga msgs emitted this dispatch.
-        fn saga_msgs(&self) -> Vec<SagaMsg> {
-            self.msgs
-                .iter()
-                .filter(|m| m.target == "saga")
-                .map(|m| saga_interface::decode_msg(&m.payload).expect("saga msg"))
-                .collect()
+        fn with_taken_dispatch(mut self, dispatch_id: &str) -> Self {
+            self.taken_dispatches.insert(dispatch_id.into());
+            self
+        }
+        /// a job the board holds as Processing, claimed by "agent" at `height`.
+        fn with_claimed_job(mut self, job_id: &str, height: u64) -> Self {
+            self.jobs.insert(
+                job_id.into(),
+                Job {
+                    job_id: job_id.into(),
+                    kind: "agent/duck".into(),
+                    spec: "spec".into(),
+                    submitter: "ext:01".into(),
+                    status: JobStatus::Processing,
+                    attempt: 1,
+                    claim: Some(JobClaim {
+                        worker: "agent".into(),
+                        claimed_at_height: height,
+                        lease_views: JOB_RUN_LEASE_VIEWS,
+                    }),
+                    result: None,
+                    created_at_height: height,
+                    updated_at_height: height,
+                },
+            );
+            self
         }
         /// decoded chat msgs emitted this dispatch.
         fn chat_msgs(&self) -> Vec<ChatMsg> {
@@ -2622,7 +2473,7 @@ mod tests {
                     ))),
                     _ => Err(Error::QueryUnsupported),
                 },
-                "chat" => match chat_decode_query(req).map_err(Error::Module)? {
+                "chat" => match chat_interface::decode_query(req).map_err(Error::Module)? {
                     ChatQuery::MessagesRange {
                         channel_id,
                         from_seq,
@@ -2638,10 +2489,10 @@ mod tests {
                             let to = head.min(from + limit - 1);
                             window = transcript[(from - 1) as usize..to as usize].to_vec();
                         }
-                        Ok(chat_encode_reply(&ChatReply::Messages(window)))
+                        Ok(chat_interface::encode_reply(&ChatReply::Messages(window)))
                     }
                     ChatQuery::Message { message_id } => {
-                        Ok(chat_encode_reply(&ChatReply::Message(
+                        Ok(chat_interface::encode_reply(&ChatReply::Message(
                             self.transcripts
                                 .values()
                                 .flatten()
@@ -2652,6 +2503,29 @@ mod tests {
                     _ => Err(Error::QueryUnsupported),
                 },
                 "tasks" => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
+                "jobs" => match jobs_interface::decode_query(req).map_err(Error::Module)? {
+                    JobsQuery::Get { job_id } => Ok(jobs_encode_reply(&JobsReply::Job(
+                        self.jobs.get(&job_id).cloned(),
+                    ))),
+                    _ => Err(Error::QueryUnsupported),
+                },
+                "dispatch" => match dispatch_interface::decode_query(req).map_err(Error::Module)? {
+                    DispatchQuery::Dispatch { dispatch_id, .. } => {
+                        let view = self.taken_dispatches.contains(&dispatch_id).then(|| {
+                            DispatchView {
+                                dispatch_id,
+                                recipe_id: "agent/x".into(),
+                                receiver: "agent".into(),
+                                status: DispatchStatus::Delivered,
+                                outcome: Some(Ok(Vec::new())),
+                                created_at: 0,
+                                updated_at: 0,
+                            }
+                        });
+                        Ok(dispatch_encode_reply(&DispatchReply::Dispatch(view)))
+                    }
+                    _ => Err(Error::QueryUnsupported),
+                },
                 other => Err(Error::UnknownModule(other.into())),
             }
         }
@@ -2762,18 +2636,7 @@ mod tests {
         }
     }
 
-    fn callback(run_id: &str, outcome: SagaOutcome) -> Msg {
-        Msg {
-            target: "agent".into(),
-            payload: saga_encode_callback(&SagaCallback {
-                saga_id: saga_id_for(run_id),
-                payload: run_id.as_bytes().to_vec(),
-                outcome,
-            }),
-        }
-    }
-
-    /// the dispatch plane's next-block delivery for a chat run.
+    /// the dispatch plane's next-block delivery for a run.
     fn result_event(run_id: &str, outcome: Result<Vec<u8>, String>) -> Msg {
         Msg {
             target: "agent".into(),
@@ -2781,6 +2644,20 @@ mod tests {
                 dispatch_id: dispatch_id_for(run_id),
                 recipe_id: recipe_id_for("bot"),
                 outcome,
+            }),
+        }
+    }
+
+    /// a jobs-board submit notification, spec + matching hash included.
+    fn jobs_event(job_id: &str, kind: &str, spec: &str) -> Msg {
+        Msg {
+            target: "agent".into(),
+            payload: jobs_encode_event(&JobsEvent::Submitted {
+                job_id: job_id.into(),
+                kind: kind.into(),
+                submitter: "ext:01".into(),
+                spec: spec.into(),
+                spec_hash: job_spec_hash(spec.as_bytes()),
             }),
         }
     }
@@ -2797,15 +2674,16 @@ mod tests {
         block_on(m.abort_block()).unwrap();
     }
 
-    fn get_run(m: &AgentModule, run_id: &str) -> Option<RunView> {
-        let reply = block_on(m.query(&encode_query(&AgentQuery::Run {
-            run_id: run_id.into(),
-        })))
-        .unwrap();
+    fn pending_runs(m: &AgentModule) -> Vec<PendingRun> {
+        let reply = block_on(m.query(&encode_query(&AgentQuery::PendingRuns))).unwrap();
         match decode_reply(&reply).unwrap() {
-            AgentReply::Run(view) => view,
+            AgentReply::PendingRuns(runs) => runs,
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    fn get_pending(m: &AgentModule, run_id: &str) -> Option<PendingRun> {
+        pending_runs(m).into_iter().find(|p| p.run_id == run_id)
     }
 
     fn get_agent(m: &AgentModule, agent_id: &str) -> Option<AgentRecord> {
@@ -2849,6 +2727,20 @@ mod tests {
         let tags = mentioned.iter().map(|a| agent_tag(a)).collect();
         exec(m, &mut ctx, &engagement("general", seq, tags)).unwrap();
         ctx
+    }
+
+    fn response(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
+        encode_response(&AgentResponse {
+            reply_blocks: reply
+                .iter()
+                .map(|t| ReplyBlock {
+                    kind: "Paragraph".into(),
+                    text: (*t).into(),
+                    lang: None,
+                })
+                .collect(),
+            actions,
+        })
     }
 
     // ---- registry admin -------------------------------------------------------
@@ -3261,16 +3153,10 @@ mod tests {
         commit(&mut m);
 
         let run_id = run_id_for("general", 3, "bot1");
-        let run = get_run(&m, &run_id).expect("bot1 engaged");
-        assert_eq!(
-            run.status,
-            RunStatus::AwaitingResult {
-                dispatch_id: dispatch_id_for(&run_id),
-            }
-        );
-        assert_eq!(run.requester, SagaOrigin::Module("tagging".into()));
-        assert_eq!(run.context_hash, context_hash(&transcript(3)));
-        assert_eq!(get_run(&m, &run_id_for("general", 3, "bot2")), None);
+        let entry = get_pending(&m, &run_id).expect("bot1 engaged");
+        assert_eq!(entry.dispatch_id, dispatch_id_for(&run_id));
+        assert_eq!(entry.requester, SagaOrigin::Module("tagging".into()));
+        assert_eq!(get_pending(&m, &run_id_for("general", 3, "bot2")), None);
 
         // exactly one dispatch, under the agent's own recipe, carrying the
         // fully composed payload — prompt framing, contract, transcript.
@@ -3322,13 +3208,13 @@ mod tests {
             2,
             "two active agents, two dispatches"
         );
-        assert!(get_run(&m, &run_id_for("general", 2, "a")).is_some());
+        assert!(get_pending(&m, &run_id_for("general", 2, "a")).is_some());
         assert_eq!(
-            get_run(&m, &run_id_for("general", 2, "b")),
+            get_pending(&m, &run_id_for("general", 2, "b")),
             None,
             "a paused agent never engages"
         );
-        assert!(get_run(&m, &run_id_for("general", 2, "c")).is_some());
+        assert!(get_pending(&m, &run_id_for("general", 2, "c")).is_some());
     }
 
     #[test]
@@ -3341,9 +3227,9 @@ mod tests {
         // seq 4 over [a, b, c]: 4 % 3 = 1 -> "b".
         engage_post(&mut m, 4, &[]);
         commit(&mut m);
-        assert!(get_run(&m, &run_id_for("general", 4, "b")).is_some());
-        assert_eq!(get_run(&m, &run_id_for("general", 4, "a")), None);
-        assert_eq!(get_run(&m, &run_id_for("general", 4, "c")), None);
+        assert!(get_pending(&m, &run_id_for("general", 4, "b")).is_some());
+        assert_eq!(get_pending(&m, &run_id_for("general", 4, "a")), None);
+        assert_eq!(get_pending(&m, &run_id_for("general", 4, "c")), None);
 
         // pause "b": the domain shrinks to [a, c]; seq 5 % 2 = 1 -> "c".
         let mut ctx = CaptureCtx::new().from_origin(user(9));
@@ -3358,8 +3244,8 @@ mod tests {
         commit(&mut m);
         engage_post(&mut m, 5, &[]);
         commit(&mut m);
-        assert!(get_run(&m, &run_id_for("general", 5, "c")).is_some());
-        assert_eq!(get_run(&m, &run_id_for("general", 5, "b")), None);
+        assert!(get_pending(&m, &run_id_for("general", 5, "c")).is_some());
+        assert_eq!(get_pending(&m, &run_id_for("general", 5, "b")), None);
     }
 
     #[test]
@@ -3367,8 +3253,8 @@ mod tests {
         let mut m = watched(TurnPolicy::Assigned("b".into()), &[("a", &[]), ("b", &[])]);
         engage_post(&mut m, 2, &[]);
         commit(&mut m);
-        assert!(get_run(&m, &run_id_for("general", 2, "b")).is_some());
-        assert_eq!(get_run(&m, &run_id_for("general", 2, "a")), None);
+        assert!(get_pending(&m, &run_id_for("general", 2, "b")).is_some());
+        assert_eq!(get_pending(&m, &run_id_for("general", 2, "a")), None);
 
         // paused assignee: nothing engages, the block still commits.
         let mut ctx = CaptureCtx::new().from_origin(user(9));
@@ -3384,11 +3270,11 @@ mod tests {
         let ctx = engage_post(&mut m, 3, &[]);
         commit(&mut m);
         assert!(ctx.dispatch_msgs().is_empty());
-        assert_eq!(get_run(&m, &run_id_for("general", 3, "b")), None);
+        assert_eq!(get_pending(&m, &run_id_for("general", 3, "b")), None);
     }
 
     #[test]
-    fn foreign_source_engagements_and_direct_chat_follow_ups_are_dead_letters() {
+    fn foreign_sources_and_direct_chat_or_saga_follow_ups_are_dead_letters() {
         // the LOOP RULE itself lives in the tagging plane (only user posts
         // fire) and is tested there; this module's job is to survive the
         // events it should not act on.
@@ -3428,6 +3314,21 @@ mod tests {
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
+
+        // a saga-origin callback (a foreign trigger's reply_to pointed here):
+        // dead-lettered — an Err would abort the saga's terminal block.
+        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("saga".into()));
+        exec(
+            &mut m,
+            &mut ctx,
+            &Msg {
+                target: "agent".into(),
+                payload: b"a saga callback of any shape".to_vec(),
+            },
+        )
+        .unwrap();
+        assert!(ctx.msgs.is_empty());
+        assert!(!ctx.events.is_empty(), "the drop leaves a breadcrumb");
         commit(&mut m);
         assert_eq!(m.root(), before, "nothing was staged");
     }
@@ -3466,7 +3367,7 @@ mod tests {
         let ctx = engage_post(&mut m, 2, &[]);
         assert_eq!(ctx.dispatch_msgs().len(), 1);
         let run_id = run_id_for("general", 2, "bot");
-        let created = get_run(&m, &run_id).unwrap();
+        let created = get_pending(&m, &run_id).unwrap();
 
         // ...an explicit RequestRun for the SAME turn in the same block is a
         // staged no-op (first in consensus order won)...
@@ -3487,9 +3388,9 @@ mod tests {
         assert!(ctx.msgs.is_empty(), "the losing claim re-fires nothing");
         commit(&mut m);
         assert_eq!(
-            get_run(&m, &run_id).unwrap(),
+            get_pending(&m, &run_id).unwrap(),
             created,
-            "the first claim's record survives untouched"
+            "the first claim's entry survives untouched"
         );
 
         // ...and a COMMITTED duplicate (the same engagement replayed later)
@@ -3499,6 +3400,44 @@ mod tests {
         assert!(ctx.msgs.is_empty());
         commit(&mut m);
         assert_eq!(m.root(), root, "a duplicate claim moves nothing");
+    }
+
+    #[test]
+    fn a_delivered_turn_stays_claimed_via_the_dispatch_record() {
+        // after delivery the pending entry is pruned — the dispatch module's
+        // permanent record is what keeps the turn claimed. re-staging an
+        // entry here would orphan it forever (the dispatch module no-ops the
+        // duplicate dispatch and no ResultEvent would ever prune it).
+        let mut m = watched(TurnPolicy::All, &[("bot", &[])]);
+        let run_id = run_id_for("general", 2, "bot");
+        let taken = dispatch_id_for(&run_id);
+
+        let mut ctx = CaptureCtx::new()
+            .at(9)
+            .from_tagging()
+            .with_transcript("general", transcript(2))
+            .with_taken_dispatch(&taken);
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+        assert!(ctx.msgs.is_empty(), "a taken turn re-fires nothing");
+
+        let mut ctx = CaptureCtx::new()
+            .at(9)
+            .from_origin(user(5))
+            .with_transcript("general", transcript(2))
+            .with_taken_dispatch(&taken);
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::RequestRun {
+                agent_id: "bot".into(),
+                channel_id: "general".into(),
+                anchor_seq: 2,
+            }),
+        )
+        .unwrap();
+        assert!(ctx.msgs.is_empty());
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None, "nothing was re-staged");
     }
 
     #[test]
@@ -3545,20 +3484,31 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &Msg {
-                target: "agent".into(),
-                payload: jobs_interface::encode_event(&JobsEvent::Submitted {
-                    job_id: "bad\u{1f}job".into(),
-                    kind: "agent/bot".into(),
-                    submitter: "system".into(),
-                    spec_hash: vec![1u8; 32],
-                }),
-            },
+            &jobs_event("bad\u{1f}job", "agent/bot", "spec"),
         )
         .expect("separator in a no-fail jobs event is a no-op");
         assert!(ctx.msgs.is_empty(), "no claim emitted for a bad job id");
+
+        // a spec that does not hash to spec_hash is dropped the same way.
+        let mut ctx = CaptureCtx::new().from_jobs();
+        exec(
+            &mut m,
+            &mut ctx,
+            &Msg {
+                target: "agent".into(),
+                payload: jobs_encode_event(&JobsEvent::Submitted {
+                    job_id: "job-x".into(),
+                    kind: "agent/bot".into(),
+                    submitter: "ext:01".into(),
+                    spec: "actual".into(),
+                    spec_hash: vec![9u8; 32],
+                }),
+            },
+        )
+        .expect("a mismatched spec hash is a no-op");
+        assert!(ctx.msgs.is_empty());
         commit(&mut m);
-        assert_eq!(m.root(), root, "bad jobs event staged no run");
+        assert_eq!(m.root(), root, "bad jobs events staged nothing");
     }
 
     // ---- the no-fail arms ----------------------------------------------------------
@@ -3595,27 +3545,18 @@ mod tests {
         .unwrap();
         assert!(ctx.msgs.is_empty());
 
-        // garbage from the saga origin: the terminal block must survive.
-        let mut ctx = CaptureCtx::new().from_saga();
+        // garbage from the jobs origin: the submit block must survive.
+        let mut ctx = CaptureCtx::new().from_jobs();
         exec(
             &mut m,
             &mut ctx,
             &Msg {
                 target: "agent".into(),
-                payload: b"not a callback".to_vec(),
+                payload: b"not a jobs event".to_vec(),
             },
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
-
-        // a well-formed callback for an UNKNOWN run: staged no-op.
-        let mut ctx = CaptureCtx::new().from_saga();
-        exec(
-            &mut m,
-            &mut ctx,
-            &callback("general/9/ghost", SagaOutcome::Done(Vec::new())),
-        )
-        .unwrap();
 
         // a well-formed result event for an UNKNOWN dispatch: staged no-op.
         let mut ctx = CaptureCtx::new().from_dispatch();
@@ -3623,39 +3564,6 @@ mod tests {
 
         commit(&mut m);
         assert_eq!(m.root(), before, "none of the drops staged anything");
-    }
-
-    #[test]
-    fn a_stale_or_mismatched_delivery_never_transitions_the_run() {
-        let mut m = watched(TurnPolicy::All, &[("bot", &[ACTION_CHAT_POST])]);
-        engage_post(&mut m, 2, &[]);
-        commit(&mut m);
-        let run_id = run_id_for("general", 2, "bot");
-
-        // a saga callback echoing the run id: chat runs have no saga — the
-        // run is not AwaitingOracle, so the callback is a no-op.
-        let before = m.root();
-        let mut ctx = CaptureCtx::new().from_saga();
-        exec(
-            &mut m,
-            &mut ctx,
-            &Msg {
-                target: "agent".into(),
-                payload: saga_encode_callback(&SagaCallback {
-                    saga_id: "agent/some-other-saga".into(),
-                    payload: run_id.as_bytes().to_vec(),
-                    outcome: SagaOutcome::Done(Vec::new()),
-                }),
-            },
-        )
-        .unwrap();
-        assert!(ctx.msgs.is_empty());
-        commit(&mut m);
-        assert_eq!(m.root(), before);
-        assert!(matches!(
-            get_run(&m, &run_id).unwrap().status,
-            RunStatus::AwaitingResult { .. }
-        ));
     }
 
     #[test]
@@ -3671,7 +3579,7 @@ mod tests {
         let err = exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
-        assert_eq!(get_run(&m, &run_id_for("general", 2, "bot")), None);
+        assert_eq!(get_pending(&m, &run_id_for("general", 2, "bot")), None);
 
         // result-shaped bytes from an EXTERNAL origin: same story.
         engage_post(&mut m, 2, &[]);
@@ -3682,17 +3590,14 @@ mod tests {
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
         assert!(
-            matches!(
-                get_run(&m, &run_id).unwrap().status,
-                RunStatus::AwaitingResult { .. }
-            ),
-            "the forged delivery transitioned nothing"
+            get_pending(&m, &run_id).is_some(),
+            "the forged delivery pruned nothing"
         );
     }
 
-    // ---- output validation ----------------------------------------------------------
+    // ---- the result intake ----------------------------------------------------------
 
-    /// a committed module holding one awaiting run for `agent` (granted
+    /// a committed module holding one pending run for "bot" (granted
     /// `actions`) at general/2, plus the run id.
     fn awaiting_run(actions: &[&str]) -> (AgentModule, String) {
         let mut m = watched(TurnPolicy::All, &[("bot", actions)]);
@@ -3701,15 +3606,8 @@ mod tests {
         (m, run_id_for("general", 2, "bot"))
     }
 
-    fn output(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
-        encode_output(&AgentOutput {
-            reply_blocks: reply.iter().map(|t| Block::paragraph(*t)).collect(),
-            actions,
-        })
-    }
-
     #[test]
-    fn a_valid_output_emits_the_reply_and_actions_and_lands_done() {
+    fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
         let (mut m, run_id) = awaiting_run(&[
             ACTION_CHAT_POST,
             ACTION_TASKS_CREATE,
@@ -3724,14 +3622,14 @@ mod tests {
             &mut ctx,
             &result_event(
                 &run_id,
-                Ok(output(
+                Ok(response(
                     &["on it"],
                     vec![
                         AgentAction::CreateTask {
                             task_id: "t1".into(),
                             title: "ship it".into(),
                         },
-                        // updating a task created earlier in this SAME output
+                        // updating a task created earlier in this SAME response
                         // is valid — tasks applies the follow-ups in order.
                         AgentAction::UpdateTaskStatus {
                             task_id: "t1".into(),
@@ -3744,7 +3642,11 @@ mod tests {
         .unwrap();
         commit(&mut m);
 
-        assert_eq!(get_run(&m, &run_id).unwrap().status, RunStatus::Done);
+        assert_eq!(
+            get_pending(&m, &run_id),
+            None,
+            "the delivered entry pruned — the dispatch module holds the history"
+        );
         assert_eq!(
             ctx.chat_msgs(),
             vec![ChatMsg::PostMessage {
@@ -3790,7 +3692,7 @@ mod tests {
         exec(&mut m, &mut ctx, &engagement("general", 3, vec![])).unwrap();
         commit(&mut m);
         let run_id = run_id_for("general", 3, "bot");
-        assert_eq!(get_run(&m, &run_id).unwrap().thread_root, Some(1));
+        assert_eq!(get_pending(&m, &run_id).unwrap().thread_root, Some(1));
 
         let mut ctx = CaptureCtx::new()
             .at(9)
@@ -3799,7 +3701,7 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &result_event(&run_id, Ok(output(&["answered"], vec![]))),
+            &result_event(&run_id, Ok(response(&["answered"], vec![]))),
         )
         .unwrap();
         commit(&mut m);
@@ -3812,14 +3714,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_outputs_fail_the_run_and_emit_no_follow_ups() {
+    fn invalid_responses_fail_the_run_and_emit_no_follow_ups() {
         // normalization already absorbed shape problems (prose, fences,
         // oversize); what remains failable is POLICY: task validity and
-        // grants. every case still emits NOTHING and fails only the run.
+        // grants. every case still emits NOTHING, leaves a breadcrumb, and
+        // prunes the entry — never the block.
         let cases: Vec<(&str, Vec<u8>)> = vec![
             (
                 "task already exists: t0",
-                output(
+                response(
                     &["ok"],
                     vec![AgentAction::CreateTask {
                         task_id: "t0".into(),
@@ -3829,7 +3732,7 @@ mod tests {
             ),
             (
                 "task already exists: fresh",
-                output(
+                response(
                     &["ok"],
                     vec![
                         AgentAction::CreateTask {
@@ -3845,7 +3748,7 @@ mod tests {
             ),
             (
                 "unknown task: ghost",
-                output(
+                response(
                     &["ok"],
                     vec![AgentAction::UpdateTaskStatus {
                         task_id: "ghost".into(),
@@ -3855,7 +3758,7 @@ mod tests {
             ),
             (
                 "unknown task status",
-                output(
+                response(
                     &["ok"],
                     vec![AgentAction::UpdateTaskStatus {
                         task_id: "t0".into(),
@@ -3865,7 +3768,7 @@ mod tests {
             ),
             (
                 "non-empty task_id",
-                output(
+                response(
                     &["ok"],
                     vec![AgentAction::CreateTask {
                         task_id: String::new(),
@@ -3888,15 +3791,22 @@ mod tests {
             exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes))).unwrap();
             assert!(
                 ctx.msgs.is_empty(),
-                "an invalid output must emit NOTHING ({fragment})"
+                "an invalid response must emit NOTHING ({fragment})"
+            );
+            let breadcrumbs: Vec<String> = ctx
+                .events
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+                .collect();
+            assert!(
+                breadcrumbs.iter().any(|b| b.contains(fragment)),
+                "breadcrumbs {breadcrumbs:?} must mention {fragment:?}"
             );
             commit(&mut m);
-            let RunStatus::Failed { reason } = get_run(&m, &run_id).unwrap().status else {
-                panic!("the run must fail ({fragment})");
-            };
-            assert!(
-                reason.contains(fragment),
-                "reason {reason:?} must mention {fragment:?}"
+            assert_eq!(
+                get_pending(&m, &run_id),
+                None,
+                "the failed run's entry pruned ({fragment})"
             );
         }
     }
@@ -3908,7 +3818,7 @@ mod tests {
         // valid replies instead of failed runs.
         let cases: Vec<Vec<u8>> = vec![
             b"just prose, no JSON anywhere".to_vec(),
-            output(&[], vec![]),
+            response(&[], vec![]),
             "x".repeat(MAX_REPLY_BLOCKS_BYTES + 1).into_bytes(),
         ];
         for bytes in cases {
@@ -3919,14 +3829,45 @@ mod tests {
                 .with_transcript("general", transcript(2));
             exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes))).unwrap();
             commit(&mut m);
-            assert_eq!(get_run(&m, &run_id).unwrap().status, RunStatus::Done);
+            assert_eq!(get_pending(&m, &run_id), None, "the entry pruned");
             let posts = ctx.chat_msgs();
             assert_eq!(posts.len(), 1, "exactly one normalized reply posts");
         }
     }
 
     #[test]
-    fn outputs_beyond_the_agents_grants_fail_the_run() {
+    fn code_blocks_survive_normalization_into_chat_blocks() {
+        let (mut m, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+        let raw = r#"{"reply_blocks":[{"id":"b1","kind":"Paragraph","text":"hello"},{"kind":"Code","lang":"rust","text":"fn main() {}"},{"kind":"Alien","text":"dropped"},{"kind":"Paragraph","text":"  "}],"actions":[]}"#;
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .from_dispatch()
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(raw.as_bytes().to_vec())),
+        )
+        .unwrap();
+        let posts = ctx.chat_msgs();
+        let ChatMsg::PostMessage { blocks, .. } = &posts[0] else {
+            panic!("expected a post");
+        };
+        assert_eq!(
+            *blocks,
+            vec![
+                Block::paragraph("hello"),
+                Block::Code {
+                    lang: Some("rust".into()),
+                    text: "fn main() {}".into(),
+                },
+            ],
+            "known kinds map to chat blocks; unknown kinds and blank texts drop"
+        );
+    }
+
+    #[test]
+    fn responses_beyond_the_agents_grants_fail_the_run() {
         // an agent granted ONLY chat.post must not create tasks...
         let (mut m, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
         let mut ctx = CaptureCtx::new()
@@ -3937,7 +3878,7 @@ mod tests {
             &mut ctx,
             &result_event(
                 &run_id,
-                Ok(output(
+                Ok(response(
                     &["look what i did"],
                     vec![AgentAction::CreateTask {
                         task_id: "t1".into(),
@@ -3949,10 +3890,7 @@ mod tests {
         .unwrap();
         assert!(ctx.msgs.is_empty(), "a disallowed action emits NOTHING");
         commit(&mut m);
-        assert!(matches!(
-            get_run(&m, &run_id).unwrap().status,
-            RunStatus::Failed { .. }
-        ));
+        assert_eq!(get_pending(&m, &run_id), None);
 
         // ...and an agent granted only tasks.create must not post replies.
         let (mut m, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
@@ -3962,15 +3900,21 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &result_event(&run_id, Ok(output(&["hello"], vec![]))),
+            &result_event(&run_id, Ok(response(&["hello"], vec![]))),
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(
+            breadcrumbs.iter().any(|b| b.contains(ACTION_CHAT_POST)),
+            "the failure names the missing grant: {breadcrumbs:?}"
+        );
         commit(&mut m);
-        let RunStatus::Failed { reason } = get_run(&m, &run_id).unwrap().status else {
-            panic!("the run must fail");
-        };
-        assert!(reason.contains(ACTION_CHAT_POST));
+        assert_eq!(get_pending(&m, &run_id), None);
     }
 
     #[test]
@@ -4014,7 +3958,7 @@ mod tests {
             &mut ctx,
             &result_event(
                 &run_id,
-                Ok(output(
+                Ok(response(
                     &["ok"],
                     vec![AgentAction::CreateTask {
                         task_id: "t1".into(),
@@ -4025,11 +3969,14 @@ mod tests {
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(breadcrumbs.iter().any(|b| b.contains("no tasks module")));
         commit(&mut m);
-        let RunStatus::Failed { reason } = get_run(&m, &run_id).unwrap().status else {
-            panic!("the run must fail");
-        };
-        assert!(reason.contains("no tasks module"));
+        assert_eq!(get_pending(&m, &run_id), None);
     }
 
     #[test]
@@ -4044,15 +3991,18 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &result_event(&run_id, Ok(output(&["hi"], vec![]))),
+            &result_event(&run_id, Ok(response(&["hi"], vec![]))),
         )
         .unwrap();
         assert!(ctx.msgs.is_empty(), "the squatted id emits NOTHING");
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(breadcrumbs.iter().any(|b| b.contains("already taken")));
         commit(&mut m);
-        let RunStatus::Failed { reason } = get_run(&m, &run_id).unwrap().status else {
-            panic!("the run must fail");
-        };
-        assert!(reason.contains("already taken"));
+        assert_eq!(get_pending(&m, &run_id), None);
     }
 
     #[test]
@@ -4077,19 +4027,22 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &result_event(&run_id, Ok(output(&["hi"], vec![]))),
+            &result_event(&run_id, Ok(response(&["hi"], vec![]))),
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(breadcrumbs.iter().any(|b| b.contains("thread reply cap")));
         commit(&mut m);
-        let RunStatus::Failed { reason } = get_run(&m, &run_id).unwrap().status else {
-            panic!("the run must fail");
-        };
-        assert!(reason.contains("thread reply cap"));
+        assert_eq!(get_pending(&m, &run_id), None);
     }
 
     #[test]
-    fn failed_dispatch_outcomes_transition_the_run() {
+    fn failed_dispatch_outcomes_prune_the_entry_without_follow_ups() {
         let mut m = watched(TurnPolicy::All, &[("bot", &[ACTION_CHAT_POST])]);
         for seq in [2, 3] {
             engage_post(&mut m, seq, &[]);
@@ -4109,15 +4062,260 @@ mod tests {
             .unwrap();
             assert!(ctx.msgs.is_empty(), "terminal failures emit nothing");
             commit(&mut m);
-            let run = get_run(&m, &run_id).unwrap();
-            assert_eq!(
-                run.status,
-                RunStatus::Failed {
-                    reason: reason.into(),
-                }
-            );
-            assert_eq!(run.updated_at, 20);
+            assert_eq!(get_pending(&m, &run_id), None, "the entry pruned");
         }
+    }
+
+    // ---- the jobs lane ----------------------------------------------------------
+
+    /// a committed module with "duck" registered (task grants) and the jobs
+    /// worker semantics of the collaboration loop.
+    fn job_ready() -> AgentModule {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register("duck", &[ACTION_TASKS_CREATE])),
+        )
+        .unwrap();
+        commit(&mut m);
+        m
+    }
+
+    #[test]
+    fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
+        let mut m = job_ready();
+        let mut ctx = CaptureCtx::new().at(3).from_jobs();
+        exec(
+            &mut m,
+            &mut ctx,
+            &jobs_event("job-1", "agent/duck", "summarize this work item"),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        // the claim and the dispatch are staged together in the submit block.
+        assert_eq!(
+            ctx.job_msgs(),
+            vec![JobsMsg::Claim {
+                job_id: "job-1".into(),
+                lease_views: JOB_RUN_LEASE_VIEWS,
+            }]
+        );
+        let run_id = job_run_id_for("job-1", "duck", 3);
+        let dispatches = ctx.dispatch_msgs();
+        assert_eq!(dispatches.len(), 1);
+        let DispatchMsg::Dispatch {
+            dispatch_id,
+            recipe_id,
+            payload,
+        } = &dispatches[0]
+        else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(*dispatch_id, dispatch_id_for(&run_id));
+        assert_eq!(*recipe_id, recipe_id_for("duck"));
+        let text = String::from_utf8(payload.clone()).unwrap();
+        assert!(
+            text.contains("summarize this work item"),
+            "the FULL job spec rides the payload"
+        );
+        assert!(text.contains("Return ONLY a JSON object"));
+        assert!(text.contains("actions only"), "job framing rides along");
+
+        let entry = get_pending(&m, &run_id).expect("job entry staged");
+        assert_eq!(entry.job_id, Some("job-1".into()));
+        assert_eq!(entry.job_claim_height, 3);
+        assert_eq!(entry.agent_id, "duck");
+        assert_eq!(entry.requester, SagaOrigin::Module("jobs".into()));
+    }
+
+    #[test]
+    fn unknown_paused_or_foreign_kind_jobs_are_left_unclaimed() {
+        let mut m = job_ready();
+        let root = m.root();
+
+        // an unregistered agent kind: no claim, no dispatch, no entry.
+        let mut ctx = CaptureCtx::new().at(2).from_jobs();
+        exec(&mut m, &mut ctx, &jobs_event("j", "agent/ghost", "s")).unwrap();
+        assert!(ctx.msgs.is_empty());
+
+        // a non-agent kind is somebody else's job.
+        let mut ctx = CaptureCtx::new().at(2).from_jobs();
+        exec(&mut m, &mut ctx, &jobs_event("j", "render/video", "s")).unwrap();
+        assert!(ctx.msgs.is_empty());
+
+        // a paused agent never claims.
+        let mut pause = CaptureCtx::new().from_origin(user(9));
+        exec(
+            &mut m,
+            &mut pause,
+            &admin(&AgentMsg::PauseAgent {
+                agent_id: "duck".into(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let mut ctx = CaptureCtx::new().at(2).from_jobs();
+        exec(&mut m, &mut ctx, &jobs_event("j", "agent/duck", "s")).unwrap();
+        assert!(ctx.msgs.is_empty());
+        commit(&mut m);
+        assert_ne!(m.root(), root, "only the pause moved the root");
+        assert!(pending_runs(&m).is_empty());
+    }
+
+    #[test]
+    fn a_job_result_finalizes_the_board_and_emits_actions() {
+        let mut m = job_ready();
+        let mut ctx = CaptureCtx::new().at(3).from_jobs();
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
+        commit(&mut m);
+        let run_id = job_run_id_for("job-1", "duck", 3);
+
+        let bytes = response(
+            &[],
+            vec![AgentAction::CreateTask {
+                task_id: "job-task".into(),
+                title: "complete job".into(),
+            }],
+        );
+        let mut ctx = CaptureCtx::new()
+            .at(10)
+            .from_dispatch()
+            .with_claimed_job("job-1", 3);
+        exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes.clone()))).unwrap();
+        commit(&mut m);
+
+        assert_eq!(get_pending(&m, &run_id), None, "the job entry pruned");
+        assert_eq!(
+            ctx.task_msgs(),
+            vec![TaskMsg::CreateTask {
+                task_id: "job-task".into(),
+                title: "complete job".into(),
+            }]
+        );
+        let finalize = ctx.job_msgs();
+        assert_eq!(finalize.len(), 1);
+        let JobsMsg::Finalize {
+            job_id,
+            ok,
+            payload,
+        } = &finalize[0]
+        else {
+            panic!("expected a finalize");
+        };
+        assert_eq!(job_id, "job-1");
+        assert!(*ok);
+        assert_eq!(
+            payload.as_bytes(),
+            bytes.as_slice(),
+            "the normalized response JSON is the finalize payload"
+        );
+        assert!(ctx.chat_msgs().is_empty(), "job runs never post to chat");
+    }
+
+    #[test]
+    fn a_failed_job_result_finalizes_with_error_detail() {
+        let mut m = job_ready();
+        let mut ctx = CaptureCtx::new().at(3).from_jobs();
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
+        commit(&mut m);
+        let run_id = job_run_id_for("job-1", "duck", 3);
+
+        let mut ctx = CaptureCtx::new()
+            .at(10)
+            .from_dispatch()
+            .with_claimed_job("job-1", 3);
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Err("model unavailable".into())),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        assert_eq!(get_pending(&m, &run_id), None);
+        assert_eq!(
+            ctx.job_msgs(),
+            vec![JobsMsg::Finalize {
+                job_id: "job-1".into(),
+                ok: false,
+                payload: "model unavailable".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_job_response_with_reply_blocks_normalizes_to_actions_only() {
+        // job runs have no channel: normalization CLEARS reply blocks. a
+        // response left with neither blocks nor actions fails the run and
+        // finalizes the job as failed.
+        let mut m = job_ready();
+        let mut ctx = CaptureCtx::new().at(3).from_jobs();
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
+        commit(&mut m);
+        let run_id = job_run_id_for("job-1", "duck", 3);
+
+        let mut ctx = CaptureCtx::new()
+            .at(10)
+            .from_dispatch()
+            .with_claimed_job("job-1", 3);
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(response(&["chatty"], vec![]))),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        assert!(ctx.chat_msgs().is_empty(), "no chat post for a job run");
+        let finalize = ctx.job_msgs();
+        assert_eq!(finalize.len(), 1);
+        let JobsMsg::Finalize { ok, payload, .. } = &finalize[0] else {
+            panic!("expected a finalize");
+        };
+        assert!(!*ok, "an empty normalized response fails the job run");
+        assert!(payload.contains("neither reply blocks nor actions"));
+        assert_eq!(get_pending(&m, &run_id), None);
+    }
+
+    #[test]
+    fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
+        // the board reclaimed and re-claimed the job at a LATER height: the
+        // stale run's delivery must not finalize the new episode.
+        let mut m = job_ready();
+        let mut ctx = CaptureCtx::new().at(3).from_jobs();
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
+        commit(&mut m);
+        let run_id = job_run_id_for("job-1", "duck", 3);
+
+        let mut ctx = CaptureCtx::new()
+            .at(2000)
+            .from_dispatch()
+            .with_claimed_job("job-1", 1005);
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(response(
+                    &[],
+                    vec![AgentAction::CreateTask {
+                        task_id: "stale".into(),
+                        title: "late".into(),
+                    }],
+                )),
+            ),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        assert!(
+            ctx.job_msgs().is_empty(),
+            "a stale claim episode is never finalized"
+        );
+        assert_eq!(get_pending(&m, &run_id), None, "the stale entry still prunes");
     }
 
     // ---- explicit runs + cancellation ------------------------------------------------
@@ -4172,8 +4370,8 @@ mod tests {
         assert!(exec(&mut m, &mut ctx, &request("bot", 3)).is_err());
         abort(&mut m);
 
-        // resumed, the request lands: run staged + trigger emitted, requester
-        // recorded as the submitting user.
+        // resumed, the request lands: entry staged + dispatch emitted,
+        // requester recorded as the submitting user.
         let mut resume_ctx = CaptureCtx::new().from_origin(user(9));
         exec(
             &mut m,
@@ -4191,9 +4389,9 @@ mod tests {
         exec(&mut m, &mut ctx, &request("bot", 3)).unwrap();
         assert_eq!(ctx.dispatch_msgs().len(), 1);
         commit(&mut m);
-        let run = get_run(&m, &run_id_for("general", 3, "bot")).unwrap();
-        assert_eq!(run.requester, SagaOrigin::External(vec![1; 32]));
-        assert_eq!(run.context_hash, context_hash(&transcript(3)));
+        let entry = get_pending(&m, &run_id_for("general", 3, "bot")).unwrap();
+        assert_eq!(entry.requester, SagaOrigin::External(vec![1; 32]));
+        assert_eq!(entry.created_at, 6);
     }
 
     #[test]
@@ -4236,7 +4434,9 @@ mod tests {
         );
         abort(&mut m);
 
-        // the REQUESTER cancels: the dispatch plane is told, run Cancelled.
+        // the REQUESTER cancels: the dispatch plane is told; the entry STAYS
+        // pending — the plane's Err("cancelled") delivery is the one result
+        // path that prunes it.
         let mut ctx = CaptureCtx::new().at(7).from_origin(user(1));
         exec(&mut m, &mut ctx, &cancel).unwrap();
         assert_eq!(
@@ -4246,18 +4446,9 @@ mod tests {
             }]
         );
         commit(&mut m);
-        assert_eq!(get_run(&m, &run_id).unwrap().status, RunStatus::Cancelled);
+        assert!(get_pending(&m, &run_id).is_some(), "still pending delivery");
 
-        // cancelling a TERMINAL run is an idempotent no-op, no dispatch msg.
-        let root = m.root();
-        let mut ctx = CaptureCtx::new().from_origin(user(1));
-        exec(&mut m, &mut ctx, &cancel).unwrap();
-        assert!(ctx.msgs.is_empty());
-        commit(&mut m);
-        assert_eq!(m.root(), root);
-
-        // the plane's late Err("cancelled") delivery no-ops against the (by
-        // then terminal) run.
+        // the plane's Err("cancelled") delivery prunes the entry.
         let mut ctx = CaptureCtx::new().from_dispatch();
         exec(
             &mut m,
@@ -4267,7 +4458,15 @@ mod tests {
         .unwrap();
         assert!(ctx.msgs.is_empty());
         commit(&mut m);
-        assert_eq!(get_run(&m, &run_id).unwrap().status, RunStatus::Cancelled);
+        assert_eq!(get_pending(&m, &run_id), None);
+
+        // cancelling the now-delivered run is an idempotent no-op (the
+        // dispatch record proves it existed); a truly unknown one errors.
+        let mut ctx = CaptureCtx::new()
+            .from_origin(user(1))
+            .with_taken_dispatch(&dispatch_id_for(&run_id));
+        exec(&mut m, &mut ctx, &cancel).unwrap();
+        assert!(ctx.msgs.is_empty());
 
         // the OWNER may cancel an engagement-created run (requester = the
         // tagging plane).
@@ -4283,63 +4482,121 @@ mod tests {
             }),
         )
         .unwrap();
-        commit(&mut m);
-        assert_eq!(
-            get_run(&m, &engaged_run).unwrap().status,
-            RunStatus::Cancelled
-        );
+        assert_eq!(ctx.dispatch_msgs().len(), 1);
     }
 
-    // ---- context pinning ------------------------------------------------------------
+    // ---- consensus-resident prompts ---------------------------------------------
 
     #[test]
-    fn context_hash_pins_the_window_and_is_prefix_sensitive() {
-        // 70 messages, anchor 70: the window is seqs 7..=70 (64 messages).
-        let base = transcript(70);
-        let expected = context_hash(&base[6..70]);
-
-        let request = admin(&AgentMsg::RequestRun {
-            agent_id: "bot".into(),
-            channel_id: "general".into(),
-            anchor_seq: 70,
-        });
-        let run_of = |t: Vec<MessageView>| {
-            let mut m = watched(TurnPolicy::Mention, &[("bot", &[ACTION_CHAT_POST])]);
-            let mut ctx = CaptureCtx::new()
-                .from_origin(user(1))
-                .with_transcript("general", t);
-            exec(&mut m, &mut ctx, &request).unwrap();
+    fn a_prompt_doc_rides_the_payload_only_when_it_hashes_to_the_pin() {
+        let prompt = "You are DUCK-1, a terse reviewer.";
+        let register_with_doc = |prompt_hash: Vec<u8>| {
+            let mut m = module();
+            let mut ctx = CaptureCtx::new().from_origin(user(9));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&AgentMsg::RegisterAgent {
+                    agent_id: "bot".into(),
+                    display_name: "BOT".into(),
+                    capability: "model-1".into(),
+                    prompt_hash,
+                    prompt_doc: Some("prompts/bot".into()),
+                    allowed_actions: vec![ACTION_CHAT_POST.into()],
+                }),
+            )
+            .unwrap();
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&AgentMsg::WatchChannel {
+                    channel_id: "general".into(),
+                    policy: TurnPolicy::All,
+                }),
+            )
+            .unwrap();
             commit(&mut m);
-            get_run(&m, &run_id_for("general", 70, "bot")).unwrap()
+            m
         };
 
-        assert_eq!(run_of(base.clone()).context_hash, expected);
+        // the doc's canonical rendering hashes to the pin: it LEADS the
+        // composed payload — for chat runs AND job runs.
+        let good_hash = Sha256::digest(prompt.as_bytes()).to_vec();
+        let mut m = register_with_doc(good_hash.clone());
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_tagging()
+            .with_transcript("general", transcript(2))
+            .with_doc("prompts/bot", prompt);
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+        let dispatches = ctx.dispatch_msgs();
+        assert_eq!(dispatches.len(), 1);
+        let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
+            panic!("expected a dispatch");
+        };
+        assert!(String::from_utf8(payload.clone()).unwrap().starts_with(prompt));
+        abort(&mut m);
 
-        // editing a message OUTSIDE the window (seq 6) changes nothing...
-        let mut outside = base.clone();
-        outside[5].head.blocks = vec![Block::paragraph("edited away")];
-        assert_eq!(
-            run_of(outside).context_hash,
-            expected,
-            "the pin is bounded: seq 6 is outside the 64-message window"
+        let mut ctx = CaptureCtx::new()
+            .at(3)
+            .from_jobs()
+            .with_doc("prompts/bot", prompt);
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/bot", "spec")).unwrap();
+        let dispatches = ctx.dispatch_msgs();
+        assert_eq!(dispatches.len(), 1);
+        let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
+            panic!("expected a dispatch");
+        };
+        assert!(
+            String::from_utf8(payload.clone()).unwrap().starts_with(prompt),
+            "the job payload leads with the prompt doc too"
         );
 
-        // ...but changing seq 7 (the window's first message) changes the pin,
-        // and so does a tombstone anywhere inside it.
-        let mut inside = base.clone();
-        inside[6].head.blocks = vec![Block::paragraph("edited inside")];
-        assert_ne!(run_of(inside).context_hash, expected);
-        let mut deleted = base.clone();
-        deleted[40].head.deleted = true;
-        deleted[40].head.blocks = Vec::new();
-        assert_ne!(run_of(deleted).context_hash, expected);
+        // a drifted document (hash mismatch) skips the run — a breadcrumb,
+        // never a block abort; and an explicit request errors cleanly. a
+        // job submit is left UNCLAIMED the same way.
+        let mut m = register_with_doc(vec![7u8; PROMPT_HASH_LEN]);
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_tagging()
+            .with_transcript("general", transcript(2))
+            .with_doc("prompts/bot", prompt);
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+        assert!(ctx.msgs.is_empty(), "a drifted prompt doc dispatches nothing");
+        assert!(!ctx.events.is_empty());
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_jobs()
+            .with_doc("prompts/bot", prompt);
+        exec(&mut m, &mut ctx, &jobs_event("job-2", "agent/bot", "spec")).unwrap();
+        assert!(ctx.msgs.is_empty(), "no claim on an uncomposable job");
+        let mut ctx = CaptureCtx::new()
+            .from_origin(user(1))
+            .with_transcript("general", transcript(2))
+            .with_doc("prompts/bot", prompt);
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::RequestRun {
+                agent_id: "bot".into(),
+                channel_id: "general".into(),
+                anchor_seq: 2,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(reason) if reason.contains("prompt")));
 
-        // and two instances pinning the same transcript agree byte-for-byte
-        // (P4: any validator re-derives the same prompt input).
-        assert_eq!(run_of(base.clone()).context_hash, expected);
+        // a MISSING document skips the same way.
+        let mut m = register_with_doc(good_hash);
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_tagging()
+            .with_transcript("general", transcript(2));
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+        assert!(ctx.msgs.is_empty());
     }
 
-    // ---- determinism + queries ---------------------------------------------------------
+    // ---- determinism + queries + state-sync -------------------------------------------
 
     #[test]
     fn two_instances_replaying_the_same_ops_produce_identical_roots() {
@@ -4380,7 +4637,7 @@ mod tests {
             .unwrap();
             commit(&mut m);
             roots.push(m.root());
-            // block 3: the dispatch result lands Done.
+            // block 3: the dispatch result lands and prunes.
             let mut ctx = CaptureCtx::new()
                 .at(3)
                 .from_dispatch()
@@ -4388,7 +4645,7 @@ mod tests {
             exec(
                 &mut m,
                 &mut ctx,
-                &result_event(&run_id, Ok(output(&["done"], vec![]))),
+                &result_event(&run_id, Ok(response(&["done"], vec![]))),
             )
             .unwrap();
             commit(&mut m);
@@ -4415,7 +4672,7 @@ mod tests {
     }
 
     #[test]
-    fn queries_list_filter_and_clamp() {
+    fn queries_list_pending_watches_and_agents() {
         let mut m = watched(TurnPolicy::All, &[("a", &[]), ("b", &[])]);
         // watch a second channel and create runs in both.
         let mut ctx = CaptureCtx::new().from_origin(user(9));
@@ -4443,21 +4700,13 @@ mod tests {
         exec(&mut m, &mut ctx, &engagement("dev", 1, vec![])).unwrap();
         commit(&mut m);
 
-        let runs = |channel: Option<&str>, limit: u64| {
-            let reply = block_on(m.query(&encode_query(&AgentQuery::Runs {
-                channel_id: channel.map(String::from),
-                limit,
-            })))
-            .unwrap();
-            match decode_reply(&reply).unwrap() {
-                AgentReply::Runs(runs) => runs,
-                other => panic!("unexpected reply: {other:?}"),
-            }
-        };
-        assert_eq!(runs(None, 100).len(), 4, "2 agents x 2 channels");
-        assert_eq!(runs(Some("dev"), 100).len(), 2);
-        assert_eq!(runs(None, 1).len(), 1, "the limit clamps the page");
-        assert_eq!(runs(Some("nope"), 100).len(), 0);
+        let runs = pending_runs(&m);
+        assert_eq!(runs.len(), 4, "2 agents x 2 channels, all in flight");
+        assert!(
+            runs.iter()
+                .all(|r| r.dispatch_id == dispatch_id_for(&r.run_id)),
+            "every view carries its own dispatch id"
+        );
 
         let reply = block_on(m.query(&encode_query(&AgentQuery::Watches))).unwrap();
         let AgentReply::Watches(watches) = decode_reply(&reply).unwrap() else {
@@ -4500,93 +4749,5 @@ mod tests {
             StateSyncHandle::SnapshotBytes(m.snapshot()),
             "the handle IS the canonical snapshot"
         );
-    }
-
-    // ---- consensus-resident prompts ---------------------------------------------
-
-    #[test]
-    fn a_prompt_doc_rides_the_payload_only_when_it_hashes_to_the_pin() {
-        let prompt = "You are DUCK-1, a terse reviewer.";
-        let register_with_doc = |prompt_hash: Vec<u8>| {
-            let mut m = module();
-            let mut ctx = CaptureCtx::new().from_origin(user(9));
-            exec(
-                &mut m,
-                &mut ctx,
-                &admin(&AgentMsg::RegisterAgent {
-                    agent_id: "bot".into(),
-                    display_name: "BOT".into(),
-                    capability: "model-1".into(),
-                    prompt_hash,
-                    prompt_doc: Some("prompts/bot".into()),
-                    allowed_actions: vec![ACTION_CHAT_POST.into()],
-                }),
-            )
-            .unwrap();
-            exec(
-                &mut m,
-                &mut ctx,
-                &admin(&AgentMsg::WatchChannel {
-                    channel_id: "general".into(),
-                    policy: TurnPolicy::All,
-                }),
-            )
-            .unwrap();
-            commit(&mut m);
-            m
-        };
-
-        // the doc's canonical rendering hashes to the pin: it LEADS the
-        // composed payload.
-        let good_hash = Sha256::digest(prompt.as_bytes()).to_vec();
-        let mut m = register_with_doc(good_hash);
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .from_tagging()
-            .with_transcript("general", transcript(2))
-            .with_doc("prompts/bot", prompt);
-        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
-        let dispatches = ctx.dispatch_msgs();
-        assert_eq!(dispatches.len(), 1);
-        let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
-            panic!("expected a dispatch");
-        };
-        assert!(String::from_utf8(payload.clone()).unwrap().starts_with(prompt));
-
-        // a drifted document (hash mismatch) skips the run — a breadcrumb,
-        // never a block abort; and an explicit request errors cleanly.
-        let mut m = register_with_doc(vec![7u8; PROMPT_HASH_LEN]);
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .from_tagging()
-            .with_transcript("general", transcript(2))
-            .with_doc("prompts/bot", prompt);
-        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
-        assert!(ctx.msgs.is_empty(), "a drifted prompt doc dispatches nothing");
-        assert!(!ctx.events.is_empty());
-        let mut ctx = CaptureCtx::new()
-            .from_origin(user(1))
-            .with_transcript("general", transcript(2))
-            .with_doc("prompts/bot", prompt);
-        let err = exec(
-            &mut m,
-            &mut ctx,
-            &admin(&AgentMsg::RequestRun {
-                agent_id: "bot".into(),
-                channel_id: "general".into(),
-                anchor_seq: 2,
-            }),
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Module(reason) if reason.contains("prompt")));
-
-        // a MISSING document skips the same way.
-        let mut m = register_with_doc(Sha256::digest(prompt.as_bytes()).to_vec());
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .from_tagging()
-            .with_transcript("general", transcript(2));
-        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
-        assert!(ctx.msgs.is_empty());
     }
 }

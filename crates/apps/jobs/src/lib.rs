@@ -275,7 +275,7 @@ impl Jobs {
         self.stage_upsert(Job {
             job_id: job_id.clone(),
             kind: kind.clone(),
-            spec,
+            spec: spec.clone(),
             submitter: submitter.clone(),
             status: JobStatus::Pending,
             attempt: 0,
@@ -288,6 +288,7 @@ impl Jobs {
             job_id,
             kind,
             submitter,
+            spec,
             spec_hash,
         })
     }

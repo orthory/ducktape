@@ -31,9 +31,9 @@
 //! "concurrent writer" for optimistic-projection race scenarios.
 //!
 //! honesty rules: no synthetic-rejection knob (rejection scenarios must use
-//! genuinely rejectable ops, so module semantics stay real), no LlmWorker
-//! (an external llm call in a determinism tool is a contradiction; the echo
-//! worker behind `--echo-oracle` is the only oracle). storage should be a
+//! genuinely rejectable ops, so module semantics stay real), no live LLM
+//! worker (an external llm call in a determinism tool is a contradiction; the
+//! echo worker behind `--echo-oracle` is the only oracle). storage should be a
 //! fresh dir per run (the height resumes above the index watermark like
 //! noded's, but reused module state defeats the same-script reproducibility
 //! this tool exists for).
@@ -828,35 +828,15 @@ impl reactor::Worker for EchoWorker {
         };
         // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
         // module judged a Text contract; the agent module normalizes).
-        if let Ok(work) = dispatch_interface::decode_work_spec(&request.spec) {
-            return Ok(reactor::WorkOutcome::Handled(Some(Msg {
-                target: "saga".into(),
-                payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
-                    saga_id: request.saga_id,
-                    attempt: request.attempt,
-                    outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id)
-                        .into_bytes()),
-                }),
-            })));
-        }
-        let llm = match agent_interface::decode_llm_request(&request.spec) {
-            Ok(llm) => llm,
-            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
+        let Ok(work) = dispatch_interface::decode_work_spec(&request.spec) else {
+            return Ok(reactor::WorkOutcome::NotMine);
         };
         Ok(reactor::WorkOutcome::Handled(Some(Msg {
             target: "saga".into(),
             payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
                 saga_id: request.saga_id,
                 attempt: request.attempt,
-                outcome: Ok(agent_interface::encode_output(
-                    &agent_interface::AgentOutput {
-                        reply_blocks: vec![chat_interface::Block::paragraph(format!(
-                            "echo: handling {}",
-                            llm.run_id
-                        ))],
-                        actions: Vec::new(),
-                    },
-                )),
+                outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
             }),
         })))
     }

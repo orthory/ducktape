@@ -131,10 +131,10 @@ export function DucktapeProvider({
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
           agentClient.watches(live),
-          // newest-first for the timeline; Runs is ascending on the wire.
+          // newest-first for the timeline; the wire orders by dispatch id.
           agentClient
-            .runs(live, { channelId: null, limit: 50 })
-            .then((list) => [...list].reverse()),
+            .pendingRuns(live)
+            .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
           // ── unexposed-until-now modules — every one best-effort so a node
           //    that does not register the module reads as "empty", never a
@@ -164,7 +164,7 @@ export function DucktapeProvider({
         pageBlocks,
         agents,
         watches,
-        runs,
+        pendingRuns,
         profiles,
         inbox,
         inboxUnread,
@@ -208,7 +208,7 @@ export function DucktapeProvider({
                 activePageBlocks: pageBlocks ?? [],
                 agents,
                 watches,
-                runs,
+                pendingRuns,
                 inbox,
                 inboxUnread,
                 jobs,

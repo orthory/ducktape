@@ -85,7 +85,7 @@ const makeFakeNode = () => {
       if (target === "agent") {
         if (query === "Agents") return Promise.resolve({ Agents: [] });
         if (query === "Watches") return Promise.resolve({ Watches: [] });
-        return Promise.resolve({ Runs: [] });
+        return Promise.resolve({ PendingRuns: [] });
       }
       if (target === "profiles") {
         return Promise.resolve({ Profiles: [] });

@@ -715,6 +715,33 @@ impl IndexStore {
         Ok(())
     }
 
+    /// store one explorer row at `height` WITHOUT a dispatch fold — the write
+    /// side for a follower that observes state boundaries, never sealed
+    /// blocks. the module read models are the caller's problem (they re-derive
+    /// from canonical state, [`IndexStore::rebuild_module`]); this keeps the
+    /// blocks database honest about the one thing such a caller DID observe:
+    /// the boundary itself. same discipline as the fold's record write —
+    /// idempotent skip at or below the blocks watermark, row and watermark in
+    /// one atomic batch, failures poison.
+    pub fn apply_block_record(&self, height: u64, record: Vec<u8>) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let out = (|| -> Result<()> {
+            if read_height(&self.blocks)? < height {
+                let mut batch = WriteBatch::new();
+                batch.put(block_key(height), record);
+                batch.put(META_HEIGHT, height.to_be_bytes());
+                self.blocks.write(batch)?;
+            }
+            Ok(())
+        })();
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
     /// the newest `limit` explorer rows, oldest-first — the durable equivalent
     /// of an in-memory ring's "recent" read. rows return verbatim (their json
     /// shape is the node layer's), at one MVCC snapshot. `limit` is clamped to
@@ -1475,6 +1502,32 @@ mod tests {
         let ops = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
         assert!(ops.entries.is_empty(), "no op rows");
         assert_eq!(store.resume_height().unwrap(), 9, "blocks watermark counts");
+    }
+
+    #[test]
+    fn block_record_without_fold_leaves_module_watermarks_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // a boundary follower's write: the explorer row lands, the blocks
+        // watermark advances, and NO module watermark moves — read models
+        // answer to the from-state rebuild, not to this row.
+        store
+            .apply_block_record(7, br#"{"height":7}"#.to_vec())
+            .unwrap();
+
+        assert_eq!(store.recent_block_rows(10).unwrap(), vec![br#"{"height":7}"#.to_vec()]);
+        assert_eq!(store.blocks_height().unwrap(), 7);
+        assert_eq!(store.applied_height("chat").unwrap(), 0);
+        assert_eq!(store.applied_height("tasks").unwrap(), 0);
+
+        // idempotent at or below the blocks watermark, exactly like the fold.
+        store
+            .apply_block_record(7, br#"{"height":"dup"}"#.to_vec())
+            .unwrap();
+        store
+            .apply_block_record(3, br#"{"height":3}"#.to_vec())
+            .unwrap();
+        assert_eq!(store.recent_block_rows(10).unwrap(), vec![br#"{"height":7}"#.to_vec()]);
     }
 
     #[test]

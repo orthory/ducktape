@@ -52,29 +52,9 @@ dependencies = [
 name = "agent-interface"
 version = "0.1.0"
 dependencies = [
- "chat-interface",
  "saga-interface",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "agent-oracle"
-version = "0.1.0"
-dependencies = [
- "agent-interface",
- "async-trait",
- "capability-host",
- "chat-interface",
- "files",
- "futures",
- "reactor",
- "saga-interface",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
 ]
 
 [[package]]
@@ -4213,7 +4193,6 @@ name = "node-bin"
 version = "0.1.0"
 dependencies = [
  "agent",
- "agent-oracle",
  "async-trait",
  "automations",
  "base64 0.22.1",
@@ -4283,8 +4262,6 @@ name = "noded"
 version = "0.1.0"
 dependencies = [
  "agent",
- "agent-interface",
- "agent-oracle",
  "async-trait",
  "automations",
  "axum",
@@ -6097,7 +6074,6 @@ name = "simnode"
 version = "0.1.0"
 dependencies = [
  "agent",
- "agent-interface",
  "async-trait",
  "automations",
  "axum",

@@ -99,13 +99,16 @@ pub enum JobsMsg {
 /// the notification payload sent by `jobs` to each registered worker module.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum JobsEvent {
-    /// a job was submitted. `spec_hash` is sha256 over the submitted spec bytes;
-    /// workers use it to pin job-backed runs during the submit cascade, where
-    /// committed-only jobs queries cannot see the just-staged job.
+    /// a job was submitted. the event carries the full `spec` because it fires
+    /// inside the submit cascade, where committed-only jobs queries cannot see
+    /// the just-staged job — a worker that composes work from the spec (e.g. a
+    /// dispatch-plane payload) has ONLY this event to read it from. `spec_hash`
+    /// is sha256 over the same bytes, the cheap pin for job-backed runs.
     Submitted {
         job_id: String,
         kind: String,
         submitter: String,
+        spec: String,
         spec_hash: Vec<u8>,
     },
 }
