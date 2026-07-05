@@ -31,7 +31,7 @@ use std::time::Duration;
 use commonware_cryptography::{Signer as _, ed25519};
 use nat_traversal::{NatClient, NodeKey};
 use tokio::sync::mpsc;
-use wireguard_effect::{WireGuardEffect, apply_tunnel_plans};
+use wireguard_effect::{PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, apply_tunnel_plans};
 use wireguard_upgrade::{
     ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, Endpoint, MeshVersion, MeshView,
     OverlayPolicy, Perspective, PortPolicy, ReplayCache, SignedEndpointRecord, TunnelInstallPlan,
@@ -43,6 +43,7 @@ use wireguard_upgrade::{
 use crate::binding;
 use crate::keys::{KeyError, WireGuardKeypair};
 use crate::msg::{MsgError, ReachabilityMsg};
+use crate::store::{self, PersistedMesh};
 
 /// Views an advertisement stays valid for past the cutover view that minted
 /// it. Generous: a re-advertisement (NAT rebind, key rotation) supersedes by
@@ -86,6 +87,10 @@ pub struct ReachabilityConfig {
     pub coordinators: Vec<SocketAddr>,
     /// The endpoint policy advertisements and handshakes validate against.
     pub port_policy: PortPolicy,
+    /// Where the last applied epoch's verified mesh is persisted (and read
+    /// back for the cold-restart re-apply). `None` disables persistence —
+    /// the plane then only ever assembles from live gossip.
+    pub persist_file: Option<PathBuf>,
 }
 
 /// A valset cutover (or boot) the orchestrator must retarget to.
@@ -158,6 +163,21 @@ pub enum ReachabilityEvent {
     /// The epoch as a whole failed (mesh verification, effect rejection).
     /// Previous tunnels stay as they were; the next cutover retries.
     EpochFailed { epoch: u64, reason: String },
+    /// The persisted mesh re-applied at boot: `peers` tunnels from epoch
+    /// `epoch`'s remembered records, endpoints freshly coordinator-resolved.
+    /// Purely a gossip carrier — the boot epoch's own assembly replaces it.
+    MeshRestored {
+        epoch: u64,
+        interface: String,
+        peers: usize,
+    },
+    /// The boot re-apply could not run (unreadable state file, effect
+    /// rejection). The plane continues on live assembly alone — exactly the
+    /// pre-persistence behavior.
+    RestoreFailed { reason: String },
+    /// The epoch applied but its mesh could not be persisted; a cold restart
+    /// would restore the PREVIOUS persisted epoch (or nothing).
+    PersistFailed { reason: String },
 }
 
 /// How a peer's WireGuard endpoint was resolved.
@@ -422,6 +442,10 @@ struct Driver<'a, E, R> {
     /// A previous epoch's interface is live and must be removed before (or
     /// instead of) the next apply.
     interface_live: bool,
+    /// The cold-restart re-apply runs at most once per process life, on the
+    /// first `Retarget` (boot). Later retargets are live cutovers with a
+    /// working transport — restoring over them would tear down good tunnels.
+    restore_tried: bool,
 }
 
 /// Drive the reachability plane until `Shutdown` (clean exit) or a channel
@@ -472,6 +496,7 @@ where
         view: 0,
         state: None,
         interface_live: false,
+        restore_tried: false,
     };
     while let Some(command) = commands.recv().await {
         match command {
@@ -557,6 +582,10 @@ where
                 })
                 .await;
         }
+        if !self.restore_tried {
+            self.restore_tried = true;
+            self.restore(&event).await?;
+        }
         let set = binding::active_set(&self.config.chain_id, event.epoch, identities.clone())?;
         let pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey> = event
             .members
@@ -612,6 +641,120 @@ where
         }
         // a single-member network is a complete mesh already.
         self.advance().await
+    }
+
+    /// The cold-restart re-apply: bring the LAST applied epoch's tunnels
+    /// back from the persisted mesh so plane gossip has a path on a node
+    /// that restarted with zero TCP links (NATed member whose join ingress
+    /// is gone; whole-network cold start). Everything re-derives from the
+    /// persisted records — peer WireGuard keys and advertised endpoints from
+    /// the records themselves, overlay addresses from `(chain_id, identity)`
+    /// — except endpoints behind NAT, which are re-resolved FRESH through
+    /// the coordinator (a persisted punch/relay observation died with the
+    /// downtime's NAT mappings; re-resolution needs no gossip). One-sided
+    /// resolution suffices: WireGuard roams a peer's endpoint on any
+    /// authenticated inbound packet, so whichever side resolves a working
+    /// path first heals the pair.
+    ///
+    /// Strictly best-effort and strictly a bootstrap: failures degrade to
+    /// the pre-persistence behavior (live assembly only), and the boot
+    /// epoch's own assembly replaces the restored interface at its apply.
+    async fn restore(&mut self, event: &MeshEpochEvent) -> Result<(), ReachabilityError> {
+        let Some(path) = &self.config.persist_file else {
+            return Ok(());
+        };
+        let mesh = match store::load(path, &self.config.chain_id) {
+            Ok(Some(mesh)) => mesh,
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                return self
+                    .emit(ReachabilityEvent::RestoreFailed {
+                        reason: err.to_string(),
+                    })
+                    .await;
+            }
+        };
+        // the BOOT epoch's members gate the restore: a departed member's
+        // tunnel is dead weight, an arrival has no persisted record (its
+        // tunnel assembles live). Signatures were verified by `load`.
+        let member_pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey> = event
+            .members
+            .iter()
+            .map(|pk| (binding::identity_of(pk), pk.clone()))
+            .collect();
+        let records: Vec<EndpointRecord> = mesh
+            .adverts
+            .iter()
+            .map(|advert| advert.record.clone())
+            .filter(|record| {
+                record.validator_identity != self.me
+                    && member_pk_of.contains_key(&record.validator_identity)
+            })
+            .collect();
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut peers = Vec::with_capacity(records.len());
+        for record in &records {
+            let advertised = record.wireguard_endpoint.socket_addr();
+            let endpoint = match self
+                .resolver
+                .resolve(binding::node_key(record.validator_identity), advertised)
+                .await
+            {
+                Ok(Resolution::Advertised) => advertised,
+                Ok(Resolution::Punched(addr)) | Ok(Resolution::Relayed(addr)) => addr,
+                Err(reason) => {
+                    // same contract as live assembly: the peer rides its
+                    // advertised endpoint and the failure is surfaced.
+                    self.emit(ReachabilityEvent::PeerFailed {
+                        peer: member_pk_of[&record.validator_identity].clone(),
+                        reason: format!("restore endpoint resolution: {reason}"),
+                    })
+                    .await?;
+                    advertised
+                }
+            };
+            let allowed_ips = self
+                .overlay
+                .identity_allowed_ips(record.validator_identity)
+                .expect("the plane's overlay is ula_v6, which derives view-free");
+            peers.push(PeerTunnelConfig {
+                wireguard_public_key: record.wireguard_public_key,
+                endpoint,
+                allowed_ips,
+                keepalive_seconds: Some(KEEPALIVE_SECONDS),
+            });
+        }
+        let local_interface_ips = self
+            .overlay
+            .identity_allowed_ips(self.me)
+            .expect("the plane's overlay is ula_v6, which derives view-free");
+        let peer_count = peers.len();
+        match apply_peer_tunnels(
+            &mut self.effect,
+            self.interface.clone(),
+            self.keypair.private_key_base64(),
+            self.config.wireguard_listen,
+            &local_interface_ips,
+            &peers,
+        ) {
+            Ok(()) => {
+                self.interface_live = true;
+                self.emit(ReachabilityEvent::MeshRestored {
+                    epoch: mesh.epoch,
+                    interface: self.interface.clone(),
+                    peers: peer_count,
+                })
+                .await
+            }
+            Err(err) => {
+                self.emit(ReachabilityEvent::RestoreFailed {
+                    reason: format!("wireguard effect: {err:?}"),
+                })
+                .await
+            }
+        }
     }
 
     /// Re-offer whatever the current stage is still waiting on, always the
@@ -1029,6 +1172,7 @@ where
             let epoch = state.epoch;
             let plans: Vec<TunnelInstallPlan> = state.plans.values().cloned().collect();
             let overrides = state.overrides.clone();
+            let adverts: Vec<EndpointAdvertisement> = state.adverts.values().cloned().collect();
             if self.interface_live {
                 let _ = self.effect.remove_interface();
                 self.interface_live = false;
@@ -1050,6 +1194,20 @@ where
                         .await;
                 }
                 self.interface_live = true;
+                // the epoch's mesh is now REAL — remember it for the
+                // cold-restart re-apply. Only here: an all-peers-failed
+                // epoch (no interface) must not clobber the last mesh that
+                // actually carried tunnels.
+                if let Some(path) = &self.config.persist_file {
+                    let mesh =
+                        PersistedMesh::new(self.config.chain_id.clone(), epoch, adverts);
+                    if let Err(err) = store::save(path, &mesh) {
+                        self.emit(ReachabilityEvent::PersistFailed {
+                            reason: err.to_string(),
+                        })
+                        .await?;
+                    }
+                }
             }
             return self
                 .emit(ReachabilityEvent::TunnelsApplied {

@@ -19,6 +19,7 @@ use crate::WireGuardEffect;
 /// container works), then confirm with `ip addr show <ifname>` and
 /// `wg show <ifname>`.
 pub struct DefguardWireGuardEffect {
+    ifname: String,
     api: WGApi<Userspace>,
 }
 
@@ -27,8 +28,10 @@ impl DefguardWireGuardEffect {
     /// the `WGApi` handle — it does not touch the network or require
     /// privilege; `create_interface` does.
     pub fn new(ifname: impl Into<String>) -> Result<Self, WireguardInterfaceError> {
+        let ifname = ifname.into();
         Ok(Self {
-            api: WGApi::<Userspace>::new(ifname)?,
+            api: WGApi::<Userspace>::new(ifname.clone())?,
+            ifname,
         })
     }
 }
@@ -68,7 +71,39 @@ impl WireGuardEffect for DefguardWireGuardEffect {
     }
 
     fn remove_interface(&mut self) -> Result<(), Self::Error> {
-        self.api.remove_interface()
+        self.api.remove_interface()?;
+        // A remove->create cycle on the same name (epoch cutover replacing
+        // the interface; live assembly replacing a restored mesh) trips a
+        // lifecycle bug in defguard's userspace `WGApi`: `remove_interface`
+        // takes `&self` and CANNOT clear the stale `DeviceHandle` it holds,
+        // so the next `create_interface` drops that handle only AFTER the
+        // new device has bound the same UAPI socket path — and
+        // `DeviceHandle::drop`'s `clean()` then unlinks the NEW device's
+        // socket, making the following `configure_interface` fail with
+        // `IoError(NotFound)`. Rebuild the `WGApi` here instead, so the
+        // stale handle drops NOW, while the socket path is already gone.
+        self.api = WGApi::<Userspace>::new(self.ifname.clone())?;
+        // The old device's worker threads exit asynchronously (they hold
+        // the TUN until they observe the exit trigger); creating a same-name
+        // TUN against that window fails. Wait for the device to actually
+        // vanish — bounded, and a timeout stays loud: the caller's next
+        // `create_interface` is the operation that would break.
+        #[cfg(target_os = "linux")]
+        {
+            let sys = format!("/sys/class/net/{}", self.ifname);
+            for _ in 0..200 {
+                if !std::path::Path::new(&sys).exists() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            return Err(WireguardInterfaceError::Interface(format!(
+                "interface {} still exists 2s after removal",
+                self.ifname
+            )));
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(())
     }
 }
 
@@ -116,6 +151,15 @@ mod tests {
             mtu: None,
             fwmark: None,
         };
+        effect.apply(&config).unwrap();
+
+        // The replace cycle every epoch cutover (and every restored-mesh
+        // handoff) runs: remove the live interface and stand it back up
+        // under the SAME name. Without the WGApi rebuild in
+        // `remove_interface`, the stale DeviceHandle's drop unlinks the new
+        // device's UAPI socket and this second `apply` fails NotFound.
+        effect.remove_interface().unwrap();
+        effect.create_interface().unwrap();
         effect.apply(&config).unwrap();
 
         // `apply` must leave a USABLE tunnel: link up (the flags string
