@@ -556,3 +556,91 @@ fn signed_record_verifies_owner_and_rejects_tamper_and_cross_domain() {
     };
     assert_eq!(grafted.verify().unwrap_err(), UpgradeError::BadSignature);
 }
+
+/// The two ends of a handshake run INDEPENDENT view clocks (each node's
+/// plane learns views from its own finalization drain), so the ack's
+/// `installed_at_view` routinely lands a tick or two AHEAD of the
+/// validating responder's clock. Forward skew within the same freshness
+/// lag must validate — a zero-tolerance future check permanently failed
+/// real cross-node pairs (observed live: initiator applied, responder
+/// refused the same triple with BadAckView). Skew beyond the lag still
+/// refuses in both directions.
+#[test]
+fn ack_view_tolerates_cross_node_skew_within_the_lag() {
+    let (a, b, set, view, policy) = mesh();
+    let overlay = OverlayPolicy::ula_v6(set.namespace.clone());
+    let request = TunnelUpgradeRequest::sign(
+        TunnelUpgradeRequestFields {
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            initiator_identity: id(&a),
+            responder_identity: id(&b),
+            initiator_wireguard_public_key: xkey(1),
+            initiator_wireguard_endpoint: view.record(id(&a)).unwrap().wireguard_endpoint,
+            requested_allowed_ips: overlay.allowed_ips_for(&view, id(&b)).unwrap(),
+            port_policy_hash: policy.hash(),
+            expires_at_view: 40,
+            nonce: 1,
+        },
+        &a,
+    );
+    let response = TunnelUpgradeResponse::sign(
+        TunnelUpgradeResponseFields {
+            request_hash: request.hash(),
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            responder_identity: id(&b),
+            initiator_identity: id(&a),
+            responder_wireguard_public_key: xkey(2),
+            responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
+            accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
+            relay_candidates: vec![],
+            direct_dial_failure: None,
+            keepalive_seconds: Some(25),
+            expires_at_view: 40,
+            nonce: 2,
+        },
+        &b,
+    );
+    let ack = TunnelUpgradeAck::sign(
+        TunnelUpgradeAckFields {
+            request_hash: request.hash(),
+            response_hash: response.hash(),
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            initiator_identity: id(&a),
+            responder_identity: id(&b),
+            installed_at_view: 11,
+            expires_at_view: 40,
+            nonce: 3,
+        },
+        &a,
+    );
+
+    // the responder's clock is ONE view behind the initiator's mint — the
+    // routine cross-node case that must validate.
+    let mut cache = ReplayCache::default();
+    validate_upgrade(
+        &view, &policy, &overlay, 10, &request, &response, &ack, &mut cache,
+    )
+    .expect("one view of forward skew validates");
+
+    // nine views behind (past MAX_ACK_INSTALL_LAG = 8): still refused.
+    let mut cache = ReplayCache::default();
+    assert_eq!(
+        validate_upgrade(
+            &view, &policy, &overlay, 2, &request, &response, &ack, &mut cache,
+        )
+        .unwrap_err(),
+        UpgradeError::BadAckView
+    );
+}

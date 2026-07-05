@@ -1074,7 +1074,15 @@ pub fn validate_upgrade_as(
     {
         return Err(UpgradeError::Expired);
     }
-    if ak.installed_at_view > current_view
+    // freshness is a SYMMETRIC window: the two ends of a handshake run
+    // independent view clocks (each node's plane learns views from its own
+    // finalization drain), so a genuine ack routinely arrives with
+    // `installed_at_view` a tick or two ahead of the validator's clock. a
+    // zero-tolerance future check permanently failed real cross-node pairs
+    // (initiator applied, responder refused the same triple); bounding both
+    // directions by the same lag keeps the staleness envelope without
+    // punishing ordinary skew.
+    if ak.installed_at_view.saturating_sub(current_view) > MAX_ACK_INSTALL_LAG
         || current_view.saturating_sub(ak.installed_at_view) > MAX_ACK_INSTALL_LAG
     {
         return Err(UpgradeError::BadAckView);
@@ -1180,8 +1188,11 @@ fn validate_direct_dial_failure(
     {
         return Err(UpgradeError::InvalidDialFailure);
     }
+    // symmetric freshness window, exactly as the ack's `installed_at_view`:
+    // the evidence is minted on the INITIATOR's view clock and validated on
+    // the responder's — ordinary cross-node skew must not refuse it.
     if current_view > f.expires_at_view
-        || f.failed_at_view > current_view
+        || f.failed_at_view.saturating_sub(current_view) > MAX_DIAL_FAILURE_LAG
         || current_view.saturating_sub(f.failed_at_view) > MAX_DIAL_FAILURE_LAG
     {
         return Err(UpgradeError::InvalidDialFailure);
