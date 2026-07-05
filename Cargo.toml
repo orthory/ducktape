@@ -18,6 +18,7 @@ members = [
     "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
+    "crates/kernel/capability-host",
     # system — consensus infrastructure modules
     "crates/system/kv", "crates/system/kv-interface",
     "crates/system/valset", "crates/system/valset-interface",
@@ -28,6 +29,7 @@ members = [
     "crates/system/wireguard-effect",
     "crates/system/nat-traversal",
     "crates/system/saga", "crates/system/saga-interface",
+    "crates/system/capability", "crates/system/capability-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
     "crates/apps/document", "crates/apps/document-interface", "crates/apps/document-index",
@@ -94,6 +96,7 @@ reactor = { path = "crates/kernel/reactor" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
+capability-host = { path = "crates/kernel/capability-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 chat-index = { path = "crates/apps/chat-index" }
@@ -106,6 +109,7 @@ valset = { path = "crates/system/valset" }
 governance = { path = "crates/system/governance" }
 upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
+capability = { path = "crates/system/capability" }
 forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
 pages = { path = "crates/apps/pages" }
@@ -132,6 +136,7 @@ wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 wireguard-effect = { path = "crates/system/wireguard-effect" }
 nat-traversal = { path = "crates/system/nat-traversal" }
 saga-interface = { path = "crates/system/saga-interface" }
+capability-interface = { path = "crates/system/capability-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
 pages-interface = { path = "crates/apps/pages-interface" }

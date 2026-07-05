@@ -50,7 +50,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent::AgentModule;
-use agent_oracle::{AuthStore, LlmWorker};
+use agent_oracle::LlmWorker;
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
@@ -80,6 +80,7 @@ const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 /// (the forge multi-repo-v2 root/snapshot divergence) and truthfully `SignalReady`.
 const MAX_PROTOCOL_VERSION: u32 = 2;
 use automations::Automations;
+use capability::CapabilityRegistry;
 use chat::Chat;
 use directory::Directory;
 use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
@@ -167,7 +168,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 19] = [
+const MODULE_IDS: [&str; 20] = [
     "kv",
     "document",
     "pages",
@@ -177,6 +178,7 @@ const MODULE_IDS: [&str; 19] = [
     "governance",
     "upgrade",
     "saga",
+    "capability",
     "tasks",
     "vaults",
     "profiles",
@@ -428,6 +430,81 @@ impl ReadinessSignaller {
     }
 }
 
+/// the capability self-announcer: the state-driven twin of
+/// [`ReadinessSignaller`] for the capability registry. it polls the committed
+/// registry each pump tick and, when this node's announced set differs from
+/// what discovery found locally, self-submits ONE declarative
+/// [`CapabilityMsg::Announce`]. state-driven (survives restart/late-join) and
+/// idempotent: once the committed set matches, it stays quiet. a node with no
+/// providers announces nothing.
+struct CapabilityAnnouncer {
+    /// this node's own validator pubkey bytes — the registry identity.
+    me: Vec<u8>,
+    /// the capability tags discovery found on this host, sorted — the truthful
+    /// set to announce. empty means this node provides nothing.
+    capabilities: Vec<String>,
+    /// the set we last SUBMITTED (not yet observed committed), latched so an
+    /// in-flight announce is not re-sent every tick.
+    announced: Option<Vec<String>>,
+}
+
+impl CapabilityAnnouncer {
+    fn new(me: Vec<u8>, capabilities: Vec<String>) -> Self {
+        Self {
+            me,
+            capabilities,
+            announced: None,
+        }
+    }
+
+    /// the PURE decision core: given this node's committed announced set,
+    /// decide whether to (re)announce. `None` when the registry already matches
+    /// what we'd announce, or an identical announce is already in flight.
+    fn decide(&mut self, committed: &[String]) -> Option<Vec<String>> {
+        // nothing to provide and nothing recorded: stay silent (genesis state).
+        if self.capabilities.is_empty() && committed.is_empty() {
+            return None;
+        }
+        // the registry already reflects our providers — nothing to do.
+        if committed == self.capabilities.as_slice() {
+            self.announced = None;
+            return None;
+        }
+        // an announce for this exact set is already in flight.
+        if self.announced.as_deref() == Some(self.capabilities.as_slice()) {
+            return None;
+        }
+        self.announced = Some(self.capabilities.clone());
+        Some(self.capabilities.clone())
+    }
+
+    /// query this node's committed capability set and, when an announce is due,
+    /// build the external-origin `Announce` op. gracefully `None` when the
+    /// module is absent (pre-retrofit net) or the reply is unreadable.
+    async fn maybe_announce(&mut self, host: &Host) -> Option<Msg> {
+        use capability_interface::{
+            CapabilityMsg, CapabilityQuery, CapabilityReply, decode_reply, encode_msg, encode_query,
+        };
+        let reply = host
+            .query(
+                "capability",
+                &encode_query(&CapabilityQuery::Node {
+                    node: self.me.clone(),
+                }),
+            )
+            .await
+            .ok()?;
+        let CapabilityReply::Node(committed) = decode_reply(&reply).ok()? else {
+            return None;
+        };
+        let capabilities = self.decide(&committed)?;
+        Some(Msg {
+            target: "capability".into(),
+            payload: encode_msg(&CapabilityMsg::Announce { capabilities }),
+        })
+    }
+}
+
 /// hex-encode a state root for a stable, greppable log line.
 fn hex(root: &StateRoot) -> String {
     hex_bytes(&root.0)
@@ -474,6 +551,11 @@ async fn genesis_host(
         // presence in the registry is its genesis app-hash contribution.
         Box::new(Upgrade::new("upgrade", "valset")),
         Box::new(SagaModule::new("saga")),
+        // the network-wide registry of node host capabilities ("codex",
+        // "claude", ...): member-gated self-announcements, so every node holds
+        // an identical view of who can run what. its genesis contribution is an
+        // empty registry (ZERO root) until nodes announce.
+        Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
         // the origin-gated display-name registry: each verified submit origin
@@ -565,6 +647,12 @@ async fn restore_host(
     saga.install(bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
+    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    let (bytes, root) = snapshot_of("capability")?;
+    capability
+        .install(bytes, root)
+        .map_err(|e| format!("capability install: {e}"))?;
+
     let mut tasks = Tasks::new("tasks");
     let (bytes, root) = snapshot_of("tasks")?;
     tasks
@@ -640,6 +728,7 @@ async fn restore_host(
         Box::new(governance),
         Box::new(upgrade),
         Box::new(saga),
+        Box::new(capability),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -776,6 +865,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     saga.install(&bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("capability").await?;
+    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    capability
+        .install(&bytes, root)
+        .map_err(|e| format!("capability install: {e}"))?;
+
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance = Governance::new("governance", "valset", "upgrade");
     governance
@@ -875,6 +970,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(governance),
         Box::new(upgrade),
         Box::new(saga),
+        Box::new(capability),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -4177,12 +4273,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the host-owned worker set (reactor seam): effects of finalized
         // blocks are offered here, and claimed follow-ups re-enter the ordered
         // lane as their own blocks.
+        // discover this host's installed executor CLIs (BYO — no credential
+        // handling here). the discovered tag set is BOTH what the oracle worker
+        // can run and what this node announces to the capability registry, so
+        // the two can never drift.
+        let providers = capability_host::discover();
+        let my_capabilities = providers.capabilities();
         let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
             blobs.clone(),
-            AuthStore::from_default_path(),
-            // the ChatGPT/Codex subscription endpoint rejects gpt-5.1 (400 "not
-            // supported when using Codex with a ChatGPT account") — default to a
-            // model the account can serve; per-agent model_ref overrides this.
+            providers,
+            // default codex model when a request pins none; a claude model_ref
+            // routes to the claude provider instead (see agent_oracle::capability_for).
             "gpt-5.3-codex-spark".into(),
         ))];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
@@ -4191,6 +4292,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // one-shot effect). inert before the module is registered.
         let mut signaller =
             ReadinessSignaller::new(MAX_PROTOCOL_VERSION, signer.public_key().as_ref().to_vec());
+        // the capability self-announcer: publishes this node's discovered
+        // provider set into the capability registry once (state-driven,
+        // idempotent). inert when this host installed no executor CLIs.
+        let mut announcer =
+            CapabilityAnnouncer::new(signer.public_key().as_ref().to_vec(), my_capabilities);
         // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
         // modeled on the `converged` latch: `upgrade armed …` fires when readiness
         // first reaches R==n (every current boundary member signaled) for the
@@ -5047,6 +5153,31 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 // the next tick (the module stays idempotent).
                                 signaller.signaled = None;
                                 eprintln!("[node {label}] readiness signal submit failed: {e}");
+                            }
+                        }
+                    }
+
+                    // CAPABILITY ANNOUNCE: a current member whose discovered
+                    // provider set differs from the committed registry
+                    // self-submits ONE declarative `Announce`. member-gated (the
+                    // module rejects non-members) and idempotent (committed-read
+                    // + local latch). inert on a host with no executor CLIs.
+                    if orchestrator
+                        .current_members()
+                        .contains(&signer.public_key())
+                        && let Some(msg) = announcer.maybe_announce(node.host()).await
+                    {
+                        let seq = next_seq;
+                        next_seq += 1;
+                        match node.submit(&signer, seq, msg).await {
+                            Ok(_) => println!(
+                                "[node {label}] announced capabilities {:?}",
+                                announcer.capabilities
+                            ),
+                            Err(e) => {
+                                // un-latch so a transient submit failure retries.
+                                announcer.announced = None;
+                                eprintln!("[node {label}] capability announce submit failed: {e}");
                             }
                         }
                     }

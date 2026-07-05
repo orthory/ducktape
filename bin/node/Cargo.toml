@@ -35,6 +35,11 @@ governance-interface = { workspace = true }
 upgrade = { workspace = true }
 upgrade-interface = { workspace = true }
 saga = { workspace = true }
+# the network-wide node-capability registry + its wire surface; the host-side
+# provider discovery announces this node's installed executor CLIs into it.
+capability = { workspace = true }
+capability-interface = { workspace = true }
+capability-host = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
 pages = { workspace = true }
