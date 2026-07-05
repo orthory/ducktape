@@ -60,6 +60,7 @@ use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver, Recipients, Send
 use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 use dispatch::DispatchModule;
+use tagging::TaggingModule;
 use dispatch_oracle::DispatchWorker;
 use futures::{FutureExt as _, StreamExt as _};
 
@@ -559,7 +560,9 @@ async fn genesis_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
-    let chat = Chat::init(context.child("chat"), "chat").await;
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
     // forge shares the files body plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge =
@@ -602,6 +605,9 @@ async fn genesis_host(
         // the task plane: recipe manifests + capability-routed dispatch with
         // next-block result delivery (the host's DeliverPending injection).
         Box::new(DispatchModule::new("dispatch", "saga")),
+        // the engagement plane: content modules report tags, subscriber
+        // modules receive engagement events — router only, module-agnostic.
+        Box::new(TaggingModule::new("tagging")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
         // the origin-gated display-name registry: each verified submit origin
@@ -619,8 +625,11 @@ async fn genesis_host(
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -649,7 +658,9 @@ async fn restore_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
-    let chat = Chat::init(context.child("chat"), "chat").await;
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
     // forge shares the files body plane (see genesis_host) for Push materialization.
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
         .map_err(|e| format!("forge: {e}"))?;
@@ -705,6 +716,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
 
+    let mut tagging = TaggingModule::new("tagging");
+    let (bytes, root) = snapshot_of("tagging")?;
+    tagging
+        .install(bytes, root)
+        .map_err(|e| format!("tagging install: {e}"))?;
+
     let mut tasks = Tasks::new("tasks");
     let (bytes, root) = snapshot_of("tasks")?;
     tasks
@@ -750,8 +767,11 @@ async fn restore_host(
         "agent",
         "chat",
         "saga",
+        "tagging",
+        "dispatch",
         Some("tasks".into()),
         Some("jobs".into()),
+        Some("document".into()),
     );
     let (bytes, root) = snapshot_of("agent")?;
     agent
@@ -782,6 +802,7 @@ async fn restore_host(
         Box::new(saga),
         Box::new(capability),
         Box::new(dispatch),
+        Box::new(tagging),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -884,7 +905,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await
+    .with_tagging("tagging");
 
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
@@ -929,6 +951,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     dispatch
         .install(&bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("tagging").await?;
+    let mut tagging = TaggingModule::new("tagging");
+    tagging
+        .install(&bytes, root)
+        .map_err(|e| format!("tagging install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance = Governance::new("governance", "valset", "upgrade");
@@ -988,8 +1016,11 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "agent",
         "chat",
         "saga",
+        "tagging",
+        "dispatch",
         Some("tasks".into()),
         Some("jobs".into()),
+        Some("document".into()),
     );
     agent
         .install(&bytes, root)
@@ -1031,6 +1062,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(saga),
         Box::new(capability),
         Box::new(dispatch),
+        Box::new(tagging),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),

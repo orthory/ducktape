@@ -25,6 +25,7 @@ automations = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
 dispatch = { workspace = true }
+tagging = { workspace = true }
 agent-interface = { workspace = true }
 saga = { workspace = true }
 saga-interface = { workspace = true }

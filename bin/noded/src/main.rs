@@ -31,6 +31,7 @@ use chat::Chat;
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
+use tagging::TaggingModule;
 use dispatch_oracle::DispatchWorker;
 use document::Document;
 use files::Files;
@@ -57,10 +58,11 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 14] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
+    "tagging",
     "tasks",
     "inbox",
     "automations",
@@ -249,11 +251,15 @@ fn run_node(
         // files registers over the
         // http layer's blob handle so uploads land in the store `serve_sync`
         // reads — the bytes themselves never touch consensus.
-        let chat = Chat::init(context.child("chat"), "chat").await;
+        let chat = Chat::init(context.child("chat"), "chat")
+            .await
+            .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         // the task plane: recipe manifests + capability dispatch with
         // next-block result delivery.
         let dispatch = DispatchModule::new("dispatch", "saga");
+        // the engagement plane: tag reports in, engagement events out.
+        let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
@@ -262,8 +268,11 @@ fn run_node(
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         );
         let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
@@ -286,6 +295,7 @@ fn run_node(
             Box::new(chat),
             Box::new(saga),
             Box::new(dispatch),
+            Box::new(tagging),
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),

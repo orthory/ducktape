@@ -62,6 +62,7 @@ use axum::{Json, Router};
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
+use tagging::TaggingModule;
 use document::Document;
 use files::Files;
 use forge::Forge;
@@ -89,10 +90,11 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 14] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
+    "tagging",
     "tasks",
     "inbox",
     "automations",
@@ -372,9 +374,12 @@ fn run_sim(
     executor.start(|context| async move {
         // genesis: noded's exact module set (keep in sync with MODULE_IDS) so
         // app queries and status roots behave like a real daemon's.
-        let chat = Chat::init(context.child("chat"), "chat").await;
+        let chat = Chat::init(context.child("chat"), "chat")
+            .await
+            .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         let dispatch = DispatchModule::new("dispatch", "saga");
+        let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
@@ -383,8 +388,11 @@ fn run_sim(
             "agent",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         );
         let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
@@ -396,6 +404,7 @@ fn run_sim(
             Box::new(chat),
             Box::new(saga),
             Box::new(dispatch),
+            Box::new(tagging),
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
