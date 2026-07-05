@@ -11,7 +11,7 @@ use common::{NetworkShapeCluster, serial};
 const CONVERGE: Duration = Duration::from_secs(180);
 
 #[test]
-fn network_shape_joiner_parks_until_invite_accept() {
+fn network_shape_joiner_parks_until_promote() {
     let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
@@ -23,7 +23,7 @@ fn network_shape_joiner_parks_until_invite_accept() {
     cluster.spawn(0);
     // network-shape nodes never print the dev-demo `converged app_hash=`; the
     // founder is up and finalizing once its rpc surface is listening (genesis
-    // is already crossed by then), which is all `invite`/`invite-accept` need.
+    // is already crossed by then), which is all `invite`/`promote` need.
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
     // the MANUAL flavor (token-less v2 blob): the pubkey travels out-of-band
@@ -50,8 +50,8 @@ fn network_shape_joiner_parks_until_invite_accept() {
     cluster.wait_marker(1, "joiner mode: parking", Duration::from_secs(60));
     cluster.wait_marker(1, "parked:", Duration::from_secs(60));
 
-    let (ok, out) = cluster.run_invite_accept(&friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_promote(&friend_key);
+    assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);

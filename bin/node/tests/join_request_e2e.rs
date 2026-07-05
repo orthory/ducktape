@@ -1,7 +1,7 @@
 //! the automatic half of onboarding: a joiner holding a TOKENED invite parks
 //! and DELIVERS its pubkey to the member over the lobby channel — no
 //! copy/paste — and the member sees it as a pending join request. approval
-//! stays a member decision: `invite-accept` casts the ballot, and only then
+//! stays a member decision: `promote` (direct admission) casts the ballot, and only then
 //! does the joiner promote.
 
 mod common;
@@ -41,8 +41,8 @@ fn a_tokened_join_delivers_the_pubkey_and_manual_approval_promotes() {
     assert_eq!(issuer.len(), 64, "the queue names the inviting member");
 
     // nothing is admitted until a member approves — that is the manual gate.
-    let (ok, out) = cluster.run_invite_accept(&friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_promote(&friend_key);
+    assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);

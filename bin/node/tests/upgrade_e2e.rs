@@ -23,7 +23,7 @@
 //! plus a live `ducktape-node upgrade-status` CLI read against a scheduled net.
 //!
 //! NOTE on the mixed-old/new-binary leg: a single `cargo test` links ONE node
-//! binary (`CARGO_BIN_EXE_ducktape-node`, `MAX_PROTOCOL_VERSION = 2`), so a true
+//! binary (`CARGO_BIN_EXE_ducktape-node`, `MAX_PROTOCOL_VERSION = 3`), so a true
 //! mixed v1/v2 handshake cannot be spawned here. The structurally-load-bearing
 //! property it would assert — version gating rides the app/consensus payload, not
 //! the p2p handshake namespace `sha256(scheme ‖ validators)` — is covered by the
@@ -425,7 +425,7 @@ fn cluster_upgrade() {
     let activation_height = schedule_upgrade(&cluster, "forge-v2", 2, UPGRADE_LEAD);
 
     // 3. every validator's ReadinessSignaller auto-emits SignalReady (this binary
-    //    is MAX_PROTOCOL_VERSION=2, so the signal is truthful).
+    //    is MAX_PROTOCOL_VERSION=3, so the signal is truthful).
     for i in 0..3 {
         cluster.wait_marker(i, "signaled ready name=forge-v2", CONVERGE);
     }
@@ -592,8 +592,8 @@ fn cluster_upgrade() {
     //        pending rule no longer rejects it (proving the Advance freed the slot).
     //        `schedule_upgrade` only returns once the pending slot names forge-v3,
     //        so a successful return IS the acceptance proof.
-    let _ = schedule_upgrade(&cluster, "forge-v3", 3, UPGRADE_LEAD);
-    // (test ends here; the second upgrade never arms — MAX_PROTOCOL_VERSION=2 < 3,
+    let _ = schedule_upgrade(&cluster, "over-max-4", 4, UPGRADE_LEAD);
+    // (test ends here; the second upgrade never arms — MAX_PROTOCOL_VERSION=3 < 4,
     // so no node signals ready — proving a truthful binary refuses to lie.)
 }
 
@@ -635,7 +635,7 @@ fn cluster_upgrade_aborts_on_unmet_quorum() {
     //    (=2 in bin/node), so NO truthful node can ever signal ready for it. the
     //    SCHEDULE itself is version-agnostic (only monotonicity/lead/at-most-one
     //    gate it), so it arms a pending slot exactly like a supported one.
-    const OVER_MAX: u32 = 3; // > MAX_PROTOCOL_VERSION=2
+    const OVER_MAX: u32 = 4; // > MAX_PROTOCOL_VERSION=3
     let abort_height = schedule_upgrade(&cluster, "over-max", OVER_MAX, UPGRADE_LEAD);
 
     // TRUTHFUL READINESS: the pending upgrade is live, but the module's armed

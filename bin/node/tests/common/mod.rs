@@ -262,13 +262,15 @@ impl NetworkShapeCluster {
         });
     }
 
-    pub fn run_invite_accept(&self, pubkey_hex: &str) -> (bool, String) {
+    /// drive the DIRECT admission ceremony (`promote` — the pre-staged
+    /// `invite-accept` semantics) from node 0's config.
+    pub fn run_promote(&self, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args(["invite-accept", pubkey_hex, "--config"])
+            .args(["promote", pubkey_hex, "--config"])
             .arg(cfg)
             .output()
-            .expect("run invite-accept");
+            .expect("run promote");
         (out.status.success(), command_output(&out))
     }
 
