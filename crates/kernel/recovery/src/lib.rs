@@ -1003,13 +1003,29 @@ where
 // boot-time replay.
 // ============================================================================
 
+/// one re-executed sealed block, as replay hands it to a [`ReplaySink`]: the
+/// SEALED frame bytes, how the block landed, the composed app-hash it left
+/// behind (the seal's recorded value), and the deterministic dispatch trace
+/// (empty for a rejected block). the frame + disposition + app-hash ride
+/// along because a node-layer observer (the explorer's blocks database)
+/// derives its row from the frame's content, not the dispatch trace — the
+/// trace alone cannot reproduce it.
+pub struct FoldedBlock<'a> {
+    pub height: u64,
+    pub frame: &'a [u8],
+    pub disposition: Disposition,
+    pub app_hash: StateRoot,
+    pub dispatches: &'a [DispatchRecord],
+}
+
 /// observer of every sealed block the journal replay walks, in height order —
 /// the seam a derived tier (the per-module read-model index) folds from, so a
 /// restart re-derives exactly what the live drain would have fed it.
 ///
 /// two shapes, because replay cannot always reproduce a block's content:
-/// - a RE-EXECUTED block surfaces the deterministic dispatch trace consensus
-///   applied ([`ReplaySink::folded_block`]; empty for a rejected block);
+/// - a RE-EXECUTED block surfaces its sealed frame and the deterministic
+///   dispatch trace consensus applied ([`ReplaySink::folded_block`]; the
+///   trace is empty for a rejected block);
 /// - a block replay SKIPS — its state already durable, or root-idempotent —
 ///   has no reproducible trace ([`ReplaySink::opaque_block`]). the observer
 ///   decides what an unreproducible height means for its tier (the index
@@ -1018,7 +1034,7 @@ where
 /// observation is best-effort by design: sink calls return nothing and MUST
 /// not fail — recovery's own verification never depends on them.
 pub trait ReplaySink {
-    fn folded_block(&mut self, height: u64, dispatches: &[DispatchRecord]);
+    fn folded_block(&mut self, block: &FoldedBlock<'_>);
     fn opaque_block(&mut self, height: u64);
 }
 
@@ -1184,7 +1200,13 @@ where
                         if let Some(sink) = sink.as_deref_mut() {
                             match disposition {
                                 // a rejected block never had content anywhere.
-                                Disposition::Rejected => sink.folded_block(height, &[]),
+                                Disposition::Rejected => sink.folded_block(&FoldedBlock {
+                                    height,
+                                    frame: &frame,
+                                    disposition,
+                                    app_hash,
+                                    dispatches: &[],
+                                }),
                                 // an applied block whose ops moved no root:
                                 // its trace existed at runtime but is not
                                 // re-executed here — unreproducible.
@@ -1220,7 +1242,13 @@ where
                                 apply_block(host, height, &frame, protocol_version, Some(disposition))
                                     .await?;
                             if let Some(sink) = sink.as_deref_mut() {
-                                sink.folded_block(height, &dispatches);
+                                sink.folded_block(&FoldedBlock {
+                                    height,
+                                    frame: &frame,
+                                    disposition,
+                                    app_hash,
+                                    dispatches: &dispatches,
+                                });
                             }
                             for (id, root) in &changed {
                                 let live = host.module_root(id);
@@ -1320,7 +1348,13 @@ where
                                 // the dispatch trace is the full deterministic
                                 // re-execution; only the COMMIT scope was
                                 // selective.
-                                sink.folded_block(height, &dispatches);
+                                sink.folded_block(&FoldedBlock {
+                                    height,
+                                    frame: &frame,
+                                    disposition,
+                                    app_hash,
+                                    dispatches: &dispatches,
+                                });
                             }
                             // every changed module — the re-committed cohort AND
                             // the already-durable ones left untouched — must now
@@ -1367,7 +1401,15 @@ where
                 let (disposition, dispatches) =
                     apply_block(host, height, &frame, protocol_version, None).await?;
                 if let Some(sink) = sink.as_deref_mut() {
-                    sink.folded_block(height, &dispatches);
+                    sink.folded_block(&FoldedBlock {
+                        height,
+                        frame: &frame,
+                        disposition,
+                        // the roll-forward seals from the observed outcome
+                        // below; this is that same post-block boundary.
+                        app_hash: host.app_hash(),
+                        dispatches: &dispatches,
+                    });
                 }
                 disposition
             } else {
