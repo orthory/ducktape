@@ -664,6 +664,34 @@ impl DispatchModule {
         Ok(())
     }
 
+    /// receiver-scoped cancellation: the emitting module may cancel its own
+    /// in-flight dispatch. only the saga is told — the terminal `Cancelled`
+    /// callback then drives the normal AwaitingResult → AwaitingDelivery →
+    /// delivery path, so there is exactly one result state machine.
+    fn on_cancel(&mut self, ctx: &mut dyn Ctx, dispatch_id: String) -> Result<(), Error> {
+        let Origin::Module(receiver) = &ctx.env().origin else {
+            return Err(Error::Module(
+                "CancelDispatch is module-origin only (a module cancels its own dispatch)".into(),
+            ));
+        };
+        let key = dispatch_key(receiver, &dispatch_id);
+        // unknown or already-terminal: a deterministic no-op, so double
+        // cancels and cancel/result races are all safe.
+        let Some(dispatch) = self.dispatch(&key) else {
+            return Ok(());
+        };
+        if dispatch.status != Status::AwaitingResult {
+            return Ok(());
+        }
+        ctx.emit_msg(Msg {
+            target: self.saga.clone(),
+            payload: saga_encode_msg(&SagaMsg::Cancel {
+                saga_id: dispatch.saga_id.clone(),
+            }),
+        });
+        Ok(())
+    }
+
     /// the host-injected delivery sweep: emit up to
     /// [`MAX_DELIVERIES_PER_BLOCK`] mailbox events, FIFO, each as one
     /// follow-up `Msg` to its receiver.
@@ -790,6 +818,7 @@ impl DispatchModule {
                 recipe_id,
                 payload,
             } => self.on_dispatch(ctx, dispatch_id, recipe_id, payload),
+            DispatchMsg::CancelDispatch { dispatch_id } => self.on_cancel(ctx, dispatch_id),
             DispatchMsg::DeliverPending {} => self.on_deliver_pending(ctx),
         }
     }
@@ -1434,5 +1463,43 @@ mod tests {
         block_on(m.abort_block()).unwrap();
         assert_eq!(m.root(), before, "aborted block leaves no trace");
         assert_eq!(pending_deliveries(&m), 0);
+    }
+
+    #[test]
+    fn cancel_is_receiver_scoped_and_idempotent() {
+        let mut m = module();
+        let key = registered_and_dispatched(&mut m, OutputContract::Text);
+        let cancel = DispatchMsg::CancelDispatch {
+            dispatch_id: "d1".into(),
+        };
+
+        // an external submitter has no cancel surface.
+        let mut ctx = CaptureCtx::new().from_origin(owner());
+        assert!(exec(&mut m, &mut ctx, &cancel).is_err());
+
+        // a foreign module's cancel lands in its OWN receiver namespace —
+        // an unknown key, a deterministic no-op.
+        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("other".into()));
+        exec(&mut m, &mut ctx, &cancel).unwrap();
+        assert!(ctx.msgs.is_empty());
+
+        // the receiver's cancel tells exactly the dispatch's own saga.
+        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("caller".into()));
+        exec(&mut m, &mut ctx, &cancel).unwrap();
+        assert_eq!(ctx.msgs.len(), 1);
+        assert_eq!(ctx.msgs[0].target, "saga");
+        match saga_decode_msg(&ctx.msgs[0].payload).unwrap() {
+            SagaMsg::Cancel { saga_id } => assert_eq!(saga_id, saga_id_for(&key)),
+            other => panic!("expected a saga Cancel, got {other:?}"),
+        }
+
+        // once the Cancelled callback lands, the result flows the NORMAL
+        // path (Err in the mailbox) and a repeat cancel is a no-op.
+        callback_for(&mut m, &key, SagaOutcome::Cancelled).unwrap();
+        commit(&mut m);
+        assert_eq!(pending_deliveries(&m), 1);
+        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("caller".into()));
+        exec(&mut m, &mut ctx, &cancel).unwrap();
+        assert!(ctx.msgs.is_empty());
     }
 }

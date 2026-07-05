@@ -193,6 +193,13 @@ pub enum DispatchMsg {
         recipe_id: String,
         payload: Vec<u8>,
     },
+    /// MODULE-ORIGIN ONLY, receiver-scoped: cancel an in-flight dispatch the
+    /// emitting module owns. the underlying saga is cancelled in the same
+    /// block; its terminal callback then flows the normal path, so the
+    /// receiver still gets a [`ResultEvent`] (`Err`) via next-block delivery.
+    /// unknown, foreign, and already-terminal dispatches are deterministic
+    /// no-ops — cancellation is idempotent.
+    CancelDispatch { dispatch_id: String },
     /// SYSTEM-ORIGIN ONLY: emit up to [`MAX_DELIVERIES_PER_BLOCK`] pending
     /// [`ResultEvent`]s to their receivers. injected by the host drain when
     /// the committed mailbox is non-empty — never submitted by anyone.
