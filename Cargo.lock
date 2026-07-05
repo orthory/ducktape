@@ -6064,6 +6064,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
+name = "simnode"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "agent-interface",
+ "async-trait",
+ "automations",
+ "axum",
+ "chat",
+ "chat-interface",
+ "commonware-runtime",
+ "document",
+ "files",
+ "forge",
+ "futures",
+ "host",
+ "inbox",
+ "jobs",
+ "memory",
+ "noded",
+ "pages",
+ "profiles",
+ "reactor",
+ "saga",
+ "saga-interface",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tasks",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
