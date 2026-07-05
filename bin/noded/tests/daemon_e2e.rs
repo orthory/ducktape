@@ -646,10 +646,13 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(code, 404);
 
         // the watermark surface: all three blocks indexed, nothing poisoned.
+        // EVERY module's watermark tracks the last applied block — chat reads
+        // 3 even though its last op landed in block 2 — so a watermark below
+        // the tip always means missing blocks, never a quiet module.
         let (code, status) = daemon.request("GET", "/v1/index/status", None);
         assert_eq!(code, 200);
         assert_eq!(status["poisoned"], false);
-        assert_eq!(status["modules"]["chat"], 2);
+        assert_eq!(status["modules"]["chat"], 3);
         assert_eq!(status["modules"]["tasks"], 3);
 
         pre_restart_height = daemon.status()["height"].as_u64().expect("height");
