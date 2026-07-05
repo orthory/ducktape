@@ -298,6 +298,22 @@ fn cluster_lifecycle() {
             .is_some_and(|ops| !ops.is_empty()),
         "an applied block carries its dispatch trace: {submitted}"
     );
+    // 8d. the record's op hash is a real content address: staging at the
+    // drain keys the committed payload bytes by sha256, so the blob lane
+    // must serve the exact submitted payload back under that digest.
+    let op_hash = submitted["opHash"].as_str().unwrap_or_default();
+    assert_eq!(
+        op_hash.len(),
+        64,
+        "explorer record carries the op's content address: {submitted}"
+    );
+    let (code, blob) = cluster.http(0, "GET", &format!("/v1/files/blob/{op_hash}"), None);
+    assert_eq!(code, 200, "op hash must dereference on the blob lane: {blob}");
+    assert_eq!(
+        blob,
+        serde_json::json!({ "Set": { "key": "via-app-surface", "value": "held" } }),
+        "blob lane serves the committed payload bytes back"
+    );
 
     // 9. quiesce, then the boundary every joiner must rebuild: identical
     // status app-hashes across validators — and the app surface reports the

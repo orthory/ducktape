@@ -155,6 +155,7 @@ describe("remoteTransport", () => {
           { module: "chat", origin: "external", emittedMsgs: 0, emittedEvents: 0 },
         ],
         payload: '{"Post":{}}',
+        opHash: "dd".repeat(32),
       },
     ];
     // a Response body reads once, and this test fetches twice — hand back a
