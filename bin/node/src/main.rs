@@ -175,13 +175,6 @@ const CHANNEL_REACHABILITY: u64 = 6;
 /// survive member restarts (the request queue is in-memory), quiet enough to
 /// stay out of the members' way.
 const LOBBY_ANNOUNCE_EVERY: usize = 5;
-/// a parked node holding OBSERVER standing pre-syncs the served boundary
-/// whenever it advanced this many blocks past the last pre-sync — the disk
-/// substrates stay warm, so the eventual promotion catches up a small delta
-/// instead of a full state transfer (the quorum only ever gains a warm
-/// validator). small enough to track a chatty chain, large enough not to
-/// hammer the serving validators.
-const OBSERVER_PRESYNC_STRIDE: u64 = 64;
 /// how many epochs of engine channels are PRE-REGISTERED. discovery channels
 /// can only be registered before `network.start()`, and every epoch's respawned
 /// engine needs FRESH channels (an aborted old engine must never collide with
@@ -3550,9 +3543,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     }
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
-    // so a bind failure is a clean startup error, not an async surprise.
+    // so a bind failure is a clean startup error, not an async surprise. a
+    // JOINER binds too: the park loop pumps the same surface — an observer
+    // serves local reads from its pre-synced boundary, a still-parked joiner
+    // answers with a clear not-admitted error instead of a dead port.
     let rpc_listener = match rpc_listen.as_deref() {
-        Some(addr) if !sync_only && !joiner => Some(std::net::TcpListener::bind(addr)?),
+        Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
         _ => None,
     };
 
@@ -3576,8 +3572,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone());
     let blobs = http_handle.blob_handle();
+    // (like the rpc surface above, a joiner binds and the park loop pumps —
+    // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
-        Some(addr) if !sync_only && !joiner => {
+        Some(addr) if !sync_only => {
             let listener = std::net::TcpListener::bind(addr)?;
             listener.set_nonblocking(true)?;
             println!(
@@ -3890,9 +3888,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut last_tracked = PEER_SET;
             let mut attempt = 0usize;
             let mut announce_round = 0usize;
-            // the last boundary height an OBSERVER pre-sync completed at (0 =
-            // never) — the stride watermark.
-            let mut last_presync_height: u64 = 0;
             // once observer standing is seen, parking is the STEADY state
             // (awaiting a deliberate promote) — the not-admitted bail below
             // must never fire.
@@ -3912,6 +3907,42 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                 }
             };
+
+            // ---- the OBSERVER's serving lanes ------------------------------
+            //
+            // the same two local surfaces a validator exposes, pumped by the
+            // park loop's serve window below: an observer answers reads from
+            // its last pre-synced boundary; a still-parked joiner answers
+            // with a clear not-admitted error instead of a dead port. writes
+            // are refused — ops enter the chain through validators only.
+            // promotion re-execs this process (`reboot_self`), which closes
+            // these listeners (CLOEXEC) and re-binds them on the validator
+            // path.
+            let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
+            if let Some(listener) = rpc_listener {
+                println!(
+                    "[node {label}] rpc listening on {}",
+                    listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                );
+                spawn_rpc_listener(listener, rpc_tx);
+            } else {
+                drop(rpc_tx); // rpc off: the ingress arm stays terminated.
+            }
+            let mut http_ingress = http_cmds;
+            // the last pre-synced boundary this observer serves reads from:
+            // (boundary height, the composed host). exactly ONE live host may
+            // exist — the sync path reopens the same on-disk partitions, so
+            // this is dropped before every re-sync.
+            let mut serving: Option<(u64, Host)> = None;
+            let not_serving = |standing: bool| -> String {
+                if standing {
+                    "observer: no boundary pre-synced yet — retry shortly".into()
+                } else {
+                    "parked: not admitted yet — no state to serve (a member must run \
+                     `invite-accept` for this key)"
+                        .into()
+                }
+            };
             let (boundary, host, floor) = loop {
                 attempt += 1;
                 if attempt > 900 && !observer_standing {
@@ -3925,7 +3956,134 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                context.sleep(Duration::from_secs(2)).await;
+                // the serve window: between manifest polls, pump the local
+                // read surfaces from the last pre-synced boundary. the tick
+                // both paces the polls and bounds a not-yet-serving joiner's
+                // wait. (a sync in flight below queues jobs here — bounded by
+                // the rpc bridge's buffer and the listener's reply timeout —
+                // so every answer reflects a whole boundary, never a torn one.)
+                {
+                    let tick = context.sleep(Duration::from_secs(2)).fuse();
+                    futures::pin_mut!(tick);
+                    loop {
+                        futures::select_biased! {
+                            job = rpc_ingress.next() => {
+                                let Some((req, reply)) = job else { continue };
+                                let resp = match req {
+                                    RpcRequest::Submit { .. } => RpcReply::err(
+                                        "this node is not a validator: observer standing \
+                                         serves reads only — submit ops via a validator",
+                                    ),
+                                    RpcRequest::Query { target, req_hex } => match &serving {
+                                        Some((_, host)) => match unhex(&req_hex) {
+                                            Ok(req_bytes) => {
+                                                match host.query(&target, &req_bytes).await {
+                                                    Ok(bytes) => RpcReply {
+                                                        reply_hex: Some(hex_bytes(&bytes)),
+                                                        ..RpcReply::ok()
+                                                    },
+                                                    Err(e) => RpcReply::err(format!(
+                                                        "query failed: {e}"
+                                                    )),
+                                                }
+                                            }
+                                            Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
+                                        },
+                                        None => RpcReply::err(not_serving(observer_standing)),
+                                    },
+                                    RpcRequest::Status => match &serving {
+                                        Some((height, host)) => {
+                                            let mut modules = std::collections::BTreeMap::new();
+                                            for m in MODULE_IDS {
+                                                if let Some(root) = host.module_root(m) {
+                                                    modules.insert(m.to_string(), hex(&root));
+                                                }
+                                            }
+                                            RpcReply {
+                                                status: Some(RpcStatus {
+                                                    height: Some(*height),
+                                                    app_hash: hex(&host.app_hash()),
+                                                    modules,
+                                                }),
+                                                ..RpcReply::ok()
+                                            }
+                                        }
+                                        None => RpcReply::err(not_serving(observer_standing)),
+                                    },
+                                    RpcRequest::JoinRequests => RpcReply::err(
+                                        "this node is not a member — join requests queue on \
+                                         validators",
+                                    ),
+                                    RpcRequest::Shutdown => {
+                                        // an observer writes no checkpoint — nothing to
+                                        // flush; a restart parks straight back here.
+                                        let _ = reply.send(RpcReply::ok());
+                                        println!(
+                                            "[node {label}] shutdown requested via rpc — exiting"
+                                        );
+                                        std::process::exit(0);
+                                    }
+                                };
+                                let _ = reply.send(resp);
+                            }
+                            cmd = http_ingress.next() => {
+                                let Some(cmd) = cmd else { continue };
+                                match cmd {
+                                    noded::NodeCommand::Submit { reply, .. } => {
+                                        let _ = reply.send(Err(
+                                            "this node is not a validator: observer standing \
+                                             serves reads only — submit ops via a validator"
+                                                .into(),
+                                        ));
+                                    }
+                                    noded::NodeCommand::Query { target, req, reply } => {
+                                        let result = match &serving {
+                                            Some((_, host)) => host
+                                                .query(&target, &req)
+                                                .await
+                                                .map_err(|e| e.to_string()),
+                                            None => Err(not_serving(observer_standing)),
+                                        };
+                                        let _ = reply.send(result);
+                                    }
+                                    noded::NodeCommand::Status { reply } => {
+                                        // pre-first-sync the surface still answers (the
+                                        // app's liveness heartbeat): a zeroed status is
+                                        // honest — no boundary is served yet.
+                                        let (height, app_hash, modules) = match &serving {
+                                            Some((height, host)) => (
+                                                *height,
+                                                hex(&host.app_hash()),
+                                                MODULE_IDS
+                                                    .iter()
+                                                    .map(|m| noded::ModuleStatus {
+                                                        id: (*m).into(),
+                                                        root: host
+                                                            .module_root(m)
+                                                            .map(|r| hex(&r))
+                                                            .unwrap_or_default(),
+                                                        category: noded::ModuleCategory::of(m),
+                                                    })
+                                                    .collect(),
+                                            ),
+                                            None => (0, String::new(), Vec::new()),
+                                        };
+                                        let _ = reply.send(noded::NodeStatus {
+                                            version: env!("CARGO_PKG_VERSION").into(),
+                                            app_hash,
+                                            height,
+                                            modules,
+                                        });
+                                    }
+                                    noded::NodeCommand::Metrics { reply } => {
+                                        let _ = reply.send(context.encode());
+                                    }
+                                }
+                            }
+                            _ = tick => break,
+                        }
+                    }
+                }
                 let m = match fetch_manifest(&client).await {
                     Ok(m) => m,
                     Err(e) => {
@@ -3985,16 +4143,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         announce_targets = current;
                     }
                     if m.observers.iter().any(|k| k == &me_bytes) {
-                        observer_standing = true;
+                        if !observer_standing {
+                            observer_standing = true;
+                            println!(
+                                "[node {label}] observer: standing granted — following \
+                                 boundaries and serving local reads"
+                            );
+                        }
                         // OBSERVER standing (staged admission): granted, so
-                        // stop knocking — and PRE-SYNC the boundary on a
-                        // stride cadence. no checkpoint manifest is written
-                        // (a restart parks again cleanly); the disk
-                        // substrates keep the warm state, so the eventual
-                        // `promote` catches up a small delta.
-                        if m.height >= last_presync_height.saturating_add(OBSERVER_PRESYNC_STRIDE)
-                            || last_presync_height == 0
-                        {
+                        // stop knocking — and FOLLOW: every boundary advance
+                        // re-syncs the warm substrates (the qmdb lanes fetch
+                        // deltas; snapshots re-install), then serves reads
+                        // from the fresh host through the serve window above.
+                        // no checkpoint manifest is written (a restart parks
+                        // again cleanly), and `promote` catches up only a
+                        // small delta.
+                        if serving.as_ref().map_or(true, |(h, _)| m.height > *h) {
                             if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
                                 eprintln!(
                                     "[node {label}] FATAL: cannot observe this network — {e}"
@@ -4006,28 +4170,27 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 m.height,
                                 m.entries.len()
                             );
+                            // drop the served host FIRST: the sync reopens the
+                            // same on-disk partitions, and exactly one live
+                            // handle may exist. reads queue in the serve window
+                            // until the fresh host lands.
+                            serving = None;
                             match sync_all_modules(&context, &client, &m, &forge_repo, attempt)
                                 .await
                             {
                                 Ok(host) => {
-                                    last_presync_height = m.height;
                                     println!(
                                         "[node {label}] observer: pre-synced boundary {} app_hash={}",
                                         m.height,
                                         hex(&host.app_hash())
                                     );
+                                    serving = Some((m.height, host));
                                 }
                                 Err(e) => println!(
                                     "[node {label}] observer pre-sync at boundary {} failed: {e}",
                                     m.height
                                 ),
                             }
-                        } else {
-                            println!(
-                                "[node {label}] observer: warm at boundary {} (next pre-sync at {})",
-                                m.height,
-                                last_presync_height + OBSERVER_PRESYNC_STRIDE
-                            );
                         }
                         continue;
                     }
@@ -4065,6 +4228,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     eprintln!("[node {label}] FATAL: cannot promote — {e}");
                     std::process::exit(1);
                 }
+                // a promoted observer stops serving: drop the served host
+                // before the promotion sync reopens the same partitions.
+                serving = None;
                 match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
                     Ok(host) => {
                         let latest = match fetch_manifest(&client).await {
