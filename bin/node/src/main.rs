@@ -563,6 +563,22 @@ impl CapabilityAnnouncer {
     }
 }
 
+/// the committed dispatch mailbox's undelivered-result count — the nudge
+/// pump's read. `0` when the module is absent or the mailbox is empty.
+async fn dispatch_pending_deliveries(host: &Host) -> u64 {
+    use dispatch_interface::{DispatchQuery, DispatchReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("dispatch", &encode_query(&DispatchQuery::PendingDeliveries))
+        .await
+    else {
+        return 0;
+    };
+    match decode_reply(&reply) {
+        Ok(DispatchReply::PendingDeliveries(n)) => n,
+        _ => 0,
+    }
+}
+
 /// the committed saga ledger's earliest pending lease-expiry/deadline — the
 /// crank pump's read. `None` when the module is absent or nothing pending
 /// carries one.
@@ -5307,6 +5323,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut last_nop = std::time::Instant::now();
         // throttle for the saga crank pump below.
         let mut last_crank = std::time::Instant::now();
+        // throttle for the dispatch delivery-nudge pump below.
+        let mut last_nudge = std::time::Instant::now();
         // the host-owned worker set (reactor seam): effects of finalized
         // blocks are offered here, and claimed follow-ups re-enter the ordered
         // lane as their own blocks.
@@ -6054,6 +6072,40 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 "[node {label}] saga crank submitted \
                                  (next expiry {expiry} <= height {finalized_height})"
                             );
+                        }
+                    }
+
+                    // DISPATCH DELIVERY NUDGE (never-pop-stack liveness): a
+                    // result committed into the dispatch mailbox delivers via
+                    // the drain's DeliverPending injection in the NEXT
+                    // successful block — and heartbeat nops are rejected
+                    // frames that never apply, so a quiet chain would sit on
+                    // its mailbox. state-driven: while the committed mailbox
+                    // is non-empty, push one permissionless Nudge — a no-op
+                    // whose block carries the injection. duplicate nudges
+                    // from other nodes are free.
+                    if last_nudge.elapsed() >= HEARTBEAT_INTERVAL
+                        && dispatch_pending_deliveries(node.host()).await > 0
+                    {
+                        last_nudge = std::time::Instant::now();
+                        let seq = next_seq;
+                        next_seq += 1;
+                        if let Err(e) = node
+                            .submit(
+                                &signer,
+                                seq,
+                                Msg {
+                                    target: "dispatch".into(),
+                                    payload: dispatch_interface::encode_msg(
+                                        &dispatch_interface::DispatchMsg::Nudge {},
+                                    ),
+                                },
+                            )
+                            .await
+                        {
+                            eprintln!("[node {label}] dispatch nudge submit failed: {e}");
+                        } else {
+                            println!("[node {label}] dispatch delivery nudge submitted");
                         }
                     }
 

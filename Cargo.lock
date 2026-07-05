@@ -4233,6 +4233,7 @@ dependencies = [
  "directory",
  "directory-interface",
  "dispatch",
+ "dispatch-interface",
  "dispatch-oracle",
  "document",
  "files",
@@ -5433,6 +5434,7 @@ name = "reactor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dispatch-interface",
  "futures",
  "host",
  "saga",

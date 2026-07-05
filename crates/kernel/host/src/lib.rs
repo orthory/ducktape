@@ -498,6 +498,14 @@ impl Host {
         })
     }
 
+    /// whether the committed dispatch mailbox holds undelivered results —
+    /// the drain will inject `DeliverPending` into the NEXT successful block.
+    /// drivers with no other block flow (a reactor fixpoint, a block-per-op
+    /// daemon, a quiet validator) read this to know a flush block is needed.
+    pub async fn has_pending_deliveries(&self) -> bool {
+        self.pending_deliveries().await.is_some()
+    }
+
     /// the current app-hash: [`state::global_root`] over the registered modules.
     pub fn app_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();

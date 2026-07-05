@@ -820,6 +820,9 @@ impl DispatchModule {
             } => self.on_dispatch(ctx, dispatch_id, recipe_id, payload),
             DispatchMsg::CancelDispatch { dispatch_id } => self.on_cancel(ctx, dispatch_id),
             DispatchMsg::DeliverPending {} => self.on_deliver_pending(ctx),
+            // the block's EXISTENCE is the point (it carries the host's
+            // delivery injection); the op itself stages nothing.
+            DispatchMsg::Nudge {} => Ok(()),
         }
     }
 

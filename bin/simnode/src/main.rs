@@ -566,10 +566,27 @@ impl Sim {
     }
 
     /// noded's follow-up budget, for auto mode only: manual steps are already
-    /// bounded by the test issuing them one at a time.
+    /// bounded by the test issuing them one at a time. (in HOLD mode a
+    /// committed dispatch mailbox flushes on the next explicit step's block —
+    /// that is the deterministic-sim semantic, deliberately not auto-nudged.)
     async fn drain_oracle_budgeted(&mut self) -> Result<(), String> {
         let mut rounds = 1u32;
-        while let Some(follow) = self.oracle_queue.pop_front() {
+        loop {
+            let Some(follow) = self.oracle_queue.pop_front() else {
+                // the never-pop-stack tail: results committed into the
+                // dispatch mailbox deliver in a LATER block — auto mode
+                // settles fully, so nudge one flush block per pending batch.
+                if !self.host.has_pending_deliveries().await {
+                    break;
+                }
+                self.oracle_queue.push_back(Msg {
+                    target: dispatch_interface::DEFAULT_DISPATCH_TARGET.into(),
+                    payload: dispatch_interface::encode_msg(
+                        &dispatch_interface::DispatchMsg::Nudge {},
+                    ),
+                });
+                continue;
+            };
             rounds += 1;
             if rounds > MAX_WORKER_ROUNDS {
                 return Err("worker-round budget exceeded".into());

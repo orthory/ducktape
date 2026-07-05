@@ -204,6 +204,12 @@ pub enum DispatchMsg {
     /// [`ResultEvent`]s to their receivers. injected by the host drain when
     /// the committed mailbox is non-empty — never submitted by anyone.
     DeliverPending {},
+    /// permissionless no-op: stages nothing, always applies. its only purpose
+    /// is EXISTING as a successful block, which carries the host's
+    /// `DeliverPending` injection — the liveness pump for a committed
+    /// mailbox on a chain nothing else is ticking (the never-pop-stack
+    /// rule's flush lane). duplicate nudges are free.
+    Nudge {},
 }
 
 // ---- queries --------------------------------------------------------------------

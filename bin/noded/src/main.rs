@@ -483,7 +483,20 @@ async fn submit_and_drain(
     offer_effects(workers, effects, &mut queue).await;
     let mut rounds = 1u32;
 
-    while let Some(follow) = queue.pop_front() {
+    loop {
+        let Some(follow) = queue.pop_front() else {
+            // the never-pop-stack tail: results committed into the dispatch
+            // mailbox deliver in a LATER block, and this block-per-op daemon
+            // ticks no other blocks — nudge one flush block per pending batch.
+            if !host.has_pending_deliveries().await {
+                break;
+            }
+            queue.push_back(Msg {
+                target: dispatch_interface::DEFAULT_DISPATCH_TARGET.into(),
+                payload: dispatch_interface::encode_msg(&dispatch_interface::DispatchMsg::Nudge {}),
+            });
+            continue;
+        };
         rounds += 1;
         if rounds > MAX_WORKER_ROUNDS {
             return Err("worker-round budget exceeded".into());
