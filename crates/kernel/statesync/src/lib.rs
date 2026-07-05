@@ -257,6 +257,11 @@ pub struct Manifest {
     /// necessarily the valset projection at `height`, which may already
     /// stage a change awaiting its cutover.
     pub participants: Vec<Vec<u8>>,
+    /// the epoch's OBSERVER set (transport standing, no quorum seat). rides
+    /// an ADDITIVE wire tail — omitted when empty, so pre-observer binaries
+    /// interoperate until the first grant (which the v3 gate defers past the
+    /// upgrade that replaces those binaries anyway).
+    pub observers: Vec<Vec<u8>>,
     /// the scheme-encoded finalization certificate for exactly `height`,
     /// when the serving node holds one (`None` right after a cutover, when
     /// the epoch has not finalized past its base — the joiner then spawns on
@@ -524,6 +529,17 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                     None => out.push(0),
                 }
             }
+            // ADDITIVE observer tail — omitted when empty so the byte stream
+            // is identical to the pre-observer wire until a grant exists (a
+            // pre-observer decoder rejects trailing bytes, but it can only
+            // meet a non-empty set on a >=v3 net, which its boot preflight
+            // refuses right after this decode anyway).
+            if !m.observers.is_empty() {
+                out.extend_from_slice(&(m.observers.len() as u64).to_le_bytes());
+                for o in &m.observers {
+                    wire::put_bytes(&mut out, o);
+                }
+            }
         }
         SyncResponse::Chunk { total, bytes } => {
             out.push(1u8);
@@ -650,12 +666,30 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                     resolver_target,
                 });
             }
+            // ADDITIVE observer tail — absent on the pre-observer wire.
+            let observers = if buf.is_empty() {
+                Vec::new()
+            } else {
+                let o = wire::take_u64(&mut buf)?;
+                if o == 0 || o > (buf.len() / 8) as u64 {
+                    return Err(WireError::Codec(format!(
+                        "observer count {o} invalid against the {} remaining bytes",
+                        buf.len()
+                    )));
+                }
+                let mut observers = Vec::with_capacity(o as usize);
+                for _ in 0..o {
+                    observers.push(wire::take_bytes(&mut buf)?.to_vec());
+                }
+                observers
+            };
             SyncResponse::Manifest(Manifest {
                 height,
                 app_hash,
                 epoch,
                 view_base,
                 participants,
+                observers,
                 floor_cert,
                 current_version,
                 pending_upgrade,
@@ -793,6 +827,7 @@ pub struct BoundaryCoords {
     pub epoch: u64,
     pub view_base: u64,
     pub participants: Vec<Vec<u8>>,
+    pub observers: Vec<Vec<u8>>,
     pub floor_cert: Option<Vec<u8>>,
     /// the agreed protocol version active at the served boundary. the caller
     /// stamps it from live upgrade-module state, like `epoch`/`view_base`.
@@ -1007,6 +1042,7 @@ impl SyncServer {
                     epoch: capture.coords.epoch,
                     view_base: capture.coords.view_base,
                     participants: capture.coords.participants.clone(),
+                    observers: capture.coords.observers.clone(),
                     floor_cert: capture.coords.floor_cert.clone(),
                     current_version: capture.coords.current_version,
                     pending_upgrade: capture.coords.pending_upgrade.clone(),
@@ -1503,6 +1539,8 @@ mod tests {
                 epoch: 2,
                 view_base: 5,
                 participants: vec![vec![3u8; 32], vec![4u8; 32]],
+                // non-empty: exercises the additive observer wire tail.
+                observers: vec![vec![5u8; 32]],
                 floor_cert: Some(vec![0xCC; 96]),
                 // a pending upgrade set: exercise the Some arm of the tail.
                 current_version: 3,
@@ -1540,6 +1578,7 @@ mod tests {
                 epoch: 1,
                 view_base: 12,
                 participants: vec![vec![3u8; 32]],
+                observers: vec![],
                 floor_cert: None,
                 current_version: 0,
                 pending_upgrade: None,
@@ -1657,6 +1696,7 @@ mod tests {
             epoch: 2,
             view_base: 5,
             participants: vec![],
+            observers: vec![],
             floor_cert: None,
             current_version: 3,
             pending_upgrade: None,
@@ -1683,6 +1723,7 @@ mod tests {
             epoch: 0,
             view_base: 0,
             participants: vec![],
+            observers: vec![],
             floor_cert: None,
             current_version: 3,
             pending_upgrade: None,

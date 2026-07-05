@@ -10,8 +10,9 @@
 //!   4. converged != genesis                -> ops actually applied
 //!   5. chat posted via node 0 reads on 1   -> rpc -> consensus -> cross-apply
 //!   6. governance admits a 4th key         -> member gating, votes, tally
-//!   7. all validators cut over to epoch 1  -> live engine teardown + respawn
-//!   8. post-cutover post reads on node 2   -> the epoch-1 engines finalize
+//!   7. admission cutover                   -> the passed proposal seats the
+//!      key at one boundary; node 3 syncs the frozen boundary and promotes
+//!   8. post-cutover post reads on node 2   -> the respawned engines finalize
 //!   9. status app-hashes agree             -> the boundary a joiner rebuilds
 //!  10. sync-only joiner hash parity        -> network statesync, full rebuild
 //!
@@ -211,14 +212,19 @@ fn cluster_lifecycle() {
         proposal_status(&cluster, 0, "admit-node3").filter(|(s, _)| *s == ProposalStatus::Passed)
     });
 
-    // 7. LIVE EPOCH CUTOVER: the valset change schedules a cutover at
-    // observed_view + CUTOVER_DELAY; finalized views only advance with ops,
-    // so push fillers until every validator respawns onto the 4-member set.
-    // fillers go through the raw rpc and tolerate rejection — an op caught
-    // mid-teardown dies with its epoch's content store by design.
+    // the passed proposal seats node 3 directly: cutover #1 (epoch 1)
+    // widens the quorum to 4. node 3 boots as a parked joiner, sees itself
+    // in the participant set at the boundary, syncs, and promotes.
+    cluster.spawn(3);
+    cluster.wait_marker(3, "joiner mode: parking", Duration::from_secs(60));
+
+    // 7. ADMISSION CUTOVER. finalized views only advance with ops, so push
+    // fillers through the boundary. fillers go through the raw rpc and
+    // tolerate rejection — an op caught mid-teardown dies with its epoch's
+    // content store by design.
     let mut filler = 0u32;
     let mut last_filler = std::time::Instant::now() - Duration::from_secs(1);
-    poll_until("all validators to cut over to epoch 1", CONVERGE, || {
+    poll_until("the admission cutover to cross", CONVERGE, || {
         if last_filler.elapsed() >= Duration::from_secs(1) {
             last_filler = std::time::Instant::now();
             filler += 1;
@@ -239,6 +245,9 @@ fn cluster_lifecycle() {
             .all(|i| cluster.marker(i, "cutover complete: epoch 1").is_some())
             .then_some(())
     });
+    // the admitted key sees itself in the epoch-1 participant set and
+    // promotes through the normal restore path.
+    cluster.wait_marker(3, "promoted: validator at epoch 1", CONVERGE);
 
     // 8. the epoch-1 engines must still finalize: post through the respawned
     // net via node 0, read on node 2.
@@ -356,7 +365,12 @@ fn cluster_lifecycle() {
         .expect("status carries app_hash");
 
     // 10. the sync-only joiner rebuilds EVERY module over the statesync
-    // channel from node 0 and must compose the identical app-hash.
+    // channel from node 0 and must compose the identical app-hash. node 3's
+    // slot is reused as a FRESH observer: kill the promoted validator
+    // (quorum(4) = 3 keeps the network live — nops move heights, not state,
+    // so the step-9 boundary hash stands) and wipe its state.
+    cluster.kill(3);
+    cluster.wipe_storage(3);
     let (ok, log) = cluster.run_sync_only(3, Duration::from_secs(120));
     assert!(ok, "sync-only joiner failed:\n{log}");
     let synced = log

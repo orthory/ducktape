@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 // change under a signature domain always bumps the domain, so v1 and v2
 // blobs can never cross-verify.
 const ENDPOINT_NS: &[u8] = b"ducktape:wireguard-endpoint:v2";
+const ENDPOINT_RECORD_NS: &[u8] = b"ducktape:wireguard-endpoint-record:v1";
 const UPGRADE_REQUEST_NS: &[u8] = b"ducktape:wireguard-upgrade-request:v1";
 const UPGRADE_RESPONSE_NS: &[u8] = b"ducktape:wireguard-upgrade-response:v1";
 const UPGRADE_ACK_NS: &[u8] = b"ducktape:wireguard-upgrade-ack:v1";
@@ -285,6 +286,43 @@ pub struct EndpointRecord {
     pub nonce: u64,
 }
 
+/// An [`EndpointRecord`] signed by its own validator, for gossip paths where
+/// the transport does not authenticate the record's OWNER — a record relayed
+/// through a third member arrives on a link authenticated to the forwarder,
+/// so the record itself must carry the owner's signature. Distinct signing
+/// domain from [`EndpointAdvertisement`] (which additionally commits to a
+/// mesh version): the two blobs can never cross-verify.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedEndpointRecord {
+    pub record: EndpointRecord,
+    pub signature: SignatureBytes,
+}
+
+impl SignedEndpointRecord {
+    pub fn sign(record: EndpointRecord, signer: &ed25519::PrivateKey) -> Self {
+        let mut msg = Vec::new();
+        put_endpoint_record(&mut msg, &record);
+        let signature = signer.sign(ENDPOINT_RECORD_NS, &msg);
+        Self {
+            record,
+            signature: signature_bytes(&signature),
+        }
+    }
+
+    /// Verify the owner signature: the signer is always
+    /// `record.validator_identity` — a record is only ever self-signed.
+    pub fn verify(&self) -> Result<(), UpgradeError> {
+        let mut msg = Vec::new();
+        put_endpoint_record(&mut msg, &self.record);
+        verify_ed25519(
+            self.record.validator_identity,
+            ENDPOINT_RECORD_NS,
+            &msg,
+            &self.signature,
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointAdvertisement {
     pub record: EndpointRecord,
@@ -308,7 +346,7 @@ impl EndpointAdvertisement {
         }
     }
 
-    fn verify_signature(&self) -> Result<(), UpgradeError> {
+    pub fn verify_signature(&self) -> Result<(), UpgradeError> {
         let mut msg = Vec::new();
         put_endpoint_ad_without_signature(&mut msg, &self.record, self.mesh_version);
         verify_ed25519(
@@ -640,7 +678,7 @@ impl TunnelUpgradeRequest {
         hash32(&out)
     }
 
-    fn verify_signature(&self) -> Result<(), UpgradeError> {
+    pub fn verify_signature(&self) -> Result<(), UpgradeError> {
         let mut msg = Vec::new();
         put_request_fields(&mut msg, &self.fields);
         verify_ed25519(
@@ -741,7 +779,7 @@ impl TunnelUpgradeResponse {
         hash32(&out)
     }
 
-    fn verify_signature(&self) -> Result<(), UpgradeError> {
+    pub fn verify_signature(&self) -> Result<(), UpgradeError> {
         let mut msg = Vec::new();
         put_response_fields(&mut msg, &self.fields);
         verify_ed25519(
@@ -786,7 +824,7 @@ impl TunnelUpgradeAck {
         }
     }
 
-    fn verify_signature(&self) -> Result<(), UpgradeError> {
+    pub fn verify_signature(&self) -> Result<(), UpgradeError> {
         let mut msg = Vec::new();
         put_ack_fields(&mut msg, &self.fields);
         verify_ed25519(
@@ -1036,7 +1074,15 @@ pub fn validate_upgrade_as(
     {
         return Err(UpgradeError::Expired);
     }
-    if ak.installed_at_view > current_view
+    // freshness is a SYMMETRIC window: the two ends of a handshake run
+    // independent view clocks (each node's plane learns views from its own
+    // finalization drain), so a genuine ack routinely arrives with
+    // `installed_at_view` a tick or two ahead of the validator's clock. a
+    // zero-tolerance future check permanently failed real cross-node pairs
+    // (initiator applied, responder refused the same triple); bounding both
+    // directions by the same lag keeps the staleness envelope without
+    // punishing ordinary skew.
+    if ak.installed_at_view.saturating_sub(current_view) > MAX_ACK_INSTALL_LAG
         || current_view.saturating_sub(ak.installed_at_view) > MAX_ACK_INSTALL_LAG
     {
         return Err(UpgradeError::BadAckView);
@@ -1142,8 +1188,11 @@ fn validate_direct_dial_failure(
     {
         return Err(UpgradeError::InvalidDialFailure);
     }
+    // symmetric freshness window, exactly as the ack's `installed_at_view`:
+    // the evidence is minted on the INITIATOR's view clock and validated on
+    // the responder's — ordinary cross-node skew must not refuse it.
     if current_view > f.expires_at_view
-        || f.failed_at_view > current_view
+        || f.failed_at_view.saturating_sub(current_view) > MAX_DIAL_FAILURE_LAG
         || current_view.saturating_sub(f.failed_at_view) > MAX_DIAL_FAILURE_LAG
     {
         return Err(UpgradeError::InvalidDialFailure);

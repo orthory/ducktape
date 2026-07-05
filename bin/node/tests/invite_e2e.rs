@@ -3,7 +3,7 @@
 //!
 //! the flow under test (two humans, three commands):
 //!   friend starts an out-of-mesh node        -> it parks, refused by the mesh
-//!   a member runs `invite-accept <pubkey>`   -> governance passes, valset Join
+//!   a member runs `promote <pubkey>` (direct) -> governance passes, valset Join
 //!   the epoch cutover re-tracks the mesh     -> the parked node syncs at the
 //!                                                boundary, fabricates its
 //!                                                recovery checkpoint, reboots,
@@ -73,17 +73,18 @@ fn solo_founder_invites_a_friend() {
     let friend_hex = hex(&Cluster::identity(1));
     let cfg = cluster.config_file(0);
     let (ok, out) = cluster.run_verb(&[
-        "invite-accept",
+        "promote",
         &friend_hex,
         "--config",
         cfg.to_str().expect("utf-8 config path"),
     ]);
-    assert!(ok, "invite-accept failed:\n{out}");
+    assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
-    // the founder cuts over to epoch 1 (the nop pusher advances the views);
-    // epoch 1 then STALLS at its base — quorum is 2 of 2 — which is exactly
-    // what hands the joiner a frozen boundary at the epoch's genesis floor.
+    // the cutover (the nop pusher advances the views)
+    // seats the friend directly — epoch 1 then STALLS at its base (quorum
+    // 2-of-2), which is exactly what hands the joiner a frozen boundary at
+    // the epoch's genesis floor.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
 
     // the parked node notices its admission, syncs the boundary, fabricates
@@ -142,25 +143,27 @@ fn live_quorum_admits_a_fourth_validator() {
     for member in [0usize, 1] {
         let cfg = cluster.config_file(member);
         let (ok, out) = cluster.run_verb(&[
-            "invite-accept",
+            "promote",
             &friend_hex,
             "--config",
             cfg.to_str().expect("utf-8 config path"),
         ]);
-        assert!(ok, "invite-accept via member {member} failed:\n{out}");
+        assert!(ok, "promote via member {member} failed:\n{out}");
     }
 
+    // direct admission: ONE cutover seats the joiner on every incumbent.
     for i in 0..3 {
         cluster.wait_marker(i, "cutover complete: epoch 1", CONVERGE);
     }
 
     // advance the boundary PAST the epoch base while the joiner is still
-    // syncing-or-parked: the incumbents finalize without it, so the joiner
-    // must adopt a mid-epoch boundary plus its finalization floor.
+    // syncing-or-parked: quorum(4) = 3, so the incumbents finalize without
+    // it and the joiner must adopt a mid-epoch boundary plus its
+    // finalization floor.
     for n in 0..5 {
-        cluster.submit(0, "directory", &dir_set(&format!("epoch1-op-{n}"), "x"));
-        let _ = poll_until("epoch-1 filler to finalize", FINALIZE, || {
-            dir_value(&cluster, 1, &format!("epoch1-op-{n}"))
+        cluster.submit(0, "directory", &dir_set(&format!("epoch2-op-{n}"), "x"));
+        let _ = poll_until("epoch-2 filler to finalize", FINALIZE, || {
+            dir_value(&cluster, 1, &format!("epoch2-op-{n}"))
         });
     }
 

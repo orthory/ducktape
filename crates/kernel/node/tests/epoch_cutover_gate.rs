@@ -95,7 +95,7 @@ fn ceiling_discards_and_cutover_rebases_heights() {
         // epoch; k0/k1 resolved below the ceiling and are NOT carried. no
         // client resubmit anywhere.
         let carried = node
-            .cutover(RoundOrderer::new(), 1, 2, &[])
+            .cutover(RoundOrderer::new(), 1, 2, &[], &[])
             .await
             .expect("cutover");
         assert_eq!(carried, 2, "exactly the unresolved accepted frames carry");
@@ -154,6 +154,7 @@ impl BlockSink for PinRecorder {
         _epoch: u64,
         _view_base: u64,
         _participants: &[Vec<u8>],
+        _observers: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
         async { Ok(()) }
     }
@@ -176,7 +177,7 @@ fn carry_repins_byte_identical_frames() {
         // epoch's recovery stretch must own the frame independently of the
         // (prunable) old pin record.
         let carried = node
-            .cutover(RoundOrderer::new(), 1, 1, &[])
+            .cutover(RoundOrderer::new(), 1, 1, &[], &[])
             .await
             .expect("cutover");
         assert_eq!(carried, 1);

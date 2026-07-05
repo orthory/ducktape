@@ -182,7 +182,9 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
 
             // rebuild ENTIRELY through the wire: every op batch crosses the
             // channel as proof-carrying bytes and is merkle-verified.
-            let rebuilt = Kv::sync_from(joiner_ctx, "kv-rebuilt", target, resolver).await;
+            let rebuilt = Kv::sync_from(joiner_ctx, "kv-rebuilt", target, resolver)
+                .await
+                .expect("sync_from");
             assert_eq!(rebuilt.root(), src_kv_root, "synced root == source root");
             assert_eq!(
                 rebuilt.get(b"motd").await.as_deref(),

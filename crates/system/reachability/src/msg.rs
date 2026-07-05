@@ -1,10 +1,10 @@
 //! The reachability plane's control-mesh messages: what members exchange
 //! over the node's dedicated reachability channel to assemble a `MeshView`
-//! and run tunnel handshakes. Every payload is already ed25519-signed by
-//! `wireguard-upgrade` (advertisements and the handshake triple) or feeds a
-//! signed artifact (the pre-version `Record` gossip), and the channel itself
-//! rides the key-authenticated commonware mesh — the codec adds transport
-//! framing, not trust.
+//! and run tunnel handshakes. Every payload is ed25519-signed by its OWNER
+//! (`wireguard-upgrade` records, advertisements, and the handshake triple),
+//! never merely by the delivering link: messages are relayed through third
+//! members when two members share no direct transport path, so the codec —
+//! and the transport — add framing, not trust.
 //!
 //! serde_json deliberately: control-plane rate (a handful of messages per
 //! epoch), human-debuggable on the wire, and the same codec the node's other
@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use wireguard_upgrade::{
-    EndpointAdvertisement, EndpointRecord, TunnelUpgradeAck, TunnelUpgradeRequest,
+    EndpointAdvertisement, SignedEndpointRecord, TunnelUpgradeAck, TunnelUpgradeRequest,
     TunnelUpgradeResponse,
 };
 
@@ -28,8 +28,10 @@ pub struct MsgError(#[from] serde_json::Error);
 /// first, then signed advertisements over the agreed set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReachabilityMsg {
-    /// Pre-version gossip: this member's record for the current epoch.
-    Record(EndpointRecord),
+    /// Pre-version gossip: a member's OWNER-SIGNED record for the current
+    /// epoch — self-signed so a relaying member can neither forge nor alter
+    /// it in flight.
+    Record(SignedEndpointRecord),
     /// The signed, mesh-versioned advertisement (`MeshView::verify` input).
     Advert(EndpointAdvertisement),
     /// Tunnel handshake, initiator -> responder.
@@ -53,10 +55,11 @@ impl ReachabilityMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use std::net::{IpAddr, Ipv4Addr};
     use wireguard_upgrade::{
-        AdmissionRoot, Endpoint, MeshCapability, PortPolicy, Root, Transport, ValidatorIdentity,
-        X25519PublicKey,
+        AdmissionRoot, Endpoint, EndpointRecord, MeshCapability, PortPolicy, Root, Transport,
+        ValidatorIdentity, X25519PublicKey,
     };
 
     #[test]
@@ -71,12 +74,13 @@ mod tests {
             )
             .unwrap()
         };
+        let signer = PrivateKey::from_seed(1);
         let record = EndpointRecord {
             namespace: "net#1".into(),
             epoch: 7,
             valset_root: Root([1; 32]),
             admission_root: AdmissionRoot([2; 32]),
-            validator_identity: ValidatorIdentity([3; 32]),
+            validator_identity: ValidatorIdentity::try_from(signer.public_key().as_ref()).unwrap(),
             wireguard_public_key: X25519PublicKey([4; 32]),
             control_endpoint: endpoint(10, 443, Transport::Tcp),
             wireguard_endpoint: endpoint(10, 51820, Transport::Udp),
@@ -84,7 +88,7 @@ mod tests {
             expires_at_view: 50,
             nonce: 1,
         };
-        let msg = ReachabilityMsg::Record(record);
+        let msg = ReachabilityMsg::Record(SignedEndpointRecord::sign(record, &signer));
         assert_eq!(ReachabilityMsg::decode(&msg.encode()).unwrap(), msg);
 
         assert!(ReachabilityMsg::decode(b"not json").is_err());

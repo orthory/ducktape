@@ -381,7 +381,9 @@ fn main() {
             .query("valset", &valset_encode_query(&ValsetQuery::Validators))
             .await
             .expect("query valset");
-        let ValsetReply::Validators(vs) = valset_decode_reply(&reply).unwrap();
+        let ValsetReply::Validators(vs) = valset_decode_reply(&reply).unwrap() else {
+            panic!("expected Validators reply");
+        };
         println!("  validator count: {} (was 0 at genesis)", vs.len());
         println!(
             "  valset root    : {:?}",
