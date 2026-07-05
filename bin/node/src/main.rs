@@ -1269,6 +1269,99 @@ async fn heal_index(index: &indexer::IndexStore, host: &Host, boundary: u64, lab
     }
 }
 
+/// cut and frame every derived-index database (modules + the blocks db) for
+/// the shipped-index lane (indexable spec §7 lane 2). a database that fails
+/// to cut is skipped — whatever a joiner does not receive, its staleness
+/// heal re-derives — and a poisoned store cuts nothing, so the shipment
+/// comes back empty and the joiner falls back entirely.
+fn ship_index_blobs(
+    index: &indexer::IndexStore,
+    label: &str,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut blobs = std::collections::BTreeMap::new();
+    let dbs: Vec<String> = index
+        .module_ids()
+        .map(str::to_string)
+        .chain(std::iter::once(indexer::BLOCKS_DB_ID.to_string()))
+        .collect();
+    for db in dbs {
+        match index.checkpoint_files(&db) {
+            Ok(files) => {
+                blobs.insert(db, statesync::encode_index_archive(&files));
+            }
+            Err(err) => eprintln!("[node {label}] shipped index skips {db}: {err}"),
+        }
+    }
+    blobs
+}
+
+/// fetch the sync source's shipped-index checkpoints and stage them for
+/// adoption at the promoted reboot — the OPTIONAL, UNVERIFIED warm start
+/// over the from-state rebuild (indexable spec §7 lane 2). every outcome
+/// short of a staged-and-committed install converges on the same fallback:
+/// the boot heal re-derives whatever the watermarks say is missing, so
+/// failures here log and fall through, never abort the promotion.
+async fn stage_shipped_index<C: statesync::SyncClient>(
+    client: &C,
+    boundary: statesync::BoundaryId,
+    storage: &std::path::Path,
+    label: &str,
+) {
+    let index_base = storage.join("index");
+    let known: std::collections::BTreeSet<&str> = MODULE_IDS
+        .iter()
+        .copied()
+        .chain(std::iter::once(indexer::BLOCKS_DB_ID))
+        .collect();
+    let staged: Result<usize, String> = async {
+        // a retry of the promotion loop may have staged a partial set
+        // already; start clean so attempts never interleave.
+        indexer::discard_staged(&index_base).map_err(|e| e.to_string())?;
+        let entries = statesync::fetch_index_modules(client, boundary)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut staged = 0usize;
+        for (db, _) in &entries {
+            // a db this binary does not know (version skew) would sit
+            // unopened on disk forever — skip it, its module heals instead.
+            if !known.contains(db.as_str()) {
+                println!("[node {label}] shipped index skips unknown db {db:?}");
+                continue;
+            }
+            let blob = statesync::fetch_index_db(client, boundary, db)
+                .await
+                .map_err(|e| format!("{db}: {e}"))?;
+            let files =
+                statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
+            indexer::stage_shipped_db(&index_base, db, &files).map_err(|e| e.to_string())?;
+            staged += 1;
+        }
+        if staged > 0 {
+            indexer::commit_staged(&index_base).map_err(|e| e.to_string())?;
+        }
+        Ok(staged)
+    }
+    .await;
+    match staged {
+        Ok(0) => println!(
+            "[node {label}] source ships no index — views heal from verified state"
+        ),
+        Ok(n) => println!(
+            "[node {label}] shipped index staged ({n} databases) — adopted at the promoted \
+             reboot; contents are trusted from the source, not verified (spec §7 lane 2)"
+        ),
+        Err(e) => {
+            eprintln!(
+                "[node {label}] shipped index fetch failed: {e} — views heal from verified \
+                 state instead"
+            );
+            if let Err(e) = indexer::discard_staged(&index_base) {
+                eprintln!("[node {label}] shipped index staging cleanup failed: {e}");
+            }
+        }
+    }
+}
+
 async fn apply_verified_suffix_frame(
     host: &mut Host,
     served: &statesync::FinalizedFrame,
@@ -3050,6 +3143,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         dev_demo,
         checkpoint_blocks,
         invite_token,
+        sync_index,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -3685,6 +3779,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             };
             println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
+
+            // the optional shipped-index warm start rides the same sync
+            // connection, staged BEFORE the promotion checkpoint lands: a
+            // crash mid-fetch reboots back into joiner mode and refetches,
+            // and a torn staging directory is discarded at adoption. the
+            // promoted reboot's IndexStore::open adopts what committed here.
+            if sync_index {
+                stage_shipped_index(&client, boundary.boundary_id(), &storage_for_sync, &label)
+                    .await;
+            }
 
             // fabricate the checkpoint a restart would have left; the normal
             // recovery boot turns it into a live validator. next_seq starts
@@ -5155,6 +5259,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             statesync::encode_response(&response)
                         }
                         Ok(req) => {
+                            // the shipped-index lane cuts lazily: the FIRST
+                            // index request for a boundary checkpoints the
+                            // derived databases and attaches the archives to
+                            // that capture, so joiners that never opt in cost
+                            // nothing. an unleased boundary cannot hold an
+                            // attachment — handle() below answers it with the
+                            // proper refetch error either way.
+                            if let statesync::SyncRequest::IndexModules { boundary } = &req {
+                                if !sync_server.index_attached(*boundary) {
+                                    let _ = sync_server
+                                        .attach_index(*boundary, ship_index_blobs(&index, &label));
+                                }
+                            }
                             // the boundary's consensus coordinates ride the manifest.
                             // the floor certificate is served only when it certifies
                             // exactly the current boundary — a cert behind the

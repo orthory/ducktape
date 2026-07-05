@@ -6203,9 +6203,11 @@ dependencies = [
  "commonware-utils",
  "futures",
  "host",
+ "indexer",
  "kv",
  "kv-interface",
  "sdk",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

@@ -33,3 +33,7 @@ kv = { workspace = true }
 kv-interface = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }
+# the shipped-index lane's end-to-end proof: real fluent31 databases cut,
+# framed, fetched, staged, and adopted through this crate's wire.
+indexer = { workspace = true }
+tempfile = "3"

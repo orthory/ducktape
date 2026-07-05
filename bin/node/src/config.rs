@@ -964,6 +964,12 @@ pub struct NodeToml {
     /// memory; for dev/sim runs, and for several same-chain nodes on one
     /// host, which would otherwise fight over one interface name).
     pub wireguard_effect: Option<String>,
+    /// opt-in shipped-index warm start when joining (node-local operator
+    /// policy, like checkpoint_blocks): fetch the sync source's derived
+    /// index checkpoints alongside state-sync. the derived tier has no
+    /// root, so these bytes are UNVERIFIABLE — off, the default, means the
+    /// index heals from verified state instead (indexable spec §7).
+    pub sync_index: Option<bool>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -1185,6 +1191,8 @@ pub struct Resolved {
     /// parked joiner announces over the lobby channel. always `None` for the
     /// dev shape and for manual (token-less) joins.
     pub invite_token: Option<InviteToken>,
+    /// opt-in shipped-index warm start when joining; see `NodeToml::sync_index`.
+    pub sync_index: bool,
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -1293,6 +1301,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: load_invite_token(base)?,
+        sync_index: raw.sync_index.unwrap_or(false),
     })
 }
 
@@ -1412,6 +1421,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
+        sync_index: raw.sync_index.unwrap_or(false),
     })
 }
 
