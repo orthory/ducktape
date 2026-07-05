@@ -683,15 +683,17 @@ pub trait BlockSink {
     /// durably record a settled block's outcome.
     fn seal(&mut self, seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>>;
     /// durably record an epoch cutover: the new epoch, its app-height base,
-    /// and the ENGINE PARTICIPANT SET it was spawned over (raw public-key
-    /// bytes). the set rides the record because a restart must respawn the
-    /// engine with the EPOCH'S set — the instantaneous valset projection may
-    /// already include a change awaiting the next cutover.
+    /// the ENGINE PARTICIPANT SET it was spawned over, and the epoch's
+    /// OBSERVER set (raw public-key bytes). the sets ride the record because
+    /// a restart must respawn the engine (and re-track the mesh) with the
+    /// EPOCH'S sets — the instantaneous valset projection may already include
+    /// a change awaiting the next cutover.
     fn cutover(
         &mut self,
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
+        observers: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>>;
 }
 
@@ -720,6 +722,7 @@ impl BlockSink for NullSink {
         _epoch: u64,
         _view_base: u64,
         _participants: &[Vec<u8>],
+        _observers: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>> {
         async { Ok(()) }
     }
@@ -894,8 +897,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
+        observers: &[Vec<u8>],
     ) -> Result<usize, Error> {
-        self.sink.cutover(epoch, view_base, participants).await?;
+        self.sink.cutover(epoch, view_base, participants, observers).await?;
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;

@@ -250,6 +250,16 @@ fn participant_bytes(
         .collect()
 }
 
+fn observer_bytes(
+    orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
+) -> Vec<Vec<u8>> {
+    orchestrator
+        .current_observers()
+        .iter()
+        .map(|k| k.as_ref().to_vec())
+        .collect()
+}
+
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
 async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
@@ -262,6 +272,23 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
     };
     match decode_reply(&reply) {
         Ok(ValsetReply::Validators(v)) => v,
+        Ok(_) | Err(_) => Vec::new(),
+    }
+}
+
+/// read the valset module's current OBSERVER projection (committed state —
+/// called between drains, outside any block; same read point as
+/// [`read_valset_members`], so a boundary read sees one frozen state).
+async fn read_valset_observers(host: &Host) -> Vec<Vec<u8>> {
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("valset", &encode_query(&ValsetQuery::Observers))
+        .await
+    else {
+        return Vec::new();
+    };
+    match decode_reply(&reply) {
+        Ok(ValsetReply::Observers(v)) => v,
         Ok(_) | Err(_) => Vec::new(),
     }
 }
@@ -1673,6 +1700,7 @@ where
         target.epoch,
         target.view_base,
         target.participants.clone(),
+        target.observers.clone(),
         pending_cutover_view,
         target.current_version,
         target.pending_upgrade.clone(),
@@ -1938,6 +1966,25 @@ fn resume_member_keys(
         keys.push(
             ed25519::PublicKey::decode(k.as_slice())
                 .map_err(|e| format!("recovered participant set holds a non-ed25519 key: {e}"))?,
+        );
+    }
+    Ok(keys)
+}
+
+/// the recovered epoch's OBSERVER keys — empty on a fresh boot (genesis has
+/// no observers) and on checkpoints written before the staged-admission tier.
+fn resume_observer_keys(
+    resumed: Option<&recovery::Recovered>,
+) -> Result<Vec<ed25519::PublicKey>, String> {
+    let raw: Vec<Vec<u8>> = match resumed {
+        Some(rec) => rec.observers.clone(),
+        None => Vec::new(),
+    };
+    let mut keys = Vec::with_capacity(raw.len());
+    for k in &raw {
+        keys.push(
+            ed25519::PublicKey::decode(k.as_slice())
+                .map_err(|e| format!("recovered observer set holds a non-ed25519 key: {e}"))?,
         );
     }
     Ok(keys)
@@ -3937,6 +3984,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 boundary.epoch,
                 boundary.view_base,
                 boundary.participants.clone(),
+                boundary.observers.clone(),
                 None,
                 cv,
                 pu,
@@ -4011,6 +4059,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         0,
                         0,
                         genesis_participants,
+                        Vec::new(),
                         None,
                         cv,
                         pu,
@@ -4386,6 +4435,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
+                                &target.observers,
                             )
                             .await
                             {
@@ -4506,6 +4556,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
+                                &target.observers,
                             )
                             .await
                             {
@@ -4522,6 +4573,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             target.epoch,
                             target.view_base,
                             target.participants.clone(),
+                            target.observers.clone(),
                             None,
                             target.current_version,
                             target.pending_upgrade.clone(),
@@ -4891,9 +4943,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // schedules deterministic epoch cutovers. it resumes at the recovered
         // epoch coordinates over the epoch's ENGINE PARTICIPANT SET, and
         // re-arms a cutover the pre-crash process had scheduled.
+        let observer_keys = match resume_observer_keys(resumed.as_ref()) {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("[node {label}] FATAL: {e}");
+                std::process::exit(1);
+            }
+        };
         let mut orchestrator = consensus::ValsetOrchestrator::resume(
             CUTOVER_DELAY,
             member_keys.clone(),
+            observer_keys.clone(),
             resume_epoch,
             view_base,
             pending_boot,
@@ -5087,6 +5147,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         orchestrator.epoch(),
                         orchestrator.epoch_base(),
                         participant_bytes(&orchestrator),
+                        observer_bytes(&orchestrator),
                         orchestrator.pending_cutover().map(|c| c.cutover_view()),
                         cv,
                         pu,
@@ -5333,6 +5394,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
+                                observer_bytes(&orchestrator),
                                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                                 cv,
                                 pu,
@@ -5402,8 +5464,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 observed.push(pk);
                             }
                         }
+                        // the OBSERVER projection, read at the same frozen
+                        // point: a grant/revoke arms the same single cutover
+                        // slot (mesh admission is epoch-scoped).
+                        let observers_raw = read_valset_observers(node.host()).await;
+                        let mut observed_observers: Vec<ed25519::PublicKey> = Vec::new();
+                        for key in &observers_raw {
+                            if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
+                                observed_observers.push(pk);
+                            }
+                        }
                         if let consensus::ObservationOutcome::Scheduled(cutover) =
-                            orchestrator.observe_members(engine_view, observed.iter().cloned())
+                            orchestrator.observe_members(
+                                engine_view,
+                                observed.iter().cloned(),
+                                observed_observers.iter().cloned(),
+                            )
                         {
                             println!(
                                 "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
@@ -5435,17 +5511,29 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 node.set_view_ceiling(cutover.cutover_view());
                             }
                         }
-                        if let Some(plan) =
-                            orchestrator.respawn_if_due(engine_view, observed, boundary_upgrade)
-                        {
+                        if let Some(plan) = orchestrator.respawn_if_due(
+                            engine_view,
+                            observed,
+                            observed_observers,
+                            boundary_upgrade,
+                        ) {
                             let members = plan.valset().consensus_members();
                             let member_bytes: Vec<Vec<u8>> =
                                 members.iter().map(|k| k.as_ref().to_vec()).collect();
+                            let plan_observer_bytes: Vec<Vec<u8>> = plan
+                                .valset()
+                                .transport_members()
+                                .difference(members)
+                                .map(|k| k.as_ref().to_vec())
+                                .collect();
                             // transport FIRST: the new epoch's mesh must admit
-                            // its members (a fresh joiner above all) before
-                            // anything is expected of them. index = epoch,
-                            // strictly increasing across cutovers.
-                            mesh_oracle.track(plan.epoch(), mesh_at(members));
+                            // its members (a fresh joiner — or a granted
+                            // observer — above all) before anything is
+                            // expected of them. the mesh tracks the TRANSPORT
+                            // union; the engine below gets validators only.
+                            // index = epoch, strictly increasing across
+                            // cutovers.
+                            mesh_oracle.track(plan.epoch(), mesh_at(plan.valset().transport_members()));
                             // the reachability plane retunnels for the new
                             // member set the moment transport admits it.
                             // cutover_app_height IS the new epoch's absolute
@@ -5490,6 +5578,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     plan.epoch(),
                                     plan.cutover_app_height(),
                                     &member_bytes,
+                                    &plan_observer_bytes,
                                 )
                                 .await
                             {
@@ -5546,6 +5635,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
+                                observer_bytes(&orchestrator),
                                 None,
                                 cv,
                                 pu,
@@ -6077,6 +6167,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 epoch: orchestrator.epoch(),
                                 view_base: orchestrator.epoch_base(),
                                 participants: participant_bytes(&orchestrator),
+                                observers: observer_bytes(&orchestrator),
                                 current_version: bc_current,
                                 pending_upgrade: bc_pending,
                                 floor_cert: latest_floor
@@ -6137,6 +6228,7 @@ mod tests {
             epoch: 0,
             view_base: 0,
             participants: vec![test_me()],
+            observers: vec![],
             floor_cert,
             current_version: host::BASELINE_VERSION,
             pending_upgrade: None,
@@ -6597,6 +6689,7 @@ mod tests {
                 0,
                 0,
                 vec![test_me()],
+                vec![],
                 None,
                 host::BASELINE_VERSION,
                 None,
@@ -6613,6 +6706,7 @@ mod tests {
                 epoch: 0,
                 view_base: 0,
                 participants: vec![test_me()],
+                observers: vec![],
                 floor_cert: Some(vec![1, 2, 3]),
                 current_version: host::BASELINE_VERSION,
                 pending_upgrade: None,

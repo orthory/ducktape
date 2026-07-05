@@ -228,6 +228,7 @@ fn replay_recomputes_the_identical_app_hash_across_an_armed_boundary() {
             0,
             0,
             vec![],
+            vec![],
             None,
             0,
             Some(UpgradeCoords {
@@ -379,6 +380,7 @@ fn roll_forward_of_an_unsealed_block_across_h_is_version_aware() {
             Some(checkpoint_height),
             0,
             0,
+            vec![],
             vec![],
             None,
             0,
