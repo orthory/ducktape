@@ -13,7 +13,7 @@ mod defguard_effect;
 pub use defguard_effect::DefguardWireGuardEffect;
 
 mod wiring;
-pub use wiring::apply_tunnel_plan;
+pub use wiring::{apply_tunnel_plan, apply_tunnel_plans};
 
 use defguard_wireguard_rs::InterfaceConfiguration;
 
