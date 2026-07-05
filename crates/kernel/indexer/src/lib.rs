@@ -1284,7 +1284,11 @@ mod tests {
         store.apply_block(&block_with_record(9, Vec::new())).unwrap();
 
         assert_eq!(store.recent_block_rows(10).unwrap().len(), 1);
-        assert_eq!(store.applied_height("chat").unwrap(), 0, "no op rows");
+        // every module's watermark advances — quiet is not stale — but no op
+        // rows were written.
+        assert_eq!(store.applied_height("chat").unwrap(), 9);
+        let ops = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
+        assert!(ops.entries.is_empty(), "no op rows");
         assert_eq!(store.resume_height().unwrap(), 9, "blocks watermark counts");
     }
 
