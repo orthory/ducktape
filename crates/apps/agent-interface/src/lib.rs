@@ -1,16 +1,19 @@
 //! the agent module's public wire surface — types only.
 //!
 //! the agent module is the collaboration-loop orchestrator (design §3, §5):
-//! it registers agents, watches chat channels through hooks, turns engaged
-//! posts into runs, pins each run to the exact transcript prefix it saw, and
-//! validates the LLM's output before any cross-module write happens. four
-//! payload families cross this surface:
+//! it registers agents, watches chat channels through the tagging plane's
+//! engagement events, turns engaged posts into dispatch-plane runs, pins each
+//! run to the exact transcript prefix it saw, and validates the model's
+//! output before any cross-module write happens. four payload families cross
+//! this surface:
 //!
 //! - [`AgentMsg`] — writes: registry admin, channel watches, explicit run
 //!   requests, and run cancellation.
-//! - [`LlmRequest`] — the saga work spec a trigger carries: everything an
-//!   off-consensus LLM worker needs to re-derive the prompt input (P4) and
-//!   answer under the right idempotency key.
+//! - [`LlmRequest`] — the saga work spec a JOB-BACKED run's trigger carries:
+//!   everything an off-consensus LLM worker needs to re-derive the prompt
+//!   input (P4) and answer under the right idempotency key. chat-engaged runs
+//!   do not use it — they ride the dispatch plane, whose payload the agent
+//!   module composes in-consensus.
 //! - [`AgentOutput`] — the agreed oracle result: reply blocks for chat plus a
 //!   bounded list of [`AgentAction`]s. it is DATA until the agent module
 //!   deterministically validates it against the agent's allowed-action set.
@@ -92,6 +95,13 @@ pub struct AgentRecord {
     pub capability: String,
     /// sha256 of the agent's prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
     pub prompt_hash: Vec<u8>,
+    /// the document module doc holding the prompt CONTENT, when the prompt is
+    /// consensus-resident. the canonical rendering (block texts joined by
+    /// blank lines) must hash to `prompt_hash` — verified at dispatch time,
+    /// so a drifted document fails the run's staging, never the block.
+    /// `None` = no stored prompt; dispatch-plane runs use generic
+    /// instructions.
+    pub prompt_doc: Option<String>,
     /// granted action names, each from [`KNOWN_ACTIONS`], sorted and deduped.
     pub allowed_actions: Vec<String>,
     pub status: AgentStatus,
@@ -127,11 +137,14 @@ pub struct WatchView {
 /// ops move it to a terminal state.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
-    /// the saga carrying this run's LLM work, awaited for its callback.
+    /// a JOB-BACKED run's saga, awaited for its callback.
     AwaitingOracle { saga_id: String },
+    /// a chat-engaged run's dispatch, awaited for its next-block
+    /// `ResultEvent` from the dispatch plane.
+    AwaitingResult { dispatch_id: String },
     /// the output validated and its follow-ups were emitted.
     Done,
-    /// the saga failed / timed out, or the output failed validation.
+    /// the work failed / timed out, or the output failed validation.
     Failed { reason: String },
     /// cancelled by the run's creator or the agent's owner.
     Cancelled,
@@ -140,7 +153,10 @@ pub enum RunStatus {
 impl RunStatus {
     /// true for every state a run can never leave.
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, RunStatus::AwaitingOracle { .. })
+        !matches!(
+            self,
+            RunStatus::AwaitingOracle { .. } | RunStatus::AwaitingResult { .. }
+        )
     }
 }
 
@@ -240,20 +256,25 @@ pub struct AgentOutput {
 pub enum AgentMsg {
     /// register an agent under the submitter's origin (a non-empty external
     /// key or a module — the owner capability). a duplicate `agent_id` is an
-    /// error.
+    /// error. registration also registers the agent's dispatch-plane recipe
+    /// (`agent/{agent_id}`) in the same block.
     RegisterAgent {
         agent_id: String,
         display_name: String,
         capability: String,
         prompt_hash: Vec<u8>,
+        prompt_doc: Option<String>,
         allowed_actions: Vec<String>,
     },
-    /// owner-gated partial update; `None` fields keep their current value.
+    /// owner-gated partial update; `None` fields keep their current value
+    /// (clearing `prompt_doc` means re-registering). a capability change also
+    /// retunes the agent's dispatch-plane recipe in the same block.
     UpdateAgent {
         agent_id: String,
         display_name: Option<String>,
         capability: Option<String>,
         prompt_hash: Option<Vec<u8>>,
+        prompt_doc: Option<String>,
         allowed_actions: Option<Vec<String>>,
     },
     /// owner-gated: stop the agent from engaging new runs.

@@ -28,6 +28,9 @@ dependencies = [
  "chat",
  "chat-interface",
  "commonware-runtime",
+ "dispatch",
+ "dispatch-interface",
+ "document-interface",
  "futures",
  "host",
  "jobs",
@@ -36,8 +39,11 @@ dependencies = [
  "saga",
  "saga-interface",
  "sdk",
+ "serde",
  "serde_json",
  "sha2",
+ "tagging",
+ "tagging-interface",
  "tasks",
  "tasks-interface",
 ]
@@ -902,6 +908,7 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
+ "tagging-interface",
 ]
 
 [[package]]
