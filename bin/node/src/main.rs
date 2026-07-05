@@ -132,6 +132,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// enough to let discovery links warm, but bounded so boot cannot hang forever
 /// before the statesync server bridge is installed.
 const BOOT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+/// how often the reachability plane re-offers its un-acked gossip
+/// (`ReachabilityCommand::Nudge`). fast enough that a boot-window record loss
+/// costs one beat of mesh convergence, slow enough to be noise-free — the
+/// nudge is a no-op once the epoch has assembled.
+const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
 /// post-reboot catch-up should close the reboot gap, not chase a live chain
 /// forever. any tiny lag left after this cap is handled by the normal engine.
 const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
@@ -2742,6 +2747,8 @@ async fn reachability_plane(
     advertised: Ingress,
     coordinators: Vec<Ingress>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
+    // a clone of the `commands` sender, for the plane's own nudge ticker.
+    nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
 ) {
     use std::net::ToSocketAddrs as _;
@@ -2824,6 +2831,35 @@ async fn reachability_plane(
         coordinators: coords,
         port_policy: policy,
     };
+    // the boot `Retarget`'s record fan-out fires before the p2p actors have
+    // a single live connection, and mesh sends are best-effort — when both
+    // sides of a link lose that first datagram the plane deadlocks in record
+    // gossip. the nudge re-offers un-acked gossip until the epoch assembles
+    // (a no-op afterwards). the ticker holds only a WEAK sender: the plane's
+    // exit is "every command sender dropped", and a strong clone here would
+    // keep its own channel alive forever.
+    let nudges = {
+        let weak = nudges.downgrade();
+        // the strong param must die NOW — holding it for the plane's
+        // lifetime would itself keep the channel open.
+        drop(nudges);
+        weak
+    };
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(NUDGE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(tx) = nudges.upgrade() else { break };
+            if tx
+                .send(reachability::ReachabilityCommand::Nudge)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     match effect_kind {
         WireGuardEffectKind::Fake => {
             println!(
@@ -2970,17 +3006,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
     // there was a silent no-op). reaching them needs the nat client to
     // hole-punch/relay through the coordinator and bring up a WireGuard tunnel
-    // — the reachability data plane. that plane now runs STAGED behind the
-    // `wireguard_listen` key (rendezvous + handshakes are real, the interface
-    // effect is the recording fake), so a coordinated-only invite still
+    // — the reachability data plane. that plane runs behind the
+    // `wireguard_listen` key and drives a real interface by default
+    // (`wireguard_effect = "fake"` opts out), but the TCP mesh dialer does
+    // not route over the tunnel yet, so a coordinated-only invite still
     // cannot carry mesh traffic; surface it loudly rather than park silently.
     // see docs/deploy/private-cutover-integration-gap.md.
     if !coordinated.is_empty() {
         println!(
-            "[node {label}] WARNING: {} coordinated reach target(s) require a live WireGuard \
-             tunnel, which this build only STAGES (fake interface effect) — these peers are \
-             UNREACHABLE for mesh traffic until the real effect lands. use a direct/fronted \
-             invite for now.",
+            "[node {label}] WARNING: {} coordinated reach target(s) need mesh traffic to flow \
+             over a WireGuard tunnel, but the mesh dialer does not route over tunnels yet — \
+             these peers are UNREACHABLE for mesh traffic. use a direct/fronted invite for \
+             now.",
             coordinated.len()
         );
         for (target, coord, _coord_key) in &coordinated {
@@ -2991,11 +3028,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         }
     }
     if let Some(wg) = &wireguard_listen {
-        println!(
-            "[node {label}] reachability plane: STAGED — advertising WireGuard endpoint \
-             udp/{wg}; records, advertisements, and tunnel handshakes run for real, the \
-             interface effect is the phase-A recording fake (no root, no real tunnel)."
-        );
+        match wireguard_effect {
+            WireGuardEffectKind::Real => println!(
+                "[node {label}] reachability plane: advertising WireGuard endpoint udp/{wg}"
+            ),
+            WireGuardEffectKind::Fake => println!(
+                "[node {label}] reachability plane: advertising WireGuard endpoint udp/{wg}; \
+                 records, advertisements, and tunnel handshakes run for real, the interface \
+                 effect is the in-memory fake (no real tunnel)."
+            ),
+        }
     }
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
@@ -3833,6 +3875,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let reach_signer = signer.clone();
                     let chain_id = String::from_utf8_lossy(&namespace).to_string();
                     let key_file = wireguard_key_file.clone();
+                    let nudge_tx = cmd_tx.clone();
                     std::thread::Builder::new()
                         .name("reachability".into())
                         .spawn(move || {
@@ -3850,6 +3893,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     advertised_reach,
                                     coordinators,
                                     cmd_rx,
+                                    nudge_tx,
                                     ev_tx,
                                 ));
                         })
