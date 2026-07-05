@@ -1,7 +1,7 @@
 //! Orchestrator e2e over an in-memory message router: N `run()` instances,
 //! each with its own keystore + fake effect, wired Send->Deliver exactly the
 //! way bin/node's reachability channel will wire them. Proves the whole
-//! phase-A pipeline — record gossip -> signed adverts -> converged mesh
+//! orchestration pipeline — record gossip -> signed adverts -> converged mesh
 //! version -> pairwise handshakes -> ONE apply per node — with no real
 //! sockets and no real WireGuard.
 
@@ -74,6 +74,21 @@ fn spawn_mesh(
     seeds: &[u64],
     resolvers: Vec<StaticResolver>,
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
+    let always_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    spawn_mesh_gated(local, dir, seeds, resolvers, always_up)
+}
+
+/// [`spawn_mesh`] with a link gate: while `links_up` is false the router
+/// DROPS every `Send` instead of delivering it — the real transport's
+/// behavior for a datagram fired before any p2p connection exists (exactly
+/// the boot `Retarget` window in `bin/node`).
+fn spawn_mesh_gated(
+    local: &LocalSet,
+    dir: &std::path::Path,
+    seeds: &[u64],
+    resolvers: Vec<StaticResolver>,
+    links_up: Arc<std::sync::atomic::AtomicBool>,
+) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
     let policy = PortPolicy::production();
     let signers: Vec<PrivateKey> = seeds.iter().map(|s| PrivateKey::from_seed(*s)).collect();
     let pks: Vec<_> = signers.iter().map(|s| s.public_key()).collect();
@@ -120,11 +135,15 @@ fn spawn_mesh(
         let all_pks = pks.clone();
         let my_pk = pks[i].clone();
         let collected = collected_tx.clone();
+        let gate = links_up.clone();
         let mut ev_rx = ev_rx;
         local.spawn_local(async move {
             while let Some(event) = ev_rx.recv().await {
                 match event {
                     ReachabilityEvent::Send { to, bytes } => {
+                        if !gate.load(std::sync::atomic::Ordering::Relaxed) {
+                            continue; // link not up yet — the datagram is gone
+                        }
                         if let Some(j) = all_pks.iter().position(|pk| *pk == to) {
                             let _ = all_cmds[j]
                                 .send(ReachabilityCommand::Deliver {
@@ -423,4 +442,59 @@ async fn nat_resolver_without_coordinators_is_pass_through() {
         r.resolve(NodeKey([2; 32]), advertised).await.unwrap(),
         Resolution::Advertised
     );
+}
+
+/// the boot race: every node's `Retarget` record fan-out fires before the
+/// transport has any live connection, so BOTH sides of every link lose their
+/// initial `EndpointRecord` — `on_record`'s first-contact heal never fires
+/// and, without nudges, the epoch stalls in record gossip forever. periodic
+/// `Nudge` commands (bin/node's ticker) re-offer the stored gossip once the
+/// links are up, and the mesh must then converge to a full apply.
+#[tokio::test]
+async fn boot_window_record_loss_heals_by_nudge() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) = spawn_mesh_gated(
+                &local,
+                dir.path(),
+                &[1, 2],
+                vec![StaticResolver::default(), StaticResolver::default()],
+                links_up.clone(),
+            );
+
+            // both boot Retargets fire into the dead transport.
+            retarget_all(&nodes, &[0, 1], 1, 10).await;
+            tokio::task::yield_now().await;
+
+            // the links come up AFTER the initial fan-out was lost.
+            links_up.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            // bin/node's nudge ticker, at test cadence.
+            for node in &nodes {
+                let cmd = node.cmd.clone();
+                local.spawn_local(async move {
+                    let mut tick =
+                        tokio::time::interval(Duration::from_millis(50));
+                    loop {
+                        tick.tick().await;
+                        if cmd.send(ReachabilityCommand::Nudge).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let versions = await_applied(&mut collected, &[0, 1], 1).await;
+            assert_eq!(versions[&0], versions[&1]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.create_calls, 1, "node {i}: one interface");
+                assert_eq!(fake.applied.len(), 1, "node {i}: one apply");
+                assert_eq!(fake.applied[0].peers.len(), 1);
+            }
+        })
+        .await;
 }

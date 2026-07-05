@@ -5,14 +5,19 @@ use defguard_wireguard_rs::{
 use crate::WireGuardEffect;
 
 /// Real `WireGuardEffect` backed by `defguard_wireguard_rs`'s userspace
-/// (BoringTun) implementation. Not exercised by the automated test suite —
-/// CI has no WireGuard userspace runtime, and `create_interface`/`apply`
-/// require a privileged host (root or `CAP_NET_ADMIN`) with BoringTun
-/// reachable at `/var/run/wireguard/<ifname>.sock`. Verify this path
-/// manually, cross-machine, using the `real_userspace_lifecycle_smoke`
-/// `#[ignore]`d test below: `cargo test -p wireguard-effect --
-/// --ignored real_userspace_lifecycle_smoke` on a Linux box with root, then
-/// confirm with `ip addr show <ifname>` and `wg show <ifname>`.
+/// (BoringTun) implementation. BoringTun runs in-process
+/// (`defguard_boringtun::device::DeviceHandle`): `create_interface` opens
+/// the TUN device and binds the UAPI socket at
+/// `/var/run/wireguard/<ifname>.sock` itself — there is no external runtime
+/// to install or start. Not exercised by the automated test suite:
+/// `create_interface`/`apply` need a privileged unix host (root or
+/// `CAP_NET_ADMIN`, plus `/dev/net/tun`), and `remove_interface` shells out
+/// to `resolvconf` for DNS cleanup — missing binary = `IoError(NotFound)`
+/// at teardown. Verify manually with the `real_userspace_lifecycle_smoke`
+/// `#[ignore]`d test below: `cargo test -p wireguard-effect -- --ignored
+/// real_userspace_lifecycle_smoke` on such a host (a privileged Linux
+/// container works), then confirm with `ip addr show <ifname>` and
+/// `wg show <ifname>`.
 pub struct DefguardWireGuardEffect {
     api: WGApi<Userspace>,
 }
@@ -36,7 +41,30 @@ impl WireGuardEffect for DefguardWireGuardEffect {
     }
 
     fn apply(&mut self, config: &InterfaceConfiguration) -> Result<(), Self::Error> {
-        self.api.configure_interface(config)
+        self.api.configure_interface(config)?;
+        // The userspace `configure_interface` assigns addresses and writes
+        // the UAPI config but neither flips IFF_UP nor installs allowed-ip
+        // routes — the kernel path gets its UP flag inside defguard's
+        // (crate-private) `netlink::create_interface`, and peer routing is a
+        // separate trait call. Without both, the "applied" tunnel cannot
+        // carry a single packet (the two-container smoke surfaced the
+        // interface sitting in `state DOWN` with no route to the peer's
+        // overlay address). `ip` is the same external tool defguard's own
+        // peer routing shells out to on this path.
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::process::Command::new("ip")
+                .args(["link", "set", "up", "dev", &config.name])
+                .status()?;
+            if !status.success() {
+                return Err(WireguardInterfaceError::Interface(format!(
+                    "`ip link set up dev {}` exited with {status}",
+                    config.name
+                )));
+            }
+            self.api.configure_peer_routing(&config.peers)?;
+        }
+        Ok(())
     }
 
     fn remove_interface(&mut self) -> Result<(), Self::Error> {
@@ -62,7 +90,10 @@ mod tests {
         use defguard_wireguard_rs::{key::Key, net::IpAddrMask, peer::Peer};
         use std::net::{IpAddr, Ipv4Addr};
 
-        let mut effect = DefguardWireGuardEffect::new("ducktape-wg-smoke0").unwrap();
+        // The name must fit IFNAMSIZ - 1 (15 chars) or BoringTun rejects it
+        // with `InvalidTunnelName`; production names ("dt-" + 8 hex) always
+        // do, so keep the fixture inside the same bound.
+        let mut effect = DefguardWireGuardEffect::new("dt-smoke0").unwrap();
         effect.create_interface().unwrap();
 
         let mut peer = Peer::new(Key::new([9u8; 32]));
@@ -71,8 +102,11 @@ mod tests {
             32,
         )]);
         let config = InterfaceConfiguration {
-            name: "ducktape-wg-smoke0".into(),
-            prvkey: "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy".into(),
+            name: "dt-smoke0".into(),
+            // A real 32-byte key: `Key::try_from(&str)` rejects anything
+            // else, so a shorter placeholder would fail `apply` before the
+            // UAPI socket is ever touched.
+            prvkey: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=".into(),
             addresses: vec![IpAddrMask::new(
                 IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
                 32,
@@ -83,6 +117,29 @@ mod tests {
             fwmark: None,
         };
         effect.apply(&config).unwrap();
+
+        // `apply` must leave a USABLE tunnel: link up (the flags string
+        // gains `UP`; down is bare `<POINTOPOINT,MULTICAST,NOARP>`) and a
+        // route to the peer's allowed ip via this interface.
+        #[cfg(target_os = "linux")]
+        {
+            let link = std::process::Command::new("ip")
+                .args(["-o", "link", "show", "dt-smoke0"])
+                .output()
+                .unwrap();
+            let link = String::from_utf8_lossy(&link.stdout).to_string();
+            assert!(link.contains("UP"), "link is not up: {link}");
+            let route = std::process::Command::new("ip")
+                .args(["-4", "route", "get", "100.64.0.2"])
+                .output()
+                .unwrap();
+            let route = String::from_utf8_lossy(&route.stdout).to_string();
+            assert!(
+                route.contains("dt-smoke0"),
+                "peer allowed-ip does not route via the tunnel: {route}"
+            );
+        }
+
         effect.remove_interface().unwrap();
     }
 }

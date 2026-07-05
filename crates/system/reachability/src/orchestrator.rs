@@ -106,6 +106,16 @@ pub enum ReachabilityCommand {
     },
     /// The consensus view advanced (drives expiry checks between cutovers).
     ViewTick(u64),
+    /// Periodic controller kick: re-offer this node's un-acknowledged gossip
+    /// (record, then advert) to every peer while the epoch is still
+    /// assembling. Mesh sends are best-effort datagrams — a message fired
+    /// before the transport has a live connection to the peer (every boot
+    /// `Retarget` fires before the p2p actors even start) is silently
+    /// dropped, and when BOTH sides lose their initial record the
+    /// first-contact heal in `on_record` never triggers on either. Safe at
+    /// any cadence: receivers dedup by nonce and the re-offer never re-signs,
+    /// so the mesh version is unchanged.
+    Nudge,
     /// Drain and exit; the interface is torn down on the way out.
     Shutdown,
 }
@@ -393,6 +403,7 @@ where
             ReachabilityCommand::Retarget(event) => driver.retarget(event).await?,
             ReachabilityCommand::Deliver { from, bytes } => driver.deliver(from, bytes).await?,
             ReachabilityCommand::ViewTick(view) => driver.view = driver.view.max(view),
+            ReachabilityCommand::Nudge => driver.nudge().await?,
             ReachabilityCommand::Shutdown => {
                 if driver.interface_live {
                     // best-effort: exiting matters more than the teardown's
@@ -506,6 +517,35 @@ where
         }
         // a single-member network is a complete mesh already.
         self.advance().await
+    }
+
+    /// Re-offer the stored (never re-signed — a fresh nonce would change the
+    /// mesh version peers already computed) record or advert to every peer
+    /// while the corresponding stage is incomplete. Post-verification
+    /// handshake messages are deliberately NOT re-offered here: by then the
+    /// transport has proven live connections both ways (records and adverts
+    /// flowed), and re-signed requests interact with the shared replay cache
+    /// — that retry needs its own design if single-shot loss ever shows up
+    /// there.
+    async fn nudge(&mut self) -> Result<(), ReachabilityError> {
+        let (msg, peers) = {
+            let Some(state) = &self.state else {
+                return Ok(());
+            };
+            if !state.own_advert_sent {
+                let own = state.records.get(&self.me).cloned().expect("own record");
+                (ReachabilityMsg::Record(own), state.peers.clone())
+            } else if state.view_state.is_none() {
+                let own = state.adverts.get(&self.me).cloned().expect("own advert");
+                (ReachabilityMsg::Advert(own), state.peers.clone())
+            } else {
+                return Ok(());
+            }
+        };
+        for peer in peers {
+            self.send_msg(peer, &msg).await?;
+        }
+        Ok(())
     }
 
     async fn deliver(
