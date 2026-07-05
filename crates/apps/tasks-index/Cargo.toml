@@ -7,6 +7,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 indexer = { workspace = true }
 tasks-interface = { workspace = true }
 serde = { workspace = true }
@@ -14,3 +15,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true }

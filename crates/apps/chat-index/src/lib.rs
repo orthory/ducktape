@@ -19,13 +19,24 @@
 //! caveat (shared by every mapper): the view reflects ops applied SINCE the
 //! index existed. enabling an index against storage with prior chat history
 //! leaves that history unsearchable — and the seq mirror offset — until the
-//! chain (or the index together with the local block counter feeding it) is
-//! rebuilt from genesis.
+//! index is re-derived, either by replaying the chain from genesis or via the
+//! from-state rebuild below.
+//!
+//! from-state rebuild: canonical `Channels`/`MessagesRange` enumerate every
+//! sequence gap-free (tombstones and replies included), so the seq mirrors,
+//! rows, and postings all re-derive with an exact hit set. this mapper is the
+//! spec's NAMED degradation case: canonical heads keep no block height, so
+//! `height` collapses to the boundary — but `created_at` survives, so `time`
+//! (and with it search ranking) stays exact.
 
-use chat_interface::{Block, ChatMsg, DEFAULT_CHAT_TARGET, Span, decode_msg};
+use chat_interface::{
+    AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, DEFAULT_CHAT_TARGET, MAX_QUERY_LIMIT, Span,
+    decode_msg, decode_reply, encode_query,
+};
 use indexer::search::{self, DEFAULT_POSTING_CAP};
 use indexer::{
-    ApplyCtx, Derived, Error, ModuleIndexer, OpMeta, OriginKind, OriginTag, Result, ViewReader,
+    ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, OriginKind, OriginTag, RebuildMeta,
+    Result, StateReader, ViewReader,
 };
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +165,19 @@ fn author(origin: &OriginTag, as_agent: Option<&str>) -> String {
     }
 }
 
+/// render a canonical [`AuthorRef`] to the SAME string [`author`] renders the
+/// dispatch origin to — rebuilt rows must read identically to folded ones.
+/// user keys go through the same lossy utf-8 the node layer applies when it
+/// flattens an external origin into an [`OriginTag`].
+fn author_from_ref(author: &AuthorRef) -> String {
+    match author {
+        AuthorRef::User(key) => format!("user:{}", String::from_utf8_lossy(key)),
+        AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
+        AuthorRef::Module(id) => format!("module:{id}"),
+        AuthorRef::System => "system".to_string(),
+    }
+}
+
 fn read_u64(ctx: &ApplyCtx, key: &str) -> Result<u64> {
     Ok(ctx
         .get(key.as_bytes())?
@@ -171,16 +195,14 @@ fn read_row(ctx: &ApplyCtx, key: &str) -> Result<Option<MsgRow>> {
     }
 }
 
-fn put_row(out: &mut Derived, row: &MsgRow) -> Result<()> {
-    out.put(
+/// every entry one head state materializes to — the row plus one posting per
+/// token (a tombstone's empty text yields none). fold and rebuild both write
+/// THROUGH this, so the two paths produce byte-identical rows.
+fn row_entries(row: &MsgRow) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut entries = vec![(
         msg_key(&row.channel_id, row.seq),
         serde_json::to_vec(row).map_err(|e| Error::Mapper(e.to_string()))?,
-    );
-    Ok(())
-}
-
-/// write (or delete) the postings of one head state.
-fn put_toks(out: &mut Derived, row: &MsgRow) -> Result<()> {
+    )];
     let tok_ref = serde_json::to_vec(&TokRef {
         channel_id: row.channel_id.clone(),
         seq: row.seq,
@@ -189,7 +211,14 @@ fn put_toks(out: &mut Derived, row: &MsgRow) -> Result<()> {
     })
     .map_err(|e| Error::Mapper(e.to_string()))?;
     for token in search::tokens(&row.text) {
-        out.put(tok_key(&token, &row.channel_id, row.seq), tok_ref.clone());
+        entries.push((tok_key(&token, &row.channel_id, row.seq), tok_ref.clone()));
+    }
+    Ok(entries)
+}
+
+fn put_row_and_toks(out: &mut Derived, row: &MsgRow) -> Result<()> {
+    for (key, value) in row_entries(row)? {
+        out.put(key, value);
     }
     Ok(())
 }
@@ -200,6 +229,7 @@ fn delete_toks(out: &mut Derived, row: &MsgRow) {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl ModuleIndexer for ChatIndex {
     fn module(&self) -> &str {
         &self.module
@@ -237,8 +267,7 @@ impl ModuleIndexer for ChatIndex {
                     thread,
                     channel_id,
                 };
-                put_toks(out, &row)?;
-                put_row(out, &row)
+                put_row_and_toks(out, &row)
             }
             ChatMsg::EditMessage {
                 channel_id, seq, blocks, ..
@@ -251,11 +280,12 @@ impl ModuleIndexer for ChatIndex {
                 if row.deleted {
                     return Ok(());
                 }
+                // delete BEFORE re-putting: tokens shared by the old and new
+                // text stage a delete then a put, and the last action wins.
                 delete_toks(out, &row);
                 row.text = plain_text(&blocks);
                 row.edited = true;
-                put_toks(out, &row)?;
-                put_row(out, &row)
+                put_row_and_toks(out, &row)
             }
             ChatMsg::DeleteMessage { channel_id, seq } => {
                 let Some(mut row) = read_row(ctx, &msg_key(&channel_id, seq))? else {
@@ -264,7 +294,7 @@ impl ModuleIndexer for ChatIndex {
                 delete_toks(out, &row);
                 row.deleted = true;
                 row.text = String::new();
-                put_row(out, &row)
+                put_row_and_toks(out, &row)
             }
             // channel records, reactions, hooks, and membership don't change
             // any searchable text — no view impact.
@@ -318,6 +348,82 @@ impl ModuleIndexer for ChatIndex {
                     .map_err(|e| Error::View(e.to_string()))
             }
         }
+    }
+
+    fn supports_rebuild(&self) -> bool {
+        true
+    }
+
+    /// re-derive the seq mirrors, rows, and postings from canonical
+    /// `Channels`/`MessagesRange`. the per-channel sequence space is gap-free
+    /// (tombstones and replies included), so every head re-derives. the
+    /// spec's named degradation: heads keep no block height, so `height`
+    /// collapses to the boundary — `time` survives via `created_at`, so
+    /// ranking stays exact.
+    async fn rebuild_from_state(
+        &self,
+        state: &dyn StateReader,
+        meta: &RebuildMeta,
+        out: &mut Backfill<'_>,
+    ) -> Result<()> {
+        let reply = state.query(&encode_query(&ChatQuery::Channels)).await?;
+        let channels = match decode_reply(&reply).map_err(Error::State)? {
+            ChatReply::Channels(channels) => channels,
+            other => return Err(Error::State(format!("Channels answered {other:?}"))),
+        };
+        for channel in channels {
+            out.put(seq_key(&channel.id), channel.head_seq.to_be_bytes().to_vec())?;
+            let mut from_seq = 1u64;
+            while from_seq <= channel.head_seq {
+                let reply = state
+                    .query(&encode_query(&ChatQuery::MessagesRange {
+                        channel_id: channel.id.clone(),
+                        from_seq,
+                        limit: MAX_QUERY_LIMIT,
+                    }))
+                    .await?;
+                let views = match decode_reply(&reply).map_err(Error::State)? {
+                    ChatReply::Messages(views) => views,
+                    other => {
+                        return Err(Error::State(format!("MessagesRange answered {other:?}")));
+                    }
+                };
+                // the sequence space is gap-free through head_seq, so an
+                // empty page below the head is drift, not the end.
+                let Some(last) = views.last() else {
+                    return Err(Error::State(format!(
+                        "channel {} empty at seq {from_seq}, head {}",
+                        channel.id, channel.head_seq
+                    )));
+                };
+                from_seq = last.seq + 1;
+                for view in views {
+                    let head = view.head;
+                    let row = MsgRow {
+                        channel_id: view.channel_id,
+                        seq: view.seq,
+                        message_id: head.message_id,
+                        author: author_from_ref(&head.author),
+                        height: meta.height,
+                        time: head.created_at,
+                        // mirror the fold's tombstone exactly: empty text (so
+                        // no postings), whatever skeleton the head kept.
+                        text: if head.deleted {
+                            String::new()
+                        } else {
+                            plain_text(&head.blocks)
+                        },
+                        deleted: head.deleted,
+                        edited: head.rev > 0,
+                        thread: head.thread,
+                    };
+                    for (key, value) in row_entries(&row)? {
+                        out.put(key, value)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -483,5 +589,152 @@ mod tests {
         apply(&store, 1, vec![agent_post]);
         let hits = search(&store, serde_json::json!({"search": {"text": "agent"}}));
         assert_eq!(hits[0].author, "agent:agent/helper");
+    }
+
+    /// canonical chat state standing in for the module's query surface. pages
+    /// `MessagesRange` TWO views at a time regardless of the asked limit, so
+    /// the rebuild's pagination loop is exercised, not just its first lap.
+    struct CanonicalChat {
+        channels: Vec<chat_interface::Channel>,
+        views: Vec<chat_interface::MessageView>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl indexer::StateReader for CanonicalChat {
+        async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
+            let reply = match chat_interface::decode_query(req).map_err(Error::State)? {
+                ChatQuery::Channels => ChatReply::Channels(self.channels.clone()),
+                ChatQuery::MessagesRange {
+                    channel_id,
+                    from_seq,
+                    ..
+                } => ChatReply::Messages(
+                    self.views
+                        .iter()
+                        .filter(|v| v.channel_id == channel_id && v.seq >= from_seq)
+                        .take(2)
+                        .cloned()
+                        .collect(),
+                ),
+                other => return Err(Error::State(format!("unexpected query {other:?}"))),
+            };
+            Ok(chat_interface::encode_reply(&reply))
+        }
+    }
+
+    fn canonical_channel(id: &str, head_seq: u64) -> chat_interface::Channel {
+        chat_interface::Channel {
+            id: id.into(),
+            name: id.into(),
+            created_at: 900,
+            head_seq,
+            post_policy: chat_interface::PostPolicy::Open,
+            hooks: Vec::new(),
+            pinned: Vec::new(),
+        }
+    }
+
+    fn canonical_view(
+        channel: &str,
+        seq: u64,
+        head_seq: u64,
+        message_id: &str,
+        author: AuthorRef,
+        text: &str,
+        created_at: u64,
+        rev: u32,
+        deleted: bool,
+    ) -> chat_interface::MessageView {
+        chat_interface::MessageView {
+            channel_id: channel.into(),
+            seq,
+            head: chat_interface::MessageHead {
+                message_id: message_id.into(),
+                author,
+                blocks: vec![Block::paragraph(text)],
+                created_at,
+                rev,
+                edited_at: (rev > 0).then_some(created_at + 1),
+                base_rev: None,
+                deleted,
+                thread: None,
+                reply_count: 0,
+                last_reply_seq: None,
+            },
+            reactions: Vec::new(),
+            channel_head_seq: head_seq,
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_rederives_channels_pagination_and_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // folded rows the rebuild must throw away.
+        apply(&store, 1, vec![post("stale", "m0", "vanishing text")]);
+
+        // channel g: 3 live sequences (pages of 2 exercise the loop), one
+        // edited; channel q: one tombstone.
+        let state = CanonicalChat {
+            channels: vec![canonical_channel("g", 3), canonical_channel("q", 1)],
+            views: vec![
+                canonical_view("g", 1, 3, "m1", AuthorRef::User(b"jess".to_vec()), "hello fluent world", 1_001, 0, false),
+                canonical_view("g", 2, 3, "m2", AuthorRef::Agent { module: "agent".into(), agent_id: "helper".into() }, "fluent chatter", 1_002, 0, false),
+                canonical_view("g", 3, 3, "m3", AuthorRef::User(b"eddy".to_vec()), "revised phrasing", 1_003, 2, false),
+                canonical_view("q", 1, 1, "m4", AuthorRef::User(b"jess".to_vec()), "was deleted", 1_004, 0, true),
+            ],
+        };
+        store
+            .rebuild_module("chat", &state, indexer::RebuildMeta { height: 50, time: 0 })
+            .await
+            .expect("rebuild");
+
+        assert!(
+            search(&store, serde_json::json!({"search": {"text": "vanishing"}})).is_empty(),
+            "pre-rebuild rows do not survive"
+        );
+
+        let hits = search(&store, serde_json::json!({"search": {"text": "fluent"}}));
+        assert_eq!(hits.len(), 2);
+        // ranking survives the rebuild: created_at is canonical.
+        assert_eq!(hits[0].message_id, "m2");
+        assert_eq!(hits[0].author, "agent:agent/helper");
+        assert_eq!(hits[1].author, "user:jess");
+        assert_eq!(hits[1].time, 1_001, "time survives via created_at");
+        assert_eq!(hits[1].height, 50, "height collapses to the boundary");
+
+        let hits = search(&store, serde_json::json!({"search": {"text": "revised"}}));
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].edited, "rev > 0 rebuilds as edited");
+
+        assert!(
+            search(&store, serde_json::json!({"search": {"text": "deleted"}})).is_empty(),
+            "tombstones rebuild without postings"
+        );
+
+        assert_eq!(store.applied_height("chat").unwrap(), 50);
+        assert_eq!(store.backfill_height("chat").unwrap(), Some(50));
+
+        // the rebuilt seq mirror carries the fold forward: the next post in g
+        // is assigned seq 4, and an edit of a rebuilt row retokenizes.
+        apply(&store, 51, vec![post("g", "m5", "post rebuild message")]);
+        let hits = search(&store, serde_json::json!({"search": {"text": "rebuild"}}));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].seq, 4, "seq mirror rebuilt from head_seq");
+        apply(
+            &store,
+            52,
+            vec![op(&ChatMsg::EditMessage {
+                channel_id: "g".into(),
+                seq: 3,
+                blocks: vec![Block::paragraph("polished phrasing")],
+                base_rev: None,
+            })],
+        );
+        assert!(search(&store, serde_json::json!({"search": {"text": "revised"}})).is_empty());
+        assert_eq!(
+            search(&store, serde_json::json!({"search": {"text": "polished"}})).len(),
+            1
+        );
     }
 }
