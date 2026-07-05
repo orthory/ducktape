@@ -4,6 +4,7 @@
 
 import { useState, type CSSProperties, type ReactNode } from "react";
 
+import { normalizeKey } from "../../../domain/names";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
@@ -587,9 +588,6 @@ function PreferencesSection() {
     </>
   );
 }
-
-const normalizeKey = (key: string | null | undefined): string =>
-  (key ?? "").trim().replace(/^0x/i, "").toLowerCase();
 
 function DangerRow({
   title,

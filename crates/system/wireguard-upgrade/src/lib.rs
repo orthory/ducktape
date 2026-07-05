@@ -20,7 +20,10 @@ use defguard_wireguard_rs::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const ENDPOINT_NS: &[u8] = b"ducktape:wireguard-endpoint:v1";
+// v2: the signed record layout gained `wireguard_public_key` — a layout
+// change under a signature domain always bumps the domain, so v1 and v2
+// blobs can never cross-verify.
+const ENDPOINT_NS: &[u8] = b"ducktape:wireguard-endpoint:v2";
 const UPGRADE_REQUEST_NS: &[u8] = b"ducktape:wireguard-upgrade-request:v1";
 const UPGRADE_RESPONSE_NS: &[u8] = b"ducktape:wireguard-upgrade-response:v1";
 const UPGRADE_ACK_NS: &[u8] = b"ducktape:wireguard-upgrade-ack:v1";
@@ -268,6 +271,13 @@ pub struct EndpointRecord {
     pub valset_root: Root,
     pub admission_root: AdmissionRoot,
     pub validator_identity: ValidatorIdentity,
+    /// The validator's WireGuard X25519 public key. Lives HERE — in the
+    /// ed25519-signed, mesh-versioned advertisement — rather than in consensus
+    /// state: rotation is a re-advertisement (a new mesh version), never a
+    /// state schema change. `validate_upgrade_as` pins the tunnel handshake's
+    /// keys to these records, so a coordinator or relay on the path cannot
+    /// substitute its own key without breaking the record signature.
+    pub wireguard_public_key: X25519PublicKey,
     pub control_endpoint: Endpoint,
     pub wireguard_endpoint: Endpoint,
     pub capabilities: Vec<MeshCapability>,
@@ -341,6 +351,7 @@ impl MeshView {
             }
             policy.check_endpoint(&record.control_endpoint)?;
             policy.check_endpoint(&record.wireguard_endpoint)?;
+            ensure_x25519(record.wireguard_public_key)?;
             match selected.get(&record.validator_identity) {
                 Some(prev) if record.nonce <= prev.record.nonce => {
                     return Err(UpgradeError::StaleDuplicateAdvertisement);
@@ -397,13 +408,15 @@ impl MeshView {
     }
 }
 
-/// the documented v1 preimage (docs/wireguard-tunnel-upgrade.md "Mesh
+/// the documented v2 preimage (docs/wireguard-tunnel-upgrade.md "Mesh
 /// Version"): HASH(domain || namespace || epoch || valset_root ||
-/// admission_root || SORT_ASC(endpoint_record_hashes)). the epoch tuple is
-/// hashed at the TOP LEVEL — not only inside each record hash — exactly as
-/// the doc specifies, so an independent implementation working from the doc
-/// produces the same version. records carrying mismatched tuples cannot
-/// version at all (a mixed set is a protocol violation, never hashable).
+/// admission_root || SORT_ASC(endpoint_record_hashes)). v2 differs from v1
+/// only in each record hash now covering `wireguard_public_key` (and the
+/// bumped domain string). the epoch tuple is hashed at the TOP LEVEL — not
+/// only inside each record hash — exactly as the doc specifies, so an
+/// independent implementation working from the doc produces the same
+/// version. records carrying mismatched tuples cannot version at all (a
+/// mixed set is a protocol violation, never hashable).
 pub fn compute_mesh_version(records: &[EndpointRecord]) -> Result<MeshVersion, UpgradeError> {
     let Some(first) = records.first() else {
         return Err(UpgradeError::MissingAdvertisement);
@@ -434,7 +447,7 @@ pub fn compute_mesh_version(records: &[EndpointRecord]) -> Result<MeshVersion, U
         .collect();
     hashes.sort();
     let mut out = Vec::new();
-    put_str(&mut out, "ducktape:validator-mesh-version:v1");
+    put_str(&mut out, "ducktape:validator-mesh-version:v2");
     put_str(&mut out, &first.namespace);
     put_u64(&mut out, first.epoch);
     put_root(&mut out, first.valset_root);
@@ -462,16 +475,73 @@ impl AllowedIp {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum OverlayMode {
+    /// stable-index host allocation out of a v4 block (the original scheme).
+    /// an address is a function of the validator's INDEX, so it moves when
+    /// the set reorders across epochs.
+    IndexedV4 { base: Ipv4Addr, prefix: u8 },
+    /// identity-hash /128s inside a chain-scoped IPv6 ULA /48. an address is
+    /// a function of (chain_id, identity) ONLY — every node derives every
+    /// peer's address without an allocator or index, and it never moves when
+    /// the valset reorders. fd00::/8 cannot collide with RFC1918 v4 or the
+    /// 100.64.0.0/10 CGNAT block a resident Tailscale occupies, which is what
+    /// lets a `dt-*` interface coexist with a personal tailnet.
+    UlaV6 { chain_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverlayPolicy {
-    base_v4: Ipv4Addr,
-    prefix_v4: u8,
+    mode: OverlayMode,
+}
+
+/// The chain-scoped ULA /48 prefix: `fd` followed by the first 40 bits of
+/// HASH("ducktape:overlay-ula:v1" || chain_id).
+pub fn ula_v6_prefix(chain_id: &str) -> Ipv6Addr {
+    let mut pre = Vec::new();
+    put_str(&mut pre, "ducktape:overlay-ula:v1");
+    put_str(&mut pre, chain_id);
+    let h = hash32(&pre);
+    let mut b = [0u8; 16];
+    b[0] = 0xfd;
+    b[1..6].copy_from_slice(&h[..5]);
+    Ipv6Addr::from(b)
+}
+
+/// A member's overlay /128 inside the chain's ULA /48: the low 80 bits are
+/// the first 80 bits of HASH("ducktape:overlay-addr:v1" || chain_id ||
+/// identity). Deterministic from public inputs, so the whole mesh agrees on
+/// every member's address with no coordination.
+pub fn ula_v6_member_addr(chain_id: &str, identity: ValidatorIdentity) -> Ipv6Addr {
+    let prefix = ula_v6_prefix(chain_id).octets();
+    let mut pre = Vec::new();
+    put_str(&mut pre, "ducktape:overlay-addr:v1");
+    put_str(&mut pre, chain_id);
+    put_identity(&mut pre, identity);
+    let h = hash32(&pre);
+    let mut b = [0u8; 16];
+    b[..6].copy_from_slice(&prefix[..6]);
+    b[6..16].copy_from_slice(&h[..10]);
+    Ipv6Addr::from(b)
 }
 
 impl OverlayPolicy {
     pub fn default_v4() -> Self {
         Self {
-            base_v4: Ipv4Addr::new(100, 64, 0, 0),
-            prefix_v4: 16,
+            mode: OverlayMode::IndexedV4 {
+                base: Ipv4Addr::new(100, 64, 0, 0),
+                prefix: 16,
+            },
+        }
+    }
+
+    /// The node-driven WireGuard overlay: identity-hash /128s in the chain's
+    /// ULA /48 (see [`ula_v6_prefix`] / [`ula_v6_member_addr`]). `chain_id`
+    /// must be the same string the mesh uses as its advertisement namespace.
+    pub fn ula_v6(chain_id: impl Into<String>) -> Self {
+        Self {
+            mode: OverlayMode::UlaV6 {
+                chain_id: chain_id.into(),
+            },
         }
     }
 
@@ -480,19 +550,30 @@ impl OverlayPolicy {
         view: &MeshView,
         identity: ValidatorIdentity,
     ) -> Result<Vec<AllowedIp>, UpgradeError> {
+        // membership gate for BOTH modes: an overlay address exists only for
+        // a validator of this view, even though the ULA derivation would
+        // happily hash any identity.
         let index = view
             .stable_index(identity)
             .ok_or(UpgradeError::UnknownValidator)? as u32;
-        let base = u32::from(self.base_v4);
-        let host_count = 1u32 << (32 - self.prefix_v4 as u32);
-        let offset = index + 1;
-        if offset >= host_count {
-            return Err(UpgradeError::InvalidAllowedIp);
+        match &self.mode {
+            OverlayMode::IndexedV4 { base, prefix } => {
+                let base = u32::from(*base);
+                let host_count = 1u32 << (32 - *prefix as u32);
+                let offset = index + 1;
+                if offset >= host_count {
+                    return Err(UpgradeError::InvalidAllowedIp);
+                }
+                Ok(vec![AllowedIp {
+                    addr: IpAddr::V4(Ipv4Addr::from(base + offset)),
+                    cidr: 32,
+                }])
+            }
+            OverlayMode::UlaV6 { chain_id } => Ok(vec![AllowedIp {
+                addr: IpAddr::V6(ula_v6_member_addr(chain_id, identity)),
+                cidr: 128,
+            }]),
         }
-        Ok(vec![AllowedIp {
-            addr: IpAddr::V4(Ipv4Addr::from(base + offset)),
-            cidr: 32,
-        }])
     }
 
     fn validate_for(
@@ -820,8 +901,51 @@ impl TunnelInstallPlan {
     }
 }
 
+/// Which side of a validated handshake a [`TunnelInstallPlan`] is built for.
+/// [`validate_upgrade`] (unchanged, kept for existing callers) always builds
+/// the initiator's plan; [`validate_upgrade_as`] lets either party derive its
+/// OWN install plan from the identical signed triple.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Perspective {
+    Initiator,
+    Responder,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn validate_upgrade(
+    view: &MeshView,
+    policy: &PortPolicy,
+    overlay: &OverlayPolicy,
+    current_view: u64,
+    request: &TunnelUpgradeRequest,
+    response: &TunnelUpgradeResponse,
+    ack: &TunnelUpgradeAck,
+    replay: &mut ReplayCache,
+) -> Result<TunnelInstallPlan, UpgradeError> {
+    validate_upgrade_as(
+        Perspective::Initiator,
+        view,
+        policy,
+        overlay,
+        current_view,
+        request,
+        response,
+        ack,
+        replay,
+    )
+}
+
+/// Identical validation to [`validate_upgrade`], but returns the install plan
+/// for the requested `perspective`. The initiator and responder each hold a
+/// full copy of the same signed request/response/ack triple; each calls this
+/// ONCE, from its own `MeshView` and its own `ReplayCache`, with its own
+/// perspective, to derive its own `local_*`/`peer_*` install config. This is
+/// the responder-side counterpart the `tunnel_e2e` "PINNED GAP" test
+/// documents: before this function existed, only the initiator's plan was
+/// derivable.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_upgrade_as(
+    perspective: Perspective,
     view: &MeshView,
     policy: &PortPolicy,
     overlay: &OverlayPolicy,
@@ -892,6 +1016,16 @@ pub fn validate_upgrade(
     {
         return Err(UpgradeError::HandshakeMismatch);
     }
+    // the handshake's X25519 keys must be the ones the mesh-versioned,
+    // ed25519-signed records advertise — same rule as the endpoint pin above.
+    // without this, a party could complete a handshake under a fresh WG key
+    // the rest of the mesh never versioned, and the tunnel would silently
+    // diverge from the advertised mesh.
+    if rq.initiator_wireguard_public_key != initiator_record.wireguard_public_key
+        || rs.responder_wireguard_public_key != responder_record.wireguard_public_key
+    {
+        return Err(UpgradeError::HandshakeMismatch);
+    }
     ensure_x25519(rq.initiator_wireguard_public_key)?;
     ensure_x25519(rs.responder_wireguard_public_key)?;
     policy.check_endpoint(&rq.initiator_wireguard_endpoint)?;
@@ -909,6 +1043,12 @@ pub fn validate_upgrade(
     }
     overlay.validate_for(view, rq.responder_identity, &rq.requested_allowed_ips)?;
     overlay.validate_for(view, rq.initiator_identity, &rs.accepted_allowed_ips)?;
+    // the two parties' canonical overlay routes must differ — equality means
+    // the derivation collided (identity-hash ULA) or mis-indexed (v4), and a
+    // tunnel whose local and peer routes coincide cannot route.
+    if rq.requested_allowed_ips == rs.accepted_allowed_ips {
+        return Err(UpgradeError::InvalidAllowedIp);
+    }
     if !rs.relay_candidates.is_empty() && rs.direct_dial_failure.is_none() {
         return Err(UpgradeError::InvalidRelay);
     }
@@ -943,23 +1083,38 @@ pub fn validate_upgrade(
         replay.insert(identity, epoch, nonce);
     }
 
-    Ok(TunnelInstallPlan {
-        context: TunnelInstallContext {
-            namespace: view.active_set.namespace.clone(),
-            epoch: view.active_set.epoch,
-            valset_root: root,
-            admission_root,
-            mesh_version: view.mesh_version,
+    let context = TunnelInstallContext {
+        namespace: view.active_set.namespace.clone(),
+        epoch: view.active_set.epoch,
+        valset_root: root,
+        admission_root,
+        mesh_version: view.mesh_version,
+    };
+    Ok(match perspective {
+        Perspective::Initiator => TunnelInstallPlan {
+            context,
+            local_identity: rq.initiator_identity,
+            peer_identity: rq.responder_identity,
+            local_wireguard_public_key: rq.initiator_wireguard_public_key,
+            peer_wireguard_public_key: rs.responder_wireguard_public_key,
+            peer_endpoint: rs.responder_wireguard_endpoint,
+            local_interface_ips: rs.accepted_allowed_ips.clone(),
+            allowed_ips: rq.requested_allowed_ips.clone(),
+            relay_candidates: rs.relay_candidates.clone(),
+            keepalive_seconds: rs.keepalive_seconds,
         },
-        local_identity: rq.initiator_identity,
-        peer_identity: rq.responder_identity,
-        local_wireguard_public_key: rq.initiator_wireguard_public_key,
-        peer_wireguard_public_key: rs.responder_wireguard_public_key,
-        peer_endpoint: rs.responder_wireguard_endpoint,
-        local_interface_ips: rs.accepted_allowed_ips.clone(),
-        allowed_ips: rq.requested_allowed_ips.clone(),
-        relay_candidates: rs.relay_candidates.clone(),
-        keepalive_seconds: rs.keepalive_seconds,
+        Perspective::Responder => TunnelInstallPlan {
+            context,
+            local_identity: rq.responder_identity,
+            peer_identity: rq.initiator_identity,
+            local_wireguard_public_key: rs.responder_wireguard_public_key,
+            peer_wireguard_public_key: rq.initiator_wireguard_public_key,
+            peer_endpoint: rq.initiator_wireguard_endpoint,
+            local_interface_ips: rq.requested_allowed_ips.clone(),
+            allowed_ips: rs.accepted_allowed_ips.clone(),
+            relay_candidates: rs.relay_candidates.clone(),
+            keepalive_seconds: rs.keepalive_seconds,
+        },
     })
 }
 
@@ -1273,6 +1428,7 @@ fn put_endpoint_record(out: &mut Vec<u8>, record: &EndpointRecord) {
     put_root(out, record.valset_root);
     put_admission_root(out, record.admission_root);
     put_identity(out, record.validator_identity);
+    put_x25519(out, record.wireguard_public_key);
     put_endpoint(out, record.control_endpoint);
     put_endpoint(out, record.wireguard_endpoint);
     put_capabilities(out, &record.capabilities);

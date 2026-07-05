@@ -50,13 +50,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent::AgentModule;
-use agent_oracle::{AuthStore, LlmWorker};
+use agent_oracle::LlmWorker;
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::{Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
+use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
@@ -80,6 +80,7 @@ const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 /// (the forge multi-repo-v2 root/snapshot divergence) and truthfully `SignalReady`.
 const MAX_PROTOCOL_VERSION: u32 = 2;
 use automations::Automations;
+use capability::CapabilityRegistry;
 use chat::Chat;
 use directory::Directory;
 use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
@@ -148,6 +149,12 @@ const CHANNEL_STATE_SYNC: u64 = 4;
 /// verify and RECORD the join request for manual approval, and answer with an
 /// informational reply. see the `lobby` module.
 const CHANNEL_LOBBY: u64 = 5;
+/// the reachability channel: members gossip WireGuard endpoint records and
+/// signed advertisements and run the tunnel-upgrade handshake here (the
+/// `reachability` crate's staged node-driven WireGuard plane). registered in
+/// EVERY mode — an unregistered channel is a protocol violation that kills
+/// the sender's connection — and black-holed where the plane does not run.
+const CHANNEL_REACHABILITY: u64 = 6;
 /// while parked and un-admitted, re-announce every N park-loop attempts
 /// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
 /// survive member restarts (the request queue is in-memory), quiet enough to
@@ -167,7 +174,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 19] = [
+const MODULE_IDS: [&str; 20] = [
     "kv",
     "document",
     "pages",
@@ -177,6 +184,7 @@ const MODULE_IDS: [&str; 19] = [
     "governance",
     "upgrade",
     "saga",
+    "capability",
     "tasks",
     "vaults",
     "profiles",
@@ -428,6 +436,81 @@ impl ReadinessSignaller {
     }
 }
 
+/// the capability self-announcer: the state-driven twin of
+/// [`ReadinessSignaller`] for the capability registry. it polls the committed
+/// registry each pump tick and, when this node's announced set differs from
+/// what discovery found locally, self-submits ONE declarative
+/// [`CapabilityMsg::Announce`]. state-driven (survives restart/late-join) and
+/// idempotent: once the committed set matches, it stays quiet. a node with no
+/// providers announces nothing.
+struct CapabilityAnnouncer {
+    /// this node's own validator pubkey bytes — the registry identity.
+    me: Vec<u8>,
+    /// the capability tags discovery found on this host, sorted — the truthful
+    /// set to announce. empty means this node provides nothing.
+    capabilities: Vec<String>,
+    /// the set we last SUBMITTED (not yet observed committed), latched so an
+    /// in-flight announce is not re-sent every tick.
+    announced: Option<Vec<String>>,
+}
+
+impl CapabilityAnnouncer {
+    fn new(me: Vec<u8>, capabilities: Vec<String>) -> Self {
+        Self {
+            me,
+            capabilities,
+            announced: None,
+        }
+    }
+
+    /// the PURE decision core: given this node's committed announced set,
+    /// decide whether to (re)announce. `None` when the registry already matches
+    /// what we'd announce, or an identical announce is already in flight.
+    fn decide(&mut self, committed: &[String]) -> Option<Vec<String>> {
+        // nothing to provide and nothing recorded: stay silent (genesis state).
+        if self.capabilities.is_empty() && committed.is_empty() {
+            return None;
+        }
+        // the registry already reflects our providers — nothing to do.
+        if committed == self.capabilities.as_slice() {
+            self.announced = None;
+            return None;
+        }
+        // an announce for this exact set is already in flight.
+        if self.announced.as_deref() == Some(self.capabilities.as_slice()) {
+            return None;
+        }
+        self.announced = Some(self.capabilities.clone());
+        Some(self.capabilities.clone())
+    }
+
+    /// query this node's committed capability set and, when an announce is due,
+    /// build the external-origin `Announce` op. gracefully `None` when the
+    /// module is absent (pre-retrofit net) or the reply is unreadable.
+    async fn maybe_announce(&mut self, host: &Host) -> Option<Msg> {
+        use capability_interface::{
+            CapabilityMsg, CapabilityQuery, CapabilityReply, decode_reply, encode_msg, encode_query,
+        };
+        let reply = host
+            .query(
+                "capability",
+                &encode_query(&CapabilityQuery::Node {
+                    node: self.me.clone(),
+                }),
+            )
+            .await
+            .ok()?;
+        let CapabilityReply::Node(committed) = decode_reply(&reply).ok()? else {
+            return None;
+        };
+        let capabilities = self.decide(&committed)?;
+        Some(Msg {
+            target: "capability".into(),
+            payload: encode_msg(&CapabilityMsg::Announce { capabilities }),
+        })
+    }
+}
+
 /// hex-encode a state root for a stable, greppable log line.
 fn hex(root: &StateRoot) -> String {
     hex_bytes(&root.0)
@@ -474,6 +557,11 @@ async fn genesis_host(
         // presence in the registry is its genesis app-hash contribution.
         Box::new(Upgrade::new("upgrade", "valset")),
         Box::new(SagaModule::new("saga")),
+        // the network-wide registry of node host capabilities ("codex",
+        // "claude", ...): member-gated self-announcements, so every node holds
+        // an identical view of who can run what. its genesis contribution is an
+        // empty registry (ZERO root) until nodes announce.
+        Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
         // the origin-gated display-name registry: each verified submit origin
@@ -565,6 +653,12 @@ async fn restore_host(
     saga.install(bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
+    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    let (bytes, root) = snapshot_of("capability")?;
+    capability
+        .install(bytes, root)
+        .map_err(|e| format!("capability install: {e}"))?;
+
     let mut tasks = Tasks::new("tasks");
     let (bytes, root) = snapshot_of("tasks")?;
     tasks
@@ -640,6 +734,7 @@ async fn restore_host(
         Box::new(governance),
         Box::new(upgrade),
         Box::new(saga),
+        Box::new(capability),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -776,6 +871,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     saga.install(&bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("capability").await?;
+    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    capability
+        .install(&bytes, root)
+        .map_err(|e| format!("capability install: {e}"))?;
+
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance = Governance::new("governance", "valset", "upgrade");
     governance
@@ -875,6 +976,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(governance),
         Box::new(upgrade),
         Box::new(saga),
+        Box::new(capability),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -1988,6 +2090,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         scheme: config::SCHEME_ED25519.into(),
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
+        reach: Vec::new(),
     };
     if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -2011,12 +2114,14 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `invite [--config node.toml] [--manual]` — emit the one-line paste blob:
 /// the network descriptor with THIS member's dial hint folded in (and
-/// persisted, so every future invite carries it), plus a signed INVITE TOKEN.
-/// the token lets the joiner's parked node deliver its pubkey over the lobby
+/// persisted, so every future invite carries it), plus an INVITE TOKEN. the
+/// token lets the joiner's parked node deliver its pubkey over the lobby
 /// channel automatically — the join request then awaits member approval
 /// (`invite-accept`, or the app's approve button); a token never admits by
 /// itself. `--manual` omits the token: the joiner's pubkey travels out-of-band
-/// exactly as before.
+/// exactly as before. any current member may invite (the blob is a low-trust
+/// doorbell, gated by the descriptor's genesis fingerprint and the admission
+/// ballot — not a signed genesis-only credential).
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // `--manual` is a bare boolean; strip it before the `--flag value` parser.
     let mut manual = false;
@@ -2044,8 +2149,11 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
     match config::dialable(raw.advertised.as_deref(), &raw.listen)? {
         Some(addr) => descriptor.add_bootstrap(&key.public_key(), &addr),
-        // an invite must carry SOME dialable member.
-        None if descriptor.bootstrap.is_empty() => {
+        // an invite must carry SOME dialable member. a member that joined via a
+        // v3 invite holds its dial hints as `reach` (bootstrap is empty), so
+        // check the union, not just bootstrap — else a reachable NAT'd member
+        // is wrongly refused.
+        None if descriptor.reach_hints().map(|h| h.is_empty()).unwrap_or(true) => {
             return Err(
                 "no dialable address: give node.toml a concrete `listen` port or an \
                         `advertised` addr so a joiner can reach the network"
@@ -2724,6 +2832,116 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// the reachability plane's thread body: derive the plane's endpoints, bind
+/// the nat client against the coordinated-reach coordinators, and drive
+/// `reachability::run` with the phase-A fake WireGuard effect. every failure
+/// path prints and returns — the plane is an overlay on a working node,
+/// never a reason to take the node down.
+#[allow(clippy::too_many_arguments)]
+async fn reachability_plane(
+    label: String,
+    chain_id: String,
+    signer: ed25519::PrivateKey,
+    wireguard_key_file: PathBuf,
+    wireguard_listen: std::net::SocketAddr,
+    advertised: Ingress,
+    coordinators: Vec<Ingress>,
+    commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
+    events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
+) {
+    use std::net::ToSocketAddrs as _;
+    let policy = reachability::open_port_policy();
+    // the plane's records carry IP literals only (the endpoint parser
+    // rejects DNS); a hostname ingress resolves ONCE at plane start.
+    let resolve_ingress = |ingress: &Ingress| match ingress {
+        Ingress::Socket(addr) => Some(*addr),
+        Ingress::Dns { host, port } => (host.as_str(), *port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next()),
+    };
+    let Some(control_addr) = resolve_ingress(&advertised) else {
+        eprintln!(
+            "[node {label}] reachability: advertised {advertised:?} did not resolve — plane \
+             not started"
+        );
+        return;
+    };
+    let control_endpoint = match wireguard_upgrade::Endpoint::new(
+        control_addr.ip(),
+        control_addr.port(),
+        wireguard_upgrade::Transport::Tcp,
+        &policy,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: advertised control endpoint rejected ({err:?}) — \
+                 set `advertised` to a dialable address; plane not started"
+            );
+            return;
+        }
+    };
+    let wireguard_endpoint = match wireguard_upgrade::Endpoint::new(
+        wireguard_listen.ip(),
+        wireguard_listen.port(),
+        wireguard_upgrade::Transport::Udp,
+        &policy,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: wireguard_listen rejected ({err:?}) — plane not \
+                 started"
+            );
+            return;
+        }
+    };
+    let mut coords: Vec<std::net::SocketAddr> = Vec::new();
+    for ingress in &coordinators {
+        match resolve_ingress(ingress) {
+            Some(addr) if !coords.contains(&addr) => coords.push(addr),
+            Some(_) => {}
+            None => eprintln!(
+                "[node {label}] reachability: coordinator {ingress:?} did not resolve — skipped"
+            ),
+        }
+    }
+    let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
+    let resolver = match reachability::NatResolver::bind(me, coords.clone()).await {
+        Ok(resolver) => resolver,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: nat client bind failed: {err} — plane not started"
+            );
+            return;
+        }
+    };
+    if let Some(reflexive) = resolver.reflexive() {
+        println!("[node {label}] reachability: coordinator-observed reflexive {reflexive}");
+    }
+    let config = reachability::ReachabilityConfig {
+        chain_id,
+        signer,
+        wireguard_key_file,
+        wireguard_listen: wireguard_endpoint,
+        control_endpoint,
+        coordinators: coords,
+        port_policy: policy,
+    };
+    if let Err(err) = reachability::run(
+        config,
+        wireguard_effect::FakeWireGuardEffect::default(),
+        resolver,
+        commands,
+        events,
+    )
+    .await
+    {
+        eprintln!("[node {label}] reachability plane exited: {err}");
+    }
+}
+
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
 /// or until state sync completes (`--sync-only`).
 ///
@@ -2739,11 +2957,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         mesh: peers,
         validators,
         bootstrappers,
+        coordinated,
         listen,
         advertised,
         storage_dir: storage,
         rpc_listen,
         http_listen,
+        wireguard_listen,
+        wireguard_key_file,
         dev_demo,
         checkpoint_blocks,
         invite_token,
@@ -2807,6 +3028,37 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         String::from_utf8_lossy(&namespace),
         storage.display()
     );
+    // coordinated reach targets are split OUT of the TCP mesh dialer (a
+    // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
+    // there was a silent no-op). reaching them needs the nat client to
+    // hole-punch/relay through the coordinator and bring up a WireGuard tunnel
+    // — the reachability data plane. that plane now runs STAGED behind the
+    // `wireguard_listen` key (rendezvous + handshakes are real, the interface
+    // effect is the recording fake), so a coordinated-only invite still
+    // cannot carry mesh traffic; surface it loudly rather than park silently.
+    // see docs/deploy/private-cutover-integration-gap.md.
+    if !coordinated.is_empty() {
+        println!(
+            "[node {label}] WARNING: {} coordinated reach target(s) require a live WireGuard \
+             tunnel, which this build only STAGES (fake interface effect) — these peers are \
+             UNREACHABLE for mesh traffic until the real effect lands. use a direct/fronted \
+             invite for now.",
+            coordinated.len()
+        );
+        for (target, coord, _coord_key) in &coordinated {
+            println!(
+                "[node {label}]   coordinated target {} via coordinator {coord:?}",
+                hex_bytes(&target.as_ref()[..4])
+            );
+        }
+    }
+    if let Some(wg) = &wireguard_listen {
+        println!(
+            "[node {label}] reachability plane: STAGED — advertising WireGuard endpoint \
+             udp/{wg}; records, advertisements, and tunnel handshakes run for real, the \
+             interface effect is the phase-A recording fake (no root, no real tunnel)."
+        );
+    }
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise.
@@ -2820,10 +3072,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
-    // the derived per-module index (noded's exact store, <storage>/index):
-    // the pump folds sealed blocks into it, boot heals it from verified state
-    // at sync/recovery boundaries, and the already-routed /v1/index/* lanes
-    // light up through the handle below.
+    // the derived per-module index (noded's exact store, <storage>/index),
+    // plus the blocks database the explorer reads: the pump folds sealed
+    // blocks into it, boot heals it from verified state at sync/recovery
+    // boundaries, and the already-routed GET /v1/blocks + /v1/index/* lanes
+    // light up through the handle below. an open failure is fatal-with-remedy
+    // rather than a silent no-index run: the tier is rebuildable, so the fix
+    // is always "delete <storage>/index".
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
@@ -2832,9 +3087,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone());
     let blobs = http_handle.blob_handle();
-    // the explorer's backing store: the pump below pushes each non-empty
-    // block as it drains; GET /v1/blocks reads it directly (never the actor).
-    let http_blocks = http_handle.block_ring();
     match http_listen.as_deref() {
         Some(addr) if !sync_only && !joiner => {
             let listener = std::net::TcpListener::bind(addr)?;
@@ -2918,6 +3170,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         } else {
             signer.clone()
         };
+        // the staged reachability plane derives its advertised control
+        // endpoint from the mesh `advertised`; keep a copy — discovery's
+        // config consumes the original.
+        let advertised_reach = advertised.clone();
         let p2p_cfg = discovery::Config::local(
             p2p_signer,
             &namespace,
@@ -2965,6 +3221,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 context.child("blackhole_lobby").spawn(move |_ctx| async move {
                     while rx.recv().await.is_ok() {}
                 });
+            }
+            // the reachability lane: a sync-only observer runs no WireGuard
+            // plane, but the channel must exist — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_reachability")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
             network.start();
 
@@ -3082,6 +3346,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            // the reachability lane: only MEMBERS run the WireGuard plane; a
+            // parked joiner just keeps the channel legal — black-hole. (its
+            // promotion reboots the node into the validator path, which wires
+            // the plane for real.)
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_reachability")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
             // the lobby lane: where this parked node announces its key. member
             // replies are drained by a printer task — purely informational.
             let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
@@ -3598,6 +3872,134 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // as the derived lobby identity); this member verifies each announce
         // against the invite token it carries and RECORDS it for approval.
         let (mut lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+
+        // the reachability lane + the staged WireGuard plane. the channel is
+        // registered unconditionally (an unregistered channel is a protocol
+        // violation that kills the sender's connection); the plane itself
+        // runs only when `wireguard_listen` is configured, on its OWN
+        // plain-tokio OS thread (the app-surface split exactly), talking to
+        // the mesh through the two pump tasks below.
+        let (reach_p2p_tx, mut reach_p2p_rx) =
+            network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> =
+            match wireguard_listen {
+                Some(wg_addr) => {
+                    let (cmd_tx, cmd_rx) =
+                        tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(256);
+                    let (ev_tx, mut ev_rx) =
+                        tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
+
+                    // rendezvous coordinators = every coordinated-reach hint's
+                    // coordinator ingress; hostnames resolve once at plane start.
+                    let coordinators: Vec<Ingress> =
+                        coordinated.iter().map(|(_, c, _)| c.clone()).collect();
+                    let thread_label = label.clone();
+                    let reach_signer = signer.clone();
+                    let chain_id = String::from_utf8_lossy(&namespace).to_string();
+                    let key_file = wireguard_key_file.clone();
+                    std::thread::Builder::new()
+                        .name("reachability".into())
+                        .spawn(move || {
+                            tokio::runtime::Builder::new_multi_thread()
+                                .enable_all()
+                                .build()
+                                .expect("reachability tokio runtime")
+                                .block_on(reachability_plane(
+                                    thread_label,
+                                    chain_id,
+                                    reach_signer,
+                                    key_file,
+                                    wg_addr,
+                                    advertised_reach,
+                                    coordinators,
+                                    cmd_rx,
+                                    ev_tx,
+                                ));
+                        })
+                        .expect("spawn reachability thread");
+
+                    // pump in: mesh datagrams -> orchestrator commands.
+                    {
+                        let cmd = cmd_tx.clone();
+                        context.child("reachability_in").spawn(move |_ctx| async move {
+                            while let Ok((peer, msg)) = reach_p2p_rx.recv().await {
+                                let bytes: Vec<u8> = msg.into();
+                                let deliver =
+                                    reachability::ReachabilityCommand::Deliver { from: peer, bytes };
+                                if cmd.send(deliver).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    // pump out: orchestrator sends -> mesh; everything else is
+                    // operator-visible progress.
+                    {
+                        let pump_label = label.clone();
+                        let mut tx = reach_p2p_tx;
+                        context.child("reachability_out").spawn(move |_ctx| async move {
+                            while let Some(event) = ev_rx.recv().await {
+                                match event {
+                                    reachability::ReachabilityEvent::Send { to, bytes } => {
+                                        let _ =
+                                            tx.send(Recipients::One(to), IoBuf::from(bytes), false);
+                                    }
+                                    reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
+                                        println!(
+                                            "[node {pump_label}] reachability: epoch {epoch} mesh \
+                                             verified"
+                                        )
+                                    }
+                                    reachability::ReachabilityEvent::TunnelsApplied {
+                                        epoch,
+                                        interface,
+                                        peers,
+                                    } => println!(
+                                        "[node {pump_label}] reachability: epoch {epoch} tunnel \
+                                         config staged on {interface} ({peers} peer(s); fake \
+                                         effect — no real interface yet)"
+                                    ),
+                                    reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
+                                        println!(
+                                            "[node {pump_label}] reachability: peer {}: {reason}",
+                                            hex_bytes(&peer.as_ref()[..4])
+                                        )
+                                    }
+                                    reachability::ReachabilityEvent::EpochFailed {
+                                        epoch,
+                                        reason,
+                                    } => println!(
+                                        "[node {pump_label}] reachability: epoch {epoch} failed: \
+                                         {reason}"
+                                    ),
+                                }
+                            }
+                        });
+                    }
+                    Some(cmd_tx)
+                }
+                None => {
+                    context
+                        .child("blackhole_reachability")
+                        .spawn(move |_ctx| async move { while reach_p2p_rx.recv().await.is_ok() {} });
+                    drop(reach_p2p_tx);
+                    None
+                }
+            };
+        // boot: target the resume epoch's member set immediately; cutovers
+        // retarget from the orchestrator loop below. the recovered view base
+        // keeps advert expiries in the same view regime as live peers.
+        if let Some(cmd) = &reach_cmd {
+            let _ = cmd
+                .send(reachability::ReachabilityCommand::Retarget(
+                    reachability::MeshEpochEvent {
+                        epoch: initial_resume_epoch,
+                        members: initial_member_keys.clone(),
+                        current_view: resumed.as_ref().map(|r| r.view_base).unwrap_or(0),
+                    },
+                ))
+                .await;
+        }
 
         // start the network actors (dialer/listener/router/tracker). registered
         // receivers buffer regardless, so starting before the engine is fine.
@@ -4273,12 +4675,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the host-owned worker set (reactor seam): effects of finalized
         // blocks are offered here, and claimed follow-ups re-enter the ordered
         // lane as their own blocks.
+        // discover this host's installed executor CLIs (BYO — no credential
+        // handling here). the discovered tag set is BOTH what the oracle worker
+        // can run and what this node announces to the capability registry, so
+        // the two can never drift.
+        let providers = capability_host::discover();
+        let my_capabilities = providers.capabilities();
         let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
             blobs.clone(),
-            AuthStore::from_default_path(),
-            // the ChatGPT/Codex subscription endpoint rejects gpt-5.1 (400 "not
-            // supported when using Codex with a ChatGPT account") — default to a
-            // model the account can serve; per-agent model_ref overrides this.
+            providers,
+            // default codex model when a request pins none; a claude model_ref
+            // routes to the claude provider instead (see agent_oracle::capability_for).
             "gpt-5.3-codex-spark".into(),
         ))];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
@@ -4287,6 +4694,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // one-shot effect). inert before the module is registered.
         let mut signaller =
             ReadinessSignaller::new(MAX_PROTOCOL_VERSION, signer.public_key().as_ref().to_vec());
+        // the capability self-announcer: publishes this node's discovered
+        // provider set into the capability registry once (state-driven,
+        // idempotent). inert when this host installed no executor CLIs.
+        let mut announcer =
+            CapabilityAnnouncer::new(signer.public_key().as_ref().to_vec(), my_capabilities);
         // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
         // modeled on the `converged` latch: `upgrade armed …` fires when readiness
         // first reaches R==n (every current boundary member signaled) for the
@@ -4718,6 +5130,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // height, and every module's watermark must track the
                     // sealed tip or restart staleness checks would rebuild
                     // spuriously). discarded frames never sealed a height.
+                    // a frame the explorer shows — a decoded op that isn't
+                    // the heartbeat nop (the deliberately-empty block that
+                    // only ticks an idle chain) — additionally carries its
+                    // explorer row, so GET /v1/blocks survives restarts.
                     // canonical state committed above, so an index failure
                     // degrades read models only — the store poisons itself
                     // and stays loud until rebuilt.
@@ -4729,7 +5145,52 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             (node::Disposition::Applied, Some(op)) => &op.dispatches,
                             _ => &[],
                         };
-                        let ops = noded::index_block_ops(d.height, d.height, dispatches);
+                        let record = match &d.op {
+                            Some(op) if op.target != NOP_TARGET => {
+                                let disposition = match d.disposition {
+                                    node::Disposition::Applied => noded::BlockDisposition::Applied,
+                                    node::Disposition::Rejected => noded::BlockDisposition::Rejected,
+                                    // unreachable — filtered at the loop top —
+                                    // but stay total on this observability
+                                    // lane rather than panic.
+                                    node::Disposition::Discarded => continue,
+                                };
+                                Some(noded::block_row(&noded::BlockRecord {
+                                    height: d.height,
+                                    hash: noded::hex_bytes(&d.id),
+                                    commit_hash: hex(&d.app_hash),
+                                    proposer: match &op.origin {
+                                        sdk::Origin::External(key) => noded::hex_bytes(key),
+                                        // frames only carry verified External
+                                        // authorship; label the impossible rest.
+                                        sdk::Origin::Module(id) => format!("module:{id}"),
+                                        sdk::Origin::System => "system".into(),
+                                    },
+                                    disposition,
+                                    target: op.target.clone(),
+                                    operations: op
+                                        .dispatches
+                                        .iter()
+                                        .map(noded::DispatchInfo::from)
+                                        .collect(),
+                                    payload: noded::payload_preview(&op.payload),
+                                    // staging IS hashing: put_chunk keys the
+                                    // blob by sha256, so this one call both
+                                    // computes the op's content address and
+                                    // makes it dereferencable via
+                                    // GET /v1/files/blob/{op_hash}.
+                                    op_hash: noded::hex_bytes(&blobs.put_chunk(op.payload.clone())),
+                                }))
+                            }
+                            _ => None,
+                        };
+                        let ops = indexer::BlockOps {
+                            record,
+                            // this lane's agreed clock IS the height: the
+                            // drain stamps BlockContext { consensus_time:
+                            // height } for every frame.
+                            ..noded::index_block_ops(d.height, d.height, dispatches)
+                        };
                         if let Err(err) = index.apply_block(&ops) {
                             eprintln!(
                                 "[node {label}] module index apply failed at height {}: {err} \
@@ -4737,40 +5198,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 d.height
                             );
                         }
-                    }
-                    // publish each NON-EMPTY block to the explorer ring: skip
-                    // the heartbeat nop (the deliberately-empty block that only
-                    // ticks an idle chain) and frames with no decoded op (a
-                    // ceiling discard or a failed decode — nothing to show).
-                    for d in &drained {
-                        let Some(op) = &d.op else { continue };
-                        if op.target == NOP_TARGET {
-                            continue;
-                        }
-                        let disposition = match d.disposition {
-                            node::Disposition::Applied => noded::BlockDisposition::Applied,
-                            node::Disposition::Rejected => noded::BlockDisposition::Rejected,
-                            // unreachable — a discard carries no op and was
-                            // skipped above — but stay total on this
-                            // observability lane rather than panic.
-                            node::Disposition::Discarded => continue,
-                        };
-                        http_blocks.push(noded::BlockRecord {
-                            height: d.height,
-                            hash: noded::hex_bytes(&d.id),
-                            commit_hash: hex(&d.app_hash),
-                            proposer: match &op.origin {
-                                sdk::Origin::External(key) => noded::hex_bytes(key),
-                                // frames only carry verified External
-                                // authorship; label the impossible rest.
-                                sdk::Origin::Module(id) => format!("module:{id}"),
-                                sdk::Origin::System => "system".into(),
-                            },
-                            disposition,
-                            target: op.target.clone(),
-                            operations: op.dispatches.iter().map(noded::DispatchInfo::from).collect(),
-                            payload: noded::payload_preview(&op.payload),
-                        });
                     }
                     for d in drained {
                         let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
@@ -4961,6 +5388,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // anything is expected of them. index = epoch,
                             // strictly increasing across cutovers.
                             mesh_oracle.track(plan.epoch(), mesh_at(members));
+                            // the reachability plane retunnels for the new
+                            // member set the moment transport admits it.
+                            if let Some(cmd) = &reach_cmd {
+                                let _ = cmd
+                                    .send(reachability::ReachabilityCommand::Retarget(
+                                        reachability::MeshEpochEvent {
+                                            epoch: plan.epoch(),
+                                            members: members.iter().cloned().collect(),
+                                            current_view: engine_view,
+                                        },
+                                    ))
+                                    .await;
+                            }
                             if !members.contains(&signer.public_key()) {
                                 println!(
                                     "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
@@ -5123,6 +5563,31 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 // the next tick (the module stays idempotent).
                                 signaller.signaled = None;
                                 eprintln!("[node {label}] readiness signal submit failed: {e}");
+                            }
+                        }
+                    }
+
+                    // CAPABILITY ANNOUNCE: a current member whose discovered
+                    // provider set differs from the committed registry
+                    // self-submits ONE declarative `Announce`. member-gated (the
+                    // module rejects non-members) and idempotent (committed-read
+                    // + local latch). inert on a host with no executor CLIs.
+                    if orchestrator
+                        .current_members()
+                        .contains(&signer.public_key())
+                        && let Some(msg) = announcer.maybe_announce(node.host()).await
+                    {
+                        let seq = next_seq;
+                        next_seq += 1;
+                        match node.submit(&signer, seq, msg).await {
+                            Ok(_) => println!(
+                                "[node {label}] announced capabilities {:?}",
+                                announcer.capabilities
+                            ),
+                            Err(e) => {
+                                // un-latch so a transient submit failure retries.
+                                announcer.announced = None;
+                                eprintln!("[node {label}] capability announce submit failed: {e}");
                             }
                         }
                     }
@@ -5745,23 +6210,23 @@ mod tests {
                 "disk cohort committed the catch-up block durably"
             );
 
-            // replaying from the OLD base sees the mixed-durability state —
-            // disk cohort already at its sealed post-root, memory rolled back
-            // — and HEALS it: the sealed frame re-runs with commit scoped to
-            // the still-at-pre memory cohort, never re-committing the durable
-            // disk store (a re-commit would move its op-log root and fork).
+            // an old-base replay reconciles the torn sealed block via selective
+            // replay (the still-at-pre memory cohort recommits, the already-
+            // durable disk cohort aborts) rather than fail-stopping; the
+            // checkpoint's value below is recovering WITHOUT that replay.
             let mut torn_host =
                 restore_mixed_durability_host(durable_store.clone(), &base_manifest);
             let healed = recovery
                 .recover(&mut torn_host, &base_manifest)
                 .await
-                .expect("old base replay heals torn mixed durability");
+                .expect("old base replay heals the torn sealed block selectively");
             assert_eq!(healed.height, Some(1));
-            assert_eq!(healed.applied, 1);
+            assert_eq!(healed.app_hash, target.app_hash);
+            assert_eq!(healed.applied, 1, "the torn suffix frame was replayed");
             assert_eq!(
                 durable_store.get(),
                 7,
-                "the already-durable disk cohort was not re-committed"
+                "disk cohort stays at its durable post-state"
             );
 
             let ckpt = write_post_reboot_catchup_checkpoint(

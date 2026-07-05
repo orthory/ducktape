@@ -35,6 +35,11 @@ governance-interface = { workspace = true }
 upgrade = { workspace = true }
 upgrade-interface = { workspace = true }
 saga = { workspace = true }
+# the network-wide node-capability registry + its wire surface; the host-side
+# provider discovery announces this node's installed executor CLIs into it.
+capability = { workspace = true }
+capability-interface = { workspace = true }
+capability-host = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
 pages = { workspace = true }
@@ -50,6 +55,13 @@ jobs = { workspace = true }
 agent = { workspace = true }
 agent-oracle = { workspace = true }
 reactor = { workspace = true }
+# the staged node-driven WireGuard plane: the reachability orchestrator runs
+# on its own plain-tokio thread (mirroring the app-surface split) behind the
+# `wireguard_listen` node.toml key; wireguard-upgrade/-effect supply the
+# endpoint types and the phase-A fake effect it drives.
+reachability = { workspace = true }
+wireguard-upgrade = { workspace = true }
+wireguard-effect = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
@@ -58,8 +70,9 @@ base64 = "0.22"
 # axum router, and serve() — this binary only owns the pump-side of the lane.
 noded = { path = "../noded" }
 # the derived read-model tier: bin/node reuses noded's store construction and
-# /v1/index/* lanes, folds sealed blocks in its drain/replay, and re-derives
-# views from verified state at sync/recovery boundaries.
+# /v1/index/* + /v1/blocks lanes, folds each sealed block (ops + explorer row)
+# in its drain/replay, and re-derives views from verified state at
+# sync/recovery boundaries.
 indexer = { workspace = true }
 # the app-surface thread runs plain tokio (axum); the node itself stays on
 # commonware's runner. the promoted-validator boot catch-up also uses Tokio's

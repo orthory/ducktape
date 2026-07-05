@@ -22,6 +22,7 @@ import {
   type ProposalStatus,
   type ProposalView,
 } from "../../../domain/governance-client";
+import { sameKey, shortKey } from "../../../domain/names";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 
@@ -53,20 +54,6 @@ const sectionLabel: CSSProperties = {
   font: `600 9.5px ${font.mono}`,
   letterSpacing: ".1em",
   color: color.muted2,
-};
-
-const normalizeKey = (key: string | null | undefined): string =>
-  (key ?? "").trim().replace(/^0x/i, "").toLowerCase();
-
-const sameKey = (left: string | null | undefined, right: string | null | undefined): boolean =>
-  Boolean(normalizeKey(left)) && normalizeKey(left) === normalizeKey(right);
-
-const shortKey = (hex: string, start = 10, end = 6): string => {
-  const clean = hex.trim();
-  if (!clean) return "—";
-  return clean.length > start + end + 1
-    ? `${clean.slice(0, start)}…${clean.slice(-end)}`
-    : clean;
 };
 
 interface ProposalVM {

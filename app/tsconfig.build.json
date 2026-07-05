@@ -1,0 +1,11 @@
+// the production type gate (`bun run build`): shippable webview code only.
+// tests + the vitest setup file typecheck under the base tsconfig (editor,
+// `bun run typecheck`) where node/vitest ambients are welcome — they must
+// never gate the app bundle, and the bundle must never see node globals.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": []
+  },
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test-setup.ts"]
+}

@@ -56,6 +56,13 @@ const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
 
 export interface ConsoleActions {
   setScreen(screen: string): void;
+  /** Jump to the explorer opened on the block at `height` — the finalization
+   *  mark's cross-link. Best-effort: if the ring no longer holds that height
+   *  the explorer just lands on the list. */
+  openExplorerAt(height: number): void;
+  /** The explorer calls this once it has consumed (or given up on) a pending
+   *  focus hand-off. */
+  clearExplorerFocus(): void;
   /** Switch the sidebar rail (user apps vs operator surfaces) and persist it.
    *  Jumps to the target rail's default surface when the current screen belongs
    *  to the other rail, so the body always matches the rail. */
@@ -497,6 +504,22 @@ export function createActions({
       } else {
         patch({ screen });
       }
+    },
+
+    openExplorerAt: (height) => {
+      // Same rail-adoption contract as setScreen — the explorer lives on the
+      // operator rail, so the jump must move the sidebar with it.
+      const section = sectionForScreen("explorer");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "explorer", viewMode: section, explorerFocus: height });
+      } else {
+        patch({ screen: "explorer", explorerFocus: height });
+      }
+    },
+
+    clearExplorerFocus: () => {
+      patch({ explorerFocus: null });
     },
 
     setViewMode: (mode) => {

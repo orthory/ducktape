@@ -1,0 +1,15 @@
+[package]
+name = "nat-traversal"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+commonware-cryptography.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "rt-multi-thread"] }
+
+[features]
+simnat = []

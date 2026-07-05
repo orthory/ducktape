@@ -50,7 +50,12 @@ const FINALIZE: Duration = Duration::from_secs(60);
 /// the first-attempt scheduled-activation lead (blocks). `schedule_upgrade` doubles
 /// it on a min-lead abort until it sticks, so this only needs to cover a typical
 /// ceremony's height growth to avoid retries; it is otherwise self-correcting.
-const UPGRADE_LEAD: u64 = 800;
+/// calibrated to the GATED heartbeat regime (~1-3 blocks/s while a ceremony
+/// runs): a ceremony grows height by tens of blocks, and the boundary is then
+/// crossed by the filler pump at a few hundred views per CONVERGE window — 800
+/// (the old value, tuned when unconditional nops kept blocks fast) no longer
+/// fits the budget.
+const UPGRADE_LEAD: u64 = 200;
 
 /// this node's finalized height via the status rpc (`None` before the first block).
 fn height(cluster: &Cluster, idx: usize) -> Option<u64> {
@@ -230,10 +235,15 @@ fn schedule_upgrade(cluster: &Cluster, name: &str, to_version: u32, start_lead: 
     );
 }
 
-/// push deterministically-rejected/idempotent directory fillers on node 0 until
+/// push deterministically-applied idempotent directory fillers on node 0 until
 /// `done` — finalized views only advance with ops, so an idle net would park at
-/// the armed boundary. (the runtime's own cutover nop-pusher also advances views;
-/// these fillers just make crossing brisk and independent of nop timing.)
+/// the armed boundary. the rpc submit's reply is HELD until the frame drains at
+/// a finalized boundary, so this loop self-paces at the real block rate: with
+/// the gated heartbeat filling the other leader slots it sustains ~3 views/s
+/// ([`UPGRADE_LEAD`] is budgeted against that rate). do NOT parallelize the
+/// fillers across validators to cross faster — concurrent rpc submitters
+/// reproducibly livelock the engine mid-crossing (views stop finalizing while
+/// every node idles; see the fix/node-bin-dev-failures investigation).
 fn push_until(cluster: &Cluster, what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + CONVERGE;
     let mut filler = 0u32;

@@ -108,7 +108,10 @@ export function DucktapeProvider({
           live.status(),
           chatClient.channels(live),
           tasksClient.listTasks(live),
-          valsetClient.validators(live),
+          // valset only exists on the NETWORKED node (the local daemon has no
+          // validator set) — best-effort like governance below, so a local
+          // node reads as "no members" instead of never connecting.
+          valsetClient.validators(live).catch((): number[][] => []),
           // governance is a first-class operator surface but best-effort in the
           // snapshot: a node/build without it just reads as "no proposals"
           // rather than failing the whole refresh.

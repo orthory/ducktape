@@ -7,9 +7,14 @@
 // Hovering the settled mark reveals the inclusion facts: the block height the
 // op landed at and, when the node returned one, the op's addressable hash
 // (sha256 of the committed payload — fetchable via the node's blob lane).
+// Clicking a mark that knows its height jumps to the explorer opened on that
+// block (openExplorerAt). The store context is read as OPTIONAL: the mark
+// renders on every operation surface, and a bare render (tests, previews)
+// must stay a passive indicator, not throw for a missing provider.
 
-import { useState } from "react";
+import { useContext, useState } from "react";
 
+import { ConsoleContext } from "../store/context";
 import type { OpRecord } from "../store/finalization";
 import { color, font, radius, shadow } from "../theme/tokens";
 import { Icon } from "./Icon";
@@ -24,6 +29,7 @@ export function FinalizationMark({
   size?: number;
 }) {
   const [hover, setHover] = useState(false);
+  const store = useContext(ConsoleContext);
   if (!op) return null;
 
   const label =
@@ -35,9 +41,34 @@ export function FinalizationMark({
           : "included"
         : "rejected";
 
+  // The cross-link needs both an inclusion height and a live store.
+  const jumpHeight =
+    store && op.phase === "finalized" && op.height !== undefined ? op.height : null;
+  const openInExplorer =
+    jumpHeight === null
+      ? undefined
+      : (event: { stopPropagation(): void }) => {
+          // Marks sit inside clickable rows — the jump must not also fire the
+          // row's own open action.
+          event.stopPropagation();
+          store?.actions.openExplorerAt(jumpHeight);
+        };
+
   return (
     <span
       aria-label={label}
+      role={openInExplorer ? "button" : undefined}
+      tabIndex={openInExplorer ? 0 : undefined}
+      onClick={openInExplorer}
+      onKeyDown={
+        openInExplorer === undefined
+          ? undefined
+          : (event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              openInExplorer(event);
+            }
+      }
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
@@ -48,6 +79,7 @@ export function FinalizationMark({
         width: size + 2,
         height: size + 2,
         flexShrink: 0,
+        cursor: openInExplorer ? "pointer" : undefined,
       }}
     >
       {op.phase === "pending" ? (
@@ -102,6 +134,11 @@ export function FinalizationMark({
               }}
             >
               op {op.opHash}
+            </span>
+          )}
+          {openInExplorer && (
+            <span style={{ display: "block", marginTop: 3, color: color.muted3 }}>
+              click to view in explorer
             </span>
           )}
           {op.phase === "failed" && op.error && (

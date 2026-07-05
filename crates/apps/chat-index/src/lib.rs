@@ -463,6 +463,7 @@ mod tests {
                 height,
                 time: 1_000 + height,
                 ops,
+                record: None,
             })
             .expect("apply");
     }

@@ -1,0 +1,14 @@
+[package]
+name = "capability-host"
+edition.workspace = true
+version.workspace = true
+
+# host-side capability providers: spawn the operator's locally installed
+# executor CLIs (BYO — the node never holds or manages credentials; auth is
+# the CLI's own problem). the consensus-side twin is crates/system/capability,
+# which replicates WHO provides what; this crate is the machine-local half
+# that actually provides it.
+[dependencies]
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util"] }

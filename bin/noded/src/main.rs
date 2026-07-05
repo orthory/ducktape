@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
-use agent_oracle::{AuthStore, LlmWorker};
+use agent_oracle::LlmWorker;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
@@ -41,8 +41,9 @@ use indexer::IndexStore;
 use jobs::Jobs;
 use memory::Memory;
 use noded::{
-    BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus,
-    TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame, hex_root,
+    BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
+    NodeCommand, NodeHandle, NodeStatus, TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame,
+    block_row, hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
 use profiles::Profiles;
@@ -265,6 +266,11 @@ fn run_node(
         // pack bytes never enter consensus (root stays sha256(head oid)).
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
         let worker_blobs = blobs.clone();
+        // the block loop's own handle: each block's root payload is staged as
+        // its explorer row is built, so op hashes stay dereferencable via the
+        // blob lane (worker follow-ups included — the http submit handler only
+        // stages what clients POST).
+        let op_blobs = blobs.clone();
         let files = Files::with_blobs("files", blobs);
         let memory = Memory::new("memory", "files");
         // the origin-gated display-name registry: maps each verified submit
@@ -343,6 +349,7 @@ fn run_node(
                         &workers,
                         &mut height,
                         &index,
+                        &op_blobs,
                         &events,
                         &telemetry,
                         &metrics,
@@ -406,10 +413,13 @@ fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
     }
     vec![Box::new(LlmWorker::new(
         blobs,
-        AuthStore::from_default_path(),
-        // the ChatGPT/Codex subscription endpoint rejects gpt-5.1 (400 "not
-        // supported when using Codex with a ChatGPT account") — default to a
-        // model the account can serve; per-agent model_ref overrides this.
+        // BYO: run whatever executor CLIs (codex/claude) are installed on this
+        // host — no credential handling here. the single-node daemon carries no
+        // capability registry (its "network" is one node); the worker looks up
+        // the local provider by the request's model_ref directly.
+        capability_host::discover(),
+        // default codex model when a request pins none; a claude model_ref
+        // routes to the claude provider instead (see agent_oracle::capability_for).
         "gpt-5.3-codex-spark".into(),
     ))]
 }
@@ -422,6 +432,7 @@ async fn submit_and_drain(
     workers: &[Box<dyn reactor::Worker>],
     height: &mut u64,
     index: &IndexStore,
+    blobs: &files::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
     telemetry: &TelemetryRing,
     metrics: &NodeMetrics,
@@ -429,7 +440,8 @@ async fn submit_and_drain(
     msg: Msg,
 ) -> Result<BlockSummary, String> {
     let (included, effects) =
-        match submit_one(host, height, index, events, telemetry, metrics, origin, msg).await {
+        match submit_one(host, height, index, blobs, events, telemetry, metrics, origin, msg).await
+        {
             Ok(out) => out,
             Err(SubmitError::Fatal(err)) => {
                 eprintln!("[noded] FATAL: {err} — halting");
@@ -451,6 +463,7 @@ async fn submit_and_drain(
             host,
             height,
             index,
+            blobs,
             events,
             telemetry,
             metrics,
@@ -479,6 +492,7 @@ async fn submit_one(
     host: &mut Host,
     height: &mut u64,
     index: &IndexStore,
+    blobs: &files::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
     telemetry: &TelemetryRing,
     metrics: &NodeMetrics,
@@ -486,6 +500,23 @@ async fn submit_one(
     msg: Msg,
 ) -> Result<(BlockSummary, Vec<Effect>), SubmitError> {
     let consensus_time = unix_millis();
+    // the explorer row's identity: capture the root op's coordinates before
+    // ctx/msg consume them. this lane frames and signs nothing, so the
+    // "proposer" is the SUBMITTER's origin bytes, hex like the networked
+    // lane's keys (the profiles registry is keyed the same way, so the
+    // console resolves it to a display name).
+    let proposer = match &origin {
+        Origin::External(id) => hex_bytes(id),
+        Origin::Module(id) => format!("module:{id}"),
+        Origin::System => "system".into(),
+    };
+    let target = msg.target.clone();
+    let payload = payload_preview(&msg.payload);
+    // staging IS hashing: put_chunk keys the blob by sha256, so this both
+    // computes the op's content address and keeps it dereferencable via
+    // GET /v1/files/blob/{op_hash} — receipt-parity with the submit reply,
+    // and coverage for worker follow-ups no client ever POSTed.
+    let op_hash = hex_bytes(&blobs.put_chunk(msg.payload.clone()));
     let ctx = BlockContext { protocol_version: 0,
         height: *height + 1,
         consensus_time,
@@ -503,11 +534,12 @@ async fn submit_one(
         height: *height,
         app_hash: hex_root(&out.app_hash),
     };
+    let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
     let frame = TelemetryFrame {
         height: *height,
         consensus_time,
         latency_us,
-        dispatches: out.dispatches.iter().map(dispatch_info).collect(),
+        dispatches: operations.clone(),
         events: out.events.iter().map(event_preview).collect(),
     };
     // fold this block into the Prometheus series (before `out` is consumed).
@@ -523,7 +555,24 @@ async fn submit_one(
     // is already committed, so an index failure degrades the read models and
     // never the block. the store poisons itself on error (contiguity over
     // coverage) and stays loud on every later block until rebuilt.
-    let block_ops = noded::index_block_ops(*height, consensus_time, &out.dispatches);
+    let block_ops = indexer::BlockOps {
+        // the explorer row. every block on this lane is applied — a rejected
+        // submit never increments the height, so it never was a block. the
+        // frame hash stays empty: nothing is framed on this lane, and an
+        // invented digest would claim a verification that never happened.
+        record: Some(block_row(&BlockRecord {
+            height: *height,
+            hash: String::new(),
+            commit_hash: hex_root(&out.app_hash),
+            proposer,
+            disposition: BlockDisposition::Applied,
+            target,
+            operations,
+            payload,
+            op_hash,
+        })),
+        ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
+    };
     if let Err(err) = index.apply_block(&block_ops) {
         eprintln!(
             "[noded] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",

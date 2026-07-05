@@ -1,12 +1,14 @@
 // The block explorer: recent NON-EMPTY finalized blocks (heartbeat nops never
 // reach the app), newest-first. One row per block — height, frame hash, commit
-// (post-block app-hash), proposer (the frame's verified signer), op count —
+// (post-block app-hash), proposer (the frame's verified signer, shown as its
+// profile display name when the `profiles` registry knows the key), op count —
 // and clicking a row opens the block: its coordinates in full plus the
 // transactions inside (the deterministic dispatch trace + the root op's
 // payload). Read-only; records re-pull from the node's ring on every block.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
+import { displayNameForKey } from "../../../domain/names";
 import type { BlockRecord, TelemetryDispatch } from "../../../domain/transport";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
@@ -38,7 +40,16 @@ function ColumnHeaders() {
   );
 }
 
-function BlockRow({ block, onOpen }: { block: BlockRecord; onOpen: () => void }) {
+function BlockRow({
+  block,
+  names,
+  onOpen,
+}: {
+  block: BlockRecord;
+  names: Record<string, string>;
+  onOpen: () => void;
+}) {
+  const proposerName = displayNameForKey(block.proposer, names);
   return (
     <button
       type="button"
@@ -66,8 +77,17 @@ function BlockRow({ block, onOpen }: { block: BlockRecord; onOpen: () => void })
       <span style={{ font: `400 11.5px ${font.mono}`, color: color.muted3 }}>
         {shortHex(block.commitHash)}
       </span>
-      <span style={{ font: `400 11.5px ${font.mono}`, color: color.muted3 }}>
-        {shortHex(block.proposer)}
+      <span
+        title={block.proposer}
+        style={{
+          font: proposerName ? `500 11.5px ${font.sans}` : `400 11.5px ${font.mono}`,
+          color: color.muted3,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {proposerName ?? shortHex(block.proposer)}
       </span>
       <span
         style={{
@@ -127,7 +147,16 @@ function OperationRow({ op, index }: { op: TelemetryDispatch; index: number }) {
   );
 }
 
-function BlockDetail({ block, onBack }: { block: BlockRecord; onBack: () => void }) {
+function BlockDetail({
+  block,
+  names,
+  onBack,
+}: {
+  block: BlockRecord;
+  names: Record<string, string>;
+  onBack: () => void;
+}) {
+  const proposerName = displayNameForKey(block.proposer, names);
   return (
     <div style={{ padding: 17, display: "flex", flexDirection: "column", gap: 13, overflowY: "auto" }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
@@ -174,7 +203,11 @@ function BlockDetail({ block, onBack }: { block: BlockRecord; onBack: () => void
       >
         <DigestLine label="HASH" value={block.hash} />
         <DigestLine label="COMMIT" value={block.commitHash} />
-        <DigestLine label="PROPOSER" value={block.proposer} />
+        <DigestLine
+          label="PROPOSER"
+          value={proposerName ? `${proposerName} · ${block.proposer}` : block.proposer}
+        />
+        <DigestLine label="OP HASH" value={block.opHash ?? ""} />
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -219,13 +252,26 @@ function BlockDetail({ block, onBack }: { block: BlockRecord; onBack: () => void
 }
 
 export function ExplorerView() {
-  const { state } = useDucktape();
+  const { state, actions } = useDucktape();
   // The open block is held as the record itself, not a height lookup: a
   // finalized block is immutable, and holding the snapshot keeps the detail
   // stable even if the ring evicts the record mid-view.
   const [open, setOpen] = useState<BlockRecord | null>(null);
   // State keeps blocks oldest-first; the explorer reads newest-first.
   const blocks = [...state.blocks].reverse();
+
+  // Consume a cross-link hand-off (openExplorerAt): open the focused block and
+  // clear the focus so re-entering the explorer later doesn't replay the jump.
+  // While `blocks` is still empty the focus is left pending — the landing
+  // refresh may not have delivered the ring yet; once data exists, a missing
+  // height means the ring evicted it, and the list is the honest fallback.
+  const { explorerFocus } = state;
+  useEffect(() => {
+    if (explorerFocus === null || state.blocks.length === 0) return;
+    const match = state.blocks.find((block) => block.height === explorerFocus);
+    if (match) setOpen(match);
+    actions.clearExplorerFocus();
+  }, [explorerFocus, state.blocks, actions]);
 
   return (
     <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
@@ -245,7 +291,7 @@ export function ExplorerView() {
       </div>
 
       {open ? (
-        <BlockDetail block={open} onBack={() => setOpen(null)} />
+        <BlockDetail block={open} names={state.authorNames} onBack={() => setOpen(null)} />
       ) : (
         <div style={{ padding: 17, display: "flex", flexDirection: "column", gap: 7, overflowY: "auto" }}>
           {blocks.length === 0 ? (
@@ -260,6 +306,7 @@ export function ExplorerView() {
                 <BlockRow
                   key={block.height}
                   block={block}
+                  names={state.authorNames}
                   onOpen={() => setOpen(block)}
                 />
               ))}

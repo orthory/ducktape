@@ -107,6 +107,10 @@ export interface BlockRecord {
   operations: TelemetryDispatch[];
   /** Capped utf-8 preview of the root op's payload (module `*Msg` json). */
   payload: string;
+  /** Hex content address of the root op — sha256 of the committed payload
+   *  bytes, fetchable via the blob lane (`GET /v1/files/blob/{opHash}`).
+   *  Optional: rings written before the field existed lack it. */
+  opHash?: string;
 }
 
 export interface NodeTransport {

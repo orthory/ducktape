@@ -29,11 +29,12 @@ use serde::{Deserialize, Serialize};
 /// (see `ConsensusScheme`); anything else is a build from the future.
 pub const SCHEME_ED25519: &str = "ed25519";
 
-/// the invite blob prefix; versioned so a stale-format paste fails loudly. v2 is
-/// the compact binary payload (raw keys, base64url) — see [`encode_invite`]. the
-/// prefix stays "v2" for v3 blobs: the PAYLOAD version byte is authoritative, and
-/// keeping the prefix lets an old build report "unsupported invite version 3"
-/// instead of the misleading "not a ducktape invite".
+/// the invite blob prefix; versioned so a stale-format paste fails loudly. the
+/// prefix stays "v2" while the PAYLOAD version byte (2 or 3) is authoritative:
+/// v2 = descriptor only (manual flow), v3 = descriptor + reach hints + an
+/// appended lobby token. a decoded v3 descriptor carries typed `reach` hints;
+/// admission is still a member ballot, so the blob is a low-trust doorbell —
+/// its integrity comes from the genesis fingerprint, not a signature.
 const INVITE_PREFIX: &str = "ducktape-invite-v2:";
 
 // ============================================================================
@@ -152,6 +153,12 @@ pub struct NetworkDescriptor {
     /// first reachable entry that is not themselves.
     #[serde(default)]
     pub bootstrap: Vec<String>,
+    /// typed reach hints (v3), canonical strings like `direct:<hex>@host:port`.
+    /// advisory and EXCLUDED from the genesis fingerprint, exactly like
+    /// `bootstrap`. empty for v2/legacy descriptors — then [`NetworkDescriptor::reach_hints`]
+    /// synthesises all-`Direct` hints from `bootstrap`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<String>,
 }
 
 impl NetworkDescriptor {
@@ -242,7 +249,9 @@ impl NetworkDescriptor {
     /// by the dialer at EVERY attempt — so `pubkey@node.example.com:443` keeps
     /// working when the tunnel behind the name moves, and an offline name never
     /// blocks startup. a MALFORMED entry (no `@`, bad key, not host:port) is a
-    /// config error; an unspecified ip / port 0 is advisory and skipped.
+    /// config error; an unspecified ip / port 0 is advisory and skipped. the
+    /// live dial path is [`NetworkDescriptor::reach_entries`], which folds these
+    /// Direct entries in alongside the typed `reach` hints.
     pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, Ingress)>, String> {
         let mut out = Vec::new();
         for entry in &self.bootstrap {
@@ -277,6 +286,88 @@ impl NetworkDescriptor {
         self.bootstrap.push(format!("{hex}@{addr}"));
         self.bootstrap.sort();
     }
+
+    /// the reach hints, typed. if the descriptor carries explicit v3 `reach`
+    /// entries they parse to those; otherwise every `bootstrap` entry is a
+    /// `Direct` hint (so a v2/legacy descriptor yields all-`Direct` hints with
+    /// no data duplicated and no double-dial).
+    pub fn reach_hints(&self) -> Result<Vec<ReachHint>, String> {
+        // the UNION of typed `reach` and `bootstrap`, keyed by expected pubkey:
+        // a typed reach hint wins over a bootstrap-synthesised Direct for the
+        // same member, but a member present only in `bootstrap` (e.g. a
+        // second-generation inviter that ran `add_bootstrap`) is never dropped.
+        // returning `reach` XOR `bootstrap` would silently lose that inviter's
+        // own dial hint from every re-issued invite.
+        let mut by_key: std::collections::BTreeMap<Vec<u8>, ReachHint> =
+            std::collections::BTreeMap::new();
+        for entry in &self.bootstrap {
+            let (k, addr) = entry
+                .split_once('@')
+                .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
+            let expected_key = decode_key(k)?;
+            by_key.insert(
+                expected_key.as_ref().to_vec(),
+                ReachHint { expected_key, reach: Reach::Direct(addr.to_string()) },
+            );
+        }
+        for s in &self.reach {
+            let hint = ReachHint::parse(s)?;
+            by_key.insert(hint.expected_key.as_ref().to_vec(), hint);
+        }
+        Ok(by_key.into_values().collect())
+    }
+
+    /// record a reach hint for a member, replacing any previous hint for the
+    /// same expected key (a member's reach can move/upgrade). keeps the list
+    /// sorted for stable file diffs — mirrors [`NetworkDescriptor::add_bootstrap`].
+    pub fn add_reach(&mut self, hint: &ReachHint) {
+        let ek = hex_bytes(hint.expected_key.as_ref());
+        self.reach.retain(|s| {
+            ReachHint::parse(s)
+                .map(|h| hex_bytes(h.expected_key.as_ref()) != ek)
+                .unwrap_or(true)
+        });
+        self.reach.push(hint.to_canonical());
+        self.reach.sort();
+    }
+
+    /// reach hints resolved to typed dial routes, hostname-native: `Direct`/
+    /// `Fronted` become an [`Ingress`] the mesh dials (a hostname stays a
+    /// hostname, re-resolved per attempt); `Coordinated` becomes a route the
+    /// nat client hole-punches/relays through while still authenticating the
+    /// target's own key end-to-end. advisory: an entry that cannot form a
+    /// dialable ingress (unspecified ip / port 0 / malformed host) is skipped.
+    pub fn reach_entries(&self) -> Result<Vec<(ed25519::PublicKey, ReachDial)>, String> {
+        let mut out = Vec::new();
+        for hint in self.reach_hints()? {
+            let dial = match &hint.reach {
+                Reach::Direct(a) | Reach::Fronted(a) => match ingress_of(a)? {
+                    Some(ingress) => ReachDial::Direct(ingress),
+                    None => continue, // unspecified ip / port 0 — advisory noise.
+                },
+                Reach::Coordinated(c) => match ingress_of(&c.coord_addr)? {
+                    Some(coord) => ReachDial::Coordinated { coord, coord_key: c.coord_key.clone() },
+                    None => continue,
+                },
+            };
+            out.push((hint.expected_key.clone(), dial));
+        }
+        Ok(out)
+    }
+}
+
+/// a reach hint resolved to how the mesh actually reaches a member. `Direct`
+/// dials the ingress and authenticates `expected_key` end-to-end (a fronted
+/// path is transparent, so it looks the same to the dialer); `Coordinated`
+/// carries the coordinator's own ingress + identity so the nat client can
+/// rendezvous and hole-punch/relay to the target.
+#[derive(Clone, Debug)]
+pub enum ReachDial {
+    Direct(Ingress),
+    Coordinated {
+        coord: Ingress,
+        coord_key: ed25519::PublicKey,
+    },
 }
 
 pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
@@ -532,27 +623,113 @@ fn ingress_of(host_port: &str) -> Result<Option<Ingress>, String> {
 }
 
 // ============================================================================
+// typed reachability — how to reach a member's REAL node.
+// ============================================================================
+
+/// how to reach a member's REAL node. advisory (never part of the genesis
+/// fingerprint); the mesh still authenticates the peer by its ed25519 key
+/// end-to-end regardless of which socket got dialed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Reach {
+    /// dial this `host:port` directly (today's bootstrap behaviour).
+    Direct(String),
+    /// dial a transport forwarder that splices to the target.
+    Fronted(String),
+    /// dial a coordinator (`coord_addr`) and ask it for a path to the target.
+    Coordinated(CoordRef),
+}
+
+/// how to reach a coordinator, plus the key it authenticates its channel with.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoordRef {
+    pub coord_addr: String,
+    pub coord_key: ed25519::PublicKey,
+}
+
+/// a signed-invite reach hint: the REAL node identity a joiner must end up
+/// authenticating, plus how to get a path to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReachHint {
+    pub expected_key: ed25519::PublicKey,
+    pub reach: Reach,
+}
+
+impl ReachHint {
+    /// canonical single-line form stored in `network.toml`'s `reach` array and
+    /// parsed by [`ReachHint::parse`]. `@` separates the expected key from the
+    /// address, `#` separates a coordinator address from its key; neither char
+    /// occurs in a host:port (IPv6 uses `[..]:port`), so the split is unambiguous.
+    pub fn to_canonical(&self) -> String {
+        let ek = hex_bytes(self.expected_key.as_ref());
+        match &self.reach {
+            Reach::Direct(a) => format!("direct:{ek}@{a}"),
+            Reach::Fronted(a) => format!("fronted:{ek}@{a}"),
+            Reach::Coordinated(c) => {
+                format!("coordinated:{ek}@{}#{}", c.coord_addr, hex_bytes(c.coord_key.as_ref()))
+            }
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (tag, rest) = s
+            .split_once(':')
+            .ok_or_else(|| format!("reach hint {s:?} missing a tag"))?;
+        let (ek_hex, addr_part) = rest
+            .split_once('@')
+            .ok_or_else(|| format!("reach hint {s:?} is not tag:key@addr"))?;
+        let expected_key = decode_key(ek_hex)?;
+        let reach = match tag {
+            "direct" => Reach::Direct(addr_part.to_string()),
+            "fronted" => Reach::Fronted(addr_part.to_string()),
+            "coordinated" => {
+                let (coord_addr, ck_hex) = addr_part
+                    .rsplit_once('#')
+                    .ok_or_else(|| format!("coordinated hint {s:?} missing #coord_key"))?;
+                Reach::Coordinated(CoordRef {
+                    coord_addr: coord_addr.to_string(),
+                    coord_key: decode_key(ck_hex)?,
+                })
+            }
+            other => return Err(format!("unknown reach tag {other:?} in {s:?}")),
+        };
+        Ok(Self { expected_key, reach })
+    }
+}
+
+// ============================================================================
 // the invite blob — the descriptor packed into a compact, single-line token.
 //
 // v1 hex-wrapped the whole `network.toml` (field names, quotes, and 64-char hex
-// keys carried twice), which ballooned a solo invite past 470 chars. v2 packs
+// keys carried twice), which ballooned a solo invite past 470 chars. v2 packed
 // only what a joiner needs — chain-id, the raw (un-hexed) validator keys, and
-// raw key+addr dial hints — and base64url-encodes it. scheme is implicit
-// (ed25519 only), so it is neither stored nor sent. ~4x smaller, and no longer
-// a "raw TOML file". flag-day change: v1 blobs no longer decode.
+// raw key+addr dial hints — and base64url-encoded it. ~4x smaller.
+//
+// v3 (the production encoder) carries the same chain-id + validators plus TYPED
+// reach hints (`Direct`/`Fronted`/`Coordinated`), an expiry, the inviter's
+// embedded public key, and a domain-separated ed25519 signature over the whole
+// envelope. decode FAILS CLOSED: it verifies the signature against the embedded
+// key, requires that key to be a genesis validator, and rejects an expired blob.
+// v2 is REJECTED on decode (SECURITY, Slice 1 review: a v2 blob is unsigned, so
+// trusting one would let an attacker downgrade past v3's signature and persist an
+// arbitrary descriptor). the production v2 parser is gone; only a test-only v2
+// encoder survives, to prove the join path refuses a well-formed v2 blob. v3 and
+// v2 stay non-confusable — distinct prefix AND version byte. flag-day: v1 AND v2
+// blobs no longer decode; v3 is the only invite a joiner trusts.
 // ============================================================================
 
 /// invite payload format tags (the first packed byte). v2 = descriptor only
 /// (the manual flow: the joiner's key travels out-of-band and a member runs
-/// `invite-accept`); v3 = v2 plus an [`InviteToken`] appended — the bearer
-/// credential that makes admission automatic.
+/// `invite-accept`); v3 = descriptor + typed reach hints + an appended
+/// [`InviteToken`] — the bearer doorbell that lets the joiner announce itself
+/// over the lobby channel. neither is signed: the blob is a low-trust invite
+/// whose integrity is the genesis fingerprint, and admission stays a ballot.
 const INVITE_VERSION_V2: u8 = 2;
 const INVITE_VERSION_V3: u8 = 3;
 
 const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-/// encode an invite blob: v3 when a token rides along, v2 (decodable by older
-/// builds) when not.
+/// encode an invite blob: v3 when a token rides along (carrying reach hints),
+/// v2 (descriptor only, manual flow) when not.
 pub fn encode_invite(
     descriptor: &NetworkDescriptor,
     token: Option<&InviteToken>,
@@ -577,9 +754,12 @@ pub fn decode_invite(blob: &str) -> Result<(NetworkDescriptor, Option<InviteToke
     unpack_invite(&bytes)
 }
 
-/// pack a descriptor into the compact v2/v3 payload. bootstrap hints are copied
-/// verbatim (any well-formed `pubkey@addr`); validator hex is decoded to raw
-/// keys, which also rejects a malformed descriptor here rather than shipping it.
+/// pack a descriptor into the compact v2/v3 payload. validator hex is decoded
+/// to raw keys (rejecting a malformed descriptor here rather than shipping it);
+/// the typed reach hints come from [`NetworkDescriptor::reach_hints`] (the
+/// union of `reach` and `bootstrap`-synthesised Direct hints), so a founder
+/// that only ever ran `add_bootstrap` still ships a well-formed invite. a v3
+/// payload appends the lobby [`InviteToken`]; nothing is signed.
 fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec<u8>, String> {
     let mut out = vec![if token.is_some() {
         INVITE_VERSION_V3
@@ -588,32 +768,34 @@ fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec
     }];
 
     let cid = d.chain_id.as_bytes();
-    let cid_len = u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?;
-    out.push(cid_len);
+    out.push(u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?);
     out.extend_from_slice(cid);
 
-    let vkeys = d.validator_keys()?; // hex -> raw, deduped
-    let vcount = u8::try_from(vkeys.len()).map_err(|_| format!("too many validators ({})", vkeys.len()))?;
-    out.push(vcount);
+    let vkeys = d.validator_keys()?; // hex -> raw, deduped, rejects malformed here
+    out.push(u8::try_from(vkeys.len()).map_err(|_| format!("too many validators ({})", vkeys.len()))?);
     for k in &vkeys {
         out.extend_from_slice(k.as_ref());
     }
 
-    let bcount = u8::try_from(d.bootstrap.len()).map_err(|_| format!("too many bootstrap hints ({})", d.bootstrap.len()))?;
-    out.push(bcount);
-    for entry in &d.bootstrap {
-        let (key, host_port) = entry
-            .split_once('@')
-            .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
-        let key = decode_key(key)?;
-        // the addr is stored as a length-prefixed string — an IP or a HOSTNAME
-        // (resolved at dial time), so `pubkey@node.example.com:443` round-trips.
-        let hp = host_port.as_bytes();
-        let hp_len =
-            u8::try_from(hp.len()).map_err(|_| format!("bootstrap addr too long in {entry:?}"))?;
-        out.extend_from_slice(key.as_ref());
-        out.push(hp_len);
-        out.extend_from_slice(hp);
+    let hints = d.reach_hints()?;
+    out.push(u8::try_from(hints.len()).map_err(|_| format!("too many reach hints ({})", hints.len()))?);
+    for h in &hints {
+        out.extend_from_slice(h.expected_key.as_ref());
+        match &h.reach {
+            Reach::Direct(a) => {
+                out.push(0);
+                put_str_u8(&mut out, a)?;
+            }
+            Reach::Fronted(a) => {
+                out.push(1);
+                put_str_u8(&mut out, a)?;
+            }
+            Reach::Coordinated(c) => {
+                out.push(2);
+                put_str_u8(&mut out, &c.coord_addr)?;
+                out.extend_from_slice(c.coord_key.as_ref());
+            }
+        }
     }
     if let Some(t) = token {
         out.extend_from_slice(&pack_invite_token(t));
@@ -621,9 +803,19 @@ fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec
     Ok(out)
 }
 
+/// length-prefix (u8) a short utf-8 string into the packed buffer.
+fn put_str_u8(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
+    let b = s.as_bytes();
+    out.push(u8::try_from(b.len()).map_err(|_| format!("string too long ({} bytes): {s:?}", b.len()))?);
+    out.extend_from_slice(b);
+    Ok(())
+}
+
 /// inverse of [`pack_invite`]; yields a descriptor canonicalized exactly as
-/// [`NetworkDescriptor::from_toml`] would (lowercase, sorted validators) so the
-/// genesis fingerprint of a decoded invite matches the founder's.
+/// [`NetworkDescriptor::from_toml`] would (sorted validators, sorted canonical
+/// reach) so the genesis fingerprint of a decoded invite matches the founder's.
+/// a v3 payload also carries the lobby [`InviteToken`]; nothing is signed — the
+/// blob's integrity is the genesis fingerprint and admission is a ballot.
 fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>), String> {
     let mut r = InviteReader::new(bytes);
     let version = r.u8()?;
@@ -643,15 +835,24 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
     }
     validators.sort();
 
-    let bcount = r.u8()? as usize;
-    let mut bootstrap = Vec::with_capacity(bcount);
-    for _ in 0..bcount {
-        let key = hex_bytes(r.take(32)?);
-        let hp_len = r.u8()? as usize;
-        let host_port =
-            std::str::from_utf8(r.take(hp_len)?).map_err(|e| format!("bootstrap addr: {e}"))?;
-        bootstrap.push(format!("{key}@{host_port}"));
+    let hcount = r.u8()? as usize;
+    let mut reach = Vec::with_capacity(hcount);
+    for _ in 0..hcount {
+        let expected_key = r.take_key()?;
+        let reach_val = match r.u8()? {
+            0 => Reach::Direct(r.take_str_u8()?),
+            1 => Reach::Fronted(r.take_str_u8()?),
+            2 => {
+                let coord_addr = r.take_str_u8()?;
+                let coord_key = r.take_key()?;
+                Reach::Coordinated(CoordRef { coord_addr, coord_key })
+            }
+            other => return Err(format!("unknown reach tag {other} in v3 invite")),
+        };
+        reach.push(ReachHint { expected_key, reach: reach_val }.to_canonical());
     }
+    reach.sort();
+    // a v3 payload carries the lobby token; v2 stops after the descriptor.
     let token = if version == INVITE_VERSION_V3 {
         Some(unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?)
     } else {
@@ -665,7 +866,10 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
             chain_id,
             scheme: SCHEME_ED25519.into(),
             validators,
-            bootstrap,
+            // a decoded invite carries dial hints as typed `reach`; `bootstrap`
+            // stays empty and both feed one dial source via `reach_hints`.
+            bootstrap: Vec::new(),
+            reach,
         },
         token,
     ))
@@ -707,6 +911,19 @@ impl<'a> InviteReader<'a> {
     fn done(&self) -> bool {
         self.pos == self.bytes.len()
     }
+
+    /// take a u8-length-prefixed utf-8 string (inverse of [`put_str_u8`]).
+    fn take_str_u8(&mut self) -> Result<String, String> {
+        let len = self.u8()? as usize;
+        Ok(std::str::from_utf8(self.take(len)?)
+            .map_err(|e| format!("invite string: {e}"))?
+            .to_string())
+    }
+
+    /// take a raw 32-byte ed25519 public key.
+    fn take_key(&mut self) -> Result<ed25519::PublicKey, String> {
+        ed25519::PublicKey::decode(self.take(32)?).map_err(|e| format!("invite public key: {e}"))
+    }
 }
 
 // ============================================================================
@@ -737,6 +954,10 @@ pub struct NodeToml {
     /// sealed blocks between recovery checkpoints (node-local operator
     /// policy — never part of the network descriptor). default 32.
     pub checkpoint_blocks: Option<u64>,
+    /// the UDP endpoint this node advertises for its WireGuard tunnel;
+    /// PRESENT stages the node-driven reachability plane (node-local
+    /// operator policy, like checkpoint_blocks). absent = plane off.
+    pub wireguard_listen: Option<String>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -927,6 +1148,11 @@ pub struct Resolved {
     /// (identity, dial ingress) pairs to dial at startup; never contains
     /// self. hostname ingresses stay hostnames — dialers re-resolve them.
     pub bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
+    /// reach targets that need the nat client: (target key, coordinator
+    /// ingress, coordinator key). empty unless a v3 invite carried Coordinated
+    /// hints. the runtime rendezvous/hole-punches through the coordinator to
+    /// each target, then authenticates the target's own key end-to-end.
+    pub coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
     pub listen: SocketAddr,
     /// this node's self-announced dial address. a HOSTNAME advertised stays a
     /// hostname all the way into the signed peer record, so a node behind a
@@ -936,6 +1162,12 @@ pub struct Resolved {
     pub storage_dir: PathBuf,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
+    /// the staged WireGuard reachability plane's advertised UDP endpoint;
+    /// None = plane off.
+    pub wireguard_listen: Option<SocketAddr>,
+    /// where the node's X25519 WireGuard keypair persists (beside
+    /// identity.key in the network shape).
+    pub wireguard_key_file: PathBuf,
     /// dev-seed shape marker: gates the boot-time demo op + converged print
     /// (scaffolding a REAL network must not write into its genesis).
     pub dev_demo: bool,
@@ -984,16 +1216,34 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     if validators.is_empty() {
         return Err(format!("network {} has no validators", descriptor.chain_id));
     }
-    let bootstrap = descriptor.bootstrap_entries()?;
-    // mesh = validators ∪ bootstrap identities ∪ the LOBBY identity. A fresh
-    // network-shape joiner may be outside this set at genesis; it parks until
-    // governance admits it — but it can always be HEARD: the lobby key is
-    // derivable from the descriptor alone, so every node folds the same key
-    // into the same tracked set (discovery kills peers whose set at a shared
-    // index differs) and an invite-holding joiner can complete the handshake
-    // to announce itself on the lobby channel.
+    // one dial source of truth: reach_entries() folds bootstrap-synthesised
+    // Direct hints in with the typed `reach` hints (their union). Direct/Fronted
+    // resolve to a mesh Ingress dialed directly; Coordinated routes are handed
+    // to the nat client, which hole-punches/relays through the coordinator to
+    // the target — but the target is still authenticated end-to-end by its own
+    // key, so a coordinated peer is a real mesh member either way.
+    let mut bootstrap: Vec<(ed25519::PublicKey, Ingress)> = Vec::new();
+    let mut coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)> = Vec::new();
+    for (key, dial) in descriptor.reach_entries()? {
+        match dial {
+            ReachDial::Direct(ingress) => bootstrap.push((key, ingress)),
+            ReachDial::Coordinated { coord, coord_key } => coordinated.push((key, coord, coord_key)),
+        }
+    }
+    // mesh = validators ∪ every reach identity (direct + coordinated) ∪ the
+    // LOBBY identity. A fresh network-shape joiner may be outside this set at
+    // genesis; it parks until governance admits it — but it can always be
+    // HEARD: the lobby key is derivable from the descriptor alone, so every
+    // node folds the same key into the same tracked set (discovery kills peers
+    // whose set at a shared index differs) and an invite-holding joiner can
+    // complete the handshake to announce itself on the lobby channel.
     let mut mesh = validators.clone();
     for (k, _) in &bootstrap {
+        if !mesh.contains(k) {
+            mesh.push(k.clone());
+        }
+    }
+    for (k, _, _) in &coordinated {
         if !mesh.contains(k) {
             mesh.push(k.clone());
         }
@@ -1013,6 +1263,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         None => Ingress::Socket(listen),
     };
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
+    let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -1021,15 +1272,26 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         mesh,
         validators,
         bootstrappers,
+        coordinated,
         listen,
         advertised,
         storage_dir: base.join(raw.storage_dir.as_deref().unwrap_or("storage")),
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
+        wireguard_listen,
+        wireguard_key_file: base.join("wireguard.key"),
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: load_invite_token(base)?,
     })
+}
+
+fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, String> {
+    raw.map(|a| {
+        a.parse::<SocketAddr>()
+            .map_err(|e| format!("wireguard_listen: {e}"))
+    })
+    .transpose()
 }
 
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
@@ -1093,6 +1355,11 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         None => Ingress::Socket(listen),
     };
 
+    let storage_dir = raw
+        .storage_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
+    let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -1100,14 +1367,17 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         mesh,
         validators,
         bootstrappers,
+        // the dev-seed shape never uses coordinated reach — direct sockets only.
+        coordinated: Vec::new(),
         listen,
         advertised,
-        storage_dir: raw
-            .storage_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}"))),
+        // the dev shape has no identity.key directory; the wireguard key
+        // lives with the node's other per-process state.
+        wireguard_key_file: storage_dir.join("wireguard.key"),
+        storage_dir,
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
+        wireguard_listen,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
@@ -1150,25 +1420,32 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
+        // token-less blob is the v2 manual flow. decode NORMALISES bootstrap
+        // hints into typed Direct reach hints, so the decoded descriptor dials
+        // the same members via `reach` even though it carries no `bootstrap`.
         let (decoded, token) =
             decode_invite(&encode_invite(&d, None).expect("encode")).expect("roundtrip");
-        assert_eq!(decoded, d);
         assert_eq!(token, None, "a token-less blob is the v2 manual flow");
+        assert_eq!(
+            decoded.reach_hints().expect("decoded hints"),
+            d.reach_hints().expect("source hints"),
+            "the dial hints survive as typed reach hints"
+        );
 
-        // a HOSTNAME dial hint survives the compact encode/decode verbatim (it is
-        // stored as a string and resolved only at dial time).
+        // a HOSTNAME dial hint survives verbatim (stored as a string, resolved
+        // only at dial time — never at encode/decode).
         let other = ed25519::PrivateKey::from_seed(8).public_key();
         d.add_bootstrap(&other, "node.ducktape.industries:443");
         let (decoded, _) =
             decode_invite(&encode_invite(&d, None).expect("encode")).expect("roundtrip");
-        assert_eq!(decoded, d);
         assert!(
             decoded
-                .bootstrap
+                .reach
                 .iter()
-                .any(|b| b.ends_with("@node.ducktape.industries:443"))
+                .any(|r| r.ends_with("@node.ducktape.industries:443"))
         );
     }
 
@@ -1180,6 +1457,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         let binding = d.genesis_namespace();
         let token = mint_invite_token(&issuer, binding.as_bytes());
@@ -1235,6 +1513,7 @@ mod tests {
                 "{}@definitely-not-resolvable.ducktape.invalid:443",
                 hex_bytes(me.public_key().as_ref())
             )],
+            reach: vec![],
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1272,6 +1551,7 @@ mod tests {
                     ed25519::PrivateKey::from_seed(40).public_key().as_ref(),
                 )],
                 bootstrap: vec![],
+                reach: vec![],
             };
             d.save(&dir.join("network.toml")).expect("save");
         }
@@ -1314,6 +1594,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1339,6 +1620,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.admit(&a);
         d.admit(&b);
@@ -1363,6 +1645,7 @@ mod tests {
                 hex_bytes(other.as_ref()),
             ],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -1397,6 +1680,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(other.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1430,6 +1714,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(a.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1446,6 +1731,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         let founder_only = d.genesis_namespace();
         assert!(founder_only.starts_with("net#00000000@"));
@@ -1513,6 +1799,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         // empty dir: anything goes.
         assert!(guard_join_descriptor(&dir, &ours).is_ok());
@@ -1559,6 +1846,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![lower, upper],
             bootstrap: vec![],
+            reach: vec![],
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1575,6 +1863,7 @@ mod tests {
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(b.as_ref())],
             bootstrap: vec![],
+            reach: vec![],
         };
         // a hand-edited twin: uppercase, whitespace, different order.
         let messy = NetworkDescriptor {
@@ -1585,6 +1874,7 @@ mod tests {
                 hex_bytes(a.as_ref()),
             ],
             bootstrap: vec![],
+            reach: vec![],
         };
         // identical decoded sets MUST run under the identical namespace.
         assert_eq!(messy.genesis_namespace(), canonical.genesis_namespace());
@@ -1614,6 +1904,7 @@ mod tests {
                 format!("{}@127.0.0.1:0", hex_bytes(a.as_ref())),
                 format!("{}@127.0.0.1:52200", hex_bytes(b.as_ref())),
             ],
+            reach: vec![],
         };
         let entries = d.bootstrap_entries().expect("well-formed hints parse");
         assert_eq!(
@@ -1625,6 +1916,7 @@ mod tests {
         // malformed is still an error, never a skip.
         let bad = NetworkDescriptor {
             bootstrap: vec!["nope".into()],
+            reach: vec![],
             ..d
         };
         assert!(bad.bootstrap_entries().is_err());
@@ -1730,5 +2022,178 @@ bootstrapper_addr = "127.0.0.1:52200"
             r.signer.public_key(),
             ed25519::PrivateKey::from_seed(1).public_key()
         );
+    }
+
+    #[test]
+    fn reach_hint_canonical_roundtrips_every_kind() {
+        let ek = ed25519::PrivateKey::from_seed(11).public_key();
+        let ck = ed25519::PrivateKey::from_seed(12).public_key();
+        let cases = [
+            ReachHint { expected_key: ek.clone(), reach: Reach::Direct("127.0.0.1:9000".into()) },
+            ReachHint { expected_key: ek.clone(), reach: Reach::Fronted("front.example.com:443".into()) },
+            ReachHint {
+                expected_key: ek.clone(),
+                reach: Reach::Coordinated(CoordRef {
+                    coord_addr: "p2p.ducktape.industries:7777".into(),
+                    coord_key: ck.clone(),
+                }),
+            },
+        ];
+        for h in cases {
+            let s = h.to_canonical();
+            assert_eq!(ReachHint::parse(&s).expect("parse"), h, "roundtrip {s}");
+        }
+    }
+
+    #[test]
+    fn reach_hint_parse_rejects_malformed() {
+        assert!(ReachHint::parse("nope").is_err(), "no tag");
+        assert!(ReachHint::parse("direct:deadbeef").is_err(), "no @addr");
+        assert!(ReachHint::parse("bogus:00@host:1").is_err(), "unknown tag");
+        assert!(ReachHint::parse("direct:zz@host:1").is_err(), "bad hex key");
+        // coordinated without the #coord_key delimiter:
+        assert!(ReachHint::parse("coordinated:00@host:1").is_err(), "missing #coord_key");
+    }
+
+    #[test]
+    fn reach_field_defaults_empty_and_toml_roundtrips() {
+        let a = ed25519::PrivateKey::from_seed(21).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        // an existing network.toml without a [reach] array still parses (serde default),
+        // and an empty reach is not serialised (skip_serializing_if).
+        assert!(!d.to_toml().contains("reach"));
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("10.0.0.1:9000".into()) });
+        let back = NetworkDescriptor::from_toml(&d.to_toml()).expect("roundtrip");
+        assert_eq!(back.reach, d.reach);
+    }
+
+    #[test]
+    fn reach_hints_synthesizes_direct_from_bootstrap_when_reach_empty() {
+        let a = ed25519::PrivateKey::from_seed(22).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        d.add_bootstrap(&a, "127.0.0.1:52200");
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0], ReachHint { expected_key: a, reach: Reach::Direct("127.0.0.1:52200".into()) });
+    }
+
+    #[test]
+    fn add_reach_dedups_by_expected_key_and_sorts() {
+        let a = ed25519::PrivateKey::from_seed(23).public_key();
+        let coord = ed25519::PrivateKey::from_seed(24).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("1.1.1.1:1".into()) });
+        // same expected_key, different reach — replaces, never duplicates.
+        d.add_reach(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "c:2".into(), coord_key: coord }),
+        });
+        assert_eq!(d.reach.len(), 1);
+        assert!(matches!(d.reach_hints().unwrap()[0].reach, Reach::Coordinated(_)));
+        let mut sorted = d.reach.clone();
+        sorted.sort();
+        assert_eq!(d.reach, sorted);
+    }
+
+    #[test]
+    fn reach_hints_are_excluded_from_the_genesis_fingerprint() {
+        let v = ed25519::PrivateKey::from_seed(31).public_key();
+        let coord = ed25519::PrivateKey::from_seed(32).public_key();
+        let base = NetworkDescriptor {
+            chain_id: "fp#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(v.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        let ns0 = base.genesis_namespace();
+
+        let mut with_reach = base.clone();
+        with_reach.add_bootstrap(&v, "127.0.0.1:52200");
+        with_reach.add_reach(&ReachHint {
+            expected_key: v.clone(),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "p2p:7777".into(), coord_key: coord }),
+        });
+
+        // advisory reach + bootstrap NEVER move the consensus identity.
+        assert_eq!(with_reach.genesis_namespace(), ns0);
+        // two descriptors differing ONLY in reach fingerprint identically.
+        let mut other_reach = base.clone();
+        other_reach.add_reach(&ReachHint { expected_key: v, reach: Reach::Direct("9.9.9.9:9".into()) });
+        assert_eq!(other_reach.genesis_namespace(), ns0);
+    }
+
+    // ---- Task 7: reach resolution to dial targets ----
+
+    #[test]
+    fn coordinated_hint_resolves_dial_target_to_coord_addr_with_expected_key() {
+        let target = ed25519::PrivateKey::from_seed(71).public_key();
+        let coord = ed25519::PrivateKey::from_seed(72).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "co#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(target.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        // a coordinated hint routes through the coordinator, but the identity
+        // we expect end-to-end is the TARGET; the coordinator's own ingress and
+        // key ride along for the nat client to rendezvous through.
+        d.add_reach(&ReachHint {
+            expected_key: target.clone(),
+            reach: Reach::Coordinated(CoordRef { coord_addr: "127.0.0.1:59999".into(), coord_key: coord.clone() }),
+        });
+        let entries = d.reach_entries().expect("resolve");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, target); // expect target key
+        match &entries[0].1 {
+            ReachDial::Coordinated { coord: c, coord_key } => {
+                assert_eq!(*c, Ingress::Socket("127.0.0.1:59999".parse().unwrap()));
+                assert_eq!(*coord_key, coord);
+            }
+            other => panic!("expected a coordinated dial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reach_entries_folds_bootstrap_and_reach_into_direct_ingresses() {
+        let a = ed25519::PrivateKey::from_seed(73).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "co#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+        };
+        // a bootstrap hint alone synthesises a Direct reach ingress...
+        d.add_bootstrap(&a, "127.0.0.1:52200");
+        let entries = d.reach_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, a);
+        assert!(matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52200".parse().unwrap())));
+        // ...and an explicit reach hint for the same key wins over it (union,
+        // reach-preferred), still one Direct entry.
+        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("127.0.0.1:52201".into()) });
+        let entries = d.reach_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52201".parse().unwrap())));
     }
 }
