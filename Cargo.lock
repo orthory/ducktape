@@ -1438,6 +1438,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinator-bin"
+version = "0.1.0"
+dependencies = [
+ "nat-traversal",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3990,6 +3998,15 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nat-traversal"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -8416,6 +8433,16 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "wireguard-effect"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "defguard_wireguard_rs",
+ "nat-traversal",
+ "wireguard-upgrade",
 ]
 
 [[package]]
