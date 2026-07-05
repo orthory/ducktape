@@ -277,6 +277,31 @@ format = "text"
         }
     }
 
+    /// live end-to-end against a REAL locally installed CLI (BYO auth):
+    /// the payload goes to the provider VERBATIM and the raw answer comes
+    /// back — the whole opinion-free contract. ignored by default; name the
+    /// capability tag your host provides:
+    /// `DUCKTAPE_LIVE_CAPABILITY=<tag> cargo test -p dispatch-oracle -- --ignored live_run`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_run_feeds_the_payload_verbatim_to_a_local_cli() {
+        let capability = std::env::var("DUCKTAPE_LIVE_CAPABILITY")
+            .expect("set DUCKTAPE_LIVE_CAPABILITY to a capability this host provides");
+        let worker = DispatchWorker::new(
+            capability_host::discover().expect("capability specs load"),
+            b"live".to_vec(),
+        );
+        let payload = b"Reply with exactly one word: quack".to_vec();
+        let answer = worker
+            .answer(&capability, &payload)
+            .await
+            .expect("the provider answered");
+        assert!(
+            !answer.is_empty(),
+            "the raw answer must be non-empty (got zero bytes)"
+        );
+    }
+
     #[tokio::test]
     async fn non_utf8_payloads_error_cleanly() {
         let worker = DispatchWorker::new(mock_specs_only(), b"me".to_vec());
