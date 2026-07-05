@@ -696,7 +696,7 @@ struct CapturedModule {
 /// and the consensus wiring) supplies them per request; the floor-cert
 /// contract is the caller's: pass it only when it certifies exactly the
 /// current finalized height.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BoundaryCoords {
     pub epoch: u64,
     pub view_base: u64,
@@ -973,7 +973,18 @@ impl SyncServer {
             height: finalized.height,
             app_hash: snapshot.app_hash,
         };
-        if self.captures.contains_key(&id) {
+        if let Some(capture) = self.captures.get_mut(&id) {
+            // same boundary STATE, possibly new consensus ADDRESS: an epoch
+            // cutover at a stalled boundary (a 1->2 admission is the canonical
+            // case — epoch 1 cannot finalize until the joiner arrives) changes
+            // the coordinates without changing (height, app_hash). a capture
+            // taken just before the cutover would otherwise serve its stale
+            // epoch/participants forever, and the parked joiner it describes
+            // would never learn it was admitted. the payload bytes are
+            // identical either way; only the coordinates are refreshed.
+            if &capture.coords != coords {
+                capture.coords = coords.clone();
+            }
             return Ok(id);
         }
 

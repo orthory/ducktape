@@ -5,6 +5,7 @@ import { AgentView } from "../views/agent/AgentView";
 import { AutomationsView } from "../views/automations/AutomationsView";
 import { ChatView } from "../views/chat/ChatView";
 import { DocumentView } from "../views/document/DocumentView";
+import { ExplorerView } from "../views/explorer/ExplorerView";
 import { FilesView } from "../views/files/FilesView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { GovernanceView } from "../views/governance/GovernanceView";
@@ -14,6 +15,7 @@ import { MemoryView } from "../views/memory/MemoryView";
 import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { PagesView } from "../views/pages/PagesView";
+import { SearchView } from "../views/search/SearchView";
 import { StatusView } from "../views/status/StatusView";
 import { TasksView } from "../views/tasks/TasksView";
 import { TelemetryView } from "../views/telemetry/TelemetryView";
@@ -27,6 +29,7 @@ import type { AppModule, NavSection } from "./module-def";
 // independently.
 export const MODULES: AppModule[] = [
   // ── User apps ──
+  { id: "search", nav: { icon: "search", label: "Search", order: -1, section: "user" }, Screen: SearchView },
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
   { id: "inbox", nav: { icon: "inbox", label: "Inbox", order: 1, section: "user" }, Screen: InboxView },
   { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 2, section: "user" }, Screen: TasksView },
@@ -44,6 +47,7 @@ export const MODULES: AppModule[] = [
   { id: "modules", nav: { icon: "modules", label: "Modules", order: 4, section: "operator" }, Screen: ModulesView },
   { id: "status", nav: { icon: "node", label: "Node", order: 5, section: "operator" }, Screen: StatusView },
   { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 6, section: "operator" }, Screen: TelemetryView },
+  { id: "explorer", nav: { icon: "hash", label: "Explorer", order: 7, section: "operator" }, Screen: ExplorerView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

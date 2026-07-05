@@ -1,0 +1,16 @@
+# tasks' materialized view on the derived tier: by-status listing with
+# pagination (canonical TaskQuery::List is unpaged and unfiltered). depends on
+# the indexer contract and tasks' types-only interface — NEVER the module impl.
+[package]
+name = "tasks-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexer = { workspace = true }
+tasks-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

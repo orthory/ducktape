@@ -158,21 +158,26 @@ fn dispatch_trace_records_every_dispatch_in_causal_order() {
             .expect("submit succeeds");
 
         // the deterministic trace: the root op (relay) then the follow-up it
-        // emitted (kv), in drain order — each tagged with its trigger origin and
-        // its intent fan-out. `submit` uses the default context, so the root
-        // op's origin is an empty External.
+        // emitted (kv), in drain order — each tagged with its trigger origin,
+        // the op bytes it applied, and its intent fan-out. `submit` uses the
+        // default context, so the root op's origin is an empty External.
         assert_eq!(
             outcome.dispatches,
             vec![
                 DispatchRecord {
                     module: RELAY_ID.to_string(),
                     origin: Origin::External(Vec::new()),
+                    payload: Vec::new(),
                     emitted_msgs: 1,
                     emitted_events: 0,
                 },
                 DispatchRecord {
                     module: KV_ID.to_string(),
                     origin: Origin::Module(RELAY_ID.to_string()),
+                    payload: kv_interface::encode(&kv_interface::KvMsg::Set {
+                        key: WRITE_KEY.to_vec(),
+                        value: WRITE_VAL.to_vec(),
+                    }),
                     emitted_msgs: 0,
                     emitted_events: 0,
                 },

@@ -13,12 +13,15 @@
 //! run: `cargo run -p noded -- [--listen 127.0.0.1:8844] [--storage <dir>]`
 //!
 //! without `--storage` state lives in a fresh temp dir (clean run each boot).
-//! with it, qmdb modules and the forge repo persist; the height counter still
-//! restarts at 0 — it is a local block counter, not consensus state.
+//! with it, qmdb modules, the forge repo, and the per-module index persist;
+//! the local block counter resumes ABOVE the index's watermark, so op-log
+//! heights stay monotonic across restarts (a counter restarting at 0 would
+//! make every new block look already-indexed and be silently skipped).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
@@ -34,6 +37,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use inbox::Inbox;
+use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
 use jobs::Jobs;
 use memory::Memory;
 use noded::{
@@ -166,8 +170,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same path — the actor to materialize into, the http handle to serve from.
     let forge_repo = storage.join("forge-git");
 
+    // the per-module derived index: one fluent31 database per module under
+    // <storage>/index/<module>/, with each module's view mapper registered.
+    // an open failure is fatal-with-remedy rather than a silent no-index run:
+    // the tier is rebuildable, so the fix is always "delete <storage>/index".
+    let index_dir = storage.join("index");
+    let index = IndexStore::open(&index_dir, &MODULE_IDS)
+        .map(|store| {
+            Arc::new(
+                store
+                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
+                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
+                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
+                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
+            )
+        })
+        .map_err(|err| {
+            format!(
+                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
+                index_dir.display()
+            )
+        })?;
+
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
-    let handle = handle.with_forge_repo(forge_repo.clone());
+    let handle = handle
+        .with_forge_repo(forge_repo.clone())
+        .with_index_store(index.clone());
 
     // the node actor gets its own thread: commonware's tokio runner owns that
     // thread's runtime, and the host must never leave it. the blob handle and
@@ -176,6 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // into the ring, while the http layer reads both through its own clones.
     let actor_storage = storage.clone();
     let actor_forge_repo = forge_repo.clone();
+    let actor_index = index.clone();
     let blobs = handle.blob_handle();
     let telemetry = handle.telemetry_ring();
     std::thread::Builder::new()
@@ -184,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_node(
                 actor_storage,
                 actor_forge_repo,
+                actor_index,
                 blobs,
                 telemetry,
                 cmd_rx,
@@ -213,6 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
+    index: Arc<IndexStore>,
     blobs: files::BlobHandle,
     telemetry: TelemetryRing,
     mut cmds: mpsc::Receiver<NodeCommand>,
@@ -280,7 +311,13 @@ fn run_node(
         let metrics = NodeMetrics::register(&context);
 
         let workers = oracle_workers(worker_blobs);
-        let mut height = 0u64;
+        // resume the local block counter ABOVE the index watermark: the op
+        // log persists under --storage, and a counter restarting at 0 would
+        // re-use indexed heights — every new block silently skipped.
+        let mut height = index.resume_height().expect("read index watermarks");
+        if height > 0 {
+            println!("[noded] module index resumes at height {height}");
+        }
         while let Some(cmd) = cmds.next().await {
             match cmd {
                 NodeCommand::Submit {
@@ -293,6 +330,7 @@ fn run_node(
                         &mut host,
                         &workers,
                         &mut height,
+                        &index,
                         &events,
                         &telemetry,
                         &metrics,
@@ -371,6 +409,7 @@ async fn submit_and_drain(
     host: &mut Host,
     workers: &[Box<dyn reactor::Worker>],
     height: &mut u64,
+    index: &IndexStore,
     events: &broadcast::Sender<WsFrame>,
     telemetry: &TelemetryRing,
     metrics: &NodeMetrics,
@@ -378,7 +417,7 @@ async fn submit_and_drain(
     msg: Msg,
 ) -> Result<BlockSummary, String> {
     let (included, effects) =
-        match submit_one(host, height, events, telemetry, metrics, origin, msg).await {
+        match submit_one(host, height, index, events, telemetry, metrics, origin, msg).await {
             Ok(out) => out,
             Err(SubmitError::Fatal(err)) => {
                 eprintln!("[noded] FATAL: {err} — halting");
@@ -399,6 +438,7 @@ async fn submit_and_drain(
         match submit_one(
             host,
             height,
+            index,
             events,
             telemetry,
             metrics,
@@ -426,6 +466,7 @@ async fn submit_and_drain(
 async fn submit_one(
     host: &mut Host,
     height: &mut u64,
+    index: &IndexStore,
     events: &broadcast::Sender<WsFrame>,
     telemetry: &TelemetryRing,
     metrics: &NodeMetrics,
@@ -465,7 +506,42 @@ async fn submit_one(
     telemetry.push(frame.clone());
     let _ = events.send(WsFrame::Block(block.clone()));
     let _ = events.send(WsFrame::Telemetry(frame));
+
+    // fold the block into the derived per-module index LAST: canonical state
+    // is already committed, so an index failure degrades the read models and
+    // never the block. the store poisons itself on error (contiguity over
+    // coverage) and stays loud on every later block until rebuilt.
+    let ops = out
+        .dispatches
+        .into_iter()
+        .map(|d| AppliedOp {
+            origin: index_origin(&d.origin),
+            module: d.module,
+            payload: d.payload,
+        })
+        .collect();
+    let block_ops = BlockOps {
+        height: *height,
+        time: consensus_time,
+        ops,
+    };
+    if let Err(err) = index.apply_block(&block_ops) {
+        eprintln!(
+            "[noded] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
+            *height
+        );
+    }
+
     Ok((block, out.effects))
+}
+
+/// map a dispatch origin to the index's flattened origin tag.
+fn index_origin(origin: &Origin) -> OriginTag {
+    match origin {
+        Origin::External(id) => OriginTag::external(String::from_utf8_lossy(id)),
+        Origin::Module(id) => OriginTag::module(id.clone()),
+        Origin::System => OriginTag::system(),
+    }
 }
 
 /// map a deterministic dispatch record to its telemetry wire twin.

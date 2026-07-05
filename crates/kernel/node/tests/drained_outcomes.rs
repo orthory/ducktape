@@ -66,6 +66,31 @@ fn drained_outcomes_correlate_submits_with_dispositions() {
         assert_eq!(ok_frame.disposition, Disposition::Applied);
         assert_eq!(bad_frame.disposition, Disposition::Rejected);
 
+        // the applied frame carries its decoded op: authenticated authorship,
+        // the root msg, and the block's dispatch trace.
+        let op = ok_frame.op.as_ref().expect("applied frame carries its op");
+        assert_eq!(op.target, "directory");
+        assert_eq!(
+            op.origin,
+            sdk::Origin::External(signer.public_key().as_ref().to_vec()),
+            "origin is the frame's verified signer"
+        );
+        assert!(
+            !op.dispatches.is_empty(),
+            "an applied op leaves a dispatch trace"
+        );
+        // the rejected frame decoded fine (the MODULE refused it), so its op
+        // contents are still known — but a deterministic no-op leaves no trace.
+        let bad_op = bad_frame
+            .op
+            .as_ref()
+            .expect("a decoded-then-rejected frame still carries its op");
+        assert!(bad_op.dispatches.is_empty(), "a rejected op leaves no trace");
+        // per-frame boundary capture: the reject rolled back, so both frames
+        // settled at the same composed app-hash the node now reports.
+        assert_eq!(ok_frame.app_hash, node.app_hash());
+        assert_eq!(bad_frame.app_hash, node.app_hash());
+
         assert!(node.take_drained().is_empty(), "take clears the queue");
     });
 }
@@ -87,6 +112,10 @@ fn frames_past_the_ceiling_drain_as_discarded() {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].id, id);
         assert_eq!(drained[0].disposition, Disposition::Discarded);
+        assert!(
+            drained[0].op.is_none(),
+            "discarded at the ceiling — dropped before decode, no op contents"
+        );
         // the engine clock advances (the view was agreed), but the finalized
         // STATE boundary does not: a discard is never journaled, so a
         // boundary that included it would claim a height recovery cannot

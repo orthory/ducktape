@@ -129,6 +129,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       "jobs",
       "agent",
       "document",
+      "pages",
       "forge",
       "files",
       "memory",
@@ -140,12 +141,13 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     await createChannel(transport, {
       channelId: "general",
       name: "General",
+      postPolicy: "Open",
       origin: "eddy",
     });
     const posted = await postMessage(transport, {
       channelId: "general",
       messageId: "m1",
-      text: "hello from the app domain layer",
+      blocks: [{ Paragraph: [{ text: "hello from the app domain layer", marks: [] }] }],
       origin: "eddy",
     });
     expect(posted.height).toBeGreaterThan(0);
@@ -165,7 +167,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     await postMessage(transport, {
       channelId: "general",
       messageId: "m2",
-      text: "a threaded reply",
+      blocks: [{ Paragraph: [{ text: "a threaded reply", marks: [] }] }],
       origin: "jess",
       thread: view.seq,
     });
@@ -206,6 +208,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       await createChannel(transport, {
         channelId: "ws-probe",
         name: "Ws Probe",
+        postPolicy: "Open",
         origin: "eddy",
       });
       let event: BlockEvent | null = null;
@@ -213,7 +216,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
         await postMessage(transport, {
           channelId: "ws-probe",
           messageId: `probe-${probe}`,
-          text: "block event probe",
+          blocks: [{ Paragraph: [{ text: "block event probe", marks: [] }] }],
           origin: "eddy",
         });
         event = await Promise.race([

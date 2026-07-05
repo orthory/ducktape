@@ -156,3 +156,30 @@ export const listPages = (transport: NodeTransport): Promise<PageMeta[]> =>
   Promise.resolve()
     .then(() => transport.query(TARGET, "ListPages"))
     .then((reply) => replyVariant<PageMeta[]>(reply, "PageList"));
+
+// ── Materialized view (the module's derived-index endpoint) ──
+
+/** One search hit from pages' materialized view (camelCase index wire). */
+export interface PageSearchHit {
+  blockId: string;
+  pageId: string;
+  parent?: string;
+  kind: BlockKind;
+  text: string;
+  height: number;
+  time: number;
+}
+
+/** Full-text search over the page block tree, newest first — served by the
+ *  node's per-module index (pages' own view endpoint), not canonical state. */
+export const searchPageBlocks = (
+  transport: NodeTransport,
+  params: { text: string; pageId?: string; limit?: number },
+): Promise<PageSearchHit[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.view(TARGET, {
+        search: { text: params.text, pageId: params.pageId, limit: params.limit },
+      }),
+    )
+    .then((reply) => replyVariant<PageSearchHit[]>(reply, "hits"));

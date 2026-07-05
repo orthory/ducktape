@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519};
+use commonware_p2p::Ingress;
+use commonware_utils::Hostname;
 use serde::{Deserialize, Serialize};
 
 /// the consensus scheme tag a descriptor must carry — a genesis-wide constant
@@ -28,7 +30,10 @@ use serde::{Deserialize, Serialize};
 pub const SCHEME_ED25519: &str = "ed25519";
 
 /// the invite blob prefix; versioned so a stale-format paste fails loudly. v2 is
-/// the compact binary payload (raw keys, base64url) — see [`encode_invite`].
+/// the compact binary payload (raw keys, base64url) — see [`encode_invite`]. the
+/// prefix stays "v2" for v3 blobs: the PAYLOAD version byte is authoritative, and
+/// keeping the prefix lets an old build report "unsupported invite version 3"
+/// instead of the misleading "not a ducktape invite".
 const INVITE_PREFIX: &str = "ducktape-invite-v2:";
 
 // ============================================================================
@@ -232,27 +237,23 @@ impl NetworkDescriptor {
         format!("{}@{}", self.chain_id, hex_bytes(&digest.as_ref()[..16]))
     }
 
-    /// bootstrap entries RESOLVED to concrete socket addrs to dial. the host may
-    /// be a literal IP or a HOSTNAME — `to_socket_addrs` resolves either (DNS for
-    /// a name), so `pubkey@node.example.com:443` works the same as an ip. a
-    /// MALFORMED entry (no `@`, bad key) is a config error; a hint that does not
-    /// resolve, or resolves to an unspecified ip / port 0, is advisory and
-    /// skipped rather than failing startup.
-    pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, SocketAddr)>, String> {
-        use std::net::ToSocketAddrs as _;
+    /// bootstrap entries as dial INGRESSES. an IP literal becomes a socket
+    /// ingress; a HOSTNAME stays a hostname (`Ingress::Dns`) and is re-resolved
+    /// by the dialer at EVERY attempt — so `pubkey@node.example.com:443` keeps
+    /// working when the tunnel behind the name moves, and an offline name never
+    /// blocks startup. a MALFORMED entry (no `@`, bad key, not host:port) is a
+    /// config error; an unspecified ip / port 0 is advisory and skipped.
+    pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, Ingress)>, String> {
         let mut out = Vec::new();
         for entry in &self.bootstrap {
             let (key, host_port) = entry
                 .split_once('@')
                 .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
             let key = decode_key(key)?;
-            let Some(addr) = host_port.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
-                continue; // unresolvable (stale DNS, offline) — advisory, skip.
-            };
-            if addr.ip().is_unspecified() || addr.port() == 0 {
-                continue;
+            match ingress_of(host_port).map_err(|e| format!("bootstrap entry {entry:?}: {e}"))? {
+                Some(ingress) => out.push((key, ingress)),
+                None => continue, // unspecified ip / port 0 — advisory noise.
             }
-            out.push((key, addr));
         }
         Ok(out)
     }
@@ -282,6 +283,162 @@ pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
     let raw = unhex(hex.trim())?;
     ed25519::PublicKey::decode(raw.as_slice())
         .map_err(|e| format!("{hex:?} is not an ed25519 public key: {e}"))
+}
+
+// ============================================================================
+// invite tokens — the bearer credential a v3 invite blob carries. minted by a
+// member (`invite`), presented by the joiner's parked node over the lobby
+// channel, verified by each RECEIVING member node before it records the join
+// request for manual approval. the token authenticates that an announce comes
+// from a real invitation (and names the inviter); it does NOT admit by itself
+// — admission stays a member decision through the normal governance ballots.
+// ============================================================================
+
+/// ed25519 signing namespace for the grant an issuer mints:
+/// `sign(INVITE_GRANT_NAMESPACE, binding ‖ nonce)`.
+pub const INVITE_GRANT_NAMESPACE: &[u8] = b"ducktape-invite-grant-v1";
+/// ed25519 signing namespace for the joiner's proof-of-possession:
+/// `sign(INVITE_JOIN_NAMESPACE, binding ‖ nonce ‖ joiner)`.
+pub const INVITE_JOIN_NAMESPACE: &[u8] = b"ducktape-invite-join-v1";
+/// invite token nonce width in bytes.
+pub const INVITE_NONCE_LEN: usize = 16;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InviteToken {
+    /// the minting member — checked against CURRENT membership on receipt.
+    pub issuer: ed25519::PublicKey,
+    /// per-invite randomness: distinguishes tokens, keys announce dedup.
+    pub nonce: [u8; INVITE_NONCE_LEN],
+    /// issuer's signature over `binding ‖ nonce` in the invite-grant namespace.
+    pub sig: ed25519::Signature,
+}
+
+/// mint a token binding an invite to `binding` (the genesis namespace): fresh
+/// OS randomness for the nonce, signed by this member's identity.
+pub fn mint_invite_token(signer: &ed25519::PrivateKey, binding: &[u8]) -> InviteToken {
+    let mut nonce = [0u8; INVITE_NONCE_LEN];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let msg = [binding, &nonce].concat();
+    InviteToken {
+        issuer: signer.public_key(),
+        nonce,
+        sig: signer.sign(INVITE_GRANT_NAMESPACE, &msg),
+    }
+}
+
+/// the joiner's proof-of-possession over its own key for `token` — binds the
+/// announced pubkey to someone actually holding its secret, so a blob holder
+/// cannot park a join request under a key that never asked to join.
+pub fn sign_join_proof(
+    joiner: &ed25519::PrivateKey,
+    binding: &[u8],
+    token: &InviteToken,
+) -> ed25519::Signature {
+    let msg = [
+        binding,
+        token.nonce.as_slice(),
+        joiner.public_key().as_ref(),
+    ]
+    .concat();
+    joiner.sign(INVITE_JOIN_NAMESPACE, &msg)
+}
+
+/// verify a token on receipt: issuer signature over `binding ‖ nonce`.
+pub fn verify_invite_token(token: &InviteToken, binding: &[u8]) -> bool {
+    use commonware_cryptography::Verifier as _;
+    let msg = [binding, token.nonce.as_slice()].concat();
+    token
+        .issuer
+        .verify(INVITE_GRANT_NAMESPACE, &msg, &token.sig)
+}
+
+/// verify a joiner's proof-of-possession against `token`.
+pub fn verify_join_proof(
+    joiner: &ed25519::PublicKey,
+    binding: &[u8],
+    token: &InviteToken,
+    proof: &ed25519::Signature,
+) -> bool {
+    use commonware_cryptography::Verifier as _;
+    let msg = [binding, token.nonce.as_slice(), joiner.as_ref()].concat();
+    joiner.verify(INVITE_JOIN_NAMESPACE, &msg, proof)
+}
+
+const INVITE_TOKEN_FILE: &str = "invite.token";
+const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 64;
+
+fn pack_invite_token(t: &InviteToken) -> Vec<u8> {
+    let mut out = Vec::with_capacity(INVITE_TOKEN_LEN);
+    out.extend_from_slice(t.issuer.as_ref());
+    out.extend_from_slice(&t.nonce);
+    out.extend_from_slice(t.sig.encode().as_ref());
+    out
+}
+
+fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
+    if bytes.len() != INVITE_TOKEN_LEN {
+        return Err(format!(
+            "invite token must be {INVITE_TOKEN_LEN} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let issuer = ed25519::PublicKey::decode(&bytes[..32])
+        .map_err(|e| format!("invite token issuer: {e}"))?;
+    let mut nonce = [0u8; INVITE_NONCE_LEN];
+    nonce.copy_from_slice(&bytes[32..32 + INVITE_NONCE_LEN]);
+    let sig = ed25519::Signature::decode(&bytes[32 + INVITE_NONCE_LEN..])
+        .map_err(|e| format!("invite token signature: {e}"))?;
+    Ok(InviteToken { issuer, nonce, sig })
+}
+
+/// persist the token a `join` received beside the descriptor (0600 like the
+/// identity: it is a bearer credential until used). overwrites — a re-join
+/// with a fresh invite replaces a stale/spent token.
+pub fn save_invite_token(dir: &Path, token: &InviteToken) -> Result<(), String> {
+    use std::io::Write as _;
+    let path = dir.join(INVITE_TOKEN_FILE);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).map_err(|e| format!("create {path:?}: {e}"))?;
+    f.write_all(format!("{}\n", hex_bytes(&pack_invite_token(token))).as_bytes())
+        .map_err(|e| format!("write {path:?}: {e}"))
+}
+
+/// the token a previous `join` stored, if any — a missing file is the normal
+/// state for founders, dev-shape nodes, and manual (token-less) joins.
+pub fn load_invite_token(dir: &Path) -> Result<Option<InviteToken>, String> {
+    let path = dir.join(INVITE_TOKEN_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
+    let raw = unhex(text.trim()).map_err(|e| format!("{path:?}: {e}"))?;
+    unpack_invite_token(&raw).map(Some)
+}
+
+// ============================================================================
+// the lobby identity — a keypair every holder of this network's descriptor can
+// DERIVE (seeded from the genesis namespace, which is public to members and
+// invitees alike). it authenticates NOTHING: it exists so a not-yet-admitted
+// joiner can complete the discovery handshake and be heard on the lobby
+// channel at all — authorization is the invite token it then presents. every
+// member folds this key into its tracked mesh, so the set stays identical
+// across nodes (discovery kills peers whose set at a shared index differs).
+// ============================================================================
+
+pub fn lobby_identity(binding: &[u8]) -> ed25519::PrivateKey {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let mut hasher = Sha256::default();
+    hasher.update(b"ducktape-lobby-v1:");
+    hasher.update(binding);
+    let digest = hasher.finalize();
+    // every 32-byte string is a valid ed25519 seed (the scheme clamps).
+    ed25519::PrivateKey::decode(digest.as_ref()).expect("32 digest bytes decode")
 }
 
 /// guard a join against clobbering a DIFFERENT network's descriptor: a
@@ -349,15 +506,29 @@ fn is_host_port(s: &str) -> bool {
     }
 }
 
-/// resolve a `host:port` (IP literal or hostname via DNS) to a single socket
-/// addr, erroring if it does not resolve.
-fn resolve_one(host_port: &str) -> Result<SocketAddr, String> {
-    use std::net::ToSocketAddrs as _;
-    host_port
-        .to_socket_addrs()
-        .map_err(|e| format!("{host_port:?}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{host_port:?} did not resolve"))
+/// parse a `host:port` into a dial ingress WITHOUT resolving anything: an IP
+/// literal becomes `Ingress::Socket`; a host:port-shaped name stays a hostname
+/// (`Ingress::Dns`), re-resolved by dialing peers at each attempt. `Ok(None)`
+/// = syntactically fine but never dialable (unspecified ip / port 0); a shape
+/// that is neither an ip nor host:port is an error.
+fn ingress_of(host_port: &str) -> Result<Option<Ingress>, String> {
+    if let Ok(addr) = host_port.parse::<SocketAddr>() {
+        if addr.ip().is_unspecified() || addr.port() == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(Ingress::Socket(addr)));
+    }
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return Err(format!("{host_port:?} is not host:port"));
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("{host_port:?} has no valid port"))?;
+    if port == 0 {
+        return Ok(None);
+    }
+    let host = Hostname::new(host).map_err(|e| format!("{host_port:?}: bad hostname: {e:?}"))?;
+    Ok(Some(Ingress::Dns { host, port }))
 }
 
 // ============================================================================
@@ -371,17 +542,30 @@ fn resolve_one(host_port: &str) -> Result<SocketAddr, String> {
 // a "raw TOML file". flag-day change: v1 blobs no longer decode.
 // ============================================================================
 
-/// invite payload format tag (the first packed byte).
-const INVITE_VERSION: u8 = 2;
+/// invite payload format tags (the first packed byte). v2 = descriptor only
+/// (the manual flow: the joiner's key travels out-of-band and a member runs
+/// `invite-accept`); v3 = v2 plus an [`InviteToken`] appended — the bearer
+/// credential that makes admission automatic.
+const INVITE_VERSION_V2: u8 = 2;
+const INVITE_VERSION_V3: u8 = 3;
 
 const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-pub fn encode_invite(descriptor: &NetworkDescriptor) -> Result<String, String> {
+/// encode an invite blob: v3 when a token rides along, v2 (decodable by older
+/// builds) when not.
+pub fn encode_invite(
+    descriptor: &NetworkDescriptor,
+    token: Option<&InviteToken>,
+) -> Result<String, String> {
     use base64::Engine as _;
-    Ok(format!("{INVITE_PREFIX}{}", INVITE_B64.encode(pack_invite(descriptor)?)))
+    Ok(format!(
+        "{INVITE_PREFIX}{}",
+        INVITE_B64.encode(pack_invite(descriptor, token)?)
+    ))
 }
 
-pub fn decode_invite(blob: &str) -> Result<NetworkDescriptor, String> {
+/// decode an invite blob; the token is `None` for a v2 (manual-flow) blob.
+pub fn decode_invite(blob: &str) -> Result<(NetworkDescriptor, Option<InviteToken>), String> {
     use base64::Engine as _;
     let body = blob
         .trim()
@@ -393,11 +577,15 @@ pub fn decode_invite(blob: &str) -> Result<NetworkDescriptor, String> {
     unpack_invite(&bytes)
 }
 
-/// pack a descriptor into the compact v2 payload. bootstrap hints are copied
+/// pack a descriptor into the compact v2/v3 payload. bootstrap hints are copied
 /// verbatim (any well-formed `pubkey@addr`); validator hex is decoded to raw
 /// keys, which also rejects a malformed descriptor here rather than shipping it.
-fn pack_invite(d: &NetworkDescriptor) -> Result<Vec<u8>, String> {
-    let mut out = vec![INVITE_VERSION];
+fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec<u8>, String> {
+    let mut out = vec![if token.is_some() {
+        INVITE_VERSION_V3
+    } else {
+        INVITE_VERSION_V2
+    }];
 
     let cid = d.chain_id.as_bytes();
     let cid_len = u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?;
@@ -427,18 +615,22 @@ fn pack_invite(d: &NetworkDescriptor) -> Result<Vec<u8>, String> {
         out.push(hp_len);
         out.extend_from_slice(hp);
     }
+    if let Some(t) = token {
+        out.extend_from_slice(&pack_invite_token(t));
+    }
     Ok(out)
 }
 
 /// inverse of [`pack_invite`]; yields a descriptor canonicalized exactly as
 /// [`NetworkDescriptor::from_toml`] would (lowercase, sorted validators) so the
 /// genesis fingerprint of a decoded invite matches the founder's.
-fn unpack_invite(bytes: &[u8]) -> Result<NetworkDescriptor, String> {
+fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>), String> {
     let mut r = InviteReader::new(bytes);
     let version = r.u8()?;
-    if version != INVITE_VERSION {
+    if version != INVITE_VERSION_V2 && version != INVITE_VERSION_V3 {
         return Err(format!(
-            "unsupported invite version {version} (this build reads v{INVITE_VERSION})"
+            "unsupported invite version {version} (this build reads v{INVITE_VERSION_V2} and \
+             v{INVITE_VERSION_V3})"
         ));
     }
     let cid_len = r.u8()? as usize;
@@ -460,15 +652,23 @@ fn unpack_invite(bytes: &[u8]) -> Result<NetworkDescriptor, String> {
             std::str::from_utf8(r.take(hp_len)?).map_err(|e| format!("bootstrap addr: {e}"))?;
         bootstrap.push(format!("{key}@{host_port}"));
     }
+    let token = if version == INVITE_VERSION_V3 {
+        Some(unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?)
+    } else {
+        None
+    };
     if !r.done() {
         return Err("invite payload has trailing bytes".into());
     }
-    Ok(NetworkDescriptor {
-        chain_id,
-        scheme: SCHEME_ED25519.into(),
-        validators,
-        bootstrap,
-    })
+    Ok((
+        NetworkDescriptor {
+            chain_id,
+            scheme: SCHEME_ED25519.into(),
+            validators,
+            bootstrap,
+        },
+        token,
+    ))
 }
 
 /// a bounds-checked forward cursor over the packed invite bytes.
@@ -632,8 +832,8 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
 /// key is in the validator set — otherwise a joiner pins a peer that can
 /// never answer and retries forever. preference: first validator bootstrap
 /// hint, else any validator that is not us. None = nobody can serve (solo).
-pub fn choose_sync_source(
-    bootstrappers: &[(ed25519::PublicKey, SocketAddr)],
+pub fn choose_sync_source<A>(
+    bootstrappers: &[(ed25519::PublicKey, A)],
     validators: &[ed25519::PublicKey],
     me: &ed25519::PublicKey,
 ) -> Option<ed25519::PublicKey> {
@@ -643,6 +843,71 @@ pub fn choose_sync_source(
         .find(|k| *k != me && validators.contains(k))
         .or_else(|| validators.iter().find(|k| *k != me))
         .cloned()
+}
+
+// ============================================================================
+// the workspace registry — the desktop app materializes one directory per
+// network under `~/.ducktape/workspaces/<id>/` (node.toml + network.toml +
+// identity.key). `--network <chain id>` resolves through it, so the CLI can
+// address a node by the name humans actually know.
+// ============================================================================
+
+/// the registry root: `$DUCKTAPE_HOME/workspaces` when the override is set
+/// (tests, portable setups), else `~/.ducktape/workspaces`.
+pub fn workspaces_root() -> Result<PathBuf, String> {
+    if let Some(home) = std::env::var_os("DUCKTAPE_HOME") {
+        return Ok(PathBuf::from(home).join("workspaces"));
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or("cannot resolve $HOME — pass --config <node.toml> instead of --network")?;
+    Ok(PathBuf::from(home).join(".ducktape").join("workspaces"))
+}
+
+/// resolve `--network <chain id>` to a workspace's node.toml: scan the
+/// registry for descriptors whose chain-id matches `needle` — exact first,
+/// else a unique prefix (so `ducktape` finds `ducktape#a1b2c3d4`). ambiguity
+/// and absence are loud errors that name what WAS found.
+pub fn find_workspace_config(needle: &str) -> Result<PathBuf, String> {
+    find_workspace_config_in(&workspaces_root()?, needle)
+}
+
+fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String> {
+    let entries = std::fs::read_dir(root).map_err(|e| {
+        format!("no workspace registry at {root:?} ({e}) — pass --config <node.toml>")
+    })?;
+    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let descriptor_path = dir.join("network.toml");
+        if !descriptor_path.is_file() {
+            continue;
+        }
+        // an unreadable descriptor in one workspace must not break addressing
+        // the others — skip it.
+        let Ok(d) = NetworkDescriptor::load(&descriptor_path) else {
+            continue;
+        };
+        if d.chain_id == needle {
+            return Ok(dir.join("node.toml"));
+        }
+        if d.chain_id.starts_with(needle) {
+            matches.push((d.chain_id, dir.join("node.toml")));
+        }
+    }
+    match matches.len() {
+        0 => Err(format!(
+            "no workspace under {root:?} matches network {needle:?}"
+        )),
+        1 => Ok(matches.swap_remove(0).1),
+        _ => Err(format!(
+            "network {needle:?} is ambiguous — matches: {}",
+            matches
+                .iter()
+                .map(|(c, _)| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// everything `run_node` needs, shape-independent.
@@ -659,10 +924,15 @@ pub struct Resolved {
     pub mesh: Vec<ed25519::PublicKey>,
     /// the genesis consensus participant subset.
     pub validators: Vec<ed25519::PublicKey>,
-    /// (identity, addr) pairs to dial at startup; never contains self.
-    pub bootstrappers: Vec<(ed25519::PublicKey, SocketAddr)>,
+    /// (identity, dial ingress) pairs to dial at startup; never contains
+    /// self. hostname ingresses stay hostnames — dialers re-resolve them.
+    pub bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
     pub listen: SocketAddr,
-    pub advertised: SocketAddr,
+    /// this node's self-announced dial address. a HOSTNAME advertised stays a
+    /// hostname all the way into the signed peer record, so a node behind a
+    /// tunnel with a stable name never needs an address update — and it BOOTS
+    /// even while its own name does not resolve.
+    pub advertised: Ingress,
     pub storage_dir: PathBuf,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
@@ -671,6 +941,10 @@ pub struct Resolved {
     pub dev_demo: bool,
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
+    /// the invite token a `join` stored beside the descriptor, if any — what a
+    /// parked joiner announces over the lobby channel. always `None` for the
+    /// dev shape and for manual (token-less) joins.
+    pub invite_token: Option<InviteToken>,
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -711,21 +985,32 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         return Err(format!("network {} has no validators", descriptor.chain_id));
     }
     let bootstrap = descriptor.bootstrap_entries()?;
-    // mesh = validators ∪ bootstrap identities. A fresh network-shape joiner
-    // may be outside this set at genesis; it parks until governance admits it.
+    // mesh = validators ∪ bootstrap identities ∪ the LOBBY identity. A fresh
+    // network-shape joiner may be outside this set at genesis; it parks until
+    // governance admits it — but it can always be HEARD: the lobby key is
+    // derivable from the descriptor alone, so every node folds the same key
+    // into the same tracked set (discovery kills peers whose set at a shared
+    // index differs) and an invite-holding joiner can complete the handshake
+    // to announce itself on the lobby channel.
     let mut mesh = validators.clone();
     for (k, _) in &bootstrap {
         if !mesh.contains(k) {
             mesh.push(k.clone());
         }
     }
+    let lobby = lobby_identity(descriptor.genesis_namespace().as_bytes()).public_key();
+    if !mesh.contains(&lobby) {
+        mesh.push(lobby);
+    }
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
-    let advertised: SocketAddr = match raw.advertised.as_deref() {
-        // resolve (DNS for a hostname) — the mesh wants a concrete socket addr
-        // for our self-announced dial address.
-        Some(a) => resolve_one(a).map_err(|e| format!("advertised: {e}"))?,
-        None => listen,
+    let advertised: Ingress = match raw.advertised.as_deref() {
+        // an explicitly-configured advertised that can never be dialed is a
+        // config error; a hostname is kept VERBATIM (no boot-time DNS).
+        Some(a) => ingress_of(a)
+            .map_err(|e| format!("advertised: {e}"))?
+            .ok_or_else(|| format!("advertised addr {a:?} is not dialable"))?,
+        None => Ingress::Socket(listen),
     };
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
 
@@ -743,6 +1028,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         http_listen: raw.http_listen,
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
+        invite_token: load_invite_token(base)?,
     })
 }
 
@@ -793,18 +1079,18 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
             .map_err(|e| format!("bootstrapper_addr: {e}"))?;
         // self-filter matches the Resolved.bootstrappers contract: a config
         // with peer_seeds[0] == id would otherwise dial (and statesync) itself.
-        vec![(key_of(boot_seed), boot_addr)]
+        vec![(key_of(boot_seed), Ingress::Socket(boot_addr))]
             .into_iter()
             .filter(|(k, _)| *k != ed25519::PrivateKey::from_seed(id).public_key())
             .collect()
     };
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
-    let advertised: SocketAddr = match raw.advertised.as_deref() {
-        // resolve (DNS for a hostname) — the mesh wants a concrete socket addr
-        // for our self-announced dial address.
-        Some(a) => resolve_one(a).map_err(|e| format!("advertised: {e}"))?,
-        None => listen,
+    let advertised: Ingress = match raw.advertised.as_deref() {
+        Some(a) => ingress_of(a)
+            .map_err(|e| format!("advertised: {e}"))?
+            .ok_or_else(|| format!("advertised addr {a:?} is not dialable"))?,
+        None => Ingress::Socket(listen),
     };
 
     Ok(Resolved {
@@ -824,6 +1110,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         http_listen: raw.http_listen,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
+        invite_token: None,
     })
 }
 
@@ -865,20 +1152,181 @@ mod tests {
             bootstrap: vec![],
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
-        let decoded = decode_invite(&encode_invite(&d).expect("encode")).expect("roundtrip");
+        let (decoded, token) =
+            decode_invite(&encode_invite(&d, None).expect("encode")).expect("roundtrip");
         assert_eq!(decoded, d);
+        assert_eq!(token, None, "a token-less blob is the v2 manual flow");
 
         // a HOSTNAME dial hint survives the compact encode/decode verbatim (it is
         // stored as a string and resolved only at dial time).
         let other = ed25519::PrivateKey::from_seed(8).public_key();
         d.add_bootstrap(&other, "node.ducktape.industries:443");
-        let decoded = decode_invite(&encode_invite(&d).expect("encode")).expect("roundtrip");
+        let (decoded, _) =
+            decode_invite(&encode_invite(&d, None).expect("encode")).expect("roundtrip");
         assert_eq!(decoded, d);
         assert!(
             decoded
                 .bootstrap
                 .iter()
                 .any(|b| b.ends_with("@node.ducktape.industries:443"))
+        );
+    }
+
+    #[test]
+    fn invite_blob_roundtrips_the_token_and_verifies() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+        };
+        let binding = d.genesis_namespace();
+        let token = mint_invite_token(&issuer, binding.as_bytes());
+        let (decoded, carried) =
+            decode_invite(&encode_invite(&d, Some(&token)).expect("encode")).expect("roundtrip");
+        assert_eq!(decoded, d);
+        let carried = carried.expect("v3 carries the token");
+        assert_eq!(carried, token);
+        assert!(verify_invite_token(&carried, binding.as_bytes()));
+        assert!(
+            !verify_invite_token(&carried, b"other-net"),
+            "a token binds to its network"
+        );
+
+        // the joiner's proof-of-possession verifies for the signing key only.
+        let joiner = ed25519::PrivateKey::from_seed(9);
+        let proof = sign_join_proof(&joiner, binding.as_bytes(), &carried);
+        assert!(verify_join_proof(
+            &joiner.public_key(),
+            binding.as_bytes(),
+            &carried,
+            &proof
+        ));
+        let thief = ed25519::PrivateKey::from_seed(10).public_key();
+        assert!(
+            !verify_join_proof(&thief, binding.as_bytes(), &carried, &proof),
+            "a substituted key fails the proof"
+        );
+    }
+
+    #[test]
+    fn invite_token_file_roundtrips() {
+        let dir = tmp("invitetoken");
+        assert_eq!(load_invite_token(&dir).expect("absent is fine"), None);
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let token = mint_invite_token(&issuer, b"net#00000000@feedface");
+        save_invite_token(&dir, &token).expect("save");
+        assert_eq!(load_invite_token(&dir).expect("load"), Some(token));
+    }
+
+    #[test]
+    fn a_hostname_advertised_boots_without_dns_and_stays_a_hostname() {
+        // the tunnel case: a stable name whose IP moves (or does not resolve
+        // right now) must neither block boot nor be frozen to one lookup —
+        // it stays a DNS ingress that dialing peers re-resolve every attempt.
+        let dir = tmp("dnsadvertised");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        let d = NetworkDescriptor {
+            chain_id: "net#44444444".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.public_key().as_ref())],
+            bootstrap: vec![format!(
+                "{}@definitely-not-resolvable.ducktape.invalid:443",
+                hex_bytes(me.public_key().as_ref())
+            )],
+        };
+        d.save(&dir.join("network.toml")).expect("save");
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"127.0.0.1:52250\"\n\
+             advertised = \"my-tunnel.example.com:443\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("hostnames never block boot");
+        assert!(
+            matches!(&r.advertised, Ingress::Dns { port: 443, .. }),
+            "advertised stays a hostname: {:?}",
+            r.advertised
+        );
+        // the unresolvable bootstrap hint is KEPT as a hostname too (self is
+        // filtered from bootstrappers, so check via the descriptor directly).
+        let entries = d.bootstrap_entries().expect("hints parse");
+        assert!(
+            matches!(&entries[0].1, Ingress::Dns { port: 443, .. }),
+            "hint stays a hostname: {:?}",
+            entries[0].1
+        );
+    }
+
+    #[test]
+    fn network_flag_resolves_workspaces_by_chain_id_prefix() {
+        let root = tmp("registry");
+        for (ws, chain) in [("a", "ducktape#a1b2c3d4"), ("b", "kitchen#99887766")] {
+            let dir = root.join(ws);
+            std::fs::create_dir_all(&dir).expect("mk workspace");
+            let d = NetworkDescriptor {
+                chain_id: chain.into(),
+                scheme: SCHEME_ED25519.into(),
+                validators: vec![hex_bytes(
+                    ed25519::PrivateKey::from_seed(40).public_key().as_ref(),
+                )],
+                bootstrap: vec![],
+            };
+            d.save(&dir.join("network.toml")).expect("save");
+        }
+        // stray non-workspace entries are skipped, not errors.
+        std::fs::create_dir_all(root.join("not-a-workspace")).expect("mk stray");
+
+        // exact and unique-prefix both land on the workspace's node.toml.
+        assert_eq!(
+            find_workspace_config_in(&root, "ducktape#a1b2c3d4").expect("exact"),
+            root.join("a").join("node.toml")
+        );
+        assert_eq!(
+            find_workspace_config_in(&root, "kitchen").expect("prefix"),
+            root.join("b").join("node.toml")
+        );
+        // absence and ambiguity are loud.
+        assert!(find_workspace_config_in(&root, "nope").is_err());
+        let err = find_workspace_config_in(&root, "").expect_err("ambiguous");
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn lobby_identity_is_deterministic_and_lands_in_the_mesh() {
+        let a = lobby_identity(b"net#11111111@aa");
+        let b = lobby_identity(b"net#11111111@aa");
+        assert_eq!(a.public_key(), b.public_key(), "derivable by every holder");
+        let c = lobby_identity(b"net#22222222@bb");
+        assert_ne!(
+            a.public_key(),
+            c.public_key(),
+            "distinct networks get distinct lobby doors"
+        );
+
+        // resolve() folds the lobby key into the tracked mesh (but never into
+        // the consensus validator set).
+        let dir = tmp("lobbymesh");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        let d = NetworkDescriptor {
+            chain_id: "net#33333333".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.public_key().as_ref())],
+            bootstrap: vec![],
+        };
+        d.save(&dir.join("network.toml")).expect("save");
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"127.0.0.1:52240\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve");
+        let lobby = lobby_identity(d.genesis_namespace().as_bytes()).public_key();
+        assert!(r.mesh.contains(&lobby), "lobby key is tracked");
+        assert!(
+            !r.validators.contains(&lobby),
+            "lobby key never becomes a participant"
         );
     }
 
@@ -929,7 +1377,8 @@ mod tests {
         assert_eq!(r.namespace, d.genesis_namespace().into_bytes());
         assert!(String::from_utf8_lossy(&r.namespace).starts_with("net#11223344@"));
         assert_eq!(r.validators.len(), 2);
-        assert_eq!(r.mesh.len(), 2);
+        // validators + the derived lobby identity (the join-request door).
+        assert_eq!(r.mesh.len(), 3);
         // self never appears in bootstrappers; the other member does.
         assert_eq!(r.bootstrappers.len(), 1);
         assert_eq!(r.bootstrappers[0].0, other);
@@ -959,7 +1408,8 @@ mod tests {
         assert_eq!(r.signer.public_key(), me.public_key());
         assert!(!r.validators.contains(&me.public_key()));
         assert_eq!(r.validators, vec![other.clone()]);
-        assert_eq!(r.mesh, vec![other]);
+        let lobby = lobby_identity(d.genesis_namespace().as_bytes()).public_key();
+        assert_eq!(r.mesh, vec![other, lobby]);
     }
 
     #[test]
@@ -1203,13 +1653,14 @@ mod tests {
         );
 
         // no usable hint: any validator that is not us.
+        let no_hints: &[(ed25519::PublicKey, SocketAddr)] = &[];
         assert_eq!(
-            choose_sync_source(&[], &validators, &me),
+            choose_sync_source(no_hints, &validators, &me),
             Some(validator.clone())
         );
 
         // solo network: nobody can serve.
-        assert_eq!(choose_sync_source(&[], &[me.clone()], &me), None);
+        assert_eq!(choose_sync_source(no_hints, &[me.clone()], &me), None);
     }
 
     #[test]

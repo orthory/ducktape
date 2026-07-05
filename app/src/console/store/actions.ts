@@ -228,6 +228,15 @@ export interface ConsoleActions {
   /** Clear the active search. */
   clearMemorySearch(): void;
 
+  // ── Search (cross-module, over the node's derived-index views) ──
+  /** Search chat, docs, and pages with one text: the three modules'
+   *  materialized views fan out concurrently and land grouped in
+   *  `state.search`. A node without the index tier contributes empty groups
+   *  rather than failing the search. */
+  runSearch(text: string): void;
+  /** Drop the last search's results. */
+  clearSearch(): void;
+
   // ── Files (content-addressed manifests over the `files` module) ──
   /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
   uploadFile(params: { name: string; mime: string; bytes: Uint8Array<ArrayBuffer> }): void;
@@ -1287,6 +1296,32 @@ export function createActions({
     },
 
     clearMemorySearch: () => patch({ memoryMatches: null }),
+
+    // ── Search (derived-index views) ──
+    runSearch: (text) => {
+      const live = getNode();
+      const query = text.trim();
+      if (!live || !query) return;
+      patch({ searchPending: true });
+      // per-module tolerance (deliberate granular catches): an older node
+      // without the index tier 404s a view; that module contributes an empty
+      // group instead of sinking the whole search.
+      const tolerant = <T,>(read: Promise<T[]>): Promise<T[]> => read.catch(() => []);
+      Promise.resolve()
+        .then(() =>
+          Promise.all([
+            tolerant(chatClient.searchMessages(live, { text: query })),
+            tolerant(documentClient.searchBlocks(live, { text: query })),
+            tolerant(pagesClient.searchPageBlocks(live, { text: query })),
+          ]),
+        )
+        .then(([chat, docs, pages]) =>
+          patch({ search: { query, chat, docs, pages }, searchPending: false }),
+        )
+        .catch(fail);
+    },
+
+    clearSearch: () => patch({ search: null, searchPending: false }),
 
     // ── Files ──
     uploadFile: ({ name, mime, bytes }) => {

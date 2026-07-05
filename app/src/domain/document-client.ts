@@ -107,3 +107,29 @@ export const listDocs = (transport: NodeTransport): Promise<string[]> =>
   Promise.resolve()
     .then(() => transport.query(TARGET, "ListDocs"))
     .then((reply) => replyVariant<string[]>(reply, "DocList"));
+
+// ── Materialized view (the module's derived-index endpoint) ──
+
+/** One search hit from document's materialized view (camelCase index wire). */
+export interface DocSearchHit {
+  docId: string;
+  blockId: string;
+  kind: BlockKind;
+  text: string;
+  height: number;
+  time: number;
+}
+
+/** Full-text search over document blocks, newest first — served by the node's
+ *  per-module index (document's own view endpoint), not canonical state. */
+export const searchBlocks = (
+  transport: NodeTransport,
+  params: { text: string; docId?: string; limit?: number },
+): Promise<DocSearchHit[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.view(TARGET, {
+        search: { text: params.text, docId: params.docId, limit: params.limit },
+      }),
+    )
+    .then((reply) => replyVariant<DocSearchHit[]>(reply, "hits"));

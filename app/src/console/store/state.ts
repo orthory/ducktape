@@ -5,8 +5,13 @@
 
 import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client";
 import type { Rule } from "../../domain/automations-client";
-import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
-import type { Block } from "../../domain/document-client";
+import type {
+  Channel,
+  ChatSearchHit,
+  ChatThread,
+  MessageView,
+} from "../../domain/chat-client";
+import type { Block, DocSearchHit } from "../../domain/document-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type { Notification } from "../../domain/inbox-client";
@@ -17,9 +22,9 @@ import type {
   GrepHit,
   LsEntry,
 } from "../../domain/memory-client";
-import type { PageBlock, PageMeta } from "../../domain/pages-client";
+import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
-import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -27,6 +32,15 @@ import type { PhaseReport, Workspace } from "../../domain/workspace-client";
  *  participant "user" apps and the "operator" node/network surfaces. Neither
  *  side confers authority — it is purely which surfaces the rail shows. */
 export type ViewMode = "user" | "operator";
+
+/** One search round-trip across the modules that ship materialized views —
+ *  chat, docs, and pages searched with the same text, results grouped. */
+export interface SearchResults {
+  query: string;
+  chat: ChatSearchHit[];
+  docs: DocSearchHit[];
+  pages: PageSearchHit[];
+}
 
 // ── State shape ─────────────────────────────────────────
 
@@ -128,6 +142,13 @@ export interface ConsoleState {
   /** Active grep hits, or null when no search is running. */
   memoryMatches: GrepHit[] | null;
 
+  // ── Search (cross-module reads over the node's derived index) ──
+  /** The last search's results, or null before any search ran. Query-driven
+   *  like `memoryMatches` — never part of the per-block snapshot. */
+  search: SearchResults | null;
+  /** A search round-trip is in flight (three module views fan out). */
+  searchPending: boolean;
+
   // ── Files (content-addressed manifests) ──
   /** Every file manifest (List, prefix ""), re-queried per block. */
   files: Manifest[];
@@ -136,6 +157,11 @@ export interface ConsoleState {
    *  first). Node-local observability — never re-queried from committed state;
    *  backfilled from the node's ring on connect, then followed live over ws. */
   telemetry: TelemetryFrame[];
+
+  /** Recent NON-EMPTY blocks, oldest-first (the explorer renders newest
+   *  first). Node-local observability like telemetry — re-pulled from the
+   *  node's ring on every refresh; empty on a node without the surface. */
+  blocks: BlockRecord[];
 
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
@@ -265,8 +291,11 @@ export const createInitialState = (): ConsoleState => {
     memoryEntries: [],
     memoryOpen: null,
     memoryMatches: null,
+    search: null,
+    searchPending: false,
     files: [],
     telemetry: [],
+    blocks: [],
     ops: {},
     error: null,
     workspaces: [],
@@ -304,6 +333,7 @@ export interface ConsoleSnapshot {
   rules: Rule[];
   memoryEntries: LsEntry[];
   files: Manifest[];
+  blocks: BlockRecord[];
 }
 
 /** Project a committed node snapshot onto store data fields. Global UI,
@@ -334,6 +364,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   rules: snapshot.rules,
   memoryEntries: snapshot.memoryEntries,
   files: snapshot.files,
+  blocks: snapshot.blocks,
 });
 
 // ── Pure helpers ────────────────────────────────────────

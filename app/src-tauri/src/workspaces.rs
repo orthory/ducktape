@@ -478,6 +478,28 @@ pub fn workspace_invite_blob(app: tauri::AppHandle, id: String) -> Result<String
     run_verb(&node_bin, &["invite", "--config", &cfg.to_string_lossy()]).map(|out| last_line(&out))
 }
 
+/// the join requests parked joiners delivered to this member's running node
+/// over the lobby channel — the queue the Members view renders with an
+/// "Approve" button (approve = [`workspace_admit`], the normal governance
+/// ballot). raw JSON array from the `join-requests` verb, parsed here so the
+/// frontend gets typed rows.
+#[tauri::command]
+pub fn workspace_join_requests(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
+    let out = run_verb(
+        &node_bin,
+        &["join-requests", "--config", &cfg.to_string_lossy()],
+    )?;
+    serde_json::from_str(last_line(&out).trim())
+        .map_err(|e| format!("join-requests output is not json: {e}"))
+}
+
 /// admit a joiner by pubkey: drive the governance AddValidator through THIS
 /// running member node's local rpc. the node must be started (a member serves
 /// rpc); the joiner's parked node promotes itself once the epoch cuts over.

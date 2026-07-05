@@ -26,7 +26,10 @@ fn network_shape_joiner_parks_until_invite_accept() {
     // is already crossed by then), which is all `invite`/`invite-accept` need.
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
-    let invite = cluster.invite();
+    // the MANUAL flavor (token-less v2 blob): the pubkey travels out-of-band
+    // and no lobby announce happens — the tokened flavor has its own e2e
+    // (join_request_e2e).
+    let invite = cluster.invite_manual();
     let friend_key = cluster.join_friend(&invite);
     assert_eq!(
         friend_key.len(),

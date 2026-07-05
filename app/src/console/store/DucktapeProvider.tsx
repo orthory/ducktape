@@ -35,7 +35,7 @@ import {
 import * as profilesClient from "../../domain/profiles-client";
 import * as tasksClient from "../../domain/tasks-client";
 import * as valsetClient from "../../domain/valset-client";
-import type { NodeTransport } from "../../domain/transport";
+import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
@@ -53,6 +53,9 @@ export type { ConsoleContextValue } from "./context";
 /** How many recent telemetry frames the console keeps in memory (the node's
  *  ring holds more; this bounds the live view's buffer). */
 const TELEMETRY_KEEP = 200;
+
+/** How many recent non-empty blocks the explorer pulls per refresh. */
+const BLOCKS_KEEP = 200;
 
 /** How often to re-poll a resolved-but-unanswering node until it comes back. */
 const RECONNECT_POLL_MS = 3_000;
@@ -140,6 +143,9 @@ export function DucktapeProvider({
           automationsClient.listRules(live).catch(() => []),
           memoryClient.ls(live, { path: memoryPath }).catch(() => []),
           filesClient.list(live, {}).catch(() => []),
+          // the explorer's ring pull — best-effort like telemetry, so a node
+          // without /v1/blocks reads as "no blocks yet".
+          live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
         ]),
       )
       .then(([
@@ -164,6 +170,7 @@ export function DucktapeProvider({
         rules,
         memoryEntries,
         files,
+        blocks,
       ]) => {
         // Profile.key is the origin bytes — the same bytes AuthorRef::User
         // carries — so hex(key) is exactly authorName's AuthorNames key.
@@ -206,6 +213,7 @@ export function DucktapeProvider({
                 rules,
                 memoryEntries,
                 files,
+                blocks,
               }),
             }),
           );

@@ -274,3 +274,36 @@ export const thread = (
       }),
     )
     .then((reply) => replyVariant<ChatThread | null>(reply, "Thread"));
+
+// ── Materialized view (the module's derived-index endpoint) ──
+
+/** One search hit from chat's materialized view. camelCase wire — the
+ *  `*-index` tier's convention, unlike the module's snake_case canonical
+ *  shapes above. `author` is pre-rendered by the index ("user:jess",
+ *  "agent:agent/helper", "module:automations", "system"). */
+export interface ChatSearchHit {
+  channelId: string;
+  seq: number;
+  messageId: string;
+  author: string;
+  height: number;
+  time: number;
+  text: string;
+  deleted: boolean;
+  edited: boolean;
+  thread?: number;
+}
+
+/** Full-text search over message heads, newest first — served by the node's
+ *  per-module index (chat's own view endpoint), not canonical state. */
+export const searchMessages = (
+  transport: NodeTransport,
+  params: { text: string; channelId?: string; limit?: number },
+): Promise<ChatSearchHit[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.view(TARGET, {
+        search: { text: params.text, channelId: params.channelId, limit: params.limit },
+      }),
+    )
+    .then((reply) => replyVariant<ChatSearchHit[]>(reply, "hits"));
