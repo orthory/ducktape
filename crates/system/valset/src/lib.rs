@@ -1,4 +1,4 @@
-//! the ed25519 permissionless validator set as replicated state.
+//! the ed25519 membership registry as replicated state: validators + observers.
 //!
 //! a validator is a 32-byte ed25519 public key. anyone holding a WELL-FORMED
 //! ed25519 key may [`ValsetMsg::Join`] the set — no authorization, no gating,
@@ -6,6 +6,23 @@
 //! "permissionless joining suffices; don't concern with proper shares." real
 //! governance (who may join) and stake-weighted shares (voting power) are
 //! DEFERRED — this module only replicates *membership*.
+//!
+//! ## observers (staged admission, protocol >= 3)
+//!
+//! an OBSERVER holds mesh + statesync standing but no quorum seat — the tier
+//! a joiner syncs in before promotion, so the consensus set only ever gains a
+//! caught-up validator. [`ValsetMsg::Grant`] / [`ValsetMsg::Revoke`] manage
+//! the set; a [`ValsetMsg::Join`] on a current observer PROMOTES it (adds the
+//! validator, removes the observer, one block). both new ops REJECT below
+//! protocol version 3 — byte-for-byte the outcome an older binary's
+//! unknown-variant decode produces, so a mixed-binary net cannot fork on them.
+//!
+//! ## root/snapshot compatibility
+//!
+//! the root preimage and snapshot append the observer section ONLY when the
+//! observer set is non-empty: every pre-observer state (and every state that
+//! never grants) keeps its exact historical root and snapshot bytes — no
+//! migration, no dual-path root.
 //!
 //! state model mirrors the directory module's host-lent staging seam:
 //! `execute` STAGES into a `pending` overlay (committed state untouched);
@@ -35,6 +52,11 @@ use valset_interface::{
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
 
+/// the protocol version that introduces the observer tier. `Grant`/`Revoke`
+/// reject below it — the same deterministic reject an older binary's
+/// unknown-variant decode produces, so mixed-binary nets cannot fork.
+const OBSERVER_VERSION: u32 = 3;
+
 pub struct Valset {
     id: ModuleId,
     /// committed membership — what `root()` and the app-hash commit to.
@@ -43,6 +65,13 @@ pub struct Valset {
     /// `false` == staged remove. read ahead of `validators` (read-your-writes),
     /// merged into committed state (and `root()`) only on `commit_block`.
     pending: BTreeMap<Vec<u8>, bool>,
+    /// committed OBSERVER standing (mesh + statesync, no quorum seat). folded
+    /// into `root()`/`snapshot()` only when non-empty — see the module doc's
+    /// compatibility note.
+    observers: BTreeSet<Vec<u8>>,
+    /// observer changes staged during the current block, same discipline as
+    /// `pending`.
+    pending_observers: BTreeMap<Vec<u8>, bool>,
 }
 
 impl Valset {
@@ -51,6 +80,8 @@ impl Valset {
             id: id.into(),
             validators: BTreeSet::new(),
             pending: BTreeMap::new(),
+            observers: BTreeSet::new(),
+            pending_observers: BTreeMap::new(),
         }
     }
 
@@ -89,8 +120,18 @@ impl Valset {
     /// the committed validator set with this block's staged changes applied —
     /// read-your-writes, sorted (order-independent).
     fn effective(&self) -> Vec<Vec<u8>> {
-        let mut set: BTreeSet<Vec<u8>> = self.validators.clone();
-        for (k, present) in &self.pending {
+        Self::overlay(&self.validators, &self.pending)
+    }
+
+    /// the committed observer set with this block's staged changes applied.
+    fn effective_observers(&self) -> Vec<Vec<u8>> {
+        Self::overlay(&self.observers, &self.pending_observers)
+    }
+
+    /// committed-plus-staged projection shared by both sets.
+    fn overlay(committed: &BTreeSet<Vec<u8>>, staged: &BTreeMap<Vec<u8>, bool>) -> Vec<Vec<u8>> {
+        let mut set: BTreeSet<Vec<u8>> = committed.clone();
+        for (k, present) in staged {
             if *present {
                 set.insert(k.clone());
             } else {
@@ -105,48 +146,66 @@ impl Valset {
     // after re-deriving the root consensus expects — the root, not the peer, is
     // the trust anchor.
 
-    /// canonical bytes of the COMMITTED set — exactly the byte stream `root()`
-    /// hashes: count u64-le, then per sorted key its len u64-le + key bytes. so
-    /// for a non-empty set `sha256(snapshot()) == root()`; an empty set snapshots
-    /// to a lone zero count (whose root is still `ZERO`, unhashed). pending is
-    /// deliberately excluded — a snapshot ships what consensus committed to, and
-    /// staged-but-uncommitted changes are not that.
+    /// canonical bytes of the COMMITTED state — exactly the byte stream `root()`
+    /// hashes: the validator section (count u64-le, then per sorted key its len
+    /// u64-le + key bytes), then — ONLY when the observer set is non-empty — the
+    /// observer section in the same shape. the conditional append is the
+    /// compatibility invariant: with no observers this is byte-for-byte the
+    /// historical validators-only stream, so every pre-observer state keeps its
+    /// exact root. so for non-empty state `sha256(snapshot()) == root()`; fully
+    /// empty state snapshots to a lone zero count (root still `ZERO`, unhashed).
+    /// pending is deliberately excluded — a snapshot ships what consensus
+    /// committed to, and staged-but-uncommitted changes are not that.
     pub fn snapshot(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(8 + self.validators.iter().map(|k| 8 + k.len()).sum::<usize>());
-        out.extend_from_slice(&(self.validators.len() as u64).to_le_bytes());
-        for k in &self.validators {
-            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
-            out.extend_from_slice(k);
+        let sized = |set: &BTreeSet<Vec<u8>>| 8 + set.iter().map(|k| 8 + k.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(
+            sized(&self.validators) + if self.observers.is_empty() { 0 } else { sized(&self.observers) },
+        );
+        let mut section = |out: &mut Vec<u8>, set: &BTreeSet<Vec<u8>>| {
+            out.extend_from_slice(&(set.len() as u64).to_le_bytes());
+            for k in set {
+                out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                out.extend_from_slice(k);
+            }
+        };
+        section(&mut out, &self.validators);
+        if !self.observers.is_empty() {
+            section(&mut out, &self.observers);
         }
         out
     }
 
-    /// replace committed state with a decoded snapshot, iff the decoded set's
+    /// replace committed state with a decoded snapshot, iff the decoded state's
     /// recomputed root equals `expected`. decode and verification land in a
     /// temporary: self is mutated only after both pass, so on any `Err` committed
     /// state, pending, and `root()` are byte-identical to before the call.
     /// success clears pending — staged changes belong to the state being
     /// replaced, not the state being adopted.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let decoded = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&decoded);
+        let (validators, observers) = Self::decode_snapshot(bytes)?;
+        let root = Self::root_of(&validators, &observers);
         if root != expected {
             return Err(Error::Module(format!(
                 "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
             )));
         }
-        self.validators = decoded;
+        self.validators = validators;
+        self.observers = observers;
         self.pending.clear();
+        self.pending_observers.clear();
         Ok(())
     }
 
-    /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves them).
+    /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves them):
+    /// the validator section, then an OPTIONAL observer section (present iff
+    /// bytes remain — the encoder omits it when empty, and an explicit empty
+    /// section is rejected so a given state has exactly one valid encoding).
     /// the count and every key length are checked against the remaining buffer
     /// BEFORE any allocation, truncation and trailing bytes both reject, and
-    /// keys must arrive strictly increasing — a given set has exactly one valid
-    /// encoding, so a peer cannot mint alternative byte streams for one state.
-    fn decode_snapshot(bytes: &[u8]) -> Result<BTreeSet<Vec<u8>>, Error> {
+    /// keys must arrive strictly increasing per section — a peer cannot mint
+    /// alternative byte streams for one state.
+    #[allow(clippy::type_complexity)]
+    fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>), Error> {
         fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
             let Some((head, rest)) = (*buf).split_first_chunk::<8>() else {
                 return Err(Error::Module("snapshot truncated".into()));
@@ -155,58 +214,83 @@ impl Valset {
             Ok(u64::from_le_bytes(*head))
         }
 
-        let mut buf = bytes;
-        let count = take_u64(&mut buf)?;
-        // each entry costs at least its 8-byte length prefix, so a count the
-        // remaining bytes cannot possibly hold is rejected up front — a forged
-        // count never drives allocation.
-        if count > (buf.len() / 8) as u64 {
-            return Err(Error::Module(format!(
-                "snapshot count {count} exceeds the {} remaining bytes",
-                buf.len()
-            )));
-        }
-        let mut set = BTreeSet::new();
-        let mut prev: Option<&[u8]> = None;
-        for _ in 0..count {
-            let len = take_u64(&mut buf)?;
-            if len > buf.len() as u64 {
+        fn take_section(buf: &mut &[u8]) -> Result<BTreeSet<Vec<u8>>, Error> {
+            let count = take_u64(buf)?;
+            // each entry costs at least its 8-byte length prefix, so a count the
+            // remaining bytes cannot possibly hold is rejected up front — a forged
+            // count never drives allocation.
+            if count > (buf.len() / 8) as u64 {
                 return Err(Error::Module(format!(
-                    "snapshot key length {len} exceeds the {} remaining bytes",
+                    "snapshot count {count} exceeds the {} remaining bytes",
                     buf.len()
                 )));
             }
-            let (key, rest) = buf.split_at(len as usize);
-            buf = rest;
-            if prev.is_some_and(|p| p >= key) {
+            let mut set = BTreeSet::new();
+            let mut prev: Option<Vec<u8>> = None;
+            for _ in 0..count {
+                let len = take_u64(buf)?;
+                if len > buf.len() as u64 {
+                    return Err(Error::Module(format!(
+                        "snapshot key length {len} exceeds the {} remaining bytes",
+                        buf.len()
+                    )));
+                }
+                let (key, rest) = buf.split_at(len as usize);
+                *buf = rest;
+                if prev.as_deref().is_some_and(|p| p >= key) {
+                    return Err(Error::Module(
+                        "snapshot keys must be strictly increasing".into(),
+                    ));
+                }
+                prev = Some(key.to_vec());
+                set.insert(key.to_vec());
+            }
+            Ok(set)
+        }
+
+        let mut buf = bytes;
+        let validators = take_section(&mut buf)?;
+        let observers = if buf.is_empty() {
+            BTreeSet::new()
+        } else {
+            let observers = take_section(&mut buf)?;
+            if observers.is_empty() {
+                // the encoder omits an empty observer section — an explicit
+                // zero count would be a second encoding of the same state.
                 return Err(Error::Module(
-                    "snapshot keys must be strictly increasing".into(),
+                    "snapshot carries an explicit empty observer section".into(),
                 ));
             }
-            prev = Some(key);
-            set.insert(key.to_vec());
-        }
+            observers
+        };
         if !buf.is_empty() {
             return Err(Error::Module(format!(
                 "snapshot carries {} trailing bytes",
                 buf.len()
             )));
         }
-        Ok(set)
+        Ok((validators, observers))
     }
 
-    /// the state-based commitment for `set`: `ZERO` when empty, else sha256 over
-    /// exactly the bytes `snapshot` emits. shared by `root()` (committed state)
-    /// and `install` (a decoded candidate), so the two can never drift.
-    fn root_of(set: &BTreeSet<Vec<u8>>) -> StateRoot {
-        if set.is_empty() {
+    /// the state-based commitment: `ZERO` when both sets are empty, else sha256
+    /// over exactly the bytes `snapshot` emits (observer section only when
+    /// non-empty — the compatibility invariant). shared by `root()` (committed
+    /// state) and `install` (a decoded candidate), so the two can never drift.
+    fn root_of(validators: &BTreeSet<Vec<u8>>, observers: &BTreeSet<Vec<u8>>) -> StateRoot {
+        if validators.is_empty() && observers.is_empty() {
             return StateRoot::ZERO;
         }
         let mut h = Sha256::new();
-        h.update((set.len() as u64).to_le_bytes());
-        for k in set {
-            h.update((k.len() as u64).to_le_bytes());
-            h.update(k);
+        let mut section = |set: &BTreeSet<Vec<u8>>| {
+            h.update((set.len() as u64).to_le_bytes());
+            for k in set {
+                h.update((k.len() as u64).to_le_bytes());
+                h.update(k);
+            }
+        };
+        section(validators);
+        if !observers.is_empty() {
+            section(observers);
         }
         StateRoot(h.finalize().into())
     }
@@ -218,12 +302,13 @@ impl Module for Valset {
         self.id.clone()
     }
 
-    /// state-based commitment over the COMMITTED set: a length-prefixed sha256
-    /// over the sorted validators. order-independent (BTreeSet) and idempotent.
-    /// an empty set reports `ZERO` — an empty/uninitialized module (matching the
-    /// sdk `StateRoot::ZERO` doc and forge's unborn-repo root).
+    /// state-based commitment over the COMMITTED state: a length-prefixed
+    /// sha256 over the sorted validators (plus the observer section only when
+    /// non-empty). order-independent (BTreeSet) and idempotent. fully empty
+    /// state reports `ZERO` — an empty/uninitialized module (matching the sdk
+    /// `StateRoot::ZERO` doc and forge's unborn-repo root).
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.validators)
+        Self::root_of(&self.validators, &self.observers)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -248,6 +333,12 @@ impl Module for Valset {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             ValsetMsg::Join { key } => {
                 Self::validate_key(&key)?;
+                // PROMOTION: a joining observer leaves the observer tier in
+                // the same block — one boundary carries the whole transition,
+                // and the transport union never double-counts the key.
+                if self.effective_observers().contains(&key) {
+                    self.pending_observers.insert(key.clone(), false);
+                }
                 self.stage_add(key);
             }
             ValsetMsg::Leave { key } => {
@@ -268,14 +359,45 @@ impl Module for Valset {
                 }
                 self.stage_remove(key);
             }
+            ValsetMsg::Grant { key } => {
+                // the observer tier exists from protocol 3: rejecting below it
+                // is byte-for-byte what an older binary's unknown-variant
+                // decode does, so a mixed-binary net cannot fork on a Grant.
+                if ctx.env().protocol_version < OBSERVER_VERSION {
+                    return Err(Error::Module(format!(
+                        "observer grants require protocol version {OBSERVER_VERSION}"
+                    )));
+                }
+                Self::validate_key(&key)?;
+                // a validator already holds every observer capability; a
+                // second standing would only smear the promote/demote edges.
+                if self.effective().contains(&key) {
+                    return Err(Error::Module(
+                        "key is a current validator — observer standing is the pre-promotion tier"
+                            .into(),
+                    ));
+                }
+                self.pending_observers.insert(key, true);
+            }
+            ValsetMsg::Revoke { key } => {
+                if ctx.env().protocol_version < OBSERVER_VERSION {
+                    return Err(Error::Module(format!(
+                        "observer revokes require protocol version {OBSERVER_VERSION}"
+                    )));
+                }
+                self.pending_observers.insert(key, false);
+            }
         }
         Ok(())
     }
 
-    /// read projection — the committed set plus this block's staged changes.
+    /// read projection — the committed sets plus this block's staged changes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             ValsetQuery::Validators => Ok(encode_reply(&ValsetReply::Validators(self.effective()))),
+            ValsetQuery::Observers => Ok(encode_reply(&ValsetReply::Observers(
+                self.effective_observers(),
+            ))),
         }
     }
 
@@ -289,6 +411,13 @@ impl Module for Valset {
                 self.validators.remove(&k);
             }
         }
+        for (k, present) in std::mem::take(&mut self.pending_observers) {
+            if present {
+                self.observers.insert(k);
+            } else {
+                self.observers.remove(&k);
+            }
+        }
         Ok(())
     }
 
@@ -296,6 +425,7 @@ impl Module for Valset {
     /// unchanged, so a failed block leaves no trace.
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending.clear();
+        self.pending_observers.clear();
         Ok(())
     }
 }
@@ -307,14 +437,20 @@ mod tests {
     use commonware_cryptography::ed25519::PrivateKey;
     use valset_interface::{encode_msg, encode_query};
 
-    // a minimal Ctx — valset's execute never touches ctx, but the trait needs one.
+    // a minimal Ctx — valset's execute reads only env (origin + protocol_version).
     struct TestCtx {
         env: sdk::Env,
     }
     impl TestCtx {
         fn new() -> Self {
+            Self::at_version(0)
+        }
+        /// a ctx whose block runs at `protocol_version` — the observer ops
+        /// gate on it, so their tests need a v3 block.
+        fn at_version(protocol_version: u32) -> Self {
             Self {
-                env: sdk::Env { protocol_version: 0,
+                env: sdk::Env {
+                    protocol_version,
                     height: 0,
                     consensus_time: 0,
                     origin: sdk::Origin::System,
@@ -364,6 +500,27 @@ mod tests {
             futures::executor::block_on(v.query(&encode_query(&ValsetQuery::Validators))).unwrap();
         match valset_interface::decode_reply(&reply).unwrap() {
             ValsetReply::Validators(list) => list,
+            other => panic!("expected Validators, got {other:?}"),
+        }
+    }
+    fn observers(v: &Valset) -> Vec<Vec<u8>> {
+        let reply =
+            futures::executor::block_on(v.query(&encode_query(&ValsetQuery::Observers))).unwrap();
+        match valset_interface::decode_reply(&reply).unwrap() {
+            ValsetReply::Observers(list) => list,
+            other => panic!("expected Observers, got {other:?}"),
+        }
+    }
+    fn grant(key: &[u8]) -> Msg {
+        Msg {
+            target: "valset".into(),
+            payload: encode_msg(&ValsetMsg::Grant { key: key.to_vec() }),
+        }
+    }
+    fn revoke(key: &[u8]) -> Msg {
+        Msg {
+            target: "valset".into(),
+            payload: encode_msg(&ValsetMsg::Revoke { key: key.to_vec() }),
         }
     }
 
@@ -672,5 +829,132 @@ mod tests {
         dst.install(&bytes, StateRoot::ZERO).unwrap();
         assert_eq!(dst.root(), StateRoot::ZERO);
         assert!(validators(&dst).is_empty());
+    }
+
+    // ---- observers (staged admission) --------------------------------------
+
+    #[test]
+    fn observer_ops_reject_below_protocol_v3() {
+        // the version gate IS the mixed-binary fork guard: below v3 a new
+        // binary must land exactly where an old binary's unknown-variant
+        // decode lands — deterministic reject, no state, root untouched.
+        let mut v = Valset::new("valset");
+        let mut ctx = TestCtx::new(); // protocol_version 0
+        futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        let before = v.root();
+
+        for msg in [grant(&valid_key(2)), revoke(&valid_key(2))] {
+            let err = futures::executor::block_on(v.execute(&mut ctx, &msg)).unwrap_err();
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("protocol version 3")),
+                "got {err:?}"
+            );
+        }
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert_eq!(v.root(), before, "a gated op leaves the root byte-identical");
+        assert!(observers(&v).is_empty());
+    }
+
+    #[test]
+    fn grant_folds_the_root_only_while_observers_exist() {
+        // the compatibility invariant end to end: a validators-only state
+        // keeps its exact historical root; granting moves it; revoking the
+        // last observer returns it BYTE-IDENTICAL to the validators-only root.
+        let mut v = Valset::new("valset");
+        let mut ctx = TestCtx::at_version(3);
+        futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        let validators_only = v.root();
+        let validators_only_snapshot = v.snapshot();
+
+        let obs = valid_key(2);
+        futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
+        assert_eq!(v.root(), validators_only, "root reflects committed only");
+        assert_eq!(observers(&v), vec![obs.clone()], "read-your-writes");
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert_ne!(v.root(), validators_only, "a committed grant moves the root");
+
+        futures::executor::block_on(v.execute(&mut ctx, &revoke(&obs))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert_eq!(
+            v.root(),
+            validators_only,
+            "revoking the last observer restores the exact validators-only root"
+        );
+        assert_eq!(
+            v.snapshot(),
+            validators_only_snapshot,
+            "and the exact validators-only snapshot bytes"
+        );
+    }
+
+    #[test]
+    fn join_promotes_an_observer_out_of_the_tier() {
+        let mut v = Valset::new("valset");
+        let mut ctx = TestCtx::at_version(3);
+        futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
+        let obs = valid_key(2);
+        futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert_eq!(observers(&v), vec![obs.clone()]);
+
+        // the promotion: ONE Join both seats the validator and clears the
+        // observer standing, in the same block.
+        futures::executor::block_on(v.execute(&mut ctx, &join(&obs))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert!(validators(&v).contains(&obs), "promoted into the quorum");
+        assert!(observers(&v).is_empty(), "and out of the observer tier");
+    }
+
+    #[test]
+    fn granting_a_current_validator_is_refused() {
+        let mut v = Valset::new("valset");
+        let mut ctx = TestCtx::at_version(3);
+        let k = valid_key(1);
+        futures::executor::block_on(v.execute(&mut ctx, &join(&k))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+
+        let err = futures::executor::block_on(v.execute(&mut ctx, &grant(&k))).unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("current validator")),
+            "got {err:?}"
+        );
+        assert!(observers(&v).is_empty());
+    }
+
+    #[test]
+    fn snapshot_with_observers_round_trips_and_rejects_forgeries() {
+        let mut src = Valset::new("valset");
+        let mut ctx = TestCtx::at_version(3);
+        futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
+        futures::executor::block_on(src.execute(&mut ctx, &grant(&valid_key(2)))).unwrap();
+        futures::executor::block_on(src.commit_block()).unwrap();
+        let src_root = src.root();
+
+        // the snapshot stays the exact root preimage with observers present.
+        let bytes = src.snapshot();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(StateRoot(digest), src_root, "sha256(snapshot()) == root()");
+
+        let mut dst = Valset::new("valset");
+        dst.install(&bytes, src_root).unwrap();
+        assert_eq!(dst.root(), src_root);
+        assert_eq!(validators(&dst), validators(&src));
+        assert_eq!(observers(&dst), observers(&src));
+
+        // an EXPLICIT empty observer section is a second encoding of a
+        // validators-only state — reject it (single-encoding invariant).
+        let mut two_encodings = Valset::new("valset");
+        let mut c2 = TestCtx::new();
+        futures::executor::block_on(two_encodings.execute(&mut c2, &join(&valid_key(3)))).unwrap();
+        futures::executor::block_on(two_encodings.commit_block()).unwrap();
+        let mut padded = two_encodings.snapshot();
+        padded.extend_from_slice(&0u64.to_le_bytes());
+        let err = dst.install(&padded, two_encodings.root()).unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("empty observer section")),
+            "got {err:?}"
+        );
     }
 }
