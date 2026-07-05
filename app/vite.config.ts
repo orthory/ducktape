@@ -27,5 +27,10 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: "./src/test-setup.ts",
+    // Node ≥22 ships its own global localStorage/sessionStorage; vitest's jsdom
+    // env skips globals that already exist, so Node's non-functional stub (no
+    // --localstorage-file) shadows jsdom's real Storage and every access throws.
+    // Drop Node's webstorage in the workers so jsdom's Storage wins.
+    execArgv: ["--no-experimental-webstorage"],
   },
 });
