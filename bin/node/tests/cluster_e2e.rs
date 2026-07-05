@@ -10,9 +10,8 @@
 //!   4. converged != genesis                -> ops actually applied
 //!   5. chat posted via node 0 reads on 1   -> rpc -> consensus -> cross-apply
 //!   6. governance admits a 4th key         -> member gating, votes, tally
-//!   7. two-phase activation                -> registration cutover (standby,
-//!      quorum unchanged), then node 3 syncs + announces online, a member
-//!      relays the proof, and the ACTIVATION cutover widens the quorum
+//!   7. admission cutover                   -> the passed proposal seats the
+//!      key at one boundary; node 3 syncs the frozen boundary and promotes
 //!   8. post-cutover post reads on node 2   -> the respawned engines finalize
 //!   9. status app-hashes agree             -> the boundary a joiner rebuilds
 //!  10. sync-only joiner hash parity        -> network statesync, full rebuild
@@ -213,27 +212,19 @@ fn cluster_lifecycle() {
         proposal_status(&cluster, 0, "admit-node3").filter(|(s, _)| *s == ProposalStatus::Passed)
     });
 
-    // activation is NODE-ATTESTED now: an admitted key that never shows up
-    // stays standby forever (and costs the quorum nothing) — so node 3 must
-    // actually run to get activated. it boots as a parked joiner, probes its
-    // registration, proves a sync, and announces online.
+    // the passed proposal seats node 3 directly: cutover #1 (epoch 1)
+    // widens the quorum to 4. node 3 boots as a parked joiner, sees itself
+    // in the participant set at the boundary, syncs, and promotes.
     cluster.spawn(3);
     cluster.wait_marker(3, "joiner mode: parking", Duration::from_secs(60));
 
-    // 7. TWO-PHASE ACTIVATION. the passed proposal registered node 3 as
-    // STANDBY: cutover #1 (epoch 1) re-tracks the transport mesh with the
-    // standby key but the quorum stays 3. node 3's parked loop then probes
-    // its registration from the valset snapshot, verifies a full state sync,
-    // and announces ONLINE over the lobby with its own signed proof; a member
-    // relays it into the ordered lane and cutover #2 (epoch 2) widens the
-    // quorum to 4 — at which point node 3 sees itself in the participant set
-    // and promotes. finalized views only advance with ops, so push fillers
-    // through both boundaries. fillers go through the raw rpc and tolerate
-    // rejection — an op caught mid-teardown dies with its epoch's content
-    // store by design.
+    // 7. ADMISSION CUTOVER. finalized views only advance with ops, so push
+    // fillers through the boundary. fillers go through the raw rpc and
+    // tolerate rejection — an op caught mid-teardown dies with its epoch's
+    // content store by design.
     let mut filler = 0u32;
     let mut last_filler = std::time::Instant::now() - Duration::from_secs(1);
-    poll_until("standby registration, online relay, activation", CONVERGE, || {
+    poll_until("the admission cutover to cross", CONVERGE, || {
         if last_filler.elapsed() >= Duration::from_secs(1) {
             last_filler = std::time::Instant::now();
             filler += 1;
@@ -251,19 +242,12 @@ fn cluster_lifecycle() {
             );
         }
         (0..3)
-            .all(|i| cluster.marker(i, "cutover complete: epoch 2").is_some())
+            .all(|i| cluster.marker(i, "cutover complete: epoch 1").is_some())
             .then_some(())
     });
-    // the activation was node-attested: a member relayed node 3's own signed
-    // online announce, and node 3 proved a full state sync first.
-    assert!(
-        (0..3).any(|i| cluster.marker(i, "online announce from standby").is_some()),
-        "some member must have relayed node 3's online proof"
-    );
-    cluster.wait_marker(3, "standby: state verified", Duration::from_secs(30));
-    // the activated key sees itself in the epoch-2 participant set and
+    // the admitted key sees itself in the epoch-1 participant set and
     // promotes through the normal restore path.
-    cluster.wait_marker(3, "promoted: validator at epoch 2", CONVERGE);
+    cluster.wait_marker(3, "promoted: validator at epoch 1", CONVERGE);
 
     // 8. the epoch-1 engines must still finalize: post through the respawned
     // net via node 0, read on node 2.

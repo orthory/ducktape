@@ -262,13 +262,94 @@ impl NetworkShapeCluster {
         });
     }
 
-    pub fn run_invite_accept(&self, pubkey_hex: &str) -> (bool, String) {
+    /// kill node `idx`'s process (reaped by NodeProc's drop).
+    pub fn kill(&mut self, idx: usize) {
+        self.nodes[idx] = None;
+    }
+
+    /// drive the DIRECT admission ceremony (`promote` — the pre-staged
+    /// `invite-accept` semantics) from node 0's config.
+    /// one json-lines rpc against node `idx` — the NetworkShapeCluster
+    /// mirror of [`Cluster::rpc`] (same wire, same ports array).
+    pub fn rpc(&self, idx: usize, req: serde_json::Value) -> serde_json::Value {
+        let port = self.rpc_ports[idx];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let stream = loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "rpc connect to node idx {idx} (port {port}) failed: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        };
+        let mut stream = stream;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("rpc read timeout");
+        let mut line = serde_json::to_string(&req).expect("rpc request serializes");
+        line.push('\n');
+        stream.write_all(line.as_bytes()).expect("rpc write");
+        let mut reply = String::new();
+        BufReader::new(stream)
+            .read_line(&mut reply)
+            .expect("rpc read");
+        serde_json::from_str(reply.trim()).expect("rpc reply is json")
+    }
+
+    pub fn query(&self, idx: usize, target: &str, req: &[u8]) -> Option<Vec<u8>> {
+        let reply = self.rpc(
+            idx,
+            serde_json::json!({
+                "cmd": "query",
+                "target": target,
+                "req_hex": hex(req),
+            }),
+        );
+        if reply["ok"] != true {
+            return None;
+        }
+        Some(unhex(
+            reply["reply_hex"]
+                .as_str()
+                .expect("query reply carries hex"),
+        ))
+    }
+
+    pub fn submit(&self, idx: usize, target: &str, payload: &[u8]) {
+        let reply = self.rpc(
+            idx,
+            serde_json::json!({
+                "cmd": "submit",
+                "target": target,
+                "payload_hex": hex(payload),
+            }),
+        );
+        assert_eq!(
+            reply["ok"], true,
+            "submit to {target} via node idx {idx} rejected: {reply}"
+        );
+    }
+
+    pub fn status(&self, idx: usize) -> serde_json::Value {
+        let reply = self.rpc(idx, serde_json::json!({ "cmd": "status" }));
+        assert_eq!(
+            reply["ok"], true,
+            "status via node idx {idx} failed: {reply}"
+        );
+        reply["status"].clone()
+    }
+
+    pub fn run_promote(&self, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args(["invite-accept", pubkey_hex, "--config"])
+            .args(["promote", pubkey_hex, "--config"])
             .arg(cfg)
             .output()
-            .expect("run invite-accept");
+            .expect("run promote");
         (out.status.success(), command_output(&out))
     }
 

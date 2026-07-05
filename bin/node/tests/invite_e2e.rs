@@ -3,7 +3,7 @@
 //!
 //! the flow under test (two humans, three commands):
 //!   friend starts an out-of-mesh node        -> it parks, refused by the mesh
-//!   a member runs `invite-accept <pubkey>`   -> governance passes, valset Join
+//!   a member runs `promote <pubkey>` (direct) -> governance passes, valset Join
 //!   the epoch cutover re-tracks the mesh     -> the parked node syncs at the
 //!                                                boundary, fabricates its
 //!                                                recovery checkpoint, reboots,
@@ -73,30 +73,25 @@ fn solo_founder_invites_a_friend() {
     let friend_hex = hex(&Cluster::identity(1));
     let cfg = cluster.config_file(0);
     let (ok, out) = cluster.run_verb(&[
-        "invite-accept",
+        "promote",
         &friend_hex,
         "--config",
         cfg.to_str().expect("utf-8 config path"),
     ]);
-    assert!(ok, "invite-accept failed:\n{out}");
+    assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
-    // two-phase activation (the nop pusher advances the views): cutover #1
-    // registers the friend as STANDBY with the quorum unchanged; the parked
-    // node proves a sync and announces online, the founder relays it, and
-    // cutover #2 widens the quorum to 2 — epoch 2 then STALLS at its base,
-    // which is exactly what hands the joiner a frozen boundary at the
-    // epoch's genesis floor.
+    // the cutover (the nop pusher advances the views)
+    // seats the friend directly — epoch 1 then STALLS at its base (quorum
+    // 2-of-2), which is exactly what hands the joiner a frozen boundary at
+    // the epoch's genesis floor.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "standby: state verified", CONVERGE);
-    cluster.wait_marker(0, "online announce from standby", CONVERGE);
-    cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
 
     // the parked node notices its admission, syncs the boundary, fabricates
     // its recovery checkpoint, and reboots into the restore path.
-    cluster.wait_marker(joiner, "admitted at epoch 2", CONVERGE);
+    cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
-    cluster.wait_marker(joiner, "promoted: validator at epoch 2", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
 
     // THE property: consensus is live again, and only because the friend
@@ -148,22 +143,17 @@ fn live_quorum_admits_a_fourth_validator() {
     for member in [0usize, 1] {
         let cfg = cluster.config_file(member);
         let (ok, out) = cluster.run_verb(&[
-            "invite-accept",
+            "promote",
             &friend_hex,
             "--config",
             cfg.to_str().expect("utf-8 config path"),
         ]);
-        assert!(ok, "invite-accept via member {member} failed:\n{out}");
+        assert!(ok, "promote via member {member} failed:\n{out}");
     }
 
-    // two-phase activation: registration cutover, the joiner's online proof
-    // (relayed by an incumbent), then the activation cutover to epoch 2.
+    // direct admission: ONE cutover seats the joiner on every incumbent.
     for i in 0..3 {
         cluster.wait_marker(i, "cutover complete: epoch 1", CONVERGE);
-    }
-    cluster.wait_marker(joiner, "standby: state verified", CONVERGE);
-    for i in 0..3 {
-        cluster.wait_marker(i, "cutover complete: epoch 2", CONVERGE);
     }
 
     // advance the boundary PAST the epoch base while the joiner is still
@@ -177,9 +167,9 @@ fn live_quorum_admits_a_fourth_validator() {
         });
     }
 
-    cluster.wait_marker(joiner, "admitted at epoch 2", CONVERGE);
+    cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
-    cluster.wait_marker(joiner, "promoted: validator at epoch 2", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
 
     // the promoted validator's own op finalizes and reads on an incumbent —

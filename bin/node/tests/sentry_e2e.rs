@@ -143,7 +143,7 @@ fn joiner_enters_through_a_sentry() {
     // track it — so the pre-admission parked state is genuinely
     // "parked: not yet admitted (...); retrying", matched by the generic
     // "parked:" prefix exactly as the sibling invite_e2e does. (the joiner
-    // cannot reach node 0 until `invite-accept` runs, direct OR fronted; the
+    // cannot reach node 0 until `promote` (direct admission) runs, fronted; the
     // sentry is what carries the sync + votes AFTER admission.)
     let joiner = cluster.spawn_joiner(1);
     cluster.wait_marker(joiner, "joiner mode: parking", Duration::from_secs(60));
@@ -153,29 +153,23 @@ fn joiner_enters_through_a_sentry() {
     let friend_hex = hex(&Cluster::identity(1));
     let cfg = cluster.config_file(0);
     let (ok, out) = cluster.run_verb(&[
-        "invite-accept",
+        "promote",
         &friend_hex,
         "--config",
         cfg.to_str().expect("utf-8 config path"),
     ]);
-    assert!(ok, "invite-accept failed:\n{out}");
+    assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
-    // two-phase activation. cutover #1 registers the friend as STANDBY
-    // (quorum stays 1, the founder keeps finalizing); the parked node then
-    // proves a sync, announces online through the sentry pipe, the founder
-    // relays the proof, and cutover #2 widens the quorum to 2 — epoch 2
-    // stalls at its base until the friend promotes there.
+    // direct admission: ONE cutover seats the friend — epoch 1 stalls at
+    // its base (quorum 2-of-2) until the friend arrives.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "standby: state verified", CONVERGE);
-    cluster.wait_marker(0, "online announce from standby", CONVERGE);
-    cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
 
     // the parked node syncs the boundary and promotes — every byte of that
     // handshake + state-sync crossed the sentry pipe.
-    cluster.wait_marker(joiner, "admitted at epoch 2", CONVERGE);
+    cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
-    cluster.wait_marker(joiner, "promoted: validator at epoch 2", CONVERGE);
+    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
 
     // sanity check that node 0 was reachable through the forwarder at all — a

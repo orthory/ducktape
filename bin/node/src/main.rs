@@ -78,9 +78,10 @@ const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 /// `ReadinessSignaller` truthfully signals readiness for a pending upgrade iff
 /// `MAX_PROTOCOL_VERSION >= to_version`, and the boot preflight refuses a boundary
 /// whose `required_min_version` exceeds it. Phase 9 raised this to 2 when the
-/// forge v2 dual path landed — this binary can execute a scheduled `to_version=2`
-/// (the forge multi-repo-v2 root/snapshot divergence) and truthfully `SignalReady`.
-const MAX_PROTOCOL_VERSION: u32 = 2;
+/// forge v2 dual path landed; the staged-admission observer tier raised it to
+/// 3 — this binary can execute a scheduled `to_version=3` (valset/governance
+/// observer ops, gated below 3) and truthfully `SignalReady`.
+const MAX_PROTOCOL_VERSION: u32 = 3;
 use automations::Automations;
 use capability::CapabilityRegistry;
 use chat::Chat;
@@ -174,6 +175,13 @@ const CHANNEL_REACHABILITY: u64 = 6;
 /// survive member restarts (the request queue is in-memory), quiet enough to
 /// stay out of the members' way.
 const LOBBY_ANNOUNCE_EVERY: usize = 5;
+/// a parked node holding OBSERVER standing pre-syncs the served boundary
+/// whenever it advanced this many blocks past the last pre-sync — the disk
+/// substrates stay warm, so the eventual promotion catches up a small delta
+/// instead of a full state transfer (the quorum only ever gains a warm
+/// validator). small enough to track a chatty chain, large enough not to
+/// hammer the serving validators.
+const OBSERVER_PRESYNC_STRIDE: u64 = 64;
 /// how many epochs of engine channels are PRE-REGISTERED. discovery channels
 /// can only be registered before `network.start()`, and every epoch's respawned
 /// engine needs FRESH channels (an aborted old engine must never collide with
@@ -252,6 +260,16 @@ fn participant_bytes(
         .collect()
 }
 
+fn observer_bytes(
+    orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
+) -> Vec<Vec<u8>> {
+    orchestrator
+        .current_observers()
+        .iter()
+        .map(|k| k.as_ref().to_vec())
+        .collect()
+}
+
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
 async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
@@ -268,20 +286,20 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-/// read the full committed membership picture — `(active, standby)`. the
-/// active list is the consensus-quorum projection; the union is what the
-/// transport mesh tracks.
-async fn read_valset_membership(host: &Host) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+/// read the valset module's current OBSERVER projection (committed state —
+/// called between drains, outside any block; same read point as
+/// [`read_valset_members`], so a boundary read sees one frozen state).
+async fn read_valset_observers(host: &Host) -> Vec<Vec<u8>> {
     use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
-        .query("valset", &encode_query(&ValsetQuery::Members))
+        .query("valset", &encode_query(&ValsetQuery::Observers))
         .await
     else {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     };
     match decode_reply(&reply) {
-        Ok(ValsetReply::Members { active, standby }) => (active, standby),
-        Ok(_) | Err(_) => (Vec::new(), Vec::new()),
+        Ok(ValsetReply::Observers(v)) => v,
+        Ok(_) | Err(_) => Vec::new(),
     }
 }
 
@@ -352,6 +370,23 @@ async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCo
         to_version: up.to_version,
     });
     (status.current_version, pending)
+}
+
+/// the CURRENT member set from the valset module's committed+staged projection
+/// (host-routed read, between drains). an unreadable reply degrades to empty —
+/// callers treat that as "can't authorize anything right now", never a panic.
+async fn read_members_from_host(host: &Host) -> Vec<Vec<u8>> {
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    let Ok(raw) = host
+        .query("valset", &encode_query(&ValsetQuery::Validators))
+        .await
+    else {
+        return Vec::new();
+    };
+    match decode_reply(&raw) {
+        Ok(ValsetReply::Validators(v)) => v,
+        Ok(_) | Err(_) => Vec::new(),
+    }
 }
 
 /// read the upgrade module's raw committed [`UpgradeStatus`] (committed state,
@@ -804,29 +839,6 @@ async fn restore_host(
 /// retries (a busy source moves its qmdb targets past the captured boundary;
 /// the caller refetches the manifest and tries again, and metrics labels
 /// must not collide).
-/// fetch and root-verify JUST the valset module's snapshot at `manifest`'s
-/// boundary — the lightweight probe a parked joiner runs to learn whether its
-/// key has been registered as STANDBY (registration shows in the valset
-/// state, not in the manifest's engine participant set). returns
-/// `(active, standby)` raw key bytes; the manifest entry root is the trust
-/// anchor, exactly as in a full sync.
-async fn read_standby_membership<C: statesync::SyncClient>(
-    client: &C,
-    manifest: &statesync::Manifest,
-) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), String> {
-    let entry = manifest
-        .entry("valset")
-        .ok_or_else(|| "valset missing from the manifest".to_string())?;
-    let bytes = statesync::fetch_snapshot(client, manifest.boundary_id(), "valset")
-        .await
-        .map_err(|e| format!("valset snapshot: {e}"))?;
-    let mut scratch = Valset::new("valset");
-    scratch
-        .install(&bytes, entry.root)
-        .map_err(|e| format!("valset snapshot verify: {e}"))?;
-    Ok(scratch.membership())
-}
-
 async fn sync_all_modules<C: statesync::SyncClient>(
     context: &commonware_runtime::tokio::Context,
     client: &C,
@@ -1712,6 +1724,7 @@ where
         target.epoch,
         target.view_base,
         target.participants.clone(),
+        target.observers.clone(),
         pending_cutover_view,
         target.current_version,
         target.pending_upgrade.clone(),
@@ -1982,6 +1995,25 @@ fn resume_member_keys(
     Ok(keys)
 }
 
+/// the recovered epoch's OBSERVER keys — empty on a fresh boot (genesis has
+/// no observers) and on checkpoints written before the staged-admission tier.
+fn resume_observer_keys(
+    resumed: Option<&recovery::Recovered>,
+) -> Result<Vec<ed25519::PublicKey>, String> {
+    let raw: Vec<Vec<u8>> = match resumed {
+        Some(rec) => rec.observers.clone(),
+        None => Vec::new(),
+    };
+    let mut keys = Vec::with_capacity(raw.len());
+    for k in &raw {
+        keys.push(
+            ed25519::PublicKey::decode(k.as_slice())
+                .map_err(|e| format!("recovered observer set holds a non-ed25519 key: {e}"))?,
+        );
+    }
+    Ok(keys)
+}
+
 fn advance_next_seq_from_frames(next_seq: &mut u64, frames: &[Vec<u8>], me: &[u8]) {
     for frame in frames {
         if let Some((origin, seq)) = node::frame_origin_seq(frame) {
@@ -2184,6 +2216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
+        Some("promote") => return cmd_promote(&args[1..]),
         Some("join-requests") => return cmd_join_requests(&args[1..]),
         Some("member-remove") => return cmd_member_remove(&args[1..]),
         Some("member-leave") => return cmd_member_leave(&args[1..]),
@@ -2518,7 +2551,16 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
     match decode_reply(&raw)? {
         ValsetReply::Validators(v) => Ok(v),
-        other => Err(format!("unexpected valset reply shape: {other:?}")),
+        other => Err(format!("expected Validators, got {other:?}")),
+    }
+}
+
+fn read_observers(addr: &str) -> Result<Vec<Vec<u8>>, String> {
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Observers))?;
+    match decode_reply(&raw)? {
+        ValsetReply::Observers(v) => Ok(v),
+        other => Err(format!("expected Observers, got {other:?}")),
     }
 }
 
@@ -2643,15 +2685,138 @@ fn poll_proposal(
     }
 }
 
-/// `invite-accept <hex pubkey> [--config node.toml]` — post-genesis
-/// admission: drive a governance AddValidator proposal for `pubkey` through
-/// this member's own RUNNING node. idempotent across members — each runs the
-/// same command (propose if absent, cast a yes ballot, execute once
-/// decidable); the run that lands the deciding ballot executes. the passing
-/// proposal's valset Join schedules the epoch cutover that re-tracks the
-/// mesh, at which point the parked joiner syncs and promotes itself.
+/// how a driven membership ceremony left the proposal.
+enum CeremonyOutcome {
+    /// passed and executed — the set changes at the next epoch cutover.
+    Passed,
+    /// this ballot landed but a strict majority is still outstanding.
+    AwaitingBallots,
+}
+
+/// drive a strict-majority governance membership ceremony for `wanted`
+/// through this member's own running node: adopt an existing OPEN proposal
+/// for exactly this action (else mint an unused `<id_prefix><key>:<n>` id and
+/// propose), cast a yes ballot, and execute once decidable. idempotent across
+/// members — each runs the same verb; the run landing the deciding ballot
+/// executes. shared by `invite-accept` (AddObserver) and `promote`
+/// (AddValidator).
+fn drive_membership_ceremony(
+    rpc_addr: &str,
+    me_bytes: &[u8],
+    pubkey_hex: &str,
+    verb: &str,
+    id_prefix: &str,
+    wanted: governance_interface::GovAction,
+) -> Result<CeremonyOutcome, Box<dyn std::error::Error>> {
+    use governance_interface::{GovMsg, ProposalStatus, encode_msg};
+    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
+    let proposals = match decode_reply(&rpc_query(
+        rpc_addr,
+        "governance",
+        &encode_query(&GovQuery::Proposals),
+    )?)? {
+        GovReply::Proposals(views) => views,
+        other => return Err(format!("unexpected governance reply: {other:?}").into()),
+    };
+    let proposal_id = match proposals
+        .iter()
+        .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
+    {
+        Some(p) => {
+            eprintln!("joining open proposal {}", p.proposal_id);
+            p.proposal_id.clone()
+        }
+        None => {
+            let prefix: String = pubkey_hex.chars().take(16).collect();
+            let id = (0u64..)
+                .map(|n| format!("{id_prefix}{prefix}:{n}"))
+                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
+                .expect("the id space is unbounded");
+            rpc_submit(
+                rpc_addr,
+                "governance",
+                &encode_msg(&GovMsg::Propose {
+                    proposal_id: id.clone(),
+                    action: wanted,
+                    // a far horizon in consensus-time units (heights advance
+                    // about one per finalized op): admission must not expire
+                    // under a slow second ballot.
+                    voting_period: 1_000_000,
+                }),
+            )?;
+            poll_proposal(rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
+            eprintln!("proposed {id}");
+            id
+        }
+    };
+
+    rpc_submit(
+        rpc_addr,
+        "governance",
+        &encode_msg(&GovMsg::Vote {
+            proposal_id: proposal_id.clone(),
+            approve: true,
+        }),
+    )?;
+    let after_vote = poll_proposal(rpc_addr, &proposal_id, "this ballot to finalize", |p| {
+        p.as_ref().is_some_and(|v| {
+            v.status != ProposalStatus::Open
+                || v.votes
+                    .iter()
+                    .any(|(voter, yes)| voter == me_bytes && *yes)
+        })
+    })?
+    .expect("the poll only accepts a present proposal");
+    eprintln!("ballot cast as {}", hex_bytes(me_bytes));
+
+    // execute only when decidable — a strict-majority shortfall is the
+    // normal n>=2 intermediate state, not an error.
+    let members = read_members(rpc_addr)?;
+    let yes = members
+        .iter()
+        .filter(|m| {
+            after_vote
+                .votes
+                .iter()
+                .any(|(voter, approve)| voter == *m && *approve)
+        })
+        .count();
+    let majority = members.len() / 2 + 1;
+    if after_vote.status == ProposalStatus::Open && yes < majority {
+        eprintln!(
+            "{yes} of {majority} required ballots — waiting on other members. each runs:\n    \
+             ducktape-node {verb} {pubkey_hex} --config <their node.toml>"
+        );
+        return Ok(CeremonyOutcome::AwaitingBallots);
+    }
+    if after_vote.status == ProposalStatus::Open {
+        rpc_submit(
+            rpc_addr,
+            "governance",
+            &encode_msg(&GovMsg::Execute {
+                proposal_id: proposal_id.clone(),
+            }),
+        )?;
+    }
+    let settled = poll_proposal(rpc_addr, &proposal_id, "the tally to settle", |p| {
+        p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
+    })?
+    .expect("the poll only accepts a present proposal");
+    match settled.status {
+        ProposalStatus::Passed => Ok(CeremonyOutcome::Passed),
+        status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
+    }
+}
+
+/// `invite-accept <hex pubkey> [--config node.toml]` — approve a join request
+/// as OBSERVER standing (the staged-admission tier): drive a governance
+/// AddObserver proposal for `pubkey` through this member's own RUNNING node.
+/// the passing proposal's valset Grant schedules the epoch cutover that
+/// admits the key to the mesh, at which point its parked node PRE-SYNCS
+/// state on a stride cadence. promotion into the quorum is the separate,
+/// deliberate `promote` verb — run it once the observer is warm.
 fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use governance_interface::{GovAction, GovMsg, ProposalStatus, encode_msg};
+    use governance_interface::GovAction;
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
@@ -2676,115 +2841,87 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
     }
+    if read_observers(&rpc_addr)?.contains(&key_bytes) {
+        eprintln!(
+            "{pubkey_hex} already holds observer standing — promote with \
+             `ducktape-node promote {pubkey_hex}` once it is synced"
+        );
+        return Ok(());
+    }
     if !members.contains(&me_bytes) {
         return Err(
             "this node's identity is not a current member — only members admit \
+                    observers"
+                .into(),
+        );
+    }
+
+    match drive_membership_ceremony(
+        &rpc_addr,
+        &me_bytes,
+        pubkey_hex,
+        "invite-accept",
+        "observe:",
+        GovAction::AddObserver { key: key_bytes },
+    )? {
+        CeremonyOutcome::Passed => {
+            eprintln!(
+                "granted observer standing to {pubkey_hex}: the mesh admits it at the next \
+                 epoch cutover and its parked node pre-syncs state. promote it into the \
+                 quorum once warm:\n    ducktape-node promote {pubkey_hex}"
+            );
+            Ok(())
+        }
+        CeremonyOutcome::AwaitingBallots => Ok(()),
+    }
+}
+
+/// `promote <hex pubkey> [--config node.toml]` — seat a key in the consensus
+/// quorum: drive a governance AddValidator proposal through this member's own
+/// RUNNING node. the passing proposal's valset Join clears any observer
+/// standing in the same block and schedules the epoch cutover; a pre-synced
+/// observer then catches up a small delta and reboots as a validator, so the
+/// quorum only ever gains a warm member. also serves DIRECT (un-staged)
+/// admission — exactly the pre-observer `invite-accept` semantics.
+fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use governance_interface::GovAction;
+
+    let (pos, flags) = parse_flags(args)?;
+    let [pubkey_hex] = pos.as_slice() else {
+        return Err("promote needs exactly one <hex pubkey>".into());
+    };
+    let key = config::decode_key(pubkey_hex)?;
+    let key_bytes = key.as_ref().to_vec();
+    let cfg_path = config_path(&flags)?;
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("promote drives the node's local rpc — set `rpc_listen` in node.toml")?;
+    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+
+    let members = read_members(&rpc_addr)?;
+    if members.contains(&key_bytes) {
+        eprintln!("{pubkey_hex} is already a validator — nothing to do");
+        return Ok(());
+    }
+    if !members.contains(&me_bytes) {
+        return Err(
+            "this node's identity is not a current member — only members promote \
                     validators"
                 .into(),
         );
     }
 
-    // adopt an existing OPEN proposal for exactly this action, else mint an
-    // unused id (settled proposals keep their ids forever — a re-admitted
-    // key gets a fresh suffix).
-    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
-    let proposals = match decode_reply(&rpc_query(
+    match drive_membership_ceremony(
         &rpc_addr,
-        "governance",
-        &encode_query(&GovQuery::Proposals),
-    )?)? {
-        GovReply::Proposals(views) => views,
-        other => return Err(format!("unexpected governance reply: {other:?}").into()),
-    };
-    let wanted = GovAction::AddValidator {
-        key: key_bytes.clone(),
-    };
-    let proposal_id = match proposals
-        .iter()
-        .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
-    {
-        Some(p) => {
-            eprintln!("joining open proposal {}", p.proposal_id);
-            p.proposal_id.clone()
-        }
-        None => {
-            let prefix: String = pubkey_hex.chars().take(16).collect();
-            let id = (0u64..)
-                .map(|n| format!("admit:{prefix}:{n}"))
-                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
-                .expect("the id space is unbounded");
-            rpc_submit(
-                &rpc_addr,
-                "governance",
-                &encode_msg(&GovMsg::Propose {
-                    proposal_id: id.clone(),
-                    action: wanted,
-                    // a far horizon in consensus-time units (heights advance
-                    // about one per finalized op): admission must not expire
-                    // under a slow second ballot.
-                    voting_period: 1_000_000,
-                }),
-            )?;
-            poll_proposal(&rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
-            eprintln!("proposed {id}");
-            id
-        }
-    };
-
-    rpc_submit(
-        &rpc_addr,
-        "governance",
-        &encode_msg(&GovMsg::Vote {
-            proposal_id: proposal_id.clone(),
-            approve: true,
-        }),
-    )?;
-    let after_vote = poll_proposal(&rpc_addr, &proposal_id, "this ballot to finalize", |p| {
-        p.as_ref().is_some_and(|v| {
-            v.status != ProposalStatus::Open
-                || v.votes
-                    .iter()
-                    .any(|(voter, yes)| voter == &me_bytes && *yes)
-        })
-    })?
-    .expect("the poll only accepts a present proposal");
-    eprintln!("ballot cast as {}", hex_bytes(&me_bytes));
-
-    // execute only when decidable — a strict-majority shortfall is the
-    // normal n>=2 intermediate state, not an error.
-    let members = read_members(&rpc_addr)?;
-    let yes = members
-        .iter()
-        .filter(|m| {
-            after_vote
-                .votes
-                .iter()
-                .any(|(voter, approve)| voter == *m && *approve)
-        })
-        .count();
-    let majority = members.len() / 2 + 1;
-    if after_vote.status == ProposalStatus::Open && yes < majority {
-        eprintln!(
-            "{yes} of {majority} required ballots — waiting on other members. each runs:\n    \
-             ducktape-node invite-accept {pubkey_hex} --config <their node.toml>"
-        );
-        return Ok(());
-    }
-    if after_vote.status == ProposalStatus::Open {
-        rpc_submit(
-            &rpc_addr,
-            "governance",
-            &encode_msg(&GovMsg::Execute {
-                proposal_id: proposal_id.clone(),
-            }),
-        )?;
-    }
-    let settled = poll_proposal(&rpc_addr, &proposal_id, "the tally to settle", |p| {
-        p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
-    })?
-    .expect("the poll only accepts a present proposal");
-    match settled.status {
-        ProposalStatus::Passed => {
+        &me_bytes,
+        pubkey_hex,
+        "promote",
+        "admit:",
+        GovAction::AddValidator { key: key_bytes },
+    )? {
+        CeremonyOutcome::Passed => {
             eprintln!(
                 "admitted {pubkey_hex} as STANDBY: the joiner's parked node will verify a \
                  state sync, announce itself online, and join the consensus quorum at the \
@@ -2792,7 +2929,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             );
             Ok(())
         }
-        status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
+        CeremonyOutcome::AwaitingBallots => Ok(()),
     }
 }
 
@@ -3753,33 +3890,34 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut last_tracked = PEER_SET;
             let mut attempt = 0usize;
             let mut announce_round = 0usize;
-            // one round-robin lobby sender for BOTH announce kinds: the join
-            // request while unregistered, the online announce once standby.
-            let mut send_lobby =
-                |targets: &[ed25519::PublicKey], attempt: usize, frame: IoBuf, what: &str| {
-                    if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
-                        return;
-                    }
-                    let target = targets[announce_round % targets.len()].clone();
-                    announce_round += 1;
-                    let attempted =
-                        lobby_tx.send(Recipients::One(target.clone()), frame, false);
-                    if !attempted.is_empty() {
-                        println!(
-                            "[node {label}] {what} sent to member {}",
-                            hex_bytes(&target.as_ref()[..4])
-                        );
-                    }
-                };
-            // standby latch: sync capability is proven ONCE, then every
-            // announce round carries a FRESH online proof (an expired proof
-            // never wedges the flow — the next round re-signs).
-            let mut standby_sync_proven = false;
+            // the last boundary height an OBSERVER pre-sync completed at (0 =
+            // never) — the stride watermark.
+            let mut last_presync_height: u64 = 0;
+            // once observer standing is seen, parking is the STEADY state
+            // (awaiting a deliberate promote) — the not-admitted bail below
+            // must never fire.
+            let mut observer_standing = false;
+            let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
+                let Some(frame) = &announce_frame else { return };
+                if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
+                    return;
+                }
+                let target = targets[announce_round % targets.len()].clone();
+                announce_round += 1;
+                let attempted = lobby_tx.send(Recipients::One(target.clone()), frame.clone(), false);
+                if !attempted.is_empty() {
+                    println!(
+                        "[node {label}] join request sent to member {} — awaiting approval",
+                        hex_bytes(&target.as_ref()[..4])
+                    );
+                }
+            };
             let (boundary, host, floor) = loop {
                 attempt += 1;
-                if attempt > 900 {
+                if attempt > 900 && !observer_standing {
                     // ~30 minutes of 2s retries: parking forever is operator
-                    // guidance territory, not a silent spin.
+                    // guidance territory, not a silent spin. (an OBSERVER
+                    // parks indefinitely by design — that bail is gated off.)
                     eprintln!(
                         "[node {label}] FATAL: still not admitted after {attempt} attempts — \
                          has a member run `ducktape-node invite-accept {}`?",
@@ -3804,9 +3942,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                              unreachable) — a member must run `invite-accept` for this \
                              key; see the joiner-mode banner above. retrying ({e})"
                         );
-                        if let Some(frame) = &announce_frame {
-                            send_lobby(&announce_targets, attempt, frame.clone(), "join request");
-                        }
+                        send_announce(&announce_targets, attempt);
                         continue;
                     }
                 };
@@ -3848,60 +3984,59 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     if !current.is_empty() {
                         announce_targets = current;
                     }
-                    // STANDBY probe: registration shows in the valset
-                    // snapshot, not in `participants` (the engine set). once
-                    // registered: prove sync capability ONCE, then announce
-                    // online — a member relays the proof into the ordered
-                    // lane and the activation cutover puts this key into
-                    // `participants`, which the next loop iteration sees.
-                    let standby_now = match read_standby_membership(&client, &m).await {
-                        Ok((_, standby)) => standby.iter().any(|k| k == &me_bytes),
-                        // a boundary hiccup re-probes next attempt.
-                        Err(_) => false,
-                    };
-                    if standby_now {
-                        if !standby_sync_proven {
+                    if m.observers.iter().any(|k| k == &me_bytes) {
+                        observer_standing = true;
+                        // OBSERVER standing (staged admission): granted, so
+                        // stop knocking — and PRE-SYNC the boundary on a
+                        // stride cadence. no checkpoint manifest is written
+                        // (a restart parks again cleanly); the disk
+                        // substrates keep the warm state, so the eventual
+                        // `promote` catches up a small delta.
+                        if m.height >= last_presync_height.saturating_add(OBSERVER_PRESYNC_STRIDE)
+                            || last_presync_height == 0
+                        {
+                            if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
+                                eprintln!(
+                                    "[node {label}] FATAL: cannot observe this network — {e}"
+                                );
+                                std::process::exit(1);
+                            }
                             println!(
-                                "[node {label}] standby: registered — verifying state sync at \
-                                 boundary {}",
-                                m.height
+                                "[node {label}] observer: pre-syncing boundary {} ({} modules)",
+                                m.height,
+                                m.entries.len()
                             );
                             match sync_all_modules(&context, &client, &m, &forge_repo, attempt)
                                 .await
                             {
-                                Ok(synced) => {
+                                Ok(host) => {
+                                    last_presync_height = m.height;
                                     println!(
-                                        "[node {label}] standby: state verified \
-                                         (app_hash={}) — announcing online",
-                                        hex(&synced.app_hash())
+                                        "[node {label}] observer: pre-synced boundary {} app_hash={}",
+                                        m.height,
+                                        hex(&host.app_hash())
                                     );
-                                    standby_sync_proven = true;
-                                    // capability proof only; promotion re-syncs
-                                    // at its own (fresher) boundary below.
-                                    drop(synced);
                                 }
                                 Err(e) => println!(
-                                    "[node {label}] standby: sync not clean yet ({e}); retrying"
+                                    "[node {label}] observer pre-sync at boundary {} failed: {e}",
+                                    m.height
                                 ),
                             }
+                        } else {
+                            println!(
+                                "[node {label}] observer: warm at boundary {} (next pre-sync at {})",
+                                m.height,
+                                last_presync_height + OBSERVER_PRESYNC_STRIDE
+                            );
                         }
-                        if standby_sync_proven {
-                            let frame = IoBuf::from(lobby::encode_msg(&lobby::online_announce(
-                                &signer, m.height,
-                            )));
-                            send_lobby(&announce_targets, attempt, frame, "online announce");
-                        }
-                    } else {
-                        println!(
-                            "[node {label}] parked: awaiting admission (epoch {} has {} \
-                             validators)",
-                            m.epoch,
-                            m.participants.len()
-                        );
-                        if let Some(frame) = &announce_frame {
-                            send_lobby(&announce_targets, attempt, frame.clone(), "join request");
-                        }
+                        continue;
                     }
+                    println!(
+                        "[node {label}] parked: awaiting admission (epoch {} has {} validators)",
+                        m.epoch,
+                        m.participants.len()
+                    );
+                    send_announce(&announce_targets, attempt);
                     continue;
                 }
                 // in the epoch set. a boundary PAST the epoch base needs its
@@ -4046,6 +4181,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 boundary.epoch,
                 boundary.view_base,
                 boundary.participants.clone(),
+                boundary.observers.clone(),
                 None,
                 cv,
                 pu,
@@ -4120,6 +4256,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         0,
                         0,
                         genesis_participants,
+                        Vec::new(),
                         None,
                         cv,
                         pu,
@@ -4227,17 +4364,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         }
         let initial_resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
 
-        // the TRANSPORT baseline adds the committed STANDBY set (registered,
-        // quorum-exempt keys the mesh must admit so they can sync and
-        // announce). read LIVE from the recovered host, unlike the frozen
-        // participant set above: a standby registration arms its own cutover,
-        // so within any epoch the standby set is constant — except a reboot
-        // inside that cutover window, where this node briefly tracks the
-        // wider set alone; the boundary re-tracks identically a few views
-        // later.
-        let initial_standby_keys: Vec<ed25519::PublicKey> = read_valset_membership(&host)
+        // the TRANSPORT baseline adds the committed OBSERVER set (granted,
+        // quorum-exempt keys the mesh must admit so they can sync). read
+        // LIVE from the recovered host, unlike the frozen participant set
+        // above: an observer grant arms its own cutover, so within any epoch
+        // the observer set is constant — except a reboot inside that cutover
+        // window, where this node briefly tracks the wider set alone; the
+        // boundary re-tracks identically a few views later.
+        let initial_observer_keys: Vec<ed25519::PublicKey> = read_valset_observers(&host)
             .await
-            .1
             .iter()
             .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
             .collect();
@@ -4266,7 +4401,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             mesh_at(
                 &initial_member_keys
                     .iter()
-                    .chain(initial_standby_keys.iter())
+                    .chain(initial_observer_keys.iter())
                     .cloned()
                     .collect(),
             ),
@@ -4517,6 +4652,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
+                                &target.observers,
                             )
                             .await
                             {
@@ -4637,6 +4773,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
+                                &target.observers,
                             )
                             .await
                             {
@@ -4653,6 +4790,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             target.epoch,
                             target.view_base,
                             target.participants.clone(),
+                            target.observers.clone(),
                             None,
                             target.current_version,
                             target.pending_upgrade.clone(),
@@ -5022,13 +5160,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // schedules deterministic epoch cutovers. it resumes at the recovered
         // epoch coordinates over the epoch's ENGINE PARTICIPANT SET, and
         // re-arms a cutover the pre-crash process had scheduled.
-        let mut orchestrator = consensus::ValsetOrchestrator::resume_with_transport(
+        let observer_keys = match resume_observer_keys(resumed.as_ref()) {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("[node {label}] FATAL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut orchestrator = consensus::ValsetOrchestrator::resume(
             CUTOVER_DELAY,
             member_keys.clone(),
-            member_keys
-                .iter()
-                .cloned()
-                .chain(initial_standby_keys.iter().cloned()),
+            observer_keys.clone(),
             resume_epoch,
             view_base,
             pending_boot,
@@ -5121,12 +5263,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // nothing durable. read by the `join-requests` rpc; entries whose key
         // has since become a member are dropped at read time.
         let mut join_requests: std::collections::BTreeMap<Vec<u8>, JoinRequestRecord> =
-            std::collections::BTreeMap::new();
-        // online-announce relay latch: standby key -> the proof height last
-        // relayed into the ordered lane. keyed by proof height so a FRESH
-        // proof (an expired one re-announced) relays again, while the same
-        // proof re-announced every few seconds submits exactly once.
-        let mut online_relays: std::collections::BTreeMap<Vec<u8>, u64> =
             std::collections::BTreeMap::new();
         // recovery cadence: sealed blocks since the last checkpoint manifest.
         let mut blocks_since_checkpoint: u64 = 0;
@@ -5239,6 +5375,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         orchestrator.epoch(),
                         orchestrator.epoch_base(),
                         participant_bytes(&orchestrator),
+                        observer_bytes(&orchestrator),
                         orchestrator.pending_cutover().map(|c| c.cutover_view()),
                         cv,
                         pu,
@@ -5485,6 +5622,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
+                                observer_bytes(&orchestrator),
                                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                                 cv,
                                 pu,
@@ -5547,20 +5685,28 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 last_reach_view = Some(absolute_view);
                             }
                         }
-                        let (active_raw, standby_raw) =
-                            read_valset_membership(node.host()).await;
-                        let decode_keys = |raw: &[Vec<u8>]| -> Vec<ed25519::PublicKey> {
-                            raw.iter()
-                                .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
-                                .collect()
-                        };
-                        let observed = decode_keys(&active_raw);
-                        let observed_standby = decode_keys(&standby_raw);
+                        let members_raw = read_valset_members(node.host()).await;
+                        let mut observed: Vec<ed25519::PublicKey> = Vec::new();
+                        for key in &members_raw {
+                            if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
+                                observed.push(pk);
+                            }
+                        }
+                        // the OBSERVER projection, read at the same frozen
+                        // point: a grant/revoke arms the same single cutover
+                        // slot (mesh admission is epoch-scoped).
+                        let observers_raw = read_valset_observers(node.host()).await;
+                        let mut observed_observers: Vec<ed25519::PublicKey> = Vec::new();
+                        for key in &observers_raw {
+                            if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
+                                observed_observers.push(pk);
+                            }
+                        }
                         if let consensus::ObservationOutcome::Scheduled(cutover) =
                             orchestrator.observe_members(
                                 engine_view,
                                 observed.iter().cloned(),
-                                observed_standby.iter().cloned(),
+                                observed_observers.iter().cloned(),
                             )
                         {
                             println!(
@@ -5596,19 +5742,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if let Some(plan) = orchestrator.respawn_if_due(
                             engine_view,
                             observed,
-                            observed_standby,
+                            observed_observers,
                             boundary_upgrade,
                         ) {
                             let members = plan.valset().consensus_members();
                             let member_bytes: Vec<Vec<u8>> =
                                 members.iter().map(|k| k.as_ref().to_vec()).collect();
+                            let plan_observer_bytes: Vec<Vec<u8>> = plan
+                                .valset()
+                                .transport_members()
+                                .difference(members)
+                                .map(|k| k.as_ref().to_vec())
+                                .collect();
                             // transport FIRST: the new epoch's mesh must admit
-                            // its members (a fresh joiner above all, standby
-                            // registrants included) before anything is
-                            // expected of them. index = epoch, strictly
-                            // increasing across cutovers.
-                            mesh_oracle
-                                .track(plan.epoch(), mesh_at(plan.valset().transport_members()));
+                            // its members (a fresh joiner — or a granted
+                            // observer — above all) before anything is
+                            // expected of them. the mesh tracks the TRANSPORT
+                            // union; the engine below gets validators only.
+                            // index = epoch, strictly increasing across
+                            // cutovers.
+                            mesh_oracle.track(plan.epoch(), mesh_at(plan.valset().transport_members()));
                             // the reachability plane retunnels for the new
                             // member set the moment transport admits it.
                             // cutover_app_height IS the new epoch's absolute
@@ -5653,6 +5806,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     plan.epoch(),
                                     plan.cutover_app_height(),
                                     &member_bytes,
+                                    &plan_observer_bytes,
                                 )
                                 .await
                             {
@@ -5709,6 +5863,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
+                                observer_bytes(&orchestrator),
                                 None,
                                 cv,
                                 pu,
@@ -6002,13 +6157,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         RpcRequest::JoinRequests => {
-                            // read-time hygiene: an approved joiner is
-                            // REGISTERED now (standby or already active) —
+                            // read-time hygiene: an approved joiner holds
+                            // STANDING now (observer or already validator) —
                             // its request is settled, drop it.
-                            let (active, standby) =
-                                read_valset_membership(node.host()).await;
+                            let members = read_members_from_host(node.host()).await;
+                            let observers_now = read_valset_observers(node.host()).await;
                             join_requests.retain(|joiner, _| {
-                                !active.contains(joiner) && !standby.contains(joiner)
+                                !members.contains(joiner) && !observers_now.contains(joiner)
                             });
                             let views = join_requests
                                 .iter()
@@ -6051,81 +6206,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         Ok(m) => m,
                         Err(_) => continue, // junk on the doorbell — drop.
                     };
-                    // the ONLINE announce: a standby key proving it is up.
-                    // verify the proof, gate on committed standby membership,
-                    // relay it into the ordered lane as `ValsetMsg::Online` —
-                    // the module re-verifies the identical proof, so this
-                    // member attests nothing. latched per proof height.
-                    if let lobby::LobbyMsg::OnlineAnnounce { signed_height, .. } = &msg {
-                        let signed_height = *signed_height;
-                        let standby_key = match lobby::verify_online_announce(&msg) {
-                            Ok(pk) => pk,
-                            Err(e) => {
-                                send_reply(false, e);
-                                continue;
-                            }
-                        };
-                        let key = standby_key.as_ref().to_vec();
-                        let (active, standby) = read_valset_membership(node.host()).await;
-                        if active.contains(&key) {
-                            // already activated — the announcer will see the
-                            // participant set shortly; nothing to relay.
-                            continue;
-                        }
-                        if !standby.contains(&key) {
-                            send_reply(false, "not a registered standby key".into());
-                            continue;
-                        }
-                        if online_relays.get(&key) == Some(&signed_height) {
-                            continue; // this exact proof already relayed.
-                        }
-                        // only an active member has standing to carry the
-                        // frame (the module enforces the same rule).
-                        if !orchestrator.current_members().contains(&signer.public_key()) {
-                            continue;
-                        }
-                        let lobby::LobbyMsg::OnlineAnnounce { key: key_bytes, signature, .. } =
-                            msg
-                        else {
-                            unreachable!("matched above");
-                        };
-                        let seq = next_seq;
-                        next_seq += 1;
-                        let submit = node
-                            .submit(
-                                &signer,
-                                seq,
-                                Msg {
-                                    target: "valset".into(),
-                                    payload: valset_interface::encode_msg(
-                                        &valset_interface::ValsetMsg::Online {
-                                            key: key_bytes,
-                                            signed_height,
-                                            signature,
-                                        },
-                                    ),
-                                },
-                            )
-                            .await;
-                        match submit {
-                            Ok(_) => {
-                                online_relays.insert(key, signed_height);
-                                println!(
-                                    "[node {label}] online announce from standby {} relayed \
-                                     (proof height {signed_height})",
-                                    hex_bytes(&standby_key.as_ref()[..4])
-                                );
-                                send_reply(true, "online announce relayed".into());
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[node {label}] online relay submit failed: {e} — the \
-                                     announcer retries"
-                                );
-                            }
-                        }
-                        continue;
-                    }
                     // crypto first (pure, cheap): the token must verify for
                     // THIS network and the announced key must prove itself.
                     let verified = match lobby::verify_join_request(&msg, &namespace) {
@@ -6137,23 +6217,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     };
                     // then membership: the issuer must still be a member (a
                     // removed member's outstanding invites die with it), and a
-                    // joiner that is already registered — ACTIVE or STANDBY —
-                    // has nothing pending.
-                    let (active_members, standby_members) =
-                        read_valset_membership(node.host()).await;
+                    // joiner that already holds standing — VALIDATOR or
+                    // OBSERVER — has nothing pending.
+                    let members = read_members_from_host(node.host()).await;
+                    let observers_now = read_valset_observers(node.host()).await;
                     let joiner_bytes = verified.joiner.as_ref().to_vec();
-                    if active_members.contains(&joiner_bytes) {
+                    if members.contains(&joiner_bytes) {
                         send_reply(false, "already a validator".into());
                         continue;
                     }
-                    if standby_members.contains(&joiner_bytes) {
+                    if observers_now.contains(&joiner_bytes) {
                         send_reply(
                             false,
-                            "already registered as standby — announce online instead".into(),
+                            "already an observer — a member promotes it into the quorum".into(),
                         );
                         continue;
                     }
-                    let members = active_members;
                     if !members.contains(&verified.issuer.as_ref().to_vec()) {
                         send_reply(
                             false,
@@ -6329,6 +6408,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 epoch: orchestrator.epoch(),
                                 view_base: orchestrator.epoch_base(),
                                 participants: participant_bytes(&orchestrator),
+                                observers: observer_bytes(&orchestrator),
                                 current_version: bc_current,
                                 pending_upgrade: bc_pending,
                                 floor_cert: latest_floor
@@ -6389,6 +6469,7 @@ mod tests {
             epoch: 0,
             view_base: 0,
             participants: vec![test_me()],
+            observers: vec![],
             floor_cert,
             current_version: host::BASELINE_VERSION,
             pending_upgrade: None,
@@ -6855,6 +6936,7 @@ mod tests {
                 0,
                 0,
                 vec![test_me()],
+                vec![],
                 None,
                 host::BASELINE_VERSION,
                 None,
@@ -6871,6 +6953,7 @@ mod tests {
                 epoch: 0,
                 view_base: 0,
                 participants: vec![test_me()],
+                observers: vec![],
                 floor_cert: Some(vec![1, 2, 3]),
                 current_version: host::BASELINE_VERSION,
                 pending_upgrade: None,

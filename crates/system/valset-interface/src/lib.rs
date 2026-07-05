@@ -1,75 +1,47 @@
 //! the valset module's public wire surface — types only.
 //!
-//! valset is the ed25519 validator set as replicated state, split into two
-//! classes: **active** validators (the consensus quorum) and **standby**
-//! validators (registered by governance, tracked on the transport mesh, not
-//! yet counted for quorum). [`ValsetMsg::Join`] registers a key as standby;
-//! [`ValsetMsg::Online`] — carrying the key's own proof of possession —
-//! moves it standby -> active once the node is genuinely up;
-//! [`ValsetMsg::Leave`] removes a key from either class. reads go via
-//! [`ValsetQuery`] -> [`ValsetReply`]. each `key` is a 32-byte ed25519
-//! public key encoding (the impl crate validates the curve point; this
-//! crate stays types-only).
+//! valset is the ed25519 membership registry as replicated state: VALIDATORS
+//! (the consensus quorum) via [`ValsetMsg::Join`] / [`ValsetMsg::Leave`], and
+//! OBSERVERS (mesh + statesync standing, NO consensus participation) via
+//! [`ValsetMsg::Grant`] / [`ValsetMsg::Revoke`] — the staged-admission tier a
+//! joiner syncs in before promotion. reads go via [`ValsetQuery`] ->
+//! [`ValsetReply`]. each `key` is a 32-byte ed25519 public key encoding (the
+//! impl crate validates the curve point; this crate stays types-only).
 
 use serde::{Deserialize, Serialize};
 
-/// the signing domain for [`ValsetMsg::Online`] proofs: the standby key
-/// signs `key || signed_height (u64 le)` under this namespace.
-pub const ONLINE_PROOF_NS: &[u8] = b"ducktape:valset-online:v1";
-
-/// how many blocks an online proof stays valid past its `signed_height` —
-/// long enough for lobby relay + inclusion, short enough that a proof from
-/// a previous standby term cannot be replayed much later.
-pub const ONLINE_PROOF_TTL_BLOCKS: u64 = 1800;
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ValsetMsg {
-    /// register a validator as STANDBY. `key` MUST be a 32-byte ed25519
-    /// public key; the impl rejects a malformed key with `Error::Module`.
-    /// a key that is already active or standby is left as-is.
+    /// add a validator. `key` MUST be a 32-byte ed25519 public key; the impl
+    /// rejects a malformed key with `Error::Module`. a key holding observer
+    /// standing is PROMOTED: the same op removes it from the observer set —
+    /// one boundary carries the whole transition.
     Join { key: Vec<u8> },
-    /// remove a validator by key, active or standby. a no-op if the key is
-    /// in neither set.
+    /// remove a validator by key. a no-op if the key is not in the set.
     Leave { key: Vec<u8> },
-    /// move a STANDBY key to ACTIVE at the next cutover. `signature` is the
-    /// standby key's own ed25519 signature over `key || signed_height` under
-    /// [`ONLINE_PROOF_NS`] — proof of possession, so a relaying member
-    /// cannot activate a node that never announced. valid while
-    /// `signed_height <= height <= signed_height + ONLINE_PROOF_TTL_BLOCKS`.
-    Online {
-        key: Vec<u8>,
-        signed_height: u64,
-        signature: Vec<u8>,
-    },
+    /// grant OBSERVER standing: mesh + statesync access, no quorum seat.
+    /// requires protocol version >= 3 (the impl rejects below it, matching
+    /// an older binary's unknown-variant decode reject byte-for-byte).
+    Grant { key: Vec<u8> },
+    /// revoke observer standing by key. a no-op if the key is not an
+    /// observer. protocol version >= 3, like `Grant`.
+    Revoke { key: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ValsetQuery {
-    /// the committed ACTIVE set — the consensus-quorum projection.
+    /// the full committed validator set.
     Validators,
-    /// the full committed membership picture, active and standby.
-    Members,
+    /// the full committed observer set.
+    Observers,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ValsetReply {
-    /// the committed active validators, sorted (order-independent).
+    /// the committed validators, sorted (order-independent).
     Validators(Vec<Vec<u8>>),
-    /// the full membership: both lists sorted.
-    Members {
-        active: Vec<Vec<u8>>,
-        standby: Vec<Vec<u8>>,
-    },
-}
-
-/// the exact byte stream an online proof signs: `key || signed_height` little
-/// endian — shared by the announcing node and the module's verifier so the
-/// two can never drift.
-pub fn online_proof_message(key: &[u8], signed_height: u64) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(key.len() + 8);
-    msg.extend_from_slice(key);
-    msg.extend_from_slice(&signed_height.to_le_bytes());
-    msg
+    /// the committed observers, sorted (order-independent).
+    Observers(Vec<Vec<u8>>),
 }
 
 pub fn encode_msg(m: &ValsetMsg) -> Vec<u8> {

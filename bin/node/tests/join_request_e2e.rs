@@ -1,7 +1,7 @@
 //! the automatic half of onboarding: a joiner holding a TOKENED invite parks
 //! and DELIVERS its pubkey to the member over the lobby channel — no
 //! copy/paste — and the member sees it as a pending join request. approval
-//! stays a member decision: `invite-accept` casts the ballot, and only then
+//! stays a member decision: `promote` (direct admission) casts the ballot, and only then
 //! does the joiner promote.
 
 mod common;
@@ -41,19 +41,16 @@ fn a_tokened_join_delivers_the_pubkey_and_manual_approval_promotes() {
     assert_eq!(issuer.len(), 64, "the queue names the inviting member");
 
     // nothing is admitted until a member approves — that is the manual gate.
-    let (ok, out) = cluster.run_invite_accept(&friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_promote(&friend_key);
+    assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
-    // two-phase activation: registration cutover, then the joiner's own
-    // online proof (relayed by the founder) widens the quorum at cutover #2.
+    // direct admission: ONE cutover seats the friend; it syncs the frozen
+    // boundary and promotes there.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
-    cluster.wait_marker(1, "standby: state verified", CONVERGE);
-    cluster.wait_marker(0, "online announce from standby", CONVERGE);
-    cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
-    cluster.wait_marker(1, "admitted at epoch 2", CONVERGE);
+    cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);
-    cluster.wait_marker(1, "promoted: validator at epoch 2", CONVERGE);
+    cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
 
     // settled: the approved key is a member now, so the queue drains.
     let after = cluster.join_requests();

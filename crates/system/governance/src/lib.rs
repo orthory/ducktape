@@ -47,6 +47,12 @@ use valset_interface::{
 /// horizon. views advance about once per finalized op, so this is generous.
 const MAX_VOTING_PERIOD: u64 = 1_000_000_000;
 
+/// the protocol version that introduces the observer tier — keep in lockstep
+/// with the valset module's `OBSERVER_VERSION` (valset re-gates its Grant/
+/// Revoke on the same value; the interface crates are types-only, so the
+/// constant lives in each enforcing module).
+const OBSERVER_VERSION: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Proposal {
     action: GovAction,
@@ -114,7 +120,7 @@ impl Governance {
         match valset_decode_reply(&reply).map_err(Error::Module)? {
             ValsetReply::Validators(members) => Ok(members),
             other => Err(Error::Module(format!(
-                "valset answered Validators with an unexpected reply shape: {other:?}"
+                "valset answered a Validators query with {other:?}"
             ))),
         }
     }
@@ -175,6 +181,14 @@ impl Governance {
                 GovAction::CancelUpgrade { name } => {
                     out.push(4);
                     push_bytes(&mut out, name.as_bytes());
+                }
+                GovAction::AddObserver { key } => {
+                    out.push(5);
+                    push_bytes(&mut out, key);
+                }
+                GovAction::RemoveObserver { key } => {
+                    out.push(6);
+                    push_bytes(&mut out, key);
                 }
             }
             push_bytes(&mut out, &p.proposer);
@@ -238,14 +252,29 @@ impl Governance {
                 "voting_period must be in 1..={MAX_VOTING_PERIOD}"
             )));
         }
-        if let GovAction::AddValidator { key } | GovAction::RemoveValidator { key } = &action {
+        if let GovAction::AddValidator { key }
+        | GovAction::RemoveValidator { key }
+        | GovAction::AddObserver { key }
+        | GovAction::RemoveObserver { key } = &action
+        {
             // shape-check the key here so a proposal that can never execute is
             // rejected at the door, not at tally time.
             if key.len() != 32 {
                 return Err(Error::Module(
-                    "validator key must be a 32-byte ed25519 public key".into(),
+                    "membership key must be a 32-byte ed25519 public key".into(),
                 ));
             }
+        }
+        // observer actions exist from protocol 3: rejecting the PROPOSE below
+        // it lands exactly where an older binary lands (its GovMsg decode
+        // fails on the unknown variant), so a mixed-binary net cannot even
+        // open a proposal it would later fork on.
+        if let GovAction::AddObserver { .. } | GovAction::RemoveObserver { .. } = &action
+            && ctx.env().protocol_version < OBSERVER_VERSION
+        {
+            return Err(Error::Module(format!(
+                "observer proposals require protocol version {OBSERVER_VERSION}"
+            )));
         }
         // upgrade authorizations must name a non-empty upgrade — an unnamed
         // proposal can never match a real pending, so reject it at the door.
@@ -386,6 +415,17 @@ impl Governance {
                 GovAction::CancelUpgrade { name } => ctx.emit_msg(Msg {
                     target: self.upgrade_id.clone(),
                     payload: upgrade_encode_msg(&UpgradeMsg::Cancel { name: name.clone() }),
+                }),
+                // the staged-admission grant/revoke: valset re-gates on the
+                // protocol version (defense in depth for direct submits) and
+                // owns the validator-overlap rule.
+                GovAction::AddObserver { key } => ctx.emit_msg(Msg {
+                    target: self.valset_id.clone(),
+                    payload: valset_encode_msg(&ValsetMsg::Grant { key: key.clone() }),
+                }),
+                GovAction::RemoveObserver { key } => ctx.emit_msg(Msg {
+                    target: self.valset_id.clone(),
+                    payload: valset_encode_msg(&ValsetMsg::Revoke { key: key.clone() }),
                 }),
                 GovAction::Signal { .. } => {}
             }
@@ -543,6 +583,12 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Proposal>, Error> {
             },
             4 => GovAction::CancelUpgrade {
                 name: take_string(&mut buf)?,
+            },
+            5 => GovAction::AddObserver {
+                key: take_vec(&mut buf)?,
+            },
+            6 => GovAction::RemoveObserver {
+                key: take_vec(&mut buf)?,
             },
             other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
         };

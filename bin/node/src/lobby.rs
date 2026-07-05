@@ -33,15 +33,6 @@ pub enum LobbyMsg {
     /// a member's answer, purely informational for the parked node's logs:
     /// `recorded` means the request now awaits approval on that member.
     JoinReply { recorded: bool, detail: String },
-    /// "this STANDBY key is up — activate it": the key's own height-windowed
-    /// signature under the valset online-proof domain. any member relays it
-    /// into the ordered lane as `ValsetMsg::Online`; the module re-verifies
-    /// the same proof deterministically, so the relayer attests nothing.
-    OnlineAnnounce {
-        key: Vec<u8>,
-        signed_height: u64,
-        signature: Vec<u8>,
-    },
 }
 
 pub fn encode_msg(m: &LobbyMsg) -> Vec<u8> {
@@ -69,49 +60,6 @@ pub fn join_request(
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
     }
-}
-
-/// build the online announce for a standby node: a fresh proof of possession
-/// signed over `key || signed_height` under the valset online-proof domain.
-/// `signed_height` should be the freshest committed height the node has seen
-/// (the manifest height while parked) — the proof expires
-/// `ONLINE_PROOF_TTL_BLOCKS` past it, and re-announces mint fresh proofs.
-pub fn online_announce(key: &ed25519::PrivateKey, signed_height: u64) -> LobbyMsg {
-    use commonware_cryptography::Signer as _;
-    let key_bytes = key.public_key().as_ref().to_vec();
-    let signature = key.sign(
-        valset_interface::ONLINE_PROOF_NS,
-        &valset_interface::online_proof_message(&key_bytes, signed_height),
-    );
-    LobbyMsg::OnlineAnnounce {
-        key: key_bytes,
-        signed_height,
-        signature: signature.as_ref().to_vec(),
-    }
-}
-
-/// verify an online announce's proof of possession — crypto only; standby
-/// membership and the height window are the valset module's deterministic
-/// checks (a member relay only pre-filters junk, it attests nothing).
-pub fn verify_online_announce(msg: &LobbyMsg) -> Result<ed25519::PublicKey, String> {
-    use commonware_cryptography::Verifier as _;
-    let LobbyMsg::OnlineAnnounce {
-        key,
-        signed_height,
-        signature,
-    } = msg
-    else {
-        return Err("not an online announce".into());
-    };
-    let pk =
-        ed25519::PublicKey::decode(key.as_slice()).map_err(|e| format!("standby key: {e}"))?;
-    let sig = ed25519::Signature::decode(signature.as_slice())
-        .map_err(|e| format!("online proof signature: {e}"))?;
-    let payload = valset_interface::online_proof_message(key, *signed_height);
-    if !pk.verify(valset_interface::ONLINE_PROOF_NS, &payload, &sig) {
-        return Err("online proof does not verify against the announced key".into());
-    }
-    Ok(pk)
 }
 
 /// a decoded, signature-verified join request — what a member records for
@@ -226,37 +174,6 @@ mod tests {
         };
         let err = verify_join_request(&forged, BINDING).expect_err("refused");
         assert!(err.contains("proof-of-possession"), "{err}");
-    }
-
-    #[test]
-    fn an_online_announce_roundtrips_and_verifies_only_its_own_key() {
-        let standby = ed25519::PrivateKey::from_seed(5);
-        let msg = online_announce(&standby, 42);
-        let decoded = decode_msg(&encode_msg(&msg)).expect("roundtrip");
-        assert_eq!(decoded, msg);
-        assert_eq!(
-            verify_online_announce(&decoded).expect("verifies"),
-            standby.public_key()
-        );
-
-        // a substituted key fails the proof.
-        let LobbyMsg::OnlineAnnounce {
-            signed_height,
-            signature,
-            ..
-        } = msg
-        else {
-            unreachable!()
-        };
-        let forged = LobbyMsg::OnlineAnnounce {
-            key: ed25519::PrivateKey::from_seed(6)
-                .public_key()
-                .as_ref()
-                .to_vec(),
-            signed_height,
-            signature,
-        };
-        assert!(verify_online_announce(&forged).is_err());
     }
 
     #[test]

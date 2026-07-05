@@ -75,20 +75,7 @@ async fn validators(host: &Host) -> Vec<Vec<u8>> {
         .expect("valset query");
     match valset_decode(&reply).expect("decode") {
         ValsetReply::Validators(v) => v,
-        other => panic!("unexpected valset reply shape: {other:?}"),
-    }
-}
-
-/// the standby class — where a governance admission lands under the two-phase
-/// membership protocol (activation is the node's own Online announce).
-async fn standby(host: &Host) -> Vec<Vec<u8>> {
-    let reply = host
-        .query("valset", &valset_query(&ValsetQuery::Members))
-        .await
-        .expect("valset query");
-    match valset_decode(&reply).expect("decode") {
-        ValsetReply::Members { standby, .. } => standby,
-        other => panic!("unexpected valset reply shape: {other:?}"),
+        other => panic!("expected Validators, got {other:?}"),
     }
 }
 
@@ -190,15 +177,9 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
             proposal_status(&host, "add-9").await,
             Some(ProposalStatus::Passed)
         );
-        // a governance admission REGISTERS the key as standby — the quorum
-        // widens only when the node itself announces online.
         let members = validators(&host).await;
-        assert_eq!(members.len(), 2, "the quorum is unchanged by registration");
-        let registered = standby(&host).await;
-        assert!(
-            registered.contains(&newcomer),
-            "the admitted validator is registered standby"
-        );
+        assert_eq!(members.len(), 3, "the admitted validator is a member");
+        assert!(members.contains(&newcomer));
     });
 }
 
@@ -457,14 +438,9 @@ fn a_single_member_ballot_is_a_deciding_majority() {
             proposal_status(&host, "add-friend").await,
             Some(ProposalStatus::Passed)
         );
-        // registration lands standby; the solo member's quorum is untouched.
         let members = validators(&host).await;
-        assert_eq!(members.len(), 1, "the quorum is unchanged by registration");
-        let registered = standby(&host).await;
-        assert!(
-            registered.contains(&friend),
-            "the friend is registered standby"
-        );
+        assert_eq!(members.len(), 2, "the friend is admitted");
+        assert!(members.contains(&friend));
     });
 }
 
@@ -576,7 +552,7 @@ fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
             .await
             .expect_err("emptying the set must be refused");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("last active validator")),
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("last validator")),
             "got {err:?}"
         );
         assert_eq!(validators(&host).await, vec![founder], "the set is untouched");
