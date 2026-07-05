@@ -958,6 +958,12 @@ pub struct NodeToml {
     /// PRESENT stages the node-driven reachability plane (node-local
     /// operator policy, like checkpoint_blocks). absent = plane off.
     pub wireguard_listen: Option<String>,
+    /// which `WireGuardEffect` the reachability plane drives: "real"
+    /// (default — configure an actual interface via the userspace WireGuard
+    /// runtime; needs root/CAP_NET_ADMIN) or "fake" (record configs in
+    /// memory; for dev/sim runs, and for several same-chain nodes on one
+    /// host, which would otherwise fight over one interface name).
+    pub wireguard_effect: Option<String>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -1165,6 +1171,8 @@ pub struct Resolved {
     /// the staged WireGuard reachability plane's advertised UDP endpoint;
     /// None = plane off.
     pub wireguard_listen: Option<SocketAddr>,
+    /// which `WireGuardEffect` the plane drives when it is on.
+    pub wireguard_effect: WireGuardEffectKind,
     /// where the node's X25519 WireGuard keypair persists (beside
     /// identity.key in the network shape).
     pub wireguard_key_file: PathBuf,
@@ -1264,6 +1272,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     };
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
+    let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -1279,6 +1288,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
         wireguard_listen,
+        wireguard_effect,
         wireguard_key_file: base.join("wireguard.key"),
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
@@ -1292,6 +1302,25 @@ fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, Strin
             .map_err(|e| format!("wireguard_listen: {e}"))
     })
     .transpose()
+}
+
+/// which `WireGuardEffect` implementation the reachability plane drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireGuardEffectKind {
+    /// configure an actual interface through the userspace WireGuard runtime.
+    Real,
+    /// record configurations in memory without touching the network stack.
+    Fake,
+}
+
+fn parse_wireguard_effect(raw: Option<&str>) -> Result<WireGuardEffectKind, String> {
+    match raw {
+        None | Some("real") => Ok(WireGuardEffectKind::Real),
+        Some("fake") => Ok(WireGuardEffectKind::Fake),
+        Some(other) => Err(format!(
+            "wireguard_effect: {other:?} is not \"real\" or \"fake\""
+        )),
+    }
 }
 
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
@@ -1360,6 +1389,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
+    let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -1378,6 +1408,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
         wireguard_listen,
+        wireguard_effect,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
@@ -2022,6 +2053,31 @@ bootstrapper_addr = "127.0.0.1:52200"
             r.signer.public_key(),
             ed25519::PrivateKey::from_seed(1).public_key()
         );
+    }
+
+    #[test]
+    fn wireguard_effect_defaults_real_and_rejects_unknown_values() {
+        let dir = tmp("wgeffect");
+        let base = "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
+        std::fs::write(dir.join("node.toml"), base).expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve");
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Real);
+
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}wireguard_effect = \"fake\"\n"),
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve");
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Fake);
+
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}wireguard_effect = \"simulated\"\n"),
+        )
+        .expect("write");
+        let err = resolve(&dir.join("node.toml")).expect_err("unknown effect refused");
+        assert!(err.contains("wireguard_effect"), "{err}");
     }
 
     #[test]
