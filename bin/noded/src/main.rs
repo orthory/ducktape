@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
-use agent_oracle::{AuthStore, LlmWorker};
+use agent_oracle::LlmWorker;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
@@ -401,10 +401,13 @@ fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
     }
     vec![Box::new(LlmWorker::new(
         blobs,
-        AuthStore::from_default_path(),
-        // the ChatGPT/Codex subscription endpoint rejects gpt-5.1 (400 "not
-        // supported when using Codex with a ChatGPT account") — default to a
-        // model the account can serve; per-agent model_ref overrides this.
+        // BYO: run whatever executor CLIs (codex/claude) are installed on this
+        // host — no credential handling here. the single-node daemon carries no
+        // capability registry (its "network" is one node); the worker looks up
+        // the local provider by the request's model_ref directly.
+        capability_host::discover(),
+        // default codex model when a request pins none; a claude model_ref
+        // routes to the claude provider instead (see agent_oracle::capability_for).
         "gpt-5.3-codex-spark".into(),
     ))]
 }
