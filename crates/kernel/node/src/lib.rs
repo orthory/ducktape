@@ -365,7 +365,10 @@ const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 /// nothing requires it to equal the consensus lane's content digest.
 pub type FrameId = [u8; 32];
 
-fn frame_id(bytes: &[u8]) -> FrameId {
+/// compute a frame's [`FrameId`] from its exact encoded bytes. public so a
+/// boot-time observer holding journaled frame bytes derives the SAME id the
+/// live drain reported (one definition — never a re-derivation drifting).
+pub fn frame_id(bytes: &[u8]) -> FrameId {
     use commonware_cryptography::{Hasher as _, Sha256};
     let mut hasher = Sha256::default();
     hasher.update(bytes);

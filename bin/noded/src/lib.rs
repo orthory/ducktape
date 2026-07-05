@@ -670,10 +670,11 @@ pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {
 /// every module's watermark so staleness checks stay exact.
 ///
 /// `record` starts [`None`]: a caller holding a block the explorer shows
-/// grafts its [`block_row`] on via struct update. boot folds (journal replay,
-/// frame catch-up) leave it `None` — the node-layer row is not reproducible
-/// from the dispatch trace, and the blocks database keeps whatever rows the
-/// live drain already made durable.
+/// grafts its [`block_row`] on via struct update. the live drain builds it
+/// from the decoded frame; the validator's boot folds (journal replay, frame
+/// catch-up) rebuild the SAME row from the sealed frame bytes riding the
+/// replay observer — the row is not reproducible from the dispatch trace
+/// alone, so a fold without frame content leaves it `None`.
 pub fn index_block_ops(
     height: u64,
     time: u64,
