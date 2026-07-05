@@ -248,7 +248,10 @@ fn same_script_same_app_hash() {
         for (target, payload) in [
             ("chat", create_channel("general", "General")),
             ("chat", post_message("general", "m-1", "hello determinism")),
-            ("tasks", serde_json::json!({ "CreateTask": { "task_id": "t-1", "title": "repeatable" } })),
+            (
+                "tasks",
+                serde_json::json!({ "CreateTask": { "task_id": "t-1", "title": "repeatable" } }),
+            ),
         ] {
             let pending = sim.submit_in_background(target, payload);
             sim.await_sim_state("held", 1);
@@ -262,7 +265,12 @@ fn same_script_same_app_hash() {
             let (code, _) = pending.join().expect("submit thread");
             assert_eq!(code, 200);
         }
-        hashes.push(sim.status()["appHash"].as_str().unwrap_or_default().to_string());
+        hashes.push(
+            sim.status()["appHash"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
         hashes
     };
 
@@ -315,7 +323,11 @@ fn personas_shape_receipts_and_ring() {
     let (code, body) = sim.request("GET", "/v1/blocks", None);
     assert_eq!(code, 200);
     let records = body["blocks"].as_array().expect("blocks is an array");
-    assert_eq!(records.len(), 1, "the durable block index serves both personas: {body}");
+    assert_eq!(
+        records.len(),
+        1,
+        "the durable block index serves both personas: {body}"
+    );
     assert_eq!(
         records[0]["hash"], "",
         "nothing is framed on this lane — the frame hash stays empty: {body}"
@@ -332,7 +344,10 @@ fn auto_and_step_commit_paths_walk_identical_app_hashes() {
         [
             ("chat", create_channel("general", "General")),
             ("chat", post_message("general", "m-1", "hello determinism")),
-            ("tasks", serde_json::json!({ "CreateTask": { "task_id": "t-1", "title": "repeatable" } })),
+            (
+                "tasks",
+                serde_json::json!({ "CreateTask": { "task_id": "t-1", "title": "repeatable" } }),
+            ),
         ]
     };
 
@@ -402,7 +417,10 @@ fn peer_block_commits_past_a_parked_queue() {
     assert_eq!(sim.sim_state()["held"], 1, "the parked submit stays parked");
 
     let report = sim.step();
-    assert_eq!(report["committed"]["height"], 2, "held op lands after: {report}");
+    assert_eq!(
+        report["committed"]["height"], 2,
+        "held op lands after: {report}"
+    );
     let (code, receipt) = pending.join().expect("submit thread");
     assert_eq!(code, 200);
     assert_eq!(receipt["height"], 2);

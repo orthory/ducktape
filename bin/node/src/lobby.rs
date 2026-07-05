@@ -45,11 +45,7 @@ pub fn decode_msg(b: &[u8]) -> Result<LobbyMsg, String> {
 
 /// build the announce for `token` as `joiner` — the proof binds the announced
 /// key to its secret holder.
-pub fn join_request(
-    joiner: &ed25519::PrivateKey,
-    binding: &[u8],
-    token: &InviteToken,
-) -> LobbyMsg {
+pub fn join_request(joiner: &ed25519::PrivateKey, binding: &[u8], token: &InviteToken) -> LobbyMsg {
     use commonware_codec::Encode as _;
     use commonware_cryptography::Signer as _;
     let proof = crate::config::sign_join_proof(joiner, binding, token);
@@ -86,10 +82,10 @@ pub fn verify_join_request(msg: &LobbyMsg, binding: &[u8]) -> Result<VerifiedJoi
     else {
         return Err("not a join request".into());
     };
-    let issuer = ed25519::PublicKey::decode(issuer.as_slice())
-        .map_err(|e| format!("issuer key: {e}"))?;
-    let joiner = ed25519::PublicKey::decode(joiner.as_slice())
-        .map_err(|e| format!("joiner key: {e}"))?;
+    let issuer =
+        ed25519::PublicKey::decode(issuer.as_slice()).map_err(|e| format!("issuer key: {e}"))?;
+    let joiner =
+        ed25519::PublicKey::decode(joiner.as_slice()).map_err(|e| format!("joiner key: {e}"))?;
     if nonce.len() != INVITE_NONCE_LEN {
         return Err(format!("nonce must be {INVITE_NONCE_LEN} bytes"));
     }
@@ -97,8 +93,8 @@ pub fn verify_join_request(msg: &LobbyMsg, binding: &[u8]) -> Result<VerifiedJoi
     nonce_arr.copy_from_slice(nonce);
     let sig = ed25519::Signature::decode(token_sig.as_slice())
         .map_err(|e| format!("token signature: {e}"))?;
-    let proof = ed25519::Signature::decode(proof.as_slice())
-        .map_err(|e| format!("join proof: {e}"))?;
+    let proof =
+        ed25519::Signature::decode(proof.as_slice()).map_err(|e| format!("join proof: {e}"))?;
 
     let token = InviteToken {
         issuer: issuer.clone(),

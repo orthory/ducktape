@@ -238,13 +238,20 @@ fn solo_validator_survives_sigterm_restart() {
         "a SIGTERM restart must not re-run genesis (no brick)"
     );
 
-    let after = poll_until("status after sigterm recovery", Duration::from_secs(30), || {
-        let s = cluster.status(0);
-        (s["app_hash"] == before["app_hash"]).then_some(s)
-    });
+    let after = poll_until(
+        "status after sigterm recovery",
+        Duration::from_secs(30),
+        || {
+            let s = cluster.status(0);
+            (s["app_hash"] == before["app_hash"]).then_some(s)
+        },
+    );
     assert!(after["height"].as_u64().expect("height") >= height_before);
     // both pre-signal writes survived the graceful checkpoint.
-    assert_eq!(dir_value(&cluster, 0, "quit").as_deref(), Some("gracefully"));
+    assert_eq!(
+        dir_value(&cluster, 0, "quit").as_deref(),
+        Some("gracefully")
+    );
     assert_eq!(dir_value(&cluster, 0, "via").as_deref(), Some("sigterm"));
     // and the engine is LIVE again over its reopened journal.
     write_and_confirm(&cluster, 0, "after-sigterm", "still-here");

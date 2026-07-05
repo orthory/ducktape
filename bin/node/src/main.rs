@@ -59,6 +59,8 @@ use commonware_p2p::authenticated::discovery::{self, Network};
 use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
+use dispatch::DispatchModule;
+use dispatch_oracle::DispatchWorker;
 use futures::{FutureExt as _, StreamExt as _};
 
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
@@ -597,6 +599,9 @@ async fn genesis_host(
         // an identical view of who can run what. its genesis contribution is an
         // empty registry (ZERO root) until nodes announce.
         Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
+        // the task plane: recipe manifests + capability-routed dispatch with
+        // next-block result delivery (the host's DeliverPending injection).
+        Box::new(DispatchModule::new("dispatch", "saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
         // the origin-gated display-name registry: each verified submit origin
@@ -694,6 +699,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("capability install: {e}"))?;
 
+    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    let (bytes, root) = snapshot_of("dispatch")?;
+    dispatch
+        .install(bytes, root)
+        .map_err(|e| format!("dispatch install: {e}"))?;
+
     let mut tasks = Tasks::new("tasks");
     let (bytes, root) = snapshot_of("tasks")?;
     tasks
@@ -770,6 +781,7 @@ async fn restore_host(
         Box::new(upgrade),
         Box::new(saga),
         Box::new(capability),
+        Box::new(dispatch),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -912,6 +924,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("capability install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("dispatch").await?;
+    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    dispatch
+        .install(&bytes, root)
+        .map_err(|e| format!("dispatch install: {e}"))?;
+
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance = Governance::new("governance", "valset", "upgrade");
     governance
@@ -1012,6 +1030,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(upgrade),
         Box::new(saga),
         Box::new(capability),
+        Box::new(dispatch),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -1442,8 +1461,7 @@ async fn stage_shipped_index<C: statesync::SyncClient>(
             let blob = statesync::fetch_index_db(client, boundary, db)
                 .await
                 .map_err(|e| format!("{db}: {e}"))?;
-            let files =
-                statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
+            let files = statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
             indexer::stage_shipped_db(&index_base, db, &files).map_err(|e| e.to_string())?;
             staged += 1;
         }
@@ -1454,9 +1472,7 @@ async fn stage_shipped_index<C: statesync::SyncClient>(
     }
     .await;
     match staged {
-        Ok(0) => println!(
-            "[node {label}] source ships no index — views heal from verified state"
-        ),
+        Ok(0) => println!("[node {label}] source ships no index — views heal from verified state"),
         Ok(n) => println!(
             "[node {label}] shipped index staged ({n} databases) — adopted at the promoted \
              reboot; contents are trusted from the source, not verified (spec §7 lane 2)"
@@ -2368,7 +2384,11 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // v3 invite holds its dial hints as `reach` (bootstrap is empty), so
         // check the union, not just bootstrap — else a reachable NAT'd member
         // is wrongly refused.
-        None if descriptor.reach_hints().map(|h| h.is_empty()).unwrap_or(true) => {
+        None if descriptor
+            .reach_hints()
+            .map(|h| h.is_empty())
+            .unwrap_or(true) =>
+        {
             return Err(
                 "no dialable address: give node.toml a concrete `listen` port or an \
                         `advertised` addr so a joiner can reach the network"
@@ -2896,9 +2916,7 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     .expect("the poll only accepts a present proposal");
     match settled.status {
         ProposalStatus::Passed => {
-            eprintln!(
-                "removed {pubkey_hex}: the validator set changes at the next epoch cutover"
-            );
+            eprintln!("removed {pubkey_hex}: the validator set changes at the next epoch cutover");
             Ok(())
         }
         status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
@@ -5007,13 +5025,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let providers = capability_host::discover()
             .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
-        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
-            blobs.clone(),
-            providers,
-            // this node's submit key: WorkerRequests leased to another
-            // node's key are skipped, not double-run.
-            signer.public_key().as_ref().to_vec(),
-        ))];
+        // a second, identical discovery for the dispatch worker: ProviderSet
+        // owns its providers (not Clone), and both discoveries read the same
+        // specs + PATH at boot, so the two surfaces cannot drift.
+        let dispatch_providers = capability_host::discover()
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+        let workers: Vec<Box<dyn reactor::Worker>> = vec![
+            Box::new(LlmWorker::new(
+                blobs.clone(),
+                providers,
+                // this node's submit key: WorkerRequests leased to another
+                // node's key are skipped, not double-run.
+                signer.public_key().as_ref().to_vec(),
+            )),
+            Box::new(DispatchWorker::new(
+                dispatch_providers,
+                signer.public_key().as_ref().to_vec(),
+            )),
+        ];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
         // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
         // this binary can execute. survives restart/late-join (state-driven, not a
@@ -6564,10 +6593,16 @@ mod tests {
             let mut recovery = Recovery::open(context.child("post_catchup_ok"))
                 .await
                 .expect("open recovery");
-            let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
-                    .await
-                    .expect("catch up");
+            let applied = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                2,
+                frames.clone(),
+                None,
+            )
+            .await
+            .expect("catch up");
 
             assert_eq!(applied.applied, 2);
             assert_eq!(host.app_hash(), expected.app_hash());
@@ -6627,10 +6662,16 @@ mod tests {
                 .write_manifest(&base_manifest)
                 .await
                 .expect("write base manifest");
-            let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-                    .await
-                    .expect("catch up");
+            let applied = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                1,
+                vec![served],
+                None,
+            )
+            .await
+            .expect("catch up");
 
             assert_eq!(applied.applied, 1);
             assert_eq!(
@@ -6697,10 +6738,16 @@ mod tests {
             let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
                 .await
                 .expect("open recovery");
-            let err =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-                    .await
-                    .expect_err("seal mismatch must abort");
+            let err = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                1,
+                vec![served],
+                None,
+            )
+            .await
+            .expect_err("seal mismatch must abort");
 
             assert!(
                 err.contains("served seal"),
@@ -6775,7 +6822,11 @@ mod tests {
         assert_eq!(s.decide(&st), None, "the latch suppresses re-emission");
         // once the module records our signal, still silent even if the latch reset.
         s.signaled = None;
-        let st_ready = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&me], &[&me]);
+        let st_ready = status(
+            Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)),
+            &[&me],
+            &[&me],
+        );
         assert_eq!(s.decide(&st_ready), None, "module already holds our signal");
     }
 
@@ -6784,7 +6835,11 @@ mod tests {
         let me = vec![7u8; 32];
         let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
         // to_version beyond what this binary can execute: never lie about readiness.
-        let st = status(Some(("forge-v3", 100, MAX_PROTOCOL_VERSION + 1)), &[&me], &[]);
+        let st = status(
+            Some(("forge-v3", 100, MAX_PROTOCOL_VERSION + 1)),
+            &[&me],
+            &[],
+        );
         assert_eq!(s.decide(&st), None);
     }
 
@@ -6794,7 +6849,11 @@ mod tests {
         let other = vec![9u8; 32];
         let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me);
         // self is not in the boundary member set (not in the R = n denominator).
-        let st = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&other], &[]);
+        let st = status(
+            Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)),
+            &[&other],
+            &[],
+        );
         assert_eq!(s.decide(&st), None);
     }
 
@@ -6813,7 +6872,9 @@ mod tests {
     #[test]
     fn boot_preflight_refuses_under_versioned_binary() {
         // a boundary needing one version beyond this build must be refused.
-        assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION).is_err());
+        assert!(
+            sdk::check_required_version(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION).is_err()
+        );
         // exactly at the build ceiling, and below it, boots.
         assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION).is_ok());
         if MAX_PROTOCOL_VERSION > 0 {
