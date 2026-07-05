@@ -16,6 +16,9 @@ async-trait = { workspace = true }
 # module-agnostic — this is an interface crate, not a module impl (same shape as
 # governance depending on valset-interface).
 upgrade-interface = { workspace = true }
+# TYPES-ONLY interface dep, same shape: the drain's delivery injection reads
+# the dispatch module's committed mailbox count between blocks.
+dispatch-interface = { workspace = true }
 
 [dev-dependencies]
 # the end-to-end test stands a real qmdb-backed module on the deterministic
@@ -30,6 +33,11 @@ kv-interface = { workspace = true }
 upgrade = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
+# the delivery drain-injection test stands the real dispatch + saga modules
+# next to a stub receiver.
+dispatch = { workspace = true }
+saga = { workspace = true }
+saga-interface = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"

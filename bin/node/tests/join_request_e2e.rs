@@ -45,6 +45,8 @@ fn a_tokened_join_delivers_the_pubkey_and_manual_approval_promotes() {
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
+    // direct admission: ONE cutover seats the friend; it syncs the frozen
+    // boundary and promotes there.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
     cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);

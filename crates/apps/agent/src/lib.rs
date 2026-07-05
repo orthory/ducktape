@@ -929,6 +929,7 @@ impl AgentModule {
         ctx.emit_msg(Msg {
             target: self.saga.clone(),
             payload: saga_encode_msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: saga_id.clone(),
                 spec: encode_llm_request(&LlmRequest {
                     run_id: run_id.clone(),
@@ -2605,6 +2606,7 @@ mod tests {
             max_attempts,
             lease_views,
             capability,
+            pinned_assignee,
         } = &triggers[0]
         else {
             panic!("expected a trigger");
@@ -2620,6 +2622,7 @@ mod tests {
             Some("model-1"),
             "the record's capability rides the trigger for provider assignment"
         );
+        assert_eq!(*pinned_assignee, None, "chat runs never statically bind");
         let request = agent_interface::decode_llm_request(spec).unwrap();
         assert_eq!(
             request,

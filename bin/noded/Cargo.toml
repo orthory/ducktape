@@ -25,6 +25,8 @@ inbox = { workspace = true }
 automations = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
+dispatch = { workspace = true }
+dispatch-oracle = { workspace = true }
 agent-interface = { workspace = true }
 agent-oracle = { workspace = true }
 # host-side provider discovery: the LlmWorker runs the operator's locally

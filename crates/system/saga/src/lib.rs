@@ -126,6 +126,9 @@ struct Saga {
     max_attempts: u32,
     /// the current attempt's lease holder, if assignment is configured.
     assignee: Option<Vec<u8>>,
+    /// the trigger's static binding: when set, every attempt's assignee IS
+    /// this key — no pool query, no rendezvous.
+    pinned_assignee: Option<Vec<u8>>,
     /// the trigger's requested lease window in views, echoed onto every
     /// retry so re-leases reproduce the original grant deterministically.
     lease_views: Option<u64>,
@@ -200,6 +203,7 @@ fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
         out.extend_from_slice(&s.attempt.to_le_bytes());
         out.extend_from_slice(&s.max_attempts.to_le_bytes());
         put_opt_bytes(&mut out, s.assignee.as_deref());
+        put_opt_bytes(&mut out, s.pinned_assignee.as_deref());
         put_opt_u64(&mut out, s.lease_views);
         put_opt_u64(&mut out, s.lease_expires_at);
         put_opt_u64(&mut out, s.deadline);
@@ -306,10 +310,11 @@ fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
 fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
     let count = take_u64(&mut buf)?;
     // every saga costs at least its fixed-width fields — the id length prefix,
-    // one origin discriminant, seven option tags, three length prefixes,
+    // one origin discriminant, nine option tags, three length prefixes,
     // status, two u32s, and two u64s — so a count the input cannot possibly
     // hold is rejected before the loop builds anything.
-    const MIN_SAGA_BYTES: u64 = 8 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
+    const MIN_SAGA_BYTES: u64 =
+        8 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
     if count
         .checked_mul(MIN_SAGA_BYTES)
         .map_or(true, |need| need > buf.len() as u64)
@@ -345,6 +350,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
         let attempt = take_u32(&mut buf)?;
         let max_attempts = take_u32(&mut buf)?;
         let assignee = take_opt_bytes(&mut buf)?;
+        let pinned_assignee = take_opt_bytes(&mut buf)?;
         let lease_views = take_opt_u64(&mut buf)?;
         let lease_expires_at = take_opt_u64(&mut buf)?;
         let deadline = take_opt_u64(&mut buf)?;
@@ -364,6 +370,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
                 attempt,
                 max_attempts,
                 assignee,
+                pinned_assignee,
                 lease_views,
                 lease_expires_at,
                 deadline,
@@ -510,6 +517,7 @@ impl SagaModule {
             attempt: saga.attempt,
             max_attempts: saga.max_attempts,
             assignee: saga.assignee.clone(),
+            pinned_assignee: saga.pinned_assignee.clone(),
             lease_views: saga.lease_views,
             lease_expires_at: saga.lease_expires_at,
             deadline: saga.deadline,
@@ -555,11 +563,11 @@ impl SagaModule {
                     .query(valset, &valset_encode_query(&ValsetQuery::Validators))
                     .await
                     .ok()?;
-                let ValsetReply::Validators(validators) = valset_decode_reply(&reply).ok()?
-                else {
-                    return None;
-                };
-                validators
+                match valset_decode_reply(&reply).ok()? {
+                    ValsetReply::Validators(validators) => validators,
+                    // the module answered a different query — no pool.
+                    _ => return None,
+                }
             }
         };
         (!pool.is_empty()).then_some(pool)
@@ -605,12 +613,24 @@ impl SagaModule {
     }
 
     /// grant the current attempt's lease and ask the worker to run it: the
-    /// shared tail of trigger, error-retry, and lease-expiry-retry.
+    /// shared tail of trigger, error-retry, and lease-expiry-retry. a pinned
+    /// saga leases every attempt to its pinned key; everything else is
+    /// rendezvous-assigned from the pool.
     async fn lease_and_request(&mut self, ctx: &mut dyn Ctx, saga_id: String, mut saga: Saga) {
         let height = ctx.env().height;
-        saga.assignee = self
-            .compute_assignee(ctx, &saga_id, saga.capability.as_deref(), saga.attempt, height)
-            .await;
+        saga.assignee = match &saga.pinned_assignee {
+            Some(key) => Some(key.clone()),
+            None => {
+                self.compute_assignee(
+                    ctx,
+                    &saga_id,
+                    saga.capability.as_deref(),
+                    saga.attempt,
+                    height,
+                )
+                .await
+            }
+        };
         saga.lease_expires_at = lease_expiry(height, &saga.assignee, saga.lease_views);
         ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
             saga_id: saga_id.clone(),
@@ -683,6 +703,7 @@ impl Module for SagaModule {
                 max_attempts,
                 lease_views,
                 capability,
+                pinned_assignee,
             } => {
                 // a duplicate saga_id — staged this block or already committed
                 // — is a DETERMINISTIC NO-OP. (v1 silently reset the saga and
@@ -726,6 +747,16 @@ impl Module for SagaModule {
                         )));
                     }
                 }
+                // an empty pinned key is a caller bug, rejected rather than
+                // silently read as "no binding" (the same rule as an empty
+                // capability tag).
+                if let Some(key) = &pinned_assignee {
+                    if key.is_empty() {
+                        return Err(Error::Module(
+                            "trigger pinned_assignee must be non-empty when set".into(),
+                        ));
+                    }
+                }
                 // the callback-poison rule (design §4): a callback aimed at an
                 // unknown module — or at this module itself, which cannot
                 // decode its own callback — would abort every future terminal
@@ -754,6 +785,7 @@ impl Module for SagaModule {
                     attempt: 0,
                     max_attempts,
                     assignee: None,
+                    pinned_assignee,
                     lease_views,
                     lease_expires_at: None,
                     deadline,
@@ -986,7 +1018,8 @@ mod tests {
     impl CaptureCtx {
         fn new() -> Self {
             Self {
-                env: Env { protocol_version: 0,
+                env: Env {
+                    protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: Origin::System,
@@ -1072,6 +1105,7 @@ mod tests {
     /// a trigger with fire-and-forget defaults; tests override fields inline.
     fn trigger_msg(id: &str, spec: &[u8]) -> SagaMsg {
         SagaMsg::Trigger {
+            pinned_assignee: None,
             saga_id: id.into(),
             spec: spec.to_vec(),
             reply_to: None,
@@ -1132,6 +1166,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"hello".to_vec(),
                 reply_to: None,
@@ -1218,6 +1253,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: None,
@@ -1244,6 +1280,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: Some("nope".into()),
@@ -1266,6 +1303,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s2".into(),
                 spec: Vec::new(),
                 reply_to: Some("saga".into()),
@@ -1287,6 +1325,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s3".into(),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
@@ -1309,6 +1348,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"work".to_vec(),
                 reply_to: Some("agent".into()),
@@ -1354,6 +1394,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"work".to_vec(),
                 reply_to: None,
@@ -1417,6 +1458,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
@@ -1459,6 +1501,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: None,
@@ -1527,6 +1570,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: vec![0u8; MAX_SPEC_BYTES + 1],
                 reply_to: None,
@@ -1549,6 +1593,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"w".to_vec(),
                 reply_to: None,
@@ -1638,6 +1683,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
@@ -1697,6 +1743,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"w".to_vec(),
                 reply_to: None,
@@ -1749,6 +1796,7 @@ mod tests {
                 &mut m,
                 &mut ctx,
                 &msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
                     saga_id: format!("s{i:02}"),
                     spec: Vec::new(),
                     reply_to: None,
@@ -1801,6 +1849,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
@@ -2027,6 +2076,7 @@ mod tests {
     /// capability registry's providers, never the valset.
     fn capability_trigger(id: &str, tag: &str) -> Msg {
         msg(&SagaMsg::Trigger {
+            pinned_assignee: None,
             saga_id: id.into(),
             spec: b"w".to_vec(),
             reply_to: None,
@@ -2130,6 +2180,85 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_trigger_leases_every_attempt_to_the_pinned_key() {
+        // the pinned key is disjoint from the valset AND the provider pool,
+        // so any rendezvous leak in assignment fails the assertions.
+        let pinned = vec![7u8; 32];
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new()
+            .at(4)
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(vec![vec![9u8; 32]]);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 2,
+                lease_views: None,
+                capability: Some("alpha".into()),
+                pinned_assignee: Some(pinned.clone()),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.assignee, Some(pinned.clone()), "attempt 0 leases pinned");
+        assert_eq!(v.pinned_assignee, Some(pinned.clone()));
+        assert_eq!(v.lease_expires_at, Some(4 + DEFAULT_LEASE_VIEWS));
+
+        // strict: the announced provider does NOT hold this lease...
+        let pending_root = m.root();
+        let mut ctx = CaptureCtx::new().from_origin(Origin::External(vec![9u8; 32]));
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"foreign".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(m.root(), pending_root, "a non-pinned result is a no-op");
+
+        // ... and the pinned key's Err consumes the attempt: the RETRY is
+        // leased to the pinned key again, never rendezvous-reassigned.
+        let mut ctx = CaptureCtx::new()
+            .at(5)
+            .from_origin(Origin::External(pinned.clone()))
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(vec![vec![9u8; 32]]);
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Err("transient".into()))).unwrap();
+        commit(&mut m);
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.attempt, 1);
+        assert_eq!(v.assignee, Some(pinned.clone()), "the retry stays pinned");
+        assert_eq!(ctx.worker_requests()[0].assignee, Some(pinned));
+    }
+
+    #[test]
+    fn an_empty_pinned_assignee_is_rejected() {
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new();
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: Vec::new(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
+                capability: None,
+                pinned_assignee: Some(Vec::new()),
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pinned_assignee"), "got: {err}");
+    }
+
+    #[test]
     fn empty_and_oversized_capability_tags_are_rejected() {
         let mut m = SagaModule::new("saga");
         let mut ctx = CaptureCtx::new();
@@ -2139,6 +2268,7 @@ mod tests {
                 &mut m,
                 &mut ctx,
                 &msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
                     saga_id: "s1".into(),
                     spec: Vec::new(),
                     reply_to: None,
@@ -2167,6 +2297,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "a".into(),
                 spec: Vec::new(),
                 reply_to: None,
@@ -2182,6 +2313,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "b".into(),
                 spec: Vec::new(),
                 reply_to: None,
@@ -2212,6 +2344,7 @@ mod tests {
         fn script() -> Vec<Vec<Msg>> {
             let alice = |saga_id: &str, max_attempts: u32, deadline: Option<u64>| {
                 msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
                     saga_id: saga_id.into(),
                     spec: b"spec".to_vec(),
                     reply_to: None,
@@ -2230,6 +2363,7 @@ mod tests {
                     // a capability-tagged saga: the tag rides the committed
                     // encoding, so it must replay byte-identically too.
                     msg(&SagaMsg::Trigger {
+                        pinned_assignee: None,
                         saga_id: "d".into(),
                         spec: b"spec".to_vec(),
                         reply_to: None,

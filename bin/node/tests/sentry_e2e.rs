@@ -161,8 +161,8 @@ fn joiner_enters_through_a_sentry() {
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
-    // the founder cuts over to epoch 1; epoch 1 stalls at its base (quorum
-    // 2-of-2) until the friend arrives — a frozen boundary at the genesis floor.
+    // direct admission: ONE cutover seats the friend — epoch 1 stalls at
+    // its base (quorum 2-of-2) until the friend arrives.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
 
     // the parked node syncs the boundary and promotes — every byte of that

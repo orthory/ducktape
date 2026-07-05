@@ -189,7 +189,7 @@ fn synced_store_reconstructs_source_root_and_history() {
         let target = src.sync_target().await;
         let resolver = src.into_resolver();
 
-        let synced = Chat::sync_from(context.child("dst"), "dst", target, resolver).await;
+        let synced = Chat::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
 
         assert_eq!(
             synced.root(),

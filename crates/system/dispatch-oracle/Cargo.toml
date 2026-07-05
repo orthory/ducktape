@@ -1,0 +1,20 @@
+[package]
+name = "dispatch-oracle"
+edition.workspace = true
+version.workspace = true
+
+# host-side worker for dispatch WorkSpec saga effects: resolve the capability
+# to a local provider, feed the payload VERBATIM, submit the raw answer. no
+# prompt text, no output parsing opinions, no credential handling — contract
+# enforcement is the dispatch module's consensus-side validation.
+[dependencies]
+async-trait = { workspace = true }
+capability-host = { workspace = true }
+dispatch-interface = { workspace = true }
+reactor = { workspace = true }
+saga-interface = { workspace = true }
+sdk = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { workspace = true, features = ["rt", "macros"] }

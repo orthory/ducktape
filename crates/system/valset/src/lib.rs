@@ -123,6 +123,16 @@ impl Valset {
         Self::overlay(&self.validators, &self.pending)
     }
 
+    /// the COMMITTED membership pair — `(validators, observers)`, sorted.
+    /// the post-install/rebuild witness (both classes must survive a sync
+    /// byte-for-byte); reads inside a block use the staged projections.
+    pub fn membership(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (
+            self.validators.iter().cloned().collect(),
+            self.observers.iter().cloned().collect(),
+        )
+    }
+
     /// the committed observer set with this block's staged changes applied.
     fn effective_observers(&self) -> Vec<Vec<u8>> {
         Self::overlay(&self.observers, &self.pending_observers)

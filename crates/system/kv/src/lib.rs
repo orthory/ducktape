@@ -265,7 +265,7 @@ where
         id: impl Into<ModuleId>,
         target: KvTarget,
         resolver: R,
-    ) -> Self
+    ) -> Result<Self, String>
     where
         R: DbResolver<KvDb<E>>,
     {
@@ -284,12 +284,16 @@ where
             reached_target_tx: None,
             max_retained_roots: 8,
         };
-        let db = sync::sync(config).await.expect("qmdb sync failed");
-        Self {
+        // a sync failure (transport blip, dropped source) is the caller's
+        // retry loop to own — never a process kill.
+        let db = sync::sync(config)
+            .await
+            .map_err(|e| format!("qmdb sync: {e:?}"))?;
+        Ok(Self {
             id,
             db,
             pending: BTreeMap::new(),
-        }
+        })
     }
 }
 

@@ -1,6 +1,11 @@
 //! network-shape live admission: a fresh identity produced by `join` can start
-//! immediately, park as a read-only observer, and promote once a running member
-//! admits it through governance.
+//! immediately, park as a read-only observer, and promote through the
+//! TWO-PHASE membership protocol once a running member admits it through
+//! governance — registration lands it STANDBY (cutover #1, quorum unchanged),
+//! the parked node proves a full state sync and announces ONLINE with its own
+//! signed proof, a member relays that into the ordered lane, and the
+//! ACTIVATION cutover (#2) widens the quorum, at which point the joiner
+//! promotes.
 
 mod common;
 
@@ -54,6 +59,9 @@ fn network_shape_joiner_parks_until_promote() {
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
+    // direct admission: ONE cutover seats the friend; it syncs the frozen
+    // boundary and promotes there. (the staged observer flow has its own
+    // leg below.)
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
     cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);

@@ -46,6 +46,11 @@ pub const MAX_DISPATCHES: u32 = 1024;
 /// [`BASELINE_VERSION`].
 pub const UPGRADE_MODULE_ID: &str = "upgrade";
 
+/// the genesis-constant module id the `dispatch` module registers under. read
+/// by the drain's delivery injection ([`Host::pending_deliveries`]); absent on
+/// a net without the module, in which case nothing is ever injected.
+pub const DISPATCH_MODULE_ID: &str = dispatch_interface::DEFAULT_DISPATCH_TARGET;
+
 /// the block-constant consensus context for one [`Host::submit_at`]: the agreed
 /// `height` / `consensus_time` (identical on every validator — sourced from the
 /// finalized view) and the ROOT op's `origin`. these are constant across every
@@ -463,6 +468,36 @@ impl Host {
         }
     }
 
+    /// the SYSTEM-ORIGIN `DeliverPending` the drain injects when the
+    /// committed dispatch mailbox is non-empty, or `None` when there is
+    /// nothing to deliver.
+    ///
+    /// this is the never-pop-stack rule's other half: a dispatch result
+    /// commits into the mailbox in one block, and THIS injection — keyed
+    /// purely on that committed state — hands it to the receiver in a later
+    /// block. it rides the same drain as recovery-replay and
+    /// state-sync-install, so delivery reconstructs byte-for-byte on every
+    /// node. idempotent: the injected dispatch drains (a bounded batch of)
+    /// the mailbox, so blocks after the last delivery inject nothing. ABSENT
+    /// until the module is registered — the query errors → `None`, keeping
+    /// the drain byte-identical on a net without dispatch.
+    async fn pending_deliveries(&self) -> Option<Msg> {
+        let req =
+            dispatch_interface::encode_query(&dispatch_interface::DispatchQuery::PendingDeliveries);
+        let bytes = self.query(DISPATCH_MODULE_ID, &req).await.ok()?;
+        let dispatch_interface::DispatchReply::PendingDeliveries(pending) =
+            dispatch_interface::decode_reply(&bytes).ok()?
+        else {
+            return None;
+        };
+        (pending > 0).then(|| Msg {
+            target: DISPATCH_MODULE_ID.into(),
+            payload: dispatch_interface::encode_msg(
+                &dispatch_interface::DispatchMsg::DeliverPending {},
+            ),
+        })
+    }
+
     /// the current app-hash: [`state::global_root`] over the registered modules.
     pub fn app_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();
@@ -748,6 +783,16 @@ impl Host {
         // registered — `pending_advance` returns `None` when the module is absent.
         if let Some(advance) = self.pending_advance(height).await {
             queue.push_back((Origin::System, advance));
+        }
+        // DETERMINISTIC DELIVERY INJECTION: when the committed dispatch
+        // mailbox holds results, append EXACTLY ONE System-origin
+        // `DeliverPending` so the dispatch module hands them to their
+        // receivers THIS block — at least one block after each result
+        // committed (the mailbox read is committed state, so results staged
+        // by this very block are invisible here). INERT until the module is
+        // registered — `pending_deliveries` returns `None` when absent.
+        if let Some(deliver) = self.pending_deliveries().await {
+            queue.push_back((Origin::System, deliver));
         }
         let mut events: Vec<Event> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();

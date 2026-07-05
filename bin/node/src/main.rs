@@ -59,6 +59,8 @@ use commonware_p2p::authenticated::discovery::{self, Network};
 use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
+use dispatch::DispatchModule;
+use dispatch_oracle::DispatchWorker;
 use futures::{FutureExt as _, StreamExt as _};
 
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
@@ -632,6 +634,9 @@ async fn genesis_host(
         // an identical view of who can run what. its genesis contribution is an
         // empty registry (ZERO root) until nodes announce.
         Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
+        // the task plane: recipe manifests + capability-routed dispatch with
+        // next-block result delivery (the host's DeliverPending injection).
+        Box::new(DispatchModule::new("dispatch", "saga")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
         // the origin-gated display-name registry: each verified submit origin
@@ -729,6 +734,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("capability install: {e}"))?;
 
+    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    let (bytes, root) = snapshot_of("dispatch")?;
+    dispatch
+        .install(bytes, root)
+        .map_err(|e| format!("dispatch install: {e}"))?;
+
     let mut tasks = Tasks::new("tasks");
     let (bytes, root) = snapshot_of("tasks")?;
     tasks
@@ -805,6 +816,7 @@ async fn restore_host(
         Box::new(upgrade),
         Box::new(saga),
         Box::new(capability),
+        Box::new(dispatch),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -880,7 +892,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await?;
 
     let (target, resolver) = fetch_target("document").await?;
     let document = Document::sync_from(
@@ -889,7 +901,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await?;
 
     let (target, resolver) = fetch_target("pages").await?;
     let pages = Pages::sync_from(
@@ -898,7 +910,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await?;
 
     let (target, resolver) = fetch_target("chat").await?;
     let chat = Chat::sync_from(
@@ -907,7 +919,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await?;
 
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
@@ -946,6 +958,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     capability
         .install(&bytes, root)
         .map_err(|e| format!("capability install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("dispatch").await?;
+    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    dispatch
+        .install(&bytes, root)
+        .map_err(|e| format!("dispatch install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance = Governance::new("governance", "valset", "upgrade");
@@ -1047,6 +1065,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(upgrade),
         Box::new(saga),
         Box::new(capability),
+        Box::new(dispatch),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -1477,8 +1496,7 @@ async fn stage_shipped_index<C: statesync::SyncClient>(
             let blob = statesync::fetch_index_db(client, boundary, db)
                 .await
                 .map_err(|e| format!("{db}: {e}"))?;
-            let files =
-                statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
+            let files = statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
             indexer::stage_shipped_db(&index_base, db, &files).map_err(|e| e.to_string())?;
             staged += 1;
         }
@@ -1489,9 +1507,7 @@ async fn stage_shipped_index<C: statesync::SyncClient>(
     }
     .await;
     match staged {
-        Ok(0) => println!(
-            "[node {label}] source ships no index — views heal from verified state"
-        ),
+        Ok(0) => println!("[node {label}] source ships no index — views heal from verified state"),
         Ok(n) => println!(
             "[node {label}] shipped index staged ({n} databases) — adopted at the promoted \
              reboot; contents are trusted from the source, not verified (spec §7 lane 2)"
@@ -2424,7 +2440,11 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // v3 invite holds its dial hints as `reach` (bootstrap is empty), so
         // check the union, not just bootstrap — else a reachable NAT'd member
         // is wrongly refused.
-        None if descriptor.reach_hints().map(|h| h.is_empty()).unwrap_or(true) => {
+        None if descriptor
+            .reach_hints()
+            .map(|h| h.is_empty())
+            .unwrap_or(true) =>
+        {
             return Err(
                 "no dialable address: give node.toml a concrete `listen` port or an \
                         `advertised` addr so a joiner can reach the network"
@@ -2903,8 +2923,9 @@ fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
-                "admitted {pubkey_hex}: the validator set changes at the next epoch cutover, \
-                 and the joiner's parked node will sync and promote itself"
+                "admitted {pubkey_hex} as STANDBY: the joiner's parked node will verify a \
+                 state sync, announce itself online, and join the consensus quorum at the \
+                 activation cutover — no quorum slot is spent until the node is actually up"
             );
             Ok(())
         }
@@ -3057,9 +3078,7 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     .expect("the poll only accepts a present proposal");
     match settled.status {
         ProposalStatus::Passed => {
-            eprintln!(
-                "removed {pubkey_hex}: the validator set changes at the next epoch cutover"
-            );
+            eprintln!("removed {pubkey_hex}: the validator set changes at the next epoch cutover");
             Ok(())
         }
         status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
@@ -3484,22 +3503,32 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     );
     // coordinated reach targets are split OUT of the TCP mesh dialer (a
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
-    // there was a silent no-op). reaching them needs the nat client to
-    // hole-punch/relay through the coordinator and bring up a WireGuard tunnel
-    // — the reachability data plane. that plane runs behind the
-    // `wireguard_listen` key and drives a real interface by default
-    // (`wireguard_effect = "fake"` opts out), but the TCP mesh dialer does
-    // not route over the tunnel yet, so a coordinated-only invite still
-    // cannot carry mesh traffic; surface it loudly rather than park silently.
-    // see docs/deploy/private-cutover-integration-gap.md.
+    // there was a silent no-op). reaching them is the reachability plane's
+    // job: gossip relays through whatever mesh links exist, the nat client
+    // hole-punches/relays the WireGuard path through the coordinator, and
+    // once tunnels apply the mesh dials the target's advertised overlay
+    // address over the tunnel (the target sets `advertised = "overlay"`).
+    // what still needs a TCP foothold is the gossip itself: with ZERO
+    // bootstrap links nothing carries this node's records anywhere, so a
+    // coordinated-ONLY config parks until the persisted-mesh/coordinator-
+    // carried-gossip seam ships — surface that loudly rather than park
+    // silently.
     if !coordinated.is_empty() {
-        println!(
-            "[node {label}] WARNING: {} coordinated reach target(s) need mesh traffic to flow \
-             over a WireGuard tunnel, but the mesh dialer does not route over tunnels yet — \
-             these peers are UNREACHABLE for mesh traffic. use a direct/fronted invite for \
-             now.",
-            coordinated.len()
-        );
+        if bootstrappers.is_empty() {
+            println!(
+                "[node {label}] WARNING: {} coordinated reach target(s) but NO direct/fronted \
+                 bootstrap link — tunnel bring-up gossip has no path to ride, so these peers \
+                 stay unreachable. add at least one direct/fronted hint (an ephemeral ingress \
+                 is enough) for the join window.",
+                coordinated.len()
+            );
+        } else {
+            println!(
+                "[node {label}] {} coordinated reach target(s): mesh traffic flows over the \
+                 WireGuard tunnel once the reachability plane converges.",
+                coordinated.len()
+            );
+        }
         for (target, coord, _coord_key) in &coordinated {
             println!(
                 "[node {label}]   coordinated target {} via coordinator {coord:?}",
@@ -4335,13 +4364,27 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         }
         let initial_resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
 
+        // the TRANSPORT baseline adds the committed OBSERVER set (granted,
+        // quorum-exempt keys the mesh must admit so they can sync). read
+        // LIVE from the recovered host, unlike the frozen participant set
+        // above: an observer grant arms its own cutover, so within any epoch
+        // the observer set is constant — except a reboot inside that cutover
+        // window, where this node briefly tracks the wider set alone; the
+        // boundary re-tracks identically a few views later.
+        let initial_observer_keys: Vec<ed25519::PublicKey> = read_valset_observers(&host)
+            .await
+            .iter()
+            .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
+            .collect();
+
         // the validator-owned transport mesh, tracked at index = epoch: the
-        // epoch's participants ∪ the descriptor mesh (genesis members + [dev]
-        // extras — kept authorized so demoted members and pre-genesis peers
-        // can still reach the statesync service). the SAME set on every node
-        // at this index: discovery kills peers whose bit-vector length
-        // disagrees at a shared index, and epoch participant sets are the
-        // only membership every node agrees on epoch-for-epoch.
+        // epoch's TRANSPORT members (participants ∪ standby registrants) ∪
+        // the descriptor mesh (genesis members + [dev] extras — kept
+        // authorized so demoted members and pre-genesis peers can still
+        // reach the statesync service). the SAME set on every node at this
+        // index: discovery kills peers whose bit-vector length disagrees at
+        // a shared index, and boundary-read membership is the only set every
+        // node agrees on epoch-for-epoch.
         let mesh_at = {
             let descriptor_mesh = peers.clone();
             move |epoch_members: &std::collections::BTreeSet<ed25519::PublicKey>| {
@@ -4355,7 +4398,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut mesh_oracle = oracle.clone();
         mesh_oracle.track(
             initial_resume_epoch,
-            mesh_at(&initial_member_keys.iter().cloned().collect()),
+            mesh_at(
+                &initial_member_keys
+                    .iter()
+                    .chain(initial_observer_keys.iter())
+                    .cloned()
+                    .collect(),
+            ),
         );
 
         // lanes for epochs BELOW the resume epoch are registered and
@@ -5236,13 +5285,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let providers = capability_host::discover()
             .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
-        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
-            blobs.clone(),
-            providers,
-            // this node's submit key: WorkerRequests leased to another
-            // node's key are skipped, not double-run.
-            signer.public_key().as_ref().to_vec(),
-        ))];
+        // a second, identical discovery for the dispatch worker: ProviderSet
+        // owns its providers (not Clone), and both discoveries read the same
+        // specs + PATH at boot, so the two surfaces cannot drift.
+        let dispatch_providers = capability_host::discover()
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+        let workers: Vec<Box<dyn reactor::Worker>> = vec![
+            Box::new(LlmWorker::new(
+                blobs.clone(),
+                providers,
+                // this node's submit key: WorkerRequests leased to another
+                // node's key are skipped, not double-run.
+                signer.public_key().as_ref().to_vec(),
+            )),
+            Box::new(DispatchWorker::new(
+                dispatch_providers,
+                signer.public_key().as_ref().to_vec(),
+            )),
+        ];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
         // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
         // this binary can execute. survives restart/late-join (state-driven, not a
@@ -6097,10 +6157,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         RpcRequest::JoinRequests => {
-                            // read-time hygiene: an approved joiner is a member
-                            // now — its request is settled, drop it.
+                            // read-time hygiene: an approved joiner holds
+                            // STANDING now (observer or already validator) —
+                            // its request is settled, drop it.
                             let members = read_members_from_host(node.host()).await;
-                            join_requests.retain(|joiner, _| !members.contains(joiner));
+                            let observers_now = read_valset_observers(node.host()).await;
+                            join_requests.retain(|joiner, _| {
+                                !members.contains(joiner) && !observers_now.contains(joiner)
+                            });
                             let views = join_requests
                                 .iter()
                                 .map(|(joiner, r)| JoinRequestView {
@@ -6153,11 +6217,20 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     };
                     // then membership: the issuer must still be a member (a
                     // removed member's outstanding invites die with it), and a
-                    // joiner that is already a member has nothing pending.
+                    // joiner that already holds standing — VALIDATOR or
+                    // OBSERVER — has nothing pending.
                     let members = read_members_from_host(node.host()).await;
+                    let observers_now = read_valset_observers(node.host()).await;
                     let joiner_bytes = verified.joiner.as_ref().to_vec();
                     if members.contains(&joiner_bytes) {
                         send_reply(false, "already a validator".into());
+                        continue;
+                    }
+                    if observers_now.contains(&joiner_bytes) {
+                        send_reply(
+                            false,
+                            "already an observer — a member promotes it into the quorum".into(),
+                        );
                         continue;
                     }
                     if !members.contains(&verified.issuer.as_ref().to_vec()) {
@@ -6825,10 +6898,16 @@ mod tests {
             let mut recovery = Recovery::open(context.child("post_catchup_ok"))
                 .await
                 .expect("open recovery");
-            let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
-                    .await
-                    .expect("catch up");
+            let applied = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                2,
+                frames.clone(),
+                None,
+            )
+            .await
+            .expect("catch up");
 
             assert_eq!(applied.applied, 2);
             assert_eq!(host.app_hash(), expected.app_hash());
@@ -6890,10 +6969,16 @@ mod tests {
                 .write_manifest(&base_manifest)
                 .await
                 .expect("write base manifest");
-            let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-                    .await
-                    .expect("catch up");
+            let applied = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                1,
+                vec![served],
+                None,
+            )
+            .await
+            .expect("catch up");
 
             assert_eq!(applied.applied, 1);
             assert_eq!(
@@ -6960,10 +7045,16 @@ mod tests {
             let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
                 .await
                 .expect("open recovery");
-            let err =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-                    .await
-                    .expect_err("seal mismatch must abort");
+            let err = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                1,
+                vec![served],
+                None,
+            )
+            .await
+            .expect_err("seal mismatch must abort");
 
             assert!(
                 err.contains("served seal"),
@@ -7038,7 +7129,11 @@ mod tests {
         assert_eq!(s.decide(&st), None, "the latch suppresses re-emission");
         // once the module records our signal, still silent even if the latch reset.
         s.signaled = None;
-        let st_ready = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&me], &[&me]);
+        let st_ready = status(
+            Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)),
+            &[&me],
+            &[&me],
+        );
         assert_eq!(s.decide(&st_ready), None, "module already holds our signal");
     }
 
@@ -7047,7 +7142,11 @@ mod tests {
         let me = vec![7u8; 32];
         let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
         // to_version beyond what this binary can execute: never lie about readiness.
-        let st = status(Some(("forge-v3", 100, MAX_PROTOCOL_VERSION + 1)), &[&me], &[]);
+        let st = status(
+            Some(("forge-v3", 100, MAX_PROTOCOL_VERSION + 1)),
+            &[&me],
+            &[],
+        );
         assert_eq!(s.decide(&st), None);
     }
 
@@ -7057,7 +7156,11 @@ mod tests {
         let other = vec![9u8; 32];
         let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me);
         // self is not in the boundary member set (not in the R = n denominator).
-        let st = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&other], &[]);
+        let st = status(
+            Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)),
+            &[&other],
+            &[],
+        );
         assert_eq!(s.decide(&st), None);
     }
 
@@ -7076,7 +7179,9 @@ mod tests {
     #[test]
     fn boot_preflight_refuses_under_versioned_binary() {
         // a boundary needing one version beyond this build must be refused.
-        assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION).is_err());
+        assert!(
+            sdk::check_required_version(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION).is_err()
+        );
         // exactly at the build ceiling, and below it, boots.
         assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION).is_ok());
         if MAX_PROTOCOL_VERSION > 0 {

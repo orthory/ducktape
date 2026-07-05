@@ -207,7 +207,7 @@ async fn validators(v: &Valset) -> Vec<Vec<u8>> {
         .unwrap();
     match valset_decode_reply(&reply).unwrap() {
         ValsetReply::Validators(list) => list,
-        other => panic!("expected Validators, got {other:?}"),
+        other => panic!("unexpected valset reply shape: {other:?}"),
     }
 }
 
@@ -421,14 +421,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         .await;
 
         let mut src_valset = Valset::new("valset");
-        commit_op(
-            &mut src_valset,
-            0,
-            valset_encode_msg(&ValsetMsg::Join {
-                key: validator_key(7),
-            }),
-        )
-        .await;
+        // an established source network: one ACTIVE validator (genesis-style
+        // seeding — a Join alone lands STANDBY now) plus one standby
+        // registrant, so the two-class snapshot round-trips both sections.
+        src_valset.insert(validator_key(7));
         commit_op(
             &mut src_valset,
             0,
@@ -443,6 +439,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             &mut src_saga,
             0,
             saga_encode_msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "greet".into(),
                 spec: b"reverse hello".to_vec(),
                 reply_to: None,
@@ -469,6 +466,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             &mut src_saga,
             0,
             saga_encode_msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "translate".into(),
                 spec: b"hola".to_vec(),
                 reply_to: None,
@@ -675,21 +673,24 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             kv_target,
             kv_resolver,
         )
-        .await;
+        .await
+        .expect("sync_from");
         let join_document = Document::sync_from(
             context.child("joiner_document"),
             "document-rebuilt",
             document_target,
             document_resolver,
         )
-        .await;
+        .await
+        .expect("sync_from");
         let join_chat = Chat::sync_from(
             context.child("joiner_chat"),
             "chat-rebuilt",
             chat_target,
             chat_resolver,
         )
-        .await;
+        .await
+        .expect("sync_from");
 
         let mut join_directory = Directory::new("directory");
         join_directory
@@ -809,8 +810,10 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
 
         assert_eq!(join_directory.get("name"), Some(&"world".to_string()));
 
-        assert_eq!(src_validators.len(), 2);
+        assert_eq!(src_validators.len(), 1, "one ACTIVE source validator");
         assert_eq!(validators(&join_valset).await, src_validators);
+        // both membership classes survive the rebuild byte-for-byte.
+        assert_eq!(join_valset.membership(), src_valset.membership());
 
         let reply = join_saga
             .query(&saga_encode_query(&SagaQuery::Get {

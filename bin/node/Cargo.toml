@@ -41,6 +41,9 @@ saga-interface = { workspace = true }
 capability = { workspace = true }
 capability-interface = { workspace = true }
 capability-host = { workspace = true }
+# the task plane: recipe manifests + capability dispatch + its host worker.
+dispatch = { workspace = true }
+dispatch-oracle = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
 pages = { workspace = true }
