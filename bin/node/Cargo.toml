@@ -55,6 +55,13 @@ jobs = { workspace = true }
 agent = { workspace = true }
 agent-oracle = { workspace = true }
 reactor = { workspace = true }
+# the staged node-driven WireGuard plane: the reachability orchestrator runs
+# on its own plain-tokio thread (mirroring the app-surface split) behind the
+# `wireguard_listen` node.toml key; wireguard-upgrade/-effect supply the
+# endpoint types and the phase-A fake effect it drives.
+reachability = { workspace = true }
+wireguard-upgrade = { workspace = true }
+wireguard-effect = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).

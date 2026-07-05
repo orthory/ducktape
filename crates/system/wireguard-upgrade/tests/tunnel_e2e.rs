@@ -41,6 +41,7 @@ fn record(
     signer: &PrivateKey,
     set: &ActiveValidatorSet,
     last_octet: u8,
+    wg: X25519PublicKey,
     capabilities: Vec<MeshCapability>,
     nonce: u64,
 ) -> EndpointRecord {
@@ -51,6 +52,7 @@ fn record(
         valset_root: set.valset_root,
         admission_root: set.admission_root,
         validator_identity: id(signer),
+        wireguard_public_key: wg,
         control_endpoint: endpoint(&policy, [1, 1, 1, last_octet], 443, Transport::Tcp),
         wireguard_endpoint: endpoint(&policy, [8, 8, 8, last_octet], 51820, Transport::Udp),
         capabilities,
@@ -82,18 +84,18 @@ fn three_party_epoch(
 /// every validator's signed advertisement over the same records — the gossip
 /// each node would receive off the mesh.
 fn advertisements(
-    parties: &[(&PrivateKey, u8, Vec<MeshCapability>)],
+    parties: &[(&PrivateKey, u8, X25519PublicKey, Vec<MeshCapability>)],
     set: &ActiveValidatorSet,
 ) -> Vec<EndpointAdvertisement> {
     let records: Vec<EndpointRecord> = parties
         .iter()
-        .map(|(sk, octet, caps)| record(sk, set, *octet, caps.clone(), 1))
+        .map(|(sk, octet, wg, caps)| record(sk, set, *octet, *wg, caps.clone(), 1))
         .collect();
     let mesh_version = compute_mesh_version(&records).unwrap();
     parties
         .iter()
         .zip(records)
-        .map(|((sk, _, _), rec)| EndpointAdvertisement::sign(rec, mesh_version, sk))
+        .map(|((sk, _, _, _), rec)| EndpointAdvertisement::sign(rec, mesh_version, sk))
         .collect()
 }
 
@@ -200,9 +202,9 @@ fn both_parties_validate_but_the_plan_is_initiator_local() {
     let overlay = OverlayPolicy::default_v4();
     let ads = advertisements(
         &[
-            (&a, 10, vec![]),
-            (&b, 20, vec![]),
-            (&c, 30, vec![MeshCapability::Relay]),
+            (&a, 10, xkey(0x0a), vec![]),
+            (&b, 20, xkey(0x0b), vec![]),
+            (&c, 30, xkey(0x0c), vec![MeshCapability::Relay]),
         ],
         &set,
     );
@@ -329,9 +331,9 @@ fn responder_derives_its_own_install_plan_from_validate_upgrade_as() {
     let overlay = OverlayPolicy::default_v4();
     let ads = advertisements(
         &[
-            (&a, 10, vec![]),
-            (&b, 20, vec![]),
-            (&c, 30, vec![MeshCapability::Relay]),
+            (&a, 10, xkey(0x0a), vec![]),
+            (&b, 20, xkey(0x0b), vec![]),
+            (&c, 30, xkey(0x0c), vec![MeshCapability::Relay]),
         ],
         &set,
     );
@@ -448,17 +450,18 @@ fn responder_derives_its_own_install_plan_from_validate_upgrade_as() {
 
 /// docs/wireguard-tunnel-upgrade.md: "Implementations must ship fixed test
 /// vectors for this preimage so that independent nodes produce the same mesh
-/// version from the same admitted set." this pins the v1 preimage — an
-/// accidental encoding change fails HERE instead of splitting a live mesh.
-/// (a deliberate protocol change updates the constant in the same commit.)
+/// version from the same admitted set." this pins the v2 preimage (v1 + the
+/// record's `wireguard_public_key`) — an accidental encoding change fails
+/// HERE instead of splitting a live mesh. (a deliberate protocol change
+/// updates the constant in the same commit.)
 ///
 /// every input is a LITERAL — identity bytes are written out, not derived
 /// through a signature crate — so an independent implementation can reproduce
 /// the vector from this file alone, and no dependency bump can move it.
 #[test]
-fn mesh_version_v1_fixed_vector() {
-    const MESH_VERSION_V1_VECTOR: &str =
-        "2523c89471d7d40906b27c38b455b93abfa69428981890ed722822972accb0ed";
+fn mesh_version_v2_fixed_vector() {
+    const MESH_VERSION_V2_VECTOR: &str =
+        "bfbc4e1ac6a8f3ef59f77bcdf02ba2087b679685c4e740a251497c8679c7baa8";
 
     let policy = PortPolicy::production();
     let literal_record = |identity_byte: u8, host_octet: u8, relay: bool| EndpointRecord {
@@ -467,6 +470,10 @@ fn mesh_version_v1_fixed_vector() {
         valset_root: Root([0x22; 32]),
         admission_root: AdmissionRoot([0x33; 32]),
         validator_identity: ValidatorIdentity([identity_byte; 32]),
+        // literal like the identity: the wg key is the identity byte with the
+        // top bit flipped, written out so the vector derives from this file
+        // alone.
+        wireguard_public_key: X25519PublicKey([identity_byte ^ 0x80; 32]),
         control_endpoint: endpoint(&policy, [1, 1, 1, host_octet], 443, Transport::Tcp),
         wireguard_endpoint: endpoint(&policy, [8, 8, 8, host_octet], 51820, Transport::Udp),
         capabilities: if relay {
@@ -485,9 +492,18 @@ fn mesh_version_v1_fixed_vector() {
     let version = compute_mesh_version(&records).unwrap();
     assert_eq!(
         hex32(version.0),
-        MESH_VERSION_V1_VECTOR,
-        "the mesh-version v1 preimage changed — if this is deliberate, update the vector"
+        MESH_VERSION_V2_VECTOR,
+        "the mesh-version v2 preimage changed — if this is deliberate, update the vector"
     );
+
+    // v2-specific sensitivity: rotating one validator's wireguard key moves
+    // the version — the mesh commits to the key set, not just endpoints.
+    let rekeyed = {
+        let mut r = records.clone();
+        r[0].wireguard_public_key = X25519PublicKey([0x5a; 32]);
+        compute_mesh_version(&r).unwrap()
+    };
+    assert_ne!(rekeyed, version);
 
     // sensitivity: any endpoint or set change moves the version...
     let moved = {
@@ -527,9 +543,9 @@ fn epoch_cutover_revokes_departed_validators_and_rekeys_survivors() {
     let (a, b, c, set7) = three_party_epoch(7, 9, 8);
     let ads7 = advertisements(
         &[
-            (&a, 10, vec![]),
-            (&b, 20, vec![]),
-            (&c, 30, vec![MeshCapability::Relay]),
+            (&a, 10, xkey(0x0a), vec![]),
+            (&b, 20, xkey(0x0b), vec![]),
+            (&c, 30, xkey(0x0c), vec![MeshCapability::Relay]),
         ],
         &set7,
     );
@@ -568,13 +584,16 @@ fn epoch_cutover_revokes_departed_validators_and_rekeys_survivors() {
         vec![id(&a8), id(&b8)],
     )
     .unwrap();
-    let ads8 = advertisements(&[(&a8, 10, vec![]), (&b8, 20, vec![])], &set8);
+    let ads8 = advertisements(
+        &[(&a8, 10, xkey(0xa8), vec![]), (&b8, 20, xkey(0xb8), vec![])],
+        &set8,
+    );
     let view8 = MeshView::verify(set8.clone(), ads8.clone(), &policy, 10).unwrap();
     assert_ne!(view8.mesh_version, view7.mesh_version);
 
     // the departed validator's fresh epoch-8 advertisement is rejected: it is
     // simply not in the admitted set, however well-signed.
-    let mut c_record = record(&c, &set8, 30, vec![MeshCapability::Relay], 2);
+    let mut c_record = record(&c, &set8, 30, xkey(0x0c), vec![MeshCapability::Relay], 2);
     c_record.epoch = 8;
     let c_ad = EndpointAdvertisement::sign(c_record, view8.mesh_version, &c);
     let mut with_c = ads8.clone();
@@ -657,9 +676,9 @@ fn relay_fallback_uses_only_admitted_relay_validators() {
     let overlay = OverlayPolicy::default_v4();
     let ads = advertisements(
         &[
-            (&a, 10, vec![]),
-            (&b, 20, vec![]),
-            (&c, 30, vec![MeshCapability::Relay]),
+            (&a, 10, xkey(0x0a), vec![]),
+            (&b, 20, xkey(0x0b), vec![]),
+            (&c, 30, xkey(0x0c), vec![MeshCapability::Relay]),
         ],
         &set,
     );
@@ -764,4 +783,124 @@ fn relay_fallback_uses_only_admitted_relay_validators() {
         .unwrap_err(),
         UpgradeError::InvalidRelay
     );
+}
+
+// ── advertised-key pinning + the ULA-v6 overlay ─────────────────────────────
+
+/// the handshake's X25519 keys are pinned to the mesh-versioned records: a
+/// fresh session key the mesh never advertised is refused even though every
+/// signature in the triple checks out.
+#[test]
+fn handshake_wireguard_keys_must_match_the_advertised_records() {
+    let (a, b, c, set) = three_party_epoch(7, 9, 8);
+    let policy = PortPolicy::production();
+    let overlay = OverlayPolicy::default_v4();
+    let ads = advertisements(
+        &[
+            (&a, 10, xkey(0x0a), vec![]),
+            (&b, 20, xkey(0x0b), vec![]),
+            (&c, 30, xkey(0x0c), vec![MeshCapability::Relay]),
+        ],
+        &set,
+    );
+    let view = MeshView::verify(set.clone(), ads, &policy, 10).unwrap();
+
+    // a signs its request under an unadvertised key: refused at the record
+    // pin, not at any signature check.
+    let hs = handshake(
+        &a,
+        &b,
+        xkey(0x77),
+        xkey(0x0b),
+        &view,
+        &policy,
+        &overlay,
+        None,
+    );
+    let mut cache = ReplayCache::default();
+    assert_eq!(
+        validate_upgrade(
+            &view,
+            &policy,
+            &overlay,
+            12,
+            &hs.request,
+            &hs.response,
+            &hs.ack,
+            &mut cache,
+        )
+        .unwrap_err(),
+        UpgradeError::HandshakeMismatch
+    );
+}
+
+/// the ULA-v6 overlay end-to-end: the validated plan's interface address and
+/// tunnel route are the two parties' identity-hash /128s inside the chain's
+/// fd::/48, complementary and disjoint, and they survive the defguard
+/// conversion.
+#[test]
+fn ula_v6_overlay_routes_the_tunnel_with_identity_pinned_128s() {
+    let (a, b, c, set) = three_party_epoch(7, 9, 8);
+    let policy = PortPolicy::production();
+    let overlay = OverlayPolicy::ula_v6("ducktape-e2e");
+    let ads = advertisements(
+        &[
+            (&a, 10, xkey(0x0a), vec![]),
+            (&b, 20, xkey(0x0b), vec![]),
+            (&c, 30, xkey(0x0c), vec![MeshCapability::Relay]),
+        ],
+        &set,
+    );
+    let view = MeshView::verify(set.clone(), ads, &policy, 10).unwrap();
+    let hs = handshake(
+        &a,
+        &b,
+        xkey(0x0a),
+        xkey(0x0b),
+        &view,
+        &policy,
+        &overlay,
+        None,
+    );
+    let mut cache = ReplayCache::default();
+    let plan = validate_upgrade(
+        &view,
+        &policy,
+        &overlay,
+        12,
+        &hs.request,
+        &hs.response,
+        &hs.ack,
+        &mut cache,
+    )
+    .unwrap();
+
+    let expected_local = AllowedIp {
+        addr: IpAddr::V6(ula_v6_member_addr("ducktape-e2e", id(&a))),
+        cidr: 128,
+    };
+    let expected_peer = AllowedIp {
+        addr: IpAddr::V6(ula_v6_member_addr("ducktape-e2e", id(&b))),
+        cidr: 128,
+    };
+    assert_eq!(plan.local_interface_ips(), &[expected_local]);
+    assert_eq!(plan.allowed_ips(), &[expected_peer]);
+    assert_ne!(expected_local, expected_peer);
+    let prefix = ula_v6_prefix("ducktape-e2e").octets();
+    for route in plan.local_interface_ips().iter().chain(plan.allowed_ips()) {
+        let IpAddr::V6(v6) = route.addr else {
+            panic!("ULA overlay routes must be v6");
+        };
+        assert_eq!(v6.octets()[..6], prefix[..6], "route inside the chain /48");
+    }
+
+    let listen = view.record(id(&a)).unwrap().wireguard_endpoint;
+    let iface = DefguardInterfaceConfig::from_plan(
+        "dt-e2e",
+        "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
+        listen,
+        vec![plan.clone()],
+    );
+    assert_eq!(iface.config.addresses.len(), 1);
+    assert_eq!(iface.config.peers.len(), 1);
 }

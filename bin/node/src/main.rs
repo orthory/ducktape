@@ -56,7 +56,7 @@ use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::{Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
+use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
@@ -149,6 +149,12 @@ const CHANNEL_STATE_SYNC: u64 = 4;
 /// verify and RECORD the join request for manual approval, and answer with an
 /// informational reply. see the `lobby` module.
 const CHANNEL_LOBBY: u64 = 5;
+/// the reachability channel: members gossip WireGuard endpoint records and
+/// signed advertisements and run the tunnel-upgrade handshake here (the
+/// `reachability` crate's staged node-driven WireGuard plane). registered in
+/// EVERY mode — an unregistered channel is a protocol violation that kills
+/// the sender's connection — and black-holed where the plane does not run.
+const CHANNEL_REACHABILITY: u64 = 6;
 /// while parked and un-admitted, re-announce every N park-loop attempts
 /// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
 /// survive member restarts (the request queue is in-memory), quiet enough to
@@ -2718,6 +2724,116 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// the reachability plane's thread body: derive the plane's endpoints, bind
+/// the nat client against the coordinated-reach coordinators, and drive
+/// `reachability::run` with the phase-A fake WireGuard effect. every failure
+/// path prints and returns — the plane is an overlay on a working node,
+/// never a reason to take the node down.
+#[allow(clippy::too_many_arguments)]
+async fn reachability_plane(
+    label: String,
+    chain_id: String,
+    signer: ed25519::PrivateKey,
+    wireguard_key_file: PathBuf,
+    wireguard_listen: std::net::SocketAddr,
+    advertised: Ingress,
+    coordinators: Vec<Ingress>,
+    commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
+    events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
+) {
+    use std::net::ToSocketAddrs as _;
+    let policy = reachability::open_port_policy();
+    // the plane's records carry IP literals only (the endpoint parser
+    // rejects DNS); a hostname ingress resolves ONCE at plane start.
+    let resolve_ingress = |ingress: &Ingress| match ingress {
+        Ingress::Socket(addr) => Some(*addr),
+        Ingress::Dns { host, port } => (host.as_str(), *port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next()),
+    };
+    let Some(control_addr) = resolve_ingress(&advertised) else {
+        eprintln!(
+            "[node {label}] reachability: advertised {advertised:?} did not resolve — plane \
+             not started"
+        );
+        return;
+    };
+    let control_endpoint = match wireguard_upgrade::Endpoint::new(
+        control_addr.ip(),
+        control_addr.port(),
+        wireguard_upgrade::Transport::Tcp,
+        &policy,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: advertised control endpoint rejected ({err:?}) — \
+                 set `advertised` to a dialable address; plane not started"
+            );
+            return;
+        }
+    };
+    let wireguard_endpoint = match wireguard_upgrade::Endpoint::new(
+        wireguard_listen.ip(),
+        wireguard_listen.port(),
+        wireguard_upgrade::Transport::Udp,
+        &policy,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: wireguard_listen rejected ({err:?}) — plane not \
+                 started"
+            );
+            return;
+        }
+    };
+    let mut coords: Vec<std::net::SocketAddr> = Vec::new();
+    for ingress in &coordinators {
+        match resolve_ingress(ingress) {
+            Some(addr) if !coords.contains(&addr) => coords.push(addr),
+            Some(_) => {}
+            None => eprintln!(
+                "[node {label}] reachability: coordinator {ingress:?} did not resolve — skipped"
+            ),
+        }
+    }
+    let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
+    let resolver = match reachability::NatResolver::bind(me, coords.clone()).await {
+        Ok(resolver) => resolver,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: nat client bind failed: {err} — plane not started"
+            );
+            return;
+        }
+    };
+    if let Some(reflexive) = resolver.reflexive() {
+        println!("[node {label}] reachability: coordinator-observed reflexive {reflexive}");
+    }
+    let config = reachability::ReachabilityConfig {
+        chain_id,
+        signer,
+        wireguard_key_file,
+        wireguard_listen: wireguard_endpoint,
+        control_endpoint,
+        coordinators: coords,
+        port_policy: policy,
+    };
+    if let Err(err) = reachability::run(
+        config,
+        wireguard_effect::FakeWireGuardEffect::default(),
+        resolver,
+        commands,
+        events,
+    )
+    .await
+    {
+        eprintln!("[node {label}] reachability plane exited: {err}");
+    }
+}
+
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
 /// or until state sync completes (`--sync-only`).
 ///
@@ -2739,6 +2855,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         storage_dir: storage,
         rpc_listen,
         http_listen,
+        wireguard_listen,
+        wireguard_key_file,
         dev_demo,
         checkpoint_blocks,
         invite_token,
@@ -2806,15 +2924,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
     // there was a silent no-op). reaching them needs the nat client to
     // hole-punch/relay through the coordinator and bring up a WireGuard tunnel
-    // — the reachability data plane. that wiring (and its inviter-signed
-    // rendezvous auth) is the node-reachability follow-on; until it lands a
-    // coordinated-only invite CANNOT connect, so surface it loudly rather than
-    // park silently. see docs/deploy/private-cutover-integration-gap.md.
+    // — the reachability data plane. that plane now runs STAGED behind the
+    // `wireguard_listen` key (rendezvous + handshakes are real, the interface
+    // effect is the recording fake), so a coordinated-only invite still
+    // cannot carry mesh traffic; surface it loudly rather than park silently.
+    // see docs/deploy/private-cutover-integration-gap.md.
     if !coordinated.is_empty() {
         println!(
-            "[node {label}] WARNING: {} coordinated reach target(s) require the WireGuard \
-             reachability plane, which this build does not yet drive — these peers are \
-             UNREACHABLE until the node-reachability wiring lands. use a direct/fronted \
+            "[node {label}] WARNING: {} coordinated reach target(s) require a live WireGuard \
+             tunnel, which this build only STAGES (fake interface effect) — these peers are \
+             UNREACHABLE for mesh traffic until the real effect lands. use a direct/fronted \
              invite for now.",
             coordinated.len()
         );
@@ -2824,6 +2943,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 hex_bytes(&target.as_ref()[..4])
             );
         }
+    }
+    if let Some(wg) = &wireguard_listen {
+        println!(
+            "[node {label}] reachability plane: STAGED — advertising WireGuard endpoint \
+             udp/{wg}; records, advertisements, and tunnel handshakes run for real, the \
+             interface effect is the phase-A recording fake (no root, no real tunnel)."
+        );
     }
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
@@ -2951,6 +3077,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         } else {
             signer.clone()
         };
+        // the staged reachability plane derives its advertised control
+        // endpoint from the mesh `advertised`; keep a copy — discovery's
+        // config consumes the original.
+        let advertised_reach = advertised.clone();
         let p2p_cfg = discovery::Config::local(
             p2p_signer,
             &namespace,
@@ -2998,6 +3128,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 context.child("blackhole_lobby").spawn(move |_ctx| async move {
                     while rx.recv().await.is_ok() {}
                 });
+            }
+            // the reachability lane: a sync-only observer runs no WireGuard
+            // plane, but the channel must exist — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_reachability")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
             network.start();
 
@@ -3115,6 +3253,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            // the reachability lane: only MEMBERS run the WireGuard plane; a
+            // parked joiner just keeps the channel legal — black-hole. (its
+            // promotion reboots the node into the validator path, which wires
+            // the plane for real.)
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_reachability")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
             // the lobby lane: where this parked node announces its key. member
             // replies are drained by a printer task — purely informational.
             let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
@@ -3614,6 +3762,134 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // as the derived lobby identity); this member verifies each announce
         // against the invite token it carries and RECORDS it for approval.
         let (mut lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+
+        // the reachability lane + the staged WireGuard plane. the channel is
+        // registered unconditionally (an unregistered channel is a protocol
+        // violation that kills the sender's connection); the plane itself
+        // runs only when `wireguard_listen` is configured, on its OWN
+        // plain-tokio OS thread (the app-surface split exactly), talking to
+        // the mesh through the two pump tasks below.
+        let (reach_p2p_tx, mut reach_p2p_rx) =
+            network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> =
+            match wireguard_listen {
+                Some(wg_addr) => {
+                    let (cmd_tx, cmd_rx) =
+                        tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(256);
+                    let (ev_tx, mut ev_rx) =
+                        tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
+
+                    // rendezvous coordinators = every coordinated-reach hint's
+                    // coordinator ingress; hostnames resolve once at plane start.
+                    let coordinators: Vec<Ingress> =
+                        coordinated.iter().map(|(_, c, _)| c.clone()).collect();
+                    let thread_label = label.clone();
+                    let reach_signer = signer.clone();
+                    let chain_id = String::from_utf8_lossy(&namespace).to_string();
+                    let key_file = wireguard_key_file.clone();
+                    std::thread::Builder::new()
+                        .name("reachability".into())
+                        .spawn(move || {
+                            tokio::runtime::Builder::new_multi_thread()
+                                .enable_all()
+                                .build()
+                                .expect("reachability tokio runtime")
+                                .block_on(reachability_plane(
+                                    thread_label,
+                                    chain_id,
+                                    reach_signer,
+                                    key_file,
+                                    wg_addr,
+                                    advertised_reach,
+                                    coordinators,
+                                    cmd_rx,
+                                    ev_tx,
+                                ));
+                        })
+                        .expect("spawn reachability thread");
+
+                    // pump in: mesh datagrams -> orchestrator commands.
+                    {
+                        let cmd = cmd_tx.clone();
+                        context.child("reachability_in").spawn(move |_ctx| async move {
+                            while let Ok((peer, msg)) = reach_p2p_rx.recv().await {
+                                let bytes: Vec<u8> = msg.into();
+                                let deliver =
+                                    reachability::ReachabilityCommand::Deliver { from: peer, bytes };
+                                if cmd.send(deliver).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    // pump out: orchestrator sends -> mesh; everything else is
+                    // operator-visible progress.
+                    {
+                        let pump_label = label.clone();
+                        let mut tx = reach_p2p_tx;
+                        context.child("reachability_out").spawn(move |_ctx| async move {
+                            while let Some(event) = ev_rx.recv().await {
+                                match event {
+                                    reachability::ReachabilityEvent::Send { to, bytes } => {
+                                        let _ =
+                                            tx.send(Recipients::One(to), IoBuf::from(bytes), false);
+                                    }
+                                    reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
+                                        println!(
+                                            "[node {pump_label}] reachability: epoch {epoch} mesh \
+                                             verified"
+                                        )
+                                    }
+                                    reachability::ReachabilityEvent::TunnelsApplied {
+                                        epoch,
+                                        interface,
+                                        peers,
+                                    } => println!(
+                                        "[node {pump_label}] reachability: epoch {epoch} tunnel \
+                                         config staged on {interface} ({peers} peer(s); fake \
+                                         effect — no real interface yet)"
+                                    ),
+                                    reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
+                                        println!(
+                                            "[node {pump_label}] reachability: peer {}: {reason}",
+                                            hex_bytes(&peer.as_ref()[..4])
+                                        )
+                                    }
+                                    reachability::ReachabilityEvent::EpochFailed {
+                                        epoch,
+                                        reason,
+                                    } => println!(
+                                        "[node {pump_label}] reachability: epoch {epoch} failed: \
+                                         {reason}"
+                                    ),
+                                }
+                            }
+                        });
+                    }
+                    Some(cmd_tx)
+                }
+                None => {
+                    context
+                        .child("blackhole_reachability")
+                        .spawn(move |_ctx| async move { while reach_p2p_rx.recv().await.is_ok() {} });
+                    drop(reach_p2p_tx);
+                    None
+                }
+            };
+        // boot: target the resume epoch's member set immediately; cutovers
+        // retarget from the orchestrator loop below. the recovered view base
+        // keeps advert expiries in the same view regime as live peers.
+        if let Some(cmd) = &reach_cmd {
+            let _ = cmd
+                .send(reachability::ReachabilityCommand::Retarget(
+                    reachability::MeshEpochEvent {
+                        epoch: initial_resume_epoch,
+                        members: initial_member_keys.clone(),
+                        current_view: resumed.as_ref().map(|r| r.view_base).unwrap_or(0),
+                    },
+                ))
+                .await;
+        }
 
         // start the network actors (dialer/listener/router/tracker). registered
         // receivers buffer regardless, so starting before the engine is fine.
@@ -4991,6 +5267,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // anything is expected of them. index = epoch,
                             // strictly increasing across cutovers.
                             mesh_oracle.track(plan.epoch(), mesh_at(members));
+                            // the reachability plane retunnels for the new
+                            // member set the moment transport admits it.
+                            if let Some(cmd) = &reach_cmd {
+                                let _ = cmd
+                                    .send(reachability::ReachabilityCommand::Retarget(
+                                        reachability::MeshEpochEvent {
+                                            epoch: plan.epoch(),
+                                            members: members.iter().cloned().collect(),
+                                            current_view: engine_view,
+                                        },
+                                    ))
+                                    .await;
+                            }
                             if !members.contains(&signer.public_key()) {
                                 println!(
                                     "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",

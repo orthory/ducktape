@@ -4193,6 +4193,7 @@ dependencies = [
  "pages-index",
  "profiles",
  "rand 0.8.6",
+ "reachability",
  "reactor",
  "recovery",
  "saga",
@@ -4211,6 +4212,8 @@ dependencies = [
  "valset",
  "valset-interface",
  "vaults",
+ "wireguard-effect",
+ "wireguard-upgrade",
 ]
 
 [[package]]
@@ -5336,6 +5339,26 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "reachability"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "commonware-cryptography",
+ "defguard_wireguard_rs",
+ "nat-traversal",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "wireguard-effect",
+ "wireguard-upgrade",
+ "x25519-dalek",
 ]
 
 [[package]]

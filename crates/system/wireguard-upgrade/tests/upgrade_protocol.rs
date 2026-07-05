@@ -36,6 +36,7 @@ fn record_for(
     signer: &PrivateKey,
     set: &ActiveValidatorSet,
     wg_addr: [u8; 4],
+    wg: X25519PublicKey,
     nonce: u64,
 ) -> EndpointRecord {
     let policy = prod_policy();
@@ -45,6 +46,7 @@ fn record_for(
         valset_root: set.valset_root,
         admission_root: set.admission_root,
         validator_identity: id(signer),
+        wireguard_public_key: wg,
         control_endpoint: endpoint([1, 1, 1, wg_addr[3]], 443, Transport::Tcp, &policy),
         wireguard_endpoint: endpoint(wg_addr, 51820, Transport::Udp, &policy),
         capabilities: vec![MeshCapability::Bootnode, MeshCapability::Relay],
@@ -53,6 +55,8 @@ fn record_for(
     }
 }
 
+// fixture convention: a (seed 1) advertises xkey(1), b (seed 2) xkey(2) — the
+// handshake tests below sign with the same keys, satisfying the record pin.
 fn signed_ads(
     a: &PrivateKey,
     b: &PrivateKey,
@@ -60,8 +64,8 @@ fn signed_ads(
     a_addr: [u8; 4],
     b_addr: [u8; 4],
 ) -> (EndpointAdvertisement, EndpointAdvertisement) {
-    let record_a = record_for(a, set, a_addr, 1);
-    let record_b = record_for(b, set, b_addr, 1);
+    let record_a = record_for(a, set, a_addr, xkey(1), 1);
+    let record_b = record_for(b, set, b_addr, xkey(2), 1);
     let mesh_version = compute_mesh_version(&[record_a.clone(), record_b.clone()]).unwrap();
     (
         EndpointAdvertisement::sign(record_a, mesh_version, a),
@@ -148,7 +152,7 @@ fn mesh_view_uses_only_admitted_validators_and_has_deterministic_version() {
         UpgradeError::MissingAdmissionRoot
     );
     let (ad_a, ad_b) = signed_ads(&a, &b, &set, [8, 8, 8, 11], [8, 8, 8, 12]);
-    let outsider_record = record_for(&outsider, &set, [8, 8, 8, 13], 1);
+    let outsider_record = record_for(&outsider, &set, [8, 8, 8, 13], xkey(3), 1);
     let outsider_version =
         compute_mesh_version(&[ad_a.record.clone(), outsider_record.clone()]).unwrap();
     let outsider_ad = EndpointAdvertisement::sign(outsider_record, outsider_version, &outsider);
@@ -449,4 +453,71 @@ fn valid_plan_builds_defguard_peer_config() {
     assert_eq!(interface.config.name, "wg-ducktape0");
     assert_eq!(interface.config.port, 51820);
     assert_eq!(interface.config.peers.len(), 1);
+}
+
+// ── the ULA-v6 overlay + advertised wireguard keys ──────────────────────────
+
+/// the identity-hash ULA overlay: a chain-scoped fd::/48 whose member /128s
+/// derive from (chain_id, identity) alone — deterministic, allocator-free,
+/// and stable across membership churn (a v4 stable_index moves when the
+/// sorted set changes; an identity hash never does).
+#[test]
+fn ula_overlay_is_deterministic_chain_scoped_and_identity_pinned() {
+    let prefix = ula_v6_prefix("demo");
+    assert_eq!(prefix, ula_v6_prefix("demo"));
+    assert_eq!(prefix.octets()[0], 0xfd);
+    assert_ne!(ula_v6_prefix("other-chain"), prefix);
+
+    let (a, b, _set, view, _policy) = mesh();
+    let addr_a = ula_v6_member_addr("demo", id(&a));
+    let addr_b = ula_v6_member_addr("demo", id(&b));
+    assert_eq!(addr_a.octets()[..6], prefix.octets()[..6]);
+    assert_eq!(addr_b.octets()[..6], prefix.octets()[..6]);
+    assert_ne!(addr_a, addr_b);
+
+    let overlay = OverlayPolicy::ula_v6("demo");
+    assert_eq!(
+        overlay.allowed_ips_for(&view, id(&a)).unwrap(),
+        vec![AllowedIp {
+            addr: IpAddr::V6(addr_a),
+            cidr: 128,
+        }]
+    );
+    assert_eq!(
+        overlay.allowed_ips_for(&view, id(&b)).unwrap(),
+        vec![AllowedIp {
+            addr: IpAddr::V6(addr_b),
+            cidr: 128,
+        }]
+    );
+
+    // no overlay address exists for an identity outside the view, however
+    // well-formed — the membership gate holds in ULA mode exactly as in v4.
+    let outsider = PrivateKey::from_seed(9);
+    assert_eq!(
+        overlay.allowed_ips_for(&view, id(&outsider)).unwrap_err(),
+        UpgradeError::UnknownValidator
+    );
+}
+
+/// `MeshView::verify` refuses a record advertising the all-zero X25519 key —
+/// the one value that can never be a real WireGuard public key.
+#[test]
+fn mesh_view_rejects_a_zero_wireguard_key() {
+    let a = PrivateKey::from_seed(1);
+    let b = PrivateKey::from_seed(2);
+    let policy = prod_policy();
+    let set = active_set(id(&a), id(&b));
+    let mut record_a = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
+    record_a.wireguard_public_key = X25519PublicKey([0u8; 32]);
+    let record_b = record_for(&b, &set, [8, 8, 8, 20], xkey(2), 1);
+    let mesh_version = compute_mesh_version(&[record_a.clone(), record_b.clone()]).unwrap();
+    let ads = vec![
+        EndpointAdvertisement::sign(record_a, mesh_version, &a),
+        EndpointAdvertisement::sign(record_b, mesh_version, &b),
+    ];
+    assert_eq!(
+        MeshView::verify(set, ads, &policy, 10).unwrap_err(),
+        UpgradeError::InvalidWireGuardKey
+    );
 }

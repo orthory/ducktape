@@ -76,14 +76,15 @@ must not treat permissionless `ValsetMsg::Join` membership as tunnel authority.
 Each validator publishes a signed endpoint advertisement:
 
 ```text
-EndpointAdvertisementV1 {
-  domain = "ducktape:wireguard-endpoint:v1"
+EndpointAdvertisementV2 {
+  domain = "ducktape:wireguard-endpoint:v2"
   namespace
   epoch
   valset_root
   admission_root
   mesh_version
   validator_identity_ed25519
+  wireguard_public_key_x25519
   control_endpoint
   wireguard_endpoint
   capabilities
@@ -92,6 +93,12 @@ EndpointAdvertisementV1 {
   signature_ed25519
 }
 ```
+
+V2 adds `wireguard_public_key_x25519`: the validator's WireGuard key lives in
+the signed, mesh-versioned advertisement — never in consensus state — so a key
+rotation is a re-advertisement (a new mesh version), and the tunnel handshake
+below pins its session keys to these records. The layout change bumps the
+signature domain from v1; v1 and v2 blobs can never cross-verify.
 
 Endpoint fields are typed before verification. Protocol v1 endpoints use
 canonical IP literals only; DNS names are rejected. IPv4-mapped IPv6 literals
@@ -138,12 +145,13 @@ between verification and dial is a hard failure.
 signing from a preimage that excludes `mesh_version` and `signature_ed25519`:
 
 ```text
-EndpointRecordV1 {
+EndpointRecordV2 {
   namespace
   epoch
   valset_root
   admission_root
   validator_identity_ed25519
+  wireguard_public_key_x25519
   control_endpoint
   wireguard_endpoint
   capabilities
@@ -152,13 +160,18 @@ EndpointRecordV1 {
 }
 
 mesh_version =
-  HASH("ducktape:validator-mesh-version:v1" ||
+  HASH("ducktape:validator-mesh-version:v2" ||
        namespace ||
        epoch ||
        valset_root ||
        admission_root ||
        SORT_ASC(endpoint_record_hashes))
 ```
+
+The v2 preimage differs from v1 only in each record hash covering
+`wireguard_public_key_x25519` (and the bumped domain string): the mesh version
+commits to the WireGuard key set, so rotating any validator's key produces a
+new mesh version.
 
 The endpoint advertisement signs the full `EndpointAdvertisementV1`, including
 the computed `mesh_version`, but the signature is not part of the mesh-version
@@ -307,8 +320,20 @@ A node installs WireGuard peer config only after all checks pass:
 
 ## Overlay Addressing
 
-Overlay IPs are derived from `(namespace, epoch, validator_identity)` and the
-validator's stable mesh index. A peer cannot request arbitrary routes.
+Two deterministic overlay modes exist; a mesh runs exactly one. A peer cannot
+request arbitrary routes in either mode.
+
+- **Indexed v4** (the original scheme): overlay IPs derive from the
+  validator's stable mesh index inside a v4 block. An address is a function
+  of the sorted set, so it moves on membership churn.
+- **ULA v6** (the node-driven WireGuard overlay): the mesh owns the /48
+  `fd || first 40 bits of HASH("ducktape:overlay-ula:v1" || chain_id)`, and
+  each validator's /128 host is
+  `first 80 bits of HASH("ducktape:overlay-addr:v1" || chain_id || identity)`.
+  An address is a function of `(chain_id, identity)` only — no allocator, no
+  index, stable across churn — and fd00::/8 cannot collide with RFC1918 v4 or
+  the 100.64.0.0/10 CGNAT block a resident Tailscale occupies, which is what
+  lets a dedicated `dt-*` interface coexist with a personal tailnet.
 
 `requested_allowed_ips` is the initiator's proposed route set for the responder
 identity. `accepted_allowed_ips` is the responder's route set for the initiator
