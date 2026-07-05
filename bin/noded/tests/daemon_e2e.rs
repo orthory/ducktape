@@ -573,6 +573,26 @@ fn state_persists_across_restart() {
         messages[0]["head"]["blocks"][0]["Paragraph"][0]["text"],
         "written before restart"
     );
+
+    // the explorer survives too: /v1/blocks reads the durable block index,
+    // not an in-memory ring, so both pre-restart blocks are still served.
+    let (code, blocks) = daemon.request("GET", "/v1/blocks", None);
+    assert_eq!(code, 200, "blocks failed: {blocks}");
+    let blocks = blocks["blocks"].as_array().expect("blocks array").clone();
+    assert_eq!(blocks.len(), 2, "pre-restart blocks survive: {blocks:?}");
+    assert_eq!(blocks[0]["height"], 1);
+    let post = &blocks[1];
+    assert_eq!(post["height"], 2);
+    assert_eq!(post["target"], "chat");
+    assert_eq!(post["disposition"], "applied");
+    // this lane frames and signs nothing: the hash is honestly empty, and
+    // the proposer is the SUBMITTER's origin bytes as hex ("eddy").
+    assert_eq!(post["hash"], "");
+    assert_eq!(post["proposer"], "65646479");
+    assert!(
+        post["operations"].as_array().is_some_and(|ops| !ops.is_empty()),
+        "the dispatch trace rides the row: {post}"
+    );
 }
 
 #[test]

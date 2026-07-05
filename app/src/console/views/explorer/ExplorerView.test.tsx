@@ -7,11 +7,13 @@ import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import { ExplorerView } from "./ExplorerView";
 
+const proposerKey = "cc".repeat(32);
+
 const block = (height: number, patch: Partial<BlockRecord> = {}): BlockRecord => ({
   height,
   hash: "aa".repeat(32),
   commitHash: "bb".repeat(32),
-  proposer: "cc".repeat(32),
+  proposer: proposerKey,
   disposition: "applied",
   target: "chat",
   operations: [
@@ -79,5 +81,25 @@ describe("ExplorerView", () => {
     const { spies } = renderExplorer({ blocks: [block(7)], explorerFocus: 999 });
     expect(screen.queryByText("← Blocks")).not.toBeInTheDocument();
     expect(spies.clearExplorerFocus).toHaveBeenCalled();
+  });
+
+  it("resolves a proposer to its profile display name and falls back to hex", () => {
+    const anonKey = "ee".repeat(32);
+    renderExplorer({
+      blocks: [block(7), block(8, { proposer: anonKey })],
+      authorNames: { [proposerKey]: "Founder Rae" },
+    });
+    expect(screen.getByText("Founder Rae")).toBeInTheDocument();
+    // Unregistered proposer stays the truncated key.
+    expect(screen.getByText(`${anonKey.slice(0, 10)}…`)).toBeInTheDocument();
+  });
+
+  it("shows the resolved name alongside the full key in the block detail", () => {
+    renderExplorer({
+      blocks: [block(7)],
+      authorNames: { [proposerKey]: "Founder Rae" },
+    });
+    fireEvent.click(screen.getByText("Founder Rae"));
+    expect(screen.getByText(`Founder Rae · ${proposerKey}`)).toBeInTheDocument();
   });
 });
