@@ -1880,6 +1880,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         scheme: config::SCHEME_ED25519.into(),
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
+        reach: Vec::new(),
     };
     if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -1903,12 +1904,14 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `invite [--config node.toml] [--manual]` — emit the one-line paste blob:
 /// the network descriptor with THIS member's dial hint folded in (and
-/// persisted, so every future invite carries it), plus a signed INVITE TOKEN.
-/// the token lets the joiner's parked node deliver its pubkey over the lobby
+/// persisted, so every future invite carries it), plus an INVITE TOKEN. the
+/// token lets the joiner's parked node deliver its pubkey over the lobby
 /// channel automatically — the join request then awaits member approval
 /// (`invite-accept`, or the app's approve button); a token never admits by
 /// itself. `--manual` omits the token: the joiner's pubkey travels out-of-band
-/// exactly as before.
+/// exactly as before. any current member may invite (the blob is a low-trust
+/// doorbell, gated by the descriptor's genesis fingerprint and the admission
+/// ballot — not a signed genesis-only credential).
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // `--manual` is a bare boolean; strip it before the `--flag value` parser.
     let mut manual = false;
@@ -1936,8 +1939,11 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
     match config::dialable(raw.advertised.as_deref(), &raw.listen)? {
         Some(addr) => descriptor.add_bootstrap(&key.public_key(), &addr),
-        // an invite must carry SOME dialable member.
-        None if descriptor.bootstrap.is_empty() => {
+        // an invite must carry SOME dialable member. a member that joined via a
+        // v3 invite holds its dial hints as `reach` (bootstrap is empty), so
+        // check the union, not just bootstrap — else a reachable NAT'd member
+        // is wrongly refused.
+        None if descriptor.reach_hints().map(|h| h.is_empty()).unwrap_or(true) => {
             return Err(
                 "no dialable address: give node.toml a concrete `listen` port or an \
                         `advertised` addr so a joiner can reach the network"
@@ -2631,6 +2637,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         mesh: peers,
         validators,
         bootstrappers,
+        coordinated,
         listen,
         advertised,
         storage_dir: storage,
@@ -2699,6 +2706,29 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         String::from_utf8_lossy(&namespace),
         storage.display()
     );
+    // coordinated reach targets are split OUT of the TCP mesh dialer (a
+    // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
+    // there was a silent no-op). reaching them needs the nat client to
+    // hole-punch/relay through the coordinator and bring up a WireGuard tunnel
+    // — the reachability data plane. that wiring (and its inviter-signed
+    // rendezvous auth) is the node-reachability follow-on; until it lands a
+    // coordinated-only invite CANNOT connect, so surface it loudly rather than
+    // park silently. see docs/deploy/private-cutover-integration-gap.md.
+    if !coordinated.is_empty() {
+        println!(
+            "[node {label}] WARNING: {} coordinated reach target(s) require the WireGuard \
+             reachability plane, which this build does not yet drive — these peers are \
+             UNREACHABLE until the node-reachability wiring lands. use a direct/fronted \
+             invite for now.",
+            coordinated.len()
+        );
+        for (target, coord, _coord_key) in &coordinated {
+            println!(
+                "[node {label}]   coordinated target {} via coordinator {coord:?}",
+                hex_bytes(&target.as_ref()[..4])
+            );
+        }
+    }
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise.

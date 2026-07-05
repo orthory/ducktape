@@ -54,6 +54,42 @@ v1은 `network.toml` 전체를 hex로 감싸 470자를 넘겼는데, v2는 joine
   truncation/overflow/trailing-byte를 모두 loud하게 거부한다. decode 결과를 **`from_toml`과 동일하게
   canonicalize**(lowercase, sorted)해서 genesis fingerprint가 founder 것과 bit-identical하게 나오도록 보장한다.
 
+### 1.1 v3 — signed invite + typed reach (Slice 1, 구현 완료)
+
+v3가 **프로덕션 encoder**다 (`encode_invite` = v3, `pack_invite_v3`/`unpack_invite_v3`). v2는
+**parse-only**로 남아 옛 blob 붙여넣기는 계속 decode되지만 v2를 새로 *만드는* 프로덕션 경로는 없다.
+v3는 v2 위에 (a) 홉별 **typed reach hint**(`Direct`/`Fronted`/`Coordinated`), (b) **expiry**,
+(c) inviter의 **embedded pubkey + 도메인 분리 ed25519 서명**을 더한다.
+
+```
+[1]  version = 3
+[1]  chain_id 길이 + [n] chain_id
+[1]  validator 개수 + [32×k] raw ed25519 pubkey
+[1]  reach-hint 개수 + 각 항목:
+       [32] expected_key : raw pubkey          ← joiner가 끝까지 인증해야 하는 REAL 노드 신원
+       [1]  tag: 0=Direct 1=Fronted 2=Coordinated
+       Direct/Fronted:   [1] addr 길이 + [a] "host:port"
+       Coordinated:      [1] coord_addr 길이 + [a] "host:port" + [32] coord_key
+[8]  expires_unix_secs (u64 LE)
+[32] inviter_key : raw pubkey
+--- 여기까지가 서명 대상 (signed_len == len-64) ---
+[64] inviter_sig : bytes[0..signed_len]에 대한 서명, INVITE_SIG_NS = b"ducktape:invite:v3:" 로 도메인 분리
+```
+
+- **fail-closed decode 순서** (`unpack_invite_v3`): ① embedded key로 서명 검증 → ② inviter ∈ genesis
+  `validators` (valset==membership이므로 실질 제약 아님) → ③ `now < expires`. 하나라도 어기면 거부.
+  경로 위 어떤 box(coordinator 포함)도 `expected_key`·`coord_key`·expiry를 서명 무효화 없이 못 바꾼다.
+- **비혼동성 2겹**: prefix(`ducktape-invite-v3:` vs `-v2:`)와 payload version byte가 **일치**해야 한다
+  (v2 payload를 v3 prefix로, 혹은 그 반대로 실으면 거부). version byte는 서명 영역 안, prefix는 전송 framing.
+- **reach는 advisory** — genesis fingerprint에서 제외(§2와 동일한 이유, bootstrap과 같은 취급). v3 descriptor는
+  `bootstrap`이 비고 `reach`가 찬다. `reach_hints()`가 단일 dial source of truth: `reach`가 있으면 그걸 파싱,
+  없으면 `bootstrap`에서 all-`Direct`를 합성 → v2/legacy descriptor는 double-dial 없이 그대로 동작.
+  `reach_entries()`는 hint을 `(expected_key, dial_addr)`로 해석하고 `Coordinated`는 **coord_addr를 dial**하되
+  여전히 target key를 기대한다(라이브 relay 완성은 Slice 2).
+- **clock 주입** `decode_invite_at(blob, now)` 로 expiry가 결정적으로 테스트된다; `decode_invite`는 실시계를 읽어 위임.
+- CLI: `invite --ttl-days N`(기본 `DEFAULT_INVITE_TTL_DAYS=7`)이 발급자 키로 서명한다(`cmd_invite`). 발급자는
+  founder(pre-genesis 단일 validator) 또는 member(post-genesis)라 항상 `validators`에 있다.
+
 ---
 
 ## 2. NetworkDescriptor + genesis fingerprint — 프로토콜의 보안 앵커 (`config.rs:136-278`)

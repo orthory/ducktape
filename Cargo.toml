@@ -25,6 +25,8 @@ members = [
     "crates/system/governance", "crates/system/governance-interface",
     "crates/system/upgrade", "crates/system/upgrade-interface",
     "crates/system/wireguard-upgrade",
+    "crates/system/wireguard-effect",
+    "crates/system/nat-traversal",
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
@@ -43,7 +45,7 @@ members = [
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/directory-interface", "crates/examples/greeter",
     # bin — runnable binaries
-    "bin/demo", "bin/node", "bin/noded",
+    "bin/demo", "bin/node", "bin/noded", "bin/coordinator",
     # app — the desktop shell of the react client (web twin ships from app/)
     "app/src-tauri",
 ]
@@ -127,6 +129,8 @@ governance-interface = { path = "crates/system/governance-interface" }
 upgrade-interface = { path = "crates/system/upgrade-interface" }
 valset-mesh-interface = { path = "crates/system/valset-mesh-interface" }
 wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
+wireguard-effect = { path = "crates/system/wireguard-effect" }
+nat-traversal = { path = "crates/system/nat-traversal" }
 saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
