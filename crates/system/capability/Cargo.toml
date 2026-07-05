@@ -1,0 +1,17 @@
+[package]
+name = "capability"
+edition.workspace = true
+version.workspace = true
+
+# the network-wide registry of node host capabilities as replicated state.
+# depends only on sdk + its own interface (+ valset-interface to gate
+# announcements to current members, sha2 for the state-based root).
+[dependencies]
+sdk = { workspace = true }
+capability-interface = { workspace = true }
+valset-interface = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"

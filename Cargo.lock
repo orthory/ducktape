@@ -738,6 +738,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "capability"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-interface",
+ "futures",
+ "sdk",
+ "sha2",
+ "valset-interface",
+]
+
+[[package]]
+name = "capability-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cargo-platform"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
