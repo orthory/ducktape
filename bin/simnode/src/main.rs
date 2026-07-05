@@ -31,9 +31,9 @@
 //! "concurrent writer" for optimistic-projection race scenarios.
 //!
 //! honesty rules: no synthetic-rejection knob (rejection scenarios must use
-//! genuinely rejectable ops, so module semantics stay real), no LlmWorker
-//! (an external llm call in a determinism tool is a contradiction; the echo
-//! worker behind `--echo-oracle` is the only oracle). storage should be a
+//! genuinely rejectable ops, so module semantics stay real), no live LLM
+//! worker (an external llm call in a determinism tool is a contradiction; the
+//! echo worker behind `--echo-oracle` is the only oracle). storage should be a
 //! fresh dir per run (the height resumes above the index watermark like
 //! noded's, but reused module state defeats the same-script reproducibility
 //! this tool exists for).
