@@ -1,4 +1,0 @@
-interface:
-  display_name: "Done"
-  short_description: "Merge task PRs and clean up worktrees."
-  default_prompt: "Use $done to merge the current task PR, update the target branch locally, release the worktree, and leave any needed handoff."

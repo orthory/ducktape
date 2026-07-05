@@ -1,4 +1,0 @@
-interface:
-  display_name: "Blast"
-  short_description: "Summarize change blast radius by file."
-  default_prompt: "Use $blast to produce a terse blast-radius analysis for the current change set."
