@@ -5377,6 +5377,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "reachability"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "commonware-cryptography",
+ "nat-traversal",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "wireguard-effect",
+ "wireguard-upgrade",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "reactor"
 version = "0.1.0"
 dependencies = [

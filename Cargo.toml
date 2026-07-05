@@ -27,6 +27,7 @@ members = [
     "crates/system/wireguard-upgrade",
     "crates/system/wireguard-effect",
     "crates/system/nat-traversal",
+    "crates/system/reachability",
     "crates/system/saga", "crates/system/saga-interface",
     # apps — product feature modules
     "crates/apps/forge", "crates/apps/forge-interface",
@@ -77,6 +78,10 @@ commonware-parallel = "2026.5.0"
 commonware-utils = "2026.5.0"
 commonware-actor = "2026.5.0"
 defguard_wireguard_rs = "0.10.0"
+# the node's own WireGuard identity is X25519 (WireGuard's curve, not the
+# ed25519 signer's); static_secrets because the key persists across boots.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
 
 # fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
 # per-module indexer tier ONLY: nothing the app-hash commits to may live in it
@@ -131,6 +136,7 @@ valset-mesh-interface = { path = "crates/system/valset-mesh-interface" }
 wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 wireguard-effect = { path = "crates/system/wireguard-effect" }
 nat-traversal = { path = "crates/system/nat-traversal" }
+reachability = { path = "crates/system/reachability" }
 saga-interface = { path = "crates/system/saga-interface" }
 forge-interface = { path = "crates/apps/forge-interface" }
 document-interface = { path = "crates/apps/document-interface" }
