@@ -132,10 +132,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// enough to let discovery links warm, but bounded so boot cannot hang forever
 /// before the statesync server bridge is installed.
 const BOOT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
-/// how often the reachability plane re-offers its un-acked gossip
-/// (`ReachabilityCommand::Nudge`). fast enough that a boot-window record loss
-/// costs one beat of mesh convergence, slow enough to be noise-free — the
-/// nudge is a no-op once the epoch has assembled.
+/// how often the reachability plane re-offers whatever it still waits on —
+/// un-acked gossip while assembling, stalled handshake messages after
+/// verification (`ReachabilityCommand::Nudge`). fast enough that a lost
+/// message costs one beat of mesh convergence, slow enough to be noise-free
+/// — the nudge is a no-op once the epoch's handshakes have all completed.
 const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
 /// post-reboot catch-up should close the reboot gap, not chase a live chain
 /// forever. any tiny lag left after this cap is handled by the normal engine.
@@ -4877,6 +4878,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             std::collections::BTreeMap::new();
         // recovery cadence: sealed blocks since the last checkpoint manifest.
         let mut blocks_since_checkpoint: u64 = 0;
+        // the last absolute view ticked to the reachability plane — one
+        // ViewTick per actual advance, not one per 100ms drain pass.
+        let mut last_reach_view: Option<u64> = None;
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
         // the host-owned worker set (reactor seam): effects of finalized
@@ -5261,6 +5265,23 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // guarantees this tick's last view IS the changing block's
                     // view when membership moved.
                     if let Some(engine_view) = node.last_engine_view() {
+                        // tick the reachability plane's freshness clock.
+                        // engine views are EPOCH-LOCAL (they reset at every
+                        // cutover), so convert to the absolute app-height
+                        // clock (`epoch_base + view`) — the regime the boot
+                        // Retarget's `view_base` put the plane's advert and
+                        // handshake expiries in.
+                        if let Some(cmd) = &reach_cmd {
+                            let absolute_view = orchestrator.app_height(engine_view);
+                            if last_reach_view.is_none_or(|v| v < absolute_view) {
+                                let _ = cmd
+                                    .send(reachability::ReachabilityCommand::ViewTick(
+                                        absolute_view,
+                                    ))
+                                    .await;
+                                last_reach_view = Some(absolute_view);
+                            }
+                        }
                         let members_raw = read_valset_members(node.host()).await;
                         let mut observed: Vec<ed25519::PublicKey> = Vec::new();
                         for key in &members_raw {
@@ -5314,13 +5335,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             mesh_oracle.track(plan.epoch(), mesh_at(members));
                             // the reachability plane retunnels for the new
                             // member set the moment transport admits it.
+                            // cutover_app_height IS the new epoch's absolute
+                            // view at engine view 0 — the raw engine_view
+                            // here would be epoch-local, a different clock
+                            // than the ViewTicks above and the boot
+                            // Retarget's view_base.
                             if let Some(cmd) = &reach_cmd {
                                 let _ = cmd
                                     .send(reachability::ReachabilityCommand::Retarget(
                                         reachability::MeshEpochEvent {
                                             epoch: plan.epoch(),
                                             members: members.iter().cloned().collect(),
-                                            current_view: engine_view,
+                                            current_view: plan.cutover_app_height(),
                                         },
                                     ))
                                     .await;

@@ -106,15 +106,19 @@ pub enum ReachabilityCommand {
     },
     /// The consensus view advanced (drives expiry checks between cutovers).
     ViewTick(u64),
-    /// Periodic controller kick: re-offer this node's un-acknowledged gossip
-    /// (record, then advert) to every peer while the epoch is still
-    /// assembling. Mesh sends are best-effort datagrams — a message fired
-    /// before the transport has a live connection to the peer (every boot
-    /// `Retarget` fires before the p2p actors even start) is silently
-    /// dropped, and when BOTH sides lose their initial record the
-    /// first-contact heal in `on_record` never triggers on either. Safe at
-    /// any cadence: receivers dedup by nonce and the re-offer never re-signs,
-    /// so the mesh version is unchanged.
+    /// Periodic controller kick: re-offer whatever this node is still
+    /// waiting on — its un-acknowledged gossip (record, then advert) while
+    /// the epoch is assembling, then each stalled peer's pending handshake
+    /// message (request or response) after the mesh verifies. Mesh sends are
+    /// best-effort datagrams — a message fired before the transport has a
+    /// live connection to the peer (every boot `Retarget` fires before the
+    /// p2p actors even start) is silently dropped, and when BOTH sides lose
+    /// their initial record the first-contact heal in `on_record` never
+    /// triggers on either. Safe at any cadence: every re-offer re-sends the
+    /// STORED message verbatim, never re-signs — receivers dedup gossip by
+    /// nonce (the mesh version is unchanged) and recognize handshake
+    /// duplicates by hash (each side validates the triple exactly once, so
+    /// the shared per-epoch `ReplayCache` never sees a nonce twice).
     Nudge,
     /// Drain and exit; the interface is torn down on the way out.
     Shutdown,
@@ -292,7 +296,12 @@ impl From<UpgradeError> for ReachabilityError {
     }
 }
 
-/// Which half of a pending handshake this node is waiting on.
+/// Which half of a pending handshake this node is waiting on. Every stored
+/// message is re-sent VERBATIM on retry — re-signing would mint a fresh
+/// nonce, and a triple whose parts disagree can never validate on both
+/// sides (the ack pins request and response by hash).
+// a handful of entries per epoch — variant size imbalance is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum PeerHandshake {
     /// We initiated and sent the request; the peer's response is due.
     AwaitingResponse { request: TunnelUpgradeRequest },
@@ -300,6 +309,18 @@ enum PeerHandshake {
     AwaitingAck {
         request: TunnelUpgradeRequest,
         response: TunnelUpgradeResponse,
+    },
+    /// The triple validated and the plan is recorded. Kept (not removed) so
+    /// re-delivered peer messages are recognized as duplicates of THIS
+    /// handshake instead of violations — and never re-validated, which is
+    /// what keeps retries out of the shared per-epoch `ReplayCache`.
+    Done {
+        request_hash: [u8; 32],
+        response_hash: [u8; 32],
+        /// `Some` on the initiator: a re-delivered response means the peer
+        /// never got our single-shot ack — re-send this stored one.
+        /// `None` on the responder (its ack receipt ended the exchange).
+        ack: Option<TunnelUpgradeAck>,
     },
 }
 
@@ -319,8 +340,9 @@ struct EpochState {
     view_state: Option<MeshView>,
     replay: ReplayCache,
     /// Requests that arrived before our own `MeshView` completed (the peer
-    /// verified faster); drained the moment it does.
-    pending_requests: Vec<TunnelUpgradeRequest>,
+    /// verified faster); drained the moment it does. Keyed by initiator so
+    /// nudged re-offers of the same request collapse to one entry.
+    pending_requests: BTreeMap<ValidatorIdentity, TunnelUpgradeRequest>,
     handshakes: HashMap<ValidatorIdentity, PeerHandshake>,
     plans: BTreeMap<ValidatorIdentity, TunnelInstallPlan>,
     overrides: BTreeMap<ValidatorIdentity, SocketAddr>,
@@ -370,6 +392,9 @@ struct Driver<'a, E, R> {
 ///    endpoint, then request -> response -> ack; both sides validate the
 ///    triple via `validate_upgrade_as` from their own perspective under the
 ///    `OverlayPolicy::ula_v6` overlay and one shared per-epoch replay cache.
+///    Single-shot loss at any stage heals by `Nudge` re-offers: stored
+///    messages re-sent verbatim (never re-signed) into duplicate-tolerant
+///    receivers, so each side still validates the triple exactly once.
 /// 6. **Apply.** When every peer has a validated plan or a `PeerFailed`:
 ///    tear down any previous interface and make the epoch's ONE
 ///    `apply_tunnel_plans` call; emit `TunnelsApplied`.
@@ -488,7 +513,7 @@ where
             own_advert_sent: false,
             view_state: None,
             replay: ReplayCache::default(),
-            pending_requests: Vec::new(),
+            pending_requests: BTreeMap::new(),
             handshakes: HashMap::new(),
             plans: BTreeMap::new(),
             overrides: BTreeMap::new(),
@@ -519,30 +544,55 @@ where
         self.advance().await
     }
 
-    /// Re-offer the stored (never re-signed — a fresh nonce would change the
-    /// mesh version peers already computed) record or advert to every peer
-    /// while the corresponding stage is incomplete. Post-verification
-    /// handshake messages are deliberately NOT re-offered here: by then the
-    /// transport has proven live connections both ways (records and adverts
-    /// flowed), and re-signed requests interact with the shared replay cache
-    /// — that retry needs its own design if single-shot loss ever shows up
-    /// there.
+    /// Re-offer whatever the current stage is still waiting on, always the
+    /// STORED message, never re-signed: pre-version, a fresh record nonce
+    /// would change the mesh version peers already computed; post-verify, a
+    /// re-signed handshake message would desynchronize the hash-pinned
+    /// triple and mint nonces the peer's replay validation has not burnt.
+    ///
+    /// Gossip stages re-offer our record/advert to EVERY peer (receivers
+    /// dedup by nonce). The handshake stage re-offers per stalled peer: the
+    /// pending request while we await its response, our response while we
+    /// await its ack. The completed side never re-offers — a `Done`
+    /// initiator re-sends its stored ack only when the peer's re-delivered
+    /// response proves the ack was lost (see `on_response`), so retries
+    /// terminate the moment both sides are done.
     async fn nudge(&mut self) -> Result<(), ReachabilityError> {
-        let (msg, peers) = {
+        let sends: Vec<(ValidatorIdentity, ReachabilityMsg)> = {
             let Some(state) = &self.state else {
                 return Ok(());
             };
             if !state.own_advert_sent {
                 let own = state.records.get(&self.me).cloned().expect("own record");
-                (ReachabilityMsg::Record(own), state.peers.clone())
+                state
+                    .peers
+                    .iter()
+                    .map(|peer| (*peer, ReachabilityMsg::Record(own.clone())))
+                    .collect()
             } else if state.view_state.is_none() {
                 let own = state.adverts.get(&self.me).cloned().expect("own advert");
-                (ReachabilityMsg::Advert(own), state.peers.clone())
+                state
+                    .peers
+                    .iter()
+                    .map(|peer| (*peer, ReachabilityMsg::Advert(own.clone())))
+                    .collect()
             } else {
-                return Ok(());
+                state
+                    .handshakes
+                    .iter()
+                    .filter_map(|(peer, handshake)| match handshake {
+                        PeerHandshake::AwaitingResponse { request } => {
+                            Some((*peer, ReachabilityMsg::Request(request.clone())))
+                        }
+                        PeerHandshake::AwaitingAck { response, .. } => {
+                            Some((*peer, ReachabilityMsg::Response(response.clone())))
+                        }
+                        PeerHandshake::Done { .. } => None,
+                    })
+                    .collect()
             }
         };
-        for peer in peers {
+        for (peer, msg) in sends {
             self.send_msg(peer, &msg).await?;
         }
         Ok(())
@@ -681,8 +731,7 @@ where
                     self.start_handshakes().await?;
                     let state = self.state.as_mut().expect("still in epoch");
                     let pending = std::mem::take(&mut state.pending_requests);
-                    for request in pending {
-                        let sender = request.fields.initiator_identity;
+                    for (sender, request) in pending {
                         self.on_request(sender, request).await?;
                     }
                     return Box::pin(self.advance()).await;
@@ -820,22 +869,54 @@ where
         }
     }
 
-    /// Responder side: answer a request with our signed response.
+    /// Responder side: answer a request with our signed response. A
+    /// duplicate of the request we already answered (the initiator nudging —
+    /// our single-shot response may be lost) re-sends the STORED response:
+    /// re-signing would orphan the initiator's eventual ack, which pins ONE
+    /// response by hash.
     async fn on_request(
         &mut self,
         sender: ValidatorIdentity,
         request: TunnelUpgradeRequest,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
+        if state.failed.contains(&sender) {
+            // the pair already failed this epoch — its nonces are burnt in
+            // the replay cache, so no retry can revive it; stay quiet.
+            return Ok(());
+        }
         if request.fields.initiator_identity != sender
             || request.fields.epoch != state.epoch
             || !initiates(sender, self.me)
         {
             return self.fail_peer(sender, "request from the wrong side").await;
         }
+        match state.handshakes.get(&sender) {
+            Some(PeerHandshake::AwaitingAck { request: stored, response })
+                if stored.hash() == request.hash() =>
+            {
+                let response = response.clone();
+                return self
+                    .send_msg(sender, &ReachabilityMsg::Response(response))
+                    .await;
+            }
+            // stale in-flight duplicate: our ack receipt proves the
+            // initiator completed long ago — nothing left to answer.
+            Some(PeerHandshake::Done { request_hash, .. })
+                if *request_hash == request.hash() =>
+            {
+                return Ok(());
+            }
+            // a DIFFERENT request over an in-flight/completed handshake is a
+            // re-sign the protocol never does — loud, like every mismatch.
+            Some(_) => {
+                return self.fail_peer(sender, "conflicting handshake request").await;
+            }
+            None => {}
+        }
         if state.view_state.is_none() {
             // the peer's mesh completed before ours; answer once ours does.
-            state.pending_requests.push(request);
+            state.pending_requests.insert(sender, request);
             return Ok(());
         }
         self.resolve_peer(sender).await?;
@@ -872,22 +953,37 @@ where
     }
 
     /// Initiator side: the peer responded — ack, then validate our plan.
+    /// A duplicate of the response we already validated means the responder
+    /// never received our single-shot ack: re-send the stored ack VERBATIM,
+    /// and never re-validate — each side runs `validate_upgrade_as` exactly
+    /// once per peer, so the shared replay cache never sees a nonce twice.
     async fn on_response(
         &mut self,
         sender: ValidatorIdentity,
         response: TunnelUpgradeResponse,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
-        let Some(PeerHandshake::AwaitingResponse { request }) = state.handshakes.get(&sender)
-        else {
-            return self.fail_peer(sender, "unsolicited handshake response").await;
+        if state.failed.contains(&sender) {
+            // failed pairs stay failed for the epoch — see `on_request`.
+            return Ok(());
+        }
+        let request = match state.handshakes.get(&sender) {
+            Some(PeerHandshake::AwaitingResponse { request }) => request.clone(),
+            Some(PeerHandshake::Done { response_hash, ack: Some(ack), .. })
+                if *response_hash == response.hash() =>
+            {
+                let ack = ack.clone();
+                return self.send_msg(sender, &ReachabilityMsg::Ack(ack)).await;
+            }
+            _ => {
+                return self.fail_peer(sender, "unsolicited handshake response").await;
+            }
         };
         if response.fields.responder_identity != sender
             || response.fields.request_hash != request.hash()
         {
             return self.fail_peer(sender, "response does not match our request").await;
         }
-        let request = request.clone();
         let view = state.view_state.as_ref().expect("mesh verified").clone();
         let fields = TunnelUpgradeAckFields {
             request_hash: request.hash(),
@@ -920,7 +1016,11 @@ where
         // and let the peer's own validation refuse it too.
         match plan {
             Ok(plan) => {
-                state.handshakes.remove(&sender);
+                state.handshakes.insert(sender, PeerHandshake::Done {
+                    request_hash: request.hash(),
+                    response_hash: response.hash(),
+                    ack: Some(ack.clone()),
+                });
                 state.plans.insert(sender, plan);
                 self.send_msg(sender, &ReachabilityMsg::Ack(ack)).await?;
                 self.advance().await
@@ -935,16 +1035,32 @@ where
         }
     }
 
-    /// Responder side: the initiator acked — validate our plan.
+    /// Responder side: the initiator acked — validate our plan. A duplicate
+    /// of the ack that already completed this handshake is dropped without
+    /// re-validation (see `on_response` for the replay argument).
     async fn on_ack(
         &mut self,
         sender: ValidatorIdentity,
         ack: TunnelUpgradeAck,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
-        let Some(PeerHandshake::AwaitingAck { request, response }) = state.handshakes.get(&sender)
-        else {
-            return self.fail_peer(sender, "unsolicited handshake ack").await;
+        if state.failed.contains(&sender) {
+            // failed pairs stay failed for the epoch — see `on_request`.
+            return Ok(());
+        }
+        let (request, response) = match state.handshakes.get(&sender) {
+            Some(PeerHandshake::AwaitingAck { request, response }) => {
+                (request.clone(), response.clone())
+            }
+            Some(PeerHandshake::Done { request_hash, response_hash, .. })
+                if *request_hash == ack.fields.request_hash
+                    && *response_hash == ack.fields.response_hash =>
+            {
+                return Ok(());
+            }
+            _ => {
+                return self.fail_peer(sender, "unsolicited handshake ack").await;
+            }
         };
         if ack.fields.initiator_identity != sender
             || ack.fields.request_hash != request.hash()
@@ -952,7 +1068,6 @@ where
         {
             return self.fail_peer(sender, "ack does not match the handshake").await;
         }
-        let (request, response) = (request.clone(), response.clone());
         let view = state.view_state.as_ref().expect("mesh verified").clone();
         let plan = wireguard_upgrade::validate_upgrade_as(
             Perspective::Responder,
@@ -967,7 +1082,11 @@ where
         );
         match plan {
             Ok(plan) => {
-                state.handshakes.remove(&sender);
+                state.handshakes.insert(sender, PeerHandshake::Done {
+                    request_hash: request.hash(),
+                    response_hash: response.hash(),
+                    ack: None,
+                });
                 state.plans.insert(sender, plan);
                 self.advance().await
             }
