@@ -13,7 +13,10 @@ mod defguard_effect;
 pub use defguard_effect::DefguardWireGuardEffect;
 
 mod wiring;
-pub use wiring::{PeerTunnelConfig, apply_peer_tunnels, apply_tunnel_plan, apply_tunnel_plans};
+pub use wiring::{
+    PeerTunnelConfig, apply_peer_tunnels, apply_tunnel_plan, apply_tunnel_plans,
+    plan_peer_configs, update_peer_tunnels,
+};
 
 use defguard_wireguard_rs::InterfaceConfiguration;
 
@@ -47,6 +50,11 @@ pub enum FakeWireGuardEffectError {
     /// `apply` (or `remove_interface`) was called without a preceding,
     /// still-live `create_interface`.
     NotCreated,
+    /// `create_interface` was called while the interface is already live.
+    /// The real userspace path fails the same way: `DeviceHandle::new`
+    /// cannot stand up a second TUN under a name that still exists — a
+    /// caller reconfiguring a live interface must `apply`, not re-create.
+    AlreadyCreated,
     /// `apply` was rejected because `reject_next_apply` was armed. Stands in
     /// for a real `configure_interface` rejection (e.g. Defguard's
     /// `InterfaceConfiguration.prvkey` failing to decode to a 32-byte key)
@@ -82,6 +90,9 @@ impl WireGuardEffect for FakeWireGuardEffect {
     type Error = FakeWireGuardEffectError;
 
     fn create_interface(&mut self) -> Result<(), Self::Error> {
+        if self.interface_live {
+            return Err(FakeWireGuardEffectError::AlreadyCreated);
+        }
         self.create_calls += 1;
         self.interface_live = true;
         Ok(())
@@ -163,6 +174,20 @@ mod tests {
 
         assert_eq!(err, FakeWireGuardEffectError::NotCreated);
         assert!(fake.applied.is_empty());
+    }
+
+    #[test]
+    fn create_interface_while_live_is_rejected_like_the_real_adapter() {
+        // The real path's `DeviceHandle::new` fails when a TUN of the same
+        // name already exists — reconfiguring a live interface goes through
+        // `apply` (create-or-replace), never a second `create_interface`.
+        let mut fake = FakeWireGuardEffect::default();
+        fake.create_interface().unwrap();
+
+        let err = fake.create_interface().unwrap_err();
+
+        assert_eq!(err, FakeWireGuardEffectError::AlreadyCreated);
+        assert_eq!(fake.create_calls, 1);
     }
 
     #[test]

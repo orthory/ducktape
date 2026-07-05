@@ -184,6 +184,42 @@ mod tests {
             );
         }
 
+        // The standby pre-warm cycle: re-apply the FULL config on the LIVE
+        // interface (no remove) with the peer set grown by one — the exact
+        // call `update_peer_tunnels` makes when a standby's record arrives
+        // mid-epoch. Must succeed (same addresses re-assigned, existing peer
+        // routes tolerated) and leave both peers configured and routed.
+        let mut second = Peer::new(Key::new([8u8; 32]));
+        second.set_allowed_ips(vec![IpAddrMask::new(
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)),
+            32,
+        )]);
+        let mut grown = config.clone();
+        grown.peers.push(second);
+        effect.apply(&grown).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let dump = std::process::Command::new("wg")
+                .args(["show", "dt-smoke0", "peers"])
+                .output()
+                .unwrap();
+            let peers = String::from_utf8_lossy(&dump.stdout).to_string();
+            assert_eq!(
+                peers.lines().count(),
+                2,
+                "the live reconfigure carries both peers: {peers}"
+            );
+            let route = std::process::Command::new("ip")
+                .args(["-4", "route", "get", "100.64.0.3"])
+                .output()
+                .unwrap();
+            let route = String::from_utf8_lossy(&route.stdout).to_string();
+            assert!(
+                route.contains("dt-smoke0"),
+                "the added peer's allowed-ip does not route via the tunnel: {route}"
+            );
+        }
+
         effect.remove_interface().unwrap();
     }
 }
