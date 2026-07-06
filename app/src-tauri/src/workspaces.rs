@@ -923,7 +923,7 @@ fn classify(log: &str) -> PhaseReport {
 }
 
 /// the last `max` bytes of a file as lossy utf-8; empty string if absent.
-fn read_tail(path: &Path, max: u64) -> Result<String, String> {
+pub(crate) fn read_tail(path: &Path, max: u64) -> Result<String, String> {
     let mut file = match fs::File::open(path) {
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
@@ -940,7 +940,7 @@ fn read_tail(path: &Path, max: u64) -> Result<String, String> {
 
 /// is something accepting connections on this localhost port right now? used as
 /// a liveness probe for an already-running workspace node.
-fn port_listening(port: u16) -> bool {
+pub(crate) fn port_listening(port: u16) -> bool {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
