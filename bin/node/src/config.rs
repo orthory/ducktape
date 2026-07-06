@@ -334,7 +334,7 @@ impl NetworkDescriptor {
     /// reach hints resolved to typed dial routes, hostname-native: `Direct`/
     /// `Fronted` become an [`Ingress`] the mesh dials (a hostname stays a
     /// hostname, re-resolved per attempt); `Coordinated` becomes a route the
-    /// nat client hole-punches/relays through while still authenticating the
+    /// nat client hole-punches through while still authenticating the
     /// target's own key end-to-end. advisory: an entry that cannot form a
     /// dialable ingress (unspecified ip / port 0 / malformed host) is skipped.
     pub fn reach_entries(&self) -> Result<Vec<(ed25519::PublicKey, ReachDial)>, String> {
@@ -360,7 +360,7 @@ impl NetworkDescriptor {
 /// dials the ingress and authenticates `expected_key` end-to-end (a fronted
 /// path is transparent, so it looks the same to the dialer); `Coordinated`
 /// carries the coordinator's own ingress + identity so the nat client can
-/// rendezvous and hole-punch/relay to the target.
+/// rendezvous and hole-punch to the target.
 #[derive(Clone, Debug)]
 pub enum ReachDial {
     Direct(Ingress),
@@ -1253,9 +1253,10 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     // one dial source of truth: reach_entries() folds bootstrap-synthesised
     // Direct hints in with the typed `reach` hints (their union). Direct/Fronted
     // resolve to a mesh Ingress dialed directly; Coordinated routes are handed
-    // to the nat client, which hole-punches/relays through the coordinator to
-    // the target — but the target is still authenticated end-to-end by its own
-    // key, so a coordinated peer is a real mesh member either way.
+    // to the nat client, which rendezvouses through the coordinator and
+    // hole-punches to the target — but the target is still authenticated
+    // end-to-end by its own key, so a coordinated peer is a real mesh member
+    // either way.
     let mut bootstrap: Vec<(ed25519::PublicKey, Ingress)> = Vec::new();
     let mut coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)> = Vec::new();
     for (key, dial) in descriptor.reach_entries()? {

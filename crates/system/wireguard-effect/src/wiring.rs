@@ -12,13 +12,12 @@ use crate::WireGuardEffect;
 ///
 /// `peer_endpoint_override`, when set, replaces the plan's statically
 /// advertised `peer_endpoint` with a different address before applying —
-/// this is how a punched or relayed path gets wired in without touching
+/// this is how a punched path gets wired in without touching
 /// `wireguard-upgrade`'s validated plan: the caller passes the hole-punch's
 /// resolved reflexive address
 /// (`nat_traversal::punch::PunchPlan::peer_reflexive` in the simulated rig;
-/// a real `NatClient` observation in production) or, on hole-punch failure,
-/// a coordinator relay socket. `None` uses the plan's own advertised
-/// endpoint unchanged (the direct, no-NAT-surprises case).
+/// a real `NatClient` observation in production). `None` uses the plan's
+/// own advertised endpoint unchanged (the direct, no-NAT-surprises case).
 pub fn apply_tunnel_plan<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,
@@ -42,10 +41,10 @@ pub fn apply_tunnel_plan<E: WireGuardEffect>(
 
 /// The full-mesh form of [`apply_tunnel_plan`]: ONE interface carrying every
 /// validated peer relationship, with per-peer endpoint overrides — each peer
-/// resolves independently (this one punched, that one relayed, another
-/// direct), so the override is keyed by the peer's identity rather than
-/// applied interface-wide. A peer absent from `endpoint_overrides` keeps its
-/// plan's advertised endpoint.
+/// resolves independently (this one punched, that one direct), so the
+/// override is keyed by the peer's identity rather than applied
+/// interface-wide. A peer absent from `endpoint_overrides` keeps its plan's
+/// advertised endpoint.
 pub fn apply_tunnel_plans<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,

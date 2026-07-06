@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::{Coordinator, Msg, NodeKey, Side, relay::RelaySplice, simnat::SimNat};
+use crate::{Coordinator, Msg, NodeKey, simnat::SimNat};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PunchPlan {
@@ -219,112 +219,6 @@ fn internal(key: &NodeKey) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, key.0[0])), 51820)
 }
 
-/// The proof a relay fallback produces: the relay endpoint each side must point
-/// its WireGuard peer at (`apply_tunnel_plan`'s `peer_endpoint_override` on the
-/// fallback path), plus the opaque bytes actually delivered end to end.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelayFallbackProof {
-    pub a_relay_endpoint: SocketAddr,
-    pub b_relay_endpoint: SocketAddr,
-    pub delivered_to_b: Vec<u8>,
-    pub delivered_to_a: Vec<u8>,
-}
-
-/// Outcome of the reachability dance: a direct hole-punched path, or — only
-/// when hole-punch failed — the coordinator relay fallback.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FallbackOutcome {
-    Punched { a: PunchPlan, b: PunchPlan },
-    Relayed(RelayFallbackProof),
-}
-
-// The two relay egress ports the coordinator would bind for a session in the
-// deterministic model. The real coordinator binds ephemeral ports and reports
-// the actual addresses in the `RelayGrant` (Task 6); here they are derived
-// from the session id so the model stays reproducible.
-fn relay_side_addrs(session: u64) -> (SocketAddr, SocketAddr) {
-    use std::net::{IpAddr, Ipv4Addr};
-    let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-    let base = 4000u16.wrapping_add((session as u16).wrapping_mul(2));
-    (
-        SocketAddr::new(ip, base),
-        SocketAddr::new(ip, base.wrapping_add(1)),
-    )
-}
-
-/// Attempt hole-punch FIRST; only on `PunchError::NotReachable` fall back to
-/// the coordinator ciphertext relay and prove OPAQUE bidirectional delivery
-/// through both NATs. This is the CI proof that a symmetric-NAT pair still
-/// reaches each other with neither exposing an inbound port.
-#[allow(clippy::too_many_arguments)]
-pub fn drive_with_relay_fallback(
-    a_key: NodeKey,
-    b_key: NodeKey,
-    a_nat: &mut SimNat,
-    b_nat: &mut SimNat,
-    coord: &mut Coordinator,
-    a_payload: &[u8],
-    b_payload: &[u8],
-) -> Result<FallbackOutcome, PunchError> {
-    // Hole-punch first. `drive_simulated` registers both nodes with the
-    // coordinator as a side effect, which is exactly what relay allocation
-    // needs (source->key binding).
-    match drive_simulated(a_key, b_key, a_nat, b_nat, coord) {
-        Ok((a, b)) => return Ok(FallbackOutcome::Punched { a, b }),
-        Err(PunchError::NotReachable) => {}
-        Err(e) => return Err(e),
-    }
-
-    // The coordinator-facing mapping is idempotent (cone: stable; symmetric:
-    // same (internal, coord) key), so re-deriving each mapped source is safe
-    // and matches what registration observed.
-    let a_mapped = a_nat.send(internal(&a_key), coord_addr());
-    let b_mapped = b_nat.send(internal(&b_key), coord_addr());
-
-    // Control plane: both sides request the relay for the same unordered pair.
-    let (session, _a_side) = coord
-        .request_relay(a_mapped, b_key, 0)
-        .ok_or(PunchError::NoReflexive)?;
-    let (session_b, _b_side) = coord
-        .request_relay(b_mapped, a_key, 0)
-        .ok_or(PunchError::NoReflexive)?;
-    debug_assert_eq!(session, session_b, "one session per unordered pair");
-    let (a_relay_endpoint, b_relay_endpoint) = relay_side_addrs(session);
-
-    // Data plane: each side sends its opaque payload OUT to its (fixed) relay
-    // endpoint. Because the destination is stable, even a symmetric NAT opens a
-    // durable hole toward the relay, so return traffic from the relay is
-    // admitted — this is why the relay beats symmetric NAT.
-    let a_mapped_relay = a_nat.send(internal(&a_key), a_relay_endpoint);
-    let b_mapped_relay = b_nat.send(internal(&b_key), b_relay_endpoint);
-
-    let mut splice = RelaySplice::new(a_relay_endpoint, b_relay_endpoint, 0);
-    // A sends first: B's source not yet learned, so it is buffered/dropped.
-    let _ = splice.ingress(Side::A, a_mapped_relay, 1, a_payload.to_vec());
-    // B sends: A's source known -> forward B's payload toward A via a_egress.
-    let to_a = splice
-        .ingress(Side::B, b_mapped_relay, 2, b_payload.to_vec())
-        .ok_or(PunchError::NotReachable)?;
-    // A re-sends (real WireGuard retransmits): now forward A's payload to B.
-    let to_b = splice
-        .ingress(Side::A, a_mapped_relay, 3, a_payload.to_vec())
-        .ok_or(PunchError::NotReachable)?;
-
-    // Assert ACTUAL delivery: each NAT must admit the relay's egress datagram.
-    if !b_nat.allow_inbound(b_mapped_relay, to_b.from)
-        || !a_nat.allow_inbound(a_mapped_relay, to_a.from)
-    {
-        return Err(PunchError::NotReachable);
-    }
-
-    Ok(FallbackOutcome::Relayed(RelayFallbackProof {
-        a_relay_endpoint,
-        b_relay_endpoint,
-        delivered_to_b: to_b.payload,
-        delivered_to_a: to_a.payload,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +367,9 @@ mod tests {
 
     #[test]
     fn symmetric_nat_pair_fails_hole_punch_with_not_reachable() {
+        // With no relay fallback (the coordinator is rendezvous-only), a
+        // symmetric-NAT pair terminally fails: `NotReachable` is the honest
+        // outcome the reachability plane surfaces, not a degraded path.
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);
         let mut a_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
@@ -482,37 +379,6 @@ mod tests {
         let err = drive_simulated(a_key, b_key, &mut a_nat, &mut b_nat, &mut coord)
             .expect_err("symmetric NAT must defeat hole-punch");
         assert_eq!(err, PunchError::NotReachable);
-    }
-
-    #[test]
-    fn symmetric_pair_falls_back_to_relay_and_delivers_bidirectionally() {
-        let a_key = NodeKey([0xaa; 32]);
-        let b_key = NodeKey([0xbb; 32]);
-        let mut a_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
-        let mut b_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
-        let mut coord = Coordinator::new();
-
-        let outcome = drive_with_relay_fallback(
-            a_key,
-            b_key,
-            &mut a_nat,
-            &mut b_nat,
-            &mut coord,
-            b"ping-from-a",
-            b"pong-from-b",
-        )
-        .expect("relay fallback");
-
-        match outcome {
-            FallbackOutcome::Relayed(p) => {
-                // ACTUAL delivery of the opaque bytes, not just NAT-filter state.
-                assert_eq!(p.delivered_to_b, b"ping-from-a");
-                assert_eq!(p.delivered_to_a, b"pong-from-b");
-                // Two distinct relay ports, one per side.
-                assert_ne!(p.a_relay_endpoint, p.b_relay_endpoint);
-            }
-            FallbackOutcome::Punched { .. } => panic!("symmetric pair must NOT hole-punch"),
-        }
     }
 
     #[test]
@@ -530,50 +396,5 @@ mod tests {
         drop(coord);
         assert!(a_nat.allow_inbound(a_plan.local_mapped, b_plan.local_mapped));
         assert!(b_nat.allow_inbound(b_plan.local_mapped, a_plan.local_mapped));
-    }
-
-    #[test]
-    fn relayed_path_rides_the_coordinator_unlike_a_punched_one() {
-        let a_key = NodeKey([0xaa; 32]);
-        let b_key = NodeKey([0xbb; 32]);
-        let mut a_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
-        let mut b_nat = SimNat::symmetric(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
-        let mut coord = Coordinator::new();
-        let outcome = drive_with_relay_fallback(
-            a_key, b_key, &mut a_nat, &mut b_nat, &mut coord, b"a", b"b",
-        )
-        .expect("relay");
-        let coord_ip = coord_addr().ip();
-        match outcome {
-            FallbackOutcome::Relayed(p) => {
-                // Both relay endpoints sit ON the coordinator: the data path
-                // traverses it, so coordinator death kills the relayed path.
-                assert_eq!(p.a_relay_endpoint.ip(), coord_ip);
-                assert_eq!(p.b_relay_endpoint.ip(), coord_ip);
-            }
-            FallbackOutcome::Punched { .. } => panic!("symmetric pair must relay"),
-        }
-    }
-
-    #[test]
-    fn cone_pair_punches_and_never_touches_the_relay() {
-        let a_key = NodeKey([0xaa; 32]);
-        let b_key = NodeKey([0xbb; 32]);
-        let mut a_nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
-        let mut b_nat = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
-        let mut coord = Coordinator::new();
-
-        let outcome = drive_with_relay_fallback(
-            a_key, b_key, &mut a_nat, &mut b_nat, &mut coord, b"a", b"b",
-        )
-        .expect("punch");
-
-        match outcome {
-            FallbackOutcome::Punched { a, b } => {
-                assert_eq!(a.peer_reflexive, b.local_mapped);
-                assert_eq!(b.peer_reflexive, a.local_mapped);
-            }
-            FallbackOutcome::Relayed(_) => panic!("a punchable pair must not use the relay"),
-        }
     }
 }

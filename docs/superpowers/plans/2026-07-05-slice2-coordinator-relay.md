@@ -1,5 +1,13 @@
 # Slice 2 — Coordinator Ciphertext Relay + Relay Fallback Implementation Plan
 
+> **Historical record (amended 2026-07-06).** The DERP-style coordinator relay
+> this plan references (`RelayRequest`/`RelayGrant`, `request_relay`,
+> `relay_send`/`relay_recv`, `drive_with_relay_fallback`, the relay-bind
+> caveat) was built and subsequently **removed** — the coordinator is
+> rendezvous-only and a failed hole-punch is terminal. Do not plan new work
+> against the relay API. See the amendment note in
+> `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add the reachability-plane **coordinator ciphertext relay** (a DERP-lite opaque UDP splice) and the **relay-fallback** effect path, so a dial-out-only validator pair that *cannot* hole-punch (symmetric NAT) still reaches each other end-to-end — with the coordinator forwarding opaque bytes it can never decrypt, and the WireGuard peer endpoint pointed at the relay through the seam Slice 0b already left (`apply_tunnel_plan`'s `peer_endpoint_override`).

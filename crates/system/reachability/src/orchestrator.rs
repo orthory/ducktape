@@ -222,8 +222,6 @@ pub enum Resolution {
     Advertised,
     /// Hole-punch succeeded: dial the peer's punched reflexive.
     Punched(SocketAddr),
-    /// Punch failed; a coordinator granted a relay session at this address.
-    Relayed(SocketAddr),
 }
 
 /// Per-peer endpoint resolution, pluggable so the orchestrator's protocol
@@ -255,18 +253,19 @@ impl EndpointResolver for StaticResolver {
     }
 }
 
-/// How long each coordinator interaction (reflexive discovery, lookup,
-/// relay grant) may take before the resolver moves on.
+/// How long each coordinator interaction (reflexive discovery, lookup) may
+/// take before the resolver moves on.
 const COORD_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 /// One punch exchange attempt; retried [`PUNCH_TRIES`] times before the
-/// relay fallback.
+/// resolution fails (the peer then rides its advertised endpoint — the
+/// coordinator is rendezvous-only, there is no relay to fall back to).
 const PUNCH_STEP_TIMEOUT: Duration = Duration::from_secs(1);
 const PUNCH_TRIES: usize = 3;
 
 /// The production resolver: drives `nat_traversal::NatClient` against the
 /// configured coordinators — reflexive discovery + `register` at bind, then
-/// per peer `lookup` -> simultaneous-open punch -> `request_relay` fallback.
-/// With NO coordinators configured every resolution is `Advertised`.
+/// per peer `lookup` -> simultaneous-open punch. With NO coordinators
+/// configured every resolution is `Advertised`.
 pub struct NatResolver {
     client: Option<NatClient>,
     reflexive: Option<SocketAddr>,
@@ -329,11 +328,10 @@ impl EndpointResolver for NatResolver {
                 Err(_) => continue,
             }
         }
-        let (_session, relay) = tokio::time::timeout(COORD_STEP_TIMEOUT, client.request_relay(peer))
-            .await
-            .map_err(|_| "relay request timed out".to_string())?
-            .map_err(|e| format!("relay request: {e}"))?;
-        Ok(Resolution::Relayed(relay))
+        // No relay fallback: the coordinator is rendezvous-only. A failed
+        // punch is surfaced as an error so the peer rides its advertised
+        // endpoint and a `PeerFailed` is emitted for observability.
+        Err(format!("hole-punch failed after {PUNCH_TRIES} tries"))
     }
 }
 
@@ -773,7 +771,7 @@ where
     /// persisted records — peer WireGuard keys and advertised endpoints from
     /// the records themselves, overlay addresses from `(chain_id, identity)`
     /// — except endpoints behind NAT, which are re-resolved FRESH through
-    /// the coordinator (a persisted punch/relay observation died with the
+    /// the coordinator (a persisted punch observation died with the
     /// downtime's NAT mappings; re-resolution needs no gossip). One-sided
     /// resolution suffices: WireGuard roams a peer's endpoint on any
     /// authenticated inbound packet, so whichever side resolves a working
@@ -826,7 +824,7 @@ where
                 .await
             {
                 Ok(Resolution::Advertised) => advertised,
-                Ok(Resolution::Punched(addr)) | Ok(Resolution::Relayed(addr)) => addr,
+                Ok(Resolution::Punched(addr)) => addr,
                 Err(reason) => {
                     // same contract as live assembly: the peer rides its
                     // advertised endpoint and the failure is surfaced.
@@ -1724,9 +1722,9 @@ where
         Ok(())
     }
 
-    /// Run the endpoint resolver for `peer`, recording a punched/relayed
-    /// override or a `PeerFailed` observability event (the peer then rides
-    /// its advertised endpoint).
+    /// Run the endpoint resolver for `peer`, recording a punched override
+    /// or a `PeerFailed` observability event (the peer then rides its
+    /// advertised endpoint).
     async fn resolve_peer(&mut self, peer: ValidatorIdentity) -> Result<(), ReachabilityError> {
         let state = self.state.as_ref().expect("resolving inside an epoch");
         let advertised = state
@@ -1743,7 +1741,7 @@ where
             .await
         {
             Ok(Resolution::Advertised) => Ok(()),
-            Ok(Resolution::Punched(addr)) | Ok(Resolution::Relayed(addr)) => {
+            Ok(Resolution::Punched(addr)) => {
                 let state = self.state.as_mut().expect("still in epoch");
                 state.overrides.insert(peer, addr);
                 Ok(())
@@ -1776,7 +1774,7 @@ where
             .await
         {
             Ok(Resolution::Advertised) => Ok(advertised),
-            Ok(Resolution::Punched(addr)) | Ok(Resolution::Relayed(addr)) => Ok(addr),
+            Ok(Resolution::Punched(addr)) => Ok(addr),
             Err(reason) => {
                 let pk = self
                     .state
