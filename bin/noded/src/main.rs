@@ -44,7 +44,9 @@ use noded::{
     NodeCommand, NodeHandle, NodeMetrics, NodeStatus, WsFrame, block_row, hex_bytes, hex_root,
     payload_preview,
 };
-use package::PackageModule;
+use package::{
+    MODULE_PACKAGE, PackageModule, PackageQuery, PackageReply, decode_reply, encode_query,
+};
 use pages::Pages;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
@@ -312,7 +314,7 @@ fn run_node(
                     let _ = reply.send(result);
                 }
                 NodeCommand::Status { reply } => {
-                    let modules = MODULE_IDS
+                    let mut modules: Vec<ModuleStatus> = MODULE_IDS
                         .iter()
                         .map(|id| ModuleStatus {
                             id: (*id).into(),
@@ -321,8 +323,22 @@ fn run_node(
                                 .map(|root| hex_root(&root))
                                 .unwrap_or_default(),
                             category: ModuleCategory::of(id),
+                            package: None,
+                            package_version: None,
+                            lifecycle: None,
                         })
                         .collect();
+                    // presentation join: stamp each module with its owning
+                    // package's provenance (never consensus). one query, best
+                    // effort — a node with nothing installed leaves every row's
+                    // package fields None and serializes byte-identical to today.
+                    if let Ok(bytes) = host
+                        .query(MODULE_PACKAGE, &encode_query(&PackageQuery::List))
+                        .await
+                        && let Ok(PackageReply::Packages(packages)) = decode_reply(&bytes)
+                    {
+                        noded::stamp_packages(&mut modules, &packages);
+                    }
                     let _ = reply.send(NodeStatus {
                         version: env!("CARGO_PKG_VERSION").into(),
                         app_hash: hex_root(&host.app_hash()),

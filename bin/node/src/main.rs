@@ -4547,21 +4547,41 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         // app's liveness heartbeat): a zeroed status is
                                         // honest — no boundary is served yet.
                                         let (height, app_hash, modules) = match &serving {
-                                            Some((height, host)) => (
-                                                *height,
-                                                hex(&host.app_hash()),
-                                                MODULE_IDS
-                                                    .iter()
-                                                    .map(|m| noded::ModuleStatus {
-                                                        id: (*m).into(),
-                                                        root: host
-                                                            .module_root(m)
-                                                            .map(|r| hex(&r))
-                                                            .unwrap_or_default(),
-                                                        category: noded::ModuleCategory::of(m),
-                                                    })
-                                                    .collect(),
-                                            ),
+                                            Some((height, host)) => {
+                                                let mut modules: Vec<noded::ModuleStatus> =
+                                                    MODULE_IDS
+                                                        .iter()
+                                                        .map(|m| noded::ModuleStatus {
+                                                            id: (*m).into(),
+                                                            root: host
+                                                                .module_root(m)
+                                                                .map(|r| hex(&r))
+                                                                .unwrap_or_default(),
+                                                            category: noded::ModuleCategory::of(m),
+                                                            package: None,
+                                                            package_version: None,
+                                                            lifecycle: None,
+                                                        })
+                                                        .collect();
+                                                // presentation join over the package registry
+                                                // (never consensus; best effort). unstamped
+                                                // rows serialize byte-identical to before.
+                                                if let Ok(bytes) = host
+                                                    .query(
+                                                        ::package::MODULE_PACKAGE,
+                                                        &::package::encode_query(
+                                                            &::package::PackageQuery::List,
+                                                        ),
+                                                    )
+                                                    .await
+                                                    && let Ok(::package::PackageReply::Packages(
+                                                        packages,
+                                                    )) = ::package::decode_reply(&bytes)
+                                                {
+                                                    noded::stamp_packages(&mut modules, &packages);
+                                                }
+                                                (*height, hex(&host.app_hash()), modules)
+                                            }
                                             None => (0, String::new(), Vec::new()),
                                         };
                                         let _ = reply.send(noded::NodeStatus {
@@ -7085,7 +7105,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             let _ = reply.send(result);
                         }
                         noded::NodeCommand::Status { reply } => {
-                            let modules = MODULE_IDS
+                            let mut modules: Vec<noded::ModuleStatus> = MODULE_IDS
                                 .iter()
                                 .map(|m| noded::ModuleStatus {
                                     id: (*m).into(),
@@ -7095,8 +7115,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         .map(|r| hex(&r))
                                         .unwrap_or_default(),
                                     category: noded::ModuleCategory::of(m),
+                                    package: None,
+                                    package_version: None,
+                                    lifecycle: None,
                                 })
                                 .collect();
+                            // presentation join over the package registry (never
+                            // consensus; best effort). unstamped rows serialize
+                            // byte-identical to before.
+                            if let Ok(bytes) = node
+                                .host()
+                                .query(
+                                    ::package::MODULE_PACKAGE,
+                                    &::package::encode_query(&::package::PackageQuery::List),
+                                )
+                                .await
+                                && let Ok(::package::PackageReply::Packages(packages)) =
+                                    ::package::decode_reply(&bytes)
+                            {
+                                noded::stamp_packages(&mut modules, &packages);
+                            }
                             let _ = reply.send(noded::NodeStatus {
                                 version: env!("CARGO_PKG_VERSION").into(),
                                 app_hash: hex(&node.app_hash()),

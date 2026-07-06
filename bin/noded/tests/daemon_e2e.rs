@@ -384,9 +384,22 @@ fn full_surface_blocks_authorship_and_ws() {
             "forge",
             "files",
             "memory",
-            "profiles"
+            "profiles",
+            "package"
         ]
     );
+    // no package is installed at genesis, so every status row omits the package
+    // provenance fields entirely (skip_serializing_if) — byte-identical to a
+    // node built before the package registry shipped.
+    for m in status["modules"].as_array().expect("modules array") {
+        assert!(m.get("package").is_none(), "{} carries no package", m["id"]);
+        assert!(
+            m.get("packageVersion").is_none(),
+            "{} has no version",
+            m["id"]
+        );
+        assert!(m.get("lifecycle").is_none(), "{} has no lifecycle", m["id"]);
+    }
     let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();
 
     // subscribe BEFORE submitting: every committed block must fan out.

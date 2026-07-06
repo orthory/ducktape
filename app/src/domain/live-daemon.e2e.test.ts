@@ -135,7 +135,15 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       "files",
       "memory",
       "profiles",
+      "package",
     ]);
+    // no package is installed at genesis, so every row omits the package
+    // provenance fields entirely (the node skips them when None).
+    for (const m of status.modules) {
+      expect(m.package).toBeUndefined();
+      expect(m.packageVersion).toBeUndefined();
+      expect(m.lifecycle).toBeUndefined();
+    }
   });
 
   it("drives the chat flow end to end: channel, post, read, thread", async () => {
