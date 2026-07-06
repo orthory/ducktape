@@ -310,18 +310,19 @@ impl ModuleIndexer for PagesIndex {
             page_id,
             limit,
         } = serde_json::from_slice(req).map_err(|e| Error::View(e.to_string()))?;
-        let tokens = search::tokens(&text);
+        let tokens: Vec<String> = search::tokens(&text).into_iter().collect();
         if tokens.is_empty() {
             return Err(Error::View("search text has no tokens".into()));
         }
-        // block ids are global, so postings carry no page segment — the page
-        // filter applies to the intersected refs instead.
-        let prefixes: Vec<String> = tokens.iter().map(|t| format!("tok/{t}/")).collect();
-        let mut refs: Vec<TokRef> = search::intersect(reader, &prefixes, DEFAULT_POSTING_CAP)?
-            .into_iter()
-            .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
-            .filter(|r: &TokRef| page_id.as_ref().is_none_or(|p| &r.page_id == p))
-            .collect();
+        // each token matches as a prefix (search-as-you-type). block ids are
+        // global, so postings carry no page segment — the page filter applies
+        // to the intersected refs instead.
+        let mut refs: Vec<TokRef> =
+            search::intersect_prefix(reader, "tok/", &tokens, DEFAULT_POSTING_CAP)?
+                .into_iter()
+                .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
+                .filter(|r: &TokRef| page_id.as_ref().is_none_or(|p| &r.page_id == p))
+                .collect();
         refs.sort_by(|a, b| (b.time, &b.block_id).cmp(&(a.time, &a.block_id)));
         let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
         let mut hits = Vec::new();

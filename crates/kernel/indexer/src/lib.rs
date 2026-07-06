@@ -171,8 +171,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[serde(rename_all = "camelCase")]
 pub struct OriginTag {
     pub kind: OriginKind,
-    /// external: the submitter identity rendered lossily as utf-8;
-    /// module: the emitting module id; system: absent.
+    /// external: the submitter identity rendered by [`user_handle`] (printable
+    /// name, else hex); module: the emitting module id; system: absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 }
@@ -206,6 +206,26 @@ impl OriginTag {
             id: None,
         }
     }
+}
+
+/// render an external submitter identity for display in a read model.
+///
+/// a `User` identity is a claimed display name on the embedded daemon (printable
+/// utf-8, e.g. `jess`) but a raw ed25519 public key on the networked node (32
+/// arbitrary bytes). printable utf-8 passes through as the name; anything else —
+/// control bytes, invalid utf-8, the common pubkey case — renders as lowercase
+/// hex, never the lossy `�` boxes `from_utf8_lossy` would leave. mirrors the
+/// client's `displayUserBytes`, and is the single convention BOTH the fold path
+/// (`noded::index_origin`) and mappers' from-state rebuilds render through, so
+/// folded and rebuilt author rows stay byte-identical.
+pub fn user_handle(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes)
+        && !text.is_empty()
+        && !text.chars().any(char::is_control)
+    {
+        return text.to_string();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// one dispatch a finalized block applied: the target module, the trigger, and
@@ -1870,5 +1890,21 @@ mod tests {
             store.checkpoint_files("chat"),
             Err(Error::Poisoned)
         ));
+    }
+
+    #[test]
+    fn user_handle_renders_names_and_keys() {
+        // a printable claimed name (embedded daemon) passes through verbatim.
+        assert_eq!(user_handle(b"jess"), "jess");
+        // a raw ed25519-style key renders as lowercase hex, never lossy boxes.
+        let key: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(37).wrapping_add(0x80)).collect();
+        let handle = user_handle(&key);
+        assert_eq!(handle.len(), 64, "32 bytes → 64 hex chars");
+        assert!(!handle.contains('\u{FFFD}'));
+        assert!(handle.chars().all(|c| c.is_ascii_hexdigit()));
+        // control bytes disqualify the utf-8 pass-through and fall back to hex.
+        assert_eq!(user_handle(b"a\nb"), "610a62");
+        // empty stays empty rather than becoming an empty-string name.
+        assert_eq!(user_handle(b""), "");
     }
 }

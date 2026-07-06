@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ChatSearchHit } from "../../../domain/chat-client";
 import type { Manifest } from "../../../domain/files-client";
 import type { PageSearchHit } from "../../../domain/pages-client";
+import { shortKey } from "../../../domain/names";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
@@ -92,6 +93,27 @@ describe("SearchModal", () => {
     fireEvent.change(screen.getByLabelText("Search"), { target: { value: "ship" } });
     expect(screen.getByText("ship it")).toBeInTheDocument();
     expect(screen.getByText("shipping plan")).toBeInTheDocument();
+  });
+
+  it("resolves a hex user author to its profile nickname, else a short handle", () => {
+    const known = "aa".repeat(32); // Alice, per authorNames
+    const unknown = "cd".repeat(32); // no profile → short hex handle
+    renderModal({
+      search: {
+        query: "ship",
+        chat: [
+          { channelId: "general", seq: 3, author: `user:${known}`, edited: false, text: "known author" } as ChatSearchHit,
+          { channelId: "general", seq: 4, author: `user:${unknown}`, edited: false, text: "unknown author" } as ChatSearchHit,
+        ],
+        docs: [],
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "ship" } });
+    // the renamed member shows their nickname, never the raw 64-char hex.
+    expect(screen.getByText(/general · Alice/)).toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(known))).not.toBeInTheDocument();
+    // an unknown key collapses to a short handle, not garbage or full hex.
+    expect(screen.getByText(new RegExp(shortKey(unknown)))).toBeInTheDocument();
   });
 
   it("hides node-index results whose query does not match the current input", () => {

@@ -167,11 +167,13 @@ fn author(origin: &OriginTag, as_agent: Option<&str>) -> String {
 
 /// render a canonical [`AuthorRef`] to the SAME string [`author`] renders the
 /// dispatch origin to — rebuilt rows must read identically to folded ones.
-/// user keys go through the same lossy utf-8 the node layer applies when it
-/// flattens an external origin into an [`OriginTag`].
+/// user keys go through [`indexer::user_handle`], the same rendering the node
+/// layer applies when it flattens an external origin into an [`OriginTag`]
+/// (`noded::index_origin`): printable names pass through, raw pubkeys become
+/// hex — never the lossy `�` boxes a plain utf-8 decode would leave.
 fn author_from_ref(author: &AuthorRef) -> String {
     match author {
-        AuthorRef::User(key) => format!("user:{}", String::from_utf8_lossy(key)),
+        AuthorRef::User(key) => format!("user:{}", indexer::user_handle(key)),
         AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
         AuthorRef::Module(id) => format!("module:{id}"),
         AuthorRef::System => "system".to_string(),
@@ -318,21 +320,21 @@ impl ModuleIndexer for ChatIndex {
                 channel_id,
                 limit,
             } => {
-                let tokens = search::tokens(&text);
+                let tokens: Vec<String> = search::tokens(&text).into_iter().collect();
                 if tokens.is_empty() {
                     return Err(Error::View("search text has no tokens".into()));
                 }
-                let prefixes: Vec<String> = tokens
-                    .iter()
-                    .map(|t| match &channel_id {
-                        Some(c) => format!("tok/{t}/{c}/"),
-                        None => format!("tok/{t}/"),
-                    })
-                    .collect();
-                let mut refs: Vec<TokRef> = search::intersect(reader, &prefixes, DEFAULT_POSTING_CAP)?
-                    .into_iter()
-                    .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
-                    .collect();
+                // each token matches as a prefix; the channel scope filters the
+                // intersected refs by their stored channel (postings can't embed
+                // it after a partial token).
+                let mut refs: Vec<TokRef> =
+                    search::intersect_prefix(reader, "tok/", &tokens, DEFAULT_POSTING_CAP)?
+                        .into_iter()
+                        .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
+                        .filter(|r: &TokRef| {
+                            channel_id.as_ref().is_none_or(|c| &r.channel_id == c)
+                        })
+                        .collect();
                 // newest first; (channel, seq) tiebreak for a stable order.
                 refs.sort_by(|a, b| {
                     (b.time, &b.channel_id, b.seq).cmp(&(a.time, &a.channel_id, a.seq))
@@ -515,6 +517,76 @@ mod tests {
         let hits = search(&store, serde_json::json!({"search": {"text": "alpha beta"}}));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, "m1");
+    }
+
+    #[test]
+    fn partial_tokens_match_as_a_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        apply(&store, 1, vec![post("general", "m1", "testing the waters")]);
+
+        // typing a partial word surfaces the message before the full word is
+        // typed — the command-palette search-as-you-type contract.
+        for q in ["te", "tes", "test", "testing"] {
+            let hits = search(&store, serde_json::json!({"search": {"text": q}}));
+            assert_eq!(hits.len(), 1, "query {q:?} should match `testing`");
+            assert_eq!(hits[0].message_id, "m1");
+        }
+        // a prefix that matches no word still finds nothing.
+        assert!(search(&store, serde_json::json!({"search": {"text": "xyz"}})).is_empty());
+    }
+
+    #[test]
+    fn prefix_search_is_still_an_and_across_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        apply(&store, 1, vec![post("g", "m1", "alpha beta gamma")]);
+        apply(&store, 2, vec![post("g", "m2", "alpha delta")]);
+
+        // each token is a prefix; ALL must match some word in the message.
+        let hits = search(&store, serde_json::json!({"search": {"text": "alp bet"}}));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "m1");
+    }
+
+    #[test]
+    fn prefix_match_dedups_multiple_words_per_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // three distinct words all share the prefix — one message, one hit.
+        apply(&store, 1, vec![post("g", "m1", "test tester testing")]);
+        let hits = search(&store, serde_json::json!({"search": {"text": "test"}}));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "m1");
+    }
+
+    #[test]
+    fn prefix_search_honors_channel_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        apply(&store, 1, vec![post("general", "m1", "testing here")]);
+        apply(&store, 2, vec![post("random", "m2", "testing there")]);
+
+        let hits = search(
+            &store,
+            serde_json::json!({"search": {"text": "test", "channelId": "general"}}),
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "m1");
+    }
+
+    #[test]
+    fn user_author_renders_binary_key_as_hex_not_garbage() {
+        // a raw ed25519-style key: 32 bytes that are NOT printable utf-8.
+        let key: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(37).wrapping_add(0x80)).collect();
+        let rendered = author_from_ref(&AuthorRef::User(key.clone()));
+        let handle = rendered.strip_prefix("user:").expect("user-tagged");
+        assert!(!handle.contains('\u{FFFD}'), "no lossy replacement chars: {handle:?}");
+        assert!(handle.chars().all(|c| !c.is_control()), "no control chars: {handle:?}");
+        // it is the hex of the key bytes.
+        assert_eq!(handle, indexer::user_handle(&key));
+        // a printable claimed name (embedded daemon) still passes through.
+        assert_eq!(author_from_ref(&AuthorRef::User(b"jess".to_vec())), "user:jess");
     }
 
     #[test]

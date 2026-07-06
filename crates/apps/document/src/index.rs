@@ -196,21 +196,19 @@ impl ModuleIndexer for DocumentIndex {
             doc_id,
             limit,
         } = serde_json::from_slice(req).map_err(|e| Error::View(e.to_string()))?;
-        let tokens = search::tokens(&text);
+        let tokens: Vec<String> = search::tokens(&text).into_iter().collect();
         if tokens.is_empty() {
             return Err(Error::View("search text has no tokens".into()));
         }
-        let prefixes: Vec<String> = tokens
-            .iter()
-            .map(|t| match &doc_id {
-                Some(d) => format!("tok/{t}/{d}/"),
-                None => format!("tok/{t}/"),
-            })
-            .collect();
-        let mut refs: Vec<TokRef> = search::intersect(reader, &prefixes, DEFAULT_POSTING_CAP)?
-            .into_iter()
-            .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
-            .collect();
+        // each token matches as a prefix (search-as-you-type); the doc scope
+        // filters the intersected refs by their stored doc (postings can't
+        // embed it after a partial token).
+        let mut refs: Vec<TokRef> =
+            search::intersect_prefix(reader, "tok/", &tokens, DEFAULT_POSTING_CAP)?
+                .into_iter()
+                .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
+                .filter(|r: &TokRef| doc_id.as_ref().is_none_or(|d| &r.doc_id == d))
+                .collect();
         refs.sort_by(|a, b| {
             (b.time, &b.doc_id, &b.block_id).cmp(&(a.time, &a.doc_id, &a.block_id))
         });
