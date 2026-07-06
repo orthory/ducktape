@@ -23,7 +23,8 @@ members = [
     "crates/system/kv", 
     "crates/system/valset", 
     
-    "crates/system/governance", 
+    "crates/system/governance",
+    "crates/system/identity",
     "crates/system/upgrade", 
     "crates/system/wireguard-upgrade",
     "crates/system/wireguard-effect",
@@ -116,6 +117,7 @@ capability-host = { path = "crates/kernel/capability-host" }
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
 governance = { path = "crates/system/governance" }
+identity = { path = "crates/system/identity" }
 upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 capability = { path = "crates/system/capability" }
