@@ -29,14 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use sha2::{Digest as _, Sha256};
 
 use crate::objects::ObjectId;
-use crate::wire::{HISTORY_WINDOW, MAX_PINS, MAX_WATCHES};
-
-/// staging entries are capped at [`MAX_PINS`] * 64 = 65536. the real ceiling is
-/// the per-owner staging quota: `STAGING_QUOTA_BYTES / CHUNK_SIZE` = 1 GiB / 1
-/// MiB = 1024 outstanding chunks per owner, so this bound is deliberately
-/// generous (it does not try to be tight per owner — it only stops an unbounded
-/// count from a hostile decode before any allocation trusts it).
-const MAX_STAGING_ENTRIES: usize = MAX_PINS * 64;
+use crate::wire::{HISTORY_WINDOW, MAX_PINS, MAX_STAGING_ENTRIES, MAX_WATCHES};
 
 /// a named pin: the snapshot it protects from gc and the owner allowed to remove
 /// it (owner-gated unpin).

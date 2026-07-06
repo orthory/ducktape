@@ -142,6 +142,108 @@ fn quota_is_per_owner_and_expiry_frees_it_small() {
     .expect("quota freed");
 }
 
+/// the staging-table entry caps, both shrunk via the test seam so the boundary
+/// is hit in a handful of ops. the GLOBAL cap is the consensus-safety one — it is
+/// what keeps every execute-produced refs inside `decode_refs`'s staging ceiling,
+/// so an owner can never grow the table past what reboots/joiners can decode. the
+/// per-owner cap bounds one owner's share of that table. both fire on tiny chunks
+/// that are nowhere near the byte quota — the count, not the bytes, is the limit.
+#[test]
+fn staging_entry_caps_reject_owner_and_table_floods() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    // global table caps at 4 entries; each owner may hold at most 2.
+    f.set_staging_entry_caps_for_tests(4, 2);
+    let alice = || sdk::Origin::External(b"alice".to_vec());
+
+    // alice fills her per-owner share (2 x 8-byte chunks — far under any quota).
+    putblob(&mut f, alice(), 1, &distinct(8, 0)).expect("a0");
+    putblob(&mut f, alice(), 1, &distinct(8, 1)).expect("a1");
+    // her 3rd DISTINCT chunk trips the per-owner ENTRY cap, not the byte quota.
+    assert!(
+        putblob(&mut f, alice(), 1, &distinct(8, 2)).is_err(),
+        "per-owner entry cap",
+    );
+    // but a re-put of an already-staged chunk is a dedup no-op — a full per-owner
+    // table must NOT block it (the cap gates the add path only).
+    putblob(&mut f, alice(), 1, &distinct(8, 0)).expect("dedup no-op is never capped");
+
+    // bob adds his 2, taking the GLOBAL table to its cap of 4.
+    putblob(
+        &mut f,
+        sdk::Origin::External(b"bob".to_vec()),
+        1,
+        &distinct(8, 10),
+    )
+    .expect("b0");
+    putblob(
+        &mut f,
+        sdk::Origin::External(b"bob".to_vec()),
+        1,
+        &distinct(8, 11),
+    )
+    .expect("b1");
+
+    // carol has an empty per-owner share, yet the globally-full table rejects her:
+    // the consensus-safety ceiling that bounds what every node must decode.
+    assert!(
+        putblob(
+            &mut f,
+            sdk::Origin::External(b"carol".to_vec()),
+            1,
+            &distinct(8, 20)
+        )
+        .is_err(),
+        "global table-full cap",
+    );
+}
+
+/// the closure invariant the global cap exists to guarantee: every refs an
+/// `execute` can produce must survive `decode_refs`. we drive the staging table
+/// to its (shrunk) global cap, take the `snapshot()` preimage — exactly the
+/// bytes `root()` hashes and `DiskRefs` persists — and assert `decode_refs`
+/// round-trips it. before the cap this failed: an over-cap table encoded and
+/// hashed fine but bricked `decode_refs` on every reboot/joiner.
+#[test]
+fn every_execute_reachable_refs_decodes_at_the_staging_cap() {
+    use files::state::decode_refs;
+
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    f.set_staging_entry_caps_for_tests(8, 8);
+    // fill the table exactly to the global cap through the real execute path.
+    for i in 0..8u64 {
+        putblob(
+            &mut f,
+            sdk::Origin::External(b"a".to_vec()),
+            1,
+            &distinct(8, i),
+        )
+        .expect("stage");
+    }
+    // the 9th is rejected, so `execute` can never exceed the cap.
+    assert!(
+        putblob(
+            &mut f,
+            sdk::Origin::External(b"a".to_vec()),
+            1,
+            &distinct(8, 8)
+        )
+        .is_err(),
+        "table full at the cap",
+    );
+    futures::executor::block_on(f.commit_block()).expect("commit");
+
+    // the snapshot preimage of the committed, at-cap refs decodes cleanly.
+    let bytes = f.snapshot();
+    let decoded = decode_refs(&bytes).expect("execute-reachable refs must decode");
+    assert_eq!(
+        files::state::encode_refs(&decoded),
+        bytes,
+        "decode(encode) round-trips the at-cap refs",
+    );
+}
+
 /// the brief's honest fill: 1,024 x 1 MiB chunks (~1 GiB disk in the tempdir).
 /// kept for fidelity but `#[ignore]`d — the small twin above covers the same
 /// logic in milliseconds. run explicitly with `cargo test -p files -- --ignored`.

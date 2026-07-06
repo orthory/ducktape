@@ -20,7 +20,8 @@ use crate::wire::{
     CHUNK_SIZE, Change, Content, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp,
     HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_GREP_SCAN_BYTES,
     MAX_INLINE_COMMIT_BYTES, MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
-    MAX_META_VALUE_BYTES, MAX_PIN_NAME_BYTES, MAX_PINS, MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS,
+    MAX_META_VALUE_BYTES, MAX_PIN_NAME_BYTES, MAX_PINS, MAX_STAGING_ENTRIES,
+    MAX_STAGING_ENTRIES_PER_OWNER, MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS,
     MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, SyncObject,
     from_hex_32, to_hex,
 };
@@ -42,6 +43,19 @@ pub struct Fs<S: ObjectStore> {
     /// be exercised with a handful of commits instead of thousands. commit's
     /// window pop keys on this.
     pub(crate) window_cap: usize,
+    /// global staging-table entry ceiling — [`MAX_STAGING_ENTRIES`] in production,
+    /// lowered only by the `#[doc(hidden)]` test override so the table-full
+    /// boundary is exercised without staging 65_536 chunks. putblob refuses a
+    /// stage that would grow `refs.staging` to this many entries: that
+    /// execute-side rejection is what keeps every execute-produced [`Refs`] within
+    /// [`decode_refs`](crate::state::decode_refs)'s staging ceiling, so the agreed
+    /// image always re-decodes on reboot and installs on a joiner.
+    pub(crate) staging_entry_cap: usize,
+    /// per-owner staging-table entry cap — [`MAX_STAGING_ENTRIES_PER_OWNER`] in
+    /// production, lowered only by the `#[doc(hidden)]` test override so the
+    /// per-owner boundary is exercised cheaply. bounds one owner's share of the
+    /// global table.
+    pub(crate) staging_entry_cap_per_owner: usize,
 }
 
 /// a block's staged objects — `(kind, body)` pairs the glue flushes into the
@@ -107,6 +121,8 @@ impl<S: ObjectStore> Fs<S> {
             quota: STAGING_QUOTA_BYTES,
             grep_budget: MAX_GREP_SCAN_BYTES,
             window_cap: HISTORY_WINDOW,
+            staging_entry_cap: MAX_STAGING_ENTRIES,
+            staging_entry_cap_per_owner: MAX_STAGING_ENTRIES_PER_OWNER,
         }
     }
 
@@ -134,6 +150,17 @@ impl<S: ObjectStore> Fs<S> {
     #[doc(hidden)]
     pub fn set_history_window_for_tests(&mut self, n: usize) {
         self.window_cap = n;
+    }
+
+    /// `#[doc(hidden)]` test seam: shrink the staging-table entry caps (global,
+    /// then per-owner) so putblob's table-full and per-owner-flood boundaries are
+    /// exercised in a handful of ops instead of staging tens of thousands of
+    /// chunks. production never calls this — the caps stay [`MAX_STAGING_ENTRIES`]
+    /// / [`MAX_STAGING_ENTRIES_PER_OWNER`].
+    #[doc(hidden)]
+    pub fn set_staging_entry_caps_for_tests(&mut self, global: usize, per_owner: usize) {
+        self.staging_entry_cap = global;
+        self.staging_entry_cap_per_owner = per_owner;
     }
 
     /// `#[doc(hidden)]` test seam: the gc mark set over COMMITTED refs — the
@@ -238,6 +265,9 @@ impl<S: ObjectStore> Fs<S> {
         // same-block ops and the quota below see the post-sweep state.
         self.require_pending(height);
         let quota = self.quota;
+        // copy the entry caps out before the field borrows below, same as `quota`.
+        let entry_cap = self.staging_entry_cap;
+        let entry_cap_per_owner = self.staging_entry_cap_per_owner;
         // disjoint field borrows: the sweep/stage touch `pending`, the dedup
         // reads `store` — held at once only because they are distinct fields.
         let store = &self.store;
@@ -266,14 +296,37 @@ impl<S: ObjectStore> Fs<S> {
             return Ok(());
         }
 
-        // per-owner quota over the PENDING staging view (same-block stages count).
+        // the caps below gate the ADD path only — the dedup no-op above already
+        // returned for an already-reachable chunk, so a full table can never block
+        // re-staging a durable chunk.
+
+        // global table cap — the load-bearing consensus-safety check. refusing to
+        // grow `refs.staging` to `entry_cap` ([`MAX_STAGING_ENTRIES`]) is exactly
+        // what keeps every execute-produced refs within `decode_refs`'s staging
+        // ceiling, so the agreed image always re-decodes on reboot and installs on
+        // a joiner. the byte quota does NOT bound the count (distinct tiny chunks
+        // cost almost no quota), so the count needs its own cap here.
+        if pending.refs.staging.len() >= entry_cap {
+            return Err("files: staging table is full".into());
+        }
+
+        // per-owner caps over the PENDING staging view (same-block stages count):
+        // the byte quota and the entry share are tallied in one pass.
         let len = bytes.len() as u64;
-        let used = pending
+        let (used, owner_entries) = pending
             .refs
             .staging
             .values()
             .filter(|s| s.owner == actor)
-            .fold(0u64, |acc, s| acc.saturating_add(s.len));
+            .fold((0u64, 0usize), |(used, n), s| {
+                (used.saturating_add(s.len), n + 1)
+            });
+        // per-owner entry share — one owner may not monopolize the global table.
+        // 4096 × 1 MiB > the byte quota, so an honest large upload trips the quota
+        // first; this bites only a tiny-chunk flood.
+        if owner_entries >= entry_cap_per_owner {
+            return Err("files: staging entry quota exceeded".into());
+        }
         if used.saturating_add(len) > quota {
             return Err("staging quota exceeded".into());
         }

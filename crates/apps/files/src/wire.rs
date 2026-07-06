@@ -26,6 +26,27 @@ pub const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 pub const STAGING_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
 pub const STAGING_TTL_BLOCKS: u64 = 4096;
 pub const MAX_PINS: usize = 1024;
+/// the global staging-table entry ceiling — [`MAX_PINS`] × 64 = 65_536. it is a
+/// consensus constant shared by BOTH the canonical decode and the execute path:
+/// [`decode_refs`](crate::state::decode_refs) rejects any refs image whose
+/// staging section exceeds it, and `putblob` rejects a stage that would grow the
+/// table to it. keeping ONE definition across the two sides is load-bearing —
+/// because putblob refuses to stage past this bound, EVERY `Refs` an execute path
+/// can produce stays within the decode ceiling, so the agreed image always
+/// re-decodes on reboot and installs on a joiner. the per-owner byte quota does
+/// NOT bound the entry count (distinct tiny chunks cost almost no quota), so
+/// without this cap one owner could grow the table past the decode limit, commit
+/// it as agreed consensus state, then brick the whole cluster the next time each
+/// node loads its refs file (`decode_refs` would reject the honest, agreed
+/// image everywhere at once).
+pub const MAX_STAGING_ENTRIES: usize = MAX_PINS * 64;
+/// one owner's share of the [`MAX_STAGING_ENTRIES`] staging table — the count
+/// analogue of [`STAGING_QUOTA_BYTES`], bounding how many outstanding entries a
+/// single owner may hold so no owner can monopolize the shared table. 4096 ×
+/// [`CHUNK_SIZE`] (1 MiB) = 4 GiB, four times the 1 GiB byte quota, so an honest
+/// large upload always trips the byte quota first and is never limited by this
+/// cap; it bites only a hostile flood of tiny (sub-quota) chunks.
+pub const MAX_STAGING_ENTRIES_PER_OWNER: usize = 4096;
 pub const MAX_PIN_NAME_BYTES: usize = 128;
 pub const MAX_WATCHES: usize = 256;
 pub const MAX_WATCH_MODULE_ID_BYTES: usize = 128;

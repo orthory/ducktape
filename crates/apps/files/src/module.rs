@@ -170,6 +170,14 @@ impl Files {
         self.fs.set_staging_quota_for_tests(quota);
     }
 
+    /// `#[doc(hidden)]` test seam: shrink the staging-table entry caps (global,
+    /// per-owner) so the table-full and per-owner-flood boundaries are exercised
+    /// without staging tens of thousands of chunks.
+    #[doc(hidden)]
+    pub fn set_staging_entry_caps_for_tests(&mut self, global: usize, per_owner: usize) {
+        self.fs.set_staging_entry_caps_for_tests(global, per_owner);
+    }
+
     /// `#[doc(hidden)]` test seam: shrink the per-call grep scan budget so the
     /// budget-boundary + resume-cursor logic is exercised without a multi-MiB
     /// fixture per call.
