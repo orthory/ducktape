@@ -3,10 +3,91 @@
 // attribute is inert. The status dot reflects the last node round-trip and the
 // height ticks with finalized blocks.
 
+import { useState } from "react";
 import type { ReactNode } from "react";
 
-import { accentVar, color, font } from "../theme/tokens";
+import { Icon } from "../components/Icon";
+import { accentVar, color, font, radius } from "../theme/tokens";
 import { useDucktape } from "../store/use-ducktape";
+
+// The centered search affordance in the title bar: a compact field that opens
+// the ⌘K palette (see ConsoleShell / SearchModal). Absolutely centered in the
+// bar (like ErrorStrip) so it tracks the window's true midpoint regardless of
+// the asymmetric brand/status halves — the left half carries the traffic-light
+// inset. The button is interactive, so the click reaches it rather than dragging.
+function SearchBar() {
+  const { actions } = useDucktape();
+  const [hover, setHover] = useState(false);
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: "50%",
+        top: 0,
+        transform: "translateX(-50%)",
+        height: "100%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        maxWidth: "60%",
+        zIndex: 1,
+      }}
+    >
+      <button
+        onClick={actions.openSearch}
+        title="Search (⌘K)"
+        aria-label="Search"
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
+        style={{
+          all: "unset",
+          boxSizing: "border-box",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          width: 340,
+          maxWidth: "100%",
+          height: 28,
+          padding: "0 10px",
+          borderRadius: radius.md,
+          background: hover ? color.hover : color.sunken,
+          border: `1px solid ${color.border}`,
+          transition: "background .12s",
+        }}
+      >
+        <Icon name="search" size={14} color={color.muted2} />
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            textAlign: "left",
+            font: `500 11.5px ${font.sans}`,
+            color: color.muted,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Search
+        </span>
+        <span
+          style={{
+            flexShrink: 0,
+            padding: "1px 5px",
+            borderRadius: 5,
+            border: `1px solid ${color.borderSoft}`,
+            font: `600 9.5px ${font.mono}`,
+            color: color.muted2,
+            background: color.paper,
+          }}
+        >
+          ⌘K
+        </span>
+      </button>
+    </div>
+  );
+}
 
 function TitleBar() {
   const { state } = useDucktape();
@@ -82,6 +163,8 @@ function TitleBar() {
           </span>
         </div>
       </div>
+
+      <SearchBar />
 
       <div
         data-tauri-drag-region
