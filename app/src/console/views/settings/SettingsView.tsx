@@ -4,7 +4,7 @@
 
 import { useState, type CSSProperties, type ReactNode } from "react";
 
-import { normalizeKey } from "../../../domain/names";
+import { normalizeKey, shortKey } from "../../../domain/names";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
@@ -553,6 +553,58 @@ function NetworkSection() {
   );
 }
 
+// Desktop-only: the bind state lives in `state.nodeUsers`, keyed by node hex,
+// which only carries a real entry once a workspace node key exists to look up
+// (a web build has no local node key at all — degrade by omitting the whole
+// section rather than showing a false "Not linked").
+function DevicesSection() {
+  const { state } = useDucktape();
+  const workspace = state.workspace;
+  if (!workspace) return null;
+
+  const nodeKeyNorm = normalizeKey(workspace.pubkey);
+  const bound = state.nodeUsers[nodeKeyNorm];
+  // This user's OTHER bound nodes — every nodeUsers entry sharing the same
+  // userKey, excluding this device itself.
+  const otherNodes = bound
+    ? Object.entries(state.nodeUsers)
+        .filter(([key, user]) => key !== nodeKeyNorm && user.userKey === bound.userKey)
+        .map(([key]) => key)
+    : [];
+
+  return (
+    <>
+      <SectionLabel>DEVICES</SectionLabel>
+      <GroupCard>
+        <InfoRow
+          label="This device"
+          value={<span style={monoValue}>{shortKey(workspace.pubkey)}</span>}
+        />
+        <InfoRow
+          label="Bind state"
+          last={otherNodes.length === 0}
+          value={
+            <span style={monoValue}>
+              {bound ? `Linked to ${bound.name ?? shortKey(bound.userKey)}` : "Not linked"}
+            </span>
+          }
+        />
+        {otherNodes.length > 0 ? (
+          <InfoRow
+            label="Other devices"
+            last
+            value={
+              <span style={monoValue}>
+                {otherNodes.map((key) => shortKey(key)).join(", ")}
+              </span>
+            }
+          />
+        ) : null}
+      </GroupCard>
+    </>
+  );
+}
+
 function PreferencesSection() {
   const { state, actions } = useDucktape();
   return (
@@ -818,6 +870,8 @@ export function SettingsView() {
 
         <SectionLabel>YOUR IDENTITY</SectionLabel>
         <IdentityCard />
+
+        <DevicesSection />
 
         <PreferencesSection />
         <DangerZone />

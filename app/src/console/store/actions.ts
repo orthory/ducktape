@@ -7,6 +7,8 @@ import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
+import * as identityClient from "../../domain/identity-client";
+import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
@@ -786,13 +788,25 @@ export function createActions({
     },
 
     // Keep the local author identity (still the web-origin string) AND submit
-    // SetName so the chosen name propagates: it's origin-gated, so passing our
-    // origin sets our OWN profile only. Refresh re-reads authorNames.
+    // a name write so the chosen name propagates: it's origin-gated, so
+    // passing our origin only ever writes OUR OWN name. Once this node is
+    // bound to a user (state.nodeUsers has it), the durable identity is the
+    // USER, not the node — so the write goes through identity's SetUserName
+    // instead of profiles' SetName, the same way MembersView's inline
+    // self-rename (canRename row, also wired to this action) picks up the
+    // bound-vs-unbound distinction for free. An unbound node keeps the
+    // original profiles path unchanged. Refresh re-reads authorNames/nodeUsers.
     setDisplayName: (name) => {
-      const origin = getState().author;
+      const current = getState();
+      const origin = current.author;
+      const nodeKeyNorm = normalizeKey(current.workspace?.pubkey);
+      const bound = nodeKeyNorm ? current.nodeUsers[nodeKeyNorm] : undefined;
       submitTracked(
         opKey.profile(),
-        (live) => profilesClient.setName(live, { displayName: name, origin }),
+        (live) =>
+          bound
+            ? identityClient.setUserName(live, { displayName: name, origin })
+            : profilesClient.setName(live, { displayName: name, origin }),
         () => ({ author: name }),
       );
     },

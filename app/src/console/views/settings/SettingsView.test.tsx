@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi, type Mock } from "vitest";
 
+import { shortKey } from "../../../domain/names";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
@@ -206,6 +207,34 @@ describe("SettingsView", () => {
     expect(
       screen.getByRole("button", { name: /request leave/i }),
     ).toBeDisabled();
+  });
+
+  it("shows the linked device state and this user's other bound nodes", () => {
+    const otherNodeKey = "beadbead".repeat(8);
+    renderSettings({
+      nodeUsers: {
+        [workspace.pubkey]: { userKey: "user-1", name: "Rae" },
+        [otherNodeKey]: { userKey: "user-1", name: "Rae" },
+      },
+    });
+
+    expect(screen.getByText("DEVICES")).toBeInTheDocument();
+    expect(screen.getByText(shortKey(workspace.pubkey))).toBeInTheDocument();
+    expect(screen.getByText("Linked to Rae")).toBeInTheDocument();
+    expect(screen.getByText(shortKey(otherNodeKey))).toBeInTheDocument();
+  });
+
+  it("shows Not linked when this node has no bound user", () => {
+    renderSettings();
+
+    expect(screen.getByText("DEVICES")).toBeInTheDocument();
+    expect(screen.getByText("Not linked")).toBeInTheDocument();
+  });
+
+  it("omits the Devices section entirely when there is no workspace (web build)", () => {
+    renderSettings({ workspace: null });
+
+    expect(screen.queryByText("DEVICES")).not.toBeInTheDocument();
   });
 
   it("disables Request leave for a solo validator (can't remove the last one)", () => {

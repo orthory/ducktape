@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import { shortKey } from "../../../domain/names";
 import type { Workspace } from "../../../domain/workspace-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
@@ -248,6 +249,35 @@ describe("MembersView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "All" }));
     expect(screen.getByText("Olive Observer")).toBeInTheDocument();
+  });
+
+  it("groups two nodes sharing a bound user under one header, leaving an unbound key standalone", () => {
+    const deviceAKey = "e".repeat(64);
+    const deviceBKey = "f".repeat(64);
+    const soloKey = "9".repeat(64);
+    renderMembers({
+      members: [deviceAKey, deviceBKey, soloKey],
+      authorNames: {},
+      nodeUsers: {
+        [deviceAKey]: { userKey: "user-casey", name: "Casey" },
+        [deviceBKey]: { userKey: "user-casey", name: "Casey" },
+      },
+    });
+
+    // One group header for the shared user...
+    expect(screen.getByText("Casey")).toBeInTheDocument();
+    // ...but both of that user's node rows still render individually, each
+    // keeping its own per-node affordances (open button, etc).
+    expect(
+      screen.getByRole("button", { name: `Open member ${shortKey(deviceAKey)}` }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `Open member ${shortKey(deviceBKey)}` }),
+    ).toBeInTheDocument();
+    // The unbound key renders exactly as today — standalone, no group name.
+    expect(
+      screen.getByRole("button", { name: `Open member ${shortKey(soloKey)}` }),
+    ).toBeInTheDocument();
   });
 
   it("shows each node's announced capabilities as chips", () => {
