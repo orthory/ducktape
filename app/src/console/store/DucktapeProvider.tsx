@@ -328,7 +328,14 @@ export function DucktapeProvider({
         return actions.connectActive(active);
       })
       .catch((err) => {
-        if (!cancelled) fail(err);
+        if (cancelled) return;
+        // A failed boot resolution (corrupt/locked ~/.ducktape registry,
+        // permissions, a concurrent instance holding a lock) used to drop to a
+        // hollow, disconnected shell with a toast that then vanished — no
+        // workspace list, no way forward. Land on the onboarding gate, the
+        // actionable front door, with the error shown, never an empty console.
+        dispatch({ type: "patch", patch: { needsOnboarding: true } });
+        fail(err);
       });
     // Reset the guard on cleanup so StrictMode's mount→unmount→remount re-runs
     // the boot: without this the first mount's async resolve is cancelled while

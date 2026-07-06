@@ -59,6 +59,22 @@ export interface SearchResults {
   docs: PageSearchHit[];
 }
 
+/** A managed (app-spawned) node failed to START or CONNECT — the dedicated
+ *  "Node failed to start" surface reads this instead of leaving the developer
+ *  on a hollow, disconnected shell. `reason` is the human headline (the Rust
+ *  `Err` string, which already folds in the node's exit reason, or the boot
+ *  timeout); `logTail` is the daemon.log content behind it; `logPath` powers the
+ *  "Open daemon.log" affordance; `workspaceId` lets Retry re-connect the SAME
+ *  workspace idempotently (never re-minting one). Null when there is no boot
+ *  failure. Distinct from `error` (transient, dismissible op failures) and from
+ *  a joiner's `onboardingPhase: fatal` (shown in the waiting room). */
+export interface BootError {
+  workspaceId: string | null;
+  reason: string;
+  logPath: string | null;
+  logTail: string;
+}
+
 // ── State shape ─────────────────────────────────────────
 
 export interface ConsoleState {
@@ -180,6 +196,10 @@ export interface ConsoleState {
   ops: OpLedger;
 
   error: string | null;
+
+  /** A managed node failed to start/connect — routes the console to the
+   *  dedicated "Node failed to start" body (see BootError). Null on success. */
+  bootError: BootError | null;
 
   // ── Workspace / onboarding ──
   /** Every registered workspace, for the switcher. Empty on web. */
@@ -359,6 +379,7 @@ export const createInitialState = (): ConsoleState => {
     explorerFocus: null,
     ops: {},
     error: null,
+    bootError: null,
     workspaces: [],
     workspace: null,
     needsOnboarding: false,
