@@ -119,6 +119,131 @@ pub fn verify_join_request(msg: &LobbyMsg, binding: &[u8]) -> Result<VerifiedJoi
     })
 }
 
+// ============================================================================
+// the UDP intro — the same trust dance as the lobby announce, one transport
+// earlier: a fresh joiner has NO path to the mesh yet (that is what the
+// tunnel is for), so it announces its keys in a single datagram to the
+// inviter's intro listener. the token authenticates the request (mint was
+// the admission decision), the join proof binds the announced ed25519 key to
+// its holder, and a third signature binds the announced WIREGUARD key to
+// that same identity — the receiving node then installs the tunnel peer and
+// acks. everything after (lobby announce, redemption, statesync) rides the
+// tunnel-borne mesh.
+// ============================================================================
+
+/// ed25519 signing namespace binding the announced X25519 WireGuard key to
+/// the joiner identity: `sign(INTRO_WG_NAMESPACE, binding ‖ nonce ‖ wg_key)`.
+pub const INTRO_WG_NAMESPACE: &[u8] = b"ducktape-invite-intro-v1";
+
+/// the joiner's first-contact datagram. carries the whole lobby
+/// [`LobbyMsg::JoinRequest`] payload plus the WireGuard half.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IntroRequest {
+    pub issuer: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub token_sig: Vec<u8>,
+    pub joiner: Vec<u8>,
+    pub proof: Vec<u8>,
+    /// the joiner's X25519 WireGuard public key, raw.
+    pub wg_public_key: Vec<u8>,
+    /// the joiner's signature binding `wg_public_key` to its identity.
+    pub wg_sig: Vec<u8>,
+}
+
+/// the inviter's answer: the nonce echoes so the joiner matches the ack to
+/// its request; `installed` is false with a reason when the tunnel could not
+/// be brought up.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IntroAck {
+    pub nonce: Vec<u8>,
+    pub installed: bool,
+    pub detail: String,
+}
+
+pub fn encode_intro(m: &IntroRequest) -> Vec<u8> {
+    serde_json::to_vec(m).expect("serializable")
+}
+pub fn decode_intro(b: &[u8]) -> Result<IntroRequest, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+pub fn encode_intro_ack(m: &IntroAck) -> Vec<u8> {
+    serde_json::to_vec(m).expect("serializable")
+}
+pub fn decode_intro_ack(b: &[u8]) -> Result<IntroAck, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+
+/// build the intro for `token` as `joiner`, announcing `wg_public_key`.
+pub fn intro_request(
+    joiner: &ed25519::PrivateKey,
+    binding: &[u8],
+    token: &InviteToken,
+    wg_public_key: [u8; 32],
+) -> IntroRequest {
+    use commonware_codec::Encode as _;
+    use commonware_cryptography::Signer as _;
+    let proof = crate::config::sign_join_proof(joiner, binding, token);
+    let wg_msg = [binding, token.nonce.as_slice(), &wg_public_key].concat();
+    let wg_sig = joiner.sign(INTRO_WG_NAMESPACE, &wg_msg);
+    IntroRequest {
+        issuer: token.issuer.as_ref().to_vec(),
+        nonce: token.nonce.to_vec(),
+        token_sig: token.sig.encode().as_ref().to_vec(),
+        joiner: joiner.public_key().as_ref().to_vec(),
+        proof: proof.encode().as_ref().to_vec(),
+        wg_public_key: wg_public_key.to_vec(),
+        wg_sig: wg_sig.encode().as_ref().to_vec(),
+    }
+}
+
+/// a decoded, signature-verified intro — the only constructor is
+/// [`verify_intro`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedIntro {
+    pub joiner: ed25519::PublicKey,
+    pub issuer: ed25519::PublicKey,
+    pub nonce: [u8; INVITE_NONCE_LEN],
+    pub wg_public_key: [u8; 32],
+}
+
+/// verify an intro against this network's binding: the token issuer
+/// signature, the joiner's proof-of-possession, and the WireGuard-key
+/// binding signature. membership checks are the CALLER's, exactly like
+/// [`verify_join_request`].
+pub fn verify_intro(msg: &IntroRequest, binding: &[u8]) -> Result<VerifiedIntro, String> {
+    use commonware_cryptography::Verifier as _;
+    let verified = verify_join_request(
+        &LobbyMsg::JoinRequest {
+            issuer: msg.issuer.clone(),
+            nonce: msg.nonce.clone(),
+            token_sig: msg.token_sig.clone(),
+            joiner: msg.joiner.clone(),
+            proof: msg.proof.clone(),
+        },
+        binding,
+    )?;
+    let wg_public_key: [u8; 32] = msg
+        .wg_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "wireguard key must be 32 bytes".to_string())?;
+    let wg_sig = ed25519::Signature::decode(msg.wg_sig.as_slice())
+        .map_err(|e| format!("wireguard key signature: {e}"))?;
+    let wg_msg = [binding, verified.nonce.as_slice(), &wg_public_key].concat();
+    if !verified
+        .joiner
+        .verify(INTRO_WG_NAMESPACE, &wg_msg, &wg_sig)
+    {
+        return Err("wireguard key binding does not verify".into());
+    }
+    Ok(VerifiedIntro {
+        joiner: verified.joiner,
+        issuer: verified.issuer,
+        nonce: verified.nonce,
+        wg_public_key,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +309,30 @@ mod tests {
             detail: "awaiting approval".into(),
         };
         assert_eq!(decode_msg(&encode_msg(&msg)).expect("roundtrip"), msg);
+    }
+
+    #[test]
+    fn an_intro_roundtrips_verifies_and_pins_the_wireguard_key() {
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let joiner = ed25519::PrivateKey::from_seed(2);
+        let token = mint_invite_token(&issuer, BINDING);
+        let wg_key = [9u8; 32];
+        let msg = intro_request(&joiner, BINDING, &token, wg_key);
+        let decoded = decode_intro(&encode_intro(&msg)).expect("roundtrip");
+        assert_eq!(decoded, msg);
+
+        let verified = verify_intro(&decoded, BINDING).expect("verifies");
+        assert_eq!(verified.joiner, joiner.public_key());
+        assert_eq!(verified.issuer, issuer.public_key());
+        assert_eq!(verified.wg_public_key, wg_key);
+
+        // a substituted WireGuard key fails its binding signature.
+        let mut forged = msg.clone();
+        forged.wg_public_key = vec![8u8; 32];
+        let err = verify_intro(&forged, BINDING).expect_err("refused");
+        assert!(err.contains("wireguard key binding"), "{err}");
+
+        // another network refuses the same intro.
+        assert!(verify_intro(&msg, b"other-net").is_err());
     }
 }

@@ -1122,6 +1122,11 @@ pub struct Plumbing {
     pub rpc_listen: Option<String>,
     /// merged like the rest — a hand-edited storage_dir survives rewrites.
     pub storage_dir: String,
+    /// merged from an existing file only (no flag); a WireGuard join seeds a
+    /// default AFTER the merge when the invite carries a tunnel bootstrap.
+    pub wireguard_listen: Option<String>,
+    /// merged from an existing file only — a hand-set "fake" survives.
+    pub wireguard_effect: Option<String>,
 }
 
 pub fn merged_plumbing(
@@ -1155,6 +1160,8 @@ pub fn merged_plumbing(
         storage_dir: e
             .and_then(|r| r.storage_dir.clone())
             .unwrap_or_else(|| "storage".into()),
+        wireguard_listen: e.and_then(|r| r.wireguard_listen.clone()),
+        wireguard_effect: e.and_then(|r| r.wireguard_effect.clone()),
     })
 }
 
@@ -1177,6 +1184,12 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     }
     if let Some(r) = &p.rpc_listen {
         s += &format!("rpc_listen = \"{r}\"\n");
+    }
+    if let Some(w) = &p.wireguard_listen {
+        s += &format!("wireguard_listen = \"{w}\"\n");
+    }
+    if let Some(w) = &p.wireguard_effect {
+        s += &format!("wireguard_effect = \"{w}\"\n");
     }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;

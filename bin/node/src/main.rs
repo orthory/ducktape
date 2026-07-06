@@ -612,6 +612,10 @@ async fn genesis_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
+    // the network binding invite tokens verify against (the genesis
+    // namespace) — wired into governance identically on every node, or
+    // `Redeem` settles differently across validators and the app-hash forks.
+    invite_binding: &[u8],
     blobs: files::BlobHandle,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
@@ -638,7 +642,9 @@ async fn genesis_host(
         Box::new(valset),
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
-        Box::new(Governance::new("governance", "valset", "upgrade")),
+        Box::new(
+            Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding),
+        ),
         // the no-downtime upgrade coordinator: holds the at-most-one pending
         // upgrade + per-validator readiness set (valset-gated). its mere
         // presence in the registry is its genesis app-hash contribution.
@@ -715,6 +721,8 @@ async fn restore_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
     manifest: &Manifest,
+    // see `genesis_host` — the same binding must reach every rebuild path.
+    invite_binding: &[u8],
     blobs: files::BlobHandle,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
@@ -748,7 +756,8 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut governance = Governance::new("governance", "valset", "upgrade");
+    let mut governance =
+        Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding);
     let (bytes, root) = snapshot_of("governance")?;
     governance
         .install(bytes, root)
@@ -896,6 +905,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     client: &C,
     manifest: &statesync::Manifest,
     forge_repo: &std::path::Path,
+    // see `genesis_host` — the same binding must reach every rebuild path.
+    invite_binding: &[u8],
     attempt: usize,
 ) -> Result<Host, String> {
     let entry_root = |module: &str| -> Result<StateRoot, String> {
@@ -1016,7 +1027,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("tagging install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
-    let mut governance = Governance::new("governance", "valset", "upgrade");
+    let mut governance =
+        Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding);
     governance
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
@@ -3347,23 +3359,59 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("join needs exactly one <invite blob>".into());
     };
     let invite = config::decode_invite(blob)?;
-    let descriptor = &invite.descriptor;
+    let mut descriptor = invite.descriptor.clone();
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
-    config::guard_join_descriptor(&dir, descriptor)?;
+    config::guard_join_descriptor(&dir, &descriptor)?;
     // plumbing merges: explicit flags win, an existing node.toml's values
     // (network- or dev-shape) survive, defaults fill the rest. computed
     // BEFORE anything lands on disk so a corrupt existing node.toml aborts
     // the join without leaving a half-migrated dir. the file is ALWAYS
     // rewritten in the network shape — a join must take effect even in a dir
     // holding the app's dev-shape solo config.
-    let plumbing = config::merged_plumbing(
+    let mut plumbing = config::merged_plumbing(
         &dir,
         flags.get("listen").map(String::as_str),
         flags.get("advertised").map(String::as_str),
         flags.get("http").map(String::as_str),
         flags.get("rpc").map(String::as_str),
     )?;
+    if let Some(wg) = &invite.wireguard {
+        // a WireGuard invite makes the tunnel the dial path, so the joiner's
+        // defaults change shape: its own plane comes up (wireguard_listen),
+        // its mesh listens dual-stack on a CONCRETE port and advertises the
+        // overlay ULA (members reverse-dial it over the tunnels), and the
+        // descriptor gains the inviter's overlay mesh address as a Direct
+        // hint — dialable the moment the invite tunnel routes. explicit
+        // flags and an existing node.toml still win.
+        if plumbing.wireguard_listen.is_none() {
+            plumbing.wireguard_listen = Some("0.0.0.0:51820".into());
+        }
+        if flags.get("listen").is_none() {
+            let port: u16 = plumbing
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .map(|a| a.port())
+                .unwrap_or(0);
+            if port == 0 || !plumbing.listen.starts_with('[') {
+                plumbing.listen = format!("[::]:{}", if port == 0 { 52200 } else { port });
+            }
+        }
+        if plumbing.advertised.is_none() {
+            plumbing.advertised = Some("overlay".into());
+        }
+        let issuer_identity =
+            wireguard_upgrade::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
+                .map_err(|e| format!("inviter identity: {e:?}"))?;
+        let inviter_ula = wireguard_upgrade::ula_v6_member_addr(
+            &descriptor.genesis_namespace(),
+            issuer_identity,
+        );
+        descriptor.add_reach(&config::ReachHint {
+            expected_key: invite.token.issuer.clone(),
+            reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
+        });
+    }
     descriptor.save(&dir.join("network.toml"))?;
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
@@ -3375,6 +3423,10 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // the tunnel bootstrap the joining node dials BEFORE any p2p; kept
         // beside the token so `run_node` can bring the interface up first.
         config::save_invite_wireguard(&dir, &invite.token.issuer, wg)?;
+        // mint the WireGuard identity NOW so the run's plane and intro
+        // announcer read one settled key file instead of racing to create it.
+        reachability::WireGuardKeypair::load_or_generate(&dir.join("wireguard.key"))
+            .map_err(|e| format!("wireguard key: {e}"))?;
     }
     eprintln!(
         "{} identity {me_hex}",
@@ -3431,6 +3483,7 @@ fn wire_reachability_plane<S, R>(
     wireguard_effect: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    intro_listen: Option<std::net::SocketAddr>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
@@ -3464,6 +3517,7 @@ where
                     wireguard_effect,
                     advertised,
                     coordinators,
+                    intro_listen,
                     cmd_rx,
                     nudge_tx,
                     ev_tx,
@@ -3523,6 +3577,12 @@ where
                         "[node {pump_label}] reachability: epoch {epoch} standby pre-warm \
                          tunnels on {interface} ({peers} peer(s))"
                     ),
+                    reachability::ReachabilityEvent::InvitePeerInstalled { peer, interface } => {
+                        println!(
+                            "[node {pump_label}] reachability: invite tunnel to {} on {interface}",
+                            hex_bytes(&peer.as_ref()[..4])
+                        )
+                    }
                     reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
                         println!(
                             "[node {pump_label}] reachability: peer {}: {reason}",
@@ -3571,6 +3631,9 @@ async fn reachability_plane(
     effect_kind: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    // the invite intro listener: where a fresh joiner announces its keys
+    // (token-authenticated) so its tunnel exists before any p2p.
+    intro_listen: Option<std::net::SocketAddr>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
     // a clone of the `commands` sender, for the plane's own nudge ticker.
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
@@ -3664,6 +3727,88 @@ async fn reachability_plane(
         persist_file: Some(mesh_state_file),
         gossip_ingress,
     };
+    // the invite intro listener: a fresh joiner's first contact. one
+    // datagram carries the token, the joiner's identity + proof, and its
+    // WireGuard key (identity-bound); a verified intro installs the
+    // join-window tunnel peer (endpoint = the datagram's observed source —
+    // WireGuard roams to the joiner's authenticated initiation anyway) and
+    // the ack goes back only after the interface really carries it.
+    // membership is NOT checked here (this task has no state access) — the
+    // in-consensus redemption enforces it; a revoked member's token can at
+    // worst open a tunnel that admits nothing.
+    if let Some(intro_addr) = intro_listen {
+        let intro_cmds = nudges.clone().downgrade();
+        let intro_label = label.clone();
+        // `chain_id` (the namespace string) moved into the plane config
+        // above; the binding tokens sign over is those same bytes.
+        let binding = config.chain_id.clone().into_bytes();
+        tokio::spawn(async move {
+            let socket = match tokio::net::UdpSocket::bind(intro_addr).await {
+                Ok(socket) => socket,
+                Err(err) => {
+                    eprintln!(
+                        "[node {intro_label}] invite intro listener bind {intro_addr} failed: \
+                         {err} — joins via this node's invites need another member"
+                    );
+                    return;
+                }
+            };
+            println!("[node {intro_label}] invite intro listening on udp/{intro_addr}");
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, src)) = socket.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let Ok(msg) = lobby::decode_intro(&buf[..n]) else {
+                    continue; // junk on the doorbell — drop.
+                };
+                let ack = |installed: bool, detail: String| {
+                    let ack = lobby::IntroAck {
+                        nonce: msg.nonce.clone(),
+                        installed,
+                        detail,
+                    };
+                    let bytes = lobby::encode_intro_ack(&ack);
+                    let socket = &socket;
+                    async move {
+                        let _ = socket.send_to(&bytes, src).await;
+                    }
+                };
+                let verified = match lobby::verify_intro(&msg, &binding) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ack(false, e).await;
+                        continue;
+                    }
+                };
+                let Some(cmds) = intro_cmds.upgrade() else { break };
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let install = reachability::ReachabilityCommand::InstallInvitePeer {
+                    peer: verified.joiner.clone(),
+                    wireguard_public_key: wireguard_upgrade::X25519PublicKey(
+                        verified.wg_public_key,
+                    ),
+                    endpoint: src,
+                    reply: reachability::InstallReply(reply_tx),
+                };
+                if cmds.send(install).await.is_err() {
+                    break;
+                }
+                match reply_rx.await {
+                    Ok(Ok(())) => {
+                        println!(
+                            "[node {intro_label}] invite intro: tunnel peer installed for {}",
+                            config::hex_bytes(&verified.joiner.as_ref()[..4])
+                        );
+                        ack(true, "tunnel installed".into()).await;
+                    }
+                    Ok(Err(e)) => ack(false, e).await,
+                    Err(_) => ack(false, "plane exited".into()).await,
+                }
+            }
+        });
+    }
+
     // the boot `Retarget`'s record fan-out fires before the p2p actors have
     // a single live connection, and mesh sends are best-effort — when both
     // sides of a link lose that first datagram the plane deadlocks in record
@@ -3800,17 +3945,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         if invite_token.is_some() {
             println!(
                 "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: parking on the mesh and announcing this key with the invite token; \
-                 a member approves the join request (the app, or `ducktape-node \
-                 invite-accept {}`)",
-                hex_bytes(signer.public_key().as_ref()),
+                 mode: announcing this key with the invite token; a member node redeems it \
+                 automatically (the mint was the approval) and full-node standing lands at \
+                 the next block",
                 hex_bytes(signer.public_key().as_ref())
             );
         } else {
             println!(
                 "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: parking on the mesh until a member runs `ducktape-node \
-                 invite-accept {}`",
+                 mode: no invite token on disk, so a member must grant standing manually \
+                 (`ducktape-node invite-accept {}`)",
                 hex_bytes(signer.public_key().as_ref()),
                 hex_bytes(signer.public_key().as_ref())
             );
@@ -4195,7 +4339,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // disk, so every store opens under its canonical module id) and
             // print the greppable line the demo script asserts on.
             let forge_repo = storage_for_sync.join("forge-repo");
-            match sync_all_modules(&context, &client, &manifest, &forge_repo, 0).await {
+            match sync_all_modules(&context, &client, &manifest, &forge_repo, &namespace, 0).await {
                 Ok(host) => {
                     println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
                 }
@@ -4287,6 +4431,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             wireguard_effect,
                             advertised_reach,
                             coordinators,
+                            // a joiner serves no intros — only members mint
+                            // redeemable invites.
+                            None,
                             reach_tx,
                             reach_rx,
                         ))
@@ -4300,6 +4447,129 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                 }
             };
+            // the TUNNEL-FIRST join window: an invite that carried a WireGuard
+            // bootstrap makes the tunnel the join's carrier — before any p2p,
+            // (a) this node's interface gains the INVITER as a peer (endpoint
+            // straight from the blob), and (b) an intro announcer delivers
+            // this node's identity + WireGuard key to the inviter's intro
+            // listener until acked, at which point the inviter's side of the
+            // tunnel exists too. the mesh dialer below then reaches the
+            // inviter's overlay ULA (the join-minted Direct hint) the moment
+            // the tunnel routes, and everything else — lobby announce,
+            // redemption, statesync — rides it.
+            if let (Some(reach), Some(wg), Some(token)) =
+                (&reach_cmd, &invite_wireguard, &invite_token)
+            {
+                use std::net::ToSocketAddrs as _;
+                let install = wg.issuer_key().and_then(|issuer| {
+                    let endpoint = wg
+                        .endpoint
+                        .to_socket_addrs()
+                        .map_err(|e| format!("invite wireguard endpoint {:?}: {e}", wg.endpoint))?
+                        .next()
+                        .ok_or_else(|| format!("invite wireguard endpoint {:?} did not resolve", wg.endpoint))?;
+                    let public_key = wg.public_key_bytes()?;
+                    Ok((issuer, public_key, endpoint))
+                });
+                match install {
+                    Ok((issuer, public_key, endpoint)) => {
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        let _ = reach
+                            .send(reachability::ReachabilityCommand::InstallInvitePeer {
+                                peer: issuer,
+                                wireguard_public_key: wireguard_upgrade::X25519PublicKey(public_key),
+                                endpoint,
+                                reply: reachability::InstallReply(reply_tx),
+                            })
+                            .await;
+                        match reply_rx.await {
+                            Ok(Ok(())) => println!(
+                                "[node {label}] invite: tunnel to the inviter configured \
+                                 (endpoint {endpoint})"
+                            ),
+                            Ok(Err(e)) => eprintln!(
+                                "[node {label}] invite: inviter tunnel not configured: {e}"
+                            ),
+                            Err(_) => {}
+                        }
+                        // the announcer: a plain blocking UDP loop on its own OS
+                        // thread (nothing here touches the runtime) — re-sends
+                        // the intro every 2s until the inviter acks an install.
+                        let announce_label = label.clone();
+                        let announce_signer = signer.clone();
+                        let announce_namespace = namespace.clone();
+                        let announce_token = token.clone();
+                        let intro_dest = wg.intro.clone();
+                        let key_file = wireguard_key_file.clone();
+                        std::thread::Builder::new()
+                            .name("invite-intro".into())
+                            .spawn(move || {
+                                let Ok((keypair, _)) =
+                                    reachability::WireGuardKeypair::load_or_generate(&key_file)
+                                else {
+                                    eprintln!(
+                                        "[node {announce_label}] invite: wireguard key unreadable — \
+                                         intro not announced"
+                                    );
+                                    return;
+                                };
+                                let request = lobby::encode_intro(&lobby::intro_request(
+                                    &announce_signer,
+                                    &announce_namespace,
+                                    &announce_token,
+                                    keypair.public_key().0,
+                                ));
+                                let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+                                    return;
+                                };
+                                let _ = socket
+                                    .set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                                let mut announced = false;
+                                let mut buf = [0u8; 2048];
+                                loop {
+                                    let Ok(dest) = intro_dest.to_socket_addrs() else {
+                                        std::thread::sleep(std::time::Duration::from_secs(2));
+                                        continue;
+                                    };
+                                    let Some(dest) = dest.into_iter().next() else {
+                                        std::thread::sleep(std::time::Duration::from_secs(2));
+                                        continue;
+                                    };
+                                    if socket.send_to(&request, dest).is_ok() && !announced {
+                                        announced = true;
+                                        println!(
+                                            "[node {announce_label}] invite: introducing this \
+                                             node to the inviter at udp/{dest}"
+                                        );
+                                    }
+                                    if let Ok((n, _)) = socket.recv_from(&mut buf)
+                                        && let Ok(ack) = lobby::decode_intro_ack(&buf[..n])
+                                        && ack.nonce == announce_token.nonce.to_vec()
+                                    {
+                                        if ack.installed {
+                                            println!(
+                                                "[node {announce_label}] invite: inviter \
+                                                 installed our tunnel — join rides the overlay"
+                                            );
+                                            return;
+                                        }
+                                        eprintln!(
+                                            "[node {announce_label}] invite: inviter refused \
+                                             the intro: {}",
+                                            ack.detail
+                                        );
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_secs(2));
+                                }
+                            })
+                            .expect("spawn invite-intro thread");
+                    }
+                    Err(e) => eprintln!(
+                        "[node {label}] invite: wireguard bootstrap unusable ({e}) — falling \
+                         back to the descriptor's reach hints"
+                    ),
+                }
+            }
             // the voice lane: a parked joiner serves no huddle audio, but the
             // channel must exist — black-hole. dropping the session lane makes
             // /v1/call/ws refuse instead of hang (this branch always ends in
@@ -4381,7 +4651,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let attempted = lobby_tx.send(Recipients::One(target.clone()), frame.clone(), false);
                 if !attempted.is_empty() {
                     println!(
-                        "[node {label}] join request sent to member {} — awaiting approval",
+                        "[node {label}] invite announce sent to member {} — redemption follows",
                         hex_bytes(&target.as_ref()[..4])
                     );
                 }
@@ -4423,22 +4693,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut last_indexed_root: Option<StateRoot> = None;
             let not_serving = |standing: bool| -> String {
                 if standing {
-                    "observer: no boundary pre-synced yet — retry shortly".into()
+                    "full node: no boundary synced yet — retry shortly".into()
                 } else {
-                    "parked: not admitted yet — no state to serve (a member must run \
-                     `invite-accept` for this key)"
-                        .into()
+                    "joining: redemption not landed yet — no state to serve".into()
                 }
             };
             let (boundary, host, floor) = loop {
                 attempt += 1;
                 if attempt > 900 && !observer_standing {
                     // ~30 minutes of 2s retries: parking forever is operator
-                    // guidance territory, not a silent spin. (an OBSERVER
-                    // parks indefinitely by design — that bail is gated off.)
+                    // guidance territory, not a silent spin. (a FULL NODE
+                    // holds standing indefinitely — that bail is gated off.)
                     eprintln!(
-                        "[node {label}] FATAL: still not admitted after {attempt} attempts — \
-                         has a member run `ducktape-node invite-accept {}`?",
+                        "[node {label}] FATAL: still no standing after {attempt} attempts — \
+                         the invite may be spent or expired, or no member is reachable; \
+                         ask for a fresh invite (manual fallback: `ducktape-node \
+                         invite-accept {}`)",
                         hex_bytes(&me_bytes)
                     );
                     std::process::exit(1);
@@ -4581,12 +4851,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // is genuinely unreachable. lead with admission and demote
                         // the raw transport error: the old "mesh unreachable /
                         // server dead" wording read as a crash and misdirected
-                        // debugging. the joiner-mode banner above carries the exact
-                        // `invite-accept <key>` command, so we don't repeat the key.
+                        // debugging.
                         println!(
-                            "[node {label}] parked: not yet admitted (or the mesh is \
-                             unreachable) — a member must run `invite-accept` for this \
-                             key; see the joiner-mode banner above. retrying ({e})"
+                            "[node {label}] joining: redemption not landed yet (or the mesh \
+                             is unreachable) — the announce keeps retrying and a member node \
+                             redeems it automatically. retrying ({e})"
                         );
                         send_announce(&announce_targets, attempt);
                         continue;
@@ -4701,7 +4970,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // handle may exist. reads queue in the serve window
                             // until the fresh host lands.
                             serving = None;
-                            match sync_all_modules(&context, &client, &m, &forge_repo, attempt)
+                            match sync_all_modules(&context, &client, &m, &forge_repo, &namespace, attempt)
                                 .await
                             {
                                 Ok(host) => {
@@ -4756,7 +5025,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         continue;
                     }
                     println!(
-                        "[node {label}] parked: awaiting admission (epoch {} has {} validators)",
+                        "[node {label}] joining: awaiting redemption (epoch {} has {} validators)",
                         m.epoch,
                         m.participants.len()
                     );
@@ -4792,7 +5061,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // a promoted observer stops serving: drop the served host
                 // before the promotion sync reopens the same partitions.
                 serving = None;
-                match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
+                match sync_all_modules(&context, &client, &m, &forge_repo, &namespace, attempt).await {
                     Ok(host) => {
                         let latest = match fetch_manifest(&client).await {
                             Ok(latest) => latest,
@@ -4982,7 +5251,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let host = genesis_host(&context, &forge_repo, &validators, blobs.clone()).await;
+                let host = genesis_host(&context, &forge_repo, &validators, &namespace, blobs.clone()).await;
                 let pos = recovery.oplog_pos().await;
                 let genesis_participants: Vec<Vec<u8>> =
                     validators.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -5029,7 +5298,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let restored = restore_host(&context, &forge_repo, &manifest, blobs.clone()).await;
+                let restored = restore_host(&context, &forge_repo, &manifest, &namespace, blobs.clone()).await;
                 let mut host = match restored {
                     Ok(h) => h,
                     Err(e) => {
@@ -5272,6 +5541,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         wireguard_effect,
                         advertised_reach,
                         coordinators,
+                        // members serve the invite intro: a fresh joiner's
+                        // tunnel comes up against this listener before any p2p.
+                        invite_listen,
                         reach_p2p_tx,
                         reach_p2p_rx,
                     ))
@@ -5465,6 +5737,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             &client,
                             &target,
                             &forge_repo,
+                            &namespace,
                             10_000 + attempts,
                         )
                         .await
@@ -7015,6 +7288,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         );
                         continue;
                     }
+                    // AUTO-REDEMPTION: minting the invite WAS the approval, so
+                    // a verified announce submits the governance Redeem op on
+                    // the joiner's behalf — no human step. every validator
+                    // re-verifies the token in-consensus and the nonce set
+                    // makes it single-use, so racing members (the joiner
+                    // round-robins its announce) collapse to one grant and
+                    // deterministic rejects. the in-memory map only throttles
+                    // re-submits across the joiner's ~3s re-announces.
                     let now = unix_ms();
                     let fresh = !join_requests.contains_key(&joiner_bytes);
                     let record = join_requests
@@ -7022,22 +7303,57 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         .or_insert(JoinRequestRecord {
                             issuer: verified.issuer.as_ref().to_vec(),
                             first_seen_ms: now,
-                            last_seen_ms: now,
+                            last_seen_ms: 0,
                         });
-                    record.last_seen_ms = now;
-                    if fresh {
-                        println!(
-                            "[node {label}] join request: {} asks to join (invited by {}) — \
-                             approve in the app, or run `ducktape-node invite-accept {}`",
-                            hex_bytes(verified.joiner.as_ref()),
-                            hex_bytes(&record.issuer),
-                            hex_bytes(verified.joiner.as_ref())
-                        );
+                    const REDEEM_RESUBMIT_MS: u64 = 30_000;
+                    if !fresh && now.saturating_sub(record.last_seen_ms) < REDEEM_RESUBMIT_MS {
+                        send_reply(true, "redemption in flight — standing lands shortly".into());
+                        continue;
                     }
-                    send_reply(
-                        true,
-                        "join request recorded — awaiting member approval".into(),
-                    );
+                    record.last_seen_ms = now;
+                    let redeem = governance::GovMsg::Redeem {
+                        issuer: verified.issuer.as_ref().to_vec(),
+                        nonce: verified.nonce.to_vec(),
+                        token_sig: match &msg {
+                            lobby::LobbyMsg::JoinRequest { token_sig, .. } => token_sig.clone(),
+                            _ => unreachable!("verified above"),
+                        },
+                        joiner: verified.joiner.as_ref().to_vec(),
+                        proof: match &msg {
+                            lobby::LobbyMsg::JoinRequest { proof, .. } => proof.clone(),
+                            _ => unreachable!("verified above"),
+                        },
+                    };
+                    let seq = next_seq;
+                    next_seq += 1;
+                    match node
+                        .submit(
+                            &signer,
+                            seq,
+                            Msg {
+                                target: "governance".into(),
+                                payload: governance::encode_msg(&redeem),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            println!(
+                                "[node {label}] invite redemption submitted: {} (invited by {})",
+                                hex_bytes(verified.joiner.as_ref()),
+                                hex_bytes(verified.issuer.as_ref())
+                            );
+                            send_reply(
+                                true,
+                                "invite verified — redemption submitted, full-node standing \
+                                 lands at the next block"
+                                    .into(),
+                            );
+                        }
+                        Err(e) => {
+                            send_reply(false, format!("redemption submit failed: {e}"));
+                        }
+                    }
                 }
                 cmd = http_ingress.next() => {
                     let Some(cmd) = cmd else { continue };
