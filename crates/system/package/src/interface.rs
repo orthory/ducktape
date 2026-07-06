@@ -167,6 +167,9 @@ pub struct InstallSpec {
 
 /// write intents the package registry accepts (its `execute` payload). every
 /// arm rides its caller's block and MAY fail (registration posture).
+// the install variant IS the big one — the wire shape (an inline spec, not a
+// box) is the epic's shared vocabulary, so variant balance loses here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageMsg {
@@ -238,6 +241,8 @@ pub enum PackageReply {
 /// arm MAY fail (it rides the installer's block); on success the harness
 /// registers its agents + hooks and acks with [`PackageMsg::MarkActive`].
 /// suspend/resume/unplug arms pause/resume/tombstone the harness's agents.
+// same trade as [`PackageMsg`]: the inline spec is the shared wire shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessMsg {

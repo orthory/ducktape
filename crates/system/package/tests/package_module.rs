@@ -6,7 +6,7 @@
 //! staging discipline.
 
 use futures::executor::block_on;
-use memory::{Body as MemoryBody, MemoryMsg, PublishBody, decode_msg as memory_decode_msg};
+use memory::{MemoryMsg, PublishBody, decode_msg as memory_decode_msg};
 use package::{
     ActionRoute, AgentSeed, EngagementRule, HarnessMsg, InstallSpec, MANIFEST_HASH_LEN,
     ModuleBinding, PackageModule, PackageMsg, PackageQuery, PackageReply, PackageStatus,
@@ -368,9 +368,12 @@ fn install_rejects_a_duplicate_package_id() {
     assert!(exec(&mut m, &mut ctx, &PackageMsg::Install(again)).is_err());
 }
 
+/// one labelled way to break an otherwise-valid spec.
+type SpecBreaker = (&'static str, Box<dyn Fn(&mut InstallSpec)>);
+
 #[test]
 fn install_validates_the_spec_shape() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut InstallSpec)>)> = vec![
+    let cases: Vec<SpecBreaker> = vec![
         ("bad package id", Box::new(|s| s.package = "UPPER".into())),
         ("empty version", Box::new(|s| s.version = String::new())),
         (
