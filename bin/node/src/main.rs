@@ -99,7 +99,6 @@ use kv::Kv;
 use memory::Memory;
 use node::OrderedNode;
 use pages::Pages;
-use comments::Comments;
 use profiles::Profiles;
 use recovery::{Manifest, Recovery};
 use saga::{LeasePolicy, SagaModule};
@@ -608,7 +607,6 @@ async fn genesis_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
-    let comments = Comments::init(context.child("comments"), "comments").await;
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
@@ -627,7 +625,6 @@ async fn genesis_host(
         Box::new(kv),
         Box::new(document),
         Box::new(pages),
-        Box::new(comments),
         Box::new(chat),
         Box::new(forge),
         Box::new(valset),
@@ -716,7 +713,6 @@ async fn restore_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
-    let comments = Comments::init(context.child("comments"), "comments").await;
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
@@ -859,7 +855,6 @@ async fn restore_host(
         Box::new(kv),
         Box::new(document),
         Box::new(pages),
-        Box::new(comments),
         Box::new(chat),
         Box::new(forge),
         Box::new(valset),
@@ -960,15 +955,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let pages = Pages::sync_from(
         scratch_context.child(child_label("pages")),
         "pages",
-        target,
-        resolver,
-    )
-    .await?;
-
-    let (target, resolver) = fetch_target("comments").await?;
-    let comments = Comments::sync_from(
-        scratch_context.child(child_label("comments")),
-        "comments",
         target,
         resolver,
     )
@@ -1136,7 +1122,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(kv),
         Box::new(document),
         Box::new(pages),
-        Box::new(comments),
         Box::new(chat),
         Box::new(forge),
         Box::new(valset),

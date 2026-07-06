@@ -49,7 +49,6 @@ use noded::{
     block_row, hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
-use comments::Comments;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
@@ -280,7 +279,6 @@ fn run_node(
         );
         let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
-        let comments = Comments::init(context.child("comments"), "comments").await;
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
         // pack bytes never enter consensus (root stays sha256(head oid)).
@@ -308,7 +306,6 @@ fn run_node(
             Box::new(runs),
             Box::new(document),
             Box::new(pages),
-            Box::new(comments),
             Box::new(forge),
             Box::new(files),
             Box::new(memory),

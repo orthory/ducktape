@@ -40,7 +40,6 @@ members = [
     "crates/apps/document", 
     "crates/apps/pages", 
     "crates/apps/chat",
-    "crates/apps/comments",
     "crates/apps/agent",
     "crates/apps/runs", 
     "crates/apps/tasks", 
@@ -127,7 +126,6 @@ tagging = { path = "crates/system/tagging" }
 forge = { path = "crates/apps/forge" }
 document = { path = "crates/apps/document" }
 pages = { path = "crates/apps/pages" }
-comments = { path = "crates/apps/comments" }
 chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }
 runs = { path = "crates/apps/runs" }

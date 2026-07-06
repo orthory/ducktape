@@ -30,7 +30,6 @@ tagging = { workspace = true }
 saga = { workspace = true }
 document = { workspace = true }
 pages = { workspace = true }
-comments = { workspace = true }
 forge = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }

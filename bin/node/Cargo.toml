@@ -41,7 +41,6 @@ dispatch-oracle = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
 pages = { workspace = true }
-comments = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }

@@ -12,8 +12,8 @@
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use pages::Pages;
 use pages::{
-    Block, BlockKind, NewBlock, PageMeta, PageMsg, PageQuery, PageReply, decode_reply, encode_msg,
-    encode_query,
+    Block, BlockKind, NewBlock, PageMeta, PageMsg, PageQuery, PageReply, ThreadView, decode_reply,
+    encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
 
@@ -141,6 +141,17 @@ fn synced_store_reconstructs_source_root() {
         )
         .await; // overwrite: op-log order matters
         apply_commit(&mut src, &PageMsg::RemoveBlock { block_id: "c1".into() }).await; // delete rides the log too
+        // a comment rides the SAME qmdb (reserved keys) — it must sync too.
+        apply_commit(
+            &mut src,
+            &PageMsg::AddComment {
+                thread_id: "th1".into(),
+                comment_id: "cm1".into(),
+                target: "b1".into(),
+                text: "review this".into(),
+            },
+        )
+        .await;
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
 
@@ -166,6 +177,22 @@ fn synced_store_reconstructs_source_root() {
         let ids: Vec<&str> = page.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, ["p1", "b1"]);
         assert_eq!(page[1].text, "final");
+
+        // the comment survived the sync too.
+        let view = match decode_reply(
+            &synced
+                .query(&encode_query(&PageQuery::CommentThread { thread_id: "th1".into() }))
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+        {
+            PageReply::CommentThread(v) => v,
+            other => panic!("expected CommentThread, got {other:?}"),
+        };
+        let view: ThreadView = view.expect("thread present after sync");
+        assert_eq!(view.comments.len(), 1);
+        assert_eq!(view.comments[0].text, "review this");
     });
 }
 

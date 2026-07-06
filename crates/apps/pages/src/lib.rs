@@ -68,7 +68,38 @@ use commonware_storage::{
 };
 use commonware_utils::range::NonEmptyRange;
 
-use sdk::{Ctx, Error, Module, ModuleId, Msg, ResolverSyncTarget, StateRoot, StateSyncHandle};
+use sdk::{
+    Ctx, Error, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot, StateSyncHandle,
+};
+
+/// reserved logical-key prefixes for comment records + the per-target thread
+/// index. all lead with NUL, so they can never collide with a client-minted
+/// block/page id (which the reserved-id guard forbids from starting with NUL).
+const THREAD_PREFIX: &str = "\u{0}ct:";
+const COMMENT_PREFIX: &str = "\u{0}cc:";
+const TARGET_INDEX_PREFIX: &str = "\u{0}ci:";
+
+fn thread_key(id: &str) -> String {
+    format!("{THREAD_PREFIX}{id}")
+}
+fn comment_key(id: &str) -> String {
+    format!("{COMMENT_PREFIX}{id}")
+}
+fn target_index_key(target: &str) -> String {
+    format!("{TARGET_INDEX_PREFIX}{target}")
+}
+
+/// derive the comment author from the dispatch origin (mirrors chat). the
+/// pre-consensus default `Origin::External(vec![])` must never pass as a real
+/// user.
+fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
+    match origin {
+        Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
+        Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
+        Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
+        Origin::System => Ok(AuthorRef::System),
+    }
+}
 
 /// write-time cap on ONE serialized block record (and on the enumeration
 /// index value — both stage through the same guard). the codec [`RangeCfg`]
@@ -198,6 +229,27 @@ enum PageError {
     NotAPage,
     /// a set-parent would nest a page inside its own folder subtree.
     PageCycle,
+    // ── comments ──
+    /// a comment op arrived with an empty (pre-consensus) origin.
+    EmptyOrigin,
+    /// resolve/append named a thread id not in the store.
+    ThreadNotFound,
+    /// edit/delete named a comment id not in the store (or a tombstone).
+    CommentNotFound,
+    /// AddComment reused a comment id already present.
+    DuplicateComment,
+    /// an append named a target that differs from the thread's.
+    TargetMismatch,
+    /// edit/delete by someone other than the stored author.
+    NotAuthor,
+    /// comment text over [`MAX_COMMENT_TEXT_BYTES`].
+    TextTooLarge,
+    /// a thread already holds [`MAX_COMMENTS_PER_THREAD`] comments.
+    TooManyComments,
+    /// a target already holds [`MAX_THREADS_PER_TARGET`] threads.
+    TooManyThreads,
+    /// a ThreadsForTargets query named more than [`MAX_QUERY_TARGETS`] targets.
+    TooManyTargets,
 }
 
 impl core::fmt::Display for PageError {
@@ -218,6 +270,16 @@ impl core::fmt::Display for PageError {
             PageError::ParentPageNotFound => "parent page not found",
             PageError::NotAPage => "not a page",
             PageError::PageCycle => "page cycle",
+            PageError::EmptyOrigin => "empty origin",
+            PageError::ThreadNotFound => "thread not found",
+            PageError::CommentNotFound => "comment not found",
+            PageError::DuplicateComment => "duplicate comment id",
+            PageError::TargetMismatch => "target mismatch",
+            PageError::NotAuthor => "not the comment author",
+            PageError::TextTooLarge => "comment text too large",
+            PageError::TooManyComments => "too many comments in thread",
+            PageError::TooManyThreads => "too many threads on target",
+            PageError::TooManyTargets => "too many query targets",
         };
         f.write_str(s)
     }
@@ -352,6 +414,68 @@ where
         Ok(())
     }
 
+    // ── comment storage (reserved NUL-prefixed keys) ──
+
+    async fn load_thread(&self, id: &str) -> Result<Option<Thread>, PageError> {
+        match self.get(thread_key(id).as_bytes()).await {
+            Some(b) => Ok(Some(
+                serde_json::from_slice(&b).map_err(|_| PageError::Corrupt)?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    async fn load_comment(&self, id: &str) -> Result<Option<Comment>, PageError> {
+        match self.get(comment_key(id).as_bytes()).await {
+            Some(b) => Ok(Some(
+                serde_json::from_slice(&b).map_err(|_| PageError::Corrupt)?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn store_thread(&mut self, t: &Thread) -> Result<(), PageError> {
+        self.stage(&thread_key(&t.id), serde_json::to_vec(t).expect("thread serializable"))
+    }
+
+    fn store_comment(&mut self, c: &Comment) -> Result<(), PageError> {
+        self.stage(&comment_key(&c.id), serde_json::to_vec(c).expect("comment serializable"))
+    }
+
+    async fn load_target_index(&self, target: &str) -> Result<Vec<String>, PageError> {
+        match self.get(target_index_key(target).as_bytes()).await {
+            Some(b) => serde_json::from_slice(&b).map_err(|_| PageError::Corrupt),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn stage_target_index(&mut self, target: &str, ids: &[String]) -> Result<(), PageError> {
+        if ids.is_empty() {
+            self.delete_block(&target_index_key(target));
+            Ok(())
+        } else {
+            self.stage(&target_index_key(target), serde_json::to_vec(ids).expect("ids serializable"))
+        }
+    }
+
+    /// a thread plus its LIVE (non-tombstoned) comments in order. `None` when
+    /// the thread is absent; a listed comment missing from the store is
+    /// corruption, surfaced loudly.
+    async fn thread_view(&self, thread_id: &str) -> Result<Option<ThreadView>, PageError> {
+        let thread = match self.load_thread(thread_id).await? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let mut comments = Vec::new();
+        for cid in &thread.comment_ids {
+            let c = self.load_comment(cid).await?.ok_or(PageError::Corrupt)?;
+            if !c.deleted {
+                comments.push(c);
+            }
+        }
+        Ok(Some(ThreadView { thread, comments }))
+    }
+
     /// load a block that MUST exist (`missing` names the error when it does
     /// not) — the shared shape of every "look up then edit" op.
     async fn require_block(&self, block_id: &str, missing: PageError) -> Result<Block, PageError> {
@@ -402,28 +526,44 @@ where
     }
 
     /// apply one decoded [`PageMsg`] to the staged overlay. pure tree surgery
-    /// over per-block records, re-staged on success. errors abort the block.
-    async fn apply(&mut self, msg: PageMsg) -> Result<(), PageError> {
-        // no op may name the reserved index sentinel — reject deterministically
-        // BEFORE any storage touch, so a block write can never clobber the
-        // enumeration index. anchors are only ever matched against children
-        // lists (which can never contain the sentinel), so they need no check.
-        let named = match &msg {
-            PageMsg::CreatePage { page_id, .. } => [page_id.as_str(), ""],
-            PageMsg::InsertBlock { parent, block, .. } => [parent.as_str(), block.id.as_str()],
+    /// over per-block/-comment records, re-staged on success. errors abort the
+    /// block. `origin`/`now` are only consulted by the comment ops (author +
+    /// timestamp); block ops ignore them.
+    async fn apply(&mut self, msg: PageMsg, origin: &Origin, now: u64) -> Result<(), PageError> {
+        // no client-minted id may live in the reserved (NUL-prefixed) keyspace:
+        // the enumeration index (`\0page-index`) and every comment record/index
+        // key lead with NUL, so rejecting NUL-prefixed ids here — BEFORE any
+        // storage touch — keeps a block/comment write from ever clobbering them.
+        let named: Vec<&str> = match &msg {
+            PageMsg::CreatePage { page_id, parent, .. } => {
+                let mut v = vec![page_id.as_str()];
+                if let Some(p) = parent {
+                    v.push(p.as_str());
+                }
+                v
+            }
+            PageMsg::InsertBlock { parent, block, .. } => vec![parent.as_str(), block.id.as_str()],
             PageMsg::UpdateText { block_id, .. }
             | PageMsg::SetKind { block_id, .. }
             | PageMsg::SetChecked { block_id, .. }
-            | PageMsg::RemoveBlock { block_id } => [block_id.as_str(), ""],
-            PageMsg::MoveBlock {
-                block_id, parent, ..
-            } => [block_id.as_str(), parent.as_str()],
+            | PageMsg::RemoveBlock { block_id } => vec![block_id.as_str()],
+            PageMsg::MoveBlock { block_id, parent, .. } => vec![block_id.as_str(), parent.as_str()],
             PageMsg::SetPageParent { page_id, parent } => {
-                [page_id.as_str(), parent.as_deref().unwrap_or("")]
+                let mut v = vec![page_id.as_str()];
+                if let Some(p) = parent {
+                    v.push(p.as_str());
+                }
+                v
             }
-            PageMsg::DeletePage { page_id } => [page_id.as_str(), ""],
+            PageMsg::DeletePage { page_id } => vec![page_id.as_str()],
+            PageMsg::AddComment { thread_id, comment_id, target, .. } => {
+                vec![thread_id.as_str(), comment_id.as_str(), target.as_str()]
+            }
+            PageMsg::EditComment { comment_id, .. } => vec![comment_id.as_str()],
+            PageMsg::DeleteComment { comment_id } => vec![comment_id.as_str()],
+            PageMsg::ResolveThread { thread_id, .. } => vec![thread_id.as_str()],
         };
-        if named.iter().any(|id| *id == PAGE_INDEX_KEY) {
+        if named.iter().any(|id| id.starts_with('\u{0}')) {
             return Err(PageError::ReservedId);
         }
 
@@ -670,6 +810,139 @@ where
                 index.insert(page_id, parent);
                 self.stage_index(&index)
             }
+
+            // ── comments ──
+            PageMsg::AddComment { thread_id, comment_id, target, text } => {
+                if text.len() > MAX_COMMENT_TEXT_BYTES {
+                    return Err(PageError::TextTooLarge);
+                }
+                let author = author_from_origin(origin)?;
+                if self.load_comment(&comment_id).await?.is_some() {
+                    return Err(PageError::DuplicateComment);
+                }
+                match self.load_thread(&thread_id).await? {
+                    Some(mut thread) => {
+                        if thread.target != target {
+                            return Err(PageError::TargetMismatch);
+                        }
+                        if thread.comment_ids.len() >= MAX_COMMENTS_PER_THREAD {
+                            return Err(PageError::TooManyComments);
+                        }
+                        let comment = Comment {
+                            id: comment_id.clone(),
+                            thread_id: thread_id.clone(),
+                            author,
+                            text,
+                            created_at: now,
+                            edited_at: None,
+                            deleted: false,
+                        };
+                        thread.comment_ids.push(comment_id);
+                        self.store_comment(&comment)?;
+                        self.store_thread(&thread)
+                    }
+                    None => {
+                        let mut ids = self.load_target_index(&target).await?;
+                        if ids.len() >= MAX_THREADS_PER_TARGET {
+                            return Err(PageError::TooManyThreads);
+                        }
+                        let comment = Comment {
+                            id: comment_id.clone(),
+                            thread_id: thread_id.clone(),
+                            author: author.clone(),
+                            text,
+                            created_at: now,
+                            edited_at: None,
+                            deleted: false,
+                        };
+                        let thread = Thread {
+                            id: thread_id.clone(),
+                            target: target.clone(),
+                            opener: author,
+                            created_at: now,
+                            resolved: false,
+                            resolved_by: None,
+                            comment_ids: vec![comment_id],
+                        };
+                        if !ids.contains(&thread_id) {
+                            ids.push(thread_id);
+                            ids.sort();
+                            self.stage_target_index(&target, &ids)?;
+                        }
+                        self.store_comment(&comment)?;
+                        self.store_thread(&thread)
+                    }
+                }
+            }
+            PageMsg::EditComment { comment_id, text } => {
+                if text.len() > MAX_COMMENT_TEXT_BYTES {
+                    return Err(PageError::TextTooLarge);
+                }
+                let author = author_from_origin(origin)?;
+                let mut c = self
+                    .load_comment(&comment_id)
+                    .await?
+                    .ok_or(PageError::CommentNotFound)?;
+                if c.deleted {
+                    return Err(PageError::CommentNotFound);
+                }
+                if c.author != author {
+                    return Err(PageError::NotAuthor);
+                }
+                c.text = text;
+                c.edited_at = Some(now);
+                self.store_comment(&c)
+            }
+            PageMsg::DeleteComment { comment_id } => {
+                let author = author_from_origin(origin)?;
+                let mut c = self
+                    .load_comment(&comment_id)
+                    .await?
+                    .ok_or(PageError::CommentNotFound)?;
+                if c.deleted {
+                    return Ok(()); // idempotent
+                }
+                if c.author != author {
+                    return Err(PageError::NotAuthor);
+                }
+                c.deleted = true;
+                c.text = String::new();
+                let thread_id = c.thread_id.clone();
+                self.store_comment(&c)?;
+                // if no live comments remain, remove the whole thread.
+                let thread = self
+                    .load_thread(&thread_id)
+                    .await?
+                    .ok_or(PageError::Corrupt)?;
+                let mut any_live = false;
+                for cid in &thread.comment_ids {
+                    let cc = self.load_comment(cid).await?.ok_or(PageError::Corrupt)?;
+                    if !cc.deleted {
+                        any_live = true;
+                        break;
+                    }
+                }
+                if !any_live {
+                    for cid in &thread.comment_ids {
+                        self.delete_block(&comment_key(cid));
+                    }
+                    self.delete_block(&thread_key(&thread.id));
+                    let mut ids = self.load_target_index(&thread.target).await?;
+                    ids.retain(|t| t != &thread.id);
+                    self.stage_target_index(&thread.target, &ids)?;
+                }
+                Ok(())
+            }
+            PageMsg::ResolveThread { thread_id, resolved } => {
+                let author = author_from_origin(origin)?;
+                let mut thread = self
+                    .load_thread(&thread_id)
+                    .await?
+                    .ok_or(PageError::ThreadNotFound)?;
+                thread.resolved = resolved;
+                thread.resolved_by = if resolved { Some(author) } else { None };
+                self.store_thread(&thread)
+            }
         }
     }
 
@@ -795,9 +1068,13 @@ where
 
     /// decode a [`PageMsg`] and apply it to the staged overlay. the only
     /// `.await` is on own qmdb state — deterministic, so replay-safe.
-    async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let m = decode_msg(&msg.payload).map_err(Error::Module)?;
-        self.apply(m)
+        // origin + consensus time feed the comment ops (author + timestamp);
+        // block ops ignore them. clone off `ctx` so `self` can borrow mutably.
+        let origin = ctx.env().origin.clone();
+        let now = ctx.env().consensus_time;
+        self.apply(m, &origin, now)
             .await
             .map_err(|e| Error::Module(e.to_string()))
     }
@@ -842,6 +1119,31 @@ where
                     });
                 }
                 Ok(encode_reply(&PageReply::PageList(pages)))
+            }
+            PageQuery::ThreadsForTargets { targets } => {
+                if targets.len() > MAX_QUERY_TARGETS {
+                    return Err(Error::Module(PageError::TooManyTargets.to_string()));
+                }
+                let err = |e: PageError| Error::Module(e.to_string());
+                let mut out = Vec::with_capacity(targets.len());
+                for target in targets {
+                    let ids = self.load_target_index(&target).await.map_err(err)?;
+                    let mut threads = Vec::new();
+                    for tid in ids {
+                        if let Some(view) = self.thread_view(&tid).await.map_err(err)? {
+                            threads.push(view);
+                        }
+                    }
+                    out.push(TargetThreads { target, threads });
+                }
+                Ok(encode_reply(&PageReply::CommentThreads(out)))
+            }
+            PageQuery::CommentThread { thread_id } => {
+                let view = self
+                    .thread_view(&thread_id)
+                    .await
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                Ok(encode_reply(&PageReply::CommentThread(view)))
             }
         }
     }
@@ -999,6 +1301,69 @@ mod tests {
 
     fn ids(blocks: &[Block]) -> Vec<&str> {
         blocks.iter().map(|b| b.id.as_str()).collect()
+    }
+
+    // ── comment test helpers (author-carrying origins) ──
+
+    fn user(name: &str) -> sdk::Origin {
+        sdk::Origin::External(name.as_bytes().to_vec())
+    }
+    fn ctx_as(origin: sdk::Origin) -> TestCtx {
+        TestCtx {
+            env: sdk::Env {
+                protocol_version: 0,
+                height: 0,
+                consensus_time: 7,
+                origin,
+                me: "pages".into(),
+            },
+        }
+    }
+    async fn apply_commit_as<E: Context + BufferPooler>(
+        p: &mut Pages<E>,
+        m: &PageMsg,
+        origin: sdk::Origin,
+    ) {
+        p.execute(&mut ctx_as(origin), &msg(m)).await.unwrap();
+        p.commit_block().await.unwrap();
+    }
+    async fn apply_err_as<E: Context + BufferPooler>(
+        p: &mut Pages<E>,
+        m: &PageMsg,
+        origin: sdk::Origin,
+        needle: &str,
+    ) {
+        let err = p
+            .execute(&mut ctx_as(origin), &msg(m))
+            .await
+            .expect_err("op must be rejected");
+        assert!(
+            matches!(err, Error::Module(ref s) if s.contains(needle)),
+            "unexpected error: {err:?}"
+        );
+        p.abort_block().await.unwrap();
+    }
+    async fn query_threads<E: Context + BufferPooler>(
+        p: &Pages<E>,
+        targets: &[&str],
+    ) -> Vec<TargetThreads> {
+        let q = PageQuery::ThreadsForTargets {
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+        };
+        match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
+            PageReply::CommentThreads(v) => v,
+            _ => panic!("expected CommentThreads"),
+        }
+    }
+    async fn query_thread<E: Context + BufferPooler>(
+        p: &Pages<E>,
+        thread_id: &str,
+    ) -> Option<ThreadView> {
+        let q = PageQuery::CommentThread { thread_id: thread_id.into() };
+        match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
+            PageReply::CommentThread(v) => v,
+            _ => panic!("expected CommentThread"),
+        }
     }
 
     // seed one page with three top-level paragraphs b1, b2, b3.
@@ -1838,6 +2203,123 @@ mod tests {
             // deleting a non-page id is rejected.
             seed_page(&mut p, "pg").await;
             apply_expect_err(&mut p, &PageMsg::DeletePage { page_id: "b1".into() }, "not a page").await;
+        });
+    }
+
+    // ── comments (folded into the pages module) ──
+
+    fn add(thread: &str, comment: &str, target: &str, text: &str) -> PageMsg {
+        PageMsg::AddComment {
+            thread_id: thread.into(),
+            comment_id: comment.into(),
+            target: target.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn comment_add_opens_then_appends_and_batches_by_target() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
+            apply_commit_as(&mut p, &add("t1", "m2", "b1", "second"), user("bob")).await;
+            apply_commit_as(&mut p, &add("t2", "m3", "b1", "other"), user("alice")).await;
+            apply_commit_as(&mut p, &add("t3", "m4", "b2", "elsewhere"), user("alice")).await;
+
+            let groups = query_threads(&p, &["b1", "b2"]).await;
+            let b1 = groups.iter().find(|g| g.target == "b1").unwrap();
+            assert_eq!(b1.threads.len(), 2);
+            let t1 = b1.threads.iter().find(|v| v.thread.id == "t1").unwrap();
+            assert_eq!(t1.comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+            assert_eq!(t1.thread.opener, AuthorRef::User(b"alice".to_vec()));
+            assert_eq!(t1.comments[1].author, AuthorRef::User(b"bob".to_vec()));
+            assert_eq!(groups.iter().find(|g| g.target == "b2").unwrap().threads.len(), 1);
+        });
+    }
+
+    #[test]
+    fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
+            apply_err_as(&mut p, &add("t1", "m2", "b2", "y"), user("alice"), "target mismatch").await;
+            apply_err_as(&mut p, &add("t1", "m1", "b1", "z"), user("alice"), "duplicate comment id").await;
+            apply_err_as(&mut p, &add("t9", "m9", "b1", "z"), sdk::Origin::External(vec![]), "empty origin").await;
+        });
+    }
+
+    #[test]
+    fn comment_edit_and_delete_are_author_only() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            apply_commit_as(&mut p, &add("t1", "m1", "b1", "orig"), user("alice")).await;
+            apply_err_as(&mut p, &PageMsg::EditComment { comment_id: "m1".into(), text: "hax".into() }, user("bob"), "not the comment author").await;
+            apply_err_as(&mut p, &PageMsg::DeleteComment { comment_id: "m1".into() }, user("bob"), "not the comment author").await;
+            apply_commit_as(&mut p, &PageMsg::EditComment { comment_id: "m1".into(), text: "edited".into() }, user("alice")).await;
+            let v = query_thread(&p, "t1").await.unwrap();
+            assert_eq!(v.comments[0].text, "edited");
+            assert_eq!(v.comments[0].edited_at, Some(7));
+        });
+    }
+
+    #[test]
+    fn comment_deleting_last_live_removes_the_thread() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
+            apply_commit_as(&mut p, &add("t1", "m2", "b1", "b"), user("alice")).await;
+            apply_commit_as(&mut p, &PageMsg::DeleteComment { comment_id: "m1".into() }, user("alice")).await;
+            let v = query_thread(&p, "t1").await.unwrap();
+            assert_eq!(v.comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["b"]);
+            apply_commit_as(&mut p, &PageMsg::DeleteComment { comment_id: "m2".into() }, user("alice")).await;
+            assert!(query_thread(&p, "t1").await.is_none());
+            assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+        });
+    }
+
+    #[test]
+    fn comment_resolve_toggles_and_records_resolver() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
+            apply_commit_as(&mut p, &PageMsg::ResolveThread { thread_id: "t1".into(), resolved: true }, user("bob")).await;
+            let v = query_thread(&p, "t1").await.unwrap();
+            assert!(v.thread.resolved);
+            assert_eq!(v.thread.resolved_by, Some(AuthorRef::User(b"bob".to_vec())));
+            apply_commit_as(&mut p, &PageMsg::ResolveThread { thread_id: "t1".into(), resolved: false }, user("alice")).await;
+            assert_eq!(query_thread(&p, "t1").await.unwrap().thread.resolved_by, None);
+            apply_err_as(&mut p, &PageMsg::ResolveThread { thread_id: "ghost".into(), resolved: true }, user("alice"), "thread not found").await;
+        });
+    }
+
+    #[test]
+    fn comment_caps_and_reserved_ids_reject() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            let huge = "x".repeat(MAX_COMMENT_TEXT_BYTES + 1);
+            apply_err_as(&mut p, &add("t1", "m1", "b1", &huge), user("alice"), "comment text too large").await;
+            assert!(p.pending.is_empty(), "a rejected comment op stages nothing");
+            // a NUL-prefixed id lands in the reserved keyspace — rejected.
+            apply_err_as(&mut p, &add("\u{0}evil", "m1", "b1", "x"), user("alice"), "reserved block id").await;
+            // over-cap query rejected.
+            let targets: Vec<String> = (0..=MAX_QUERY_TARGETS).map(|i| format!("t{i}")).collect();
+            assert!(p.query(&encode_query(&PageQuery::ThreadsForTargets { targets })).await.is_err());
+        });
+    }
+
+    // comments ride the same qmdb as blocks (reserved NUL-prefixed keys), so a
+    // block edit and a comment op never collide, and both compose into root.
+    #[test]
+    fn comments_and_blocks_coexist_and_move_the_root() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            seed_page(&mut p, "p1").await;
+            let before = p.root();
+            apply_commit_as(&mut p, &add("t1", "m1", "b1", "note on b1"), user("alice")).await;
+            assert_ne!(p.root(), before, "a comment write moves the root");
+            // the block tree is untouched by the comment.
+            assert_eq!(ids(&get_page(&p, "p1").await.unwrap()), ["p1", "b1", "b2", "b3"]);
+            assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
         });
     }
 }

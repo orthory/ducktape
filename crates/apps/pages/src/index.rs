@@ -271,6 +271,12 @@ impl ModuleIndexer for PagesIndex {
             }
             // checked state carries no searchable text.
             PageMsg::SetChecked { .. } => Ok(()),
+            // comments live in a reserved keyspace, not the block tree — no
+            // searchable block row changes (a future pass could index them).
+            PageMsg::AddComment { .. }
+            | PageMsg::EditComment { .. }
+            | PageMsg::DeleteComment { .. }
+            | PageMsg::ResolveThread { .. } => Ok(()),
             // folder nesting carries no searchable text — the block tree (and
             // thus every row) is unchanged.
             PageMsg::SetPageParent { .. } => Ok(()),
