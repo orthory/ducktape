@@ -166,7 +166,7 @@ fn ls<S: ObjectStore>(
 
     // 0 is a useless page; the honest clamp is 1..=MAX_PAGE. BTreeMap iteration is
     // already strict ascending name order — exactly the cursor order.
-    let limit = limit.min(MAX_PAGE).max(1) as usize;
+    let limit = limit.clamp(1, MAX_PAGE) as usize;
     let entries_map = dir_entries(&store, dir_tree)?;
     let mut iter = entries_map.iter().filter(|(name, _)| match after {
         Some(a) => name.as_str() > a,
@@ -269,7 +269,7 @@ fn find<S: ObjectStore>(
     let mut acc = FindAcc {
         prefix,
         after,
-        limit: limit.min(MAX_PAGE).max(1) as usize,
+        limit: limit.clamp(1, MAX_PAGE) as usize,
         out: Vec::new(),
         next: None,
         done: false,
@@ -390,7 +390,7 @@ fn grep<S: ObjectStore>(
         prefix,
         cursor,
         snapshot_hex: &snapshot_hex,
-        limit: limit.min(MAX_PAGE).max(1) as usize,
+        limit: limit.clamp(1, MAX_PAGE) as usize,
         remaining: budget,
         whole_budget: budget,
         hits: Vec::new(),
@@ -531,7 +531,7 @@ fn history<S: ObjectStore>(fs: &Fs<S>, limit: u64) -> Result<FilesReply, String>
         store: fs.store_ref(),
         pending: &[],
     };
-    let limit = limit.min(MAX_PAGE).max(1) as usize;
+    let limit = limit.clamp(1, MAX_PAGE) as usize;
     let mut out = Vec::new();
     for id in refs.window.iter().rev().take(limit) {
         let (kind, body) = store

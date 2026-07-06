@@ -89,7 +89,7 @@ fn multi_entry_tree_round_trips_in_name_order() {
     let mk = |id: u8| TreeEntry {
         kind: EntryKind::File,
         id: [id; 32],
-        exec: id % 2 == 0,
+        exec: id.is_multiple_of(2),
         size: id as u64,
     };
     let t = TreeObj {

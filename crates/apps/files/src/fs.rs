@@ -657,7 +657,7 @@ impl<S: ObjectStore> Fs<S> {
     /// mark + sweep over COMMITTED state now; the CALLER (the glue) decides WHEN
     /// via the watermark trigger. returns the number of objects removed.
     ///
-    /// consensus-neutral: [`crate::gc::mark`] reads only committed refs and the
+    /// consensus-neutral: `gc::mark` reads only committed refs and the
     /// sweep removes only unreachable objects from the store — `self.refs`, hence
     /// the module root, is NEVER touched, so gc cannot move the root and every
     /// node converges to the same object set whenever it happens to run.

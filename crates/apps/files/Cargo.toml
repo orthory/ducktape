@@ -21,6 +21,9 @@ sdk = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
+# the host e2e + cross-host determinism suite stands the real `Files` module on
+# the deterministic kernel host and drives it through `submit_at`/`query`.
+host = { workspace = true }
 futures = "0.3"
 tempfile = { workspace = true }
 base64 = { workspace = true }

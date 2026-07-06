@@ -79,8 +79,10 @@ fn frame(
 }
 
 fn populated() -> Refs {
-    let mut r = Refs::default();
-    r.head = Some([1; 32]);
+    let mut r = Refs {
+        head: Some([1; 32]),
+        ..Default::default()
+    };
     // window is an ordered history, not a sorted set — keep two ids in insert
     // order so the round-trip proves order is preserved.
     r.window.push_back([2; 32]);
@@ -125,8 +127,10 @@ fn root_is_content_only_and_deterministic() {
     let a = Refs::default();
     let b = Refs::default();
     assert_eq!(root_bytes(&a), root_bytes(&b));
-    let mut c = Refs::default();
-    c.head = Some([9; 32]);
+    let c = Refs {
+        head: Some([9; 32]),
+        ..Default::default()
+    };
     assert_ne!(root_bytes(&a), root_bytes(&c), "head change moves the root");
 }
 

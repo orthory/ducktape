@@ -16,8 +16,10 @@ use files::{DiskRefs, DiskStore, Fs, Kind, ObjectStore as _, RefsStore as _};
 use sdk::{Module as _, StateRoot};
 
 fn a_refs() -> Refs {
-    let mut r = Refs::default();
-    r.head = Some([1; 32]);
+    let mut r = Refs {
+        head: Some([1; 32]),
+        ..Default::default()
+    };
     r.staging.insert(
         [2; 32],
         Staged {

@@ -29,8 +29,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::objects::{EntryKind, FileObj, SnapshotObj, TreeEntry, TreeObj, object_id};
 use files::{
-    CHUNK_SIZE, Change, Content, FilesMsg, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp, Fs,
-    Kind, MAX_SYNC_IDS, MemStore, ObjectId, ObjectStore as _, Refs, decode_sync_resp, encode_msg,
+    CHUNK_SIZE, Change, Content, FilesMsg, FilesQuery, FilesSyncReq, FilesSyncResp, Fs, Kind,
+    MAX_SYNC_IDS, MemStore, ObjectId, ObjectStore as _, Refs, decode_sync_resp, encode_msg,
     encode_putblob, encode_query, encode_sync_req, from_hex_32, to_hex,
 };
 use sdk::{Module as _, Origin, StateRoot};
@@ -573,8 +573,10 @@ fn read_errs_on_short_interior_chunk() {
         message: String::new(),
     };
     let snap_id = store.put(Kind::Snapshot, &snap.encode()).unwrap();
-    let mut refs = Refs::default();
-    refs.head = Some(snap_id);
+    let mut refs = Refs {
+        head: Some(snap_id),
+        ..Default::default()
+    };
     refs.window.push_back(snap_id);
     let fs = Fs::new(store, refs);
 

@@ -2338,6 +2338,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures",
+ "host",
  "sdk",
  "serde",
  "serde_json",

@@ -186,7 +186,7 @@ fn case2_staged_chunk_put_drains_staging() {
     // staging drained: the referenced chunk's 100 bytes were reclaimed, so a fresh
     // distinct 100-byte chunk fits under the 150-byte quota (it would not if the
     // committed chunk still counted).
-    putblob(&mut f, ext(b"u"), 2, &vec![9u8; 100]).expect("quota reclaimed after reference");
+    putblob(&mut f, ext(b"u"), 2, &[9u8; 100]).expect("quota reclaimed after reference");
 }
 
 #[test]
@@ -684,7 +684,7 @@ fn dedup_commit_inline_then_putblob_is_noop() {
     putblob(&mut f, ext(b"u"), 1, &x).expect("putblob of an inline-committed chunk no-ops");
     // a DIFFERENT 100-byte chunk still fits the whole quota — proof X was never
     // staged (the no-op'd putblob did not double-stage it).
-    putblob(&mut f, ext(b"u"), 1, &vec![4u8; 100]).expect("full quota free for a fresh chunk");
+    putblob(&mut f, ext(b"u"), 1, &[4u8; 100]).expect("full quota free for a fresh chunk");
     commit_block(&mut f);
     assert_eq!(stat(&f, "/shared/x", None).unwrap().size, 100);
 }
@@ -698,7 +698,7 @@ fn dedup_putblob_then_commit_inline_frees_quota_once() {
     putblob(&mut f, ext(b"u"), 1, &x).expect("stage X");
     // X fills the quota — a distinct chunk breaches it (X counted exactly once).
     assert!(
-        putblob(&mut f, ext(b"u"), 1, &vec![6u8; 100]).is_err(),
+        putblob(&mut f, ext(b"u"), 1, &[6u8; 100]).is_err(),
         "quota full with X staged"
     );
     // commit the SAME bytes inline: the inline chunk equals X → not staged again
@@ -714,7 +714,7 @@ fn dedup_putblob_then_commit_inline_frees_quota_once() {
     commit_block(&mut f);
     assert_eq!(stat(&f, "/shared/x", None).unwrap().size, 100);
     // quota freed exactly once: a fresh distinct chunk now fits.
-    putblob(&mut f, ext(b"u"), 2, &vec![7u8; 100]).expect("quota reclaimed once");
+    putblob(&mut f, ext(b"u"), 2, &[7u8; 100]).expect("quota reclaimed once");
 }
 
 // ---- extra coverage of the stat read side -----------------------------------
