@@ -7,10 +7,10 @@ use std::path::PathBuf;
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 
-use crate::disk::DiskStore;
-use crate::fs::Fs;
+use crate::disk::{DiskRefs, DiskStore};
+use crate::fs::{Fs, StagedObjects};
 use crate::state::Refs;
-use crate::store::{MemRefs, RefsStore as _};
+use crate::store::{ObjectStore as _, RefsStore as _};
 use crate::wire::{
     FilesMsg, PUTBLOB_FRAME_TAG, decode_msg, decode_query, decode_sync_req, encode_reply,
     encode_sync_resp, to_hex,
@@ -30,34 +30,41 @@ pub fn owner_of(origin: &Origin) -> String {
 
 pub struct Files {
     id: ModuleId,
-    /// the module data dir (`<dir>/objects` + `<dir>/refs`). objects now live in
-    /// the disk odb; refs persistence stays MemRefs until task 6.
-    #[allow(dead_code)]
-    dir: PathBuf,
+    /// the pure state machine over the disk odb at `<dir>/objects`.
     fs: Fs<DiskStore>,
-    refs_store: MemRefs,
+    /// the durable refs file at `<dir>/refs` — the block commit point.
+    refs_store: DiskRefs,
+    /// last block height whose refs are durable; per-node recovery bookkeeping,
+    /// persisted in the refs-file envelope, never in the root preimage.
+    durable_height: u64,
+    /// gc watermark (per-node bookkeeping); the trigger policy lands in task 13,
+    /// so it stays 0 here but is threaded through save/load already.
+    gc_watermark: u64,
 }
 
 impl Files {
     /// open (or create) the module over its data dir. the disk odb lives at
-    /// `<dir>/objects`; a fresh refs store yields empty refs (refs persistence
-    /// swaps to the disk pair in task 6).
+    /// `<dir>/objects` and the durable refs file at `<dir>/refs`; a fresh dir
+    /// yields empty refs, an existing one recovers the committed refs (durable
+    /// restart), height, and gc watermark from the refs-file envelope.
     pub fn open(id: impl Into<ModuleId>, dir: PathBuf) -> Result<Self, Error> {
-        let refs_store = MemRefs::new();
-        let refs = match refs_store
+        let refs_store = DiskRefs::open(dir.clone())
+            .map_err(|e| Error::Module(format!("files: refs open: {e}")))?;
+        let (refs, durable_height, gc_watermark) = match refs_store
             .load()
             .map_err(|e| Error::Module(format!("files: refs load: {e}")))?
         {
-            Some((refs, _height, _gc_watermark)) => refs,
-            None => Refs::default(),
+            Some((refs, height, gc_watermark)) => (refs, height, gc_watermark),
+            None => (Refs::default(), 0, 0),
         };
         let store = DiskStore::open(dir.join("objects"))
             .map_err(|e| Error::Module(format!("files: odb open: {e}")))?;
         Ok(Self {
             id: id.into(),
-            dir,
             fs: Fs::new(store, refs),
             refs_store,
+            durable_height,
+            gc_watermark,
         })
     }
 
@@ -66,11 +73,31 @@ impl Files {
         self.fs.snapshot_refs()
     }
 
-    /// verify-then-adopt a peer's refs image against the expected root.
+    /// verify-then-adopt a peer's refs image against the expected root, and
+    /// persist it immediately so a restart right after sync recovers it. it is
+    /// saved at the current per-node (height, gc_watermark); the sync-height
+    /// refinement lands with the node integration (task 14).
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         self.fs
             .install_refs(bytes, expected.0)
-            .map_err(Error::Module)
+            .map_err(Error::Module)?;
+        self.refs_store
+            .save(self.fs.refs(), self.durable_height, self.gc_watermark)
+            .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
+        Ok(())
+    }
+
+    /// last height whose refs are durable — glue surface for the node sync
+    /// integration (task 14).
+    pub fn durable_height(&self) -> u64 {
+        self.durable_height
+    }
+
+    /// `#[doc(hidden)]` test seam: stage a pending block directly so the real
+    /// `commit_block` glue can be driven before the op semantics (tasks 7/9/10).
+    #[doc(hidden)]
+    pub fn stage_pending_for_test(&mut self, refs: Refs, height: u64, objects: StagedObjects) {
+        self.fs.stage_pending(refs, height, objects);
     }
 }
 
@@ -148,14 +175,45 @@ impl Module for Files {
         Ok(encode_reply(&reply))
     }
 
+    /// the task-6 durability ordering — the load-bearing recovery contract
+    /// (see [`DiskRefs`]). the committed root must never advance ahead of the
+    /// durable refs file, or a crash reproduces this repo's historic
+    /// torn-commit brick, so we persist strictly in this order and adopt LAST:
+    ///
+    /// 1. drain the pending block WITHOUT touching committed state (pure core)
+    /// 2. flush its objects into the odb (idempotent, content-addressed)
+    /// 3. fsync the touched odb dirs — the objects are now fully durable
+    /// 4. save the refs file (atomic + parent-dir fsync) — the commit point
+    /// 5. only now adopt the refs in core — the root moves here and nowhere else
+    ///
+    /// any error before step 4 aborts the whole block WITHOUT adopting: the node
+    /// halts loudly on a fresh genesis rather than diverging, and a restart
+    /// recovers the old refs, old root, and (harmless) orphan objects.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        let Some((refs, height)) = self.fs.commit_block().map_err(Error::Module)? else {
-            return Ok(());
+        // 1. pure hand-off — no object flush, no refs swap, no root movement.
+        let Some((refs, height, objects)) = self.fs.commit_block() else {
+            return Ok(()); // the block staged nothing
         };
-        // gc watermark bookkeeping is per-node glue and lands with task 13.
+        {
+            let store = self.fs.store_mut();
+            // 2. flush objects; a failure aborts before adoption (no torn root).
+            for (kind, body) in &objects {
+                store
+                    .put(*kind, body)
+                    .map_err(|e| Error::Module(format!("files: odb put: {e}")))?;
+            }
+            // 3. object dir-entries durable BEFORE the refs commit point below.
+            store
+                .sync_dirs()
+                .map_err(|e| Error::Module(format!("files: odb sync: {e}")))?;
+        }
+        // 4. the commit point: refs file durable (atomic rename + parent fsync).
         self.refs_store
-            .save(&refs, height, 0)
+            .save(&refs, height, self.gc_watermark)
             .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
+        // 5. adopt — root advances only now that the refs file is durable.
+        self.fs.adopt_refs(refs);
+        self.durable_height = height;
         Ok(())
     }
 

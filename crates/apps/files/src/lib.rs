@@ -24,9 +24,9 @@ pub mod state;
 pub mod store;
 pub mod tree;
 
-pub use fs::{Fs, Notification};
+pub use fs::{Fs, Notification, StagedObjects};
 pub use objects::{Kind, ObjectId};
-pub use state::Refs;
+pub use state::{PinEntry, Refs, Staged, decode_refs, encode_refs, root_bytes};
 pub use store::{MemRefs, MemStore, ObjectStore, RefsStore};
 
 #[cfg(feature = "native")]
