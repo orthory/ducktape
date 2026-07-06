@@ -159,6 +159,14 @@ const MAX_BACKLOG: usize = 128;
 /// deadline in the pump loop: ingress load can delay one drain by one
 /// request's service time, but can never starve the arm.
 const DRAIN_TICK: Duration = Duration::from_millis(100);
+/// the submit-relay channel: an observer-standing node ships a frame it
+/// SIGNED (its own identity key is the frame origin — authorship) to one
+/// current validator, which takes consensus custody (`submit_frame`) and
+/// answers with the frame's fate when it drains. the last free static slot
+/// below CHANNEL_STATE_SYNC; engine banks start at 8. registered in EVERY
+/// mode like the lanes above — validators serve, observers speak, sync-only
+/// black-holes.
+const CHANNEL_SUBMIT_RELAY: u64 = 3;
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 const CHANNEL_STATE_SYNC: u64 = 4;
@@ -5178,6 +5186,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // as the derived lobby identity); this member verifies each announce
         // against the invite token it carries and RECORDS it for approval.
         let (mut lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+        // the submit-relay lane: an observer-standing node ships its own
+        // signed frame here; this validator takes custody and answers on
+        // drain/expiry. bound `mut` because the pump uses `relay_tx` from BOTH
+        // the ingress select arm and the drain-resolution/expiry code.
+        let (mut relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
 
         // the voice lane + hub: huddle audio between members. the hub runs on
         // its OWN plain-tokio OS thread (the reachability/app-surface split
@@ -5706,6 +5719,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
         });
+        // the submit-relay lane rides the same bounded drop-on-full bridge: a
+        // dropped relay degrades to the observer client's honest timeout +
+        // re-submit, so flood pressure never blocks the pump.
+        let (relay_bridge_tx, mut relay_ingress) =
+            futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
+        context.child("relay_ingress").spawn(move |_ctx| {
+            let mut receiver = relay_rx;
+            let mut bridge_tx = relay_bridge_tx;
+            async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok((peer, msg)) => {
+                            let bytes: Vec<u8> = msg.into();
+                            let _ = bridge_tx.try_send((peer, bytes));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+        });
 
         // spawn one epoch's engine from the channel bank. scheme built the
         // production way (`signer` finds our key's index in the sorted
@@ -5960,6 +5993,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
                 std::time::Instant,
             ),
+        > = std::collections::HashMap::new();
+        // relayed submits held for a wire answer, keyed like pending_submits by
+        // the frame's content address: resolved by the SAME drain that resolves
+        // local holds, expired on the same SUBMIT_HOLD budget. the peer is where
+        // the Reply goes.
+        let mut pending_relays: std::collections::HashMap<
+            node::FrameId,
+            (ed25519::PublicKey, std::time::Instant),
         > = std::collections::HashMap::new();
         let mut last_published: Option<u64> = None;
         let mut sync_server = SyncServer::new();
@@ -6248,6 +6289,27 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if d.disposition == node::Disposition::Discarded {
                             continue;
                         }
+                        // resolve a relayed hold FIRST: a relayed frame has no
+                        // local pending_submits entry, so this must precede the
+                        // `else { continue }` below or the wire Reply is lost.
+                        if let Some((peer, _)) = pending_relays.remove(&d.id) {
+                            let outcome = match d.disposition {
+                                node::Disposition::Applied => relay::RelayOutcome::Applied {
+                                    height: d.height,
+                                    app_hash: hex(&d.app_hash),
+                                },
+                                node::Disposition::Rejected => relay::RelayOutcome::Rejected {
+                                    detail: "op finalized but rejected (deterministic no-op)".into(),
+                                },
+                                node::Disposition::Discarded => unreachable!("filtered at the loop top"),
+                            };
+                            let msg = relay::RelayMsg::Reply { frame_id: d.id, outcome };
+                            let _ = relay_tx.send(
+                                Recipients::One(peer),
+                                IoBuf::from(relay::encode_msg(&msg)),
+                                false,
+                            );
+                        }
                         let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
                         let _ = reply.send(match d.disposition {
                             node::Disposition::Applied => Ok(noded::BlockSummary {
@@ -6280,6 +6342,32 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     "timed out awaiting finalization — re-query on the next block"
                                         .into(),
                                 ));
+                            }
+                        }
+                    }
+                    // the same expiry contract for relayed holds: the mesh never
+                    // finalized in time, so answer the observer truthfully — the
+                    // op may still land, it re-queries on the next block.
+                    if !pending_relays.is_empty() {
+                        let now = std::time::Instant::now();
+                        let expired: Vec<node::FrameId> = pending_relays
+                            .iter()
+                            .filter(|(_, (_, deadline))| *deadline <= now)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for k in expired {
+                            if let Some((peer, _)) = pending_relays.remove(&k) {
+                                let msg = relay::RelayMsg::Reply {
+                                    frame_id: k,
+                                    outcome: relay::RelayOutcome::Refused {
+                                        detail: "timed out awaiting finalization — re-query on the next block".into(),
+                                    },
+                                };
+                                let _ = relay_tx.send(
+                                    Recipients::One(peer),
+                                    IoBuf::from(relay::encode_msg(&msg)),
+                                    false,
+                                );
                             }
                         }
                     }
@@ -7029,6 +7117,48 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         true,
                         "join request recorded — awaiting member approval".into(),
                     );
+                }
+                relayed = relay_ingress.next() => {
+                    let Some((peer, bytes)) = relayed else { continue };
+                    let mut send_reply = |frame_id: node::FrameId, outcome: relay::RelayOutcome| {
+                        let msg = relay::RelayMsg::Reply { frame_id, outcome };
+                        let _ = relay_tx.send(
+                            Recipients::One(peer.clone()),
+                            IoBuf::from(relay::encode_msg(&msg)),
+                            false,
+                        );
+                    };
+                    let msg = match relay::decode_msg(&bytes) {
+                        Ok(m) => m,
+                        Err(_) => continue, // junk on the doorbell — drop, lobby idiom.
+                    };
+                    let relay::RelayMsg::Submit { frame } = msg else {
+                        continue; // a Reply at a validator is a protocol confusion — drop.
+                    };
+                    // the door check needs committed state: the observer projection at
+                    // this node's latest boundary. origin==peer and signature checks ride
+                    // inside.
+                    let observers_now = read_valset_observers(node.host()).await;
+                    let frame_id = match relay::verify_relay_submit(&frame, peer.as_ref(), &observers_now) {
+                        Ok(id) => id,
+                        Err(detail) => {
+                            send_reply(node::frame_id(&frame), relay::RelayOutcome::Refused { detail });
+                            continue;
+                        }
+                    };
+                    match node.submit_frame(frame).await {
+                        Ok(id) => {
+                            debug_assert_eq!(id, frame_id);
+                            pending_relays.insert(
+                                id,
+                                (peer.clone(), std::time::Instant::now() + SUBMIT_HOLD),
+                            );
+                        }
+                        Err(e) => send_reply(
+                            frame_id,
+                            relay::RelayOutcome::Refused { detail: format!("submit failed: {e}") },
+                        ),
+                    }
                 }
                 cmd = http_ingress.next() => {
                     let Some(cmd) = cmd else { continue };

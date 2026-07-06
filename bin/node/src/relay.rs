@@ -16,8 +16,6 @@
 //! json on the wire: matches the lobby idiom — this lane is low-volume (a
 //! human posting messages), and the frame bytes inside are already signed.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
