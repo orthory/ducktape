@@ -8,7 +8,7 @@ import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as pagesClient from "../../domain/pages-client";
-import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
+import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
@@ -30,8 +30,11 @@ import type { Action } from "./reducer";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import {
+  addTab,
   channelIdOf,
   clearRemoteUrl,
+  removeTab,
+  saveDocTabs,
   saveRemoteUrl,
   saveViewMode,
 } from "./state";
@@ -108,8 +111,17 @@ export interface ConsoleActions {
   listPages(): void;
   /** Create a page (root block id minted here) and open it. */
   createPage(title: string): void;
-  /** Open a page, loading its preorder block tree. */
+  /** Create an untitled page (optionally nested under `parent`) and open it —
+   *  the instant Notion-style new-page flow. `parent` null == top level. */
+  createChildPage(parent: string | null): void;
+  /** Re-nest a page under a (possibly new) parent, or to top level with null. */
+  setPageParent(params: { pageId: string; parent: string | null }): void;
+  /** Delete a page (root + subtree; child pages promote up). */
+  deletePage(pageId: string): void;
+  /** Open a page, loading its preorder block tree and comment threads. */
   openPage(pageId: string): void;
+  /** Close a document tab; activates a neighbor if it was active. */
+  closeTab(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
    *  focus to the new block, so it must know the id before the round-trip). */
   insertPageBlock(params: {
@@ -133,6 +145,19 @@ export interface ConsoleActions {
   }): void;
   /** Remove a block and its whole subtree. */
   removePageBlock(blockId: string): void;
+
+  // ── Comments (threads over the `comments` module) ──
+  /** Load the open page's comment threads (page + every visible block). */
+  loadPageThreads(): void;
+  /** Add a comment: opens a new thread when `threadId` is omitted (a fresh id
+   *  is minted), else appends to that thread. `target` is a block or page id. */
+  addComment(params: { threadId?: string; target: string; text: string }): void;
+  /** Edit own comment text. */
+  editComment(params: { commentId: string; text: string }): void;
+  /** Tombstone own comment (removes the thread if it was the last live one). */
+  deleteComment(commentId: string): void;
+  /** Toggle a thread's resolved state. */
+  resolveThread(params: { threadId: string; resolved: boolean }): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
   /** Upload the prompt text to the blob store, then RegisterAgent with the
@@ -413,19 +438,80 @@ export function createActions({
       .catch(fail);
   };
 
-  // the single entry point into a page: make it active and load its preorder
-  // block tree — every path into a page (new-page, a rail click) goes here.
+  // load the comment threads for the open page (the page id + every visible
+  // block id) in one batch; refreshed on open and after any comment op.
+  const loadPageThreads = (blocksOverride?: PageBlock[]): Promise<void> => {
+    // `blocks` is passed by callers that JUST fetched the tree, because
+    // getState().activePageBlocks lags a dispatch (stateRef updates on render);
+    // reading it here would ship only the page target and miss every block.
+    const live = getNode();
+    const page = getState().activePage;
+    if (!live || !page) {
+      patch({ pageThreads: [] });
+      return Promise.resolve();
+    }
+    const blocks = blocksOverride ?? getState().activePageBlocks;
+    const targets = [page, ...blocks.map((b) => b.id)];
+    // the module rejects a ThreadsForTargets over MAX_QUERY_TARGETS (512), so a
+    // large page must chunk its targets across several queries.
+    const CHUNK = 512;
+    const batches: string[][] = [];
+    for (let i = 0; i < targets.length; i += CHUNK) batches.push(targets.slice(i, i + CHUNK));
+    return Promise.all(batches.map((b) => pagesClient.threadsForTargets(live, { targets: b })))
+      .then((results) => patch({ pageThreads: results.flat() }))
+      .catch(fail);
+  };
+
+  // load the active page's block tree + its comment threads (threads keyed off
+  // the freshly-fetched blocks, not the lagging store copy). shared by every
+  // activation path; does NOT touch the tab list.
+  const loadActivePage = (pageId: string) => {
+    const live = getNode();
+    if (!live) return;
+    Promise.resolve()
+      .then(() => pagesClient.getPage(live, pageId))
+      .then((blocks) => {
+        patch({ activePageBlocks: blocks ?? [] });
+        return loadPageThreads(blocks ?? []);
+      })
+      .catch(fail);
+  };
+
+  // the single entry point into a page: make it active (opening a tab), then
+  // load its tree + threads — every path into a page (new-page, a rail click,
+  // a tab click) goes here.
   const enterPage = (pageId: string) => {
     const live = getNode();
     if (!live || !pageId) return;
+    const tabs = addTab(getState().openTabs, pageId);
+    saveDocTabs(tabs);
     patch({
       activePage: pageId,
       activePageBlocks: [],
+      openTabs: tabs,
+      pageThreads: [],
     });
-    Promise.resolve()
-      .then(() => pagesClient.getPage(live, pageId))
-      .then((blocks) => patch({ activePageBlocks: blocks ?? [] }))
-      .catch(fail);
+    loadActivePage(pageId);
+  };
+
+  // close a document tab; if it was active, activate a neighbor (loading its
+  // tree) so the editor never lands on a closed page. Activation here patches
+  // the already-reduced tab list directly — it must NOT go through enterPage,
+  // whose addTab(getState().openTabs, …) reads the stale pre-close list and
+  // would re-stage the just-closed id.
+  const closeTabLocal = (pageId: string) => {
+    const { tabs, active } = removeTab(getState().openTabs, getState().activePage, pageId);
+    saveDocTabs(tabs);
+    if (active && active !== getState().activePage) {
+      patch({ openTabs: tabs, activePage: active, activePageBlocks: [], pageThreads: [] });
+      loadActivePage(active);
+      return;
+    }
+    patch({
+      openTabs: tabs,
+      activePage: active,
+      ...(active ? {} : { activePageBlocks: [], pageThreads: [] }),
+    });
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -838,18 +924,81 @@ export function createActions({
     },
 
     openPage: enterPage,
+    closeTab: closeTabLocal,
 
-    createPage: (title) => {
-      const clean = title.trim();
-      if (!clean) return;
-      // the page root's block id — minted here like task/job ids; the refresh
-      // re-enumerates ListPages so the rail shows it, then open it.
+    // create a page (optionally nested under `parent`) with an EMPTY title and
+    // open it — the doc title input is where naming happens (Notion-style
+    // instant page). `parent` null == top level.
+    createChildPage: (parent: string | null) => {
       const pageId = crypto.randomUUID();
       submitTracked(
         opKey.page(pageId),
-        (live) => pagesClient.createPage(live, { pageId, title: clean }),
-        (prev) => optimistic.pageCreated(prev, { pageId, title: clean }),
+        (live) => pagesClient.createPage(live, { pageId, title: "", parent }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: "", parent }),
       ).then(() => enterPage(pageId));
+    },
+
+    // kept for programmatic/test callers that pass a title.
+    createPage: (title) => {
+      const pageId = crypto.randomUUID();
+      submitTracked(
+        opKey.page(pageId),
+        (live) => pagesClient.createPage(live, { pageId, title: title.trim() }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: title.trim() }),
+      ).then(() => enterPage(pageId));
+    },
+
+    setPageParent: ({ pageId, parent }) => {
+      submitTracked(opKey.page(pageId), (live) =>
+        pagesClient.setPageParent(live, { pageId, parent }),
+      );
+    },
+
+    deletePage: (pageId) => {
+      if (!pageId) return;
+      submitTracked(opKey.page(pageId), (live) => pagesClient.deletePage(live, pageId))
+        .then(() => {
+          const live = getNode();
+          if (live) pagesClient.listPages(live).then((pages) => patch({ pages })).catch(fail);
+        })
+        .catch(fail);
+      // close its tab immediately (optimistic UX).
+      closeTabLocal(pageId);
+    },
+
+    // ── Comments ──
+    loadPageThreads: () => {
+      void loadPageThreads();
+    },
+
+    addComment: ({ threadId, target, text }) => {
+      const clean = text.trim();
+      if (!clean) return;
+      const tid = threadId ?? crypto.randomUUID();
+      const commentId = crypto.randomUUID();
+      submitTracked(opKey.commentThread(tid), (live) =>
+        pagesClient.addComment(live, { threadId: tid, commentId, target, text: clean }),
+      ).then(() => loadPageThreads());
+    },
+
+    editComment: ({ commentId, text }) => {
+      const clean = text.trim();
+      if (!clean) return;
+      submitTracked(opKey.comment(commentId), (live) =>
+        pagesClient.editComment(live, { commentId, text: clean }),
+      ).then(() => loadPageThreads());
+    },
+
+    deleteComment: (commentId) => {
+      submitTracked(opKey.comment(commentId), (live) =>
+        pagesClient.deleteComment(live, commentId),
+      ).then(() => loadPageThreads());
+    },
+
+    resolveThread: ({ threadId, resolved }) => {
+      submitTracked(opKey.commentThread(threadId), (live) =>
+        pagesClient.resolveThread(live, { threadId, resolved }),
+      ).then(() => loadPageThreads());
     },
 
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {

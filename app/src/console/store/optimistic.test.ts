@@ -135,10 +135,10 @@ describe("page block projections", () => {
     const prev = base({
       activePage: "root",
       activePageBlocks: tree,
-      pages: [{ id: "root", title: "root" }],
+      pages: [{ id: "root", title: "root", parent: null }],
     });
     const out = optimistic.pageBlockPatched(prev, "root", { text: "Launch Plan" });
-    expect(out.pages).toEqual([{ id: "root", title: "Launch Plan" }]);
+    expect(out.pages).toEqual([{ id: "root", title: "Launch Plan", parent: null }]);
   });
 });
 
