@@ -25,12 +25,10 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
-use runs::RunsModule;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use tagging::TaggingModule;
 use dispatch_oracle::DispatchWorker;
 use files::Files;
 use forge::Forge;
@@ -50,8 +48,10 @@ use package::PackageModule;
 use pages::Pages;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
+use runs::RunsModule;
 use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
+use tagging::TaggingModule;
 use tasks::Tasks;
 use tokio::sync::broadcast;
 
@@ -387,15 +387,14 @@ async fn submit_and_drain(
     msg: Msg,
 ) -> Result<BlockSummary, String> {
     let (included, effects) =
-        match submit_one(host, height, index, blobs, events, metrics, origin, msg).await
-    {
-        Ok(out) => out,
-        Err(SubmitError::Fatal(err)) => {
-            eprintln!("[noded] FATAL: {err} — halting");
-            std::process::exit(1);
-        }
-        Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
-    };
+        match submit_one(host, height, index, blobs, events, metrics, origin, msg).await {
+            Ok(out) => out,
+            Err(SubmitError::Fatal(err)) => {
+                eprintln!("[noded] FATAL: {err} — halting");
+                std::process::exit(1);
+            }
+            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+        };
 
     let mut queue = VecDeque::new();
     offer_effects(workers, effects, &mut queue).await;

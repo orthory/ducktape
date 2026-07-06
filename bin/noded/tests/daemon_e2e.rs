@@ -261,8 +261,7 @@ impl Daemon {
     /// a refusal leaves the connection open (keep-alive), so the read is
     /// timeout-bounded instead of read-to-close.
     fn ws_upgrade_refusal(&self, path: &str) -> (u16, String) {
-        let mut stream =
-            TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
@@ -347,10 +346,7 @@ fn call_ws_without_a_hub_refuses_with_a_reason() {
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/call/ws?channel=general");
     assert_eq!(status, 503, "no call hub → refused at upgrade: {raw}");
-    assert!(
-        raw.contains("no mesh call hub"),
-        "refusal says WHY: {raw}"
-    );
+    assert!(raw.contains("no mesh call hub"), "refusal says WHY: {raw}");
 
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
     assert_eq!(status, 404, "the old voice route is unrouted, not refused");
@@ -639,7 +635,9 @@ fn state_persists_across_restart() {
     assert_eq!(post["hash"], "");
     assert_eq!(post["proposer"], "65646479");
     assert!(
-        post["operations"].as_array().is_some_and(|ops| !ops.is_empty()),
+        post["operations"]
+            .as_array()
+            .is_some_and(|ops| !ops.is_empty()),
         "the dispatch trace rides the row: {post}"
     );
 }
@@ -662,7 +660,11 @@ fn per_module_index_serves_ops_and_views() {
             None,
         );
         assert_eq!(code, 200);
-        let (code, _) = daemon.submit("chat", post_message("eng", "m1", "fluent index demo"), Some("eddy"));
+        let (code, _) = daemon.submit(
+            "chat",
+            post_message("eng", "m1", "fluent index demo"),
+            Some("eddy"),
+        );
         assert_eq!(code, 200);
         let (code, _) = daemon.submit(
             "tasks",
@@ -751,7 +753,11 @@ fn per_module_index_serves_ops_and_views() {
     assert_eq!(code, 200);
     assert_eq!(hits_of(&reply).len(), 1, "index survives a restart");
 
-    let (code, _) = daemon.submit("chat", post_message("eng", "m2", "fresh after restart"), Some("eddy"));
+    let (code, _) = daemon.submit(
+        "chat",
+        post_message("eng", "m2", "fresh after restart"),
+        Some("eddy"),
+    );
     assert_eq!(code, 200);
     let (code, reply) = daemon.request(
         "POST",
@@ -1176,7 +1182,9 @@ fn git_clone_over_http_round_trips_full_history() {
 #[test]
 fn git_push_larger_than_post_buffer_uses_the_probe_path() {
     if !have_git() {
-        eprintln!("skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH");
+        eprintln!(
+            "skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH"
+        );
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");

@@ -157,7 +157,11 @@ async fn submit_receipt_op_hash_addresses_the_committed_payload() {
     let body = body_json(response).await;
     let op_hash = body["opHash"].as_str().expect("receipt carries opHash");
     assert_eq!(op_hash.len(), 64);
-    assert!(op_hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    assert!(
+        op_hash
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    );
 
     // the hash is ADDRESSABLE, not just informational: the blob lane serves the
     // committed op bytes back under it.

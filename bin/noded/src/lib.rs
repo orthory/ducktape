@@ -239,12 +239,7 @@ impl NodeMetrics {
 
     /// fold one applied block into the series: height, count, this node's
     /// wall-clock apply latency, and the per-module dispatch counters.
-    pub fn record_block(
-        &self,
-        height: u64,
-        latency_us: u64,
-        dispatches: &[host::DispatchRecord],
-    ) {
+    pub fn record_block(&self, height: u64, latency_us: u64, dispatches: &[host::DispatchRecord]) {
         self.block_height.set(height as i64);
         self.blocks_total.inc();
         // microseconds → seconds for the Prometheus convention.
@@ -463,7 +458,11 @@ const WS_FLAG_KEYFRAME: u8 = 0b0000_0001;
 
 /// client → server control messages on the call socket (text frames).
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum CallClientControl {
     /// replace the fan-out set with these hex node keys (self excluded —
     /// the client tracks the consensus huddle roster).
@@ -476,12 +475,20 @@ pub enum CallClientControl {
 
 /// server → client control messages on the call socket (text frames).
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum CallServerControl {
     /// a peer lost sync with US: encode the next frame as a keyframe.
     KeyframeRequest,
     /// a peer's 1 Hz beacon (ephemeral presence/state — never consensus).
-    PeerBeacon { peer: String, muted: bool, camera_on: bool },
+    PeerBeacon {
+        peer: String,
+        muted: bool,
+        camera_on: bool,
+    },
     /// send at no more than this (min across peers' loss reports).
     RateHint { max_kbps: u32 },
 }
@@ -669,9 +676,7 @@ pub fn router(handle: NodeHandle) -> Router {
             "/v1/files/blob",
             // one chunk per request, so the body cap IS the chunk cap. the
             // json routes keep axum's (smaller) default limit.
-            post(put_blob).layer(DefaultBodyLimit::max(
-                files::MAX_CHUNK_SIZE as usize,
-            )),
+            post(put_blob).layer(DefaultBodyLimit::max(files::MAX_CHUNK_SIZE as usize)),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
         .route("/forge/{repo}/info/refs", get(git_info_refs))
@@ -953,19 +958,15 @@ struct IndexOpsResponse {
 }
 
 fn index_store(handle: &NodeHandle) -> Result<&Arc<indexer::IndexStore>, Response> {
-    handle.index.as_ref().ok_or_else(|| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no index store configured",
-        )
-    })
+    handle
+        .index
+        .as_ref()
+        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "no index store configured"))
 }
 
 fn index_error(err: indexer::Error) -> Response {
     let status = match err {
-        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => {
-            StatusCode::NOT_FOUND
-        }
+        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => StatusCode::NOT_FOUND,
         indexer::Error::View(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1069,10 +1070,7 @@ async fn index_view(
     match store.view(&module, &req_bytes) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "view reply was not json",
-            ),
+            Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
         },
         Err(err) => index_error(err),
     }
@@ -1104,8 +1102,7 @@ async fn index_scan(
         .entries
         .iter()
         .map(|(key, value)| {
-            let json: Option<Box<serde_json::value::RawValue>> =
-                serde_json::from_slice(value).ok();
+            let json: Option<Box<serde_json::value::RawValue>> = serde_json::from_slice(value).ok();
             IndexEntry {
                 key: String::from_utf8_lossy(key).into_owned(),
                 value_hex: json.is_none().then(|| hex_bytes(value)),
@@ -1137,10 +1134,7 @@ pub struct BlocksParams {
 /// history survives a restart. heartbeat nops never get a row, so an empty
 /// reply means no real ops have finalized, not an idle chain. a handle with
 /// no index store configured serves the same "no blocks yet" shape.
-async fn blocks(
-    State(handle): State<NodeHandle>,
-    Query(params): Query<BlocksParams>,
-) -> Response {
+async fn blocks(State(handle): State<NodeHandle>, Query(params): Query<BlocksParams>) -> Response {
     let Some(store) = handle.index.as_ref() else {
         return Json(serde_json::json!({ "blocks": [] })).into_response();
     };
@@ -1585,7 +1579,10 @@ async fn git_receive_pack(
         return (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, "application/x-git-receive-pack-result"),
+                (
+                    header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-result",
+                ),
                 (header::CACHE_CONTROL, "no-cache"),
             ],
             GIT_FLUSH_PKT.to_vec(),
@@ -1880,10 +1877,7 @@ async fn call_ws(
 /// signal the hub watches.
 async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String) {
     let (reply, opened) = tokio::sync::oneshot::channel();
-    let request = CallSessionRequest {
-        channel_id,
-        reply,
-    };
+    let request = CallSessionRequest { channel_id, reply };
     // every refusal path says WHY as a text frame before closing — the client
     // surfaces it as a session error instead of a silent no-op.
     const NO_HUB: &str = "calls are not available on this node (no live call hub)";
@@ -2020,7 +2014,6 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
