@@ -1,0 +1,36 @@
+# the Quack package test framework — the reusable harness every package uses
+# to prove the ADR checklist deterministically: an in-process Host testbed
+# with the standard platform module set, an install driver over `quack`
+# capsules, the assertion kit, a golden-fixture runner (the same script the
+# CLI's `package test` replays), and the snapshot round-trip sweep. it lives
+# under crates/testing because it depends on app/system module impls (so not
+# kernel/) and is not itself a consensus module (so not system/).
+[package]
+name = "quack-harness"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+host = { workspace = true }
+quack = { workspace = true }
+package = { workspace = true }
+saga = { workspace = true }
+dispatch = { workspace = true }
+tagging = { workspace = true }
+capability = { workspace = true }
+chat = { workspace = true }
+pages = { workspace = true }
+tasks = { workspace = true }
+jobs = { workspace = true }
+memory = { workspace = true }
+agent = { workspace = true }
+runs = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+commonware-runtime = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"

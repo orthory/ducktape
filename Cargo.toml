@@ -53,6 +53,8 @@ members = [
     "crates/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
+    # testing — reusable test frameworks (depend on module impls; not modules)
+    "crates/testing/quack-harness",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     # app — the desktop shell of the react client (web twin ships from app/)
@@ -143,6 +145,10 @@ memory = { path = "crates/apps/memory" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
+# the Quack package test framework (testbed + install driver + assertion kit +
+# golden runner) — consumed by package authors' test suites and the CLI's
+# `package test`.
+quack-harness = { path = "crates/testing/quack-harness" }
 # internal — types-only interface crates (the legal cross-module surface)
 wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 wireguard-effect = { path = "crates/system/wireguard-effect" }
