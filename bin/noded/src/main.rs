@@ -42,7 +42,6 @@ use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use inbox::Inbox;
 use indexer::IndexStore;
 use jobs::Jobs;
-use memory::Memory;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
     NodeCommand, NodeHandle, NodeStatus, TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame,
@@ -58,7 +57,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
@@ -73,7 +72,6 @@ const MODULE_IDS: [&str; 16] = [
     "pages",
     "forge",
     "files",
-    "memory",
     "profiles",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
@@ -247,9 +245,9 @@ fn run_node(
 
     executor.start(|context| async move {
         // genesis: the full product surface. chat/tasks/inbox as the core loop,
-        // automations bridging chat/memory events into chat/tasks/inbox
-        // follow-ups, jobs for deferred work, document + forge for the
-        // substrate-backed stores, and files + memory for the content planes.
+        // automations bridging chat events into chat/tasks/inbox follow-ups,
+        // jobs for deferred work, document + forge for the substrate-backed
+        // stores, and files for the content plane.
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");
@@ -287,7 +285,6 @@ fn run_node(
         // stages what clients POST).
         let op_blobs = blobs.clone();
         let files = Files::open("files", duckfs_dir).expect("duckfs open");
-        let memory = Memory::new("memory");
         // the origin-gated display-name registry: maps each verified submit
         // origin to a chosen name so the ui can resolve authors to names.
         let profiles = Profiles::new("profiles");
@@ -306,7 +303,6 @@ fn run_node(
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
-            Box::new(memory),
             Box::new(profiles),
         ])
         .expect("genesis");

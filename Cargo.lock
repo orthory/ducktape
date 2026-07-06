@@ -1877,7 +1877,6 @@ dependencies = [
  "inbox",
  "jobs",
  "kv",
- "memory",
  "profiles",
  "runs",
  "saga",
@@ -3826,19 +3825,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memory"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "host",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4071,7 +4057,6 @@ dependencies = [
  "indexer",
  "jobs",
  "kv",
- "memory",
  "node",
  "noded",
  "pages",
@@ -4124,7 +4109,6 @@ dependencies = [
  "inbox",
  "indexer",
  "jobs",
- "memory",
  "pages",
  "profiles",
  "reactor",
@@ -5918,7 +5902,6 @@ dependencies = [
  "inbox",
  "indexer",
  "jobs",
- "memory",
  "noded",
  "pages",
  "profiles",

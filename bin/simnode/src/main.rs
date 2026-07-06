@@ -74,7 +74,6 @@ use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
 use jobs::Jobs;
-use memory::Memory;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
     NodeCommand, NodeHandle, NodeStatus, TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame,
@@ -91,7 +90,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
@@ -106,7 +105,6 @@ const MODULE_IDS: [&str; 16] = [
     "pages",
     "forge",
     "files",
-    "memory",
     "profiles",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
@@ -403,7 +401,6 @@ fn run_sim(
         let pages = Pages::init(context.child("pages"), "pages").await;
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
         let files = Files::open("files", duckfs_dir).expect("duckfs open");
-        let memory = Memory::new("memory");
         let profiles = Profiles::new("profiles");
         let host = Host::genesis(vec![
             Box::new(chat),
@@ -420,7 +417,6 @@ fn run_sim(
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
-            Box::new(memory),
             Box::new(profiles),
         ])
         .expect("genesis");

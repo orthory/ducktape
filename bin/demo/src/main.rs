@@ -53,7 +53,6 @@ use inbox::{
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
 use jobs::Jobs;
-use memory::Memory;
 use profiles::Profiles;
 use saga::SagaModule;
 use saga::{
@@ -95,7 +94,6 @@ fn main() {
         let profiles = Profiles::new("profiles");
         let inbox = Inbox::new("inbox");
         let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
-        let memory = Memory::new("memory");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
@@ -125,7 +123,6 @@ fn main() {
             Box::new(profiles),
             Box::new(inbox),
             Box::new(files),
-            Box::new(memory),
             Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
@@ -133,7 +130,7 @@ fn main() {
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 19 registered modules over one host ===");
+        println!("=== super-app demo — 18 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

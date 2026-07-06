@@ -21,7 +21,6 @@ profiles = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
-memory = { workspace = true }
 jobs = { workspace = true }
 valset = { workspace = true }
 sdk = { workspace = true }

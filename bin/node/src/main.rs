@@ -96,7 +96,6 @@ use host::Host;
 use inbox::Inbox;
 use jobs::Jobs;
 use kv::Kv;
-use memory::Memory;
 use node::OrderedNode;
 use pages::Pages;
 use profiles::Profiles;
@@ -190,7 +189,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 23] = [
+const MODULE_IDS: [&str; 22] = [
     "kv",
     "document",
     "pages",
@@ -210,7 +209,6 @@ const MODULE_IDS: [&str; 23] = [
     "directory",
     "automations",
     "files",
-    "memory",
     "jobs",
     "agent",
     "runs",
@@ -666,9 +664,6 @@ async fn genesis_host(
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
         Box::new(Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open")),
-        // the shared agent workspace: a filesystem-shaped namespace with
-        // write-once publish, immutable generations, snapshots, and watches.
-        Box::new(Memory::new("memory")),
         Box::new(Jobs::new("jobs")),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
@@ -807,12 +802,6 @@ async fn restore_host(
         .install(bytes, root, manifest.height.unwrap_or(0))
         .map_err(|e| format!("files install: {e}"))?;
 
-    let mut memory = Memory::new("memory");
-    let (bytes, root) = snapshot_of("memory")?;
-    memory
-        .install(bytes, root)
-        .map_err(|e| format!("memory install: {e}"))?;
-
     let mut jobs = Jobs::new("jobs");
     let (bytes, root) = snapshot_of("jobs")?;
     jobs.install(bytes, root)
@@ -869,7 +858,6 @@ async fn restore_host(
         Box::new(profiles),
         Box::new(inbox),
         Box::new(files),
-        Box::new(memory),
         Box::new(jobs),
         Box::new(agent),
         Box::new(runs),
@@ -1066,12 +1054,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root, manifest.height)
         .map_err(|e| format!("files install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("memory").await?;
-    let mut memory = Memory::new("memory");
-    memory
-        .install(&bytes, root)
-        .map_err(|e| format!("memory install: {e}"))?;
-
     let (bytes, root) = snapshot_of("jobs").await?;
     let mut jobs = Jobs::new("jobs");
     jobs.install(&bytes, root)
@@ -1140,7 +1122,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(profiles),
         Box::new(inbox),
         Box::new(files),
-        Box::new(memory),
         Box::new(jobs),
         Box::new(agent),
         Box::new(runs),
@@ -7248,7 +7229,7 @@ mod tests {
                 .ok_or_else(|| Error::Module("missing test value".into()))?;
             self.staged = Some(value);
             ctx.emit_msg(Msg {
-                target: "memory".into(),
+                target: "mem".into(),
                 payload: vec![value],
             });
             Ok(())
@@ -7296,7 +7277,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl Module for TestMemoryModule {
         fn id(&self) -> String {
-            "memory".into()
+            "mem".into()
         }
 
         fn root(&self) -> StateRoot {
@@ -7341,10 +7322,10 @@ mod tests {
         let mut memory = TestMemoryModule::new(0);
         memory
             .install(
-                manifest.snapshot("memory").expect("memory snapshot"),
-                manifest.root("memory").expect("memory root"),
+                manifest.snapshot("mem").expect("mem snapshot"),
+                manifest.root("mem").expect("mem root"),
             )
-            .expect("memory install");
+            .expect("mem install");
         Host::genesis(vec![Box::new(TestDiskModule::new(store)), Box::new(memory)])
             .expect("restored mixed host")
     }
@@ -7709,7 +7690,7 @@ mod tests {
             .expect("write catch-up checkpoint");
             assert_eq!(ckpt.height, Some(1));
             assert_eq!(ckpt.app_hash, target.app_hash);
-            assert_eq!(ckpt.snapshot("memory"), Some([7u8].as_slice()));
+            assert_eq!(ckpt.snapshot("mem"), Some([7u8].as_slice()));
 
             let mut restored = restore_mixed_durability_host(durable_store, &ckpt);
             let recovered = recovery
