@@ -61,6 +61,9 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             id: "chat".into(),
                             root: "ef".repeat(32),
                             category: ModuleCategory::of("chat"),
+                            package: None,
+                            package_version: None,
+                            lifecycle: None,
                         }],
                         public_key: "ab".repeat(32),
                     });
@@ -157,7 +160,11 @@ async fn submit_receipt_op_hash_addresses_the_committed_payload() {
     let body = body_json(response).await;
     let op_hash = body["opHash"].as_str().expect("receipt carries opHash");
     assert_eq!(op_hash.len(), 64);
-    assert!(op_hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    assert!(
+        op_hash
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    );
 
     // the hash is ADDRESSABLE, not just informational: the blob lane serves the
     // committed op bytes back under it.

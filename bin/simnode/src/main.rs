@@ -704,6 +704,13 @@ impl Sim {
                     .map(|root| hex_root(&root))
                     .unwrap_or_default(),
                 category: ModuleCategory::of(id),
+                // the presentation join over the package registry is noded's
+                // (its status arm queries `PackageQuery::List`); this sim
+                // harness leaves the rows unstamped, which skip_serializing_if
+                // omits — byte-identical to the sim's status today.
+                package: None,
+                package_version: None,
+                lifecycle: None,
             })
             .collect();
         NodeStatus {

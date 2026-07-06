@@ -25,12 +25,10 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
-use runs::RunsModule;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use tagging::TaggingModule;
 use dispatch_oracle::DispatchWorker;
 use files::Files;
 use forge::Forge;
@@ -46,12 +44,16 @@ use noded::{
     NodeCommand, NodeHandle, NodeMetrics, NodeStatus, WsFrame, block_row, hex_bytes, hex_root,
     payload_preview,
 };
-use package::PackageModule;
+use package::{
+    MODULE_PACKAGE, PackageModule, PackageQuery, PackageReply, decode_reply, encode_query,
+};
 use pages::Pages;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
+use runs::RunsModule;
 use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
+use tagging::TaggingModule;
 use tasks::Tasks;
 use tokio::sync::broadcast;
 
@@ -312,7 +314,7 @@ fn run_node(
                     let _ = reply.send(result);
                 }
                 NodeCommand::Status { reply } => {
-                    let modules = MODULE_IDS
+                    let mut modules: Vec<ModuleStatus> = MODULE_IDS
                         .iter()
                         .map(|id| ModuleStatus {
                             id: (*id).into(),
@@ -321,8 +323,22 @@ fn run_node(
                                 .map(|root| hex_root(&root))
                                 .unwrap_or_default(),
                             category: ModuleCategory::of(id),
+                            package: None,
+                            package_version: None,
+                            lifecycle: None,
                         })
                         .collect();
+                    // presentation join: stamp each module with its owning
+                    // package's provenance (never consensus). one query, best
+                    // effort — a node with nothing installed leaves every row's
+                    // package fields None and serializes byte-identical to today.
+                    if let Ok(bytes) = host
+                        .query(MODULE_PACKAGE, &encode_query(&PackageQuery::List))
+                        .await
+                        && let Ok(PackageReply::Packages(packages)) = decode_reply(&bytes)
+                    {
+                        noded::stamp_packages(&mut modules, &packages);
+                    }
                     let _ = reply.send(NodeStatus {
                         version: env!("CARGO_PKG_VERSION").into(),
                         app_hash: hex_root(&host.app_hash()),
@@ -387,15 +403,14 @@ async fn submit_and_drain(
     msg: Msg,
 ) -> Result<BlockSummary, String> {
     let (included, effects) =
-        match submit_one(host, height, index, blobs, events, metrics, origin, msg).await
-    {
-        Ok(out) => out,
-        Err(SubmitError::Fatal(err)) => {
-            eprintln!("[noded] FATAL: {err} — halting");
-            std::process::exit(1);
-        }
-        Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
-    };
+        match submit_one(host, height, index, blobs, events, metrics, origin, msg).await {
+            Ok(out) => out,
+            Err(SubmitError::Fatal(err)) => {
+                eprintln!("[noded] FATAL: {err} — halting");
+                std::process::exit(1);
+            }
+            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+        };
 
     let mut queue = VecDeque::new();
     offer_effects(workers, effects, &mut queue).await;

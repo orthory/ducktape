@@ -239,12 +239,7 @@ impl NodeMetrics {
 
     /// fold one applied block into the series: height, count, this node's
     /// wall-clock apply latency, and the per-module dispatch counters.
-    pub fn record_block(
-        &self,
-        height: u64,
-        latency_us: u64,
-        dispatches: &[host::DispatchRecord],
-    ) {
+    pub fn record_block(&self, height: u64, latency_us: u64, dispatches: &[host::DispatchRecord]) {
         self.block_height.set(height as i64);
         self.blocks_total.inc();
         // microseconds → seconds for the Prometheus convention.
@@ -297,6 +292,64 @@ pub struct ModuleStatus {
     pub id: String,
     pub root: String,
     pub category: ModuleCategory,
+    /// the installed package this module was shipped by, when it belongs to
+    /// one. presentation metadata the status join stamps by module id from the
+    /// package registry (`PackageQuery::List`) — never consensus, never in the
+    /// app-hash. `None` for genesis/native modules and the `package` registry
+    /// itself. skipped when absent, so a node with nothing installed serializes
+    /// byte-identical rows to a node built before packages shipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    /// the owning package's version string, mirrored from its registry row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_version: Option<String>,
+    /// the owning package's lifecycle — `"active"`, `"suspended"`, or
+    /// `"inactive"` (tombstoned). absent when the module has no owning package.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+}
+
+/// Join installed-package provenance onto a set of status rows — presentation
+/// only, never consensus. For every module bound by a package in a settled
+/// lifecycle state (`Active`, `Suspended`, or `Inactive`), stamp that package's
+/// id, version, and lifecycle onto the module's row. `Installing` is transient
+/// (an install completes within its block) and `Unplugging` never commits, so
+/// neither stamps. The `package` registry module itself is never stamped — it
+/// owns the registry, no package ships it — and a module owned by no package
+/// keeps all three fields `None`, so a host with nothing installed leaves every
+/// row byte-identical to today.
+pub fn stamp_packages(modules: &mut [ModuleStatus], packages: &[package::PackageView]) {
+    use package::PackageStatus;
+    use std::collections::HashMap;
+
+    // concrete module id -> (package id, version, lifecycle). `PackageQuery::List`
+    // returns rows sorted by package id, so a later binding to the same concrete
+    // module wins deterministically.
+    let mut owned: HashMap<&str, (&str, &str, &'static str)> = HashMap::new();
+    for pkg in packages {
+        let lifecycle = match pkg.status {
+            PackageStatus::Active => "active",
+            PackageStatus::Suspended => "suspended",
+            PackageStatus::Inactive => "inactive",
+            PackageStatus::Installing | PackageStatus::Unplugging => continue,
+        };
+        for module_id in pkg.modules.values() {
+            owned.insert(
+                module_id.as_str(),
+                (pkg.package.as_str(), pkg.version.as_str(), lifecycle),
+            );
+        }
+    }
+    for module in modules.iter_mut() {
+        if module.id == package::MODULE_PACKAGE {
+            continue;
+        }
+        if let Some((pkg, version, lifecycle)) = owned.get(module.id.as_str()) {
+            module.package = Some((*pkg).to_owned());
+            module.package_version = Some((*version).to_owned());
+            module.lifecycle = Some((*lifecycle).to_owned());
+        }
+    }
 }
 
 /// A module's presentation category — how the app's Modules view groups the
@@ -463,7 +516,11 @@ const WS_FLAG_KEYFRAME: u8 = 0b0000_0001;
 
 /// client → server control messages on the call socket (text frames).
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum CallClientControl {
     /// replace the fan-out set with these hex node keys (self excluded —
     /// the client tracks the consensus huddle roster).
@@ -476,12 +533,20 @@ pub enum CallClientControl {
 
 /// server → client control messages on the call socket (text frames).
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum CallServerControl {
     /// a peer lost sync with US: encode the next frame as a keyframe.
     KeyframeRequest,
     /// a peer's 1 Hz beacon (ephemeral presence/state — never consensus).
-    PeerBeacon { peer: String, muted: bool, camera_on: bool },
+    PeerBeacon {
+        peer: String,
+        muted: bool,
+        camera_on: bool,
+    },
     /// send at no more than this (min across peers' loss reports).
     RateHint { max_kbps: u32 },
 }
@@ -669,9 +734,7 @@ pub fn router(handle: NodeHandle) -> Router {
             "/v1/files/blob",
             // one chunk per request, so the body cap IS the chunk cap. the
             // json routes keep axum's (smaller) default limit.
-            post(put_blob).layer(DefaultBodyLimit::max(
-                files::MAX_CHUNK_SIZE as usize,
-            )),
+            post(put_blob).layer(DefaultBodyLimit::max(files::MAX_CHUNK_SIZE as usize)),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
         .route("/forge/{repo}/info/refs", get(git_info_refs))
@@ -953,19 +1016,15 @@ struct IndexOpsResponse {
 }
 
 fn index_store(handle: &NodeHandle) -> Result<&Arc<indexer::IndexStore>, Response> {
-    handle.index.as_ref().ok_or_else(|| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no index store configured",
-        )
-    })
+    handle
+        .index
+        .as_ref()
+        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "no index store configured"))
 }
 
 fn index_error(err: indexer::Error) -> Response {
     let status = match err {
-        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => {
-            StatusCode::NOT_FOUND
-        }
+        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => StatusCode::NOT_FOUND,
         indexer::Error::View(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1069,10 +1128,7 @@ async fn index_view(
     match store.view(&module, &req_bytes) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "view reply was not json",
-            ),
+            Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
         },
         Err(err) => index_error(err),
     }
@@ -1104,8 +1160,7 @@ async fn index_scan(
         .entries
         .iter()
         .map(|(key, value)| {
-            let json: Option<Box<serde_json::value::RawValue>> =
-                serde_json::from_slice(value).ok();
+            let json: Option<Box<serde_json::value::RawValue>> = serde_json::from_slice(value).ok();
             IndexEntry {
                 key: String::from_utf8_lossy(key).into_owned(),
                 value_hex: json.is_none().then(|| hex_bytes(value)),
@@ -1137,10 +1192,7 @@ pub struct BlocksParams {
 /// history survives a restart. heartbeat nops never get a row, so an empty
 /// reply means no real ops have finalized, not an idle chain. a handle with
 /// no index store configured serves the same "no blocks yet" shape.
-async fn blocks(
-    State(handle): State<NodeHandle>,
-    Query(params): Query<BlocksParams>,
-) -> Response {
+async fn blocks(State(handle): State<NodeHandle>, Query(params): Query<BlocksParams>) -> Response {
     let Some(store) = handle.index.as_ref() else {
         return Json(serde_json::json!({ "blocks": [] })).into_response();
     };
@@ -1585,7 +1637,10 @@ async fn git_receive_pack(
         return (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, "application/x-git-receive-pack-result"),
+                (
+                    header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-result",
+                ),
                 (header::CACHE_CONTROL, "no-cache"),
             ],
             GIT_FLUSH_PKT.to_vec(),
@@ -1880,10 +1935,7 @@ async fn call_ws(
 /// signal the hub watches.
 async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String) {
     let (reply, opened) = tokio::sync::oneshot::channel();
-    let request = CallSessionRequest {
-        channel_id,
-        reply,
-    };
+    let request = CallSessionRequest { channel_id, reply };
     // every refusal path says WHY as a text frame before closing — the client
     // surfaces it as a session error instead of a silent no-op.
     const NO_HUB: &str = "calls are not available on this node (no live call hub)";
@@ -2021,7 +2073,6 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2062,6 +2113,134 @@ mod tests {
         assert!(preview.ends_with('…'), "truncation is visible");
         // invalid utf-8 renders lossily rather than erroring.
         assert_eq!(payload_preview(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
+    }
+
+    fn package_view(
+        package: &str,
+        version: &str,
+        status: package::PackageStatus,
+        modules: &[(&str, &str)],
+    ) -> package::PackageView {
+        use std::collections::BTreeMap;
+        package::PackageView {
+            package: package.into(),
+            version: version.into(),
+            manifest_hash: vec![0u8; 32],
+            status,
+            modules: modules
+                .iter()
+                .map(|(l, m)| ((*l).to_string(), (*m).to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            harness: modules
+                .first()
+                .map(|(_, m)| (*m).to_string())
+                .unwrap_or_default(),
+            installer: saga::SagaOrigin::System,
+            uninstall: package::UninstallPolicy {
+                pending_runs: "drain".into(),
+                user_data: "preserve".into(),
+            },
+            installed_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn status_row(id: &str) -> ModuleStatus {
+        ModuleStatus {
+            id: id.into(),
+            root: String::new(),
+            category: ModuleCategory::of(id),
+            package: None,
+            package_version: None,
+            lifecycle: None,
+        }
+    }
+
+    #[test]
+    fn stamp_packages_marks_owned_modules_and_leaves_others_none() {
+        use package::PackageStatus;
+
+        let mut modules = vec![
+            status_row("chat"),
+            status_row("pages"),
+            status_row("inbox"),
+            status_row("memory"),
+            status_row("package"),
+        ];
+
+        let packages = vec![
+            // an active package ships a harness bound to `chat`, and —
+            // pathologically — also binds a logical to the package registry
+            // itself, to prove the registry row is never stamped.
+            package_view(
+                "org.example.docs",
+                "1.2.0",
+                PackageStatus::Active,
+                &[("harness", "chat"), ("registry", "package")],
+            ),
+            // a suspended package supplies `pages`.
+            package_view(
+                "org.example.notes",
+                "0.3.1",
+                PackageStatus::Suspended,
+                &[("main", "pages")],
+            ),
+            // an inactive (tombstoned) package still stamps `inbox` — audit
+            // provenance survives an unplug.
+            package_view(
+                "org.example.old",
+                "2.0.0",
+                PackageStatus::Inactive,
+                &[("main", "inbox")],
+            ),
+            // an installing package must NOT stamp yet (transient state).
+            package_view(
+                "org.example.wip",
+                "0.0.1",
+                PackageStatus::Installing,
+                &[("main", "memory")],
+            ),
+        ];
+
+        stamp_packages(&mut modules, &packages);
+        let by_id = |id: &str| modules.iter().find(|m| m.id == id).unwrap();
+
+        let chat = by_id("chat");
+        assert_eq!(chat.package.as_deref(), Some("org.example.docs"));
+        assert_eq!(chat.package_version.as_deref(), Some("1.2.0"));
+        assert_eq!(chat.lifecycle.as_deref(), Some("active"));
+
+        let pages = by_id("pages");
+        assert_eq!(pages.package.as_deref(), Some("org.example.notes"));
+        assert_eq!(pages.lifecycle.as_deref(), Some("suspended"));
+
+        let inbox = by_id("inbox");
+        assert_eq!(inbox.package.as_deref(), Some("org.example.old"));
+        assert_eq!(inbox.lifecycle.as_deref(), Some("inactive"));
+
+        // installing is transient — memory stays unstamped until MarkActive.
+        let memory = by_id("memory");
+        assert!(memory.package.is_none());
+        assert!(memory.lifecycle.is_none());
+
+        // the registry module itself is never stamped, even when a package
+        // (mistakenly) binds a logical to it.
+        let registry = by_id("package");
+        assert!(registry.package.is_none());
+        assert!(registry.lifecycle.is_none());
+    }
+
+    #[test]
+    fn stamp_packages_with_nothing_installed_is_byte_identical_to_today() {
+        let mut modules = vec![status_row("chat")];
+        stamp_packages(&mut modules, &[]);
+        // no package installed → the row carries exactly the legacy keys, so
+        // existing status consumers see identical bytes (skip_serializing_if).
+        let json = serde_json::to_value(&modules[0]).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "id": "chat", "root": "", "category": "workspace" }),
+        );
     }
 
     #[test]

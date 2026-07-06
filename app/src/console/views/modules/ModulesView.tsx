@@ -31,8 +31,21 @@ const MODULE_INFO: Record<string, { label: string; desc: string }> = {
   memory: { label: "Memory", desc: "A shared, filesystem-shaped agent workspace." },
   files: { label: "Files", desc: "Content-addressed file manifests + chunk sync." },
   saga: { label: "Saga", desc: "The deterministic async-RPC ledger behind agents." },
+  package: {
+    label: "Packages",
+    desc: "The installed-package registry — versions, lifecycle, and action routes.",
+  },
   kv: { label: "KV", desc: "A key-value store (internal scaffold)." },
   directory: { label: "Directory", desc: "An example / demo module (internal)." },
+};
+
+// The accent a lifecycle chip wears: a live package reads green, a paused one
+// amber, a tombstoned (unplugged) one falls back to muted. Presentation only —
+// the state itself is the node's, mirrored from its package registry row.
+const LIFECYCLE_TONE: Record<string, string> = {
+  active: color.green,
+  suspended: color.amber,
+  inactive: color.muted2,
 };
 
 const infoOf = (id: string): { label: string; desc: string } =>
@@ -108,14 +121,79 @@ function RootButton({
   );
 }
 
+// A read-only badge naming the installed package a module ships in: its id +
+// version, and a lifecycle chip. Rendered only when the node stamped a package
+// onto the row (lifecycle present); genesis/native modules show nothing.
+function PackageBadge({
+  pkg,
+  version,
+  lifecycle,
+}: {
+  pkg: string;
+  version?: string;
+  lifecycle: string;
+}) {
+  const tone = LIFECYCLE_TONE[lifecycle] ?? color.muted2;
+  return (
+    <div
+      title={version ? `${pkg} ${version} · ${lifecycle}` : `${pkg} · ${lifecycle}`}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        maxWidth: "100%",
+        minWidth: 0,
+        padding: "3px 4px 3px 8px",
+        borderRadius: radius.sm,
+        border: `1px solid ${color.borderSoft}`,
+        background: color.sunken,
+      }}
+    >
+      <span
+        style={{
+          font: `500 11px ${font.mono}`,
+          color: color.muted3,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {pkg}
+        {version ? ` ${version}` : ""}
+      </span>
+      <span
+        style={{
+          flexShrink: 0,
+          font: `600 9.5px ${font.mono}`,
+          letterSpacing: ".08em",
+          textTransform: "uppercase",
+          color: tone,
+          background: color.paper,
+          border: `1px solid ${color.borderSoft}`,
+          borderRadius: radius.sm - 2,
+          padding: "1px 5px",
+        }}
+      >
+        {lifecycle}
+      </span>
+    </div>
+  );
+}
+
 function ModuleRow({
   id,
   root,
+  pkg,
+  version,
+  lifecycle,
   copied,
   onCopy,
 }: {
   id: string;
   root: string;
+  pkg?: string;
+  version?: string;
+  lifecycle?: string;
   copied: boolean;
   onCopy: () => void;
 }) {
@@ -176,6 +254,11 @@ function ModuleRow({
         >
           {info.desc}
         </div>
+        {lifecycle && pkg && (
+          <div style={{ marginTop: 7, minWidth: 0 }}>
+            <PackageBadge pkg={pkg} version={version} lifecycle={lifecycle} />
+          </div>
+        )}
         <div style={{ marginTop: 7, minWidth: 0 }}>
           <RootButton root={root} copied={copied} onCopy={onCopy} />
         </div>
@@ -286,6 +369,9 @@ export function ModulesView() {
                   key={mod.id}
                   id={mod.id}
                   root={mod.root}
+                  pkg={mod.package}
+                  version={mod.packageVersion}
+                  lifecycle={mod.lifecycle}
                   copied={copied === mod.id}
                   onCopy={() => copyRoot(mod.id, mod.root)}
                 />

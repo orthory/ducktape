@@ -36,6 +36,16 @@ export interface ModuleStatus {
   id: string;
   root: string;
   category?: ModuleCategory;
+  /** The installed package this module ships in, when it belongs to one. The
+   *  node stamps this by module id from its package registry; it is
+   *  presentation metadata only, never consensus. Absent for genesis/native
+   *  modules and the package registry itself. */
+  package?: string;
+  /** The owning package's version string, mirrored from its registry row. */
+  packageVersion?: string;
+  /** The owning package's lifecycle: "active", "suspended", or "inactive"
+   *  (tombstoned). Absent when the module has no owning package. */
+  lifecycle?: string;
 }
 
 export interface NodeStatus {
