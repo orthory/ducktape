@@ -1,25 +1,23 @@
 //! the agent module's public wire surface — types only.
 //!
-//! the agent module is the collaboration-loop consumer on the tagging and
-//! dispatch planes: it registers agents, watches chat channels through the
-//! tagging plane's engagement events, composes each engaged post's model
-//! input in consensus, dispatches it under the agent's own recipe, and
-//! validates the model's response before any cross-module write happens.
-//! run LIFECYCLE is not this module's state — a dispatched task's lifecycle
-//! lives in the dispatch module (and its saga); this surface only exposes the
-//! module's own correlation entries for still-pending work. three payload
+//! the agent module is the platform's agent REGISTRY and nothing more: a
+//! self-contained record book of which agents exist — owner, capability tag,
+//! prompt pin, granted actions, status. it consumes no other module's events
+//! and emits exactly one follow-up shape ([`AgentEvent`], to a
+//! genesis-configured hook target) so the module that runs agents can keep
+//! each agent's dispatch-plane recipe in lockstep, atomically with the
+//! registration that changed it. engagement, run orchestration, and response
+//! delivery live in the runs module (`runs-interface`). three payload
 //! families cross this surface:
 //!
-//! - [`AgentMsg`] — writes: registry admin, channel watches, explicit run
-//!   requests, and run cancellation.
+//! - [`AgentMsg`] — writes: registry admin only.
 //! - [`AgentResponse`] — the formal response wire spec: what a model's raw
 //!   answer is normalized into, and what the strict-output instruction asks
-//!   for. reply blocks are this module's OWN vocabulary (kind + text), not
-//!   another module's — the agent module maps them to chat blocks when it
-//!   emits the reply. it is DATA until the module deterministically validates
-//!   it against the agent's allowed-action set.
-//! - [`AgentQuery`] -> [`AgentReply`] — reads over agents, watches, and the
-//!   pending (not-yet-delivered) runs.
+//!   for. reply blocks are this surface's OWN vocabulary (kind + text), not
+//!   another module's — the consuming module maps them to chat blocks when it
+//!   emits the reply. it is DATA until deterministically validated against
+//!   the agent's allowed-action set.
+//! - [`AgentQuery`] -> [`AgentReply`] — reads over the registry.
 
 use saga_interface::SagaOrigin;
 use serde::{Deserialize, Serialize};
@@ -39,14 +37,20 @@ pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 /// hard cap on the serialized CHAT blocks a response's `reply_blocks` map to.
 /// deliberately well under chat's `MAX_MESSAGE_HEAD_BYTES`: the reply is
 /// emitted as a chat post inside the delivery block, and a post that chat
-/// rejects would abort that block (the no-fail rule) — so the agent module
-/// must be able to prove the post will fit BEFORE emitting.
+/// rejects would abort that block (the no-fail rule) — so the delivering
+/// module must be able to prove the post will fit BEFORE emitting.
 pub const MAX_REPLY_BLOCKS_BYTES: usize = 32 * 1024;
 
 /// required byte length of an agent's prompt hash (a sha256 digest). prompt
 /// CONTENT lives off-registry (e.g. in `document`); consensus commits to the
 /// hash, so which prompt an agent runs is part of the app-hash.
 pub const PROMPT_HASH_LEN: usize = 32;
+
+/// the reserved unit separator agent ids must never contain: the runs module
+/// keys its run records with `\x1f`-delimited fields, and an agent id
+/// carrying the delimiter would make those keys ambiguous. the registry
+/// rejects it at registration; downstream modules rely on that.
+pub const RESERVED_ID_SEPARATOR: char = '\u{1f}';
 
 // ---- the action vocabulary ---------------------------------------------------
 
@@ -106,67 +110,12 @@ pub struct AgentRecord {
     pub updated_at: u64,
 }
 
-/// how a watched channel selects which agents a user post engages.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum TurnPolicy {
-    /// agents whose `AuthorRef::Agent` ref appears in the post's mentions.
-    Mention,
-    /// every active agent.
-    All,
-    /// exactly this agent.
-    Assigned(String),
-    /// the sorted active agents indexed by `anchor_seq % n`.
-    RoundRobin,
-}
-
-/// one channel watch — the agent-module-side mirror of the tagging-plane
-/// subscription it was registered with (the two are staged atomically, P2).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct WatchView {
-    pub channel_id: String,
-    pub policy: TurnPolicy,
-}
-
-// ---- pending runs ---------------------------------------------------------------
-
-/// one in-flight run's correlation entry: everything the module needs to act
-/// on the dispatch plane's eventual `ResultEvent` — and NOTHING more. this is
-/// not a lifecycle record: the entry exists exactly while the dispatch is
-/// outstanding and is pruned when the result delivers. status and outcome
-/// live in the dispatch module (`DispatchQuery::Dispatch`), keyed by
-/// `dispatch_id` under receiver "agent".
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct PendingRun {
-    /// `"chat\x1f{channel_id}\x1f{anchor_seq}\x1f{agent_id}"` for chat runs
-    /// and `"job\x1f{job_id}\x1f{agent_id}\x1f{job_claim_height}"` for job
-    /// runs — the turn-claim key; the first creation in consensus order wins.
-    pub run_id: String,
-    /// hex sha256 of `run_id` — the dispatch-plane id this entry correlates.
-    pub dispatch_id: String,
-    pub agent_id: String,
-    /// empty for job-backed runs.
-    pub channel_id: String,
-    /// 0 for job-backed runs.
-    pub anchor_seq: u64,
-    /// the anchor's thread root, if the anchor was a thread reply — the reply
-    /// posts into the same thread.
-    pub thread_root: Option<u64>,
-    /// present for jobs-board runs. chat-triggered runs leave this `None`.
-    pub job_id: Option<String>,
-    /// the jobs claim height a job-backed run is bound to; chat runs use 0.
-    pub job_claim_height: u64,
-    /// the run-creating origin (the tagging plane, or the explicit
-    /// `RequestRun` submitter) — a cancel capability alongside the owner.
-    pub requester: SagaOrigin,
-    pub created_at: u64,
-}
-
 // ---- the response wire spec ----------------------------------------------------
 
-/// one reply block in the module's OWN vocabulary — exactly the shape the
+/// one reply block in this surface's OWN vocabulary — exactly the shape the
 /// strict-output instruction asks the model for. `kind` is one of
 /// "Paragraph", "Heading", or "Code" (anything else drops in normalization);
-/// the agent module maps these to chat blocks at emission.
+/// the consuming module maps these to chat blocks at emission.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ReplyBlock {
     pub kind: String,
@@ -178,7 +127,7 @@ pub struct ReplyBlock {
 /// the formal agent response: reply blocks plus a bounded list of
 /// [`AgentAction`]s. lenient by construction — both fields default, unknown
 /// JSON fields are ignored — so a model answer either IS this shape or the
-/// module wraps it as one; validation (grants, caps, probes) is a separate,
+/// consumer wraps it as one; validation (grants, caps, probes) is a separate,
 /// strict step.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentResponse {
@@ -219,8 +168,9 @@ impl AgentAction {
 pub enum AgentMsg {
     /// register an agent under the submitter's origin (a non-empty external
     /// key or a module — the owner capability). a duplicate `agent_id` is an
-    /// error. registration also registers the agent's dispatch-plane recipe
-    /// (`agent/{agent_id}`) in the same block.
+    /// error. registration also notifies the configured hook target
+    /// ([`AgentEvent::Registered`]) in the same block, so the agent's
+    /// dispatch-plane recipe lands (or aborts) atomically with the record.
     RegisterAgent {
         agent_id: String,
         display_name: String,
@@ -231,7 +181,8 @@ pub enum AgentMsg {
     },
     /// owner-gated partial update; `None` fields keep their current value
     /// (clearing `prompt_doc` means re-registering). a capability change also
-    /// retunes the agent's dispatch-plane recipe in the same block.
+    /// notifies the hook target ([`AgentEvent::CapabilityChanged`]) in the
+    /// same block.
     UpdateAgent {
         agent_id: String,
         display_name: Option<String>,
@@ -244,30 +195,23 @@ pub enum AgentMsg {
     PauseAgent { agent_id: String },
     /// owner-gated: resume engagement.
     ResumeAgent { agent_id: String },
-    /// watch a channel under `policy` AND subscribe on the tagging plane —
-    /// one atomic block (P2), so the watch and the subscription cannot drift.
-    WatchChannel {
-        channel_id: String,
-        policy: TurnPolicy,
-    },
-    /// drop the watch and the plane subscription, atomically.
-    UnwatchChannel { channel_id: String },
-    /// opt the agent module into or out of jobs-board submit notifications.
-    /// the jobs module derives the worker id from this module's follow-up origin.
-    EnableJobWorker { enabled: bool },
-    /// explicitly run `agent_id` against `channel_id`/`anchor_seq` without an
-    /// engagement. the duplicate of a pending or already-dispatched turn is a
-    /// deterministic no-op — the turn claim: first in consensus order wins.
-    RequestRun {
-        agent_id: String,
-        channel_id: String,
-        anchor_seq: u64,
-    },
-    /// cancel a PENDING run — only the run-creating origin or the agent's
-    /// owner. cancels the underlying dispatch in the same block; the plane's
-    /// Err("cancelled") delivery then prunes the entry (and finalizes a
-    /// job-backed run's job) through the one result path.
-    CancelRun { run_id: String },
+}
+
+// ---- the registry hook ----------------------------------------------------------
+
+/// the registry's ONE follow-up shape, emitted to a genesis-configured hook
+/// target (the runs module) in the same block as the registry write that
+/// caused it. the hook keeps the agent's dispatch-plane recipe in lockstep:
+/// if the recipe registration is rejected (a squatted id), the whole block
+/// aborts and the staged registry write vanishes with it — the agent and its
+/// recipe stay ONE atomic unit without the registry referencing the dispatch
+/// plane.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum AgentEvent {
+    /// a new agent landed; the hook registers its recipe.
+    Registered { agent_id: String, capability: String },
+    /// an existing agent's capability changed; the hook retunes its recipe.
+    CapabilityChanged { agent_id: String, capability: String },
 }
 
 // ---- queries ------------------------------------------------------------------
@@ -276,18 +220,12 @@ pub enum AgentMsg {
 pub enum AgentQuery {
     Agents,
     Agent { agent_id: String },
-    /// every in-flight correlation entry, ascending by dispatch id. bounded:
-    /// entries prune on delivery, and every dispatch has a deadline.
-    PendingRuns,
-    Watches,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum AgentReply {
     Agents(Vec<AgentRecord>),
     Agent(Option<AgentRecord>),
-    PendingRuns(Vec<PendingRun>),
-    Watches(Vec<WatchView>),
 }
 
 // ---- codecs -------------------------------------------------------------------
@@ -296,6 +234,12 @@ pub fn encode_msg(m: &AgentMsg) -> Vec<u8> {
     serde_json::to_vec(m).expect("serializable")
 }
 pub fn decode_msg(b: &[u8]) -> Result<AgentMsg, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+pub fn encode_event(e: &AgentEvent) -> Vec<u8> {
+    serde_json::to_vec(e).expect("serializable")
+}
+pub fn decode_event(b: &[u8]) -> Result<AgentEvent, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }
 pub fn encode_response(r: &AgentResponse) -> Vec<u8> {

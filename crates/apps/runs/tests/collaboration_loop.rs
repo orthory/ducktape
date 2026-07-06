@@ -5,8 +5,8 @@
 //! the post (P2) → the mock worker answers the WorkerRequest effect as an
 //! ordinary oracle op → the saga's terminal transition and the dispatch
 //! module's contract-checked mailbox write commit in that op's block — and
-//! NOTHING reaches the agent yet (the never-pop-stack rule) → the NEXT block
-//! injects the delivery, and the agent's validated reply (authored as the
+//! NOTHING reaches the runs module yet (the never-pop-stack rule) → the NEXT block
+//! injects the delivery, and the runs module's validated reply (authored as the
 //! AGENT) plus the task action commit in that delivery block (pruning the
 //! pending entry — the dispatch module keeps the history) → a second
 //! composition replaying the identical op sequence lands on the
@@ -17,11 +17,16 @@
 //! claimed and dispatched in the submit cascade, and the delivery block
 //! finalizes the board item with the validated response.
 
-use agent::{AgentModule, dispatch_id_for, job_run_id_for, reply_message_id, run_id_for};
+use agent::AgentModule;
 use agent_interface::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentQuery, AgentReply,
-    AgentResponse, AgentStatus, PendingRun, ReplyBlock, TurnPolicy, decode_reply, encode_msg,
-    encode_query, encode_response,
+    AgentResponse, AgentStatus, ReplyBlock, decode_reply, encode_msg, encode_query,
+    encode_response,
+};
+use runs::{RunsModule, dispatch_id_for, job_run_id_for, reply_message_id, run_id_for};
+use runs_interface::{
+    PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
+    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use chat::Chat;
 use chat_interface::{
@@ -116,7 +121,7 @@ fn as_user(byte: u8, height: u64) -> BlockContext {
 
 fn quackbot_ref() -> AuthorRef {
     AuthorRef::Agent {
-        module: "agent".into(),
+        module: "runs".into(),
         agent_id: "quackbot".into(),
     }
 }
@@ -173,8 +178,8 @@ fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
             3,
             alice(),
             Msg {
-                target: "agent".into(),
-                payload: encode_msg(&AgentMsg::WatchChannel {
+                target: "runs".into(),
+                payload: runs_encode_msg(&RunsMsg::WatchChannel {
                     channel_id: "general".into(),
                     policy: TurnPolicy::Mention,
                 }),
@@ -211,12 +216,14 @@ async fn genesis(context: deterministic::Context) -> Host {
         Box::new(TaggingModule::new("tagging")),
         Box::new(SagaModule::new("saga")),
         Box::new(DispatchModule::new("dispatch", "saga")),
-        Box::new(AgentModule::new(
-            "agent",
+        Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
+        Box::new(RunsModule::new(
+            "runs",
             "chat",
             "saga",
             "tagging",
             "dispatch",
+            "agent",
             Some("tasks".into()),
             Some("jobs".into()),
             None,
@@ -229,11 +236,11 @@ async fn genesis(context: deterministic::Context) -> Host {
 
 async fn pending_runs(host: &Host) -> Vec<PendingRun> {
     let reply = host
-        .query("agent", &encode_query(&AgentQuery::PendingRuns))
+        .query("runs", &runs_encode_query(&RunsQuery::PendingRuns))
         .await
         .unwrap();
-    match decode_reply(&reply).unwrap() {
-        AgentReply::PendingRuns(runs) => runs,
+    match runs_decode_reply(&reply).unwrap() {
+        RunsReply::PendingRuns(runs) => runs,
         other => panic!("unexpected reply: {other:?}"),
     }
 }
@@ -268,7 +275,7 @@ async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch_interface::Dispat
         .query(
             "dispatch",
             &dispatch_encode_query(&DispatchQuery::Dispatch {
-                receiver: "agent".into(),
+                receiver: "runs".into(),
                 dispatch_id: dispatch_id_for(run_id),
             }),
         )
@@ -339,8 +346,8 @@ fn jobs_msg(payload: JobsMsg) -> Msg {
 
 fn enable_job_worker() -> Msg {
     Msg {
-        target: "agent".into(),
-        payload: encode_msg(&AgentMsg::EnableJobWorker { enabled: true }),
+        target: "runs".into(),
+        payload: runs_encode_msg(&RunsMsg::EnableJobWorker { enabled: true }),
     }
 }
 
@@ -461,7 +468,7 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
 
         // block 5: the worker's oracle op. the saga settles, the dispatch
         // module judges the Text contract and commits the outcome into its
-        // MAILBOX — and the agent sees NOTHING this block (never pop-stack).
+        // MAILBOX — and the runs module sees NOTHING this block (never pop-stack).
         let oracle_op = oracle_op_for(&outcome.effects[0], canned_response(&run_id));
         host.submit_at(
             at(5, Origin::External(b"oracle".to_vec())),
@@ -576,7 +583,7 @@ fn an_agent_job_is_claimed_and_dispatched_in_the_submit_cascade() {
         let mut host = genesis(context).await;
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
-            .expect("enable the agent module as the single jobs worker");
+            .expect("enable the runs module as the single jobs worker");
         host.submit_at(as_user(1, 2), register_duck())
             .await
             .expect("register duck");
@@ -591,7 +598,7 @@ fn an_agent_job_is_claimed_and_dispatched_in_the_submit_cascade() {
         assert_eq!(job.status, JobStatus::Processing);
         assert_eq!(
             job.claim.as_ref().map(|claim| claim.worker.as_str()),
-            Some("agent")
+            Some("runs")
         );
 
         let run_id = job_run_id_for("job-1", "duck", 3);
@@ -617,7 +624,7 @@ fn an_agent_job_for_an_unknown_agent_commits_without_a_claim() {
         let mut host = genesis(context).await;
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
-            .expect("enable the agent module as the jobs worker");
+            .expect("enable the runs module as the jobs worker");
 
         host.submit_at(as_user(2, 2), submit_job("job-ghost", "ghost", "spec"))
             .await
@@ -639,7 +646,7 @@ fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_response() {
         let mut host = genesis(context).await;
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
-            .expect("enable the agent module as the jobs worker");
+            .expect("enable the runs module as the jobs worker");
         host.submit_at(as_user(1, 2), register_duck())
             .await
             .expect("register duck");
@@ -750,9 +757,9 @@ fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
         host.submit_at(as_user(9, 1004), reclaim_job("lease"))
             .await
             .expect("lease expiry requeues the job");
-        host.submit_at(at(1005, Origin::Module("agent".into())), claim_job("lease"))
+        host.submit_at(at(1005, Origin::Module("runs".into())), claim_job("lease"))
             .await
-            .expect("agent reclaims a new episode");
+            .expect("the runs module reclaims a new episode");
 
         oracle_result(
             &mut host,
@@ -786,7 +793,7 @@ fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
         let mut host = genesis(context).await;
         host.submit_at(as_user(1, 1), enable_job_worker())
             .await
-            .expect("enable the agent module as the jobs worker");
+            .expect("enable the runs module as the jobs worker");
         host.submit_at(as_user(1, 2), register_duck())
             .await
             .expect("register duck");
