@@ -34,7 +34,7 @@ import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
-import { hasFreshPending } from "./finalization";
+import { hasFreshPending, pageSnapshotSuperseded } from "./finalization";
 import {
   HUDDLE_CLOSED_EVENT,
   HUDDLE_CMD_EVENT,
@@ -94,7 +94,10 @@ export function DucktapeProvider({
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
     // the pages (docs) slice refreshes by enumeration + the open page's tree.
-    const activePage = stateRef.current.activePage;
+    const fetchedPage = stateRef.current.activePage;
+    // ops submitted at or after this instant cannot be in the snapshot the
+    // queries below return — pageSnapshotSuperseded keys off it at apply time.
+    const fetchStartedAt = Date.now();
     return Promise.resolve()
       .then(() =>
         Promise.all([
@@ -116,9 +119,9 @@ export function DucktapeProvider({
           // best-effort, so a node without it reads as "no docs", never a
           // failed refresh.
           pagesClient.listPages(live).catch((): PageMeta[] => []),
-          activePage
+          fetchedPage
             ? pagesClient
-                .getPage(live, activePage)
+                .getPage(live, fetchedPage)
                 .catch((): PageBlock[] | null => null)
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
@@ -177,6 +180,18 @@ export function DucktapeProvider({
           current && channels.some((c) => c.id === current)
             ? current
             : (channels[0]?.id ?? null);
+        // A pages snapshot that predates a page op must not be applied: it
+        // would clobber the op's preconfirmed projection — an optimistically
+        // inserted block unmounts (dropping the focused textarea with it) and
+        // just-committed text reverts until the op finalizes. The block
+        // stream's hasFreshPending gate covers stream refreshes; this covers
+        // the completion refresh of an EARLIER op that settles while a later
+        // one is still in flight, and a snapshot raced by an op submitted
+        // mid-fetch. A snapshot for a page we've since navigated away from is
+        // equally stale. Held slices converge on the last op's own refresh.
+        const holdPages =
+          stateRef.current.activePage !== fetchedPage ||
+          pageSnapshotSuperseded(stateRef.current.ops, fetchStartedAt, Date.now());
         // reconcile doc tabs against the live enumeration: a tab whose page no
         // longer exists (deleted here or elsewhere) drops, and a now-dead
         // active page falls back to the first surviving tab. CRITICAL: only
@@ -184,11 +199,13 @@ export function DucktapeProvider({
         // best-effort (`.catch(() => [])`), and an empty result may be a
         // transient failure (node busy, module absent). Evicting open tabs on
         // that would blank the editor mid-edit, so an empty result is a no-op.
+        // A held (superseded) enumeration is equally untrustworthy for
+        // eviction, so it is a no-op too.
         const prevTabs = stateRef.current.openTabs;
         const prevActive = stateRef.current.activePage;
         let openTabs = prevTabs;
         let activePage = prevActive;
-        if (pages.length > 0) {
+        if (!holdPages && pages.length > 0) {
           const liveIds = new Set(pages.map((p) => p.id));
           openTabs = prevTabs.filter((id) => liveIds.has(id));
           if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
@@ -228,8 +245,10 @@ export function DucktapeProvider({
                 activeChannel: active,
                 messages,
                 authorNames,
-                pages,
-                activePageBlocks: pageBlocks ?? [],
+                pages: holdPages ? stateRef.current.pages : pages,
+                activePageBlocks: holdPages
+                  ? stateRef.current.activePageBlocks
+                  : (pageBlocks ?? []),
                 agents,
                 capabilities,
                 capabilitiesByNode,

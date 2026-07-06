@@ -1,11 +1,11 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { PageBlock } from "../../../domain/pages-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
-import { PagesView } from "./PagesView";
+import { EDIT_BOUNDARY_MS, PagesView } from "./PagesView";
 
 const makeActions = () => {
   const spies: Record<string, (...args: unknown[]) => void> = {};
@@ -38,7 +38,7 @@ const PAGE: PageBlock[] = [
 ];
 
 const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
-  const state = {
+  const stateOf = (p: Partial<ConsoleState>) => ({
     ...createInitialState(),
     pages: [
       { id: "p1", title: "Launch plan", parent: null },
@@ -46,15 +46,16 @@ const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
     ],
     activePage: "p1",
     activePageBlocks: PAGE,
-    ...patch,
-  };
+    ...p,
+  });
   const { actions, spies } = makeActions();
-  render(
-    <ConsoleContext.Provider value={{ state, actions }}>
+  const view = (p: Partial<ConsoleState>) => (
+    <ConsoleContext.Provider value={{ state: stateOf(p), actions }}>
       <PagesView />
-    </ConsoleContext.Provider>,
+    </ConsoleContext.Provider>
   );
-  return { spies };
+  const { rerender } = render(view(patch));
+  return { spies, rerender: (p: Partial<ConsoleState>) => rerender(view(p)) };
 };
 
 describe("PagesView", () => {
@@ -160,6 +161,102 @@ describe("PagesView", () => {
       key: "Backspace",
     });
     expect(spies.removePageBlock).toHaveBeenCalledWith("empty");
+  });
+});
+
+describe("edit boundaries & draft protection", () => {
+  it("a typing pause commits one update op without leaving the block", () => {
+    vi.useFakeTimers();
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1");
+    fireEvent.focus(area);
+    fireEvent.change(area, { target: { value: "First draft, extended" } });
+
+    // no boundary yet: mid-typing must not flow an op per keystroke. (spies
+    // materialize lazily on first action call, so absence == never called.)
+    if (spies.updatePageBlockText) {
+      expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+    }
+    act(() => {
+      vi.advanceTimersByTime(EDIT_BOUNDARY_MS);
+    });
+    expect(spies.updatePageBlockText).toHaveBeenCalledTimes(1);
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "a",
+      text: "First draft, extended",
+    });
+    vi.useRealTimers();
+  });
+
+  it("an open slash menu is a command in progress — no boundary commit", () => {
+    vi.useFakeTimers();
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1");
+    fireEvent.focus(area);
+    fireEvent.change(area, { target: { value: "/head" } });
+    act(() => {
+      vi.advanceTimersByTime(EDIT_BOUNDARY_MS * 2);
+    });
+    // lazily-materialized spy: absent means the action was never reached.
+    if (spies.updatePageBlockText) {
+      expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+    }
+    vi.useRealTimers();
+  });
+
+  it("a snapshot landing mid-edit never clobbers the focused draft", () => {
+    const { spies, rerender } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1");
+    fireEvent.focus(area);
+    fireEvent.change(area, { target: { value: "my live draft" } });
+
+    // an earlier op's completion refresh lands a snapshot that predates the
+    // edit — the focused block keeps its draft.
+    rerender({
+      activePageBlocks: PAGE.map((b) =>
+        b.id === "a" ? { ...b, text: "stale committed" } : b,
+      ),
+    });
+    expect(area).toHaveValue("my live draft");
+
+    // blur commits the draft as usual…
+    fireEvent.blur(area);
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "a",
+      text: "my live draft",
+    });
+
+    // …and once unfocused, committed truth is adopted again.
+    rerender({
+      activePageBlocks: PAGE.map((b) =>
+        b.id === "a" ? { ...b, text: "peer edit" } : b,
+      ),
+    });
+    expect(area).toHaveValue("peer edit");
+  });
+
+  it("the title shares the contract: focused draft survives, page switch resets", () => {
+    const { rerender } = renderPagesView();
+    const title = screen.getByLabelText("Page title");
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "Launch plan v2" } });
+
+    rerender({
+      activePageBlocks: PAGE.map((b) =>
+        b.id === "p1" ? { ...b, text: "Launch plan" } : b,
+      ),
+    });
+    expect(title).toHaveValue("Launch plan v2");
+
+    // switching pages resets the draft even while the input is focused — a
+    // draft never crosses pages.
+    rerender({
+      activePage: "p2",
+      activePageBlocks: [
+        blockOf({ id: "p2", parent: null, page: "p2", kind: "page", text: "Retro", children: [] }),
+      ],
+    });
+    expect(screen.getByLabelText("Page title")).toHaveValue("Retro");
   });
 });
 

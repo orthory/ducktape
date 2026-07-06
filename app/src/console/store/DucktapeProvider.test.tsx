@@ -5,6 +5,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { BlockEvent, NodeTransport, SubmitReceipt } from "../../domain/transport";
+import type { BlockKind, PageBlock } from "../../domain/pages-client";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
@@ -468,6 +469,155 @@ describe("submitTracked lifecycle", () => {
       expect(screen.getByTestId("messages").textContent).toBe("1");
       expect(capturedState!.ops[key].phase).toBe("failed");
       expect(capturedState!.ops[key].error).toContain("members-only");
+    });
+  });
+});
+
+// ── Pages: snapshots vs in-flight ops ───────────────────
+
+describe("pages snapshot refresh vs in-flight ops", () => {
+  // The Enter-key shape: op1 commits block A's text, op2 inserts block B —
+  // both preconfirmed, both awaiting finalization. op1 settles a block
+  // earlier, and its completion refresh re-queries a snapshot that reflects
+  // op1 but NOT the still-pending op2. That stale snapshot must not replace
+  // the pages slices: block B's row (and the focused textarea inside it)
+  // would unmount, and the text projection would revert until op2 finalizes.
+  it("holds the pages slices while a later page op is still in flight", async () => {
+    const { transport } = makeFakeNode();
+
+    // committed pages state — mutated ONLY when a held submit settles, the
+    // same visibility contract as the real node (submit resolves at
+    // finalization, queries reflect settled ops immediately after).
+    const pageBlock = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
+      parent: "p1",
+      page: "p1",
+      kind: "paragraph",
+      text: "",
+      checked: false,
+      children: [],
+      ...patch,
+    });
+    let committed = [
+      pageBlock({ id: "p1", parent: null, kind: "page", text: "Plan", children: ["a"] }),
+      pageBlock({ id: "a", text: "draft" }),
+    ];
+    let committedHeight = 1;
+    const held: Array<{
+      payload: {
+        update_text?: { block_id: string; text: string };
+        insert_block?: {
+          parent: string;
+          after: string | null;
+          block: { id: string; kind: BlockKind; text: string };
+        };
+      };
+      resolve: (receipt: SubmitReceipt) => void;
+    }> = [];
+    const settleNext = () => {
+      const next = held.shift()!;
+      const update = next.payload.update_text;
+      const insert = next.payload.insert_block;
+      if (update) {
+        committed = committed.map((b) =>
+          b.id === update.block_id ? { ...b, text: update.text } : b,
+        );
+      }
+      if (insert) {
+        committed = committed
+          .map((b) =>
+            b.id === insert.parent
+              ? { ...b, children: [...b.children, insert.block.id] }
+              : b,
+          )
+          .concat([
+            pageBlock({
+              id: insert.block.id,
+              parent: insert.parent,
+              kind: insert.block.kind,
+              text: insert.block.text,
+            }),
+          ]);
+      }
+      committedHeight += 1;
+      next.resolve({ height: committedHeight, appHash: "dd".repeat(32) });
+    };
+
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (target !== "pages") return baseQuery(target, query);
+      if (query === "list_pages") {
+        return Promise.resolve({
+          page_list: [{ id: "p1", title: committed[0].text, parent: null }],
+        });
+      }
+      if ((query as { get_page?: unknown }).get_page) {
+        return Promise.resolve({ page: [...committed] });
+      }
+      return Promise.resolve({ comment_threads: [] });
+    });
+    const baseSubmit = vi.mocked(transport.submit).getMockImplementation()!;
+    vi.mocked(transport.submit).mockImplementation((target, payload, origin) => {
+      if (target !== "pages") return baseSubmit(target, payload, origin);
+      return new Promise((resolve) =>
+        held.push({ payload: payload as (typeof held)[number]["payload"], resolve }),
+      );
+    });
+    // a FRESH ring array per pull (the shared mock reuses one instance), so a
+    // state.blocks identity change marks "a refresh snapshot fully applied".
+    vi.mocked(transport.blocks).mockImplementation(() => Promise.resolve([]));
+
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+    await act(async () => {
+      capturedActions!.openPage("p1");
+    });
+    await waitFor(() =>
+      expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a"]),
+    );
+
+    // op1: commit A's text; op2: insert B after it — the Enter keystroke.
+    await act(async () => {
+      capturedActions!.updatePageBlockText({ blockId: "a", text: "hello world" });
+    });
+    await act(async () => {
+      capturedActions!.insertPageBlock({
+        blockId: "b",
+        parent: "p1",
+        after: "a",
+        kind: "paragraph",
+        text: "",
+      });
+    });
+    expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a", "b"]);
+
+    // settle op1 alone; wait for its completion refresh to fully land (the
+    // blocks ring is re-fetched as a fresh array every refresh, so identity
+    // change marks the snapshot application).
+    const blocksBefore = capturedState!.blocks;
+    await act(async () => {
+      settleNext();
+    });
+    await waitFor(() => {
+      expect(capturedState!.ops["page-block/a"].phase).toBe("finalized");
+      expect(capturedState!.blocks).not.toBe(blocksBefore);
+    });
+
+    // the stale snapshot (no block B) must NOT have clobbered op2's
+    // projection: B stays, and A keeps its committed text.
+    expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a", "b"]);
+    expect(capturedState!.activePageBlocks[1].text).toBe("hello world");
+
+    // op2 settles: committed truth now carries both ops and replaces the
+    // projections on its completion refresh.
+    await act(async () => {
+      settleNext();
+    });
+    await waitFor(() => {
+      expect(capturedState!.ops["page-block/b"].phase).toBe("finalized");
+      expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a", "b"]);
+      expect(capturedState!.activePageBlocks[1].text).toBe("hello world");
     });
   });
 });
