@@ -64,7 +64,6 @@ use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use tagging::TaggingModule;
-use document::Document;
 use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
@@ -90,7 +89,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
@@ -101,7 +100,6 @@ const MODULE_IDS: [&str; 16] = [
     "jobs",
     "agent",
     "runs",
-    "document",
     "pages",
     "forge",
     "files",
@@ -257,7 +255,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store
                     .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
                     .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(document::index::DocumentIndex::new("document")))
                     .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
             )
         })
@@ -391,9 +388,7 @@ fn run_sim(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            Some("document".into()),
         );
-        let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
         let files = Files::with_blobs("files", blobs.clone());
@@ -410,7 +405,6 @@ fn run_sim(
             Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
-            Box::new(document),
             Box::new(pages),
             Box::new(forge),
             Box::new(files),

@@ -5,7 +5,7 @@
 #   crates/kernel/   — the platform: sdk (interface), state (app-hash), host
 #                      (dispatch), node (transport seam), consensus (BFT orderer)
 #   crates/system/   — consensus infrastructure modules (kv, valset)
-#   crates/apps/     — product feature modules (forge; future document, chat, tasks)
+#   crates/apps/     — product feature modules (forge, chat, tasks, pages, …)
 #   crates/examples/ — demo + test scaffolding modules (directory, greeter)
 #   bin/             — runnable binaries (in-process demo, real-socket node)
 # the host dispatches modules over BFT consensus and composes each authenticated
@@ -36,9 +36,8 @@ members = [
     "crates/system/dispatch-oracle",
     "crates/system/tagging", 
     # apps — product feature modules
-    "crates/apps/forge", 
-    "crates/apps/document", 
-    "crates/apps/pages", 
+    "crates/apps/forge",
+    "crates/apps/pages",
     "crates/apps/chat",
     "crates/apps/agent",
     "crates/apps/runs", 
@@ -124,7 +123,6 @@ dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
 forge = { path = "crates/apps/forge" }
-document = { path = "crates/apps/document" }
 pages = { path = "crates/apps/pages" }
 chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }

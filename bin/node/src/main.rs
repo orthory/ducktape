@@ -89,7 +89,6 @@ use capability::CapabilityRegistry;
 use chat::Chat;
 use directory::Directory;
 use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
-use document::Document;
 use files::Files;
 use forge::Forge;
 use governance::Governance;
@@ -201,9 +200,8 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 23] = [
+const MODULE_IDS: [&str; 22] = [
     "kv",
-    "document",
     "pages",
     "chat",
     "forge",
@@ -617,7 +615,6 @@ async fn genesis_host(
     blobs: files::BlobHandle,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
     let chat = Chat::init(context.child("chat"), "chat")
         .await
@@ -635,7 +632,6 @@ async fn genesis_host(
     }
     Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
@@ -696,7 +692,6 @@ async fn genesis_host(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            Some("document".into()),
         )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -723,7 +718,6 @@ async fn restore_host(
     blobs: files::BlobHandle,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
     let chat = Chat::init(context.child("chat"), "chat")
         .await
@@ -845,7 +839,6 @@ async fn restore_host(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-        Some("document".into()),
     );
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
@@ -865,7 +858,6 @@ async fn restore_host(
 
     Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
@@ -949,15 +941,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let kv = Kv::sync_from(
         scratch_context.child(child_label("kv")),
         "kv",
-        target,
-        resolver,
-    )
-    .await?;
-
-    let (target, resolver) = fetch_target("document").await?;
-    let document = Document::sync_from(
-        scratch_context.child(child_label("document")),
-        "document",
         target,
         resolver,
     )
@@ -1101,7 +1084,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-        Some("document".into()),
     );
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -1132,7 +1114,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     // composes a different app-hash and the join fails its final check.
     let host = Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),

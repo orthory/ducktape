@@ -11,10 +11,10 @@
 //     owner from the block's origin, so every write function takes an
 //     `origin` and passes it to transport.submit, exactly like chat-client.
 //   - prompt CONTENT lives off-registry: RegisterAgent/UpdateAgent commit a
-//     32-byte `prompt_hash` pin plus an optional `prompt_doc` — a document
-//     module doc id whose canonical rendering (block texts joined by blank
-//     lines) must hash to the pin. every run composes its prompt in-consensus
-//     from that doc.
+//     32-byte `prompt_hash` pin — the sha256 of the prompt text. the content
+//     itself is content-addressed in the node's blob store (keyed by that
+//     digest), so every run composes its prompt from the blob the pin resolves
+//     to.
 //
 // Everything is a pure function over an injected NodeTransport.
 
@@ -36,11 +36,9 @@ export interface AgentRecord {
   owner: SagaOrigin;
   display_name: string;
   capability: string;
-  /** sha256 of the agent's prompt content — exactly 32 bytes. */
+  /** sha256 of the agent's prompt content — exactly 32 bytes. The content is
+   *  content-addressed in the node's blob store under this digest. */
   prompt_hash: number[];
-  /** The document module doc holding the prompt content, when the prompt is
-   *  consensus-resident; its canonical rendering must hash to `prompt_hash`. */
-  prompt_doc: string | null;
   /** Granted action names, each from `KNOWN_ACTIONS`; sorted and deduped. */
   allowed_actions: string[];
   status: AgentStatus;
@@ -78,8 +76,6 @@ export const registerAgent = (
     capability: string;
     /** Exactly 32 bytes — see hexToBytes / the prompt-upload flow. */
     promptHash: number[];
-    /** Document module doc id holding the prompt content, when set. */
-    promptDoc?: string | null;
     allowedActions: string[];
     origin: string;
   },
@@ -92,7 +88,6 @@ export const registerAgent = (
         display_name: params.displayName,
         capability: params.capability,
         prompt_hash: params.promptHash,
-        prompt_doc: params.promptDoc ?? null,
         allowed_actions: params.allowedActions,
       },
     },
@@ -107,7 +102,6 @@ export const updateAgent = (
     displayName?: string | null;
     capability?: string | null;
     promptHash?: number[] | null;
-    promptDoc?: string | null;
     allowedActions?: string[] | null;
     origin: string;
   },
@@ -120,7 +114,6 @@ export const updateAgent = (
         display_name: params.displayName ?? null,
         capability: params.capability ?? null,
         prompt_hash: params.promptHash ?? null,
-        prompt_doc: params.promptDoc ?? null,
         allowed_actions: params.allowedActions ?? null,
       },
     },
