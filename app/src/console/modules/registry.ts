@@ -4,7 +4,6 @@
 import { AgentView } from "../views/agent/AgentView";
 import { AutomationsView } from "../views/automations/AutomationsView";
 import { ChatView } from "../views/chat/ChatView";
-import { DocumentView } from "../views/document/DocumentView";
 import { ExplorerView } from "../views/explorer/ExplorerView";
 import { FilesView } from "../views/files/FilesView";
 import { ForgeView } from "../views/forge/ForgeView";
@@ -29,8 +28,7 @@ export const MODULES: AppModule[] = [
   // ── User apps ──
   { id: "search", nav: { icon: "search", label: "Search", order: -1, section: "user" }, Screen: SearchView },
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
-  { id: "document", nav: { icon: "document", label: "Docs", order: 3, section: "user" }, Screen: DocumentView },
-  { id: "pages", nav: { icon: "pages", label: "Pages", order: 4, section: "user" }, Screen: PagesView },
+  { id: "pages", nav: { icon: "document", label: "Docs", order: 3, section: "user" }, Screen: PagesView },
   { id: "files", nav: { icon: "files", label: "Files", order: 5, section: "user" }, Screen: FilesView },
   { id: "memory", nav: { icon: "memory", label: "Memory", order: 6, section: "user" }, Screen: MemoryView },
   { id: "forge", nav: { icon: "forge", label: "Forge", order: 7, section: "user" }, Screen: ForgeView },

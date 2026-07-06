@@ -10,7 +10,6 @@
 
 import type { ChatBlock, MessageView } from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import type { Block } from "../../domain/document-client";
 import type { Job } from "../../domain/jobs-client";
 import type { LsEntry, Meta } from "../../domain/memory-client";
 import type { PageBlock } from "../../domain/pages-client";
@@ -172,59 +171,6 @@ export const channelCreated = (
           },
         ],
       };
-
-// ── Documents ───────────────────────────────────────────
-
-export const docCreated = (
-  prev: ConsoleState,
-  docId: string,
-): Partial<ConsoleState> =>
-  prev.docIds.includes(docId) ? {} : { docIds: [...prev.docIds, docId].sort() };
-
-/** `after` rule (InsertBlock/MoveBlock): null == front, an id == right after
- *  that block. An unknown anchor appends — the refresh corrects it. */
-const docInsertIndex = (blocks: Block[], after: string | null): number => {
-  if (after === null) return 0;
-  const at = blocks.findIndex((b) => b.id === after);
-  return at === -1 ? blocks.length : at + 1;
-};
-
-export const docBlockInserted = (
-  prev: ConsoleState,
-  params: { after: string | null; block: Block },
-): Partial<ConsoleState> => {
-  const blocks = [...prev.activeDocBlocks];
-  blocks.splice(docInsertIndex(blocks, params.after), 0, params.block);
-  return { activeDocBlocks: blocks };
-};
-
-export const docBlockUpdated = (
-  prev: ConsoleState,
-  blockId: string,
-  text: string,
-): Partial<ConsoleState> => ({
-  activeDocBlocks: prev.activeDocBlocks.map((b) =>
-    b.id === blockId ? { ...b, text } : b,
-  ),
-});
-
-export const docBlockRemoved = (
-  prev: ConsoleState,
-  blockId: string,
-): Partial<ConsoleState> => ({
-  activeDocBlocks: prev.activeDocBlocks.filter((b) => b.id !== blockId),
-});
-
-export const docBlockMoved = (
-  prev: ConsoleState,
-  params: { blockId: string; after: string | null },
-): Partial<ConsoleState> => {
-  const moving = prev.activeDocBlocks.find((b) => b.id === params.blockId);
-  if (!moving) return {};
-  const rest = prev.activeDocBlocks.filter((b) => b.id !== params.blockId);
-  rest.splice(docInsertIndex(rest, params.after), 0, moving);
-  return { activeDocBlocks: rest };
-};
 
 // ── Pages ───────────────────────────────────────────────
 

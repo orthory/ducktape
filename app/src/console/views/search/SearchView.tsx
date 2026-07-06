@@ -1,17 +1,17 @@
 // Cross-module search over the node's derived-index views: one text fans out
-// to the materialized views of chat, docs, and pages (each module's own
-// /v1/index/{module}/view endpoint) and the hits come back grouped, newest
-// first. Canonical state cannot serve this shape — hashed-key qmdb has no
-// scans — which is exactly why the derived tier exists.
+// to the materialized views of chat and docs (the `pages` module — the
+// console's docs surface), each its own /v1/index/{module}/view endpoint, and
+// the hits come back grouped, newest first. Canonical state cannot serve this
+// shape — hashed-key qmdb has no scans — which is exactly why the derived tier
+// exists.
 //
-// Click-through hands off to the owning module's surface: a chat hit opens
-// its channel, a doc hit opens the doc, a page hit opens the page.
+// Click-through hands off to the owning module's surface: a chat hit opens its
+// channel, a doc hit opens the page.
 
 import { useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type { ChatSearchHit } from "../../../domain/chat-client";
-import type { DocSearchHit } from "../../../domain/document-client";
 import type { PageSearchHit } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
@@ -75,16 +75,7 @@ function ChatHit({ hit, onOpen }: { hit: ChatSearchHit; onOpen: () => void }) {
   );
 }
 
-function DocHit({ hit, onOpen }: { hit: DocSearchHit; onOpen: () => void }) {
-  return (
-    <button type="button" style={hitRow} onClick={onOpen}>
-      <span style={hitMeta}>{hit.docId} · {hit.kind}</span>
-      <span>{hit.text}</span>
-    </button>
-  );
-}
-
-function PageHit({ hit, onOpen }: { hit: PageSearchHit; onOpen: () => void }) {
+function DocHit({ hit, onOpen }: { hit: PageSearchHit; onOpen: () => void }) {
   return (
     <button type="button" style={hitRow} onClick={onOpen}>
       <span style={hitMeta}>{hit.pageId} · {hit.kind}</span>
@@ -105,9 +96,7 @@ export function SearchView() {
     actions.runSearch(text);
   };
 
-  const total = results
-    ? results.chat.length + results.docs.length + results.pages.length
-    : 0;
+  const total = results ? results.chat.length + results.docs.length : 0;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18, padding: 24, maxWidth: 760 }}>
@@ -117,7 +106,7 @@ export function SearchView() {
           style={searchInput}
           value={text}
           autoFocus
-          placeholder="Search chat, docs, and pages…"
+          placeholder="Search chat and docs…"
           onChange={(event) => setText(event.target.value)}
         />
       </form>
@@ -151,20 +140,6 @@ export function SearchView() {
             <Group title="Docs" count={results.docs.length}>
               {results.docs.map((hit) => (
                 <DocHit
-                  key={`${hit.docId}/${hit.blockId}`}
-                  hit={hit}
-                  onOpen={() => {
-                    actions.openDoc(hit.docId);
-                    actions.setScreen("document");
-                  }}
-                />
-              ))}
-            </Group>
-          )}
-          {results.pages.length > 0 && (
-            <Group title="Pages" count={results.pages.length}>
-              {results.pages.map((hit) => (
-                <PageHit
                   key={hit.blockId}
                   hit={hit}
                   onOpen={() => {

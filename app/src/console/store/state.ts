@@ -12,7 +12,6 @@ import type {
   ChatThread,
   MessageView,
 } from "../../domain/chat-client";
-import type { Block, DocSearchHit } from "../../domain/document-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type { BoardCounts, Job } from "../../domain/jobs-client";
@@ -33,12 +32,12 @@ import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 export type ViewMode = "user" | "operator";
 
 /** One search round-trip across the modules that ship materialized views —
- *  chat, docs, and pages searched with the same text, results grouped. */
+ *  chat and docs (the `pages` module) searched with the same text, grouped.
+ *  `docs` holds the page-block hits — pages is the console's docs surface. */
 export interface SearchResults {
   query: string;
   chat: ChatSearchHit[];
-  docs: DocSearchHit[];
-  pages: PageSearchHit[];
+  docs: PageSearchHit[];
 }
 
 // ── State shape ─────────────────────────────────────────
@@ -86,17 +85,7 @@ export interface ConsoleState {
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
 
-  // ── Documents ──
-  /** Every known doc id, enumerated from the document module's index
-   *  (ListDocs) and re-queried per block. These are "/"-delimited PATHS; the
-   *  view derives a folder tree from them. */
-  docIds: string[];
-  /** The doc whose blocks are loaded, or null when none is open. */
-  activeDoc: string | null;
-  /** Ordered blocks of the active doc (re-queried per block / on open). */
-  activeDocBlocks: Block[];
-
-  // ── Pages (block-tree notebook over the `pages` module) ──
+  // ── Docs (block-tree notebook over the `pages` module) ──
   /** Every page (id + live title), from ListPages, re-queried per block.
    *  Empty when the node predates the pages module. */
   pages: PageMeta[];
@@ -272,9 +261,6 @@ export const createInitialState = (): ConsoleState => {
     observers: [],
     proposals: [],
     forgeHead: null,
-    docIds: [],
-    activeDoc: null,
-    activeDocBlocks: [],
     pages: [],
     activePage: null,
     activePageBlocks: [],
@@ -317,8 +303,6 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
-  docIds: string[];
-  activeDocBlocks: Block[];
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
@@ -333,8 +317,7 @@ export interface ConsoleSnapshot {
 }
 
 /** Project a committed node snapshot onto store data fields. Global UI,
- *  workspace/onboarding, and error state are intentionally left untouched.
- *  `docIds` now comes from the node's enumeration index, so it IS projected. */
+ *  workspace/onboarding, and error state are intentionally left untouched. */
 export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> => ({
   connected: snapshot.connected,
   status: snapshot.status,
@@ -346,8 +329,6 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
-  docIds: snapshot.docIds,
-  activeDocBlocks: snapshot.activeDocBlocks,
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
@@ -371,20 +352,3 @@ export const channelIdOf = (name: string): string =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
 
-/** A doc id from user input: a "/"-delimited PATH where each segment is slugged
- *  (lowercase, dash-separated, wire-safe) and empty segments are dropped. So
- *  "Projects / Launch Plan" and "projects/launch-plan" name the same document,
- *  and the leading/trailing slashes never survive. Path structure is what the
- *  view turns into a folder tree. */
-export const docIdOf = (raw: string): string =>
-  raw
-    .toLowerCase()
-    .split("/")
-    .map((segment) =>
-      segment
-        .trim()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/(^-|-$)/g, ""),
-    )
-    .filter((segment) => segment.length > 0)
-    .join("/");

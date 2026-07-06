@@ -5,8 +5,6 @@ import * as automationsClient from "../../domain/automations-client";
 import type { Action as RuleAction, Trigger } from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import * as documentClient from "../../domain/document-client";
-import type { BlockKind } from "../../domain/document-client";
 import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
@@ -34,7 +32,6 @@ import * as optimistic from "./optimistic";
 import {
   channelIdOf,
   clearRemoteUrl,
-  docIdOf,
   saveRemoteUrl,
   saveViewMode,
 } from "./state";
@@ -87,30 +84,12 @@ export interface ConsoleActions {
   toggleReaction(seq: number, emoji: string): void;
   commitForge(params: { path: string; content: string; message: string }): void;
 
-  // ── Documents (block store over the `document` module) ──
-  /** Re-query the module's enumeration index into `state.docIds` (the tree). */
-  listDocs(): void;
-  /** Create a doc at a "/"-delimited path (CreateDoc, idempotent) and open it.
-   *  The refresh after the write re-enumerates the index, so the new path
-   *  appears in the tree. */
-  createDoc(docId: string): void;
-  /** Open a doc by path, loading its blocks (like selectChannel). */
-  openDoc(docId: string): void;
-  /** Append/insert a fresh block into the active doc (id generated here). */
-  insertBlock(params: { after: string | null; kind: BlockKind; text: string }): void;
-  /** Replace a block's text in the active doc. */
-  updateBlock(params: { blockId: string; text: string }): void;
-  /** Remove a block from the active doc. */
-  removeBlock(blockId: string): void;
-  /** Move a block within the active doc (see the `after` rule). */
-  moveBlock(params: { blockId: string; after: string | null }): void;
-
-  // ── Pages (block-tree notebook over the `pages` module) ──
+  // ── Docs (block-tree notebook over the `pages` module) ──
   /** Re-query the page enumeration into `state.pages`. */
   listPages(): void;
   /** Create a page (root block id minted here) and open it. */
   createPage(title: string): void;
-  /** Open a page, loading its preorder block tree (like openDoc). */
+  /** Open a page, loading its preorder block tree. */
   openPage(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
    *  focus to the new block, so it must know the id before the round-trip). */
@@ -384,28 +363,8 @@ export function createActions({
       .catch(fail);
   };
 
-  // the single entry point into a doc: make it active and load its blocks.
-  // Every path into a doc (new-doc, a tree click) goes here — like
-  // enterChannel. The known-doc set is the node's index (state.docIds), not a
-  // local registry, so entering a doc no longer writes any list — it just
-  // focuses the reader on `docId`.
-  const enterDoc = (rawId: string) => {
-    const live = getNode();
-    const docId = docIdOf(rawId);
-    if (!live || !docId) return;
-    patch({
-      activeDoc: docId,
-      activeDocBlocks: [],
-    });
-    Promise.resolve()
-      .then(() => documentClient.getDoc(live, docId))
-      .then((blocks) => patch({ activeDocBlocks: blocks ?? [] }))
-      .catch(fail);
-  };
-
   // the single entry point into a page: make it active and load its preorder
-  // block tree — every path into a page (new-page, a rail click) goes here,
-  // mirroring enterDoc.
+  // block tree — every path into a page (new-page, a rail click) goes here.
   const enterPage = (pageId: string) => {
     const live = getNode();
     if (!live || !pageId) return;
@@ -736,73 +695,7 @@ export function createActions({
       );
     },
 
-    // ── Documents ──
-    listDocs: () => {
-      const live = getNode();
-      if (!live) return;
-      Promise.resolve()
-        .then(() => documentClient.listDocs(live))
-        .then((docIds) => patch({ docIds }))
-        .catch(fail);
-    },
-
-    openDoc: enterDoc,
-
-    createDoc: (rawId) => {
-      const docId = docIdOf(rawId);
-      if (!docId) return;
-      // CreateDoc is idempotent and REQUIRED before any block op; the refresh
-      // re-enumerates the index so the new path shows in the tree, then open
-      // it (loads blocks), mirroring createChannel.
-      submitTracked(
-        opKey.doc(docId),
-        (live) => documentClient.createDoc(live, { docId }),
-        (prev) => optimistic.docCreated(prev, docId),
-      ).then(() => enterDoc(docId));
-    },
-
-    insertBlock: ({ after, kind, text }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      const block = { id: crypto.randomUUID(), kind, text };
-      submitTracked(
-        opKey.docBlock(docId, block.id),
-        (live) => documentClient.insertBlock(live, { docId, after, block }),
-        (prev) => optimistic.docBlockInserted(prev, { after, block }),
-      );
-    },
-
-    updateBlock: ({ blockId, text }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.updateBlock(live, { docId, blockId, text }),
-        (prev) => optimistic.docBlockUpdated(prev, blockId, text),
-      );
-    },
-
-    removeBlock: (blockId) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.removeBlock(live, { docId, blockId }),
-        (prev) => optimistic.docBlockRemoved(prev, blockId),
-      );
-    },
-
-    moveBlock: ({ blockId, after }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.moveBlock(live, { docId, blockId, after }),
-        (prev) => optimistic.docBlockMoved(prev, { blockId, after }),
-      );
-    },
-
-    // ── Pages ──
+    // ── Docs ──
     listPages: () => {
       const live = getNode();
       if (!live) return;
@@ -1260,16 +1153,16 @@ export function createActions({
       // without the index tier 404s a view; that module contributes an empty
       // group instead of sinking the whole search.
       const tolerant = <T,>(read: Promise<T[]>): Promise<T[]> => read.catch(() => []);
+      // `docs` == the pages module's block hits — pages is the docs surface.
       Promise.resolve()
         .then(() =>
           Promise.all([
             tolerant(chatClient.searchMessages(live, { text: query })),
-            tolerant(documentClient.searchBlocks(live, { text: query })),
             tolerant(pagesClient.searchPageBlocks(live, { text: query })),
           ]),
         )
-        .then(([chat, docs, pages]) =>
-          patch({ search: { query, chat, docs, pages }, searchPending: false }),
+        .then(([chat, docs]) =>
+          patch({ search: { query, chat, docs }, searchPending: false }),
         )
         .catch(fail);
     },
@@ -1385,9 +1278,6 @@ export function createActions({
         activeChannel: null,
         activeThread: null,
         authorNames: {},
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
         pages: [],
         activePage: null,
         activePageBlocks: [],
@@ -1428,9 +1318,6 @@ export function createActions({
         members: [],
         proposals: [],
         forgeHead: null,
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
         pages: [],
         activePage: null,
         activePageBlocks: [],
@@ -1543,9 +1430,6 @@ export function createActions({
             activeChannel: null,
             activeThread: null,
             authorNames: {},
-            docIds: [],
-            activeDoc: null,
-            activeDocBlocks: [],
             pages: [],
             activePage: null,
             activePageBlocks: [],

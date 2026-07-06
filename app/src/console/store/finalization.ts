@@ -55,8 +55,6 @@ export const opKey = {
   /** An op on an EXISTING message (edit/delete/reaction) — keyed by seq. */
   messageSeq: (channelId: string, seq: number) => `chat/${channelId}/seq/${seq}`,
   forgeHead: () => "forge/head",
-  doc: (docId: string) => `doc/${docId}`,
-  docBlock: (docId: string, blockId: string) => `doc/${docId}/block/${blockId}`,
   page: (pageId: string) => `page/${pageId}`,
   /** Page block ids are module-global — no page qualifier needed. */
   pageBlock: (blockId: string) => `page-block/${blockId}`,

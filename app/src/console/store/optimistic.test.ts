@@ -140,28 +140,6 @@ describe("page block projections", () => {
   });
 });
 
-describe("doc block projections", () => {
-  const doc = [
-    { id: "x", kind: "paragraph" as const, text: "x" },
-    { id: "y", kind: "paragraph" as const, text: "y" },
-  ];
-
-  it("inserts at the front on a null anchor (the module's `after` rule)", () => {
-    const prev = base({ activeDocBlocks: doc });
-    const out = optimistic.docBlockInserted(prev, {
-      after: null,
-      block: { id: "n", kind: "paragraph", text: "n" },
-    });
-    expect(out.activeDocBlocks!.map((b) => b.id)).toEqual(["n", "x", "y"]);
-  });
-
-  it("moves a block immediately after its anchor", () => {
-    const prev = base({ activeDocBlocks: doc });
-    const out = optimistic.docBlockMoved(prev, { blockId: "x", after: "y" });
-    expect(out.activeDocBlocks!.map((b) => b.id)).toEqual(["y", "x"]);
-  });
-});
-
 describe("reaction projections", () => {
   it("adds then removes the local member's reaction", () => {
     const self = Array.from(new TextEncoder().encode("jess"));
