@@ -3,16 +3,34 @@
 // real console state: connection, workspace role, height, app hash, and module
 // roots.
 
-import { useState, type CSSProperties, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 
+import {
+  blocksPerSecond,
+  formatLatency,
+  formatRate,
+  quantile,
+  type NodeMetrics,
+} from "../../../domain/metrics";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
+import { HealthBar, HealthLegend } from "./HealthBar";
+import { commitHealth, healthSegments, nodeLiveness } from "./node-health";
+import { PeersTab } from "./PeersTab";
 
-type TabId = "overview" | "permissions";
+type TabId = "overview" | "peers" | "permissions";
 
 const TABS: ReadonlyArray<readonly [TabId, string]> = [
   ["overview", "Overview"],
+  ["peers", "Connections"],
   ["permissions", "Permissions"],
 ];
 
@@ -675,8 +693,159 @@ function StateCommitment() {
   );
 }
 
+/** How often the Node overview re-scrapes /metrics for its live cadence and
+ *  apply-latency readout. Slower than the Metrics dashboard's 2 s — this is a
+ *  glance, not a chart. */
+const METRICS_POLL_MS = 2_500;
+
+interface LiveMetrics {
+  latest: NodeMetrics | null;
+  /** blocks/sec across the last two scrapes, null until a second read lands. */
+  blocksPerSec: number | null;
+}
+
+/** Poll /metrics while mounted + connected, deriving a live block rate from
+ *  successive counter reads. Mirrors MetricsView's poller, trimmed to the two
+ *  numbers this overview shows. Resets when the node changes. */
+function useLiveMetrics(): LiveMetrics {
+  const { state, actions } = useDucktape();
+  const { connected, nodeUrl } = state;
+  const [latest, setLatest] = useState<NodeMetrics | null>(null);
+  const [blocksPerSec, setBlocksPerSec] = useState<number | null>(null);
+  const prev = useRef<{ t: number; blocks: number } | null>(null);
+
+  useEffect(() => {
+    setLatest(null);
+    setBlocksPerSec(null);
+    prev.current = null;
+    if (!connected) return;
+    let cancelled = false;
+    const poll = () => {
+      actions.readMetrics().then((m) => {
+        if (cancelled || !m) return;
+        setLatest(m);
+        if (!m.present) return;
+        const now = Date.now();
+        if (prev.current) {
+          setBlocksPerSec(blocksPerSecond(prev.current.blocks, m.blocksTotal, now - prev.current.t));
+        }
+        prev.current = { t: now, blocks: m.blocksTotal };
+      });
+    };
+    poll();
+    const timer = setInterval(poll, METRICS_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [connected, nodeUrl, actions]);
+
+  return { latest, blocksPerSec };
+}
+
+const LIVENESS_DOT: Record<string, string> = {
+  live: "#5f9e74",
+  idle: color.amber,
+  stopped: "#cf6a5e",
+  offline: "#e3b443",
+};
+
+/** The status-page commit-health card: a liveness headline, the recent-block
+ *  health bar, and its applied/rejected legend. */
+function CommitHealthCard() {
+  const { state } = useDucktape();
+  const segments = useMemo(() => healthSegments(state.blocks, 48), [state.blocks]);
+  const health = commitHealth(segments);
+  const liveness = nodeLiveness({
+    connected: state.connected,
+    managed: state.managed,
+    tip: state.lastBlock,
+  });
+  const span =
+    segments.length > 0
+      ? `#${segments[0].height.toLocaleString()} – #${segments[segments.length - 1].height.toLocaleString()}`
+      : null;
+
+  return (
+    <div
+      style={{
+        marginTop: 9,
+        border: `1px solid ${color.border}`,
+        borderRadius: radius.lg,
+        background: color.paper,
+        padding: "14px 16px",
+        boxShadow: shadow.card,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          marginBottom: 12,
+        }}
+      >
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+          <span
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              background: LIVENESS_DOT[liveness.tone] ?? color.muted2,
+              animation: liveness.tone === "live" ? "ik-pulse 1.6s ease-in-out infinite" : undefined,
+            }}
+          />
+          <span style={{ font: `600 13px ${font.sans}`, color: color.dark }}>{liveness.label}</span>
+          <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>
+            {liveness.detail}
+          </span>
+        </span>
+        <span style={{ font: `600 11px ${font.mono}`, color: color.muted2 }}>
+          {health.total > 0 ? `${health.total} commits` : "—"}
+        </span>
+      </div>
+
+      {health.total > 0 ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <HealthBar segments={segments} slots={48} live={state.connected} />
+          <HealthLegend applied={health.applied} rejected={health.rejected} span={span} />
+        </div>
+      ) : (
+        <div
+          style={{
+            borderRadius: radius.md,
+            border: `1px solid ${color.borderSoft}`,
+            background: color.sunken,
+            padding: "13px 14px",
+            font: `400 12px ${font.sans}`,
+            color: color.muted2,
+          }}
+        >
+          {state.connected
+            ? "No non-empty blocks committed yet — the health bar fills as real ops land (heartbeat blocks are skipped)."
+            : "Not connected — commit health streams from the node's block ring once it's reachable."}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OverviewTab() {
   const { state } = useDucktape();
+  const { latest, blocksPerSec } = useLiveMetrics();
+
+  const p50 = latest?.present ? quantile(latest.latency, 0.5) : null;
+  const cadenceValue = blocksPerSec !== null ? formatRate(blocksPerSec) : "—";
+  const cadenceHint = !state.connected
+    ? "node offline"
+    : latest === null
+      ? "reading /metrics…"
+      : !latest.present
+        ? "no block metrics"
+        : p50 !== null
+          ? `apply p50 ${formatLatency(p50)}`
+          : "warming up";
 
   return (
     <>
@@ -695,10 +864,13 @@ function OverviewTab() {
         }}
       >
         <StatCard label="HEIGHT" value={numberValue(state.status?.height)} />
-        <StatCard label="ROUND" value="—" hint="not exposed by /v1/status" />
-        <StatCard label="PEERS" value="—" hint="not exposed by /v1/status" />
-        <StatCard label="FINALITY" value="—" hint="not exposed by /v1/status" />
+        <StatCard label="VALIDATORS" value={numberValue(state.members.length)} hint="consensus quorum" />
+        <StatCard label="OBSERVERS" value={numberValue(state.observers.length)} hint="statesync tier" />
+        <StatCard label="CADENCE" value={cadenceValue} hint={cadenceHint} />
       </div>
+
+      <SectionLabel style={{ marginTop: 22 }}>COMMIT HEALTH</SectionLabel>
+      <CommitHealthCard />
 
       <StateCommitment />
     </>
@@ -990,7 +1162,13 @@ export function StatusView() {
           padding: "18px 22px 22px",
         }}
       >
-        {activeTab === "permissions" ? <PermissionsTab /> : <OverviewTab />}
+        {activeTab === "peers" ? (
+          <PeersTab />
+        ) : activeTab === "permissions" ? (
+          <PermissionsTab />
+        ) : (
+          <OverviewTab />
+        )}
       </div>
     </div>
   );

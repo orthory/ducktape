@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
+import type { BlockRecord } from "../../../domain/transport";
 import type { Workspace } from "../../../domain/workspace-client";
 import { StatusView } from "./StatusView";
 
@@ -27,6 +28,24 @@ const status = {
   ],
 };
 
+const PEER_B = "11".repeat(32);
+const OBSERVER_C = "22".repeat(32);
+
+const block = (
+  height: number,
+  proposer: string,
+  disposition: BlockRecord["disposition"] = "applied",
+): BlockRecord => ({
+  height,
+  hash: `hash${height}`,
+  commitHash: `commit${height}`,
+  proposer,
+  disposition,
+  target: "chat",
+  operations: [],
+  payload: "",
+});
+
 const renderStatus = (patch: Partial<ConsoleState> = {}) => {
   const initialState = {
     ...createInitialState(),
@@ -36,12 +55,17 @@ const renderStatus = (patch: Partial<ConsoleState> = {}) => {
     status,
     ...patch,
   };
-  const spies: Record<string, (...args: unknown[]) => void> = {};
+  const spies: Record<string, (...args: unknown[]) => unknown> = {};
   const actions = new Proxy(
     {},
     {
       get: (_target, key: string) => {
-        spies[key] ??= vi.fn() as (...args: unknown[]) => void;
+        // The overview polls /metrics on mount, so readMetrics must resolve.
+        if (key === "readMetrics") {
+          spies[key] ??= vi.fn().mockResolvedValue(null);
+          return spies[key];
+        }
+        spies[key] ??= vi.fn() as (...args: unknown[]) => unknown;
         return spies[key];
       },
     },
@@ -64,12 +88,16 @@ describe("StatusView", () => {
       value: { writeText },
     });
 
-    renderStatus();
+    renderStatus({ members: [workspace.pubkey, PEER_B], observers: [OBSERVER_C] });
 
     expect(screen.getByText("Synced")).toBeInTheDocument();
     expect(screen.getByText(/member · validator/i)).toBeInTheDocument();
     expect(screen.getByText("42")).toBeInTheDocument();
-    expect(screen.getAllByText(/not exposed by \/v1\/status/i)).toHaveLength(3);
+    // The network cards now report real, fetched counts rather than stubs.
+    expect(screen.getByText("VALIDATORS")).toBeInTheDocument();
+    expect(screen.getByText("OBSERVERS")).toBeInTheDocument();
+    expect(screen.getByText("CADENCE")).toBeInTheDocument();
+    expect(screen.getByText("COMMIT HEALTH")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /app hash/i }));
 
@@ -77,6 +105,35 @@ describe("StatusView", () => {
     expect(screen.getByText("COPIED")).toBeInTheDocument();
     expect(screen.getByText("chat")).toBeInTheDocument();
     expect(screen.getByText("tasks")).toBeInTheDocument();
+  });
+
+  it("lists connections with derived liveness on the Connections tab", () => {
+    renderStatus({
+      members: [workspace.pubkey, PEER_B],
+      observers: [OBSERVER_C],
+      authorNames: { [PEER_B]: "beacon" },
+      // PEER_B led the two recent blocks; self led none.
+      blocks: [block(41, PEER_B), block(42, PEER_B)],
+      lastBlock: 42,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Connections" }));
+
+    // The valset roster is fetched and shown as this node's connections.
+    expect(screen.getByText("CONNECTIONS")).toBeInTheDocument();
+    expect(screen.getByText("beacon")).toBeInTheDocument();
+    expect(screen.getByText("this node")).toBeInTheDocument();
+
+    // A validator that verifiably proposed recent blocks reads as leading;
+    // the local validator that led nothing reads as quiet; observers as statesync.
+    expect(screen.getByText("leading")).toBeInTheDocument();
+    expect(screen.getByText("quiet")).toBeInTheDocument();
+    expect(screen.getByText("statesync")).toBeInTheDocument();
+    expect(screen.getByText(/led #42/)).toBeInTheDocument();
+
+    // Observer tier is disjoint from the quorum and labelled as such.
+    expect(screen.getAllByText("validator").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("observer")).toBeInTheDocument();
   });
 
   it("shows a real validator-vs-guest capability matrix", () => {
