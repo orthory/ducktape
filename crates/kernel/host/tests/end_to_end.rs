@@ -36,7 +36,7 @@ impl Module for Relay {
         // NOT a reentrant call into kv — an intent the host re-dispatches as a
         // follow-up op after this execute returns.
         // typed follow-up write via kv's interface crate (not an ad-hoc encoding).
-        let payload = kv_interface::encode(&kv_interface::KvMsg::Set {
+        let payload = kv::encode(&kv::KvMsg::Set {
             key: WRITE_KEY.to_vec(),
             value: WRITE_VAL.to_vec(),
         });
@@ -174,7 +174,7 @@ fn dispatch_trace_records_every_dispatch_in_causal_order() {
                 DispatchRecord {
                     module: KV_ID.to_string(),
                     origin: Origin::Module(RELAY_ID.to_string()),
-                    payload: kv_interface::encode(&kv_interface::KvMsg::Set {
+                    payload: kv::encode(&kv::KvMsg::Set {
                         key: WRITE_KEY.to_vec(),
                         value: WRITE_VAL.to_vec(),
                     }),

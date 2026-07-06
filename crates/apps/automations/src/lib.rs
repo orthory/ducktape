@@ -628,7 +628,7 @@ impl Automations {
                     return Err("composed id exceeds cap".into());
                 }
                 // probe: the composed task id must be unused — tasks rejects
-                // duplicates, which would abort the block. tasks-interface only
+                // duplicates, which would abort the block. the tasks wire surface only
                 // exposes List today, so this is an O(n) scan; switch to a Get
                 // query when the interface grows one.
                 let req = tasks_encode_query(&TaskQuery::List);

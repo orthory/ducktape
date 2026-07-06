@@ -13,7 +13,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};
 use host::{FinalizedBlock, Host};
 use kv::Kv;
-use kv_interface::{KvMsg, encode as kv_encode};
+use kv::{KvMsg, encode as kv_encode};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use statesync::qmdb::RemoteQmdbResolver;
 use statesync::{

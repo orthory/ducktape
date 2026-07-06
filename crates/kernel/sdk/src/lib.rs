@@ -104,7 +104,7 @@ pub type ModuleId = String;
 // ============================================================================
 
 /// the coordinates of a scheduled upgrade, mirrored for the manifests. shape
-/// matches `upgrade_interface::Upgrade` but carries no module dependency.
+/// matches `upgrade::ScheduledUpgrade` but carries no module dependency.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpgradeCoords {
     pub name: String,
@@ -175,7 +175,7 @@ pub fn required_min_version(
 /// a write intent at another module (or self). emitted via [`Ctx::emit_msg`] and
 /// re-dispatched by the host as a FOLLOW-UP op after the current `execute`
 /// returns — never a reentrant mutating call. payload bytes are typed later via
-/// per-module `*-interface` crates; the host treats them opaquely.
+/// per-module crate-root wire types; the host treats them opaquely.
 #[derive(Clone, Debug)]
 pub struct Msg {
     pub target: ModuleId,

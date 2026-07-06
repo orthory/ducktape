@@ -18,10 +18,10 @@
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
-use directory_interface::{DirMsg, encode_msg};
+use directory::{DirMsg, encode_msg};
 use host::Host;
 use kv::Kv;
-use kv_interface::{KvMsg, encode};
+use kv::{KvMsg, encode};
 use node::{ArrivalOrderer, OrderedNode, Orderer, RoundOrderer};
 use sdk::Msg;
 

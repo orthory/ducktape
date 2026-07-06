@@ -33,9 +33,9 @@ use forge::{ForgeMsg, encode_msg as forge_encode};
 use host::{BASELINE_VERSION, BlockContext, Host};
 use sdk::{Msg, Origin, StateRoot};
 use upgrade::Upgrade;
-use upgrade_interface::{UpgradeMsg, encode_msg as upgrade_encode};
+use upgrade::{UpgradeMsg, encode_msg as upgrade_encode};
 use valset::Valset;
-use valset_interface::{ValsetMsg, ValsetQuery, ValsetReply, encode_msg as valset_encode};
+use valset::{ValsetMsg, ValsetQuery, ValsetReply, encode_msg as valset_encode};
 
 /// this seed's deterministic ed25519 pubkey bytes — the identity a node derives.
 fn key(seed: u64) -> Vec<u8> {
@@ -83,29 +83,29 @@ fn signal(name: &str, to_version: u32) -> Msg {
 fn current_version(host: &Host) -> u32 {
     let reply = block_on(host.query(
         "upgrade",
-        &upgrade_interface::encode_query(&upgrade_interface::UpgradeQuery::Status),
+        &upgrade::encode_query(&upgrade::UpgradeQuery::Status),
     ))
     .expect("status query");
-    let upgrade_interface::UpgradeReply::Status(s) =
-        upgrade_interface::decode_reply(&reply).expect("decode status");
+    let upgrade::UpgradeReply::Status(s) =
+        upgrade::decode_reply(&reply).expect("decode status");
     s.current_version
 }
 
 fn pending_is_none(host: &Host) -> bool {
     let reply = block_on(host.query(
         "upgrade",
-        &upgrade_interface::encode_query(&upgrade_interface::UpgradeQuery::Status),
+        &upgrade::encode_query(&upgrade::UpgradeQuery::Status),
     ))
     .expect("status query");
-    let upgrade_interface::UpgradeReply::Status(s) =
-        upgrade_interface::decode_reply(&reply).expect("decode status");
+    let upgrade::UpgradeReply::Status(s) =
+        upgrade::decode_reply(&reply).expect("decode status");
     s.pending.is_none()
 }
 
 fn validator_count(host: &Host) -> usize {
-    let reply = block_on(host.query("valset", &valset_interface::encode_query(&ValsetQuery::Validators)))
+    let reply = block_on(host.query("valset", &valset::encode_query(&ValsetQuery::Validators)))
         .expect("valset query");
-    match valset_interface::decode_reply(&reply).expect("decode valset") {
+    match valset::decode_reply(&reply).expect("decode valset") {
         ValsetReply::Validators(v) => v.len(),
         other => panic!("expected Validators, got {other:?}"),
     }

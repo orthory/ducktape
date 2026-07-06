@@ -7,7 +7,7 @@
 //! only the root, learned from consensus, is trusted).
 
 use directory::Directory;
-use directory_interface::{DirMsg, encode_msg};
+use directory::{DirMsg, encode_msg};
 use sdk::{Ctx, Error, Event, Module, Msg, StateRoot};
 use sha2::{Digest, Sha256};
 

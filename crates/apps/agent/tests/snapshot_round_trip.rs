@@ -13,7 +13,7 @@ use agent::{
     decode_reply, encode_msg, encode_query,
 };
 use futures::executor::block_on;
-use saga_interface::SagaOrigin;
+use saga::SagaOrigin;
 use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
 
 /// a minimal `Ctx`: drives `execute` with a controllable env; the registry

@@ -7,7 +7,7 @@
 //! real one lives in `main.rs` on a commonware tokio runner; router tests drive
 //! a fake actor on plain tokio. payloads stay opaque json: a submit/query body
 //! carries the module's own `*Msg`/`*Query` enum as a json value, encoded to the
-//! exact bytes the `*-interface` crates' `encode_*` helpers would produce
+//! exact bytes the modules' crate-root `encode_*` helpers would produce
 //! (`serde_json::to_vec`), so the daemon needs no per-module knowledge —
 //! with ONE deliberate exception: the files blob lane. chunk bytes must never
 //! transit consensus (no op carries them), so POST `/v1/files/blob` and GET
@@ -652,7 +652,7 @@ pub fn open_index_store<S: AsRef<str>>(
 /// author rendering assumes — on BOTH lanes. the validator's key-byte
 /// identities render the same way, because a mapper's from-state rebuild
 /// re-renders authors from canonical state with this exact convention
-/// (see chat-index `author_from_ref`): folded and rebuilt rows must match
+/// (see `chat::index` `author_from_ref`): folded and rebuilt rows must match
 /// byte-for-byte. hex-keyed identity belongs to the explorer row's
 /// `proposer`, not the index op rows.
 pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {

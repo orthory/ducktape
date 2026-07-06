@@ -10,9 +10,9 @@ version.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 capability-host = { workspace = true }
-dispatch-interface = { workspace = true }
+dispatch = { workspace = true }
 reactor = { workspace = true }
-saga-interface = { workspace = true }
+saga = { workspace = true }
 sdk = { workspace = true }
 
 [dev-dependencies]

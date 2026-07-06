@@ -5,13 +5,13 @@ version.workspace = true
 
 [dependencies]
 sdk = { workspace = true }
-saga-interface = { workspace = true }
-valset-interface = { workspace = true }
-capability-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+valset = { workspace = true }
+capability = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"
 host = { workspace = true }
-valset = { workspace = true }

@@ -96,9 +96,9 @@ fn network_shape_joiner_parks_until_promote() {
 /// ceremony to v3 on the solo founder (schedule → auto-signal → activate).
 #[test]
 fn staged_admission_observer_presyncs_then_promotes_warm() {
-    use directory_interface::{DirMsg, DirQuery, DirReply};
-    use governance_interface::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
-    use valset_interface::{ValsetQuery, ValsetReply};
+    use directory::{DirMsg, DirQuery, DirReply};
+    use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
+    use valset::{ValsetQuery, ValsetReply};
 
     let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
@@ -113,11 +113,11 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         let reply = cluster.query(
             0,
             "governance",
-            &governance_interface::encode_query(&GovQuery::Proposal {
+            &governance::encode_query(&GovQuery::Proposal {
                 proposal_id: id.into(),
             }),
         )?;
-        match governance_interface::decode_reply(&reply).ok()? {
+        match governance::decode_reply(&reply).ok()? {
             GovReply::Proposal(Some(view)) => Some(view.status),
             _ => None,
         }
@@ -143,7 +143,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         cluster.submit(
             0,
             "governance",
-            &governance_interface::encode_msg(&GovMsg::Propose {
+            &governance::encode_msg(&GovMsg::Propose {
                 proposal_id: pid.clone(),
                 action: GovAction::ScheduleUpgrade {
                     name: "observer-tier".into(),
@@ -159,7 +159,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         cluster.submit(
             0,
             "governance",
-            &governance_interface::encode_msg(&GovMsg::Vote {
+            &governance::encode_msg(&GovMsg::Vote {
                 proposal_id: pid.clone(),
                 approve: true,
             }),
@@ -170,7 +170,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         cluster.submit(
             0,
             "governance",
-            &governance_interface::encode_msg(&GovMsg::Execute {
+            &governance::encode_msg(&GovMsg::Execute {
                 proposal_id: pid.clone(),
             }),
         );
@@ -186,10 +186,10 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
                     .query(
                         0,
                         "upgrade",
-                        &upgrade_interface::encode_query(&upgrade_interface::UpgradeQuery::Status),
+                        &upgrade::encode_query(&upgrade::UpgradeQuery::Status),
                     )
-                    .and_then(|raw| upgrade_interface::decode_reply(&raw).ok())
-                    .map(|upgrade_interface::UpgradeReply::Status(st)| st.pending.is_some())
+                    .and_then(|raw| upgrade::decode_reply(&raw).ok())
+                    .map(|upgrade::UpgradeReply::Status(st)| st.pending.is_some())
                     .unwrap_or(false);
                 if pending {
                     break true;
@@ -231,8 +231,8 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     // (1) the tier split in COMMITTED state: validators = founder only,
     //     observers = the friend.
     let validators = cluster
-        .query(0, "valset", &valset_interface::encode_query(&ValsetQuery::Validators))
-        .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+        .query(0, "valset", &valset::encode_query(&ValsetQuery::Validators))
+        .and_then(|raw| valset::decode_reply(&raw).ok())
         .map(|r| match r {
             ValsetReply::Validators(v) => v,
             other => panic!("expected Validators, got {other:?}"),
@@ -240,8 +240,8 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         .expect("valset validators readable");
     assert_eq!(validators.len(), 1, "the quorum still seats ONLY the founder");
     let observers = cluster
-        .query(0, "valset", &valset_interface::encode_query(&ValsetQuery::Observers))
-        .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+        .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+        .and_then(|raw| valset::decode_reply(&raw).ok())
         .map(|r| match r {
             ValsetReply::Observers(v) => v,
             other => panic!("expected Observers, got {other:?}"),
@@ -265,8 +265,8 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     //     visible through the observer itself, not just the founder)…
     poll("the observer to serve valset reads", Box::new(|| {
         cluster
-            .query(1, "valset", &valset_interface::encode_query(&ValsetQuery::Observers))
-            .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+            .query(1, "valset", &valset::encode_query(&ValsetQuery::Observers))
+            .and_then(|raw| valset::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(
                 r,
                 ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
@@ -292,7 +292,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         serde_json::json!({
             "cmd": "submit",
             "target": "directory",
-            "payload_hex": common::hex(&directory_interface::encode_msg(&DirMsg::Set {
+            "payload_hex": common::hex(&directory::encode_msg(&DirMsg::Set {
                 key: "observer-no-writes".into(),
                 value: "refused".into(),
             })),
@@ -308,7 +308,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     cluster.submit(
         0,
         "directory",
-        &directory_interface::encode_msg(&DirMsg::Set {
+        &directory::encode_msg(&DirMsg::Set {
             key: "observer-follow".into(),
             value: "fresh".into(),
         }),
@@ -318,11 +318,11 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             .query(
                 1,
                 "directory",
-                &directory_interface::encode_query(&DirQuery::Get {
+                &directory::encode_query(&DirQuery::Get {
                     key: "observer-follow".into(),
                 }),
             )
-            .and_then(|raw| directory_interface::decode_reply(&raw).ok())
+            .and_then(|raw| directory::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
     }));
     //     …and the DERIVED tier follows the boundary too: the explorer
@@ -359,7 +359,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     cluster.submit(
         0,
         "directory",
-        &directory_interface::encode_msg(&DirMsg::Set {
+        &directory::encode_msg(&DirMsg::Set {
             key: "observer-down-liveness".into(),
             value: "alive".into(),
         }),
@@ -369,11 +369,11 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             .query(
                 0,
                 "directory",
-                &directory_interface::encode_query(&DirQuery::Get {
+                &directory::encode_query(&DirQuery::Get {
                     key: "observer-down-liveness".into(),
                 }),
             )
-            .and_then(|raw| directory_interface::decode_reply(&raw).ok())
+            .and_then(|raw| directory::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
     }));
 
@@ -402,8 +402,8 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     );
     poll("the revoke to clear observer standing", Box::new(|| {
         cluster
-            .query(0, "valset", &valset_interface::encode_query(&ValsetQuery::Observers))
-            .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+            .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+            .and_then(|raw| valset::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, ValsetReply::Observers(v) if v.is_empty()))
     }));
     cluster.wait_marker(1, "parked: awaiting admission", CONVERGE);
@@ -427,8 +427,8 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     );
     poll("the re-grant to restore observer standing", Box::new(|| {
         cluster
-            .query(0, "valset", &valset_interface::encode_query(&ValsetQuery::Observers))
-            .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+            .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+            .and_then(|raw| valset::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(
                 r,
                 ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
@@ -437,7 +437,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     cluster.submit(
         0,
         "directory",
-        &directory_interface::encode_msg(&DirMsg::Set {
+        &directory::encode_msg(&DirMsg::Set {
             key: "post-revoke-follow".into(),
             value: "back".into(),
         }),
@@ -447,11 +447,11 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             .query(
                 1,
                 "directory",
-                &directory_interface::encode_query(&DirQuery::Get {
+                &directory::encode_query(&DirQuery::Get {
                     key: "post-revoke-follow".into(),
                 }),
             )
-            .and_then(|raw| directory_interface::decode_reply(&raw).ok())
+            .and_then(|raw| directory::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
     }));
 
@@ -464,8 +464,8 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
     let observers = cluster
-        .query(0, "valset", &valset_interface::encode_query(&ValsetQuery::Observers))
-        .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+        .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+        .and_then(|raw| valset::decode_reply(&raw).ok())
         .map(|r| match r {
             ValsetReply::Observers(v) => v,
             other => panic!("expected Observers, got {other:?}"),

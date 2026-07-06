@@ -33,7 +33,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
-use directory_interface::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
+use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
 use document::Document;
 use document::{
     Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
@@ -56,13 +56,13 @@ use jobs::Jobs;
 use memory::Memory;
 use profiles::Profiles;
 use saga::SagaModule;
-use saga_interface::{
+use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
 use sdk::{Msg, Origin};
 use tasks::Tasks;
 use valset::Valset;
-use valset_interface::{
+use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
 };
@@ -228,14 +228,14 @@ fn main() {
         let kv_reply = host
             .query(
                 "kv",
-                &kv_interface::encode_query(&kv_interface::KvQuery::Get {
+                &kv::encode_query(&kv::KvQuery::Get {
                     key: b"greeting:name".to_vec(),
                 }),
             )
             .await
             .expect("query kv");
-        if let kv_interface::KvReply::Value(Some(v)) =
-            kv_interface::decode_reply(&kv_reply).unwrap()
+        if let kv::KvReply::Value(Some(v)) =
+            kv::decode_reply(&kv_reply).unwrap()
         {
             println!(
                 "kv[greeting:name]        = {:?}",
@@ -570,19 +570,19 @@ fn main() {
         let reply = host
             .query(
                 "dispatch",
-                &dispatch_interface::encode_query(&dispatch_interface::DispatchQuery::Dispatch {
+                &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
                     receiver: "runs".into(),
                     dispatch_id: runs::dispatch_id_for(&run_id),
                 }),
             )
             .await
             .expect("query dispatch");
-        let dispatch_interface::DispatchReply::Dispatch(Some(dispatch_view)) =
-            dispatch_interface::decode_reply(&reply).unwrap()
+        let dispatch::DispatchReply::Dispatch(Some(dispatch_view)) =
+            dispatch::decode_reply(&reply).unwrap()
         else {
             panic!("the run's dispatch must exist");
         };
-        let dispatch_interface::DispatchStatus::AwaitingResult { saga_id } =
+        let dispatch::DispatchStatus::AwaitingResult { saga_id } =
             dispatch_view.status.clone()
         else {
             panic!("the dispatch awaits its saga");

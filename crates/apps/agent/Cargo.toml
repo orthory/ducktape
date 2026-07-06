@@ -4,13 +4,14 @@ edition.workspace = true
 version.workspace = true
 
 # the agent registry: a self-contained record book (owner, capability tag,
-# prompt pin, granted actions, status). saga-interface supplies the canonical
-# origin mirror; capability-interface the shared capability-tag shape rule.
+# prompt pin, granted actions, status). saga supplies the canonical
+# origin mirror; capability the shared capability-tag shape rule (wire types
+# only).
 # everything that ACTS on agents lives in the runs module.
 [dependencies]
 sdk = { workspace = true }
-saga-interface = { workspace = true }
-capability-interface = { workspace = true }
+saga = { workspace = true }
+capability = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

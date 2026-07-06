@@ -38,8 +38,8 @@ pub use interface::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use capability_interface::validate_tag;
-use saga_interface::SagaOrigin;
+use capability::validate_tag;
+use saga::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 

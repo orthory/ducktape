@@ -4,7 +4,7 @@
 
 use commonware_runtime::{Runner as _, deterministic};
 use directory::Directory;
-use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use greeter::Greeter;
 use host::Host;
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
@@ -83,15 +83,15 @@ fn greeter_reads_directory_and_writes_a_derived_greeting() {
         let kvr = host
             .query(
                 "kv",
-                &kv_interface::encode_query(&kv_interface::KvQuery::Get {
+                &kv::encode_query(&kv::KvQuery::Get {
                     key: b"greeting:name".to_vec(),
                 }),
             )
             .await
             .unwrap();
         assert_eq!(
-            kv_interface::decode_reply(&kvr).unwrap(),
-            kv_interface::KvReply::Value(Some(b"hello world".to_vec()))
+            kv::decode_reply(&kvr).unwrap(),
+            kv::KvReply::Value(Some(b"hello world".to_vec()))
         );
 
         // and the typed follow-up reached the qmdb kv module too (its real root moved).

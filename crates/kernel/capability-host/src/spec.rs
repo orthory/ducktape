@@ -51,7 +51,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use capability_interface::validate_tag;
+use capability::validate_tag;
 use serde::Deserialize;
 
 /// the one spec format version this build understands. parsing rejects any

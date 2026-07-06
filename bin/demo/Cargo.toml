@@ -6,19 +6,15 @@ version.workspace = true
 [dependencies]
 host = { workspace = true }
 kv = { workspace = true }
-kv-interface = { workspace = true }
 directory = { workspace = true }
 greeter = { workspace = true }
-directory-interface = { workspace = true }
 forge = { workspace = true }
 document = { workspace = true }
 chat = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 saga = { workspace = true }
-saga-interface = { workspace = true }
 dispatch = { workspace = true }
-dispatch-interface = { workspace = true }
 tagging = { workspace = true }
 tasks = { workspace = true }
 profiles = { workspace = true }
@@ -28,7 +24,6 @@ files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
 valset = { workspace = true }
-valset-interface = { workspace = true }
 sdk = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }

@@ -11,9 +11,9 @@ version.workspace = true
 sdk = { workspace = true }
 agent = { workspace = true }
 chat = { workspace = true }
-saga-interface = { workspace = true }
-tagging-interface = { workspace = true }
-dispatch-interface = { workspace = true }
+saga = { workspace = true }
+tagging = { workspace = true }
+dispatch = { workspace = true }
 document = { workspace = true }
 tasks = { workspace = true }
 jobs = { workspace = true }
@@ -25,7 +25,4 @@ async-trait = { workspace = true }
 [dev-dependencies]
 futures = "0.3"
 host = { workspace = true }
-saga = { workspace = true }
-tagging = { workspace = true }
-dispatch = { workspace = true }
 commonware-runtime = { workspace = true }

@@ -1,6 +1,6 @@
 //! real-socket cluster e2e: REAL `ducktape-node` OS processes over localhost
 //! TCP, driven end to end through the json-lines rpc with TYPED payloads from
-//! the `*-interface` crates (the drift that silently rotted the old bash demo
+//! the modules' crate-root wire types (the drift that silently rotted the old bash demo
 //! — a module rename plus a payload reshape — now fails to compile instead).
 //!
 //! `cluster_lifecycle` is the port of demo-2node.sh's assertion spec:
@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
 use common::{Cluster, poll_until, serial};
-use directory_interface::{DirMsg, DirQuery, DirReply};
-use governance_interface::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
+use directory::{DirMsg, DirQuery, DirReply};
+use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -88,11 +88,11 @@ fn proposal_status(cluster: &Cluster, idx: usize, id: &str) -> Option<(ProposalS
     let reply = cluster.query(
         idx,
         "governance",
-        &governance_interface::encode_query(&GovQuery::Proposal {
+        &governance::encode_query(&GovQuery::Proposal {
             proposal_id: id.into(),
         }),
     )?;
-    match governance_interface::decode_reply(&reply) {
+    match governance::decode_reply(&reply) {
         Ok(GovReply::Proposal(Some(view))) => Some((view.status, view.votes.len())),
         _ => None,
     }
@@ -102,9 +102,9 @@ fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
     let reply = cluster.query(
         idx,
         "directory",
-        &directory_interface::encode_query(&DirQuery::Get { key: key.into() }),
+        &directory::encode_query(&DirQuery::Get { key: key.into() }),
     )?;
-    match directory_interface::decode_reply(&reply) {
+    match directory::decode_reply(&reply) {
         Ok(DirReply::Value(v)) => v,
         Err(_) => None,
     }
@@ -181,7 +181,7 @@ fn cluster_lifecycle() {
     cluster.submit(
         0,
         "governance",
-        &governance_interface::encode_msg(&GovMsg::Propose {
+        &governance::encode_msg(&GovMsg::Propose {
             proposal_id: "admit-node3".into(),
             action: GovAction::AddValidator {
                 key: Cluster::identity(3),
@@ -192,7 +192,7 @@ fn cluster_lifecycle() {
     poll_until("proposal to open on node 1", FINALIZE, || {
         proposal_status(&cluster, 1, "admit-node3").filter(|(s, _)| *s == ProposalStatus::Open)
     });
-    let vote = governance_interface::encode_msg(&GovMsg::Vote {
+    let vote = governance::encode_msg(&GovMsg::Vote {
         proposal_id: "admit-node3".into(),
         approve: true,
     });
@@ -204,7 +204,7 @@ fn cluster_lifecycle() {
     cluster.submit(
         1,
         "governance",
-        &governance_interface::encode_msg(&GovMsg::Execute {
+        &governance::encode_msg(&GovMsg::Execute {
             proposal_id: "admit-node3".into(),
         }),
     );
@@ -228,7 +228,7 @@ fn cluster_lifecycle() {
         if last_filler.elapsed() >= Duration::from_secs(1) {
             last_filler = std::time::Instant::now();
             filler += 1;
-            let payload = directory_interface::encode_msg(&DirMsg::Set {
+            let payload = directory::encode_msg(&DirMsg::Set {
                 key: format!("cutover-filler-{filler}"),
                 value: "x".into(),
             });
@@ -400,7 +400,7 @@ fn quorum_tolerates_one_fault() {
     cluster.submit(
         0,
         "directory",
-        &directory_interface::encode_msg(&DirMsg::Set {
+        &directory::encode_msg(&DirMsg::Set {
             key: "after-fault".into(),
             value: "alive".into(),
         }),

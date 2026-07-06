@@ -21,29 +21,21 @@ recovery = { workspace = true }
 sdk = { workspace = true }
 statesync = { workspace = true }
 kv = { workspace = true }
-kv-interface = { workspace = true }
 directory = { workspace = true }
-directory-interface = { workspace = true }
 # the production module set: system infrastructure + every product module.
 valset = { workspace = true }
-valset-interface = { workspace = true }
 governance = { workspace = true }
 # the invite-accept verb drives governance ops through the local rpc.
-governance-interface = { workspace = true }
 # the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
 # committed boundary snapshot; the module itself is genesis-wired post-retrofit).
 upgrade = { workspace = true }
-upgrade-interface = { workspace = true }
 saga = { workspace = true }
-saga-interface = { workspace = true }
 # the network-wide node-capability registry + its wire surface; the host-side
 # provider discovery announces this node's installed executor CLIs into it.
 capability = { workspace = true }
-capability-interface = { workspace = true }
 capability-host = { workspace = true }
 # the task plane: recipe manifests + capability dispatch + its host worker.
 dispatch = { workspace = true }
-dispatch-interface = { workspace = true }
 tagging = { workspace = true }
 dispatch-oracle = { workspace = true }
 forge = { workspace = true }

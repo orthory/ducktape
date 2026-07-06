@@ -7,7 +7,7 @@
 
 use commonware_cryptography::{Signer as _, ed25519};
 use directory::Directory;
-use directory_interface::{DirMsg, encode_msg};
+use directory::{DirMsg, encode_msg};
 use host::Host;
 use node::{Disposition, OrderedNode, RoundOrderer};
 use sdk::Msg;

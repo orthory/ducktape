@@ -12,7 +12,7 @@
 
 use commonware_runtime::{Runner as _, deterministic};
 use directory::Directory;
-use directory_interface::{
+use directory::{
     DirMsg, DirQuery, DirReply, decode_reply, encode_msg as dir_encode, encode_query,
 };
 use host::Host;
@@ -22,7 +22,7 @@ const DIR: &str = "directory";
 const KV: &str = "kv";
 
 fn kv_set(key: &str, value: &str) -> Vec<u8> {
-    kv_interface::encode(&kv_interface::KvMsg::Set {
+    kv::encode(&kv::KvMsg::Set {
         key: key.as_bytes().to_vec(),
         value: value.as_bytes().to_vec(),
     })
@@ -325,14 +325,14 @@ impl Module for KvRywProbe {
                 let reply = ctx
                     .query(
                         KV,
-                        &kv_interface::encode_query(&kv_interface::KvQuery::Get {
+                        &kv::encode_query(&kv::KvQuery::Get {
                             key: b"kryw".to_vec(),
                         }),
                     )
                     .await?;
                 let seen = matches!(
-                    kv_interface::decode_reply(&reply).map_err(Error::Module)?,
-                    kv_interface::KvReply::Value(Some(v)) if v == b"staged"
+                    kv::decode_reply(&reply).map_err(Error::Module)?,
+                    kv::KvReply::Value(Some(v)) if v == b"staged"
                 );
                 ctx.emit_event(Event {
                     source: "kvryw".into(),

@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use dispatch::DispatchModule;
-use dispatch_interface::{
+use dispatch::{
     DispatchMsg, DispatchQuery, DispatchReply, DispatchStatus, OutputContract, ResultEvent,
     Routing, decode_result_event, encode_msg as dispatch_encode_msg,
     encode_query as dispatch_encode_query,
@@ -21,7 +21,7 @@ use dispatch_interface::{
 use futures::executor::block_on;
 use host::{BASELINE_VERSION, BlockContext, Host};
 use saga::SagaModule;
-use saga_interface::{SagaMsg, encode_msg as saga_encode_msg};
+use saga::{SagaMsg, encode_msg as saga_encode_msg};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 
 /// the stub dispatching module: `"go"` makes it dispatch one recipe run, and
@@ -77,13 +77,13 @@ fn pending_deliveries(host: &Host) -> u64 {
         &dispatch_encode_query(&DispatchQuery::PendingDeliveries),
     ))
     .expect("query");
-    match dispatch_interface::decode_reply(&reply).expect("decode") {
+    match dispatch::decode_reply(&reply).expect("decode") {
         DispatchReply::PendingDeliveries(n) => n,
         other => panic!("expected PendingDeliveries, got {other:?}"),
     }
 }
 
-fn dispatch_view(host: &Host) -> dispatch_interface::DispatchView {
+fn dispatch_view(host: &Host) -> dispatch::DispatchView {
     let reply = block_on(host.query(
         "dispatch",
         &dispatch_encode_query(&DispatchQuery::Dispatch {
@@ -92,7 +92,7 @@ fn dispatch_view(host: &Host) -> dispatch_interface::DispatchView {
         }),
     ))
     .expect("query");
-    match dispatch_interface::decode_reply(&reply).expect("decode") {
+    match dispatch::decode_reply(&reply).expect("decode") {
         DispatchReply::Dispatch(Some(v)) => v,
         other => panic!("expected the dispatch, got {other:?}"),
     }

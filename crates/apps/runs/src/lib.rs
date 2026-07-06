@@ -122,7 +122,7 @@ use chat::{
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
-use dispatch_interface::{
+use dispatch::{
     DispatchMsg, DispatchQuery, DispatchReply, MAX_PAYLOAD_BYTES, OutputContract, ResultEvent,
     Routing, decode_reply as dispatch_decode_reply, decode_result_event,
     encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
@@ -135,10 +135,10 @@ use jobs::{
     decode_reply as jobs_decode_reply, encode_msg as jobs_encode_msg,
     encode_query as jobs_encode_query,
 };
-use saga_interface::SagaOrigin;
+use saga::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use tagging_interface::{
+use tagging::{
     EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
     encode_msg as tagging_encode_msg,
 };
@@ -1211,10 +1211,10 @@ impl RunsModule {
             } => {
                 // the agent's recipe id must fit the dispatch plane's id cap,
                 // or the recipe registration below could never land.
-                if recipe_id_for(&agent_id).len() > dispatch_interface::MAX_ID_BYTES {
+                if recipe_id_for(&agent_id).len() > dispatch::MAX_ID_BYTES {
                     return Err(Error::Module(format!(
                         "agent_id is too long for its dispatch recipe id (cap {})",
-                        dispatch_interface::MAX_ID_BYTES - recipe_id_for("").len()
+                        dispatch::MAX_ID_BYTES - recipe_id_for("").len()
                     )));
                 }
                 ctx.emit_msg(Msg {
@@ -2150,7 +2150,7 @@ mod tests {
         encode_event as agent_encode_event, encode_reply as agent_encode_reply,
     };
     use chat::{MessageHead, decode_msg as chat_decode_msg};
-    use dispatch_interface::{
+    use dispatch::{
         DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
         encode_reply as dispatch_encode_reply, encode_result_event,
     };
@@ -2164,7 +2164,7 @@ mod tests {
     };
     use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
     use sdk::{Effect, Env};
-    use tagging_interface::{Author, encode_event as tagging_encode_event};
+    use tagging::{Author, encode_event as tagging_encode_event};
     use tasks::{
         Task, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
     };
@@ -2331,7 +2331,7 @@ mod tests {
             self.msgs
                 .iter()
                 .filter(|m| m.target == "tagging")
-                .map(|m| tagging_interface::decode_msg(&m.payload).expect("tagging msg"))
+                .map(|m| tagging::decode_msg(&m.payload).expect("tagging msg"))
                 .collect()
         }
     }
@@ -2395,7 +2395,7 @@ mod tests {
                     ))),
                     _ => Err(Error::QueryUnsupported),
                 },
-                "dispatch" => match dispatch_interface::decode_query(req).map_err(Error::Module)? {
+                "dispatch" => match dispatch::decode_query(req).map_err(Error::Module)? {
                     DispatchQuery::Dispatch { dispatch_id, .. } => {
                         let view = self.taken_dispatches.contains(&dispatch_id).then(|| {
                             DispatchView {
@@ -2723,7 +2723,7 @@ mod tests {
         // an agent id whose recipe id would blow the dispatch id cap: the
         // hook ERRORS, aborting the registration block — the atomic recipe
         // seam (the registry record must never land without its recipe).
-        let oversized = "x".repeat(dispatch_interface::MAX_ID_BYTES);
+        let oversized = "x".repeat(dispatch::MAX_ID_BYTES);
         let mut ctx = CaptureCtx::new().from_agent();
         let err = exec(
             &mut m,

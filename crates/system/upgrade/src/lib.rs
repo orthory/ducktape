@@ -2,7 +2,7 @@
 //!
 //! a small dedicated system module composed into the app-hash, mirroring
 //! valset/governance. it holds the agreed `current_version`, the SINGLE pending
-//! `Upgrade { name, activation_height, to_version }`, and the per-validator
+//! `ScheduledUpgrade { name, activation_height, to_version }`, and the per-validator
 //! readiness set — all folded into `root()`, so all covered by the global
 //! app-hash. governance authorizes a schedule/cancel by emitting a host-drained
 //! follow-up (origin `Module("governance")`); each current validator emits a
@@ -14,7 +14,7 @@
 //! ## activation is a pure derivation, never a stored flip
 //!
 //! `effective_version(height, boundary_members)` is a pure, total function of the
-//! COMMITTED state — the ONE shared predicate in `upgrade_interface`. the module's
+//! COMMITTED state — the ONE shared predicate at the crate root (`effective_version`). the module's
 //! `Advance` handler re-evaluates the byte-identical predicate against the FROZEN
 //! COMMITTED end-of-(H-1) state (NOT staged-over-committed) — the SAME snapshot the
 //! orchestrator `arm_verdict` and the host `effective_version(H)` stamp read — so a
@@ -33,15 +33,16 @@
 //! `StateRoot::ZERO` as the uninitialized sentinel, and `snapshot`/`install` ship
 //! exactly that root preimage (verify-then-adopt).
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+use crate::ScheduledUpgrade as UpgradeCoords;
+
 use std::collections::BTreeMap;
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use upgrade_interface::{
-    Upgrade as UpgradeCoords, UpgradeMsg, UpgradeQuery, UpgradeReply, UpgradeStatus, decode_msg,
-    decode_query, encode_reply,
-};
-use valset_interface::{
+use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_query as valset_encode_query,
 };
@@ -149,7 +150,7 @@ impl Upgrade {
 
     /// the pure derivation over COMMITTED state — the version the node layer
     /// stamps. byte-identical to the `Advance` arm check via the ONE shared
-    /// `upgrade_interface::effective_version` predicate.
+    /// `crate::effective_version` predicate.
     pub fn effective_version(&self, height: u64, boundary_members: &[Vec<u8>]) -> u32 {
         let ready: BTreeMap<Vec<u8>, ()> = self
             .committed
@@ -157,7 +158,7 @@ impl Upgrade {
             .keys()
             .map(|k| (k.clone(), ()))
             .collect();
-        upgrade_interface::effective_version(
+        crate::effective_version(
             height,
             self.committed.current_version,
             self.committed.pending.as_ref(),
@@ -301,7 +302,7 @@ impl Upgrade {
                 .map(|k| (k.clone(), ()))
                 .collect();
             let armed = up.to_version
-                == upgrade_interface::effective_version(
+                == crate::effective_version(
                     height,
                     self.committed.current_version,
                     Some(&up),
@@ -434,7 +435,7 @@ impl Module for Upgrade {
                 let armed = match &state.pending {
                     Some(up) => {
                         up.to_version
-                            == upgrade_interface::effective_version(
+                            == crate::effective_version(
                                 up.activation_height,
                                 state.current_version,
                                 Some(up),
@@ -579,7 +580,7 @@ mod tests {
     use commonware_cryptography::Signer as _;
     use commonware_cryptography::ed25519::PrivateKey;
     use commonware_codec::DecodeExt as _;
-    use upgrade_interface::encode_msg;
+    use crate::encode_msg;
 
     // a Ctx that answers the valset Validators query with a configurable member
     // set (upgrade's only host-routed read) and carries a settable origin/height.
@@ -610,7 +611,7 @@ mod tests {
         }
         async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
             // upgrade only ever queries the valset Validators set.
-            Ok(valset_interface::encode_reply(&ValsetReply::Validators(
+            Ok(valset::encode_reply(&ValsetReply::Validators(
                 self.members.clone(),
             )))
         }
@@ -671,10 +672,10 @@ mod tests {
     }
     fn status(u: &Upgrade, ctx: &TestCtx) -> UpgradeStatus {
         let reply = futures::executor::block_on(
-            u.query_with(ctx, &upgrade_interface::encode_query(&UpgradeQuery::Status)),
+            u.query_with(ctx, &crate::encode_query(&UpgradeQuery::Status)),
         )
         .unwrap();
-        match upgrade_interface::decode_reply(&reply).unwrap() {
+        match crate::decode_reply(&reply).unwrap() {
             UpgradeReply::Status(s) => s,
         }
     }

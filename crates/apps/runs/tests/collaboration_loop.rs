@@ -36,7 +36,7 @@ use chat::{
 };
 use commonware_runtime::{Runner as _, deterministic};
 use dispatch::DispatchModule;
-use dispatch_interface::{
+use dispatch::{
     DispatchQuery, DispatchReply, DispatchStatus, decode_work_spec,
     encode_query as dispatch_encode_query,
 };
@@ -47,7 +47,7 @@ use jobs::{
     encode_msg as jobs_encode_msg, encode_query as jobs_encode_query,
 };
 use saga::SagaModule;
-use saga_interface::{
+use saga::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
     decode_worker_request, encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
@@ -270,7 +270,7 @@ async fn saga_status(host: &Host, saga_id: &str) -> Option<SagaStatus> {
 
 /// a run's dispatch as the dispatch module sees it — the lifecycle ledger,
 /// including the INTERNAL saga id the failure tests feed oracle results to.
-async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch_interface::DispatchView {
+async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch::DispatchView {
     let reply = host
         .query(
             "dispatch",
@@ -281,7 +281,7 @@ async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch_interface::Dispat
         )
         .await
         .unwrap();
-    match dispatch_interface::decode_reply(&reply).unwrap() {
+    match dispatch::decode_reply(&reply).unwrap() {
         DispatchReply::Dispatch(Some(view)) => view,
         other => panic!("expected the run's dispatch, got {other:?}"),
     }

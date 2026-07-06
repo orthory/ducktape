@@ -585,9 +585,9 @@ impl Sim {
                     break;
                 }
                 self.oracle_queue.push_back(Msg {
-                    target: dispatch_interface::DEFAULT_DISPATCH_TARGET.into(),
-                    payload: dispatch_interface::encode_msg(
-                        &dispatch_interface::DispatchMsg::Nudge {},
+                    target: dispatch::DEFAULT_DISPATCH_TARGET.into(),
+                    payload: dispatch::encode_msg(
+                        &dispatch::DispatchMsg::Nudge {},
                     ),
                 });
                 continue;
@@ -827,18 +827,18 @@ struct EchoWorker;
 #[async_trait::async_trait(?Send)]
 impl reactor::Worker for EchoWorker {
     async fn run(&self, effect: &Effect) -> Result<reactor::WorkOutcome, reactor::Error> {
-        let request = match saga_interface::decode_worker_request(&effect.0) {
+        let request = match saga::decode_worker_request(&effect.0) {
             Ok(request) => request,
             Err(_) => return Ok(reactor::WorkOutcome::NotMine),
         };
         // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
         // module judged a Text contract; the agent module normalizes).
-        let Ok(work) = dispatch_interface::decode_work_spec(&request.spec) else {
+        let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
             return Ok(reactor::WorkOutcome::NotMine);
         };
         Ok(reactor::WorkOutcome::Handled(Some(Msg {
             target: "saga".into(),
-            payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
+            payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
                 saga_id: request.saga_id,
                 attempt: request.attempt,
                 outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),

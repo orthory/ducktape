@@ -30,10 +30,10 @@ use std::time::Duration;
 
 use agent::{ACTION_CHAT_POST, AgentMsg};
 use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
-use capability_interface::{CapabilityQuery, CapabilityReply};
+use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
 use common::{Cluster, poll_until, serial};
-use dispatch_interface::{DispatchQuery, DispatchReply, DispatchStatus};
+use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -189,11 +189,11 @@ fn providers(cluster: &Cluster, idx: usize, tag: &str) -> Option<Vec<Vec<u8>>> {
     let reply = cluster.query(
         idx,
         "capability",
-        &capability_interface::encode_query(&CapabilityQuery::Providers {
+        &capability::encode_query(&CapabilityQuery::Providers {
             capability: tag.into(),
         }),
     )?;
-    match capability_interface::decode_reply(&reply) {
+    match capability::decode_reply(&reply) {
         Ok(CapabilityReply::Providers(p)) => Some(p),
         _ => None,
     }
@@ -317,12 +317,12 @@ fn wait_for_delivered(cluster: &Cluster, idx: usize, run_id: &str) {
         let reply = cluster.query(
             idx,
             "dispatch",
-            &dispatch_interface::encode_query(&DispatchQuery::Dispatch {
+            &dispatch::encode_query(&DispatchQuery::Dispatch {
                 receiver: "runs".into(),
                 dispatch_id: runs::dispatch_id_for(run_id),
             }),
         )?;
-        match dispatch_interface::decode_reply(&reply) {
+        match dispatch::decode_reply(&reply) {
             Ok(DispatchReply::Dispatch(Some(view)))
                 if view.status == DispatchStatus::Delivered =>
             {

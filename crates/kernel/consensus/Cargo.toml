@@ -33,9 +33,7 @@ rand_chacha = "0.3"
 host = { workspace = true }
 sdk = { workspace = true }
 kv = { workspace = true }
-kv-interface = { workspace = true }
 directory = { workspace = true }
-directory-interface = { workspace = true }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 # the V2 certificate-shape test encodes certificates to assert flat-size aggregation.

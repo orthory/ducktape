@@ -34,16 +34,14 @@
 //! that dispatched — `Dispatch` is module-origin-only — so results route by
 //! construction, never by configuration.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::BTreeMap;
 
-use capability_interface::validate_tag;
-use dispatch_interface::{
-    DispatchMsg, DispatchQuery, DispatchReply, DispatchStatus, DispatchView,
-    MAX_DELIVERIES_PER_BLOCK, MAX_DESCRIPTION_BYTES, MAX_ID_BYTES, MAX_PAYLOAD_BYTES,
-    OutputContract, Recipe, ResultEvent, Routing, WORK_SPEC_KIND, WorkSpec, decode_msg,
-    decode_query, encode_reply, encode_result_event, encode_work_spec,
-};
-use saga_interface::{
+use capability::validate_tag;
+use saga::{
     SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, decode_callback, encode_msg as saga_encode_msg,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -950,7 +948,7 @@ impl Module for DispatchModule {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use saga_interface::{decode_msg as saga_decode_msg, encode_callback};
+    use saga::{decode_msg as saga_decode_msg, encode_callback};
     use sdk::{Env, Event};
 
     struct CaptureCtx {
@@ -1008,7 +1006,7 @@ mod tests {
     ) -> Result<(), Error> {
         let msg = Msg {
             target: "dispatch".into(),
-            payload: dispatch_interface::encode_msg(payload),
+            payload: crate::encode_msg(payload),
         };
         block_on(m.execute(ctx, &msg))
     }
@@ -1067,24 +1065,24 @@ mod tests {
         // the tests address dispatches by their composite state key; split it
         // back into the wire query's (receiver, local id) coordinates.
         let (receiver, dispatch_id) = key.split_once(SEP).expect("composite key");
-        let reply = block_on(m.query(&dispatch_interface::encode_query(
+        let reply = block_on(m.query(&crate::encode_query(
             &DispatchQuery::Dispatch {
                 receiver: receiver.into(),
                 dispatch_id: dispatch_id.into(),
             },
         )))
         .unwrap();
-        match dispatch_interface::decode_reply(&reply).unwrap() {
+        match crate::decode_reply(&reply).unwrap() {
             DispatchReply::Dispatch(v) => v,
             other => panic!("expected Dispatch reply, got {other:?}"),
         }
     }
     fn pending_deliveries(m: &DispatchModule) -> u64 {
-        let reply = block_on(m.query(&dispatch_interface::encode_query(
+        let reply = block_on(m.query(&crate::encode_query(
             &DispatchQuery::PendingDeliveries,
         )))
         .unwrap();
-        match dispatch_interface::decode_reply(&reply).unwrap() {
+        match crate::decode_reply(&reply).unwrap() {
             DispatchReply::PendingDeliveries(n) => n,
             other => panic!("expected PendingDeliveries reply, got {other:?}"),
         }
@@ -1197,12 +1195,12 @@ mod tests {
         .unwrap();
         commit(&mut m);
         let reply = block_on(
-            m.query(&dispatch_interface::encode_query(&DispatchQuery::Recipe {
+            m.query(&crate::encode_query(&DispatchQuery::Recipe {
                 recipe_id: "summarize".into(),
             })),
         )
         .unwrap();
-        let DispatchReply::Recipe(Some(recipe)) = dispatch_interface::decode_reply(&reply).unwrap()
+        let DispatchReply::Recipe(Some(recipe)) = crate::decode_reply(&reply).unwrap()
         else {
             panic!("recipe committed");
         };
@@ -1277,7 +1275,7 @@ mod tests {
         assert_eq!(max_attempts, 2);
         assert_eq!(capability.as_deref(), Some("alpha"));
         assert_eq!(pinned_assignee, Some(vec![7u8; 32]));
-        let work = dispatch_interface::decode_work_spec(&spec).unwrap();
+        let work = crate::decode_work_spec(&spec).unwrap();
         assert_eq!(work.dispatch_id, "d1");
         assert_eq!(work.capability, "alpha");
         assert_eq!(work.payload, b"input");
@@ -1400,7 +1398,7 @@ mod tests {
         commit(&mut m);
         assert_eq!(sys.msgs.len(), MAX_DELIVERIES_PER_BLOCK);
         // FIFO: the first emitted event is the first enqueued dispatch.
-        let first = dispatch_interface::decode_result_event(&sys.msgs[0].payload).unwrap();
+        let first = crate::decode_result_event(&sys.msgs[0].payload).unwrap();
         assert_eq!(first.dispatch_id, "d000");
         assert_eq!(first.outcome, Ok(b"r0".to_vec()));
         assert_eq!(sys.msgs[0].target, "even");

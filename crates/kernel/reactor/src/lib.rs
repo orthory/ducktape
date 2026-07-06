@@ -150,9 +150,9 @@ impl Reactor {
                     break;
                 }
                 queue.push_back(Msg {
-                    target: dispatch_interface::DEFAULT_DISPATCH_TARGET.into(),
-                    payload: dispatch_interface::encode_msg(
-                        &dispatch_interface::DispatchMsg::Nudge {},
+                    target: dispatch::DEFAULT_DISPATCH_TARGET.into(),
+                    payload: dispatch::encode_msg(
+                        &dispatch::DispatchMsg::Nudge {},
                     ),
                 });
                 continue;
@@ -195,7 +195,7 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use saga::SagaModule;
-    use saga_interface::{
+    use saga::{
         SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply, decode_worker_request,
         encode_msg, encode_query,
     };

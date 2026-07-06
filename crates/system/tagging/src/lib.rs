@@ -45,15 +45,14 @@
 //! and install re-derives the root from the decoded temporaries before
 //! adopting them.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
-use tagging_interface::{
-    EngagementEvent, MAX_ID_BYTES, MAX_SUBSCRIBERS_PER_SCOPE, MAX_TAGS_PER_EVENT,
-    SubscriptionView, TagEvent, TaggingMsg, TaggingQuery, TaggingReply, decode_msg, decode_query,
-    encode_event, encode_reply,
-};
 
 /// the field separator inside composite scope keys. rejected inside
 /// caller-chosen ids so a crafted container can never forge another scope.
@@ -327,7 +326,7 @@ impl TaggingModule {
         // entity's reply is itself content — entity-, module-, and
         // system-authored events are dropped here, plane-wide, so no
         // subscriber can be re-fired into an entity-answers-entity loop.
-        let tagging_interface::Author::User(_) = &author else {
+        let crate::Author::User(_) = &author else {
             return Ok(());
         };
         // deterministic truncation, never rejection: this arm must not abort
@@ -335,7 +334,7 @@ impl TaggingModule {
         if tags.len() > MAX_TAGS_PER_EVENT {
             tags.truncate(MAX_TAGS_PER_EVENT);
         }
-        let malformed = |t: &tagging_interface::EntityRef| {
+        let malformed = |t: &crate::EntityRef| {
             Self::validate_id("tag module", &t.module).is_err()
                 || Self::validate_id("tag entity", &t.entity).is_err()
         };
@@ -477,7 +476,7 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use sdk::Env;
-    use tagging_interface::{Author, EntityRef, decode_event, encode_msg};
+    use crate::{Author, EntityRef, decode_event, encode_msg};
 
     struct CaptureCtx {
         env: Env,

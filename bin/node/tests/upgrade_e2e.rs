@@ -36,10 +36,10 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{Cluster, poll_until, serial};
-use directory_interface::{DirMsg, DirQuery, DirReply};
+use directory::{DirMsg, DirQuery, DirReply};
 use forge::{ForgeMsg, ForgeQuery, ForgeReply};
-use governance_interface::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
-use upgrade_interface::{UpgradeQuery, UpgradeReply, UpgradeStatus};
+use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
+use upgrade::{UpgradeQuery, UpgradeReply, UpgradeStatus};
 
 /// convergence / boundary-crossing budget: mesh formation, readiness rounds, and
 /// filler-driven view advancement are real-time on a loaded CI core; polls exit
@@ -88,9 +88,9 @@ fn upgrade_status(cluster: &Cluster, idx: usize) -> Option<UpgradeStatus> {
     let reply = cluster.query(
         idx,
         "upgrade",
-        &upgrade_interface::encode_query(&UpgradeQuery::Status),
+        &upgrade::encode_query(&UpgradeQuery::Status),
     )?;
-    let UpgradeReply::Status(st) = upgrade_interface::decode_reply(&reply).ok()?;
+    let UpgradeReply::Status(st) = upgrade::decode_reply(&reply).ok()?;
     Some(st)
 }
 
@@ -99,9 +99,9 @@ fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
     let reply = cluster.query(
         idx,
         "directory",
-        &directory_interface::encode_query(&DirQuery::Get { key: key.into() }),
+        &directory::encode_query(&DirQuery::Get { key: key.into() }),
     )?;
-    match directory_interface::decode_reply(&reply) {
+    match directory::decode_reply(&reply) {
         Ok(DirReply::Value(v)) => v,
         _ => None,
     }
@@ -119,11 +119,11 @@ fn proposal_status(cluster: &Cluster, idx: usize, id: &str) -> Option<(ProposalS
     let reply = cluster.query(
         idx,
         "governance",
-        &governance_interface::encode_query(&GovQuery::Proposal {
+        &governance::encode_query(&GovQuery::Proposal {
             proposal_id: id.into(),
         }),
     )?;
-    match governance_interface::decode_reply(&reply) {
+    match governance::decode_reply(&reply) {
         Ok(GovReply::Proposal(Some(view))) => Some((view.status, view.votes.len())),
         _ => None,
     }
@@ -154,7 +154,7 @@ fn run_ceremony(cluster: &Cluster, proposal_id: &str, action: GovAction) {
     cluster.submit(
         0,
         "governance",
-        &governance_interface::encode_msg(&GovMsg::Propose {
+        &governance::encode_msg(&GovMsg::Propose {
             proposal_id: proposal_id.into(),
             action,
             voting_period: 600_000, // consensus-time ms; far past test end
@@ -171,7 +171,7 @@ fn run_ceremony(cluster: &Cluster, proposal_id: &str, action: GovAction) {
         "proposal {proposal_id} never opened;\n{}",
         cluster.all_log_tails(60)
     );
-    let vote = governance_interface::encode_msg(&GovMsg::Vote {
+    let vote = governance::encode_msg(&GovMsg::Vote {
         proposal_id: proposal_id.into(),
         approve: true,
     });
@@ -183,7 +183,7 @@ fn run_ceremony(cluster: &Cluster, proposal_id: &str, action: GovAction) {
     cluster.submit(
         1,
         "governance",
-        &governance_interface::encode_msg(&GovMsg::Execute {
+        &governance::encode_msg(&GovMsg::Execute {
             proposal_id: proposal_id.into(),
         }),
     );
@@ -264,7 +264,7 @@ fn push_until(cluster: &Cluster, what: &str, mut done: impl FnMut() -> bool) {
                 while !stop.load(Ordering::Relaxed) {
                     filler += 1;
                     let payload =
-                        directory_interface::encode_msg(&directory_interface::DirMsg::Set {
+                        directory::encode_msg(&directory::DirMsg::Set {
                             key: format!("upgrade-filler-l{lane}-{filler}"),
                             value: "x".into(),
                         });
@@ -324,7 +324,7 @@ fn push_tracked_until(
                     filler += 1;
                     let key = format!("crossing-l{lane}-{filler}");
                     let payload =
-                        directory_interface::encode_msg(&directory_interface::DirMsg::Set {
+                        directory::encode_msg(&directory::DirMsg::Set {
                             key: key.clone(),
                             value: "x".into(),
                         });
@@ -482,7 +482,7 @@ fn cluster_upgrade() {
     cluster.submit(
         0,
         "directory",
-        &directory_interface::encode_msg(&DirMsg::Set {
+        &directory::encode_msg(&DirMsg::Set {
             key: "post-h-liveness".into(),
             value: "alive".into(),
         }),
@@ -697,7 +697,7 @@ fn cluster_upgrade_aborts_on_unmet_quorum() {
     cluster.submit(
         0,
         "directory",
-        &directory_interface::encode_msg(&DirMsg::Set {
+        &directory::encode_msg(&DirMsg::Set {
             key: "post-abort-liveness".into(),
             value: "alive".into(),
         }),
