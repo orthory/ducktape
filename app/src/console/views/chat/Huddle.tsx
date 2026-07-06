@@ -10,6 +10,7 @@ import type { CSSProperties } from "react";
 
 import { authorName, keyHex } from "../../../domain/chat-client";
 import type { Channel, HuddleMember } from "../../../domain/chat-client";
+import type { VoiceError } from "../../../domain/voice-session";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "./HoverButton";
@@ -203,6 +204,17 @@ const STATUS_DOT: Record<string, { color: string; pulse: boolean }> = {
   idle: { color: color.muted2, pulse: false },
 };
 
+// What the dock says per failure. macOS records a mic denial permanently (it
+// never re-prompts), so `mic-denied` must route through System Settings — for
+// dev runs the OS attributes the prompt to the launching terminal, not the app.
+const ERROR_COPY: Record<VoiceError, string> = {
+  "mic-denied": "Mic access is blocked — allow it in System Settings, then retry.",
+  "mic-missing": "No usable microphone found.",
+  "mic-failed": "Mic setup failed.",
+  connection: "Voice connection failed.",
+  refused: "Couldn't join this huddle.",
+};
+
 /** The persistent session card, docked at the foot of the channel rail while
  *  we're in a huddle: status dot, channel name, participant pile, mute toggle,
  *  and Leave. */
@@ -215,6 +227,7 @@ export function HuddleDock() {
   const roster = channel?.huddle ?? [];
   const dot = STATUS_DOT[voice.status] ?? STATUS_DOT.idle;
   const live = voice.status === "live";
+  const failure = voice.status === "error" ? (voice.error ?? "connection") : null;
 
   return (
     <div
@@ -255,39 +268,69 @@ export function HuddleDock() {
         >
           #{channel?.name ?? voice.channelId}
         </span>
-        <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted2, flexShrink: 0 }}>
-          {voice.status === "connecting" ? "connecting…" : `${roster.length}`}
-        </span>
+        {!failure && (
+          <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted2, flexShrink: 0 }}>
+            {voice.status === "connecting" ? "connecting…" : `${roster.length}`}
+          </span>
+        )}
       </div>
+
+      {failure && (
+        <span style={{ font: `400 11px/1.4 ${font.sans}`, color: color.danger }}>
+          {ERROR_COPY[failure]}
+        </span>
+      )}
 
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          {roster.length > 0 ? (
-            <AvatarPile huddle={roster} names={state.authorNames} size={24} ring={color.paper} />
-          ) : (
-            <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>Just you</span>
-          )}
+          {!failure &&
+            (roster.length > 0 ? (
+              <AvatarPile huddle={roster} names={state.authorNames} size={24} ring={color.paper} />
+            ) : (
+              <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>Just you</span>
+            ))}
         </div>
 
-        <HoverButton
-          onClick={() => actions.setHuddleMuted(!voice.muted)}
-          title={voice.muted ? "Unmute" : "Mute"}
-          disabled={!live}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: 30,
-            height: 28,
-            borderRadius: radius.sm,
-            border: `1px solid ${voice.muted ? color.dangerBorder : color.borderSoft}`,
-            background: voice.muted ? color.dangerSoft : live ? color.dark : color.sunken,
-            color: voice.muted ? color.danger : live ? color.onDark : color.muted2,
-          }}
-          hoverStyle={{ filter: "brightness(1.05)" }}
-        >
-          <MicGlyph size={15} muted={voice.muted} />
-        </HoverButton>
+        {failure ? (
+          <HoverButton
+            onClick={() => voice.channelId && actions.joinHuddle(voice.channelId)}
+            title="Retry"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              padding: "6px 11px",
+              borderRadius: radius.sm,
+              border: `1px solid ${color.borderSoft}`,
+              background: color.sunken,
+              color: color.inkSoft,
+              font: `600 11.5px ${font.sans}`,
+            }}
+            hoverStyle={{ background: color.hover, color: color.ink }}
+          >
+            Retry
+          </HoverButton>
+        ) : (
+          <HoverButton
+            onClick={() => actions.setHuddleMuted(!voice.muted)}
+            title={voice.muted ? "Unmute" : "Mute"}
+            disabled={!live}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: 30,
+              height: 28,
+              borderRadius: radius.sm,
+              border: `1px solid ${voice.muted ? color.dangerBorder : color.borderSoft}`,
+              background: voice.muted ? color.dangerSoft : live ? color.dark : color.sunken,
+              color: voice.muted ? color.danger : live ? color.onDark : color.muted2,
+              opacity: live ? 1 : 0.55,
+            }}
+            hoverStyle={{ filter: "brightness(1.05)" }}
+          >
+            <MicGlyph size={15} muted={voice.muted} />
+          </HoverButton>
+        )}
 
         <HoverButton
           onClick={() => actions.leaveHuddle()}

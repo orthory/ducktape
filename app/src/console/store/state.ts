@@ -20,6 +20,7 @@ import type {
   TargetThreads,
 } from "../../domain/pages-client";
 import type { BlockRecord, NodeStatus } from "../../domain/transport";
+import type { VoiceError } from "../../domain/voice-session";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -37,6 +38,11 @@ export interface VoiceSlice {
   channelId: string | null;
   muted: boolean;
   status: "idle" | "connecting" | "live" | "error";
+  /** Why `status` is "error" — picks the dock's message. Null otherwise. */
+  error: VoiceError | null;
+  /** The huddle lives in its own desktop window right now — the in-app card
+   *  yields to it (desktop only; see store/huddle-window.ts). */
+  popped: boolean;
 }
 
 /** One search round-trip across the modules that ship materialized views —
@@ -304,7 +310,7 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
-    voice: { channelId: null, muted: false, status: "idle" },
+    voice: { channelId: null, muted: false, status: "idle", error: null, popped: false },
     members: [],
     observers: [],
     proposals: [],
