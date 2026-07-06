@@ -95,18 +95,6 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M3.7 12.2A1.2 1.2 0 0 1 4.9 11h14.2a1.2 1.2 0 0 1 1.18 1.46l-1.1 6A1.5 1.5 0 0 1 17.7 20H6.3a1.5 1.5 0 0 1-1.48-1.24z" />
     </>
   ),
-  jobs: (
-    <>
-      <rect x="4.5" y="7" width="15" height="12" rx="2" />
-      <path d="M9 7V5.6A1.6 1.6 0 0 1 10.6 4h2.8A1.6 1.6 0 0 1 15 5.6V7" />
-      <path d="M4.5 12h15M12 11v2" />
-    </>
-  ),
-  automations: (
-    <>
-      <path d="M13 3l-8 9.5h5l-1 8.5 8-9.5h-5z" />
-    </>
-  ),
 };
 
 export type IconName = keyof typeof PATHS;

@@ -66,8 +66,6 @@ export const opKey = {
   runRequest: (agentId: string) => `agent/run-request/${agentId}`,
   jobWorker: () => "agent/job-worker",
   proposal: (proposalId: string) => `governance/${proposalId}`,
-  job: (jobId: string) => `job/${jobId}`,
-  rule: (ruleId: string) => `rule/${ruleId}`,
   file: (fileId: string) => `file/${fileId}`,
 };
 

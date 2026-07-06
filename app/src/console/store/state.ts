@@ -5,7 +5,6 @@
 
 import type { AgentRecord } from "../../domain/agent-client";
 import type { PendingRun, WatchView } from "../../domain/runs-client";
-import type { Rule } from "../../domain/automations-client";
 import type {
   Channel,
   ChatSearchHit,
@@ -14,7 +13,6 @@ import type {
 } from "../../domain/chat-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
-import type { BoardCounts, Job } from "../../domain/jobs-client";
 import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
 import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
@@ -97,16 +95,6 @@ export interface ConsoleState {
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
    *  history lives in the dispatch module, not here. */
   pendingRuns: PendingRun[];
-
-  // ── Jobs (consensus work board) ──
-  /** Every job on the board, re-queried per block. */
-  jobs: Job[];
-  /** Per-status census of the board, or null when the module is absent. */
-  jobCounts: BoardCounts | null;
-
-  // ── Automations (event-triggered rules) ──
-  /** Every rule, re-queried per block; empty when the module is absent. */
-  rules: Rule[];
 
   // ── Search (cross-module reads over the node's derived index) ──
   /** The last search's results, or null before any search ran. Query-driven —
@@ -250,9 +238,6 @@ export const createInitialState = (): ConsoleState => {
     agents: [],
     watches: [],
     pendingRuns: [],
-    jobs: [],
-    jobCounts: null,
-    rules: [],
     search: null,
     searchPending: false,
     files: [],
@@ -287,9 +272,6 @@ export interface ConsoleSnapshot {
   agents: AgentRecord[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
-  jobs: Job[];
-  jobCounts: BoardCounts | null;
-  rules: Rule[];
   files: Manifest[];
   blocks: BlockRecord[];
 }
@@ -312,9 +294,6 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   agents: snapshot.agents,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
-  jobs: snapshot.jobs,
-  jobCounts: snapshot.jobCounts,
-  rules: snapshot.rules,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });

@@ -2,13 +2,11 @@
 // views/ + one entry here.
 
 import { AgentView } from "../views/agent/AgentView";
-import { AutomationsView } from "../views/automations/AutomationsView";
 import { ChatView } from "../views/chat/ChatView";
 import { ExplorerView } from "../views/explorer/ExplorerView";
 import { FilesView } from "../views/files/FilesView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { GovernanceView } from "../views/governance/GovernanceView";
-import { JobsView } from "../views/jobs/JobsView";
 import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { PagesView } from "../views/pages/PagesView";
@@ -34,8 +32,6 @@ export const MODULES: AppModule[] = [
   // ── Node operator surfaces ──
   { id: "members", nav: { icon: "members", label: "Members", order: 0, section: "operator" }, Screen: MembersView },
   { id: "governance", nav: { icon: "governance", label: "Governance", order: 1, section: "operator" }, Screen: GovernanceView },
-  { id: "jobs", nav: { icon: "jobs", label: "Jobs", order: 2, section: "operator" }, Screen: JobsView },
-  { id: "automations", nav: { icon: "automations", label: "Autos", order: 3, section: "operator" }, Screen: AutomationsView },
   { id: "modules", nav: { icon: "modules", label: "Modules", order: 4, section: "operator" }, Screen: ModulesView },
   { id: "status", nav: { icon: "node", label: "Node", order: 5, section: "operator" }, Screen: StatusView },
   { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 6, section: "operator" }, Screen: TelemetryView },

@@ -1,15 +1,12 @@
 import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
-import * as automationsClient from "../../domain/automations-client";
-import type { Action as RuleAction, Trigger } from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
 import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
-import * as jobsClient from "../../domain/jobs-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
@@ -155,30 +152,6 @@ export interface ConsoleActions {
   voteProposal(proposalId: string, approve: boolean): void;
   /** Tally and settle a decidable proposal (anyone may trigger it). */
   executeProposal(proposalId: string): void;
-
-  // ── Jobs (consensus work board over the `jobs` module) ──
-  /** Post a new job (id generated here). */
-  submitJob(params: { kind: string; spec: string }): void;
-  /** Claim a Pending job under a view-count lease. */
-  claimJob(params: { jobId: string; leaseViews: number }): void;
-  /** Report a result on a job this node is processing. */
-  finalizeJob(params: { jobId: string; ok: boolean; payload: string }): void;
-  /** Hand a Processing job back to Pending. */
-  releaseJob(jobId: string): void;
-  /** Permissionless requeue of a Processing job whose lease expired. */
-  reclaimJob(jobId: string): void;
-  /** Cancel a still-Pending job (submitter only). */
-  cancelJob(jobId: string): void;
-  /** Remove a terminal job's record entirely (submitter only). */
-  pruneJob(jobId: string): void;
-
-  // ── Automations (event-triggered rules over the `automations` module) ──
-  /** Create a rule pairing a trigger with an action. */
-  createRule(params: { ruleId: string; trigger: Trigger; action: RuleAction }): void;
-  /** Enable or disable a rule without deleting it. */
-  setRuleEnabled(ruleId: string, enabled: boolean): void;
-  /** Delete a rule. */
-  deleteRule(ruleId: string): void;
 
   // ── Search (cross-module, over the node's derived-index views) ──
   /** Search chat, docs, and pages with one text: the three modules'
@@ -921,130 +894,6 @@ export function createActions({
       );
     },
 
-    // ── Jobs ──
-    // Identity-gated ops (cancel/prune by submitter; finalize/release by
-    // claimant) all ride the daemon's default identity — origin is omitted — so
-    // submitter and claimant stay consistent for this node's own jobs.
-    submitJob: ({ kind, spec }) => {
-      const cleanKind = kind.trim();
-      if (!cleanKind) return;
-      const jobId = crypto.randomUUID();
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.submitJob(live, { jobId, kind: cleanKind, spec }),
-        (prev) =>
-          optimistic.jobAdded(prev, {
-            job_id: jobId,
-            kind: cleanKind,
-            spec,
-            // the module stamps the REAL submitter from the block origin; the
-            // refresh replaces these placeholders with committed truth.
-            submitter: prev.author,
-            status: "pending",
-            attempt: 0,
-            claim: null,
-            result: null,
-            created_at_height: prev.status?.height ?? 0,
-            updated_at_height: prev.status?.height ?? 0,
-          }),
-      );
-    },
-
-    claimJob: ({ jobId, leaseViews }) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.claimJob(live, { jobId, leaseViews }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "processing" }),
-      );
-    },
-
-    finalizeJob: ({ jobId, ok, payload }) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.finalizeJob(live, { jobId, ok, payload }),
-        (prev) =>
-          optimistic.jobPatched(prev, jobId, {
-            status: ok ? "done" : "failed",
-            result: { ok, payload },
-          }),
-      );
-    },
-
-    releaseJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.releaseJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "pending", claim: null }),
-      );
-    },
-
-    reclaimJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.reclaimJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "pending", claim: null }),
-      );
-    },
-
-    cancelJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.cancelJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "cancelled" }),
-      );
-    },
-
-    pruneJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.pruneJob(live, { jobId }),
-        (prev) => optimistic.jobRemoved(prev, jobId),
-      );
-    },
-
-    // ── Automations ──
-    createRule: ({ ruleId, trigger, action }) => {
-      const id = ruleId.trim();
-      if (!id) return;
-      submitTracked(
-        opKey.rule(id),
-        (live) => automationsClient.createRule(live, { ruleId: id, trigger, action }),
-        (prev) =>
-          optimistic.ruleAdded(prev, {
-            rule_id: id,
-            enabled: true,
-            trigger,
-            action,
-            created_at: Date.now(),
-            fire_count: 0,
-          }),
-      );
-    },
-
-    setRuleEnabled: (ruleId, enabled) => {
-      if (!ruleId) return;
-      submitTracked(
-        opKey.rule(ruleId),
-        (live) => automationsClient.setEnabled(live, { ruleId, enabled }),
-        (prev) => optimistic.rulePatched(prev, ruleId, { enabled }),
-      );
-    },
-
-    deleteRule: (ruleId) => {
-      if (!ruleId) return;
-      submitTracked(
-        opKey.rule(ruleId),
-        (live) => automationsClient.deleteRule(live, ruleId),
-        (prev) => optimistic.ruleRemoved(prev, ruleId),
-      );
-    },
-
     // ── Search (derived-index views) ──
     runSearch: (text) => {
       const live = getNode();
@@ -1186,9 +1035,6 @@ export function createActions({
         agents: [],
         watches: [],
         pendingRuns: [],
-        jobs: [],
-        jobCounts: null,
-        rules: [],
         files: [],
         ops: {},
         onboardingPhase: null,
@@ -1222,9 +1068,6 @@ export function createActions({
         agents: [],
         watches: [],
         pendingRuns: [],
-        jobs: [],
-        jobCounts: null,
-        rules: [],
         files: [],
         ops: {},
         onboardingPhase: null,

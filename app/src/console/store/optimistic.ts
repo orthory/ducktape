@@ -10,9 +10,7 @@
 
 import type { ChatBlock, MessageView } from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import type { Job } from "../../domain/jobs-client";
 import type { PageBlock } from "../../domain/pages-client";
-import type { Rule } from "../../domain/automations-client";
 import type { ConsoleState } from "./state";
 
 // ── Chat ────────────────────────────────────────────────
@@ -304,48 +302,6 @@ export const runCancelled = (
   // a cancel resolves through the dispatch plane's Err("cancelled") delivery,
   // which prunes the entry node-side a block later — mirror that prune.
   pendingRuns: prev.pendingRuns.filter((r) => r.run_id !== runId),
-});
-
-// ── Jobs ────────────────────────────────────────────────
-
-export const jobAdded = (prev: ConsoleState, job: Job): Partial<ConsoleState> => ({
-  jobs: [...prev.jobs, job],
-});
-
-export const jobPatched = (
-  prev: ConsoleState,
-  jobId: string,
-  patch: Partial<Job>,
-): Partial<ConsoleState> => ({
-  jobs: prev.jobs.map((j) => (j.job_id === jobId ? { ...j, ...patch } : j)),
-});
-
-export const jobRemoved = (
-  prev: ConsoleState,
-  jobId: string,
-): Partial<ConsoleState> => ({
-  jobs: prev.jobs.filter((j) => j.job_id !== jobId),
-});
-
-// ── Automations ─────────────────────────────────────────
-
-export const ruleAdded = (prev: ConsoleState, rule: Rule): Partial<ConsoleState> => ({
-  rules: [...prev.rules, rule],
-});
-
-export const rulePatched = (
-  prev: ConsoleState,
-  ruleId: string,
-  patch: Partial<Rule>,
-): Partial<ConsoleState> => ({
-  rules: prev.rules.map((r) => (r.rule_id === ruleId ? { ...r, ...patch } : r)),
-});
-
-export const ruleRemoved = (
-  prev: ConsoleState,
-  ruleId: string,
-): Partial<ConsoleState> => ({
-  rules: prev.rules.filter((r) => r.rule_id !== ruleId),
 });
 
 // ── Files ───────────────────────────────────────────────

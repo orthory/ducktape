@@ -14,14 +14,11 @@ import {
 import type { ReactNode } from "react";
 
 import * as agentClient from "../../domain/agent-client";
-import * as automationsClient from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
 import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
-import * as jobsClient from "../../domain/jobs-client";
-import type { BoardCounts } from "../../domain/jobs-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
@@ -124,12 +121,9 @@ export function DucktapeProvider({
             .pendingRuns(live)
             .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
-          // ── unexposed-until-now modules — every one best-effort so a node
-          //    that does not register the module reads as "empty", never a
-          //    failed refresh (same contract as governance above). ──
-          jobsClient.listJobs(live, {}).catch(() => []),
-          jobsClient.counts(live).catch((): BoardCounts | null => null),
-          automationsClient.listRules(live).catch(() => []),
+          // files is best-effort so a node that does not register the module
+          // reads as "empty", never a failed refresh (same contract as
+          // governance above).
           filesClient.list(live, {}).catch(() => []),
           // the explorer's ring pull — best-effort like telemetry, so a node
           // without /v1/blocks reads as "no blocks yet".
@@ -149,9 +143,6 @@ export function DucktapeProvider({
         watches,
         pendingRuns,
         profiles,
-        jobs,
-        jobCounts,
-        rules,
         files,
         blocks,
       ]) => {
@@ -188,9 +179,6 @@ export function DucktapeProvider({
                 agents,
                 watches,
                 pendingRuns,
-                jobs,
-                jobCounts,
-                rules,
                 files,
                 blocks,
               }),
