@@ -7,9 +7,10 @@ use std::path::PathBuf;
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 
+use crate::disk::DiskStore;
 use crate::fs::Fs;
 use crate::state::Refs;
-use crate::store::{MemRefs, MemStore, RefsStore as _};
+use crate::store::{MemRefs, RefsStore as _};
 use crate::wire::{
     FilesMsg, PUTBLOB_FRAME_TAG, decode_msg, decode_query, decode_sync_req, encode_reply,
     encode_sync_resp, to_hex,
@@ -29,17 +30,18 @@ pub fn owner_of(origin: &Origin) -> String {
 
 pub struct Files {
     id: ModuleId,
-    /// the module data dir (`<dir>/objects` + `<dir>/refs`). held for tasks
-    /// 5/6 — the phase-1 skeleton runs over the mem store pair.
+    /// the module data dir (`<dir>/objects` + `<dir>/refs`). objects now live in
+    /// the disk odb; refs persistence stays MemRefs until task 6.
     #[allow(dead_code)]
     dir: PathBuf,
-    fs: Fs<MemStore>,
+    fs: Fs<DiskStore>,
     refs_store: MemRefs,
 }
 
 impl Files {
-    /// open (or create) the module over its data dir. a fresh refs store
-    /// yields empty refs; tasks 5/6 swap the mem pair for the disk pair.
+    /// open (or create) the module over its data dir. the disk odb lives at
+    /// `<dir>/objects`; a fresh refs store yields empty refs (refs persistence
+    /// swaps to the disk pair in task 6).
     pub fn open(id: impl Into<ModuleId>, dir: PathBuf) -> Result<Self, Error> {
         let refs_store = MemRefs::new();
         let refs = match refs_store
@@ -49,10 +51,12 @@ impl Files {
             Some((refs, _height, _gc_watermark)) => refs,
             None => Refs::default(),
         };
+        let store = DiskStore::open(dir.join("objects"))
+            .map_err(|e| Error::Module(format!("files: odb open: {e}")))?;
         Ok(Self {
             id: id.into(),
             dir,
-            fs: Fs::new(MemStore::new(), refs),
+            fs: Fs::new(store, refs),
             refs_store,
         })
     }
