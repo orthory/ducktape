@@ -428,7 +428,7 @@ fn grep_finds_needle_at_line_with_exact_evidence_uri() {
     assert_eq!(hits[0].text, "needle here");
     assert_eq!(
         hits[0].uri,
-        format!("duck://files//shared/gb/0needle@{snap}#L1"),
+        format!("duck://files/shared/gb/0needle@{snap}#L1"),
         "byte-exact evidence uri"
     );
     assert_eq!(hits[1].path, "/shared/gb/2needle");
@@ -585,7 +585,7 @@ fn grep_snapshot_addressed_finds_a_needle_in_a_deleted_file() {
     assert_eq!(at_s1[0].path, "/shared/sg/secret");
     assert_eq!(
         at_s1[0].uri,
-        format!("duck://files//shared/sg/secret@{s1}#L1")
+        format!("duck://files/shared/sg/secret@{s1}#L1")
     );
 }
 

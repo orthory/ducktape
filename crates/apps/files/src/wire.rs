@@ -303,9 +303,12 @@ pub fn encode_putblob(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// grep-hit evidence uri.
+/// grep-hit evidence uri: `duck://files<path>@<snapshot>#L<line>`. the path is
+/// absolute and brings its own leading slash, so the authority is joined
+/// bare — same rule as memory's `duck://memory<path>` uris (a separator slash
+/// here would double it).
 pub fn evidence_uri(path: &str, snapshot: &str, line: u64) -> String {
-    format!("duck://files/{path}@{snapshot}#L{line}")
+    format!("duck://files{path}@{snapshot}#L{line}")
 }
 
 /// decode exactly 64 lowercase-hex chars into 32 bytes (uppercase rejected).
