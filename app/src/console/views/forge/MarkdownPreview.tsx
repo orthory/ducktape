@@ -18,6 +18,12 @@ const heading = (size: number, mt: number): CSSProperties => ({
 
 const codeFont = `400 12.5px ${font.mono}`;
 
+// GFM emits the HTML `align` attr ("left" | "center" | "right"), which is wider
+// than CSS textAlign accepts (it also allows "char"); narrow it to a valid value.
+function cellAlign(align: string | undefined): CSSProperties["textAlign"] {
+  return align === "center" || align === "right" ? align : "left";
+}
+
 const COMPONENTS: Components = {
   h1: ({ children }) => (
     <h1 style={{ ...heading(24, 26), borderBottom: `1px solid ${color.borderSoft}`, paddingBottom: 8 }}>
@@ -110,13 +116,13 @@ const COMPONENTS: Components = {
       <table style={{ borderCollapse: "collapse", font: `400 12.5px ${font.sans}` }}>{children}</table>
     </div>
   ),
-  th: ({ children }) => (
-    <th style={{ border: `1px solid ${color.border}`, padding: "6px 11px", background: color.sunken, textAlign: "left", fontWeight: 600 }}>
+  th: ({ children, align }) => (
+    <th style={{ border: `1px solid ${color.border}`, padding: "6px 11px", background: color.sunken, textAlign: cellAlign(align), fontWeight: 600 }}>
       {children}
     </th>
   ),
-  td: ({ children }) => (
-    <td style={{ border: `1px solid ${color.border}`, padding: "6px 11px" }}>{children}</td>
+  td: ({ children, align }) => (
+    <td style={{ border: `1px solid ${color.border}`, padding: "6px 11px", textAlign: cellAlign(align) }}>{children}</td>
   ),
   img: ({ alt, src }) => (
     <span
