@@ -11,14 +11,15 @@ roadmap). This document is the *how*.
 
 > **Scope honesty.** Everything on this page **works today**: `bin/coordinator`
 > runs as-is and its `--listen` invocation is regression-proven by
-> `bin/coordinator/tests/deploy_smoke.rs`. What does **not** work yet is the
-> other end: the live `ducktape-node` does not call the coordinator (reflexive
-> discovery, hole-punch, and WireGuard bring-up are unwired in the node —
-> `nat-traversal` and `wireguard-effect` are not dependencies of `bin/node`).
-> Deploying this coordinator is real and useful, but it does **not** by itself
-> yield a working zero-exposure tunnel. See
-> [the cross-machine runbook](cross-machine-zero-exposure-runbook.md) (every
-> step tagged) and [the integration-gap handoff](private-cutover-integration-gap.md).
+> `bin/coordinator/tests/deploy_smoke.rs`. On the other end, the node-side
+> reachability plane is wired but **staged**: `bin/node` constructs a
+> `reachability::NatResolver` (reflexive discovery, `register`, hole-punch
+> against the configured coordinators) only when `wireguard_listen` is
+> configured. What still does not work end-to-end (v3 `Coordinated` hint
+> consumption, coordinator-auth) is tracked in
+> [the integration-gap handoff](private-cutover-integration-gap.md); the
+> cross-machine procedure is
+> [the runbook](cross-machine-zero-exposure-runbook.md).
 
 ## Why this is safe (untrusted by design)
 
@@ -53,8 +54,13 @@ provides two services on that one socket:
   public `ip:port` so it can learn its own NAT-mapped address.
 
 Everything it answers derives from the **observed source** of the datagram, so
-a wildcard `--listen 0.0.0.0:3478` bind is fully functional — there is no
-bind-IP caveat.
+a wildcard `--listen 0.0.0.0:3478` bind is fully functional on a single-IP
+host. **Multi-homed caveat:** on a box with more than one routable IP, bind the
+concrete public IP peers dial. Replies from a wildcard-bound UDP socket egress
+with the kernel's route-chosen source address, and `NatClient` (correctly)
+discards any reply that does not come from the exact address it dialed — so a
+coordinator answering from the "wrong" IP looks healthy while every client
+times out.
 
 No TCP listener. No config file. No disk. No secret. `--listen` is the only flag
 the binary parses; on bind it prints `coordinator listening on <addr>` to
@@ -152,14 +158,13 @@ on it" framing actually holds.
 
 ## What this recipe does NOT do (forward reference)
 
-The coordinator deployed here is live and correct, **but the `ducktape-node`
-does not yet use it.** Reflexive discovery, hole-punch, and WireGuard bring-up
-are all **unwired in the node** — the mechanism is CI-proven in
-`crates/system/nat-traversal` and `crates/system/wireguard-effect`, but neither
-crate is a dependency of `bin/node`, and a v3 `Coordinated` invite hint is
-currently dialed as an ordinary **TCP mesh bootstrapper** at the coordinator's
-**UDP** address (a no-op-at-best). Do **not** read this page as claiming a
-zero-exposure tunnel. For the exact works-today / needs-wiring line, see
-[`cross-machine-zero-exposure-runbook.md`](cross-machine-zero-exposure-runbook.md);
-for the engineering handoff to close the gap, see
-[`private-cutover-integration-gap.md`](private-cutover-integration-gap.md).
+The coordinator deployed here is live and correct, and the node-side
+reachability plane (staged behind `wireguard_listen`) drives it: `bin/node`
+constructs a `NatResolver` that discovers its reflexive, `register`s, and
+hole-punches against the configured coordinators. What this page still does
+**not** claim is a demonstrated end-to-end zero-exposure tunnel: a v3
+`Coordinated` invite hint is not yet consumed as a reachability path, and
+coordinator-auth remains open. For the exact works-today line, see
+[`private-cutover-integration-gap.md`](private-cutover-integration-gap.md);
+the cross-machine procedure is
+[`cross-machine-zero-exposure-runbook.md`](cross-machine-zero-exposure-runbook.md).

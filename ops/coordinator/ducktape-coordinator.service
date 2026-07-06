@@ -14,9 +14,10 @@ Wants=network-online.target
 
 [Service]
 # The ONE operator-set value: which address to bind. 0.0.0.0:3478 is fully
-# functional — every answer derives from the datagram's observed source, so a
-# wildcard bind has no caveat. This file holds NO secret; the coordinator has
-# none.
+# functional on a single-IP host — every answer derives from the datagram's
+# observed source. On a multi-homed host bind the concrete public IP peers
+# dial (replies from a wildcard socket egress with the route-chosen source IP,
+# which clients reject). This file holds NO secret; the coordinator has none.
 EnvironmentFile=/etc/ducktape/coordinator.env
 ExecStart=/usr/local/bin/ducktape-coordinator --listen ${COORDINATOR_LISTEN}
 Restart=always

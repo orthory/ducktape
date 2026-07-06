@@ -64,6 +64,10 @@ fn hole_punch_failure_is_terminal() {
     // A symmetric-NAT pair defeats simultaneous open, and with no relay
     // fallback that is the END of resolution: `NotReachable`, honestly
     // surfaced, never a coordinator-carried data path.
+    //
+    // Deliberately overlaps punch.rs's symmetric-NAT unit test: this suite
+    // mirrors the spec's Acceptance §1 rows one-to-one, so the row keeps its
+    // own named test even where a unit test covers the same contract.
     let a = NodeKey([0xaa; 32]);
     let b = NodeKey([0xbb; 32]);
     let mut a_nat = SimNat::symmetric(ip(1));
@@ -112,6 +116,10 @@ async fn punched_path_survives_coordinator_death() {
     // A punched path lives entirely in the two NATs' filter state: once
     // established, the coordinator's death cannot touch it. (With rendezvous
     // only, no data path ever traverses the coordinator in the first place.)
+    //
+    // Deliberately overlaps client.rs's coordinator-shutdown unit test: this
+    // suite mirrors the spec's Acceptance §1 rows one-to-one, so the row keeps
+    // its own named test even where a unit test covers the same contract.
     let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
     let coord = tokio::spawn(run_coordinator(coord_sock));

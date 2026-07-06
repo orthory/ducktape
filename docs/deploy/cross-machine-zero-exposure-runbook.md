@@ -9,9 +9,16 @@ wiring.
 > **Legend.** `[WORKS TODAY]` — runs now with shipped binaries.
 > `[NEEDS NODE WIRING]` — the mechanism exists and is CI-proven in
 > `crates/system/nat-traversal` and/or `crates/system/wireguard-effect`, but
-> `ducktape-node` does **not** call it yet (`nat-traversal` and
-> `wireguard-effect` are not dependencies of `bin/node` — verified). See
+> was not yet called by `ducktape-node` when the step was tagged. See
 > [`private-cutover-integration-gap.md`](private-cutover-integration-gap.md).
+>
+> **Status update (2026-07-06).** Two things changed since the tags were
+> written. (1) The node-side reachability plane landed on `dev`, staged behind
+> `wireguard_listen`: `bin/node` now depends on `reachability`/`wireguard-effect`
+> and constructs a `NatResolver` (reflexive discovery, `register`, hole-punch)
+> — so several `[NEEDS NODE WIRING]` tags below are stale; the integration-gap
+> doc is the authoritative works-today line. (2) The DERP-style relay was
+> removed; the coordinator is rendezvous-only (step 8 below).
 >
 > **This runbook does not yet yield a working zero-exposure tunnel.** It stands
 > up the real coordinator and shows the invite/entry path that works today, then
@@ -70,9 +77,11 @@ gotcha, the 2-validator-quorum teardown caveat).
 - Mint and parse a v3 `Coordinated` invite (step 2, encoding).
 - Admit A and B (step 3).
 
-**You cannot yet** do any step tagged `[NEEDS NODE WIRING]` (steps 4-7 and 9):
-the node constructs no `NatClient`, discovers no reflexive, punches nothing, and
-brings up no WireGuard interface. The logic behind those steps is already
+**You cannot yet** demonstrate the end-to-end tunnel this runbook targets: a
+v3 `Coordinated` hint is still not consumed as a reachability path (step 5) and
+coordinator-auth is open — though the node-side plane itself has since landed
+staged behind `wireguard_listen` (see the status update above), so the
+per-step tags overstate what is missing today. The logic behind those steps is
 proven at the library level by the CI simulated-NAT suite
 (`crates/system/nat-traversal/tests/simnat_ci.rs`, Slice 3) with a fake NAT and a
 `FakeWireGuardEffect`. The moment the node wiring lands (the

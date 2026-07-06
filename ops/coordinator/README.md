@@ -31,6 +31,9 @@ docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
 docker run --rm -p 3478:3478/udp ducktape-coordinator
 ```
 
-A `--listen 0.0.0.0:3478` wildcard bind is fully functional: every answer
-derives from the datagram's observed source, so there is no bind-IP caveat.
-Full detail in `docs/deploy/coordinator.md`.
+A `--listen 0.0.0.0:3478` wildcard bind is fully functional on a single-IP
+host: every answer derives from the datagram's observed source. On a
+**multi-homed** host, bind the concrete public IP peers dial — replies from a
+wildcard socket egress with the route-chosen source IP, and clients discard
+replies that don't come from the address they dialed. Full detail in
+`docs/deploy/coordinator.md`.

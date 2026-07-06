@@ -1,5 +1,13 @@
 # Slice 3 — Hardening (Rebinding · Multi-Coordinator · Survival) + Full CI Simulated-NAT Suite
 
+> **Historical record (amended 2026-07-06).** The DERP-style coordinator relay
+> this plan references (`RelayRequest`/`RelayGrant`, `request_relay`,
+> `relay_send`/`relay_recv`, `drive_with_relay_fallback`, the relay-bind
+> caveat) was built and subsequently **removed** — the coordinator is
+> rendezvous-only and a failed hole-punch is terminal. Do not plan new work
+> against the relay API. See the amendment note in
+> `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Each task ends in a commit; do not batch commits.
 
 **Goal:** Harden the reachability plane built in Slices 0a/0b/1/2 against the three failure modes the design's §"Error and fallback handling" enumerates — **NAT rebinding**, **coordinator unreachability (multiple coordinators)**, and **path survival across coordinator downtime** — and consolidate the deterministic proofs into the single **CI simulated-NAT suite** that is the epic's merge gate (design §"Acceptance" item 1). This slice is the last of the code slices before the Slice 4 deployment runbook.
