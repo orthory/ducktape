@@ -710,16 +710,15 @@ pub fn open_index_store<S: AsRef<str>>(
 }
 
 /// flatten a dispatch origin into the index's plain origin tag: external
-/// submitter identities render lossily as utf-8, exactly what the mappers'
-/// author rendering assumes — on BOTH lanes. the validator's key-byte
-/// identities render the same way, because a mapper's from-state rebuild
-/// re-renders authors from canonical state with this exact convention
-/// (see `chat::index` `author_from_ref`): folded and rebuilt rows must match
-/// byte-for-byte. hex-keyed identity belongs to the explorer row's
-/// `proposer`, not the index op rows.
+/// submitter identities render via [`indexer::user_handle`] — printable claimed
+/// names pass through, raw ed25519 pubkeys become hex (never the lossy `�`
+/// boxes a plain utf-8 decode leaves). the same convention drives a mapper's
+/// from-state rebuild (see `chat::index` `author_from_ref`), so folded and
+/// rebuilt rows match byte-for-byte on BOTH lanes. hex-keyed identity belongs
+/// to the explorer row's `proposer`, not the index op rows.
 pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {
     match origin {
-        sdk::Origin::External(id) => indexer::OriginTag::external(String::from_utf8_lossy(id)),
+        sdk::Origin::External(id) => indexer::OriginTag::external(indexer::user_handle(id)),
         sdk::Origin::Module(id) => indexer::OriginTag::module(id.clone()),
         sdk::Origin::System => indexer::OriginTag::system(),
     }

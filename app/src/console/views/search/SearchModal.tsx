@@ -126,6 +126,21 @@ function Group({ title, count, children }: { title: string; count: number; child
   );
 }
 
+// The chat index pre-renders authors as `user:<id>`, `agent:<mod>/<id>`,
+// `module:<id>`, or `system`. On a networked node `<id>` is the submitter's hex
+// pubkey — resolve it to a profile nickname (or a short hex handle) so a hit
+// reads like that author does everywhere else, and picks up member renames for
+// free. On the embedded daemon `<id>` is a claimed utf-8 name; show it as-is.
+// Agent / module / system authors keep their tag, which distinguishes them.
+export function resolveHitAuthor(author: string, names: Record<string, string>): string {
+  if (!author.startsWith("user:")) return author;
+  const id = author.slice("user:".length);
+  if (/^[0-9a-f]{16,}$/.test(id) && id.length % 2 === 0) {
+    return displayNameForKey(id, names) ?? shortKey(id);
+  }
+  return id;
+}
+
 function HitButton({ meta, text, onOpen }: { meta: string; text: string; onOpen: () => void }) {
   const [hover, setHover] = useState(false);
   return (
@@ -269,7 +284,7 @@ export function SearchModal() {
               {chatHits.map((hit) => (
                 <HitButton
                   key={`${hit.channelId}/${hit.seq}`}
-                  meta={`#${hit.channelId} · ${hit.author}${hit.edited ? " · edited" : ""}`}
+                  meta={`#${hit.channelId} · ${resolveHitAuthor(hit.author, state.authorNames)}${hit.edited ? " · edited" : ""}`}
                   text={hit.text}
                   onOpen={() => openChat(hit.channelId)}
                 />

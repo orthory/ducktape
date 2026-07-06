@@ -106,6 +106,9 @@ const sectionLabel: CSSProperties = {
   color: color.muted2,
 };
 
+// mirrors `profiles::MAX_NAME_LEN` — the module rejects a longer display name.
+const MAX_NAME_LEN = 64;
+
 function makeMembers(
   members: string[],
   observers: string[],
@@ -301,6 +304,8 @@ function MemberRow({
   canGovernObserver,
   onPromote,
   onRevoke,
+  canRename,
+  onRename,
 }: {
   member: MemberVM;
   selected: boolean;
@@ -312,8 +317,80 @@ function MemberRow({
   canGovernObserver: boolean;
   onPromote: () => void;
   onRevoke: () => void;
+  /** Show the rename control for this row — the local node's own entry, the
+   *  only profile an origin-gated `SetName` may write. */
+  canRename: boolean;
+  onRename: (name: string) => void;
 }) {
   const [hover, setHover] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  // Inline self-rename: the same origin-gated profiles write Settings uses,
+  // surfaced on your own row. Enter/Save commits, Escape/Cancel discards; an
+  // empty name is treated as no change (Settings owns clearing).
+  if (canRename && editing) {
+    const commit = () => {
+      const next = draft.trim();
+      if (next && next !== member.profileName) onRename(next);
+      setEditing(false);
+    };
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "10px 14px",
+          borderBottom: `1px solid ${color.borderSoft}`,
+          borderRadius: radius.md,
+          background: color.sunken,
+        }}
+      >
+        <Avatar member={member} />
+        <input
+          autoFocus
+          aria-label="Edit your display name"
+          value={draft}
+          maxLength={MAX_NAME_LEN}
+          placeholder={member.shortKey}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              commit();
+            } else if (event.key === "Escape") {
+              event.preventDefault();
+              setEditing(false);
+            }
+          }}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            height: 30,
+            padding: "0 10px",
+            borderRadius: radius.sm,
+            border: `1px solid ${color.borderStrong}`,
+            background: color.paper,
+            font: `500 13.5px ${font.sans}`,
+            color: color.ink,
+            outline: "none",
+          }}
+        />
+        <HoverButton variant="dark" ariaLabel="Save display name" onClick={commit}>
+          <Icon name="check" size={13} />
+          Save
+        </HoverButton>
+        <HoverButton
+          variant="ghost"
+          ariaLabel="Cancel rename"
+          onClick={() => setEditing(false)}
+        >
+          <Icon name="close" size={13} />
+        </HoverButton>
+      </div>
+    );
+  }
   // A container div (not a button) so the removal control is a SIBLING of the
   // open button — nesting interactive controls inside a button is invalid.
   return (
@@ -408,6 +485,20 @@ function MemberRow({
           )}
         </div>
       </button>
+      {canRename ? (
+        <div style={{ flexShrink: 0, paddingRight: 12 }}>
+          <HoverButton
+            variant="ghost"
+            ariaLabel="Rename yourself"
+            onClick={() => {
+              setDraft(member.profileName ?? "");
+              setEditing(true);
+            }}
+          >
+            <Icon name="edit" size={14} />
+          </HoverButton>
+        </div>
+      ) : null}
       {canGovernObserver ? (
         <div style={{ flexShrink: 0, paddingRight: 12, display: "flex", gap: 7 }}>
           <HoverButton
@@ -1102,6 +1193,8 @@ export function MembersView() {
                   canGovernObserver={canAdmin && member.tier === "observer"}
                   onPromote={() => requestPromote(member)}
                   onRevoke={() => requestRevoke(member)}
+                  canRename={member.isLocal}
+                  onRename={actions.setDisplayName}
                 />
               ))}
             </div>

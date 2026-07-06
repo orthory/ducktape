@@ -72,7 +72,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::select;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use inbox::Inbox;
-use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
+use indexer::{AppliedOp, BlockOps, IndexStore};
 use jobs::Jobs;
 use memory::Memory;
 use noded::{
@@ -647,7 +647,10 @@ impl Sim {
             .dispatches
             .into_iter()
             .map(|d| AppliedOp {
-                origin: index_origin(&d.origin),
+                // reuse noded's mapping verbatim (single source of truth) so
+                // index rows read identically across the real and sim daemons —
+                // including the printable-name-or-hex author rendering.
+                origin: noded::index_origin(&d.origin),
                 module: d.module,
                 payload: d.payload,
             })
@@ -725,16 +728,6 @@ fn committed_info(committed: &Committed, kind: &'static str) -> CommittedInfo {
         op_hash: committed.op_hash.clone(),
         target: committed.target.clone(),
         kind,
-    }
-}
-
-/// map a dispatch origin to the index's flattened origin tag — noded's exact
-/// mapping, so index rows read identically across the real and sim daemons.
-fn index_origin(origin: &Origin) -> OriginTag {
-    match origin {
-        Origin::External(id) => OriginTag::external(String::from_utf8_lossy(id)),
-        Origin::Module(id) => OriginTag::module(id.clone()),
-        Origin::System => OriginTag::system(),
     }
 }
 
