@@ -253,6 +253,13 @@ export function SearchModal() {
             style={searchInput}
             value={text}
             autoFocus
+            // A search box, not prose: kill WebKit's autocorrect/-capitalize so
+            // typing "test" isn't "corrected" to "Test", and drop the native
+            // autocomplete dropdown. Matches the members search input.
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
             placeholder="Search chat, docs, members, files…"
             aria-label="Search"
             onChange={(event) => setText(event.target.value)}
