@@ -960,6 +960,18 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         msg: Msg,
     ) -> Result<FrameId, Error> {
         let frame = encode_frame(signer, seq, &msg);
+        self.submit_frame(frame).await
+    }
+
+    /// take custody of an ALREADY-SIGNED frame (the relay entry point: an
+    /// observer signs with its own identity key, a validator injects). the
+    /// signature is verified BEFORE anything is pinned — junk from the wire
+    /// must never enter the durable store or the orderer. custody semantics
+    /// are identical to [`OrderedNode::submit`]: pin, propose, track
+    /// outstanding (the cutover carry and the exactly-once digest gate treat
+    /// a relayed frame exactly like a local one).
+    pub async fn submit_frame(&mut self, frame: Vec<u8>) -> Result<FrameId, Error> {
+        decode_frame(&frame)?;
         let id = frame_id(&frame);
         // durably pin the bytes BEFORE the orderer may propose their digest:
         // once the engine journals a finalization, these bytes are the only
@@ -972,6 +984,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // errored submit is reported to the caller, who retries — tracking
         // it would double the op when the retry lands and a cutover carries
         // the failed original too.
+        let (_, seq) = frame_origin_seq(&frame).expect("decode_frame verified the envelope");
         self.outstanding.insert(id, (seq, frame));
         Ok(id)
     }
