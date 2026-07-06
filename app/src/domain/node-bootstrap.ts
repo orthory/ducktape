@@ -38,7 +38,13 @@ export const isTauri = (): boolean =>
  *  top-left of the web content. That overlay is macOS-only — Linux/Windows keep
  *  native decorations and the web build has no window chrome — so UI that insets
  *  to clear the traffic lights must gate on this predicate. Detected via the
- *  WKWebView user-agent (`Macintosh`): synchronous, no extra plugin/capability. */
+ *  WKWebView user-agent (`Macintosh`): synchronous, no extra plugin/capability.
+ *
+ *  Coupled to the window's user-agent: the default WKWebView UA carries
+ *  `Macintosh` on macOS, so this holds today. If a custom `userAgent` is ever set
+ *  in tauri.conf.json (or the target set grows to iOS, whose UA also matches
+ *  `/Mac/i`), revisit this — a false negative would let the traffic lights
+ *  occlude the brand, a false positive would inset where there are none. */
 export const isMacDesktop = (): boolean =>
   isTauri() &&
   typeof navigator !== "undefined" &&

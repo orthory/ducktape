@@ -11,6 +11,14 @@ import { accentVar, color, font, radius } from "../theme/tokens";
 import { useDucktape } from "../store/use-ducktape";
 import { isMacDesktop } from "../../domain/node-bootstrap";
 
+// Left inset that clears the macOS traffic lights. Only the macOS desktop build
+// overlays them on the content (see isMacDesktop); on Linux/Windows desktop and
+// on web the brand sits flush at the bar's normal 13px edge, symmetric with the
+// status half. The platform is fixed for the process lifetime, so this is
+// resolved once at module load rather than per TitleBar render (which re-renders
+// on every finalized block).
+const TRAFFIC_LIGHT_INSET = isMacDesktop() ? 69 : 0;
+
 // The centered search affordance in the title bar: a compact field that opens
 // the ⌘K palette (see ConsoleShell / SearchModal). It sits in the middle cell
 // of the bar's `1fr auto 1fr` grid, so it tracks the window's true midpoint
@@ -91,11 +99,6 @@ function TitleBar() {
   const { state } = useDucktape();
   const dot = state.connected ? color.green : color.red;
   const label = state.connected ? "Connected" : "Disconnected";
-  // Only the macOS desktop build overlays the traffic lights on the content, so
-  // only it needs the left inset. Elsewhere (Linux/Windows desktop, web) the
-  // brand sits flush at the bar's normal 13px edge, symmetric with the status
-  // half on the right.
-  const trafficLightInset = isMacDesktop() ? 69 : 0;
 
   return (
     <div
@@ -126,7 +129,7 @@ function TitleBar() {
           minWidth: 0,
           overflow: "hidden",
           // clear the macOS traffic lights (macOS desktop only; 0 elsewhere)
-          paddingLeft: trafficLightInset,
+          paddingLeft: TRAFFIC_LIGHT_INSET,
         }}
       >
         <div
