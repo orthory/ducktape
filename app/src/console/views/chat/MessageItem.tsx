@@ -149,19 +149,19 @@ function AgentPill() {
 
 function renderSpan(span: Span, names: AuthorNames, key: number): ReactNode {
   const mentionMark = span.marks.find(
-    (m): m is { Mention: AuthorRef } => typeof m === "object" && "Mention" in m,
+    (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
   );
   if (mentionMark) {
     return (
       <span key={key} style={{ color: accentVar, fontWeight: 500 }}>
-        @{authorName(mentionMark.Mention, names)}
+        @{authorName(mentionMark.mention, names)}
       </span>
     );
   }
-  const linkMark = span.marks.find((m): m is { Link: string } => typeof m === "object" && "Link" in m);
+  const linkMark = span.marks.find((m): m is { link: string } => typeof m === "object" && "link" in m);
   const style: CSSProperties = {
-    fontWeight: span.marks.includes("Bold") ? 600 : 400,
-    fontStyle: span.marks.includes("Italic") ? "italic" : "normal",
+    fontWeight: span.marks.includes("bold") ? 600 : 400,
+    fontStyle: span.marks.includes("italic") ? "italic" : "normal",
     color: linkMark ? accentVar : undefined,
     textDecoration: linkMark ? "underline" : undefined,
     overflowWrap: "anywhere",
@@ -188,10 +188,10 @@ function renderSpan(span: Span, names: AuthorNames, key: number): ReactNode {
 
 function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
   return blocks.map((block, i) => {
-    if (block === "Divider") {
+    if (block === "divider") {
       return <div key={i} style={{ height: 1, background: color.borderSoft, margin: "7px 0" }} />;
     }
-    if ("Paragraph" in block) {
+    if ("paragraph" in block) {
       return (
         <div
           key={i}
@@ -203,11 +203,11 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
             minWidth: 0,
           }}
         >
-          {block.Paragraph.map((span, j) => renderSpan(span, names, j))}
+          {block.paragraph.map((span, j) => renderSpan(span, names, j))}
         </div>
       );
     }
-    if ("Quote" in block) {
+    if ("quote" in block) {
       return (
         <div
           key={i}
@@ -222,7 +222,7 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
             maxWidth: "100%",
           }}
         >
-          {block.Quote.map((span, j) => renderSpan(span, names, j))}
+          {block.quote.map((span, j) => renderSpan(span, names, j))}
         </div>
       );
     }
@@ -243,7 +243,7 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
           whiteSpace: "pre",
         }}
       >
-        {block.Code.text}
+        {block.code.text}
       </pre>
     );
   });

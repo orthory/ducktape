@@ -34,16 +34,16 @@ describe("document msgs", () => {
     const transport = stubTransport();
     await createDoc(transport, { docId: "notes" });
     expect(transport.submit).toHaveBeenCalledWith("document", {
-      CreateDoc: { doc_id: "notes" },
+      create_doc: { doc_id: "notes" },
     });
   });
 
   it("encodes InsertBlock, keeping after:null (a front insert) on the wire", async () => {
     const transport = stubTransport();
-    const block: Block = { id: "b1", kind: "Paragraph", text: "hi" };
+    const block: Block = { id: "b1", kind: "paragraph", text: "hi" };
     await insertBlock(transport, { docId: "notes", after: null, block });
     expect(transport.submit).toHaveBeenCalledWith("document", {
-      InsertBlock: { doc_id: "notes", after: null, block },
+      insert_block: { doc_id: "notes", after: null, block },
     });
   });
 
@@ -52,44 +52,44 @@ describe("document msgs", () => {
 
     await updateBlock(transport, { docId: "notes", blockId: "b1", text: "next" });
     expect(transport.submit).toHaveBeenCalledWith("document", {
-      UpdateBlock: { doc_id: "notes", block_id: "b1", text: "next" },
+      update_block: { doc_id: "notes", block_id: "b1", text: "next" },
     });
 
     await removeBlock(transport, { docId: "notes", blockId: "b1" });
     expect(transport.submit).toHaveBeenCalledWith("document", {
-      RemoveBlock: { doc_id: "notes", block_id: "b1" },
+      remove_block: { doc_id: "notes", block_id: "b1" },
     });
 
     await moveBlock(transport, { docId: "notes", blockId: "b1", after: "b0" });
     expect(transport.submit).toHaveBeenCalledWith("document", {
-      MoveBlock: { doc_id: "notes", block_id: "b1", after: "b0" },
+      move_block: { doc_id: "notes", block_id: "b1", after: "b0" },
     });
   });
 });
 
 describe("document queries", () => {
   it("sends GetDoc and decodes Doc into ordered blocks", async () => {
-    const blocks: Block[] = [{ id: "b1", kind: "Heading", text: "Title" }];
-    const transport = stubTransport({ Doc: blocks });
+    const blocks: Block[] = [{ id: "b1", kind: "heading", text: "Title" }];
+    const transport = stubTransport({ doc: blocks });
     await expect(getDoc(transport, "notes")).resolves.toEqual(blocks);
     expect(transport.query).toHaveBeenCalledWith("document", {
-      GetDoc: { doc_id: "notes" },
+      get_doc: { doc_id: "notes" },
     });
   });
 
-  it("decodes Doc:null as an absent doc", async () => {
-    const transport = stubTransport({ Doc: null });
+  it("decodes doc:null as an absent doc", async () => {
+    const transport = stubTransport({ doc: null });
     await expect(getDoc(transport, "ghost")).resolves.toBeNull();
   });
 
   it("sends GetBlock and decodes Block", async () => {
-    const block: Block = { id: "b1", kind: "Code", text: "x = 1" };
-    const transport = stubTransport({ Block: block });
+    const block: Block = { id: "b1", kind: "code", text: "x = 1" };
+    const transport = stubTransport({ block: block });
     await expect(
       getBlock(transport, { docId: "notes", blockId: "b1" }),
     ).resolves.toEqual(block);
     expect(transport.query).toHaveBeenCalledWith("document", {
-      GetBlock: { doc_id: "notes", block_id: "b1" },
+      get_block: { doc_id: "notes", block_id: "b1" },
     });
   });
 });

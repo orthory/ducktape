@@ -45,7 +45,7 @@ pub struct TaskRow {
 }
 
 /// tasks' view requests, externally tagged:
-/// `{"byStatus": {"status": "Open", "after": "...", "limit": 50}}` or
+/// `{"byStatus": {"status": "open", "after": "...", "limit": 50}}` or
 /// `{"task": {"taskId": "..."}}`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -306,7 +306,7 @@ mod tests {
         );
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "Open"}}))
+            view(&store, serde_json::json!({"byStatus": {"status": "open"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -323,7 +323,7 @@ mod tests {
         );
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "Open"}}))
+            view(&store, serde_json::json!({"byStatus": {"status": "open"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(tasks[0].task_id, "t2");
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "Done"}}))
+            view(&store, serde_json::json!({"byStatus": {"status": "done"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -368,7 +368,7 @@ mod tests {
             next_after,
         } = view(
             &store,
-            serde_json::json!({"byStatus": {"status": "Open", "limit": 2}}),
+            serde_json::json!({"byStatus": {"status": "open", "limit": 2}}),
         )
         else {
             panic!("wrong reply shape")
@@ -377,7 +377,7 @@ mod tests {
         assert!(has_more);
         let TasksViewReply::Tasks { tasks, .. } = view(
             &store,
-            serde_json::json!({"byStatus": {"status": "Open", "after": next_after.unwrap()}}),
+            serde_json::json!({"byStatus": {"status": "open", "after": next_after.unwrap()}}),
         ) else {
             panic!("wrong reply shape")
         };
@@ -445,7 +445,7 @@ mod tests {
         assert!(row.is_none(), "pre-rebuild rows do not survive");
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "Open"}}))
+            view(&store, serde_json::json!({"byStatus": {"status": "open"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(tasks[0].created_height, 40);
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "Done"}}))
+            view(&store, serde_json::json!({"byStatus": {"status": "done"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -477,7 +477,7 @@ mod tests {
         );
         let TasksViewReply::Tasks { tasks, .. } = view(
             &store,
-            serde_json::json!({"byStatus": {"status": "InProgress"}}),
+            serde_json::json!({"byStatus": {"status": "in_progress"}}),
         ) else {
             panic!("wrong reply shape")
         };

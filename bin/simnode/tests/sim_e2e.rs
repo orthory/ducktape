@@ -182,16 +182,16 @@ fn free_port() -> u16 {
 
 fn create_channel(channel: &str, name: &str) -> serde_json::Value {
     serde_json::json!({
-        "CreateChannel": { "channel_id": channel, "name": name, "post_policy": "Open" }
+        "create_channel": { "channel_id": channel, "name": name, "post_policy": "open" }
     })
 }
 
 fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Value {
     serde_json::json!({
-        "PostMessage": {
+        "post_message": {
             "channel_id": channel,
             "message_id": message_id,
-            "blocks": [{ "Paragraph": [{ "text": text, "marks": [] }] }],
+            "blocks": [{ "paragraph": [{ "text": text, "marks": [] }] }],
             "thread": null,
             "as_agent": null,
         }
@@ -210,9 +210,9 @@ fn held_submit_commits_only_on_step() {
 
     // parked: nothing committed, and reads serve pre-op state.
     assert_eq!(sim.status()["height"], 0, "held submit must not commit");
-    let channels = sim.query("chat", serde_json::json!("Channels"));
+    let channels = sim.query("chat", serde_json::json!("channels"));
     assert_eq!(
-        channels["Channels"].as_array().map(Vec::len),
+        channels["channels"].as_array().map(Vec::len),
         Some(0),
         "held op must be invisible to queries: {channels}"
     );
@@ -233,8 +233,8 @@ fn held_submit_commits_only_on_step() {
     );
 
     assert_eq!(sim.status()["height"], 1);
-    let channels = sim.query("chat", serde_json::json!("Channels"));
-    assert_eq!(channels["Channels"].as_array().map(Vec::len), Some(1));
+    let channels = sim.query("chat", serde_json::json!("channels"));
+    assert_eq!(channels["channels"].as_array().map(Vec::len), Some(1));
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn same_script_same_app_hash() {
         for (target, payload) in [
             ("chat", create_channel("general", "General")),
             ("chat", post_message("general", "m-1", "hello determinism")),
-            ("tasks", serde_json::json!({ "CreateTask": { "task_id": "t-1", "title": "repeatable" } })),
+            ("tasks", serde_json::json!({ "create_task": { "task_id": "t-1", "title": "repeatable" } })),
         ] {
             let pending = sim.submit_in_background(target, payload);
             sim.await_sim_state("held", 1);
@@ -332,7 +332,7 @@ fn auto_and_step_commit_paths_walk_identical_app_hashes() {
         [
             ("chat", create_channel("general", "General")),
             ("chat", post_message("general", "m-1", "hello determinism")),
-            ("tasks", serde_json::json!({ "CreateTask": { "task_id": "t-1", "title": "repeatable" } })),
+            ("tasks", serde_json::json!({ "create_task": { "task_id": "t-1", "title": "repeatable" } })),
         ]
     };
 
@@ -408,6 +408,6 @@ fn peer_block_commits_past_a_parked_queue() {
     assert_eq!(receipt["height"], 2);
 
     // both writers' state committed, in that order.
-    let channels = sim.query("chat", serde_json::json!("Channels"));
-    assert_eq!(channels["Channels"].as_array().map(Vec::len), Some(2));
+    let channels = sim.query("chat", serde_json::json!("channels"));
+    assert_eq!(channels["channels"].as_array().map(Vec::len), Some(2));
 }

@@ -26,8 +26,8 @@ const renderDocumentView = (patch: Partial<ConsoleState> = {}) => {
     docIds: ["plan", "retro"],
     activeDoc: "plan",
     activeDocBlocks: [
-      { id: "heading-1", kind: "Heading" as const, text: "Launch plan" },
-      { id: "body-1", kind: "Paragraph" as const, text: "First draft" },
+      { id: "heading-1", kind: "heading" as const, text: "Launch plan" },
+      { id: "body-1", kind: "paragraph" as const, text: "First draft" },
     ],
     ...patch,
   };
@@ -105,14 +105,14 @@ describe("DocumentView", () => {
       text: "Revised draft",
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Insert Code block" }));
+    fireEvent.click(screen.getByRole("button", { name: "Insert code block" }));
     fireEvent.change(screen.getByLabelText("New block text"), {
       target: { value: "bunx tsc --noEmit" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Insert block" }));
     expect(spies.insertBlock).toHaveBeenCalledWith({
       after: "body-1",
-      kind: "Code",
+      kind: "code",
       text: "bunx tsc --noEmit",
     });
 

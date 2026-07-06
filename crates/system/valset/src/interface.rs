@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ValsetMsg {
     /// add a validator. `key` MUST be a 32-byte ed25519 public key; the impl
     /// rejects a malformed key with `Error::Module`. a key holding observer
@@ -29,6 +30,7 @@ pub enum ValsetMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ValsetQuery {
     /// the full committed validator set.
     Validators,
@@ -37,6 +39,7 @@ pub enum ValsetQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ValsetReply {
     /// the committed validators, sorted (order-independent).
     Validators(Vec<Vec<u8>>),

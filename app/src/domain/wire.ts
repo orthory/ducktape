@@ -1,7 +1,7 @@
 // Shared reply decoding for the module clients.
 //
 // Every `*Reply` enum serializes as a single-variant object
-// (`{"Messages": [...]}`) or, for unit variants, a bare string. replyVariant
+// (`{"messages": [...]}`) or, for unit variants, a bare string. replyVariant
 // unwraps the expected variant or throws — a mismatch means the module and
 // this client disagree about the interface, which must surface loudly.
 

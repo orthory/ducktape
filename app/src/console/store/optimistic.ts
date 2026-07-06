@@ -64,7 +64,7 @@ export const postedMessage = (
     seq,
     head: {
       message_id: params.messageId,
-      author: { User: Array.from(new TextEncoder().encode(params.author)) },
+      author: { user: Array.from(new TextEncoder().encode(params.author)) },
       blocks: params.blocks,
       created_at: params.at,
       rev: 0,
@@ -128,12 +128,12 @@ export const reactionToggled = (
   removing: boolean,
 ): Partial<ConsoleState> =>
   mapMessage(prev, channelId, seq, (m) => {
-    const self = { User: selfBytes };
+    const self = { user: selfBytes };
     const isSelf = (r: MessageView["reactions"][number]["reactors"][number]) =>
       typeof r === "object" &&
-      "User" in r &&
-      r.User.length === selfBytes.length &&
-      r.User.every((b, i) => b === selfBytes[i]);
+      "user" in r &&
+      r.user.length === selfBytes.length &&
+      r.user.every((b, i) => b === selfBytes[i]);
     const existing = m.reactions.find((r) => r.emoji === emoji);
     const reactions = removing
       ? m.reactions
@@ -185,7 +185,7 @@ export const taskAdded = (
     {
       id: params.taskId,
       title: params.title,
-      status: "Open",
+      status: "open",
       created_at: params.at,
       updated_at: params.at,
     },
@@ -465,10 +465,10 @@ export const memoryPublished = (
 ): Partial<ConsoleState> => {
   if (memoryParent(params.path) !== prev.memoryPath) return {};
   const existing = prev.memoryEntries.find(
-    (e) => "File" in e && e.File.path === params.path,
+    (e) => "file" in e && e.file.path === params.path,
   );
   const stat = (gen: number, gens: number): LsEntry => ({
-    File: {
+    file: {
       path: params.path,
       latest_generation: gen,
       generations: gens,
@@ -481,8 +481,8 @@ export const memoryPublished = (
   return {
     memoryEntries: existing
       ? prev.memoryEntries.map((e) =>
-          "File" in e && e.File.path === params.path
-            ? stat(e.File.latest_generation + 1, e.File.generations + 1)
+          "file" in e && e.file.path === params.path
+            ? stat(e.file.latest_generation + 1, e.file.generations + 1)
             : e,
         )
       : [...prev.memoryEntries, stat(1, 1)],
@@ -494,7 +494,7 @@ export const memoryRemoved = (
   path: string,
 ): Partial<ConsoleState> => ({
   memoryEntries: prev.memoryEntries.filter(
-    (e) => !("File" in e) || e.File.path !== path,
+    (e) => !("file" in e) || e.file.path !== path,
   ),
 });
 

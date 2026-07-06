@@ -60,7 +60,7 @@ describe("agent msgs", () => {
     expect(transport.submit).toHaveBeenCalledWith(
       "agent",
       {
-        RegisterAgent: {
+        register_agent: {
           agent_id: "helper",
           display_name: "Helper",
           capability: "alpha",
@@ -83,7 +83,7 @@ describe("agent msgs", () => {
     expect(transport.submit).toHaveBeenCalledWith(
       "agent",
       {
-        UpdateAgent: {
+        update_agent: {
           agent_id: "helper",
           display_name: "Helper 2",
           capability: null,
@@ -102,14 +102,14 @@ describe("agent msgs", () => {
     await pauseAgent(transport, { agentId: "helper", origin: "operator" });
     expect(transport.submit).toHaveBeenCalledWith(
       "agent",
-      { PauseAgent: { agent_id: "helper" } },
+      { pause_agent: { agent_id: "helper" } },
       "operator",
     );
 
     await resumeAgent(transport, { agentId: "helper", origin: "operator" });
     expect(transport.submit).toHaveBeenCalledWith(
       "agent",
-      { ResumeAgent: { agent_id: "helper" } },
+      { resume_agent: { agent_id: "helper" } },
       "operator",
     );
   });
@@ -118,31 +118,31 @@ describe("agent msgs", () => {
 describe("agent queries", () => {
   const record: AgentRecord = {
     agent_id: "helper",
-    owner: { External: [1, 2, 3] },
+    owner: { external: [1, 2, 3] },
     display_name: "Helper",
     capability: "alpha",
     prompt_hash: hexToBytes("cd".repeat(32)),
     prompt_doc: null,
     allowed_actions: ["chat.post"],
-    status: "Active",
+    status: "active",
     created_at: 1,
     updated_at: 2,
   };
 
   it("sends the bare string Agents and decodes the roster", async () => {
-    const transport = stubTransport({ Agents: [record] });
+    const transport = stubTransport({ agents: [record] });
     await expect(agents(transport)).resolves.toEqual([record]);
-    expect(transport.query).toHaveBeenCalledWith("agent", "Agents");
+    expect(transport.query).toHaveBeenCalledWith("agent", "agents");
   });
 
   it("sends Agent{agent_id} and decodes Agent, including null", async () => {
-    const present = stubTransport({ Agent: record });
+    const present = stubTransport({ agent: record });
     await expect(agent(present, "helper")).resolves.toEqual(record);
     expect(present.query).toHaveBeenCalledWith("agent", {
-      Agent: { agent_id: "helper" },
+      agent: { agent_id: "helper" },
     });
 
-    const absent = stubTransport({ Agent: null });
+    const absent = stubTransport({ agent: null });
     await expect(agent(absent, "ghost")).resolves.toBeNull();
   });
 });

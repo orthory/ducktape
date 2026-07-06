@@ -424,10 +424,10 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // and its consumption.
     let saga_ops = index_ops(&cluster, 0, "saga");
     let chat_ops = index_ops(&cluster, 0, "chat");
-    let result_height = op_height(&saga_ops, |p| p.get("OracleResult").is_some())
+    let result_height = op_height(&saga_ops, |p| p.get("oracle_result").is_some())
         .expect("an OracleResult op is indexed");
     let reply_height = op_height(&chat_ops, |p| {
-        p.get("PostMessage")
+        p.get("post_message")
             .and_then(|m| m["message_id"].as_str())
             .is_some_and(|id| id == format!("agent/{run_text}"))
     })
@@ -533,7 +533,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     poll_until("both accepts to finalize", FINALIZE, || {
         let accepts: Vec<String> = index_ops(&cluster, 0, "saga")
             .iter()
-            .filter(|row| row["payload"].get("Accept").is_some())
+            .filter(|row| row["payload"].get("accept").is_some())
             .filter_map(|row| row["origin"]["id"].as_str().map(str::to_string))
             .collect();
         (accepts.len() == 2).then(|| {

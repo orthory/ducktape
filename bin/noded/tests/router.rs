@@ -27,11 +27,11 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                         None => {
                             // echo enough back to prove the request crossed intact.
                             // the wire casing is the interface crates' serde
-                            // default: PascalCase variants, snake_case fields.
+                            // convention: snake_case variants and fields.
                             assert_eq!(target, "chat");
                             let value: serde_json::Value =
                                 serde_json::from_slice(&payload).expect("payload is json");
-                            assert_eq!(value["CreateChannel"]["channel_id"], "general");
+                            assert_eq!(value["create_channel"]["channel_id"], "general");
                             // the block reply doubles as the origin probe: echo
                             // the stamped origin so tests assert per-request
                             // identity without a second channel.
@@ -47,7 +47,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                     assert_eq!(target, "tasks");
                     let value: serde_json::Value =
                         serde_json::from_slice(&req).expect("query is json");
-                    assert_eq!(value, serde_json::json!("List"));
+                    assert_eq!(value, serde_json::json!("list"));
                     let _ = reply.send(Ok(
                         serde_json::to_vec(&serde_json::json!({ "tasks": [] })).unwrap()
                     ));
@@ -99,7 +99,7 @@ async fn submit_forwards_the_payload_and_returns_the_block() {
             "/v1/submit",
             serde_json::json!({
                 "target": "chat",
-                "payload": { "CreateChannel": { "channel_id": "general", "name": "General" } },
+                "payload": { "create_channel": { "channel_id": "general", "name": "General" } },
             }),
         ))
         .await
@@ -123,7 +123,7 @@ async fn submit_stamps_the_client_origin() {
             "/v1/submit",
             serde_json::json!({
                 "target": "chat",
-                "payload": { "CreateChannel": { "channel_id": "general", "name": "General" } },
+                "payload": { "create_channel": { "channel_id": "general", "name": "General" } },
                 "origin": "jess",
             }),
         ))
@@ -142,7 +142,7 @@ async fn submit_receipt_op_hash_addresses_the_committed_payload() {
     let app = noded::router(handle);
 
     let payload =
-        serde_json::json!({ "CreateChannel": { "channel_id": "general", "name": "General" } });
+        serde_json::json!({ "create_channel": { "channel_id": "general", "name": "General" } });
     let response = app
         .clone()
         .oneshot(post(
@@ -175,7 +175,7 @@ async fn submit_receipt_op_hash_addresses_the_committed_payload() {
         serde_json::from_slice(&bytes).expect("blob is the op json");
     assert_eq!(
         round_trip,
-        serde_json::json!({ "CreateChannel": { "channel_id": "general", "name": "General" } })
+        serde_json::json!({ "create_channel": { "channel_id": "general", "name": "General" } })
     );
 }
 
@@ -205,7 +205,7 @@ async fn query_returns_the_decoded_module_reply() {
     let response = noded::router(handle)
         .oneshot(post(
             "/v1/query",
-            serde_json::json!({ "target": "tasks", "query": "List" }),
+            serde_json::json!({ "target": "tasks", "query": "list" }),
         ))
         .await
         .unwrap();

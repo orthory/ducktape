@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// what makes a rule fire. every `None` field is a wildcard; every `Some` field
 /// must match the triggering event.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Trigger {
     MessagePosted {
         /// an exact channel id, or `None` for any channel.
@@ -34,6 +35,7 @@ pub enum Trigger {
 
 /// what a firing rule does.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Action {
     /// post `template` (after placeholder substitution) into `channel_id`. the
     /// module derives a deterministic `message_id` = `auto-{rule_id}-{channel}-{seq}`.
@@ -85,6 +87,7 @@ pub struct RunRecord {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AutomationsMsg {
     CreateRule {
         rule_id: String,
@@ -105,6 +108,7 @@ pub enum AutomationsMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AutomationsQuery {
     ListRules,
     GetRule {
@@ -118,6 +122,7 @@ pub enum AutomationsQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AutomationsReply {
     Rules(Vec<Rule>),
     Rule(Option<Rule>),

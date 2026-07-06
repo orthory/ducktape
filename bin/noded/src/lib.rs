@@ -153,7 +153,7 @@ pub const PAYLOAD_PREVIEW_MAX: usize = 1024;
 /// dropped before decoding, so there are no contents to show): an applied op
 /// mutated state; a rejected op finalized but rolled back — a failed tx.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum BlockDisposition {
     Applied,
     Rejected,
@@ -260,7 +260,7 @@ pub struct ModuleStatus {
 /// id; it is not part of a module's consensus identity (that stays `id` +
 /// `root`) and never enters the app-hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ModuleCategory {
     Workspace,
     Developer,

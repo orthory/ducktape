@@ -267,7 +267,7 @@ fn cluster_lifecycle() {
         "/v1/submit",
         Some(&serde_json::json!({
             "target": "directory",
-            "payload": { "Set": { "key": "via-app-surface", "value": "held" } },
+            "payload": { "set": { "key": "via-app-surface", "value": "held" } },
         })),
     );
     assert_eq!(code, 200, "app-surface submit failed: {block}");
@@ -332,7 +332,7 @@ fn cluster_lifecycle() {
     assert_eq!(code, 200, "op hash must dereference on the blob lane: {blob}");
     assert_eq!(
         blob,
-        serde_json::json!({ "Set": { "key": "via-app-surface", "value": "held" } }),
+        serde_json::json!({ "set": { "key": "via-app-surface", "value": "held" } }),
         "blob lane serves the committed payload bytes back"
     );
 

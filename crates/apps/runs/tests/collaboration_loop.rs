@@ -63,7 +63,7 @@ use tasks::{
 fn canned_response(run_id: &str) -> Vec<u8> {
     encode_response(&AgentResponse {
         reply_blocks: vec![ReplyBlock {
-            kind: "Paragraph".into(),
+            kind: "paragraph".into(),
             text: format!("quack: handling {run_id}"),
             lang: None,
         }],

@@ -220,8 +220,8 @@ const DEFAULT_PROMPT: &str =
 /// the strict output contract appended to every composed payload — exactly
 /// the [`AgentResponse`] wire shape.
 const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
-{"reply_blocks":[{"id":"<uuid>","kind":"Paragraph","text":"..."}],"actions":[]}
-Allowed reply block kinds are Paragraph, Heading, and Code. Heading is rendered as a paragraph in Ducktape chat. Code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
+{"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[]}
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
 
 /// the canonical rendering of a prompt document: block texts joined by blank
 /// lines, kind-agnostic. `AgentRecord::prompt_hash` pins sha256 of exactly
@@ -329,9 +329,9 @@ fn render_block(block: &Block) -> String {
 
 /// the reply-block kinds normalization keeps — the closed vocabulary the
 /// strict-output instruction names.
-const REPLY_KIND_PARAGRAPH: &str = "Paragraph";
-const REPLY_KIND_HEADING: &str = "Heading";
-const REPLY_KIND_CODE: &str = "Code";
+const REPLY_KIND_PARAGRAPH: &str = "paragraph";
+const REPLY_KIND_HEADING: &str = "heading";
+const REPLY_KIND_CODE: &str = "code";
 
 /// the model's raw answer as a NORMALIZED [`AgentResponse`]: the wire shape
 /// when it parses (unknown kinds and empty texts drop), a plain paragraph
@@ -2639,7 +2639,7 @@ mod tests {
             reply_blocks: reply
                 .iter()
                 .map(|t| ReplyBlock {
-                    kind: "Paragraph".into(),
+                    kind: "paragraph".into(),
                     text: (*t).into(),
                     lang: None,
                 })
@@ -3597,7 +3597,7 @@ mod tests {
     #[test]
     fn code_blocks_survive_normalization_into_chat_blocks() {
         let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
-        let raw = r#"{"reply_blocks":[{"id":"b1","kind":"Paragraph","text":"hello"},{"kind":"Code","lang":"rust","text":"fn main() {}"},{"kind":"Alien","text":"dropped"},{"kind":"Paragraph","text":"  "}],"actions":[]}"#;
+        let raw = r#"{"reply_blocks":[{"id":"b1","kind":"paragraph","text":"hello"},{"kind":"code","lang":"rust","text":"fn main() {}"},{"kind":"Alien","text":"dropped"},{"kind":"paragraph","text":"  "}],"actions":[]}"#;
         let mut ctx = CaptureCtx::new()
             .at(8)
             .from_dispatch()

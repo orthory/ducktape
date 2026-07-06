@@ -19,27 +19,27 @@ import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
-const KINDS: BlockKind[] = ["Paragraph", "Heading", "Code"];
+const KINDS: BlockKind[] = ["paragraph", "heading", "code"];
 
 const KIND_META: Record<
   BlockKind,
   { label: string; editLabel: string; text: string; bg: string; border: string }
 > = {
-  Paragraph: {
+  paragraph: {
     label: "TEXT",
     editLabel: "paragraph",
     text: color.blue,
     bg: "#f1f4f8",
     border: "#d7e0eb",
   },
-  Heading: {
+  heading: {
     label: "HEAD",
     editLabel: "heading",
     text: color.purple,
     bg: "#f1edf5",
     border: "#ddd2e6",
   },
-  Code: {
+  code: {
     label: "CODE",
     editLabel: "code",
     text: color.green,
@@ -540,8 +540,8 @@ function BlockRow({
     if (draft !== block.text) onUpdate(draft);
   };
 
-  const code = block.kind === "Code";
-  const heading = block.kind === "Heading";
+  const code = block.kind === "code";
+  const heading = block.kind === "heading";
   const meta = KIND_META[block.kind];
   const blockNumber = index + 1;
 
@@ -647,9 +647,9 @@ function BlockRow({
 // -- Insert composer ---------------------------------------------------------
 
 function AddBlock({ onAdd }: { onAdd: (kind: BlockKind, text: string) => void }) {
-  const [kind, setKind] = useState<BlockKind>("Paragraph");
+  const [kind, setKind] = useState<BlockKind>("paragraph");
   const [text, setText] = useState("");
-  const code = kind === "Code";
+  const code = kind === "code";
 
   const submit = (event: FormEvent) => {
     event.preventDefault();

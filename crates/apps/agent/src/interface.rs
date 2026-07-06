@@ -75,6 +75,7 @@ pub const KNOWN_ACTIONS: [&str; 3] = [
 /// whether an agent may engage new runs. a paused agent never engages — but
 /// pausing does not cancel work already dispatched.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Active,
     Paused,
@@ -139,6 +140,7 @@ pub struct AgentResponse {
 
 /// one validated cross-module write an agent's response may request.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentAction {
     CreateTask {
         task_id: String,
@@ -165,6 +167,7 @@ impl AgentAction {
 // ---- ops ----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentMsg {
     /// register an agent under the submitter's origin (a non-empty external
     /// key or a module — the owner capability). a duplicate `agent_id` is an
@@ -207,6 +210,7 @@ pub enum AgentMsg {
 /// recipe stay ONE atomic unit without the registry referencing the dispatch
 /// plane.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentEvent {
     /// a new agent landed; the hook registers its recipe.
     Registered { agent_id: String, capability: String },
@@ -217,12 +221,14 @@ pub enum AgentEvent {
 // ---- queries ------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentQuery {
     Agents,
     Agent { agent_id: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentReply {
     Agents(Vec<AgentRecord>),
     Agent(Option<AgentRecord>),

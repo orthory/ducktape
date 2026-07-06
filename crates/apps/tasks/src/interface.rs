@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Open,
     InProgress,
@@ -20,17 +21,20 @@ pub struct Task {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskMsg {
     CreateTask { task_id: String, title: String },
     UpdateStatus { task_id: String, status: TaskStatus },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskQuery {
     List,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskReply {
     Tasks(Vec<Task>),
 }

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// the lifecycle of a job. `Done`, `Failed`, and `Cancelled` are terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Pending,
     Processing,
@@ -66,6 +67,7 @@ pub struct Job {
 /// write intents against the board. all identity fields are derived from the
 /// dispatch origin inside the module -- none appear here.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobsMsg {
     /// post a new job (status `Pending`, attempt 0).
     Submit {
@@ -98,6 +100,7 @@ pub enum JobsMsg {
 
 /// the notification payload sent by `jobs` to each registered worker module.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobsEvent {
     /// a job was submitted. the event carries the full `spec` because it fires
     /// inside the submit cascade, where committed-only jobs queries cannot see
@@ -115,6 +118,7 @@ pub enum JobsEvent {
 
 /// read projections over the board.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobsQuery {
     Get {
         job_id: String,
@@ -139,6 +143,7 @@ pub struct BoardCounts {
 
 /// replies to [`JobsQuery`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobsReply {
     Job(Option<Job>),
     Jobs(Vec<Job>),

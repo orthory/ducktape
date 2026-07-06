@@ -57,9 +57,9 @@ export interface FileStat {
 }
 
 /** One `Ls` entry — an implicit child directory, or a file with its stat. */
-export type LsEntry = { Dir: { path: string } } | { File: FileStat };
+export type LsEntry = { dir: { path: string } } | { file: FileStat };
 
-export const isDir = (e: LsEntry): e is { Dir: { path: string } } => "Dir" in e;
+export const isDir = (e: LsEntry): e is { dir: { path: string } } => "dir" in e;
 
 /** A single grep match with a citable `duck://memory/<path>@<gen>#L<line>` URI. */
 export interface GrepHit {
@@ -96,7 +96,7 @@ export const publish = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { Publish: { path: params.path, body: params.body, meta: params.meta ?? {} } },
+    { publish: { path: params.path, body: params.body, meta: params.meta ?? {} } },
     params.origin,
   );
 
@@ -105,18 +105,18 @@ export const remove = (
   transport: NodeTransport,
   path: string,
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { Delete: { path } });
+  transport.submit(TARGET, { delete: { path } });
 
 /** Pin the current `path -> latest generation` map of the whole namespace. */
 export const snapshot = (
   transport: NodeTransport,
   name: string,
-): Promise<BlockEvent> => transport.submit(TARGET, { Snapshot: { name } });
+): Promise<BlockEvent> => transport.submit(TARGET, { snapshot: { name } });
 
 export const dropSnapshot = (
   transport: NodeTransport,
   name: string,
-): Promise<BlockEvent> => transport.submit(TARGET, { DropSnapshot: { name } });
+): Promise<BlockEvent> => transport.submit(TARGET, { drop_snapshot: { name } });
 
 // ── Queries (reads over committed state) ────────────────
 
@@ -128,18 +128,18 @@ export const ls = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        Ls: { path: params.path, limit: params.limit ?? MAX_QUERY_LIMIT },
+        ls: { path: params.path, limit: params.limit ?? MAX_QUERY_LIMIT },
       }),
     )
-    .then((reply) => replyVariant<LsEntry[]>(reply, "Ls"));
+    .then((reply) => replyVariant<LsEntry[]>(reply, "ls"));
 
 export const stat = (
   transport: NodeTransport,
   path: string,
 ): Promise<FileStat | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { Stat: { path } }))
-    .then((reply) => replyVariant<FileStat | null>(reply, "Stat"));
+    .then(() => transport.query(TARGET, { stat: { path } }))
+    .then((reply) => replyVariant<FileStat | null>(reply, "stat"));
 
 /** One generation of a file. `generation` and `snapshot` are mutually exclusive;
  *  neither reads the latest. */
@@ -150,14 +150,14 @@ export const read = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        Read: {
+        read: {
           path: params.path,
           generation: params.generation ?? null,
           snapshot: params.snapshot ?? null,
         },
       }),
     )
-    .then((reply) => replyVariant<Generation | null>(reply, "Read"));
+    .then((reply) => replyVariant<Generation | null>(reply, "read"));
 
 /** Live files under `prefix` whose latest meta matches every filter pair. This
  *  is how skills are listed: Find { prefix: "/skills/", metaFilter: {kind: skill} }. */
@@ -168,14 +168,14 @@ export const find = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        Find: {
+        find: {
           prefix: params.prefix,
           meta_filter: params.metaFilter ?? {},
           limit: params.limit ?? MAX_QUERY_LIMIT,
         },
       }),
     )
-    .then((reply) => replyVariant<FileStat[]>(reply, "Find"));
+    .then((reply) => replyVariant<FileStat[]>(reply, "find"));
 
 /** Case-sensitive substring scan over inline latest generations under `prefix`. */
 export const grep = (
@@ -185,11 +185,11 @@ export const grep = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        Grep: {
+        grep: {
           prefix: params.prefix,
           pattern: params.pattern,
           limit: params.limit ?? MAX_QUERY_LIMIT,
         },
       }),
     )
-    .then((reply) => replyVariant<GrepHit[]>(reply, "Grep"));
+    .then((reply) => replyVariant<GrepHit[]>(reply, "grep"));

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// the kind of a block. a small enum — extend later (list, quote, image, ...).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockKind {
     Paragraph,
     Heading,
@@ -28,6 +29,7 @@ pub struct Block {
 /// `None` == "at the front" (index 0); `Some(id)` == "immediately after the
 /// block with that id" (anchor must exist, else the op errors).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DocMsg {
     /// create an empty document at `doc_id`. idempotent: re-creating an existing
     /// doc is a benign no-op. required before any block op (blocks never
@@ -64,6 +66,7 @@ pub fn decode_msg(b: &[u8]) -> Result<DocMsg, String> {
 
 /// read requests the document module serves via `Module::query`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DocQuery {
     /// the whole document as its ordered `Vec<Block>` (`None` == doc absent).
     GetDoc { doc_id: String },
@@ -77,6 +80,7 @@ pub enum DocQuery {
 
 /// replies to a [`DocQuery`]. `Option` mirrors absence (doc/block not found).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DocReply {
     Doc(Option<Vec<Block>>),
     Block(Option<Block>),
