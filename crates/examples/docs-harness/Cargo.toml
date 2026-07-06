@@ -24,5 +24,6 @@ async-trait = { workspace = true }
 [dev-dependencies]
 quack = { workspace = true }
 quack-harness = { workspace = true }
+runs = { workspace = true }
 saga = { workspace = true }
 futures = "0.3"

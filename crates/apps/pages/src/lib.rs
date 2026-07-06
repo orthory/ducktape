@@ -1380,6 +1380,15 @@ where
                     .map_err(|e| Error::Module(e.to_string()))?;
                 Ok(encode_reply(&PageReply::CommentThread(view)))
             }
+            PageQuery::GetComment { comment_id } => {
+                // by-id existence surface: tombstones are returned too — the
+                // id is taken either way (see the interface docs).
+                let comment = self
+                    .load_comment(&comment_id)
+                    .await
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                Ok(encode_reply(&PageReply::Comment(comment)))
+            }
         }
     }
 
@@ -1606,6 +1615,18 @@ mod tests {
         match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
             PageReply::CommentThread(v) => v,
             _ => panic!("expected CommentThread"),
+        }
+    }
+    async fn query_comment<E: Context + BufferPooler>(
+        p: &Pages<E>,
+        comment_id: &str,
+    ) -> Option<Comment> {
+        let q = PageQuery::GetComment {
+            comment_id: comment_id.into(),
+        };
+        match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
+            PageReply::Comment(c) => c,
+            _ => panic!("expected Comment"),
         }
     }
 
@@ -2745,6 +2766,38 @@ mod tests {
             .await;
             assert!(query_thread(&p, "t1").await.is_none());
             assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+        });
+    }
+
+    #[test]
+    fn get_comment_serves_by_id_alone_including_tombstones() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
+            apply_commit_as(&mut p, &add("t1", "m2", "b1", "second"), user("bob")).await;
+
+            // exists: the record comes back by id alone, no thread context.
+            let m1 = query_comment(&p, "m1").await.expect("m1 exists");
+            assert_eq!(m1.thread_id, "t1");
+            assert_eq!(m1.text, "first");
+            assert_eq!(m1.author, AuthorRef::User(b"alice".to_vec()));
+
+            // not-exists: a free id reads None.
+            assert!(query_comment(&p, "ghost").await.is_none());
+
+            // a tombstoned comment still occupies its id (the squat-probe
+            // contract): deleted, empty text, but Some.
+            apply_commit_as(
+                &mut p,
+                &PageMsg::DeleteComment {
+                    comment_id: "m1".into(),
+                },
+                user("alice"),
+            )
+            .await;
+            let tomb = query_comment(&p, "m1").await.expect("id still taken");
+            assert!(tomb.deleted);
+            assert_eq!(tomb.text, "");
         });
     }
 

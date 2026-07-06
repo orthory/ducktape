@@ -300,6 +300,13 @@ pub enum PageQuery {
     ThreadsForTargets { targets: Vec<String> },
     /// one thread with its live comments.
     CommentThread { thread_id: String },
+    /// a single comment by id ALONE — comment ids are globally unique within
+    /// the module (stored under one reserved keyspace, whatever thread they
+    /// belong to), so this is the existence probe an action owner runs
+    /// against a minted comment id before staging an `AddComment` follow-up.
+    /// a TOMBSTONED comment is still returned (its id is still taken);
+    /// `None` means the id is free.
+    GetComment { comment_id: String },
 }
 
 /// one entry of [`PageReply::PageList`]: a page id and its current title.
@@ -320,6 +327,7 @@ pub enum PageReply {
     PageList(Vec<PageMeta>),
     CommentThreads(Vec<TargetThreads>),
     CommentThread(Option<ThreadView>),
+    Comment(Option<Comment>),
 }
 
 pub fn encode_query(q: &PageQuery) -> Vec<u8> {

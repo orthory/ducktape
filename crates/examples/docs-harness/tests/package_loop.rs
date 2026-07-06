@@ -473,6 +473,66 @@ fn unauthorized_and_malformed_actions_mutate_nothing_and_record_failure() {
     });
 }
 
+#[test]
+fn a_squatted_minted_comment_id_fails_the_action_and_the_delivery_commits() {
+    PackageTestBed::run(docs_modules(), |mut bed| async move {
+        install(&mut bed).await;
+        seed_page(&mut bed).await;
+        comment(&mut bed, "t1", "c1", "@docs.editor reply please").await;
+
+        // the squat: the run id is readable and the minted comment id is
+        // predictable — alice takes it in a thread of her own before the
+        // delivery block runs. pages stores comment ids globally, so this
+        // collides with the agent's reply in ANY thread.
+        let reply = bed
+            .query("runs", &runs::encode_query(&runs::RunsQuery::PendingRuns))
+            .await
+            .expect("runs query");
+        let pending = match runs::decode_reply(&reply).expect("runs reply") {
+            runs::RunsReply::PendingRuns(runs) => runs,
+            other => panic!("unexpected runs reply: {other:?}"),
+        };
+        let run_id = &pending
+            .iter()
+            .find(|r| r.agent_id == AGENT)
+            .expect("the mention minted a pending run")
+            .run_id;
+        let squat = docs_harness::minted_comment_id(run_id, "a1");
+        comment(&mut bed, "t-squat", &squat, "mine now").await;
+
+        // the scripted turn: without the GetComment probe, the Apply's
+        // AddComment would hit pages' duplicate-comment-id rejection and
+        // abort the whole delivery block on every redelivery.
+        bed.oracle_response_json(&json!({
+            "reply_blocks": [],
+            "actions": [{"action_id": "a1", "tag": ACTION_COMMENT_ADD,
+                         "payload": {"target": "b1", "thread_id": "t1",
+                                     "text": "on it"}}],
+        }))
+        .await
+        .expect("oracle block commits");
+        bed.deliver()
+            .await
+            .expect("the delivery block must COMMIT despite the squat");
+
+        // probe rejection recorded; the run failed; nothing landed in t1.
+        bed.assert_failure_breadcrumb("runs", "minted comment id already taken");
+        bed.assert_job_status(
+            &docs_harness::engagement_job_id(AGENT, "c1"),
+            jobs::JobStatus::Failed,
+        )
+        .await;
+        let thread = bed
+            .query_json("pages", &json!({"comment_thread": {"thread_id": "t1"}}))
+            .await
+            .expect("thread query");
+        let comments = thread["comment_thread"]["comments"]
+            .as_array()
+            .expect("comments");
+        assert_eq!(comments.len(), 1, "only the opener — no agent reply landed");
+    });
+}
+
 // ---- lifecycle ------------------------------------------------------------------
 
 #[test]

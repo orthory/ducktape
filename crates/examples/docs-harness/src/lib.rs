@@ -35,9 +35,11 @@
 //! pages. minted comment/thread ids embed `(run_id, action_id)`, so the one
 //! in-response collision that would poison the delivery block — a duplicated
 //! `action_id` minting the same comment id twice — is deduped per block here.
-//! a squatted MINTED comment id (pages has no comment-by-id read to probe)
-//! remains the documented residual, the same class as the dummy package's
-//! predictable job ids.
+//! squatted MINTED ids are probed away: the minted thread id via
+//! `PageQuery::CommentThread`, the minted comment id via
+//! `PageQuery::GetComment` (comment ids are globally unique in pages, so a
+//! squat in ANY thread collides) — both at probe time and again on the apply
+//! re-check, where a late squat lands an error row instead of a block abort.
 //!
 //! ## prompt generation pin
 //!
@@ -532,6 +534,29 @@ impl DocsHarness {
         }
     }
 
+    /// read one comment by id from the wired pages module. tombstones read as
+    /// `Some` — the id is taken either way.
+    async fn comment_of(
+        &self,
+        ctx: &dyn Ctx,
+        comment_id: &str,
+    ) -> Result<Option<pages::Comment>, String> {
+        let reply = ctx
+            .query(
+                &self.pages,
+                &pages_encode_query(&PageQuery::GetComment {
+                    comment_id: comment_id.into(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("pages query failed: {e}"))?;
+        match pages::decode_reply(&reply) {
+            Ok(PageReply::Comment(comment)) => Ok(comment),
+            Ok(other) => Err(format!("unexpected pages reply: {other:?}")),
+            Err(e) => Err(e),
+        }
+    }
+
     /// validate one owned action against STAGED-OR-COMMITTED pages state —
     /// the read-only half of `Probe` and the re-check `Apply` runs.
     async fn validate_action(
@@ -566,6 +591,14 @@ impl DocsHarness {
                 }
                 let rc: RunContext = serde_json::from_slice(run_context)
                     .map_err(|e| format!("malformed run context: {e}"))?;
+                // BOTH branches mint the comment id, and pages stores comment
+                // ids globally — a squat in ANY thread would make the
+                // AddComment follow-up reject and abort the delivery block,
+                // so probe it away here (and again on the apply re-check).
+                let comment_id = minted_comment_id(&rc.run_id, action_id);
+                if self.comment_of(ctx, &comment_id).await?.is_some() {
+                    return Err(format!("minted comment id already taken: {comment_id}"));
+                }
                 let thread_id = match &p.thread_id {
                     Some(thread_id) => {
                         let view = self
@@ -596,7 +629,7 @@ impl DocsHarness {
                 };
                 Ok(ValidatedAction::CommentAdd {
                     thread_id,
-                    comment_id: minted_comment_id(&rc.run_id, action_id),
+                    comment_id,
                     target: p.target,
                     text: p.text,
                 })
@@ -1063,6 +1096,8 @@ mod tests {
         /// the latest generation the canned memory Stat reports for any
         /// prompt path (what the staged seed publish landed on).
         prompt_generation: u64,
+        /// a comment id squatted in pages (GetComment answers Some for it).
+        squatted_comment: Option<String>,
     }
 
     impl TestCtx {
@@ -1079,7 +1114,24 @@ mod tests {
                 events: Vec::new(),
                 job_taken: false,
                 prompt_generation: 1,
+                squatted_comment: None,
             }
+        }
+
+        /// the canned comment store: the thread t1 opener `c0` plus any
+        /// squatted id — GetComment existence is what the probe checks.
+        fn canned_comment(&self, comment_id: &str) -> Option<Comment> {
+            (comment_id == "c0" || self.squatted_comment.as_deref() == Some(comment_id)).then(
+                || Comment {
+                    id: comment_id.into(),
+                    thread_id: "t1".into(),
+                    author: AuthorRef::User(vec![7; 32]),
+                    text: "taken".into(),
+                    created_at: 1,
+                    edited_at: None,
+                    deleted: false,
+                },
+            )
         }
 
         fn canned_block(block_id: &str) -> Option<Block> {
@@ -1161,6 +1213,9 @@ mod tests {
                         }
                         PageQuery::CommentThread { thread_id } => {
                             PageReply::CommentThread(Self::canned_thread(&thread_id))
+                        }
+                        PageQuery::GetComment { comment_id } => {
+                            PageReply::Comment(self.canned_comment(&comment_id))
                         }
                         other => return Err(Error::Module(format!("unexpected query: {other:?}"))),
                     };
@@ -2006,6 +2061,69 @@ mod tests {
         let mut next_block = TestCtx::at(Origin::Module("runs".into()));
         exec(&mut m, &mut next_block, payload).unwrap();
         assert_eq!(next_block.emitted.len(), 1);
+    }
+
+    #[test]
+    fn a_squatted_minted_comment_id_is_probed_away_and_never_aborts() {
+        let mut m = module();
+        installed(&mut m);
+        let squat = minted_comment_id("r1", "a1");
+
+        // probe: BOTH branches (new thread AND append) reject while the
+        // minted comment id is taken anywhere — comment ids are global.
+        for payload in [
+            serde_json::json!({"target": "b1", "text": "new thread"}),
+            serde_json::json!({"target": "b1", "thread_id": "t1", "text": "append"}),
+        ] {
+            let mut ctx = TestCtx::at(Origin::Module("runs".into()));
+            ctx.squatted_comment = Some(squat.clone());
+            let req = encode_action_query(&PackageActionQuery::Probe {
+                action_id: "a1".into(),
+                tag: ACTION_COMMENT_ADD.into(),
+                payload: serde_json::to_vec(&payload).unwrap(),
+                run_context: RUN_CONTEXT.to_vec(),
+            });
+            let reply =
+                package::decode_action_reply(&block_on(m.query_with(&ctx, &req)).unwrap()).unwrap();
+            assert!(
+                rejects(&reply, "already taken"),
+                "the squat must reject ({payload}): {reply:?}"
+            );
+        }
+
+        // apply (the re-check, a squat that landed after the probe): error
+        // row + breadcrumb, Ok — the delivery block COMMITS, never aborts.
+        let mut late = TestCtx::at(Origin::Module("runs".into()));
+        late.squatted_comment = Some(squat);
+        exec(
+            &mut m,
+            &mut late,
+            apply(
+                "a1",
+                ACTION_COMMENT_ADD,
+                serde_json::json!({"target": "b1", "text": "done"}),
+            ),
+        )
+        .expect("a squatted minted id must not abort the delivery block");
+        assert!(late.emitted.is_empty(), "nothing reaches pages");
+        assert!(late.events.iter().any(|e| e.contains("already taken")));
+        commit(&mut m);
+        assert_eq!(m.committed.failures.len(), 1);
+        assert_eq!(m.committed.failures[0].action_id, "a1");
+
+        // with no squat, the identical action applies cleanly.
+        let mut clean = TestCtx::at(Origin::Module("runs".into()));
+        exec(
+            &mut m,
+            &mut clean,
+            apply(
+                "a1",
+                ACTION_COMMENT_ADD,
+                serde_json::json!({"target": "b1", "text": "done"}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(clean.emitted.len(), 1);
     }
 
     #[test]
