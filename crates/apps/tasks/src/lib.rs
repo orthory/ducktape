@@ -15,8 +15,20 @@ pub mod index;
 
 use std::collections::BTreeMap;
 
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use package::{
+    PackageActionMsg, PackageActionQuery, PackageActionReply, decode_action_msg,
+    decode_action_query, encode_action_reply,
+};
+use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
+
+/// one action payload validated against staged-or-committed state — what a
+/// `Probe` accepts and an `Apply` stages. decoding and checking share this
+/// one path so the probe verdict and the apply-time re-check cannot drift.
+enum ValidatedAction {
+    Create { task_id: String, title: String },
+    Update { task_id: String, status: TaskStatus },
+}
 
 pub struct Tasks {
     id: ModuleId,
@@ -98,6 +110,85 @@ impl Tasks {
         task.updated_at = consensus_time;
         self.pending.insert(task_id, task);
         Ok(())
+    }
+
+    // ---- the package action-owner contract (design D6) ----------------------
+
+    /// validate one owned action against STAGED-OR-COMMITTED state: schema,
+    /// non-empty fields, duplicate ids, target existence, status values. the
+    /// read-only half of `Probe`, and the cheap re-check `Apply` runs before
+    /// staging.
+    fn validate_action(&self, tag: &str, payload: &[u8]) -> Result<ValidatedAction, String> {
+        match tag {
+            ACTION_TASKS_CREATE => {
+                let action = decode_create_action(payload)
+                    .map_err(|e| format!("malformed {ACTION_TASKS_CREATE} payload: {e}"))?;
+                if action.task_id.is_empty() || action.title.is_empty() {
+                    return Err("task actions require a non-empty task_id and title".into());
+                }
+                if self.get(&action.task_id).is_some() {
+                    return Err(format!("task already exists: {}", action.task_id));
+                }
+                Ok(ValidatedAction::Create {
+                    task_id: action.task_id,
+                    title: action.title,
+                })
+            }
+            ACTION_TASKS_UPDATE_STATUS => {
+                let action = decode_update_status_action(payload)
+                    .map_err(|e| format!("malformed {ACTION_TASKS_UPDATE_STATUS} payload: {e}"))?;
+                let Some(status) = task_status_from_wire(&action.status) else {
+                    return Err(format!("unknown task status: {}", action.status));
+                };
+                if self.get(&action.task_id).is_none() {
+                    return Err(format!("unknown task: {}", action.task_id));
+                }
+                Ok(ValidatedAction::Update {
+                    task_id: action.task_id,
+                    status,
+                })
+            }
+            other => Err(format!("tasks does not own action tag: {other}")),
+        }
+    }
+
+    /// NO-FAIL ARM (design D6): an accepted action's `Apply` rides the runs
+    /// module's delivery block, so an `Err` here would abort the whole
+    /// delivery — decode-or-drop, re-check cheaply, breadcrumb on late
+    /// conflict (a duplicate create earlier in the same block), never `Err`.
+    fn apply_action(&mut self, ctx: &mut dyn Ctx, apply: &PackageActionMsg) {
+        let PackageActionMsg::Apply {
+            action_id,
+            tag,
+            payload,
+            ..
+        } = apply;
+        let staged = match self.validate_action(tag, payload) {
+            Ok(ValidatedAction::Create { task_id, title }) => {
+                self.stage_create(task_id, title, ctx.env().consensus_time)
+            }
+            Ok(ValidatedAction::Update { task_id, status }) => {
+                self.stage_status(task_id, status, ctx.env().consensus_time)
+            }
+            Err(reason) => {
+                self.drop_action(ctx, action_id, tag, &reason);
+                return;
+            }
+        };
+        if let Err(e) = staged {
+            // belt and braces: validate_action re-checked everything the
+            // stage_* validators check, so this is unreachable in practice.
+            self.drop_action(ctx, action_id, tag, &e.to_string());
+        }
+    }
+
+    /// the observability breadcrumb a dropped `Apply` leaves instead of an
+    /// error row — the delivery block must always commit.
+    fn drop_action(&self, ctx: &mut dyn Ctx, action_id: &str, tag: &str, reason: &str) {
+        ctx.emit_event(Event {
+            source: self.id.clone(),
+            payload: format!("action {action_id} ({tag}) dropped: {reason}").into_bytes(),
+        });
     }
 
     fn root_of(tasks: &BTreeMap<String, Task>) -> StateRoot {
@@ -256,6 +347,18 @@ impl Module for Tasks {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        // the package-action Apply arm: a MODULE-origin follow-up carrying a
+        // probed-and-accepted open action (design D6). the origin gate is
+        // spoof-proof by construction — external submitters shipping
+        // Apply-shaped bytes land in the TaskMsg decode below and fail there.
+        // module-origin payloads that are NOT an Apply (automations' TaskMsg
+        // follow-ups) keep their registration-posture path.
+        if matches!(ctx.env().origin, Origin::Module(_))
+            && let Ok(apply) = decode_action_msg(&msg.payload)
+        {
+            self.apply_action(ctx, &apply);
+            return Ok(());
+        }
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             TaskMsg::CreateTask { task_id, title } => {
                 self.stage_create(task_id, title, ctx.env().consensus_time)
@@ -270,6 +373,19 @@ impl Module for Tasks {
         match decode_query(req).map_err(Error::Module)? {
             TaskQuery::List => Ok(encode_reply(&TaskReply::Tasks(self.list()))),
         }
+    }
+
+    /// the action owner's `Probe` surface (design D6) rides the same query
+    /// lane as [`TaskQuery`]; the wire shapes are disjoint, so decode picks.
+    async fn query_with(&self, _ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
+        if let Ok(PackageActionQuery::Probe { tag, payload, .. }) = decode_action_query(req) {
+            let verdict = match self.validate_action(&tag, &payload) {
+                Ok(_) => PackageActionReply::Accepted,
+                Err(reason) => PackageActionReply::Rejected { reason },
+            };
+            return Ok(encode_action_reply(&verdict));
+        }
+        self.query(req).await
     }
 
     async fn commit_block(&mut self) -> Result<(), Error> {
