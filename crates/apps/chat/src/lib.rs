@@ -21,6 +21,11 @@ mod interface;
 pub use interface::*;
 // the derived-tier materialized view; registered only by serving binaries.
 pub mod index;
+// the real-time voice media engine (Opus over the data plane's datagram
+// class). Off-consensus: it touches no qmdb and no app-hash — the chat
+// module's consensus state (channels, membership) is what will drive its
+// admission and channel→flow derivation. Kept as a self-contained submodule.
+pub mod voice;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};

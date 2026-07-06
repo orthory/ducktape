@@ -6,13 +6,13 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chat::voice::{FRAME_SAMPLES, SAMPLE_RATE, VoiceConfig, VoiceEngine};
 use data_plane::sim::{LinkModel, SimNet};
 use data_plane::{
     AdmissionPolicy, DataPlane, DatagramPolicy, FlowId, PeerId, PlaneConfig, Service,
     sim::SimEndpoint,
 };
 use tokio::time::sleep;
-use voice::{FRAME_SAMPLES, SAMPLE_RATE, VoiceConfig, VoiceEngine};
 
 fn peer(n: u8) -> PeerId {
     PeerId([n; 32])
@@ -95,7 +95,6 @@ fn mesh(n: u8, link: LinkModel, config: VoiceConfig) -> Vec<(PeerId, VoiceEngine
 fn test_config() -> VoiceConfig {
     VoiceConfig {
         bitrate_bits_per_sec: 32_000,
-        expected_loss_perc: 20,
         prefill_frames: 3,
         max_depth_frames: 8,
     }
@@ -139,7 +138,7 @@ async fn three_speakers_stay_continuous_over_jitter() {
             let j = stats.jitter;
             assert!(j.played >= 90, "{p:?} lane {stats:?}: played {}", j.played);
             assert!(
-                j.late_dropped <= 2 && j.concealed_plc <= 2 && j.underruns <= 1,
+                j.late_dropped <= 2 && j.gaps <= 2 && j.underruns <= 1,
                 "{p:?} lane not absorbing jitter: {j:?}"
             );
             assert_eq!(stats.decode_errors, 0);
@@ -149,9 +148,13 @@ async fn three_speakers_stay_continuous_over_jitter() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn packet_loss_is_concealed_by_fec() {
-    // Deterministic 10% loss, isolated (every 10th datagram) — the FEC
-    // path: each lost frame's successor arrives and carries its LBRR copy.
+async fn loss_produces_bounded_silence_and_stays_aligned() {
+    // Deterministic 10% loss, isolated (every 10th datagram). opus-rs has no
+    // FEC-decode and no PLC, so a lost frame becomes a silence tick — not a
+    // concealed one. The property to prove is that the damage stays bounded
+    // to the loss rate and the stream never desyncs: playout keeps tracking
+    // the frames that arrived, with no underrun cascade into permanent
+    // buffering.
     let link = LinkModel {
         latency: Duration::from_millis(10),
         bytes_per_sec: 1_000_000,
@@ -163,28 +166,35 @@ async fn packet_loss_is_concealed_by_fec() {
 
     const TICKS: usize = 150;
     const WARMUP: usize = 15;
-    let mut quiet_ticks = 0usize;
+    let mut silence_ticks = 0usize;
     for tick in 0..TICKS {
         let pcm = tone(330.0, tick);
         party[0].1.send_frame(&pcm, &[b_id]).await.expect("send");
         sleep(TICK).await;
         let mixed = party[1].1.playout();
         if tick >= WARMUP && rms(&mixed) < 800.0 {
-            quiet_ticks += 1;
+            silence_ticks += 1;
         }
     }
 
-    assert_eq!(quiet_ticks, 0, "loss audible as dropouts despite FEC");
     let stats = party[1].1.speaker_stats();
     assert_eq!(stats.len(), 1, "exactly one speaker lane");
     let j = stats[0].jitter;
-    // ~15 losses, all isolated: concealed via FEC, PLC stays a rarity.
+    // ~15 losses over 150 frames: gaps and audible silence track the loss
+    // rate, bounded — not amplified into a cascade.
     assert!(
-        j.concealed_fec >= 12,
-        "expected FEC concealments, got {j:?}"
+        (10u64..=24).contains(&j.gaps),
+        "gaps should track ~10% loss: {j:?}"
     );
-    assert!(j.concealed_plc <= 3, "too much blind PLC: {j:?}");
-    assert!(j.played >= 120, "played {j:?}");
+    assert!(
+        (8..=26).contains(&silence_ticks),
+        "silence not bounded to loss: {silence_ticks}"
+    );
+    // Stream stayed aligned: nearly every arrived frame played, no collapse
+    // into permanent buffering.
+    assert!(j.played >= 125, "stream desynced, only played {j:?}");
+    assert!(j.played + j.gaps >= 140, "playout stalled: {j:?}");
+    assert_eq!(stats[0].decode_errors, 0);
 }
 
 #[tokio::test(start_paused = true)]

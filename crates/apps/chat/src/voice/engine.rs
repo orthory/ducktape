@@ -15,16 +15,14 @@ use std::sync::{Arc, Mutex};
 
 use data_plane::{DataPlaneTransport, DatagramFlow, PeerId, SendError};
 
-use crate::FRAME_SAMPLES;
-use crate::codec::{CodecError, VoiceDecoder, VoiceEncoder};
-use crate::jitter::{JitterBuffer, JitterStats, MinimalJitter, PlayoutStep};
-use crate::media::{self, MediaError, MediaHeader};
+use super::FRAME_SAMPLES;
+use super::codec::{CodecError, VoiceDecoder, VoiceEncoder};
+use super::jitter::{JitterBuffer, JitterStats, MinimalJitter, PlayoutStep};
+use super::media::{self, MediaError, MediaHeader};
 
 #[derive(Clone, Copy, Debug)]
 pub struct VoiceConfig {
     pub bitrate_bits_per_sec: i32,
-    /// Sizes Opus in-band FEC redundancy; match to observed link loss.
-    pub expected_loss_perc: i32,
     /// Initial jitter cushion, frames (x20 ms).
     pub prefill_frames: usize,
     /// Cushion ceiling the buffer may grow to under underruns.
@@ -35,7 +33,6 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         VoiceConfig {
             bitrate_bits_per_sec: 32_000,
-            expected_loss_perc: 10,
             prefill_frames: 2,
             max_depth_frames: 6,
         }
@@ -95,7 +92,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         config: VoiceConfig,
         jitter_factory: JitterFactory,
     ) -> Result<Self, CodecError> {
-        let encoder = VoiceEncoder::new(config.bitrate_bits_per_sec, config.expected_loss_perc)?;
+        let encoder = VoiceEncoder::new(config.bitrate_bits_per_sec)?;
         let flow = Arc::new(flow);
         let lanes: Lanes = Arc::new(Mutex::new(HashMap::new()));
         let malformed = Arc::new(AtomicU64::new(0));
@@ -144,18 +141,18 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
-    /// One 20 ms output tick: step every speaker's jitter buffer, decode or
-    /// conceal, and mix. Call at the frame cadence; returns silence while
-    /// no speaker has playable audio.
+    /// One 20 ms output tick: step every speaker's jitter buffer, decode
+    /// present frames, and mix. A gap contributes silence (the codec offers
+    /// no concealment). Call at the frame cadence; returns silence while no
+    /// speaker has playable audio.
     pub fn playout(&self) -> [i16; FRAME_SAMPLES] {
         let mut mix = [0i32; FRAME_SAMPLES];
         let mut lanes = self.lanes.lock().expect("lanes lock");
         for lane in lanes.values_mut() {
             let decoded = match lane.jitter.tick() {
-                PlayoutStep::Buffering => None,
+                // Buffering and Gap both render as silence: nothing to add.
+                PlayoutStep::Buffering | PlayoutStep::Gap => None,
                 PlayoutStep::Frame(payload) => Some(lane.decoder.decode(&payload)),
-                PlayoutStep::ConcealWithNext(next) => Some(lane.decoder.conceal_with_fec(&next)),
-                PlayoutStep::Conceal => Some(lane.decoder.conceal()),
             };
             let pcm = match decoded {
                 None => continue,

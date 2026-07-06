@@ -50,7 +50,6 @@ members = [
     "crates/apps/files", 
     "crates/apps/memory", 
     "crates/apps/jobs",
-    "crates/apps/voice",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
     # bin — runnable binaries
@@ -71,9 +70,10 @@ thiserror = "2"
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
-# libopus FFI (voice codec) — links the system libopus when pkg-config finds
-# one (brew opus on darwin dev boxes), builds the vendored copy otherwise.
-opus = "0.3"
+# Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
+# decoder (empty input errors), so the voice engine renders lost frames as
+# silence; see crates/apps/chat/src/voice.
+opus-rs = "0.1"
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
 commonware-storage = "2026.5.0"
@@ -137,7 +137,6 @@ inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
 memory = { path = "crates/apps/memory" }
 jobs = { path = "crates/apps/jobs" }
-voice = { path = "crates/apps/voice" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)

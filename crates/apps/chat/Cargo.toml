@@ -20,8 +20,16 @@ commonware-cryptography = { workspace = true }
 commonware-parallel = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-utils = { workspace = true }
+# voice submodule (crates/apps/chat/src/voice): real-time media over the data
+# plane's datagram class. Off-consensus — no qmdb, no app-hash.
+data-plane = { workspace = true }
+opus-rs = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 
 [dev-dependencies]
 host = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "test-util"] }
+# the voice e2e proofs drive the data plane's deterministic sim transport.
+data-plane = { workspace = true, features = ["sim"] }
