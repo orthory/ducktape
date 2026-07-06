@@ -68,7 +68,6 @@ export const opKey = {
   proposal: (proposalId: string) => `governance/${proposalId}`,
   job: (jobId: string) => `job/${jobId}`,
   rule: (ruleId: string) => `rule/${ruleId}`,
-  memory: (path: string) => `memory/${path}`,
   file: (fileId: string) => `file/${fileId}`,
 };
 

@@ -15,12 +15,6 @@ import type {
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type { BoardCounts, Job } from "../../domain/jobs-client";
-import type {
-  FileStat,
-  Generation,
-  GrepHit,
-  LsEntry,
-} from "../../domain/memory-client";
 import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
 import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
@@ -114,22 +108,11 @@ export interface ConsoleState {
   /** Every rule, re-queried per block; empty when the module is absent. */
   rules: Rule[];
 
-  // ── Memory (agent filesystem workspace) ──
-  /** The directory being browsed (canonical absolute path; "/" is the root). */
-  memoryPath: string;
-  /** Entries directly under `memoryPath` (child dirs + files), re-queried per
-   *  block like the doc index. */
-  memoryEntries: LsEntry[];
-  /** The file opened in the viewer (its stat + a loaded generation), or null. */
-  memoryOpen: { stat: FileStat; generation: Generation } | null;
-  /** Active grep hits, or null when no search is running. */
-  memoryMatches: GrepHit[] | null;
-
   // ── Search (cross-module reads over the node's derived index) ──
-  /** The last search's results, or null before any search ran. Query-driven
-   *  like `memoryMatches` — never part of the per-block snapshot. */
+  /** The last search's results, or null before any search ran. Query-driven —
+   *  never part of the per-block snapshot. */
   search: SearchResults | null;
-  /** A search round-trip is in flight (three module views fan out). */
+  /** A search round-trip is in flight (the module views fan out). */
   searchPending: boolean;
 
   // ── Files (content-addressed manifests) ──
@@ -270,10 +253,6 @@ export const createInitialState = (): ConsoleState => {
     jobs: [],
     jobCounts: null,
     rules: [],
-    memoryPath: "/",
-    memoryEntries: [],
-    memoryOpen: null,
-    memoryMatches: null,
     search: null,
     searchPending: false,
     files: [],
@@ -311,7 +290,6 @@ export interface ConsoleSnapshot {
   jobs: Job[];
   jobCounts: BoardCounts | null;
   rules: Rule[];
-  memoryEntries: LsEntry[];
   files: Manifest[];
   blocks: BlockRecord[];
 }
@@ -337,7 +315,6 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   jobs: snapshot.jobs,
   jobCounts: snapshot.jobCounts,
   rules: snapshot.rules,
-  memoryEntries: snapshot.memoryEntries,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });

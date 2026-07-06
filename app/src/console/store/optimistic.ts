@@ -11,7 +11,6 @@
 import type { ChatBlock, MessageView } from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
 import type { Job } from "../../domain/jobs-client";
-import type { LsEntry, Meta } from "../../domain/memory-client";
 import type { PageBlock } from "../../domain/pages-client";
 import type { Rule } from "../../domain/automations-client";
 import type { ConsoleState } from "./state";
@@ -347,54 +346,6 @@ export const ruleRemoved = (
   ruleId: string,
 ): Partial<ConsoleState> => ({
   rules: prev.rules.filter((r) => r.rule_id !== ruleId),
-});
-
-// ── Memory ──────────────────────────────────────────────
-
-const memoryParent = (path: string): string => {
-  const cut = path.lastIndexOf("/");
-  return cut <= 0 ? "/" : path.slice(0, cut);
-};
-
-/** Upsert the published file into the OPEN directory listing (a publish into
- *  some other dir shows up when that dir is browsed — server truth anyway). */
-export const memoryPublished = (
-  prev: ConsoleState,
-  params: { path: string; bodyLen: number; meta?: Meta },
-): Partial<ConsoleState> => {
-  if (memoryParent(params.path) !== prev.memoryPath) return {};
-  const existing = prev.memoryEntries.find(
-    (e) => "file" in e && e.file.path === params.path,
-  );
-  const stat = (gen: number, gens: number): LsEntry => ({
-    file: {
-      path: params.path,
-      latest_generation: gen,
-      generations: gens,
-      latest_meta: params.meta ?? {},
-      latest_author: "", // origin-derived server-side; refresh fills it
-      latest_published_at_height: 0,
-      body_len: params.bodyLen,
-    },
-  });
-  return {
-    memoryEntries: existing
-      ? prev.memoryEntries.map((e) =>
-          "file" in e && e.file.path === params.path
-            ? stat(e.file.latest_generation + 1, e.file.generations + 1)
-            : e,
-        )
-      : [...prev.memoryEntries, stat(1, 1)],
-  };
-};
-
-export const memoryRemoved = (
-  prev: ConsoleState,
-  path: string,
-): Partial<ConsoleState> => ({
-  memoryEntries: prev.memoryEntries.filter(
-    (e) => !("file" in e) || e.file.path !== path,
-  ),
 });
 
 // ── Files ───────────────────────────────────────────────

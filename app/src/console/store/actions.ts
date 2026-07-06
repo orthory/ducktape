@@ -10,8 +10,6 @@ import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as jobsClient from "../../domain/jobs-client";
-import * as memoryClient from "../../domain/memory-client";
-import type { Meta } from "../../domain/memory-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
@@ -181,23 +179,6 @@ export interface ConsoleActions {
   setRuleEnabled(ruleId: string, enabled: boolean): void;
   /** Delete a rule. */
   deleteRule(ruleId: string): void;
-
-  // ── Memory (agent filesystem over the `memory` module) ──
-  /** Browse a directory: list its entries and make it the active path. */
-  browseMemory(path: string): void;
-  /** Open a file into the viewer, loading its latest (or a specific) generation. */
-  openMemoryFile(params: { path: string; generation?: number | null }): void;
-  /** Close the open file. */
-  closeMemoryFile(): void;
-  /** Write-once publish of an inline document at `path`, then refresh the tree. */
-  publishMemory(params: { path: string; text: string; meta?: Meta }): void;
-  /** Delete a memory file (all live generations). */
-  deleteMemory(path: string): void;
-  /** Run a case-sensitive substring search under `prefix`; results land in
-   *  `state.memoryMatches`. */
-  searchMemory(params: { prefix: string; pattern: string }): void;
-  /** Clear the active search. */
-  clearMemorySearch(): void;
 
   // ── Search (cross-module, over the node's derived-index views) ──
   /** Search chat, docs, and pages with one text: the three modules'
@@ -1064,85 +1045,6 @@ export function createActions({
       );
     },
 
-    // ── Memory ──
-    browseMemory: (path) => {
-      const live = getNode();
-      const dir = path || "/";
-      if (!live) return;
-      // set the active dir immediately (so refresh re-lists it), clear the open
-      // file + any search, then list eagerly for a snappy transition.
-      patch({ memoryPath: dir, memoryOpen: null, memoryMatches: null });
-      Promise.resolve()
-        .then(() => memoryClient.ls(live, { path: dir }))
-        .then((memoryEntries) => patch({ memoryEntries }))
-        .catch(fail);
-    },
-
-    openMemoryFile: ({ path, generation }) => {
-      const live = getNode();
-      if (!live || !path) return;
-      Promise.resolve()
-        .then(() =>
-          Promise.all([
-            memoryClient.stat(live, path),
-            memoryClient.read(live, { path, generation: generation ?? null }),
-          ]),
-        )
-        .then(([stat, gen]) =>
-          patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
-        )
-        .catch(fail);
-    },
-
-    closeMemoryFile: () => patch({ memoryOpen: null }),
-
-    publishMemory: ({ path, text, meta }) => {
-      const p = path.trim();
-      if (!p) return;
-      submitTracked(
-        opKey.memory(p),
-        (live) =>
-          memoryClient.publish(live, { path: p, body: memoryClient.inlineBody(text), meta }),
-        (prev) => optimistic.memoryPublished(prev, { path: p, bodyLen: text.length, meta }),
-      ).then(() => {
-        const live = getNode();
-        if (!live) return;
-        // reflect the new generation in the open viewer if it is this file.
-        if (getState().memoryOpen?.stat.path === p) {
-          return Promise.all([
-            memoryClient.stat(live, p),
-            memoryClient.read(live, { path: p, generation: null }),
-          ])
-            .then(([stat, gen]) =>
-              patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
-            )
-            .catch(fail);
-        }
-      });
-    },
-
-    deleteMemory: (path) => {
-      if (!path) return;
-      submitTracked(
-        opKey.memory(path),
-        (live) => memoryClient.remove(live, path),
-        (prev) => optimistic.memoryRemoved(prev, path),
-      ).then(() => {
-        if (getState().memoryOpen?.stat.path === path) patch({ memoryOpen: null });
-      });
-    },
-
-    searchMemory: ({ prefix, pattern }) => {
-      const live = getNode();
-      if (!live || !pattern) return;
-      Promise.resolve()
-        .then(() => memoryClient.grep(live, { prefix: prefix || "/", pattern }))
-        .then((memoryMatches) => patch({ memoryMatches }))
-        .catch(fail);
-    },
-
-    clearMemorySearch: () => patch({ memoryMatches: null }),
-
     // ── Search (derived-index views) ──
     runSearch: (text) => {
       const live = getNode();
@@ -1287,10 +1189,6 @@ export function createActions({
         jobs: [],
         jobCounts: null,
         rules: [],
-        memoryPath: "/",
-        memoryEntries: [],
-        memoryOpen: null,
-        memoryMatches: null,
         files: [],
         ops: {},
         onboardingPhase: null,
@@ -1327,10 +1225,6 @@ export function createActions({
         jobs: [],
         jobCounts: null,
         rules: [],
-        memoryPath: "/",
-        memoryEntries: [],
-        memoryOpen: null,
-        memoryMatches: null,
         files: [],
         ops: {},
         onboardingPhase: null,

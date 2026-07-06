@@ -9,7 +9,6 @@ import { FilesView } from "../views/files/FilesView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { GovernanceView } from "../views/governance/GovernanceView";
 import { JobsView } from "../views/jobs/JobsView";
-import { MemoryView } from "../views/memory/MemoryView";
 import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { PagesView } from "../views/pages/PagesView";
@@ -30,7 +29,6 @@ export const MODULES: AppModule[] = [
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
   { id: "pages", nav: { icon: "document", label: "Docs", order: 3, section: "user" }, Screen: PagesView },
   { id: "files", nav: { icon: "files", label: "Files", order: 5, section: "user" }, Screen: FilesView },
-  { id: "memory", nav: { icon: "memory", label: "Memory", order: 6, section: "user" }, Screen: MemoryView },
   { id: "forge", nav: { icon: "forge", label: "Forge", order: 7, section: "user" }, Screen: ForgeView },
   { id: "agent", nav: { icon: "agent", label: "Agents", order: 8, section: "user" }, Screen: AgentView },
   // ── Node operator surfaces ──

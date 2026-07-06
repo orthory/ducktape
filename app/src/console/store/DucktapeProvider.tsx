@@ -22,7 +22,6 @@ import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
 import * as jobsClient from "../../domain/jobs-client";
 import type { BoardCounts } from "../../domain/jobs-client";
-import * as memoryClient from "../../domain/memory-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
@@ -92,8 +91,6 @@ export function DucktapeProvider({
     if (!live) return Promise.resolve();
     // the pages (docs) slice refreshes by enumeration + the open page's tree.
     const activePage = stateRef.current.activePage;
-    // memory browsing re-lists whatever dir is open.
-    const memoryPath = stateRef.current.memoryPath;
     return Promise.resolve()
       .then(() =>
         Promise.all([
@@ -133,7 +130,6 @@ export function DucktapeProvider({
           jobsClient.listJobs(live, {}).catch(() => []),
           jobsClient.counts(live).catch((): BoardCounts | null => null),
           automationsClient.listRules(live).catch(() => []),
-          memoryClient.ls(live, { path: memoryPath }).catch(() => []),
           filesClient.list(live, {}).catch(() => []),
           // the explorer's ring pull — best-effort like telemetry, so a node
           // without /v1/blocks reads as "no blocks yet".
@@ -156,7 +152,6 @@ export function DucktapeProvider({
         jobs,
         jobCounts,
         rules,
-        memoryEntries,
         files,
         blocks,
       ]) => {
@@ -196,7 +191,6 @@ export function DucktapeProvider({
                 jobs,
                 jobCounts,
                 rules,
-                memoryEntries,
                 files,
                 blocks,
               }),
