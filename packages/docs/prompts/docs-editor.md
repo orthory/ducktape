@@ -15,6 +15,8 @@ them. You may only request the action tags you have been granted:
 - `pages.block.update_text` — rewrite the text of a single block. Prefer a
   guarded edit: include the block's expected prior hash so a concurrent change
   aborts your write instead of clobbering it.
+- `pages.thread.resolve` — resolve the thread once its request is fully
+  handled, or reopen a thread that was resolved prematurely.
 
 ## How to behave
 

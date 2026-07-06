@@ -15,7 +15,7 @@ use sdk::Origin;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::install::{InstallReport, install_spec_from_capsule};
+use crate::install::{InstallReport, install_spec_from_capsule_defaulted};
 use crate::testbed::PackageTestBed;
 
 /// where the fixture lives inside a capsule.
@@ -32,8 +32,11 @@ pub const GOLDEN_SCHEMA_V1: u32 = 1;
 pub struct GoldenFixture {
     pub schema: u32,
     pub package: String,
-    /// the harness module's LOGICAL id (the manifest carries no marker).
-    pub harness: String,
+    /// the harness module's LOGICAL id. optional: when omitted, the install
+    /// step resolves it from the manifest's top-level `harness` key; when
+    /// present it overrides that key.
+    #[serde(default)]
+    pub harness: Option<String>,
     #[serde(default)]
     pub bindings: BTreeMap<String, String>,
     pub steps: Vec<GoldenStep>,
@@ -134,7 +137,9 @@ pub enum GoldenStep {
 }
 
 impl GoldenStep {
-    fn label(&self) -> &'static str {
+    /// the step's wire tag (`"install"`, `"expect_job"`, ...) — what the
+    /// CLI's pass/fail table names each row with.
+    pub fn label(&self) -> &'static str {
         match self {
             GoldenStep::Install { .. } => "install",
             GoldenStep::Submit { .. } => "submit",
@@ -195,8 +200,12 @@ pub async fn run_golden(
                 let origin = parse_origin(origin).map_err(&fail)?;
                 // the fixture must drive the capsule it ships in: a package
                 // id mismatch is a fixture bug, caught before any block.
-                let spec = install_spec_from_capsule(capsule, &fixture.harness, &fixture.bindings)
-                    .map_err(&fail)?;
+                let spec = install_spec_from_capsule_defaulted(
+                    capsule,
+                    fixture.harness.as_deref(),
+                    &fixture.bindings,
+                )
+                .map_err(&fail)?;
                 if spec.package != fixture.package {
                     return Err(fail(format!(
                         "fixture drives package {:?} but the capsule manifest declares {:?}",
@@ -204,7 +213,7 @@ pub async fn run_golden(
                     )));
                 }
                 let report = bed
-                    .install_capsule(capsule, &fixture.harness, &fixture.bindings, origin)
+                    .install_capsule(capsule, &spec.harness, &fixture.bindings, origin)
                     .await
                     .map_err(&fail)?;
                 run.install = Some(report);

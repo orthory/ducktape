@@ -4,10 +4,6 @@
   "description": "Resolve or reopen a page comment thread.",
   "type": "object",
   "properties": {
-    "page_id": {
-      "type": "string",
-      "description": "The page that owns the thread."
-    },
     "thread_id": {
       "type": "string",
       "description": "The thread to resolve or reopen."
@@ -17,6 +13,6 @@
       "description": "true to resolve the thread, false to reopen it."
     }
   },
-  "required": ["page_id", "thread_id", "resolved"],
+  "required": ["thread_id", "resolved"],
   "additionalProperties": false
 }

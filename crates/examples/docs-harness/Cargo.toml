@@ -1,0 +1,27 @@
+# the reference Quack package's harness module (design D9): owns the docs
+# package's lifecycle (HarnessMsg from the package module), consumes pages
+# comment events into agent jobs, and owns the three pages.* action tags
+# (Probe validates against pages state, Apply translates to PageMsg
+# follow-ups). a CONSUMER of pages/agent/jobs — it composes them purely
+# through their crate-root wire types.
+[package]
+name = "docs-harness"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+package = { workspace = true }
+pages = { workspace = true }
+agent = { workspace = true }
+jobs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+quack = { workspace = true }
+quack-harness = { workspace = true }
+saga = { workspace = true }
+futures = "0.3"

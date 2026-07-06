@@ -1,9 +1,11 @@
-//! Smoke tests for the `ducktape-node package inspect|build|verify` verbs.
+//! Smoke tests for the `ducktape-node package inspect|build|verify|test`
+//! verbs.
 //!
 //! Drives the real built binary (`CARGO_BIN_EXE_ducktape-node`) against the
 //! reference `packages/docs/` source: verify passes, inspect prints the
-//! manifest surface, build is byte-deterministic and re-verifies, and a
-//! tampered package fails with a non-zero exit.
+//! manifest surface, build is byte-deterministic and re-verifies, test runs
+//! the capsule's golden harness in-process and prints a per-step pass table,
+//! and a tampered package fails both verbs with a non-zero exit.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -81,6 +83,86 @@ fn build_is_deterministic_and_reverifies() {
         r.status.success(),
         "verify of built .quack failed: {}",
         String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+#[test]
+fn test_runs_the_golden_harness_and_prints_a_step_table() {
+    let out = run(&["package", "test", fixture().to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "package test failed:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // the verification preamble ran.
+    assert!(stdout.contains("digests  ok"), "stdout: {stdout}");
+    // the per-step pass table names the fixture's step kinds.
+    for needle in ["install", "expect_job", "oracle", "snapshot_roundtrip"] {
+        assert!(
+            stdout.contains(&format!(" {needle}")),
+            "missing step {needle:?} in table:\n{stdout}"
+        );
+    }
+    assert!(stdout.contains("ok org.ducktape.docs"), "stdout: {stdout}");
+}
+
+#[test]
+fn test_also_accepts_a_built_capsule() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let quack = tmp.path().join("docs.quack");
+    let r = run(&[
+        "package",
+        "build",
+        fixture().to_str().unwrap(),
+        "-o",
+        quack.to_str().unwrap(),
+    ]);
+    assert!(r.status.success());
+    let out = run(&["package", "test", quack.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "package test of the .quack failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_rejects_a_tampered_package_before_running_any_step() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("docs");
+    copy_dir(&fixture(), &dir);
+    let prompt = dir.join("prompts/docs-editor.md");
+    let mut body = std::fs::read(&prompt).unwrap();
+    body.extend_from_slice(b"tampered");
+    std::fs::write(&prompt, body).unwrap();
+
+    let out = run(&["package", "test", dir.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "test must fail on a tampered package"
+    );
+}
+
+#[test]
+fn test_names_a_module_outside_the_native_catalog() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("docs");
+    copy_dir(&fixture(), &dir);
+    // rename the harness module to something no binary constructor knows.
+    let manifest = dir.join("quack.toml");
+    let toml = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("docs-harness", "ghost-harness");
+    std::fs::write(&manifest, toml).unwrap();
+
+    let out = run(&["package", "test", dir.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("native catalog") && stderr.contains("ghost-harness"),
+        "a readable catalog rejection, got:\n{stderr}"
     );
 }
 

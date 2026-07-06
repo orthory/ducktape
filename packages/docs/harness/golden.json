@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "package": "org.ducktape.docs",
+  "bindings": {},
+  "steps": [
+    { "install": { "origin": "external:616c696365" } },
+    { "expect_query": { "module": "package", "query": { "action_owner": { "tag": "pages.comment.add" } }, "expect": { "owner": "docs-harness" } } },
+    { "expect_query": { "module": "package", "query": { "action_owner": { "tag": "pages.block.update_text" } }, "expect": { "owner": "docs-harness" } } },
+    { "expect_query": { "module": "package", "query": { "action_owner": { "tag": "pages.thread.resolve" } }, "expect": { "owner": "docs-harness" } } },
+    { "submit": { "origin": "external:616c696365", "target": "pages", "payload": { "create_page": { "page_id": "p1", "title": "Docs", "parent": null } } } },
+    { "submit": { "origin": "external:616c696365", "target": "pages", "payload": { "insert_block": { "parent": "p1", "after": null, "block": { "id": "b1", "kind": "paragraph", "text": "Draft intro." } } } } },
+    { "submit": { "origin": "external:616c696365", "target": "pages", "payload": { "add_comment": { "thread_id": "t1", "comment_id": "c1", "target": "b1", "text": "@docs.editor please tighten this intro" } } } },
+    { "expect_job": { "kind_prefix": "agent/docs.editor", "count": 1 } },
+    { "expect_run": { "agent": "docs.editor", "exists": true } },
+    { "oracle": { "response": { "reply_blocks": [], "actions": [
+        { "action_id": "a1", "tag": "pages.block.update_text", "payload": { "block_id": "b1", "expected_hash": "sha256:0b5330053f4c2f56493fa924fc97451eb462bb28e0f071502a0c5aaab14a7127", "text": "A crisp intro." } },
+        { "action_id": "a2", "tag": "pages.comment.add", "payload": { "target": "b1", "thread_id": "t1", "text": "Rewrote block b1 as asked. — @docs.editor" } },
+        { "action_id": "a3", "tag": "pages.thread.resolve", "payload": { "thread_id": "t1", "resolved": true } }
+    ] } } },
+    { "deliver": {} },
+    { "expect_query": { "module": "pages", "query": { "get_block": { "block_id": "b1" } }, "expect": { "block": { "id": "b1", "parent": "p1", "page": "p1", "kind": "paragraph", "text": "A crisp intro.", "checked": false, "children": [] } } } },
+    { "expect_job": { "job_id": "docs:docs.editor:c1", "status": "done", "count": 1 } },
+    { "expect_job": { "kind_prefix": "agent/docs.editor", "count": 1 } },
+    { "expect_run": { "agent": "docs.editor", "exists": false } },
+    { "submit": { "origin": "external:616c696365", "target": "pages", "payload": { "add_comment": { "thread_id": "t2", "comment_id": "c2", "target": "b1", "text": "@docs.editor now sneak a task in" } } } },
+    { "expect_job": { "kind_prefix": "agent/docs.editor", "count": 2 } },
+    { "oracle": { "response": { "reply_blocks": [], "actions": [
+        { "action_id": "a1", "tag": "tasks.create", "payload": { "task_id": "sneaky", "title": "not granted" } }
+    ] } } },
+    { "deliver": {} },
+    { "expect_failure_row": { "source": "runs", "contains": "is not allowed to tasks.create" } },
+    { "expect_query": { "module": "tasks", "query": "list", "expect": { "tasks": [] } } },
+    { "expect_query": { "module": "pages", "query": { "get_block": { "block_id": "b1" } }, "expect": { "block": { "id": "b1", "parent": "p1", "page": "p1", "kind": "paragraph", "text": "A crisp intro.", "checked": false, "children": [] } } } },
+    { "expect_job": { "job_id": "docs:docs.editor:c2", "status": "failed", "count": 1 } },
+    { "expect_query": { "module": "docs-harness", "query": "status", "expect": { "status": { "package": "org.ducktape.docs", "phase": "active", "agents": [ "docs.editor" ], "minted": 2, "failures": 0 } } } },
+    { "snapshot_roundtrip": {} }
+  ]
+}

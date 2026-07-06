@@ -50,7 +50,10 @@ pub use golden::{
     GoldenError, GoldenFixture, GoldenRun, GoldenStep, SubmitExpect, diff_json, parse_origin,
     run_golden,
 };
-pub use install::{InstallReport, RegisteredAgent, SeededPrompt, install_spec_from_capsule};
+pub use install::{
+    InstallReport, RegisteredAgent, SeededPrompt, install_spec_from_capsule,
+    install_spec_from_capsule_defaulted,
+};
 pub use testbed::{BlockEvent, ModuleRoundtrip, PackageTestBed, RoundtripKind};
 
 // the shapes a package test asserts against, re-exported so an author's test

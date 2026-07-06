@@ -2045,6 +2045,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "docs-harness"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "async-trait",
+ "futures",
+ "jobs",
+ "package",
+ "pages",
+ "quack",
+ "quack-harness",
+ "saga",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "doctest-file"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4032,6 +4051,7 @@ dependencies = [
  "directory",
  "dispatch",
  "dispatch-oracle",
+ "docs-harness",
  "files",
  "forge",
  "futures",
@@ -4048,6 +4068,7 @@ dependencies = [
  "pages",
  "profiles",
  "quack",
+ "quack-harness",
  "rand 0.8.6",
  "reachability",
  "reactor",

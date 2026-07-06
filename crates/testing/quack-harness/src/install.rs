@@ -21,9 +21,10 @@ use sha2::{Digest, Sha256};
 /// the mapping decisions (owned here, mirrored by the CLI):
 /// - every `[[modules]]` logical binds to `bindings[logical]`, falling back
 ///   to the manifest's `default_id`.
-/// - `harness_logical` names the harness module — the manifest schema carries
-///   no harness marker (a v1 gap), so the caller (a fixture's `harness`
-///   field, the CLI's flag) supplies it; it must be a declared module.
+/// - `harness_logical` names the harness module; it must be a declared
+///   module. a caller with no opinion of its own uses
+///   [`install_spec_from_capsule_defaulted`], which falls back to the
+///   manifest's top-level `harness` key.
 /// - each prompt seeds the memory path `/packages/<package>/<capsule path>`
 ///   with the capsule file's utf-8 content; the pin is the manifest's
 ///   `sha256:` digest (already verified against the bytes).
@@ -34,12 +35,32 @@ pub fn install_spec_from_capsule(
     harness_logical: &str,
     bindings: &BTreeMap<String, String>,
 ) -> Result<InstallSpec, String> {
+    install_spec_from_capsule_defaulted(capsule, Some(harness_logical), bindings)
+}
+
+/// [`install_spec_from_capsule`] with the harness logical defaulted from the
+/// manifest's top-level `harness` key: an explicit `Some(logical)` overrides
+/// the key; `None` requires the manifest to carry it.
+pub fn install_spec_from_capsule_defaulted(
+    capsule: &Capsule,
+    harness_logical: Option<&str>,
+    bindings: &BTreeMap<String, String>,
+) -> Result<InstallSpec, String> {
     let toml = capsule
         .manifest_bytes()
         .ok_or("no quack.toml in the capsule")?;
     let manifest = quack::parse_manifest(toml).map_err(|e| format!("manifest: {e}"))?;
     quack::validate(&manifest).map_err(|e| format!("manifest: {e}"))?;
     quack::verify_digests(capsule, &manifest).map_err(|e| format!("content digests: {e}"))?;
+
+    let harness_logical = match harness_logical {
+        Some(explicit) => explicit.to_string(),
+        None => manifest
+            .harness
+            .clone()
+            .ok_or("no harness logical: pass one explicitly or set the manifest's `harness` key")?,
+    };
+    let harness_logical = harness_logical.as_str();
 
     let modules: Vec<ModuleBinding> = manifest
         .modules

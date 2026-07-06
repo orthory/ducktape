@@ -1,6 +1,7 @@
 schema = 1
 package = "org.ducktape.docs"
 version = "0.1.0"
+harness = "docs-harness"
 
 [requires]
 protocol_min = 1
@@ -23,7 +24,7 @@ kind = "native"
 [[prompts]]
 logical = "docs_editor_prompt"
 path = "prompts/docs-editor.md"
-hash = "sha256:4c959e34b57a174dd08e9b1fd6aaa431c22c5fb0ea82f0266ecc27dcd4594407"
+hash = "sha256:3402716938239813b336ad21b312832dc0c86ce8645da90e94d075fc39b7cca3"
 
 [[actions]]
 tag = "pages.comment.add"
@@ -45,7 +46,7 @@ id = "docs.editor"
 display_name = "Docs Editor"
 prompt = "docs_editor_prompt"
 capability = "codex"
-actions = ["pages.comment.add", "pages.block.update_text"]
+actions = ["pages.comment.add", "pages.block.update_text", "pages.thread.resolve"]
 status = "active"
 
 [[engagements]]

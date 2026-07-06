@@ -134,6 +134,39 @@ fn install_spec_mapping_rejects_a_tampered_capsule() {
     assert!(err.contains("ghost"), "names the bad logical, got: {err}");
 }
 
+#[test]
+fn the_manifest_harness_key_defaults_the_mapping_and_an_explicit_logical_overrides() {
+    // no explicit logical: the manifest's `harness` key names the module.
+    let spec = quack_harness::install_spec_from_capsule_defaulted(
+        &dummy_capsule(),
+        None,
+        &BTreeMap::new(),
+    )
+    .expect("the manifest harness key resolves the mapping");
+    assert_eq!(spec.harness, HARNESS);
+
+    // an explicit logical still overrides the manifest key.
+    let spec = quack_harness::install_spec_from_capsule_defaulted(
+        &dummy_capsule(),
+        Some("pages"),
+        &BTreeMap::new(),
+    )
+    .expect("an explicit declared logical overrides");
+    assert_eq!(spec.harness, "pages");
+
+    // neither an explicit logical nor a manifest key: a readable rejection.
+    let mut keyless = dummy_capsule();
+    let toml = String::from_utf8(keyless.files.get("quack.toml").unwrap().clone()).unwrap();
+    keyless.insert(
+        "quack.toml",
+        toml.replace("harness = \"dummy-harness\"\n", "")
+            .into_bytes(),
+    );
+    let err = quack_harness::install_spec_from_capsule_defaulted(&keyless, None, &BTreeMap::new())
+        .expect_err("no harness anywhere must reject");
+    assert!(err.contains("harness"), "readable failure, got: {err}");
+}
+
 // ---- the engagement -> job -> oracle -> apply loop ---------------------------------
 
 #[test]
