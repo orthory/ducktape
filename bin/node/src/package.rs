@@ -1,11 +1,14 @@
-//! `ducktape-node package …` — inspect, build, and verify Quack packages.
+//! `ducktape-node package …` — inspect, build, verify, and test Quack
+//! packages.
 //!
 //! A thin CLI over the `quack` crate: read a package from a source directory or
 //! a `.quack` capsule, print its manifest, pack a deterministic `.quack`
-//! (optionally signed), and verify content digests + the signature. `package
-//! test` (the golden harness) lands with the reference package in a later
-//! slice.
+//! (optionally signed), verify content digests + the signature, and `test` —
+//! verify, then replay the capsule's `harness/golden.json` in-process on a
+//! `quack_harness::PackageTestBed` whose extra modules come from this binary's
+//! native catalog (v1: the docs package's modules).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{hex_bytes, load_identity};
@@ -16,11 +19,12 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("build") => cmd_build(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
+        Some("test") => cmd_test(&args[1..]),
         Some(other) => Err(format!(
-            "unknown package subcommand {other:?} (want inspect|build|verify <dir|.quack>)"
+            "unknown package subcommand {other:?} (want inspect|build|verify|test <dir|.quack>)"
         )
         .into()),
-        None => Err("package needs a subcommand: inspect|build|verify <dir|.quack>".into()),
+        None => Err("package needs a subcommand: inspect|build|verify|test <dir|.quack>".into()),
     }
 }
 
@@ -38,6 +42,9 @@ fn cmd_inspect(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("package  {} {}", manifest.package, manifest.version);
     println!("schema   {}", manifest.schema);
+    if let Some(harness) = &manifest.harness {
+        println!("harness  {harness}");
+    }
     println!("manifest sha256:{}", hex_bytes(&quack::manifest_hash(toml)));
     println!(
         "requires protocol_min={} modules={:?} capabilities={:?}",
@@ -147,6 +154,102 @@ fn cmd_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("ok {} {}", manifest.package, manifest.version);
     Ok(())
+}
+
+/// `package test <dir|.quack>` — verify (digests + signature), then replay the
+/// capsule's `harness/golden.json` against an in-process testbed and print a
+/// per-step pass/fail table. Exits non-zero on any verification or step
+/// failure.
+fn cmd_test(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let opts = Opts::parse(args)?;
+    let source = opts.require_source()?;
+    let capsule = load_capsule(source)?;
+    let toml = capsule
+        .manifest_bytes()
+        .ok_or("no quack.toml in the package")?;
+    let manifest = quack::parse_manifest(toml)?;
+    quack::validate(&manifest)?;
+    quack::verify_digests(&capsule, &manifest)?;
+    println!("digests  ok ({} referenced files)", digest_count(&manifest));
+    let status = signature_status(&capsule, toml);
+    println!("signature {status}");
+    if status.starts_with("invalid") {
+        return Err("signature verification failed".into());
+    }
+
+    let fixture = quack_harness::GoldenFixture::from_capsule(&capsule)
+        .map_err(|e| format!("golden fixture: {e}"))?;
+    let extras = native_catalog(&manifest, &fixture.bindings)?;
+    let labels: Vec<&'static str> = fixture.steps.iter().map(|s| s.label()).collect();
+    println!("golden   {} steps against the native catalog", labels.len());
+
+    // the testbed owns its deterministic runtime; the whole golden run is
+    // in-process and side-effect free.
+    let outcome = quack_harness::PackageTestBed::run(extras, |mut bed| async move {
+        quack_harness::run_golden(&mut bed, &capsule, &fixture).await
+    });
+    match outcome {
+        Ok(run) => {
+            for (i, label) in run.steps.iter().enumerate() {
+                println!("  ok   {:>3} {label}", i + 1);
+            }
+            println!(
+                "ok {} {} ({} steps)",
+                manifest.package,
+                manifest.version,
+                run.steps.len()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            for (i, label) in labels.iter().take(e.step - 1).enumerate() {
+                println!("  ok   {:>3} {label}", i + 1);
+            }
+            println!("  FAIL {:>3} {}: {}", e.step, e.label, e.message);
+            Err(format!("golden harness failed at step {} ({})", e.step, e.label).into())
+        }
+    }
+}
+
+/// The binary's native module catalog: map each manifest `[[modules]]` entry
+/// to what this binary can supply. Platform logicals resolve to the testbed's
+/// standard set; package logicals resolve to in-binary constructors (v1 knows
+/// the docs package's modules). Anything else is a clear rejection.
+fn native_catalog(
+    manifest: &quack::PackageManifest,
+    bindings: &BTreeMap<String, String>,
+) -> Result<Vec<Box<dyn sdk::Module>>, Box<dyn std::error::Error>> {
+    let mut extras: Vec<Box<dyn sdk::Module>> = Vec::new();
+    for entry in &manifest.modules {
+        let concrete = bindings
+            .get(&entry.logical)
+            .unwrap_or(&entry.default_id)
+            .clone();
+        match entry.logical.as_str() {
+            // the testbed's standard platform set already registers pages.
+            "pages" => {
+                if concrete != "pages" {
+                    return Err(format!(
+                        "module {:?} binds to {concrete:?}, but the testbed's platform set \
+                         registers it as \"pages\"",
+                        entry.logical
+                    )
+                    .into());
+                }
+            }
+            "docs-harness" => extras.push(Box::new(docs_harness::DocsHarness::new(
+                concrete, "package", "agent", "jobs", "memory", "pages", "runs",
+            ))),
+            other => {
+                return Err(format!(
+                    "module {other:?} is not in this binary's native catalog \
+                     (v1 knows: pages, docs-harness)"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(extras)
 }
 
 /// Describe the signature state of a capsule: unsigned, signed-by, or invalid.

@@ -137,7 +137,9 @@ pub enum GoldenStep {
 }
 
 impl GoldenStep {
-    fn label(&self) -> &'static str {
+    /// the step's wire tag (`"install"`, `"expect_job"`, ...) — what the
+    /// CLI's pass/fail table names each row with.
+    pub fn label(&self) -> &'static str {
         match self {
             GoldenStep::Install { .. } => "install",
             GoldenStep::Submit { .. } => "submit",
