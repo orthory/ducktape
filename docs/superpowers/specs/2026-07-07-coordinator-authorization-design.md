@@ -239,7 +239,11 @@ The coordination mode is recorded once, by the founder, and consumed by nodes:
 
 - **Genesis / `network.toml`** gains a `coordination = "public" | "private"`
   field (default `"private"` — the epic's intent and the safer default). It is
-  covered by the genesis fingerprint like the rest of the descriptor.
+  parsed like the reach hints — **operational policy, NOT part of
+  `genesis_namespace`** (which fingerprints validator identity only). Flipping
+  the mode is not a key-substitution vector: a private network pointed at an
+  open coordinator simply loses enforcement, and a node with the wrong mode
+  fails closed at rendezvous — so it does not need fingerprint protection.
 - **v3 invite** echoes the mode (and, for private, carries the joiner's
   `coord.cap`) so a joiner with only an invite knows whether to attach a cap.
   The `Reach::Coordinated { coord, coord_key }` hint already exists.
