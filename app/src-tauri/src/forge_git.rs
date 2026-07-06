@@ -248,15 +248,51 @@ pub fn forge_diff(
 }
 
 fn open_forge_repo(app: &tauri::AppHandle) -> Result<Option<Repository>, String> {
-    for candidate in repo_candidates(app)? {
-        if !candidate.join(".git").exists() {
-            continue;
+    for base in repo_candidates(app)? {
+        if let Some(repo) = open_repo_in_base(&base)? {
+            return Ok(Some(repo));
         }
-        return Repository::open(&candidate)
-            .map(Some)
-            .map_err(|e| format!("open forge repo {}: {e}", candidate.display()));
     }
     Ok(None)
+}
+
+/// Open the git repo the forge module materialized under `base`.
+///
+/// forge namespaces repos at `<base>/<name>` (a `Push`/`Commit` creates the dir
+/// lazily), so the on-disk repo lives ONE LEVEL DOWN — scanning the base is what
+/// makes the desktop Forge view see a pushed repo at all. A repo AT `base` is
+/// still accepted for the legacy single-repo layout. Repo-name-agnostic: opens
+/// the first repo dir in sorted order (dev dogfooding materializes exactly one),
+/// so nothing here hardcodes the `ducktape`/`default` name.
+fn open_repo_in_base(base: &Path) -> Result<Option<Repository>, String> {
+    // legacy: the base dir is itself a repo.
+    if base.join(".git").exists() {
+        return Repository::open(base)
+            .map(Some)
+            .map_err(|e| format!("open forge repo {}: {e}", base.display()));
+    }
+    // multi-repo: `<base>/<name>` per repo. pick the first git repo, sorted so
+    // the choice is deterministic across reads.
+    let read = match fs::read_dir(base) {
+        Ok(read) => read,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("scan forge base {}: {err}", base.display())),
+    };
+    let mut repo_dirs: Vec<PathBuf> = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|e| format!("scan forge base {}: {e}", base.display()))?;
+        let path = entry.path();
+        if path.join(".git").exists() {
+            repo_dirs.push(path);
+        }
+    }
+    repo_dirs.sort();
+    match repo_dirs.into_iter().next() {
+        Some(dir) => Repository::open(&dir)
+            .map(Some)
+            .map_err(|e| format!("open forge repo {}: {e}", dir.display())),
+        None => Ok(None),
+    }
 }
 
 fn repo_candidates(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
