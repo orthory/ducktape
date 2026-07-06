@@ -1,23 +1,30 @@
 //! The voice media engine: Opus over the data plane's datagram class.
 //!
-//! Wire surface (this crate root + [`media`]): the 8-byte media header
+//! A submodule of the chat module but deliberately self-contained: it touches
+//! no qmdb, no app-hash, and none of chat's consensus state. The coupling is
+//! one-directional and future — chat's channel membership will drive this
+//! engine's `AdmissionPolicy` and the channel→flow derivation; the media
+//! pipeline here knows nothing of channels.
+//!
+//! Wire surface (this module root + [`media`]): the 8-byte media header
 //! (version, flags, seq, timestamp) carried inside a data-plane datagram on
 //! `Service::Voice`, payload = one 20 ms Opus frame. Speakers are identified
 //! by the transport-authenticated `PeerId` — the plane's WireGuard identity
 //! binding — so there is no SSRC and no media-level identity to spoof.
 //!
-//! Boundary: this crate is the media pipeline only —
-//!
 //! ```text
-//! pcm 20ms frame → Opus encode (VOIP, in-band FEC) → media header → fan-out
-//! per speaker:  datagrams → jitter buffer → Opus decode (FEC/PLC conceal)
+//! pcm 20ms frame → Opus encode (VOIP) → media header → fan-out
+//! per speaker:  datagrams → jitter buffer → Opus decode | gap→silence
 //! playout tick: sum decoded speakers → one mixed pcm frame
 //! ```
 //!
-//! No audio hardware (capture/playback/AEC arrive with the hardware edge),
-//! no consensus wiring (channel membership → `AdmissionPolicy` is the chat
-//! module's job). Everything here is provable on the data-plane sim
-//! transport under a paused clock.
+//! Codec is pure-Rust `opus-rs`, which has no FEC-decode and no PLC, so a lost
+//! frame is rendered as silence, not concealed — the jitter buffer still
+//! reports the gap so a concealment-capable codec could fill it later.
+//!
+//! No audio hardware (capture/playback/AEC arrive with the hardware edge).
+//! Everything here is provable on the data-plane sim transport under a paused
+//! clock.
 
 pub mod codec;
 pub mod engine;
