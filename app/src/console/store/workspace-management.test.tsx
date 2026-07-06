@@ -155,6 +155,47 @@ describe("selecting a not-admitted workspace from the picker", () => {
     expect(screen.getByTestId("gate").textContent).toBe("true");
   });
 
+  it("re-clicking the CURRENT not-admitted workspace still surfaces the error", async () => {
+    // boot resumes a parked workspace's waiting room; opening the picker and
+    // clicking that same workspace must not silently no-op (the old
+    // current-id early return) — the user asked for the honest status.
+    markTauri();
+    const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "workspace_list":
+          return Promise.resolve([guest]);
+        case "workspace_active":
+          return Promise.resolve(guest);
+        case "workspace_select":
+          return Promise.resolve({ id: "g", httpUrl: "http://127.0.0.1:9002" });
+        case "workspace_phase":
+          return Promise.resolve({ phase: "parked", detail: "awaiting admission" });
+        default:
+          return Promise.resolve(null);
+      }
+    });
+    // its surface never answers — boot lands in the waiting room.
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("refused"))));
+    render(
+      <DucktapeProvider>
+        <OnboardingGate />
+        <Probe />
+      </DucktapeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("phase").textContent).toBe("parked"));
+
+    await act(async () => {
+      actions!.newWorkspace();
+      actions!.selectWorkspace("g");
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("error").textContent).toMatch(/hasn't been admitted/i),
+    );
+    expect(screen.getByTestId("gate").textContent).toBe("true");
+  });
+
   it("lets a promoted (now-member) workspace connect normally", async () => {
     const guest = workspace({
       id: "g",
@@ -211,6 +252,39 @@ describe("join flow", () => {
     expect(screen.getByTestId("gate").textContent).toBe("false");
     expect(screen.getByTestId("phase").textContent).toBe("parked");
     expect(screen.getByTestId("ws").textContent).toBe("Guest");
+  });
+
+  it("holds the waiting room when the parked surface rejects reads outright", async () => {
+    // the live failure signature: a parked node answers /v1/status but rejects
+    // every query with `parked: not admitted yet — no state to serve`. that
+    // rejection must not adopt the node, escape the waiting room, or surface
+    // as an error — parked is a STEP, not a failure.
+    const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
+    await bootGate([], {
+      workspace_join: () => guest,
+      workspace_select: () => ({ id: "g", httpUrl: "http://127.0.0.1:9002" }),
+      workspace_phase: () => ({ phase: "parked", detail: "awaiting admission" }),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url).endsWith("/v1/status")
+          ? Promise.resolve(jsonResponse(200, status("ab12")))
+          : Promise.resolve(
+              jsonResponse(500, {
+                error: "parked: not admitted yet — no state to serve",
+              }),
+            ),
+      ),
+    );
+
+    await act(async () => {
+      actions!.joinWorkspace("Guest", "ducktape-invite-v2:blob");
+    });
+
+    expect(screen.getByTestId("gate").textContent).toBe("false");
+    expect(screen.getByTestId("phase").textContent).toBe("parked");
+    expect(screen.getByTestId("error").textContent).toBe("none");
   });
 
   it("seeds the waiting-room phase synchronously — the console never flashes", async () => {

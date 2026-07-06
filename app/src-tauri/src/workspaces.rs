@@ -11,10 +11,11 @@
 //! every mutation shells out to the SAME onboarding verbs the CLI exposes
 //! (`init`/`join`/`invite`/`invite-accept`), so the registry never reimplements
 //! identity, descriptors, or governance — it only allocates ports, lays out
-//! directories, and remembers the result. a parked joiner serves no http/rpc
-//! surface (the node gates both off until it is a validator), so onboarding
-//! progress is read back from the stable marker lines the node prints to
-//! `daemon.log` — see [`workspace_phase`].
+//! directories, and remembers the result. NOTE a parked joiner may well serve
+//! its http/rpc surface (newer node builds do — every read just answers
+//! "parked: no state to serve"), so an answering port is NOT admission;
+//! onboarding progress is read back from the stable marker lines the node
+//! prints to `daemon.log` — see [`workspace_phase`].
 
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -824,10 +825,10 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
     }
 
     // already running? adopt it — never spawn a second process for one
-    // workspace. we probe the p2p LISTEN port, not http: a parked joiner serves
-    // no http yet but its mesh listener is bound the whole time, so this is the
-    // one port that is up in every phase (parked, promoting, validator). a
-    // second spawn would collide on exactly this port anyway.
+    // workspace. we probe the p2p LISTEN port, not http: the mesh listener is
+    // bound in every phase (parked, promoting, validator) on every node build,
+    // while http may lag behind, so this is the one dependable liveness port.
+    // a second spawn would collide on exactly this port anyway.
     if port_listening(ws.ports.listen) {
         return Ok(Selection {
             id: ws.id,
@@ -1002,17 +1003,27 @@ fn workspace_node_pids(dir: &Path) -> Vec<u32> {
         .collect()
 }
 
+/// is `pid` a LIVE process? a zombie counts as dead: the shell never reaps its
+/// spawned nodes, so a killed child lingers as `Z` — and `kill -0` keeps
+/// succeeding on it, which would burn the whole TERM+KILL grace on an
+/// already-dead process. read the state instead of probing signalability.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(out) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+    else {
+        return false;
+    };
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    out.status.success() && !stat.is_empty() && !stat.starts_with('Z')
+}
+
 /// TERM then (after `grace`) KILL `pid`, waiting for it to exit. best-effort —
 /// the caller confirms the outcome by port, not by our signals landing.
 #[cfg(unix)]
 fn kill_pid(pid: u32, grace: std::time::Duration) {
-    let alive = |pid: u32| {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    };
+    let alive = process_alive;
     let _ = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .stderr(Stdio::null())
@@ -1329,6 +1340,32 @@ mod tests {
             assert!(
                 died(&mut child, Duration::from_secs(2)),
                 "a zombie found by command line must be stopped"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_term_killed_zombie_child_does_not_burn_the_grace() {
+            // the shell never reaps its spawned nodes, so a TERM-killed child
+            // lingers as a zombie — and `kill -0` keeps SUCCEEDING on zombies.
+            // liveness must read the process STATE, or every teardown burns
+            // the full TERM+KILL grace on an already-dead process (observed
+            // live: an 18s forget).
+            let dir = scratch_dir("zombie");
+            let mut child = spawn_fake_node(&dir);
+            fs::write(pidfile(&dir), child.id().to_string()).unwrap();
+
+            let started = std::time::Instant::now();
+            stop_workspace_node(&dir, &closed_ports(), Duration::from_secs(3)).unwrap();
+            let elapsed = started.elapsed();
+
+            assert!(
+                died(&mut child, Duration::from_secs(2)),
+                "the node must be stopped"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "teardown burned the kill grace on a zombie: {elapsed:?}"
             );
             let _ = fs::remove_dir_all(&dir);
         }

@@ -1419,7 +1419,12 @@ export function createActions({
 
     selectWorkspace: (id) => {
       const target = getState().workspaces.find((w) => w.id === id);
-      if (!target || target.id === getState().workspace?.id) return;
+      if (!target) return;
+      // re-clicking the current MEMBER workspace is a no-op; a current
+      // NON-member one falls through to the admission check below — its honest
+      // "not admitted yet" error beats a silent nothing (and a genuinely
+      // progressing one just re-runs the idempotent connect).
+      if (target.id === getState().workspace?.id && target.member) return;
       const enter = (): void => {
         // drop the old node + its projections so the switch shows no stale state.
         setNode(null);
