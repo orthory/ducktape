@@ -13,6 +13,7 @@ import type { CSSProperties, FormEvent, ReactNode } from "react";
 import type { AgentRecord, SagaOrigin } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
 import type { PendingRun, TurnPolicy, WatchView } from "../../../domain/runs-client";
+import { displayNameForKey, sameKey, shortKey } from "../../../domain/names";
 import type { Channel } from "../../../domain/chat-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
@@ -127,6 +128,18 @@ const initialsOf = (name: string): string => {
 
 const hexOf = (bytes: number[]): string =>
   bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+
+/** Whether a run was requested by the local user. On a networked node the
+ *  requester's `external` bytes ARE the submitter's pubkey (== workspace
+ *  pubkey), so this is a hex-key equality. Module/system requesters (chat,
+ *  jobs) never match, and no local pubkey means "not mine". */
+export const runIsMine = (
+  run: PendingRun,
+  workspacePubkey: string | null,
+): boolean =>
+  typeof run.requester === "object" &&
+  "external" in run.requester &&
+  sameKey(hexOf(run.requester.external), workspacePubkey);
 
 const shortHex = (bytes: number[]): string => {
   const hex = hexOf(bytes);
@@ -1517,6 +1530,8 @@ function RunRow({
   channels,
   op,
   onCancel,
+  assigneeName,
+  mine,
 }: {
   run: PendingRun;
   agents: AgentRecord[];
@@ -1524,6 +1539,10 @@ function RunRow({
   /** The run's finalization record (a cancel keys by run id). */
   op: OpRecord | undefined;
   onCancel: (id: string) => void;
+  /** Display name of the node executing this run, or null when unknown. */
+  assigneeName?: string | null;
+  /** This run was requested by the local user. */
+  mine?: boolean;
 }) {
   const agentName = agentLabel(agents, run.agent_id);
   const label = run.job_id
@@ -1594,6 +1613,8 @@ function RunRow({
             <FinalizationMark op={op} />
             <Chip text={label} tone={statusTone.blue} />
             {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
+            {assigneeName ? <Chip text={`on ${assigneeName}`} tone={statusTone.agent} /> : null}
+            {mine ? <Chip text="you" tone={statusTone.neutral} /> : null}
           </div>
           <div
             title={`run ${run.run_id} · ${runDetail(run)}`}
@@ -1620,6 +1641,9 @@ function RunsTimeline({
   channels,
   ops,
   onCancel,
+  runAssignee,
+  authorNames,
+  workspacePubkey,
 }: {
   runs: PendingRun[];
   agents: AgentRecord[];
@@ -1627,6 +1651,12 @@ function RunsTimeline({
   /** The store's finalization ledger — run rows draw their marks. */
   ops: OpLedger;
   onCancel: (id: string) => void;
+  /** run_id -> hex node key executing it (the saga assignee). */
+  runAssignee: Map<string, string>;
+  /** hex key -> display name, for the executor badge. */
+  authorNames: Record<string, string>;
+  /** The local user's pubkey, for the "you" marker. */
+  workspacePubkey: string | null;
 }) {
   return (
     <section aria-label="Pending runs" style={{ minWidth: 0 }}>
@@ -1656,16 +1686,24 @@ function RunsTimeline({
               background: color.border,
             }}
           />
-          {runs.map((run) => (
-            <RunRow
-              key={run.run_id}
-              run={run}
-              agents={agents}
-              channels={channels}
-              op={ops[opKey.run(run.run_id)]}
-              onCancel={onCancel}
-            />
-          ))}
+          {runs.map((run) => {
+            const assigneeKey = runAssignee.get(run.run_id) ?? null;
+            const assigneeName = assigneeKey
+              ? (displayNameForKey(assigneeKey, authorNames) ?? shortKey(assigneeKey))
+              : null;
+            return (
+              <RunRow
+                key={run.run_id}
+                run={run}
+                agents={agents}
+                channels={channels}
+                op={ops[opKey.run(run.run_id)]}
+                onCancel={onCancel}
+                assigneeName={assigneeName}
+                mine={runIsMine(run, workspacePubkey)}
+              />
+            );
+          })}
         </div>
       )}
     </section>
@@ -1824,6 +1862,7 @@ function NoAgentsPane({ onAdd }: { onAdd: () => void }) {
 export function AgentView() {
   const { state, actions } = useDucktape();
   const [tab, setTab] = useState<AgentTab>("agents");
+  const [runFilter, setRunFilter] = useState<"all" | "mine">("all");
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [jobWorkerOn, setJobWorkerOn] = useState(false);
@@ -2011,12 +2050,39 @@ export function AgentView() {
               op={state.ops[opKey.jobWorker()]}
               onToggle={toggleJobWorker}
             />
+            <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+              {(["all", "mine"] as const).map((f) => (
+                <button
+                  key={f}
+                  type="button"
+                  onClick={() => setRunFilter(f)}
+                  style={{
+                    ...secondaryButton,
+                    minHeight: 26,
+                    padding: "3px 10px",
+                    background: runFilter === f ? color.dark : color.paper,
+                    color: runFilter === f ? color.onDark : color.muted2,
+                  }}
+                >
+                  {f === "all" ? "All" : "Requested by you"}
+                </button>
+              ))}
+            </div>
             <RunsTimeline
-              runs={state.pendingRuns}
+              runs={
+                runFilter === "mine"
+                  ? state.pendingRuns.filter((run) =>
+                      runIsMine(run, state.workspace?.pubkey ?? null),
+                    )
+                  : state.pendingRuns
+              }
               agents={state.agents}
               channels={state.channels}
               ops={state.ops}
               onCancel={actions.cancelRun}
+              runAssignee={state.runAssignee}
+              authorNames={state.authorNames}
+              workspacePubkey={state.workspace?.pubkey ?? null}
             />
           </div>
         </main>

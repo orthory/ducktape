@@ -6,7 +6,8 @@ import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import type { Channel } from "../../../domain/chat-client";
-import { AgentView } from "./AgentView";
+import { AgentView, runIsMine } from "./AgentView";
+import type { PendingRun } from "../../../domain/runs-client";
 
 const bytes = (value: number) => Array.from({ length: 32 }, () => value);
 
@@ -282,5 +283,24 @@ describe("AgentView", () => {
       capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
     });
+  });
+});
+
+describe("runIsMine", () => {
+  const mkRun = (requester: PendingRun["requester"]): PendingRun =>
+    ({ run_id: "r", requester }) as PendingRun;
+
+  it("matches an external requester equal to my pubkey (any hex case)", () => {
+    expect(runIsMine(mkRun({ external: [0xab, 0xcd] }), "ABCD")).toBe(true);
+  });
+
+  it("rejects a different external requester", () => {
+    expect(runIsMine(mkRun({ external: [0x01, 0x02] }), "abcd")).toBe(false);
+  });
+
+  it("is false for module/system requesters and when I have no pubkey", () => {
+    expect(runIsMine(mkRun({ module: "tagging" }), "abcd")).toBe(false);
+    expect(runIsMine(mkRun("system"), "abcd")).toBe(false);
+    expect(runIsMine(mkRun({ external: [0xab, 0xcd] }), null)).toBe(false);
   });
 });
