@@ -539,7 +539,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
         (accepts.len() == 2).then(|| {
             let expected: std::collections::BTreeSet<String> = [1u64, 2]
                 .iter()
-                .map(|s| String::from_utf8_lossy(&Cluster::identity(*s)).into_owned())
+                .map(|s| indexer::user_handle(&Cluster::identity(*s)))
                 .collect();
             let actual: std::collections::BTreeSet<String> = accepts.into_iter().collect();
             assert_eq!(
