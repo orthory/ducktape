@@ -74,6 +74,16 @@ $CARGO build -p node-bin || {
   exit 1
 }
 
+# Stop any node left over from a previous session: the app ADOPTS an
+# already-running node by port (app/src-tauri/src/workspaces.rs), so a stale one
+# would be picked up instead of our fresh binary (no telemetry, still
+# heartbeating). Killing it makes the app spawn a fresh node — which inherits
+# DUCKTAPE_NODE_BIN + DUCKTAPE_DISABLE_HEARTBEAT from this shell.
+if pkill -f 'ducktape-node --config' 2>/dev/null; then
+  log "stopped a stale node from a previous session"
+  sleep 0.5
+fi
+
 # Skip the slow release-sidecar step in beforeDevCommand: in dev the app uses
 # DUCKTAPE_NODE_BIN, and build.rs leaves a placeholder that satisfies tauri's
 # externalBin. This makes startup fast; the sidecar is only for `make app`.
