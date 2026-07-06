@@ -33,6 +33,17 @@ const POLL_DELAY_MS = 250;
 export const isTauri = (): boolean =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/** True only on the macOS desktop build, where `titleBarStyle: "Overlay"`
+ *  (tauri.conf.json) floats the native traffic-light controls over the
+ *  top-left of the web content. That overlay is macOS-only — Linux/Windows keep
+ *  native decorations and the web build has no window chrome — so UI that insets
+ *  to clear the traffic lights must gate on this predicate. Detected via the
+ *  WKWebView user-agent (`Macintosh`): synchronous, no extra plugin/capability. */
+export const isMacDesktop = (): boolean =>
+  isTauri() &&
+  typeof navigator !== "undefined" &&
+  /Mac/i.test(navigator.userAgent);
+
 const webUrl = (): string =>
   import.meta.env.VITE_DUCKTAPE_NODE_URL || `http://${DEFAULT_LISTEN}`;
 
