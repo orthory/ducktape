@@ -60,10 +60,7 @@ export const opKey = {
    *  reaction chip is its own optimistic feedback). */
   reaction: (channelId: string, seq: number, emoji: string) =>
     `chat/${channelId}/seq/${seq}/react/${emoji}`,
-  task: (taskId: string) => `task/${taskId}`,
   forgeHead: () => "forge/head",
-  doc: (docId: string) => `doc/${docId}`,
-  docBlock: (docId: string, blockId: string) => `doc/${docId}/block/${blockId}`,
   page: (pageId: string) => `page/${pageId}`,
   /** Page block ids are module-global — no page qualifier needed. */
   pageBlock: (blockId: string) => `page-block/${blockId}`,
@@ -75,11 +72,6 @@ export const opKey = {
   runRequest: (agentId: string) => `agent/run-request/${agentId}`,
   jobWorker: () => "agent/job-worker",
   proposal: (proposalId: string) => `governance/${proposalId}`,
-  /** The local member's inbox controls (mark-read / clear / deliver). */
-  inbox: () => "inbox/self",
-  job: (jobId: string) => `job/${jobId}`,
-  rule: (ruleId: string) => `rule/${ruleId}`,
-  memory: (path: string) => `memory/${path}`,
   file: (fileId: string) => `file/${fileId}`,
 };
 

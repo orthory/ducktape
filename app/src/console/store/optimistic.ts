@@ -10,12 +10,7 @@
 
 import type { ChatBlock, MessageView } from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import type { Block } from "../../domain/document-client";
-import type { Job } from "../../domain/jobs-client";
-import type { LsEntry, Meta } from "../../domain/memory-client";
 import type { PageBlock } from "../../domain/pages-client";
-import type { Rule } from "../../domain/automations-client";
-import type { TaskStatus } from "../../domain/tasks-client";
 import type { ConsoleState } from "./state";
 
 // ── Chat ────────────────────────────────────────────────
@@ -174,85 +169,6 @@ export const channelCreated = (
         ],
       };
 
-// ── Tasks ───────────────────────────────────────────────
-
-export const taskAdded = (
-  prev: ConsoleState,
-  params: { taskId: string; title: string; at: number },
-): Partial<ConsoleState> => ({
-  tasks: [
-    ...prev.tasks,
-    {
-      id: params.taskId,
-      title: params.title,
-      status: "open",
-      created_at: params.at,
-      updated_at: params.at,
-    },
-  ],
-});
-
-export const taskAdvanced = (
-  prev: ConsoleState,
-  taskId: string,
-  status: TaskStatus,
-): Partial<ConsoleState> => ({
-  tasks: prev.tasks.map((t) => (t.id === taskId ? { ...t, status } : t)),
-});
-
-// ── Documents ───────────────────────────────────────────
-
-export const docCreated = (
-  prev: ConsoleState,
-  docId: string,
-): Partial<ConsoleState> =>
-  prev.docIds.includes(docId) ? {} : { docIds: [...prev.docIds, docId].sort() };
-
-/** `after` rule (InsertBlock/MoveBlock): null == front, an id == right after
- *  that block. An unknown anchor appends — the refresh corrects it. */
-const docInsertIndex = (blocks: Block[], after: string | null): number => {
-  if (after === null) return 0;
-  const at = blocks.findIndex((b) => b.id === after);
-  return at === -1 ? blocks.length : at + 1;
-};
-
-export const docBlockInserted = (
-  prev: ConsoleState,
-  params: { after: string | null; block: Block },
-): Partial<ConsoleState> => {
-  const blocks = [...prev.activeDocBlocks];
-  blocks.splice(docInsertIndex(blocks, params.after), 0, params.block);
-  return { activeDocBlocks: blocks };
-};
-
-export const docBlockUpdated = (
-  prev: ConsoleState,
-  blockId: string,
-  text: string,
-): Partial<ConsoleState> => ({
-  activeDocBlocks: prev.activeDocBlocks.map((b) =>
-    b.id === blockId ? { ...b, text } : b,
-  ),
-});
-
-export const docBlockRemoved = (
-  prev: ConsoleState,
-  blockId: string,
-): Partial<ConsoleState> => ({
-  activeDocBlocks: prev.activeDocBlocks.filter((b) => b.id !== blockId),
-});
-
-export const docBlockMoved = (
-  prev: ConsoleState,
-  params: { blockId: string; after: string | null },
-): Partial<ConsoleState> => {
-  const moving = prev.activeDocBlocks.find((b) => b.id === params.blockId);
-  if (!moving) return {};
-  const rest = prev.activeDocBlocks.filter((b) => b.id !== params.blockId);
-  rest.splice(docInsertIndex(rest, params.after), 0, moving);
-  return { activeDocBlocks: rest };
-};
-
 // ── Pages ───────────────────────────────────────────────
 
 export const pageCreated = (
@@ -386,116 +302,6 @@ export const runCancelled = (
   // a cancel resolves through the dispatch plane's Err("cancelled") delivery,
   // which prunes the entry node-side a block later — mirror that prune.
   pendingRuns: prev.pendingRuns.filter((r) => r.run_id !== runId),
-});
-
-// ── Inbox ───────────────────────────────────────────────
-
-export const inboxReadTo = (
-  prev: ConsoleState,
-  upToSeq: number,
-): Partial<ConsoleState> => {
-  const inbox = prev.inbox.map((n) =>
-    n.seq <= upToSeq ? { ...n, read: true } : n,
-  );
-  return { inbox, inboxUnread: inbox.filter((n) => !n.read).length };
-};
-
-export const inboxCleared = (
-  prev: ConsoleState,
-  upToSeq: number,
-): Partial<ConsoleState> => {
-  const inbox = prev.inbox.filter((n) => n.seq > upToSeq);
-  return { inbox, inboxUnread: inbox.filter((n) => !n.read).length };
-};
-
-// ── Jobs ────────────────────────────────────────────────
-
-export const jobAdded = (prev: ConsoleState, job: Job): Partial<ConsoleState> => ({
-  jobs: [...prev.jobs, job],
-});
-
-export const jobPatched = (
-  prev: ConsoleState,
-  jobId: string,
-  patch: Partial<Job>,
-): Partial<ConsoleState> => ({
-  jobs: prev.jobs.map((j) => (j.job_id === jobId ? { ...j, ...patch } : j)),
-});
-
-export const jobRemoved = (
-  prev: ConsoleState,
-  jobId: string,
-): Partial<ConsoleState> => ({
-  jobs: prev.jobs.filter((j) => j.job_id !== jobId),
-});
-
-// ── Automations ─────────────────────────────────────────
-
-export const ruleAdded = (prev: ConsoleState, rule: Rule): Partial<ConsoleState> => ({
-  rules: [...prev.rules, rule],
-});
-
-export const rulePatched = (
-  prev: ConsoleState,
-  ruleId: string,
-  patch: Partial<Rule>,
-): Partial<ConsoleState> => ({
-  rules: prev.rules.map((r) => (r.rule_id === ruleId ? { ...r, ...patch } : r)),
-});
-
-export const ruleRemoved = (
-  prev: ConsoleState,
-  ruleId: string,
-): Partial<ConsoleState> => ({
-  rules: prev.rules.filter((r) => r.rule_id !== ruleId),
-});
-
-// ── Memory ──────────────────────────────────────────────
-
-const memoryParent = (path: string): string => {
-  const cut = path.lastIndexOf("/");
-  return cut <= 0 ? "/" : path.slice(0, cut);
-};
-
-/** Upsert the published file into the OPEN directory listing (a publish into
- *  some other dir shows up when that dir is browsed — server truth anyway). */
-export const memoryPublished = (
-  prev: ConsoleState,
-  params: { path: string; bodyLen: number; meta?: Meta },
-): Partial<ConsoleState> => {
-  if (memoryParent(params.path) !== prev.memoryPath) return {};
-  const existing = prev.memoryEntries.find(
-    (e) => "file" in e && e.file.path === params.path,
-  );
-  const stat = (gen: number, gens: number): LsEntry => ({
-    file: {
-      path: params.path,
-      latest_generation: gen,
-      generations: gens,
-      latest_meta: params.meta ?? {},
-      latest_author: "", // origin-derived server-side; refresh fills it
-      latest_published_at_height: 0,
-      body_len: params.bodyLen,
-    },
-  });
-  return {
-    memoryEntries: existing
-      ? prev.memoryEntries.map((e) =>
-          "file" in e && e.file.path === params.path
-            ? stat(e.file.latest_generation + 1, e.file.generations + 1)
-            : e,
-        )
-      : [...prev.memoryEntries, stat(1, 1)],
-  };
-};
-
-export const memoryRemoved = (
-  prev: ConsoleState,
-  path: string,
-): Partial<ConsoleState> => ({
-  memoryEntries: prev.memoryEntries.filter(
-    (e) => !("file" in e) || e.file.path !== path,
-  ),
 });
 
 // ── Files ───────────────────────────────────────────────

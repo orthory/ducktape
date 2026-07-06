@@ -1,26 +1,17 @@
 import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
-import * as automationsClient from "../../domain/automations-client";
-import type { Action as RuleAction, Trigger } from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import * as documentClient from "../../domain/document-client";
-import type { BlockKind } from "../../domain/document-client";
 import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
-import * as inboxClient from "../../domain/inbox-client";
-import * as jobsClient from "../../domain/jobs-client";
-import * as memoryClient from "../../domain/memory-client";
-import type { Meta } from "../../domain/memory-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
-import * as tasksClient from "../../domain/tasks-client";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
@@ -36,8 +27,6 @@ import * as optimistic from "./optimistic";
 import {
   channelIdOf,
   clearRemoteUrl,
-  docIdOf,
-  nextTaskStatus,
   saveRemoteUrl,
   saveViewMode,
 } from "./state";
@@ -88,34 +77,14 @@ export interface ConsoleActions {
    *  that emoji yet, removes it if we have. Refreshes the open thread panel
    *  too, since its replies are a separate snapshot from `state.messages`. */
   toggleReaction(seq: number, emoji: string): void;
-  addTask(title: string): void;
-  advanceTask(taskId: string): void;
   commitForge(params: { path: string; content: string; message: string }): void;
 
-  // ── Documents (block store over the `document` module) ──
-  /** Re-query the module's enumeration index into `state.docIds` (the tree). */
-  listDocs(): void;
-  /** Create a doc at a "/"-delimited path (CreateDoc, idempotent) and open it.
-   *  The refresh after the write re-enumerates the index, so the new path
-   *  appears in the tree. */
-  createDoc(docId: string): void;
-  /** Open a doc by path, loading its blocks (like selectChannel). */
-  openDoc(docId: string): void;
-  /** Append/insert a fresh block into the active doc (id generated here). */
-  insertBlock(params: { after: string | null; kind: BlockKind; text: string }): void;
-  /** Replace a block's text in the active doc. */
-  updateBlock(params: { blockId: string; text: string }): void;
-  /** Remove a block from the active doc. */
-  removeBlock(blockId: string): void;
-  /** Move a block within the active doc (see the `after` rule). */
-  moveBlock(params: { blockId: string; after: string | null }): void;
-
-  // ── Pages (block-tree notebook over the `pages` module) ──
+  // ── Docs (block-tree notebook over the `pages` module) ──
   /** Re-query the page enumeration into `state.pages`. */
   listPages(): void;
   /** Create a page (root block id minted here) and open it. */
   createPage(title: string): void;
-  /** Open a page, loading its preorder block tree (like openDoc). */
+  /** Open a page, loading its preorder block tree. */
   openPage(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
    *  focus to the new block, so it must know the id before the round-trip). */
@@ -184,66 +153,16 @@ export interface ConsoleActions {
   /** Tally and settle a decidable proposal (anyone may trigger it). */
   executeProposal(proposalId: string): void;
 
-  // ── Inbox (per-member notification queue over the `inbox` module) ──
-  /** Mark every notification in the local member's queue read (idempotent). */
-  markInboxRead(): void;
-  /** Mark every item up to and including `seq` read. */
-  markInboxReadTo(seq: number): void;
-  /** Delete every notification in the local member's queue (up to the latest). */
-  clearInbox(): void;
-  /** Enqueue a notification (module follow-ups are the primary writers, but the
-   *  console can self-deliver or notify another member). */
-  deliverNotification(params: { member: string; kind: string; body: string }): void;
-
-  // ── Jobs (consensus work board over the `jobs` module) ──
-  /** Post a new job (id generated here). */
-  submitJob(params: { kind: string; spec: string }): void;
-  /** Claim a Pending job under a view-count lease. */
-  claimJob(params: { jobId: string; leaseViews: number }): void;
-  /** Report a result on a job this node is processing. */
-  finalizeJob(params: { jobId: string; ok: boolean; payload: string }): void;
-  /** Hand a Processing job back to Pending. */
-  releaseJob(jobId: string): void;
-  /** Permissionless requeue of a Processing job whose lease expired. */
-  reclaimJob(jobId: string): void;
-  /** Cancel a still-Pending job (submitter only). */
-  cancelJob(jobId: string): void;
-  /** Remove a terminal job's record entirely (submitter only). */
-  pruneJob(jobId: string): void;
-
-  // ── Automations (event-triggered rules over the `automations` module) ──
-  /** Create a rule pairing a trigger with an action. */
-  createRule(params: { ruleId: string; trigger: Trigger; action: RuleAction }): void;
-  /** Enable or disable a rule without deleting it. */
-  setRuleEnabled(ruleId: string, enabled: boolean): void;
-  /** Delete a rule. */
-  deleteRule(ruleId: string): void;
-
-  // ── Memory (agent filesystem over the `memory` module) ──
-  /** Browse a directory: list its entries and make it the active path. */
-  browseMemory(path: string): void;
-  /** Open a file into the viewer, loading its latest (or a specific) generation. */
-  openMemoryFile(params: { path: string; generation?: number | null }): void;
-  /** Close the open file. */
-  closeMemoryFile(): void;
-  /** Write-once publish of an inline document at `path`, then refresh the tree. */
-  publishMemory(params: { path: string; text: string; meta?: Meta }): void;
-  /** Delete a memory file (all live generations). */
-  deleteMemory(path: string): void;
-  /** Run a case-sensitive substring search under `prefix`; results land in
-   *  `state.memoryMatches`. */
-  searchMemory(params: { prefix: string; pattern: string }): void;
-  /** Clear the active search. */
-  clearMemorySearch(): void;
-
   // ── Search (cross-module, over the node's derived-index views) ──
-  /** Search chat, docs, and pages with one text: the three modules'
-   *  materialized views fan out concurrently and land grouped in
-   *  `state.search`. A node without the index tier contributes empty groups
-   *  rather than failing the search. */
+  /** Search chat + docs with one text: the two modules' materialized views
+   *  fan out concurrently and land grouped in `state.search`. A node without
+   *  the index tier contributes empty groups rather than failing the search. */
   runSearch(text: string): void;
   /** Drop the last search's results. */
   clearSearch(): void;
+  /** Open / close the ⌘K command-palette search overlay. */
+  openSearch(): void;
+  closeSearch(): void;
 
   // ── Files (content-addressed manifests over the `files` module) ──
   /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
@@ -337,6 +256,12 @@ export function createActions({
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
 
+  // Monotonic token gating the async search fan-out: each runSearch/clearSearch
+  // bumps it, and a resolving fan-out only writes results if its token is still
+  // current — so a slow or out-of-order response can never clobber a newer
+  // query's results (or repopulate a cleared palette).
+  let searchToken = 0;
+
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
   // key), submit, then settle the record from the node's receipt — finalized
@@ -400,28 +325,8 @@ export function createActions({
       .catch(fail);
   };
 
-  // the single entry point into a doc: make it active and load its blocks.
-  // Every path into a doc (new-doc, a tree click) goes here — like
-  // enterChannel. The known-doc set is the node's index (state.docIds), not a
-  // local registry, so entering a doc no longer writes any list — it just
-  // focuses the reader on `docId`.
-  const enterDoc = (rawId: string) => {
-    const live = getNode();
-    const docId = docIdOf(rawId);
-    if (!live || !docId) return;
-    patch({
-      activeDoc: docId,
-      activeDocBlocks: [],
-    });
-    Promise.resolve()
-      .then(() => documentClient.getDoc(live, docId))
-      .then((blocks) => patch({ activeDocBlocks: blocks ?? [] }))
-      .catch(fail);
-  };
-
   // the single entry point into a page: make it active and load its preorder
-  // block tree — every path into a page (new-page, a rail click) goes here,
-  // mirroring enterDoc.
+  // block tree — every path into a page (new-page, a rail click) goes here.
   const enterPage = (pageId: string) => {
     const live = getNode();
     if (!live || !pageId) return;
@@ -752,28 +657,6 @@ export function createActions({
       });
     },
 
-    addTask: (title) => {
-      const clean = title.trim();
-      if (!clean) return;
-      const taskId = crypto.randomUUID();
-      submitTracked(
-        opKey.task(taskId),
-        (live) => tasksClient.createTask(live, { taskId, title: clean }),
-        (prev) => optimistic.taskAdded(prev, { taskId, title: clean, at: Date.now() }),
-      );
-    },
-
-    advanceTask: (taskId) => {
-      const task = getState().tasks.find((t) => t.id === taskId);
-      if (!task || task.status === "done") return;
-      const status = nextTaskStatus(task.status);
-      submitTracked(
-        opKey.task(taskId),
-        (live) => tasksClient.updateStatus(live, { taskId, status }),
-        (prev) => optimistic.taskAdvanced(prev, taskId, status),
-      );
-    },
-
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
       submitTracked(opKey.forgeHead(), (live) =>
@@ -786,73 +669,7 @@ export function createActions({
       );
     },
 
-    // ── Documents ──
-    listDocs: () => {
-      const live = getNode();
-      if (!live) return;
-      Promise.resolve()
-        .then(() => documentClient.listDocs(live))
-        .then((docIds) => patch({ docIds }))
-        .catch(fail);
-    },
-
-    openDoc: enterDoc,
-
-    createDoc: (rawId) => {
-      const docId = docIdOf(rawId);
-      if (!docId) return;
-      // CreateDoc is idempotent and REQUIRED before any block op; the refresh
-      // re-enumerates the index so the new path shows in the tree, then open
-      // it (loads blocks), mirroring createChannel.
-      submitTracked(
-        opKey.doc(docId),
-        (live) => documentClient.createDoc(live, { docId }),
-        (prev) => optimistic.docCreated(prev, docId),
-      ).then(() => enterDoc(docId));
-    },
-
-    insertBlock: ({ after, kind, text }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      const block = { id: crypto.randomUUID(), kind, text };
-      submitTracked(
-        opKey.docBlock(docId, block.id),
-        (live) => documentClient.insertBlock(live, { docId, after, block }),
-        (prev) => optimistic.docBlockInserted(prev, { after, block }),
-      );
-    },
-
-    updateBlock: ({ blockId, text }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.updateBlock(live, { docId, blockId, text }),
-        (prev) => optimistic.docBlockUpdated(prev, blockId, text),
-      );
-    },
-
-    removeBlock: (blockId) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.removeBlock(live, { docId, blockId }),
-        (prev) => optimistic.docBlockRemoved(prev, blockId),
-      );
-    },
-
-    moveBlock: ({ blockId, after }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.moveBlock(live, { docId, blockId, after }),
-        (prev) => optimistic.docBlockMoved(prev, { blockId, after }),
-      );
-    },
-
-    // ── Pages ──
+    // ── Docs ──
     listPages: () => {
       const live = getNode();
       if (!live) return;
@@ -1097,274 +914,44 @@ export function createActions({
       );
     },
 
-    // ── Inbox ──
-    // The local member's queue is keyed by the author identity; mark/clear act on
-    // the highest seq currently loaded, so "mark all read" needs no per-item loop.
-    markInboxRead: () => {
-      const items = getState().inbox;
-      if (items.length === 0) return;
-      const upToSeq = items[items.length - 1].seq;
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.markRead(live, { member: getState().author, upToSeq }),
-        (prev) => optimistic.inboxReadTo(prev, upToSeq),
-      );
-    },
-
-    markInboxReadTo: (seq) => {
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.markRead(live, { member: getState().author, upToSeq: seq }),
-        (prev) => optimistic.inboxReadTo(prev, seq),
-      );
-    },
-
-    clearInbox: () => {
-      const items = getState().inbox;
-      if (items.length === 0) return;
-      const upToSeq = items[items.length - 1].seq;
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.clear(live, { member: getState().author, upToSeq }),
-        (prev) => optimistic.inboxCleared(prev, upToSeq),
-      );
-    },
-
-    deliverNotification: ({ member, kind, body }) => {
-      if (!member.trim() || !kind.trim()) return;
-      submitTracked(opKey.inbox(), (live) =>
-        inboxClient.deliver(live, { member: member.trim(), kind: kind.trim(), body }),
-      );
-    },
-
-    // ── Jobs ──
-    // Identity-gated ops (cancel/prune by submitter; finalize/release by
-    // claimant) all ride the daemon's default identity — origin is omitted — so
-    // submitter and claimant stay consistent for this node's own jobs.
-    submitJob: ({ kind, spec }) => {
-      const cleanKind = kind.trim();
-      if (!cleanKind) return;
-      const jobId = crypto.randomUUID();
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.submitJob(live, { jobId, kind: cleanKind, spec }),
-        (prev) =>
-          optimistic.jobAdded(prev, {
-            job_id: jobId,
-            kind: cleanKind,
-            spec,
-            // the module stamps the REAL submitter from the block origin; the
-            // refresh replaces these placeholders with committed truth.
-            submitter: prev.author,
-            status: "pending",
-            attempt: 0,
-            claim: null,
-            result: null,
-            created_at_height: prev.status?.height ?? 0,
-            updated_at_height: prev.status?.height ?? 0,
-          }),
-      );
-    },
-
-    claimJob: ({ jobId, leaseViews }) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.claimJob(live, { jobId, leaseViews }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "processing" }),
-      );
-    },
-
-    finalizeJob: ({ jobId, ok, payload }) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.finalizeJob(live, { jobId, ok, payload }),
-        (prev) =>
-          optimistic.jobPatched(prev, jobId, {
-            status: ok ? "done" : "failed",
-            result: { ok, payload },
-          }),
-      );
-    },
-
-    releaseJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.releaseJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "pending", claim: null }),
-      );
-    },
-
-    reclaimJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.reclaimJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "pending", claim: null }),
-      );
-    },
-
-    cancelJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.cancelJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "cancelled" }),
-      );
-    },
-
-    pruneJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.pruneJob(live, { jobId }),
-        (prev) => optimistic.jobRemoved(prev, jobId),
-      );
-    },
-
-    // ── Automations ──
-    createRule: ({ ruleId, trigger, action }) => {
-      const id = ruleId.trim();
-      if (!id) return;
-      submitTracked(
-        opKey.rule(id),
-        (live) => automationsClient.createRule(live, { ruleId: id, trigger, action }),
-        (prev) =>
-          optimistic.ruleAdded(prev, {
-            rule_id: id,
-            enabled: true,
-            trigger,
-            action,
-            created_at: Date.now(),
-            fire_count: 0,
-          }),
-      );
-    },
-
-    setRuleEnabled: (ruleId, enabled) => {
-      if (!ruleId) return;
-      submitTracked(
-        opKey.rule(ruleId),
-        (live) => automationsClient.setEnabled(live, { ruleId, enabled }),
-        (prev) => optimistic.rulePatched(prev, ruleId, { enabled }),
-      );
-    },
-
-    deleteRule: (ruleId) => {
-      if (!ruleId) return;
-      submitTracked(
-        opKey.rule(ruleId),
-        (live) => automationsClient.deleteRule(live, ruleId),
-        (prev) => optimistic.ruleRemoved(prev, ruleId),
-      );
-    },
-
-    // ── Memory ──
-    browseMemory: (path) => {
-      const live = getNode();
-      const dir = path || "/";
-      if (!live) return;
-      // set the active dir immediately (so refresh re-lists it), clear the open
-      // file + any search, then list eagerly for a snappy transition.
-      patch({ memoryPath: dir, memoryOpen: null, memoryMatches: null });
-      Promise.resolve()
-        .then(() => memoryClient.ls(live, { path: dir }))
-        .then((memoryEntries) => patch({ memoryEntries }))
-        .catch(fail);
-    },
-
-    openMemoryFile: ({ path, generation }) => {
-      const live = getNode();
-      if (!live || !path) return;
-      Promise.resolve()
-        .then(() =>
-          Promise.all([
-            memoryClient.stat(live, path),
-            memoryClient.read(live, { path, generation: generation ?? null }),
-          ]),
-        )
-        .then(([stat, gen]) =>
-          patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
-        )
-        .catch(fail);
-    },
-
-    closeMemoryFile: () => patch({ memoryOpen: null }),
-
-    publishMemory: ({ path, text, meta }) => {
-      const p = path.trim();
-      if (!p) return;
-      submitTracked(
-        opKey.memory(p),
-        (live) =>
-          memoryClient.publish(live, { path: p, body: memoryClient.inlineBody(text), meta }),
-        (prev) => optimistic.memoryPublished(prev, { path: p, bodyLen: text.length, meta }),
-      ).then(() => {
-        const live = getNode();
-        if (!live) return;
-        // reflect the new generation in the open viewer if it is this file.
-        if (getState().memoryOpen?.stat.path === p) {
-          return Promise.all([
-            memoryClient.stat(live, p),
-            memoryClient.read(live, { path: p, generation: null }),
-          ])
-            .then(([stat, gen]) =>
-              patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
-            )
-            .catch(fail);
-        }
-      });
-    },
-
-    deleteMemory: (path) => {
-      if (!path) return;
-      submitTracked(
-        opKey.memory(path),
-        (live) => memoryClient.remove(live, path),
-        (prev) => optimistic.memoryRemoved(prev, path),
-      ).then(() => {
-        if (getState().memoryOpen?.stat.path === path) patch({ memoryOpen: null });
-      });
-    },
-
-    searchMemory: ({ prefix, pattern }) => {
-      const live = getNode();
-      if (!live || !pattern) return;
-      Promise.resolve()
-        .then(() => memoryClient.grep(live, { prefix: prefix || "/", pattern }))
-        .then((memoryMatches) => patch({ memoryMatches }))
-        .catch(fail);
-    },
-
-    clearMemorySearch: () => patch({ memoryMatches: null }),
-
     // ── Search (derived-index views) ──
     runSearch: (text) => {
       const live = getNode();
       const query = text.trim();
       if (!live || !query) return;
+      const token = ++searchToken;
       patch({ searchPending: true });
       // per-module tolerance (deliberate granular catches): an older node
       // without the index tier 404s a view; that module contributes an empty
       // group instead of sinking the whole search.
       const tolerant = <T,>(read: Promise<T[]>): Promise<T[]> => read.catch(() => []);
+      // `docs` == the pages module's block hits — pages is the docs surface.
       Promise.resolve()
         .then(() =>
           Promise.all([
             tolerant(chatClient.searchMessages(live, { text: query })),
-            tolerant(documentClient.searchBlocks(live, { text: query })),
             tolerant(pagesClient.searchPageBlocks(live, { text: query })),
           ]),
         )
-        .then(([chat, docs, pages]) =>
-          patch({ search: { query, chat, docs, pages }, searchPending: false }),
-        )
-        .catch(fail);
+        .then(([chat, docs]) => {
+          if (token !== searchToken) return; // a newer query superseded this one
+          patch({ search: { query, chat, docs }, searchPending: false });
+        })
+        .catch((err) => {
+          if (token !== searchToken) return;
+          patch({ searchPending: false });
+          fail(err);
+        });
     },
 
-    clearSearch: () => patch({ search: null, searchPending: false }),
+    clearSearch: () => {
+      searchToken += 1; // supersede any in-flight fan-out so it can't repopulate
+      patch({ search: null, searchPending: false });
+    },
+
+    openSearch: () => patch({ searchOpen: true }),
+
+    closeSearch: () => patch({ searchOpen: false }),
 
     // ── Files ──
     uploadFile: ({ name, mime, bytes }) => {
@@ -1475,25 +1062,12 @@ export function createActions({
         activeChannel: null,
         activeThread: null,
         authorNames: {},
-        tasks: [],
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
         pages: [],
         activePage: null,
         activePageBlocks: [],
         agents: [],
         watches: [],
         pendingRuns: [],
-        inbox: [],
-        inboxUnread: 0,
-        jobs: [],
-        jobCounts: null,
-        rules: [],
-        memoryPath: "/",
-        memoryEntries: [],
-        memoryOpen: null,
-        memoryMatches: null,
         files: [],
         ops: {},
         onboardingPhase: null,
@@ -1524,28 +1098,15 @@ export function createActions({
         activeChannel: null,
         activeThread: null,
         authorNames: {},
-        tasks: [],
         members: [],
         proposals: [],
         forgeHead: null,
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
         pages: [],
         activePage: null,
         activePageBlocks: [],
         agents: [],
         watches: [],
         pendingRuns: [],
-        inbox: [],
-        inboxUnread: 0,
-        jobs: [],
-        jobCounts: null,
-        rules: [],
-        memoryPath: "/",
-        memoryEntries: [],
-        memoryOpen: null,
-        memoryMatches: null,
         files: [],
         ops: {},
         onboardingPhase: null,
@@ -1645,10 +1206,6 @@ export function createActions({
             activeChannel: null,
             activeThread: null,
             authorNames: {},
-            tasks: [],
-            docIds: [],
-            activeDoc: null,
-            activeDocBlocks: [],
             pages: [],
             activePage: null,
             activePageBlocks: [],

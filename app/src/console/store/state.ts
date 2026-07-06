@@ -5,26 +5,15 @@
 
 import type { AgentRecord } from "../../domain/agent-client";
 import type { PendingRun, WatchView } from "../../domain/runs-client";
-import type { Rule } from "../../domain/automations-client";
 import type {
   Channel,
   ChatSearchHit,
   ChatThread,
   MessageView,
 } from "../../domain/chat-client";
-import type { Block, DocSearchHit } from "../../domain/document-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
-import type { Notification } from "../../domain/inbox-client";
-import type { BoardCounts, Job } from "../../domain/jobs-client";
-import type {
-  FileStat,
-  Generation,
-  GrepHit,
-  LsEntry,
-} from "../../domain/memory-client";
 import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
-import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
@@ -35,12 +24,12 @@ import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 export type ViewMode = "user" | "operator";
 
 /** One search round-trip across the modules that ship materialized views —
- *  chat, docs, and pages searched with the same text, results grouped. */
+ *  chat and docs (the `pages` module) searched with the same text, grouped.
+ *  `docs` holds the page-block hits — pages is the console's docs surface. */
 export interface SearchResults {
   query: string;
   chat: ChatSearchHit[];
-  docs: DocSearchHit[];
-  pages: PageSearchHit[];
+  docs: PageSearchHit[];
 }
 
 // ── State shape ─────────────────────────────────────────
@@ -71,9 +60,6 @@ export interface ConsoleState {
    *  into author rendering so messages show chosen names, not hex handles. */
   authorNames: Record<string, string>;
 
-  // ── Tasks ──
-  tasks: Task[];
-
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
   members: string[];
@@ -91,17 +77,7 @@ export interface ConsoleState {
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
 
-  // ── Documents ──
-  /** Every known doc id, enumerated from the document module's index
-   *  (ListDocs) and re-queried per block. These are "/"-delimited PATHS; the
-   *  view derives a folder tree from them. */
-  docIds: string[];
-  /** The doc whose blocks are loaded, or null when none is open. */
-  activeDoc: string | null;
-  /** Ordered blocks of the active doc (re-queried per block / on open). */
-  activeDocBlocks: Block[];
-
-  // ── Pages (block-tree notebook over the `pages` module) ──
+  // ── Docs (block-tree notebook over the `pages` module) ──
   /** Every page (id + live title), from ListPages, re-queried per block.
    *  Empty when the node predates the pages module. */
   pages: PageMeta[];
@@ -120,40 +96,14 @@ export interface ConsoleState {
    *  history lives in the dispatch module, not here. */
   pendingRuns: PendingRun[];
 
-  // ── Inbox ──
-  /** This member's notification queue (List for the local author identity),
-   *  ascending by seq, re-queried per block. */
-  inbox: Notification[];
-  /** Unread count for the local member — feeds the nav badge. */
-  inboxUnread: number;
-
-  // ── Jobs (consensus work board) ──
-  /** Every job on the board, re-queried per block. */
-  jobs: Job[];
-  /** Per-status census of the board, or null when the module is absent. */
-  jobCounts: BoardCounts | null;
-
-  // ── Automations (event-triggered rules) ──
-  /** Every rule, re-queried per block; empty when the module is absent. */
-  rules: Rule[];
-
-  // ── Memory (agent filesystem workspace) ──
-  /** The directory being browsed (canonical absolute path; "/" is the root). */
-  memoryPath: string;
-  /** Entries directly under `memoryPath` (child dirs + files), re-queried per
-   *  block like the doc index. */
-  memoryEntries: LsEntry[];
-  /** The file opened in the viewer (its stat + a loaded generation), or null. */
-  memoryOpen: { stat: FileStat; generation: Generation } | null;
-  /** Active grep hits, or null when no search is running. */
-  memoryMatches: GrepHit[] | null;
-
   // ── Search (cross-module reads over the node's derived index) ──
-  /** The last search's results, or null before any search ran. Query-driven
-   *  like `memoryMatches` — never part of the per-block snapshot. */
+  /** The last search's results, or null before any search ran. Query-driven —
+   *  never part of the per-block snapshot. */
   search: SearchResults | null;
-  /** A search round-trip is in flight (three module views fan out). */
+  /** A search round-trip is in flight (the module views fan out). */
   searchPending: boolean;
+  /** The ⌘K command-palette search overlay is open. Global UI, not per-block. */
+  searchOpen: boolean;
 
   // ── Files (content-addressed manifests) ──
   /** Every file manifest (List, prefix ""), re-queried per block. */
@@ -280,31 +230,19 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
-    tasks: [],
     members: [],
     observers: [],
     proposals: [],
     forgeHead: null,
-    docIds: [],
-    activeDoc: null,
-    activeDocBlocks: [],
     pages: [],
     activePage: null,
     activePageBlocks: [],
     agents: [],
     watches: [],
     pendingRuns: [],
-    inbox: [],
-    inboxUnread: 0,
-    jobs: [],
-    jobCounts: null,
-    rules: [],
-    memoryPath: "/",
-    memoryEntries: [],
-    memoryOpen: null,
-    memoryMatches: null,
     search: null,
     searchPending: false,
+    searchOpen: false,
     files: [],
     telemetry: [],
     blocks: [],
@@ -325,7 +263,6 @@ export interface ConsoleSnapshot {
   connected: boolean;
   status: NodeStatus | null;
   channels: Channel[];
-  tasks: Task[];
   members: string[];
   observers: string[];
   proposals: ProposalView[];
@@ -333,31 +270,21 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
-  docIds: string[];
-  activeDocBlocks: Block[];
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
-  inbox: Notification[];
-  inboxUnread: number;
-  jobs: Job[];
-  jobCounts: BoardCounts | null;
-  rules: Rule[];
-  memoryEntries: LsEntry[];
   files: Manifest[];
   blocks: BlockRecord[];
 }
 
 /** Project a committed node snapshot onto store data fields. Global UI,
- *  workspace/onboarding, and error state are intentionally left untouched.
- *  `docIds` now comes from the node's enumeration index, so it IS projected. */
+ *  workspace/onboarding, and error state are intentionally left untouched. */
 export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> => ({
   connected: snapshot.connected,
   status: snapshot.status,
   channels: snapshot.channels,
-  tasks: snapshot.tasks,
   members: snapshot.members,
   observers: snapshot.observers,
   proposals: snapshot.proposals,
@@ -365,19 +292,11 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
-  docIds: snapshot.docIds,
-  activeDocBlocks: snapshot.activeDocBlocks,
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
-  inbox: snapshot.inbox,
-  inboxUnread: snapshot.inboxUnread,
-  jobs: snapshot.jobs,
-  jobCounts: snapshot.jobCounts,
-  rules: snapshot.rules,
-  memoryEntries: snapshot.memoryEntries,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });
@@ -392,32 +311,3 @@ export const channelIdOf = (name: string): string =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
 
-/** A doc id from user input: a "/"-delimited PATH where each segment is slugged
- *  (lowercase, dash-separated, wire-safe) and empty segments are dropped. So
- *  "Projects / Launch Plan" and "projects/launch-plan" name the same document,
- *  and the leading/trailing slashes never survive. Path structure is what the
- *  view turns into a folder tree. */
-export const docIdOf = (raw: string): string =>
-  raw
-    .toLowerCase()
-    .split("/")
-    .map((segment) =>
-      segment
-        .trim()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/(^-|-$)/g, ""),
-    )
-    .filter((segment) => segment.length > 0)
-    .join("/");
-
-/** The task lifecycle is a one-way lane; Done stays Done. */
-export const nextTaskStatus = (status: TaskStatus): TaskStatus => {
-  switch (status) {
-    case "open":
-      return "in_progress";
-    case "in_progress":
-      return "done";
-    case "done":
-      return "done";
-  }
-};

@@ -140,54 +140,6 @@ describe("page block projections", () => {
   });
 });
 
-describe("doc block projections", () => {
-  const doc = [
-    { id: "x", kind: "paragraph" as const, text: "x" },
-    { id: "y", kind: "paragraph" as const, text: "y" },
-  ];
-
-  it("inserts at the front on a null anchor (the module's `after` rule)", () => {
-    const prev = base({ activeDocBlocks: doc });
-    const out = optimistic.docBlockInserted(prev, {
-      after: null,
-      block: { id: "n", kind: "paragraph", text: "n" },
-    });
-    expect(out.activeDocBlocks!.map((b) => b.id)).toEqual(["n", "x", "y"]);
-  });
-
-  it("moves a block immediately after its anchor", () => {
-    const prev = base({ activeDocBlocks: doc });
-    const out = optimistic.docBlockMoved(prev, { blockId: "x", after: "y" });
-    expect(out.activeDocBlocks!.map((b) => b.id)).toEqual(["y", "x"]);
-  });
-});
-
-describe("inbox projections", () => {
-  const item = (seq: number, read = false) => ({
-    seq,
-    member: "jess",
-    kind: "note",
-    body: "",
-    source: "system",
-    created_at: 0,
-    read,
-  });
-
-  it("marks read up to a seq and recounts unread", () => {
-    const prev = base({ inbox: [item(1), item(2), item(3)], inboxUnread: 3 });
-    const out = optimistic.inboxReadTo(prev, 2);
-    expect(out.inbox!.map((n) => n.read)).toEqual([true, true, false]);
-    expect(out.inboxUnread).toBe(1);
-  });
-
-  it("clears up to a seq, keeping later arrivals", () => {
-    const prev = base({ inbox: [item(1), item(2), item(3)], inboxUnread: 3 });
-    const out = optimistic.inboxCleared(prev, 2);
-    expect(out.inbox!.map((n) => n.seq)).toEqual([3]);
-    expect(out.inboxUnread).toBe(1);
-  });
-});
-
 describe("reaction projections", () => {
   it("adds then removes the local member's reaction", () => {
     const self = Array.from(new TextEncoder().encode("jess"));

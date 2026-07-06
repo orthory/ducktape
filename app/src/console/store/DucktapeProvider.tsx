@@ -14,18 +14,11 @@ import {
 import type { ReactNode } from "react";
 
 import * as agentClient from "../../domain/agent-client";
-import * as automationsClient from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
-import * as documentClient from "../../domain/document-client";
-import type { Block } from "../../domain/document-client";
 import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
-import * as inboxClient from "../../domain/inbox-client";
-import * as jobsClient from "../../domain/jobs-client";
-import type { BoardCounts } from "../../domain/jobs-client";
-import * as memoryClient from "../../domain/memory-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
@@ -34,7 +27,6 @@ import {
 } from "../../domain/node-bootstrap";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
-import * as tasksClient from "../../domain/tasks-client";
 import * as valsetClient from "../../domain/valset-client";
 import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
@@ -94,21 +86,13 @@ export function DucktapeProvider({
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
-    // enumerate the doc index (the browse tree) and re-query the open doc's
-    // blocks (null when none is open) alongside the other projections; the
-    // pages slice refreshes the same way (enumeration + the open page's tree).
-    const activeDoc = stateRef.current.activeDoc;
+    // the pages (docs) slice refreshes by enumeration + the open page's tree.
     const activePage = stateRef.current.activePage;
-    // the inbox is per-member; the console keys "my" queue by the local author
-    // identity, and memory browsing re-lists whatever dir is open.
-    const member = stateRef.current.author;
-    const memoryPath = stateRef.current.memoryPath;
     return Promise.resolve()
       .then(() =>
         Promise.all([
           live.status(),
           chatClient.channels(live),
-          tasksClient.listTasks(live),
           // valset only exists on the NETWORKED node (the local daemon has no
           // validator set) — best-effort like governance below, so a local
           // node reads as "no members" instead of never connecting.
@@ -121,12 +105,9 @@ export function DucktapeProvider({
           // rather than failing the whole refresh.
           governanceClient.proposals(live).catch((): ProposalView[] => []),
           forgeClient.head(live),
-          documentClient.listDocs(live),
-          activeDoc
-            ? documentClient.getDoc(live, activeDoc)
-            : Promise.resolve<Block[] | null>(null),
-          // pages is newer than some reachable nodes: best-effort, so a node
-          // without the module reads as "no pages", never a failed refresh.
+          // pages (the docs surface) is newer than some reachable nodes:
+          // best-effort, so a node without it reads as "no docs", never a
+          // failed refresh.
           pagesClient.listPages(live).catch((): PageMeta[] => []),
           activePage
             ? pagesClient
@@ -140,15 +121,9 @@ export function DucktapeProvider({
             .pendingRuns(live)
             .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
-          // ── unexposed-until-now modules — every one best-effort so a node
-          //    that does not register the module reads as "empty", never a
-          //    failed refresh (same contract as governance above). ──
-          inboxClient.list(live, { member }).catch(() => []),
-          inboxClient.unread(live, member).catch(() => 0),
-          jobsClient.listJobs(live, {}).catch(() => []),
-          jobsClient.counts(live).catch((): BoardCounts | null => null),
-          automationsClient.listRules(live).catch(() => []),
-          memoryClient.ls(live, { path: memoryPath }).catch(() => []),
+          // files is best-effort so a node that does not register the module
+          // reads as "empty", never a failed refresh (same contract as
+          // governance above).
           filesClient.list(live, {}).catch(() => []),
           // the explorer's ring pull — best-effort like telemetry, so a node
           // without /v1/blocks reads as "no blocks yet".
@@ -158,25 +133,16 @@ export function DucktapeProvider({
       .then(([
         status,
         channels,
-        tasks,
         validators,
         observerKeys,
         proposals,
         forgeHead,
-        docIds,
-        docBlocks,
         pages,
         pageBlocks,
         agents,
         watches,
         pendingRuns,
         profiles,
-        inbox,
-        inboxUnread,
-        jobs,
-        jobCounts,
-        rules,
-        memoryEntries,
         files,
         blocks,
       ]) => {
@@ -201,7 +167,6 @@ export function DucktapeProvider({
                 connected: true,
                 status,
                 channels,
-                tasks,
                 members,
                 observers,
                 proposals,
@@ -209,19 +174,11 @@ export function DucktapeProvider({
                 activeChannel: active,
                 messages,
                 authorNames,
-                docIds,
-                activeDocBlocks: docBlocks ?? [],
                 pages,
                 activePageBlocks: pageBlocks ?? [],
                 agents,
                 watches,
                 pendingRuns,
-                inbox,
-                inboxUnread,
-                jobs,
-                jobCounts,
-                rules,
-                memoryEntries,
                 files,
                 blocks,
               }),
@@ -391,8 +348,8 @@ export function DucktapeProvider({
     document.documentElement.style.setProperty("--accent", state.accent);
   }, [state.accent]);
 
-  // 4. Drop any open doc when the node url resolves or changes — a different
-  //    node has different documents. `docIds` (the browse tree) is re-enumerated
+  // 4. Drop any open page (doc) when the node url resolves or changes — a
+  //    different node has different docs. The page enumeration is re-queried
   //    from the new node's index by `refresh`, so it isn't seeded here.
   useEffect(() => {
     const url = state.nodeUrl;
@@ -400,9 +357,6 @@ export function DucktapeProvider({
     dispatch({
       type: "patch",
       patch: {
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
         pages: [],
         activePage: null,
         activePageBlocks: [],

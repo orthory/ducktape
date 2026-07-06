@@ -23,7 +23,7 @@ export interface ModuleNav {
 }
 
 export interface AppModule {
-  /** Matches the node-side module id where one exists (chat, tasks). */
+  /** Matches the node-side module id where one exists (chat, files). */
   id: string;
   nav: ModuleNav;
   Screen: ComponentType;
