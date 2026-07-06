@@ -23,6 +23,8 @@ that fits its job.
 - `memory` is a filesystem-shaped shared agent workspace with immutable
   generations.
 - `jobs` is a consensus-native work board with first-claim-wins claims.
+- `identity` binds node keys to user keys — a replicated registry so a person
+  running several nodes still resolves to one identity above mesh/valset.
 - `kv`, `valset`, `saga`, `governance`, `directory`, and `greeter` support
   infrastructure, examples, and tests.
 
@@ -188,6 +190,33 @@ If two registered workers both claim the same submitted job inside the submit
 cascade, the second `Claim` observes the first staged claim, rejects, and aborts
 the entire submit block under P2. `MAX_WORKERS` exists for later off-cascade
 strategies, not for multiple in-cascade claimants of the same kind.
+
+## Identity
+
+Identity is the user/node binding registry (`crates/system/identity`): a user
+is an ed25519 keypair held by the person in the app; a node is a workspace's
+mesh/valset identity. The module stores, per user, a display name, a
+replay-guard nonce, and the set of bound node keys — one person can bind
+several nodes to the same user.
+
+`BindNode` binds the SUBMITTING node (the verified origin, never a payload
+field) to a user, consented to by a user-key signature over a
+chain-id-and-nonce-scoped preimage — a certificate can never replay onto a
+different network, and a stale nonce (from a prior bind/unbind) rejects. On
+the networked node, `BindNode` is additionally gated to current members: the
+origin must be a validator or an observer, so a node with no standing at all
+cannot mint itself a user. `UnbindNode` carries no such gate and is accepted
+from ANY external origin — a surviving device can evict a lost one — and it
+bumps the user's nonce so a captured bind certificate for the evicted node is
+dead forever. `SetUserName` is origin-gated only (a bound node is trusted
+hardware, no user signature required): it sets the display name of the user
+the submitting node is bound to, under the same 64-byte limit as profiles.
+
+Binding does not change what stays per node: mesh tracking, valset seats, and
+quorum arithmetic are untouched by this module. A user running three
+validators still holds three seats and casts three votes — identity maps keys
+to a person for display and authorship resolution, it does not collapse
+consensus weight.
 
 ## Interface Shape
 

@@ -6,6 +6,33 @@ person (app-side); a node keeps its own ed25519 `identity.key`. A replicated
 `identity` module binds node keys to user keys so every peer resolves any
 verified submit origin (a node key) to the human who owns that node.
 
+## As-built amendments (2026-07-07)
+
+Three corrections landed during implementation; where this document and the
+code (`crates/system/identity/src/interface.rs`, `crates/system/identity/src/lib.rs`)
+disagree, the code is authoritative.
+
+- **`/v1/status` was NOT extended with `chainId`.** The bind preimage's chain
+  id and the user's current nonce both reach the app without a status-endpoint
+  change: `chainId` already rides the Tauri workspace registry
+  (`Workspace.chain_id`, the same string threaded into `Identity::new` from the
+  network descriptor at genesis), and the nonce comes from the identity
+  module's `Get` query. The sentence below describing `/v1/status` gaining
+  `chainId` is superseded.
+- **User-key crypto ops ride `ducktape-node` CLI verbs, not an in-shell crypto
+  dependency.** `user-key`, `user-sign-bind`, and `user-sign-unbind` are
+  `ducktape-node` subcommands; the Tauri commands (`app/src-tauri/src/user_identity.rs`)
+  are thin wrappers that shell out to them and parse the one-line JSON they
+  print, exactly mirroring the existing keygen pattern. The desktop shell never
+  parses or holds the user secret, and no new crypto crate enters the app
+  dependency graph.
+- **Members UI groups only when it earns its keep.** A bound user with exactly
+  one node renders flat, indistinguishable from an unbound key — the row's
+  resolved name already carries the user identity, so a one-node header would
+  only repeat it. Only a user with two or more bound nodes (in the same
+  validator/observer tier) gets a group header with device (`shortKey`) rows
+  beneath it.
+
 ## Why now, and what stays put
 
 Today one key is everything: `identity.key` is the mesh identity, the
