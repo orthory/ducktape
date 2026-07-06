@@ -635,7 +635,9 @@ async fn genesis_host(
         Box::new(Upgrade::new("upgrade", "valset")),
         // capability-aware strict leases: a saga whose trigger names a
         // capability is assigned over that tag's announced providers, and
-        // only the assignee's result lands (no assignee = accept-any).
+        // only the assignee's result lands. an UNASSIGNED attempt (empty
+        // provider pool) accepts no result at all: its WorkerRequest is an
+        // announcement a capable node must first claim via `SagaMsg::Accept`.
         Box::new(SagaModule::with_assignment(
             "saga",
             "valset",
@@ -3732,6 +3734,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         checkpoint_blocks,
         invite_token,
         sync_index,
+        announce_capabilities,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -5834,7 +5837,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // load capability specs and discover this host's installed executor
         // CLIs (BYO — no credential handling here). the discovered tag set is
         // BOTH what the oracle worker can run and what this node announces to
-        // the capability registry, so the two can never drift. routing and
+        // the capability registry, so an announce can never claim more than
+        // the host provides (`announce_capabilities = false` narrows the
+        // announced set to nothing — never the reverse). routing and
         // default models live in the specs (docs/capability-spec.md); a broken
         // operator spec is a boot error, not a silently dropped executor.
         let providers = capability_host::discover()
@@ -6514,10 +6519,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // provider set differs from the committed registry
                     // self-submits ONE declarative `Announce`. member-gated (the
                     // module rejects non-members) and idempotent (committed-read
-                    // + local latch). inert on a host with no executor CLIs.
-                    if orchestrator
-                        .current_members()
-                        .contains(&signer.public_key())
+                    // + local latch). inert on a host with no executor CLIs, and
+                    // suppressed entirely under `announce_capabilities = false`
+                    // (the accept-lane-only provider: this node still executes
+                    // what it can, but only by claiming unassigned announcements
+                    // — it never enters a tag's rendezvous pool).
+                    if announce_capabilities
+                        && orchestrator
+                            .current_members()
+                            .contains(&signer.public_key())
                         && let Some(msg) = announcer.maybe_announce(node.host()).await
                     {
                         let seq = next_seq;

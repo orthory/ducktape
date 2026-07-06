@@ -976,6 +976,15 @@ pub struct NodeToml {
     /// root, so these bytes are UNVERIFIABLE — off, the default, means the
     /// index heals from verified state instead (indexable spec §7).
     pub sync_index: Option<bool>,
+    /// whether this node publishes its discovered provider set into the
+    /// capability registry (node-local operator policy, like
+    /// checkpoint_blocks; default true). `false` makes an ACCEPT-LANE-ONLY
+    /// provider: the node still resolves and executes capabilities its host
+    /// carries, but never enters any tag's rendezvous pool — it serves only
+    /// UNASSIGNED announcements, by racing `SagaMsg::Accept` like any other
+    /// capable node. announcing stays truthful either way: this can hide a
+    /// real provider, never fabricate one.
+    pub announce_capabilities: Option<bool>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -1199,6 +1208,9 @@ pub struct Resolved {
     pub invite_token: Option<InviteToken>,
     /// opt-in shipped-index warm start when joining; see `NodeToml::sync_index`.
     pub sync_index: bool,
+    /// publish the discovered provider set into the capability registry; see
+    /// `NodeToml::announce_capabilities`.
+    pub announce_capabilities: bool,
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -1306,6 +1318,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: load_invite_token(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
+        announce_capabilities: raw.announce_capabilities.unwrap_or(true),
     })
 }
 
@@ -1466,6 +1479,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
         sync_index: raw.sync_index.unwrap_or(false),
+        announce_capabilities: raw.announce_capabilities.unwrap_or(true),
     })
 }
 
@@ -1921,6 +1935,33 @@ mod tests {
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err("dup seeds refused");
         assert!(err.contains("duplicate seed"), "{err}");
+    }
+
+    #[test]
+    fn announce_capabilities_defaults_on_and_parses_off() {
+        let dir = tmp("announce");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52221\"\nnamespace = \"demo\"\npeer_seeds = [0]\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve default");
+        assert!(
+            resolved.announce_capabilities,
+            "announcing is the default posture"
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52221\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             announce_capabilities = false\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve suppressed");
+        assert!(
+            !resolved.announce_capabilities,
+            "false makes an accept-lane-only provider"
+        );
     }
 
     #[test]

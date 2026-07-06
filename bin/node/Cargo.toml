@@ -105,6 +105,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
 async-trait = { workspace = true }
+agent-interface = { workspace = true }
 chat-interface = { workspace = true }
 forge-interface = { workspace = true }
 tempfile = "3"
