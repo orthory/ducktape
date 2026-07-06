@@ -75,8 +75,9 @@ export const forgeListRepos = (): Promise<RepoInfo[]> =>
 export const forgeHead = (repo: string): Promise<string | null> =>
   desktopInvoke<string | null>("forge_head", { repo });
 
-export const forgeLog = (repo: string, limit = 24): Promise<CommitInfo[]> =>
-  desktopInvoke<CommitInfo[]>("forge_log", { repo, limit });
+/** Commit log of a repo's main, newest first. Omit `limit` for the full history. */
+export const forgeLog = (repo: string, limit?: number): Promise<CommitInfo[]> =>
+  desktopInvoke<CommitInfo[]>("forge_log", { repo, limit: limit ?? null });
 
 export const forgeTree = (repo: string, path = ""): Promise<TreeEntry[]> =>
   desktopInvoke<TreeEntry[]>("forge_tree", { repo, path });
