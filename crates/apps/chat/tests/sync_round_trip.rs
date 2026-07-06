@@ -18,8 +18,7 @@ struct TestCtx {
 impl TestCtx {
     fn at(consensus_time: u64) -> Self {
         Self {
-            env: sdk::Env {
-                protocol_version: 0,
+            env: sdk::Env { protocol_version: 0,
                 height: 0,
                 consensus_time,
                 origin: Origin::System,
@@ -190,9 +189,7 @@ fn synced_store_reconstructs_source_root_and_history() {
         let target = src.sync_target().await;
         let resolver = src.into_resolver();
 
-        let synced = Chat::sync_from(context.child("dst"), "dst", target, resolver)
-            .await
-            .expect("sync_from");
+        let synced = Chat::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
 
         assert_eq!(
             synced.root(),

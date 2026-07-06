@@ -22,12 +22,12 @@
 //! `height` and `time` collapse to the boundary — hit sets stay exact,
 //! ranking among rebuilt rows falls back to id order.
 
-use crate::{BlockKind, PageMsg, PageQuery, PageReply, decode_msg, decode_reply, encode_query};
 use indexer::search::{self, DEFAULT_POSTING_CAP};
 use indexer::{
     ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, RebuildMeta, Result, StateReader,
     ViewReader,
 };
+use crate::{BlockKind, PageMsg, PageQuery, PageReply, decode_msg, decode_reply, encode_query};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -166,11 +166,7 @@ impl ModuleIndexer for PagesIndex {
         out: &mut Derived,
     ) -> Result<()> {
         match decode_msg(payload).map_err(Error::Mapper)? {
-            PageMsg::CreatePage {
-                page_id,
-                title,
-                parent: _,
-            } => {
+            PageMsg::CreatePage { page_id, title, parent: _ } => {
                 // idempotence mirror: re-creating an existing page is a no-op
                 // that does NOT overwrite the title. the folder parent is not
                 // searchable, so the index ignores it.
@@ -330,9 +326,7 @@ impl ModuleIndexer for PagesIndex {
                 .filter(|r: &TokRef| page_id.as_ref().is_none_or(|p| &r.page_id == p))
                 .collect();
         refs.sort_by(|a, b| (b.time, &b.block_id).cmp(&(a.time, &a.block_id)));
-        let limit = limit
-            .unwrap_or(DEFAULT_SEARCH_LIMIT)
-            .clamp(1, MAX_SEARCH_LIMIT);
+        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
         let mut hits = Vec::new();
         for r in refs.into_iter().take(limit) {
             if let Some(bytes) = reader.get(blk_key(&r.block_id).as_bytes())? {
@@ -396,8 +390,8 @@ impl ModuleIndexer for PagesIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NewBlock, encode_msg};
     use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
+    use crate::{NewBlock, encode_msg};
 
     fn store(dir: &std::path::Path) -> IndexStore {
         IndexStore::open(dir, &["pages"])
@@ -635,41 +629,13 @@ mod tests {
             },
             vec![
                 canonical_block("p1", None, "p1", BlockKind::Page, "roadmap", &["b1", "b3"]),
-                canonical_block(
-                    "b1",
-                    Some("p1"),
-                    "p1",
-                    BlockKind::Paragraph,
-                    "toggle section",
-                    &["b2"],
-                ),
-                canonical_block(
-                    "b2",
-                    Some("b1"),
-                    "p1",
-                    BlockKind::Paragraph,
-                    "hidden inner text",
-                    &[],
-                ),
-                canonical_block(
-                    "b3",
-                    Some("p1"),
-                    "p1",
-                    BlockKind::Paragraph,
-                    "sibling survivor",
-                    &[],
-                ),
+                canonical_block("b1", Some("p1"), "p1", BlockKind::Paragraph, "toggle section", &["b2"]),
+                canonical_block("b2", Some("b1"), "p1", BlockKind::Paragraph, "hidden inner text", &[]),
+                canonical_block("b3", Some("p1"), "p1", BlockKind::Paragraph, "sibling survivor", &[]),
             ],
         )]);
         store
-            .rebuild_module(
-                "pages",
-                &state,
-                indexer::RebuildMeta {
-                    height: 20,
-                    time: 0,
-                },
-            )
+            .rebuild_module("pages", &state, indexer::RebuildMeta { height: 20, time: 0 })
             .await
             .expect("rebuild");
 
