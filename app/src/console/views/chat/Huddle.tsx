@@ -134,6 +134,7 @@ export function HuddleDock() {
         muted={card.muted}
         participants={card.participants}
         ring={color.paper}
+        pileMax={2}
         onSetMuted={(muted) => actions.setHuddleMuted(muted)}
         onLeave={() => actions.leaveHuddle()}
         onRetry={() => actions.joinHuddle(channelId)}

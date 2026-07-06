@@ -110,6 +110,9 @@ export interface HuddleCardProps {
   participants: string[];
   /** Ring color behind the avatar pile — the card's own surface color. */
   ring?: string;
+  /** Avatar-pile cap before the "+N" chip — the narrow in-app dock fits fewer
+   *  chips than the popped window. */
+  pileMax?: number;
   onSetMuted(muted: boolean): void;
   onLeave(): void;
   onRetry(): void;
@@ -126,6 +129,7 @@ export function HuddleCard({
   muted,
   participants,
   ring = color.paper,
+  pileMax = 5,
   onSetMuted,
   onLeave,
   onRetry,
@@ -200,7 +204,7 @@ export function HuddleCard({
         <div style={{ flex: 1, minWidth: 0 }}>
           {!failure &&
             (participants.length > 0 ? (
-              <NamePile names={participants} size={24} ring={ring} />
+              <NamePile names={participants} size={24} ring={ring} max={pileMax} />
             ) : (
               <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>Just you</span>
             ))}

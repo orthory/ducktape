@@ -67,6 +67,10 @@ function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (polic
 
 // ── Channel rail ────────────────────────────────────────
 
+/** The channel rail's fixed width — ConsoleShell sizes the floating huddle
+ *  dock to sit inside this rail, so the two must agree. */
+export const CHANNEL_RAIL_WIDTH = 200;
+
 function ChannelRail() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
@@ -84,7 +88,7 @@ function ChannelRail() {
   return (
     <div
       style={{
-        width: 200,
+        width: CHANNEL_RAIL_WIDTH,
         flexShrink: 0,
         borderRight: `1px solid ${color.borderSoft}`,
         background: color.sidebar,
