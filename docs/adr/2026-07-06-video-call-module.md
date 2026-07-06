@@ -1,6 +1,12 @@
 # ADR: Video Calls in Chat ("concall") — direction fixed, build not scheduled
 
-Date: 2026-07-06 · Status: **Accepted as direction, build not scheduled** —
+Date: 2026-07-06 · Status: **Built** (2026-07-07, `feat/video-calls`) — see
+`docs/superpowers/specs/2026-07-06-video-call-build.md` for what shipped vs
+this text. The one structural deviation: the webview↔node leg is the huddle
+build's typed websocket + WebCodecs, not the §4 str0m WebRTC gateway — the
+inter-node wire below shipped as written.
+
+Original status: Accepted as direction, build not scheduled —
 recorded so the architecture is not re-litigated when calls become current.
 The gating prerequisite (the data-plane's real transport arm) is called out
 below; nothing else about the design is time-sensitive.
