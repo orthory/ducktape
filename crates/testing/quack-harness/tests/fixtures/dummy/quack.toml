@@ -1,0 +1,63 @@
+schema = 1
+package = "org.example.dummy"
+version = "0.1.0"
+
+[requires]
+protocol_min = 1
+modules = ["agent", "runs", "jobs", "dispatch", "memory", "package"]
+
+# the dummy package binds the platform pages module (its engagement source)
+# and its own harness module (shipped in-binary for v1 native packages).
+[[modules]]
+logical = "pages"
+default_id = "pages"
+kind = "native"
+
+[[modules]]
+logical = "dummy-harness"
+default_id = "dummy-harness"
+kind = "native"
+
+[[prompts]]
+logical = "note_taker_prompt"
+path = "prompts/dummy.md"
+hash = "sha256:dca4d2684afb65d312864e8dbb65c85c41b8400c3655ffb6c43894d3bbba9e87"
+
+[[actions]]
+tag = "dummy.note.add"
+owner = "dummy-harness"
+
+[[actions]]
+tag = "dummy.note.set_text"
+owner = "dummy-harness"
+
+[[agents]]
+id = "dummy.note-taker"
+display_name = "Dummy Note Taker"
+prompt = "note_taker_prompt"
+capability = "mock-llm-1"
+actions = ["dummy.note.add", "dummy.note.set_text"]
+status = "active"
+
+[[engagements]]
+source = "pages"
+event = "comment_added"
+agent = "dummy.note-taker"
+policy = "mention"
+
+[install]
+register_modules = true
+seed_state = true
+register_agents = true
+register_actions = true
+wire_hooks = true
+enable_jobs = true
+run_harness = true
+
+[uninstall]
+remove_hooks = true
+pause_agents = true
+unregister_actions = true
+pending_runs = "drain"
+user_data = "preserve"
+package_state = "tombstone"

@@ -5035,6 +5035,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "quack-harness"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "async-trait",
+ "capability",
+ "chat",
+ "commonware-runtime",
+ "dispatch",
+ "futures",
+ "host",
+ "jobs",
+ "memory",
+ "package",
+ "pages",
+ "quack",
+ "runs",
+ "saga",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tagging",
+ "tasks",
+]
+
+[[package]]
 name = "quanta"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
