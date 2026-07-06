@@ -754,4 +754,21 @@ mod tests {
             apply_err(&mut c, &CommentMsg::ResolveThread { thread_id: "ghost".into(), resolved: true }, user("alice"), "thread not found").await;
         });
     }
+
+    #[test]
+    fn caps_reject_before_staging() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut c = Comments::init(context, "comments").await;
+            let huge = "x".repeat(MAX_COMMENT_TEXT_BYTES + 1);
+            apply_err(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m1".into(), anchor: anchor("b1"), text: huge,
+            }, user("alice"), "comment text too large").await;
+            assert!(c.pending.is_empty(), "a rejected op stages nothing");
+
+            // query target cap.
+            let targets: Vec<String> = (0..=MAX_QUERY_TARGETS).map(|i| format!("t{i}")).collect();
+            let q = CommentQuery::ThreadsForAnchors { module: "pages".into(), targets };
+            assert!(c.query(&encode_query(&q)).await.is_err(), "over-cap query is rejected");
+        });
+    }
 }
