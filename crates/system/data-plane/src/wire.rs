@@ -196,4 +196,18 @@ mod tests {
         let read = read_hello(&mut b).await.unwrap();
         assert_eq!(read, hello);
     }
+
+    #[test]
+    fn service_ids_are_wire_stable() {
+        // append-only registry: these numbers are cross-node commitments.
+        for (service, id) in [
+            (Service::StateSync, 1u8),
+            (Service::Voice, 2u8),
+            (Service::Video, 3u8),
+        ] {
+            assert_eq!(service as u8, id);
+            assert_eq!(Service::try_from(id), Ok(service));
+        }
+        assert_eq!(Service::try_from(4u8), Err(4u8));
+    }
 }
