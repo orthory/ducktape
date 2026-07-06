@@ -305,7 +305,8 @@ impl ModuleIndexer for ChatIndex {
             | ChatMsg::UnregisterHook { .. }
             | ChatMsg::SetMembership { .. }
             | ChatMsg::JoinHuddle { .. }
-            | ChatMsg::LeaveHuddle { .. } => Ok(()),
+            | ChatMsg::LeaveHuddle { .. }
+            | ChatMsg::SweepHuddle { .. } => Ok(()),
         }
     }
 

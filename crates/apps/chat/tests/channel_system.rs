@@ -1625,3 +1625,131 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
         assert_eq!(channel.huddle.len(), 1);
     });
 }
+
+#[test]
+fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::with_origin(20, user(1)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: vec![0xa1; 32],
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // member B sweeps A's stale entry — A crashed and could not leave.
+        module
+            .execute(
+                &mut TestCtx::with_origin(30, user(2)),
+                &module_msg(ChatMsg::SweepHuddle {
+                    channel_id: "general".into(),
+                    user: vec![1u8; 32],
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.huddle.len(), 0, "sweep evicts the stale member");
+
+        // sweeping an absent user is a deterministic no-op.
+        let settled = module.root();
+        module
+            .execute(
+                &mut TestCtx::with_origin(31, user(2)),
+                &module_msg(ChatMsg::SweepHuddle {
+                    channel_id: "general".into(),
+                    user: vec![1u8; 32],
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        assert_eq!(module.root(), settled, "absent sweep must stage nothing");
+    });
+}
+
+#[test]
+fn sweep_huddle_gates_on_members_only_policy_like_posting() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(
+                &mut TestCtx::at(10),
+                &module_msg(ChatMsg::CreateChannel {
+                    channel_id: "core".into(),
+                    name: "CORE".into(),
+                    post_policy: PostPolicy::MembersOnly,
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(10),
+                &module_msg(ChatMsg::SetMembership {
+                    channel_id: "core".into(),
+                    user: vec![1u8; 32],
+                    member: true,
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // a non-member's sweep is turned away exactly like a non-member post.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(20, user(2)),
+                &module_msg(ChatMsg::SweepHuddle {
+                    channel_id: "core".into(),
+                    user: vec![1u8; 32],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("members-only"));
+    });
+}
+
+#[test]
+fn sweep_huddle_rejects_module_origin() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(20, Origin::Module("agent".into())),
+                &module_msg(ChatMsg::SweepHuddle {
+                    channel_id: "general".into(),
+                    user: vec![1u8; 32],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("external users"));
+    });
+}
