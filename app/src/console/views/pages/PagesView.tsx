@@ -750,6 +750,10 @@ export function PagesView() {
   const [treeCollapsed, setTreeCollapsed] = useState<ReadonlySet<string>>(loadTreeCollapsed);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
+  // target (block id or page id) the new-thread composer is aimed at; null
+  // hides the composer. WKWebView has no window.prompt, so composing lives
+  // in the panel as a real element.
+  const [composerTarget, setComposerTarget] = useState<string | null>(null);
   const inputs = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLInputElement | null>(null);
 
@@ -775,8 +779,10 @@ export function PagesView() {
 
   useEffect(() => setTitleDraft(root?.text ?? ""), [root?.text]);
 
-  // load comment threads when the active page changes.
+  // load comment threads when the active page changes; a composer aimed at
+  // the previous page's blocks must not survive the switch.
   useEffect(() => {
+    setComposerTarget(null);
     actions.loadPageThreads();
   }, [actions, state.activePage]);
 
@@ -896,21 +902,13 @@ export function PagesView() {
   const openBlockComments = (blockId: string) => {
     setPanelOpen(true);
     const has = state.pageThreads.some((g) => g.target === blockId && g.threads.length > 0);
-    if (!has) {
-      const text = window.prompt("Comment on this block");
-      if (text && text.trim()) {
-        actions.addComment({ target: blockId, text });
-      }
-    }
+    setComposerTarget(has ? null : blockId);
   };
 
   const commentOnPage = () => {
     if (!state.activePage) return;
     setPanelOpen(true);
-    const text = window.prompt("Comment on this page");
-    if (text && text.trim()) {
-      actions.addComment({ target: state.activePage, text });
-    }
+    setComposerTarget(state.activePage);
   };
 
   const handlers: RowHandlers = {
@@ -1044,7 +1042,10 @@ export function PagesView() {
                       type="button"
                       aria-label={panelOpen ? "Hide comments" : "Show comments"}
                       aria-pressed={panelOpen}
-                      onClick={() => setPanelOpen((o) => !o)}
+                      onClick={() => {
+                        if (panelOpen) setComposerTarget(null);
+                        setPanelOpen((o) => !o);
+                      }}
                       style={{
                         ...headerBtn,
                         background: panelOpen ? color.hover : color.paper,
@@ -1191,7 +1192,23 @@ export function PagesView() {
             <CommentsPanel
               threads={state.pageThreads}
               authorNames={state.authorNames}
-              onClose={() => setPanelOpen(false)}
+              composer={
+                composerTarget
+                  ? {
+                      target: composerTarget,
+                      label: composerTarget === state.activePage ? "this page" : "this block",
+                    }
+                  : null
+              }
+              onClose={() => {
+                setPanelOpen(false);
+                setComposerTarget(null);
+              }}
+              onSubmitNew={(target, text) => {
+                actions.addComment({ target, text });
+                setComposerTarget(null);
+              }}
+              onCancelNew={() => setComposerTarget(null)}
               onReply={(threadId, text) => {
                 // a reply must carry the THREAD's target (a block id or the
                 // page id) — the module rejects an append whose target differs

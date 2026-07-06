@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { fireEvent, render } from "@testing-library/react";
 import { CommentsPanel } from "./CommentsPanel";
 import type { TargetThreads } from "../../../domain/pages-client";
 import type { AuthorRef } from "../../../domain/chat-client";
@@ -43,7 +43,10 @@ describe("CommentsPanel", () => {
       <CommentsPanel
         threads={threads}
         authorNames={{}}
+        composer={null}
         onClose={vi.fn()}
+        onSubmitNew={vi.fn()}
+        onCancelNew={vi.fn()}
         onReply={vi.fn()}
         onResolve={onResolve}
         onEdit={vi.fn()}
@@ -60,7 +63,10 @@ describe("CommentsPanel", () => {
       <CommentsPanel
         threads={[]}
         authorNames={{}}
+        composer={null}
         onClose={vi.fn()}
+        onSubmitNew={vi.fn()}
+        onCancelNew={vi.fn()}
         onReply={vi.fn()}
         onResolve={vi.fn()}
         onEdit={vi.fn()}
@@ -68,5 +74,56 @@ describe("CommentsPanel", () => {
       />,
     );
     getByText(/no comments yet/i);
+  });
+
+  it("submits a new thread from the composer", () => {
+    const onSubmitNew = vi.fn();
+    const { getByLabelText, getByRole, queryByText } = render(
+      <CommentsPanel
+        threads={[]}
+        authorNames={{}}
+        composer={{ target: "b1", label: "this block" }}
+        onClose={vi.fn()}
+        onSubmitNew={onSubmitNew}
+        onCancelNew={vi.fn()}
+        onReply={vi.fn()}
+        onResolve={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    // composer replaces the empty-state hint while it is open.
+    expect(queryByText(/no comments yet/i)).toBeNull();
+    fireEvent.change(getByLabelText("New comment text"), {
+      target: { value: "first!" },
+    });
+    getByRole("button", { name: /add comment/i }).click();
+    expect(onSubmitNew).toHaveBeenCalledWith("b1", "first!");
+  });
+
+  it("ignores submit with only whitespace and cancels", () => {
+    const onSubmitNew = vi.fn();
+    const onCancelNew = vi.fn();
+    const { getByLabelText, getByRole } = render(
+      <CommentsPanel
+        threads={[]}
+        authorNames={{}}
+        composer={{ target: "p1", label: "this page" }}
+        onClose={vi.fn()}
+        onSubmitNew={onSubmitNew}
+        onCancelNew={onCancelNew}
+        onReply={vi.fn()}
+        onResolve={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    fireEvent.change(getByLabelText("New comment text"), {
+      target: { value: "   " },
+    });
+    getByRole("button", { name: /add comment/i }).click();
+    expect(onSubmitNew).not.toHaveBeenCalled();
+    getByRole("button", { name: /cancel new comment/i }).click();
+    expect(onCancelNew).toHaveBeenCalled();
   });
 });

@@ -218,4 +218,25 @@ describe("Pages keyboard shortcuts & tab strip", () => {
     // … while the .no-scrollbar utility suppresses the global 10px bar.
     expect(strip.className).toContain("no-scrollbar");
   });
+
+  it("writes a page comment through the panel composer (no window.prompt)", () => {
+    const { spies } = renderPagesView();
+
+    fireEvent.click(screen.getByRole("button", { name: "Comment on page" }));
+    // the panel opens with the composer aimed at the page.
+    screen.getByRole("form", { name: "New comment on this page" });
+
+    fireEvent.change(screen.getByLabelText("New comment text"), {
+      target: { value: "ship checklist looks thin" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
+
+    expect(spies.addComment).toHaveBeenCalledWith({
+      target: "p1",
+      text: "ship checklist looks thin",
+    });
+    // submit dismisses the composer; the panel itself stays open.
+    expect(screen.queryByRole("form", { name: "New comment on this page" })).toBeNull();
+    screen.getByRole("complementary", { name: "Comments" });
+  });
 });
