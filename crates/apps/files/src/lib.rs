@@ -22,7 +22,15 @@ pub mod paths;
 pub mod queries;
 pub mod state;
 pub mod store;
-pub mod tree;
+// `tree` stays private: its read/edit surface is `pub` (so the crate glue and
+// the hidden `testkit` seam can reach it) but the module path is not part of the
+// public api. tests drive it through `files::testkit`.
+mod tree;
+
+// `#[doc(hidden)]` test-only facade re-exporting the tree surface for the
+// out-of-crate integration tests. always compiled — it is pure.
+#[doc(hidden)]
+pub mod testkit;
 
 pub use fs::{Fs, Notification, StagedObjects};
 pub use objects::{Kind, ObjectId};
