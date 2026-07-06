@@ -12,14 +12,15 @@ use crate::objects::{
     EntryKind, FileObj, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj, object_id,
 };
 use crate::paths::{canonical, check_authority};
-use crate::state::{Refs, Staged, decode_refs, encode_refs, root_bytes};
+use crate::state::{PinEntry, Refs, Staged, decode_refs, encode_refs, root_bytes};
 use crate::store::ObjectStore;
 use crate::tree::{Store, TreeEdit, entry_at, snapshot_root_tree};
 use crate::wire::{
     CHUNK_SIZE, Change, Content, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp,
     HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_INLINE_COMMIT_BYTES,
     MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES, MAX_META_VALUE_BYTES,
-    MAX_SYMLINK_TARGET_BYTES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, from_hex_32, to_hex,
+    MAX_PIN_NAME_BYTES, MAX_PINS, MAX_SYMLINK_TARGET_BYTES, MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES,
+    STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, from_hex_32, to_hex,
 };
 
 pub struct Fs<S: ObjectStore> {
@@ -295,32 +296,147 @@ impl<S: ObjectStore> Fs<S> {
         Ok(built.notifications)
     }
 
-    pub fn pin(&mut self, _actor: &str, _snapshot: String, _name: String) -> Result<(), String> {
-        Err(unimplemented_err())
+    /// pin a resolvable snapshot under `name`, protecting it from gc. mutates the
+    /// PENDING refs view only — the committed root moves at `commit_block` +
+    /// `adopt_refs`, never here (the established discipline). validate-then-mutate:
+    /// every check is a pre-check, so a reject leaves pending as the sweep left it.
+    ///
+    /// `height` rides the same `(actor, height, ..)` shape putblob uses: it is the
+    /// block height the sweep and `require_pending` key on — there is no other
+    /// source of the current height in the pure core (the refs preimage carries
+    /// none), and the binding sweep-first rule below needs it.
+    pub fn pin(
+        &mut self,
+        actor: &str,
+        height: u64,
+        snapshot: String,
+        name: String,
+    ) -> Result<(), String> {
+        self.require_pending(height);
+        let pending = self.pending.as_mut().expect("require_pending set it");
+        // sweep-first, on the pending view, like putblob. the deterministic staging
+        // sweep ticks at every mutating verb so expiry stays a pure function of the
+        // op stream even in a block whose only op is a pin. a reject AFTER the sweep
+        // is harmless: the kernel aborts the whole block on any execute error
+        // (verified in task 9's review — the host aborts every module on any drain
+        // failure), so `abort_block` erases the swept-but-rejected pending; it is
+        // never observed.
+        sweep_expired(&mut pending.refs, height);
+
+        // validate fully before the single mutation (all pre-checks).
+        if name.is_empty() {
+            return Err("files: pin name must not be empty".into());
+        }
+        if name.len() > MAX_PIN_NAME_BYTES {
+            return Err("files: pin name exceeds the byte cap".into());
+        }
+        if pending.refs.pins.len() >= MAX_PINS {
+            return Err("files: pin table is full".into());
+        }
+        if pending.refs.pins.contains_key(&name) {
+            return Err("files: pin name already exists".into());
+        }
+        // the id must hex-parse AND resolve in the PENDING view (head, window, or an
+        // already-pinned id). a gc'd / unknown id is unpinnable — naming an
+        // unreachable snapshot cannot revive it.
+        let id =
+            from_hex_32(&snapshot).ok_or_else(|| "files: snapshot not resolvable".to_string())?;
+        if !refs_contains_snapshot(&pending.refs, &id) {
+            return Err("files: snapshot not resolvable".into());
+        }
+
+        pending.refs.pins.insert(
+            name,
+            PinEntry {
+                snapshot: id,
+                owner: actor.to_string(),
+            },
+        );
+        Ok(())
     }
 
-    pub fn unpin(&mut self, _actor: &str, _name: String) -> Result<(), String> {
-        Err(unimplemented_err())
+    /// remove a pin by name — owner-gated: only the pin's creator or system.
+    /// mutates the PENDING view only (see [`Fs::pin`] for the height/sweep rules).
+    pub fn unpin(&mut self, actor: &str, height: u64, name: String) -> Result<(), String> {
+        self.require_pending(height);
+        let pending = self.pending.as_mut().expect("require_pending set it");
+        // sweep-first (see `pin`): `abort_block` erases a swept-but-rejected pending.
+        sweep_expired(&mut pending.refs, height);
+
+        let owner = match pending.refs.pins.get(&name) {
+            Some(entry) => entry.owner.clone(),
+            None => return Err("files: pin not found".into()),
+        };
+        // owner-gated: the creator or system may remove it; nobody else.
+        if actor != owner && actor != "system" {
+            return Err("files: only the pin owner may unpin".into());
+        }
+        pending.refs.pins.remove(&name);
+        Ok(())
     }
 
+    /// register a `(prefix, module_id)` watch. origin-gated: watches are
+    /// module-origin only and a module may only watch for itself; system may
+    /// register for any module. mutates the PENDING view only (see [`Fs::pin`]).
     pub fn watch(
         &mut self,
-        _actor: &str,
-        _is_module: bool,
-        _prefix: String,
-        _module_id: String,
+        actor: &str,
+        height: u64,
+        is_module: bool,
+        prefix: String,
+        module_id: String,
     ) -> Result<(), String> {
-        Err(unimplemented_err())
+        self.require_pending(height);
+        let pending = self.pending.as_mut().expect("require_pending set it");
+        // sweep-first (see `pin`): `abort_block` erases a swept-but-rejected pending.
+        sweep_expired(&mut pending.refs, height);
+
+        watch_origin_gate(actor, is_module, &module_id)?;
+        if module_id.is_empty() {
+            return Err("files: watch module id must not be empty".into());
+        }
+        if module_id.len() > MAX_WATCH_MODULE_ID_BYTES {
+            return Err("files: watch module id exceeds the byte cap".into());
+        }
+        // canonicalize the prefix so registration and the commit fan-out key on the
+        // SAME bytes, and so matching is segment-boundary (not substring): a watch on
+        // "/shared" must fire for "/shared/x" but NOT for "/sharedsecret/x".
+        let prefix = canonical_watch_prefix(&prefix)?;
+        if pending.refs.watches.len() >= MAX_WATCHES {
+            return Err("files: watch table is full".into());
+        }
+        let key = (prefix, module_id);
+        if pending.refs.watches.contains(&key) {
+            return Err("files: watch already registered".into());
+        }
+        pending.refs.watches.insert(key);
+        Ok(())
     }
 
+    /// remove a `(prefix, module_id)` watch — same origin gate as [`Fs::watch`].
+    /// mutates the PENDING view only.
     pub fn unwatch(
         &mut self,
-        _actor: &str,
-        _is_module: bool,
-        _prefix: String,
-        _module_id: String,
+        actor: &str,
+        height: u64,
+        is_module: bool,
+        prefix: String,
+        module_id: String,
     ) -> Result<(), String> {
-        Err(unimplemented_err())
+        self.require_pending(height);
+        let pending = self.pending.as_mut().expect("require_pending set it");
+        // sweep-first (see `pin`): `abort_block` erases a swept-but-rejected pending.
+        sweep_expired(&mut pending.refs, height);
+
+        // gate first — never leak whether a watch exists to an unauthorized caller.
+        watch_origin_gate(actor, is_module, &module_id)?;
+        // key on the same canonical prefix registration stored.
+        let prefix = canonical_watch_prefix(&prefix)?;
+        let key = (prefix, module_id);
+        if !pending.refs.watches.remove(&key) {
+            return Err("files: watch not found".into());
+        }
+        Ok(())
     }
 
     // ---- block boundary ------------------------------------------------------
@@ -738,7 +854,7 @@ fn commit_apply(
     let mut notifications = Vec::new();
     for (joined, _segs) in &touched {
         for (prefix, module_id) in &refs.watches {
-            if joined.starts_with(prefix.as_str()) {
+            if watch_matches(prefix, joined) {
                 notifications.push(Notification {
                     module_id: module_id.clone(),
                     prefix: prefix.clone(),
@@ -766,6 +882,47 @@ fn canon_authorized(actor: &str, path: &str) -> Result<Vec<String>, String> {
 /// the canonical joined form of a path's segments — the CAS/dedup/watch key.
 fn join_segs(segs: &[String]) -> String {
     format!("/{}", segs.join("/"))
+}
+
+/// the watch origin gate, shared by [`Fs::watch`]/[`Fs::unwatch`]: watches are
+/// module-origin only (external submitters cannot register), and a module may act
+/// only for itself. system (also `is_module`) may act for any module_id — it is
+/// the arbitrary-authority origin. one function so both ends enforce it identically.
+fn watch_origin_gate(actor: &str, is_module: bool, module_id: &str) -> Result<(), String> {
+    if !is_module {
+        return Err("files: watch registration is module-origin only".into());
+    }
+    if actor != "system" && actor != module_id {
+        return Err("files: a module may only watch for itself".into());
+    }
+    Ok(())
+}
+
+/// canonicalize a watch prefix to its stored joined form, run at BOTH ends
+/// (registration + removal) so the two key on identical bytes. `canonical`
+/// enforces absolute + NFC + the path byte cap and rejects empty / dot / trailing
+/// segments, so a stored prefix is always a clean segment path ("/" for the
+/// everything-watch, "/a/b" otherwise) — which is exactly what makes the commit
+/// fan-out's segment-boundary test exact rather than a substring match.
+fn canonical_watch_prefix(prefix: &str) -> Result<String, String> {
+    let segs = canonical(prefix)?;
+    Ok(join_segs(&segs))
+}
+
+/// segment-boundary watch match: a watch prefix `p` matches path `q` iff `p` is
+/// the everything-watch "/", or `q == p`, or `q` descends from `p` across a "/"
+/// boundary. so "/shared" fires for "/shared/x" but NOT for "/sharedsecret/x" —
+/// the binding fix from task 9's review (the old `starts_with` leaked across the
+/// boundary). stored prefixes are canonical (no trailing slash), so the byte at
+/// `p.len()` is always the delimiter, never part of a segment name.
+fn watch_matches(prefix: &str, path: &str) -> bool {
+    if prefix == "/" {
+        return true;
+    }
+    if path == prefix {
+        return true;
+    }
+    path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
 }
 
 /// record a touched path for dedup; a second touch of the same path rejects

@@ -152,7 +152,11 @@ impl Module for Files {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let env = ctx.env().clone();
         let actor = owner_of(&env.origin);
-        let is_module = matches!(env.origin, Origin::Module(_));
+        // the watch origin gate treats system as a module origin: it may register a
+        // watch for ANY module_id (the `actor == "system"` branch of the gate lets
+        // it through), so system must map to `is_module = true`. an external
+        // submitter is not a module and cannot register watches at all.
+        let is_module = matches!(env.origin, Origin::Module(_) | Origin::System);
         match msg.payload.first() {
             Some(&PUTBLOB_FRAME_TAG) => self
                 .fs
@@ -195,17 +199,21 @@ impl Module for Files {
                     }
                     Ok(())
                 }
-                FilesMsg::Pin { snapshot, name } => {
-                    self.fs.pin(&actor, snapshot, name).map_err(Error::Module)
-                }
-                FilesMsg::Unpin { name } => self.fs.unpin(&actor, name).map_err(Error::Module),
+                FilesMsg::Pin { snapshot, name } => self
+                    .fs
+                    .pin(&actor, env.height, snapshot, name)
+                    .map_err(Error::Module),
+                FilesMsg::Unpin { name } => self
+                    .fs
+                    .unpin(&actor, env.height, name)
+                    .map_err(Error::Module),
                 FilesMsg::Watch { prefix, module_id } => self
                     .fs
-                    .watch(&actor, is_module, prefix, module_id)
+                    .watch(&actor, env.height, is_module, prefix, module_id)
                     .map_err(Error::Module),
                 FilesMsg::Unwatch { prefix, module_id } => self
                     .fs
-                    .unwatch(&actor, is_module, prefix, module_id)
+                    .unwatch(&actor, env.height, is_module, prefix, module_id)
                     .map_err(Error::Module),
             },
         }
