@@ -3297,6 +3297,154 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// path prints and returns — the plane is an overlay on a working node,
 /// never a reason to take the node down.
 #[allow(clippy::too_many_arguments)]
+/// Wire the staged WireGuard reachability plane onto an already-registered
+/// mesh channel: the orchestrator runs on its own plain-tokio OS thread (the
+/// app-surface split exactly), and two pump tasks bridge it — mesh datagrams
+/// in as `Deliver` commands, `Send` events out as mesh datagrams, everything
+/// else printed as operator-visible progress. Returns the plane's command
+/// sender. Shared by the validator path and the parked standby path (which
+/// pre-warms its tunnels ahead of activation); the callers differ only in
+/// where their `Retarget`/`ViewTick` commands come from.
+#[allow(clippy::too_many_arguments)]
+fn wire_reachability_plane<S, R>(
+    context: &commonware_runtime::tokio::Context,
+    label: &str,
+    chain_id: &str,
+    signer: &ed25519::PrivateKey,
+    wireguard_key_file: &std::path::Path,
+    mesh_state_file: &std::path::Path,
+    wireguard_listen: std::net::SocketAddr,
+    wireguard_effect: WireGuardEffectKind,
+    advertised: Ingress,
+    coordinators: Vec<Ingress>,
+    reach_p2p_tx: S,
+    mut reach_p2p_rx: R,
+) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey> + Send + Sync + 'static,
+    R: P2pReceiver<PublicKey = ed25519::PublicKey> + Send + 'static,
+{
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(256);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
+
+    let thread_label = label.to_string();
+    let reach_signer = signer.clone();
+    let plane_chain_id = chain_id.to_string();
+    let key_file = wireguard_key_file.to_path_buf();
+    let state_file = mesh_state_file.to_path_buf();
+    let nudge_tx = cmd_tx.clone();
+    std::thread::Builder::new()
+        .name("reachability".into())
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("reachability tokio runtime")
+                .block_on(reachability_plane(
+                    thread_label,
+                    plane_chain_id,
+                    reach_signer,
+                    key_file,
+                    state_file,
+                    wireguard_listen,
+                    wireguard_effect,
+                    advertised,
+                    coordinators,
+                    cmd_rx,
+                    nudge_tx,
+                    ev_tx,
+                ));
+        })
+        .expect("spawn reachability thread");
+
+    // pump in: mesh datagrams -> orchestrator commands.
+    {
+        let cmd = cmd_tx.clone();
+        context.child("reachability_in").spawn(move |_ctx| async move {
+            while let Ok((peer, msg)) = reach_p2p_rx.recv().await {
+                let bytes: Vec<u8> = msg.into();
+                let deliver = reachability::ReachabilityCommand::Deliver { from: peer, bytes };
+                if cmd.send(deliver).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // pump out: orchestrator sends -> mesh; everything else is
+    // operator-visible progress.
+    {
+        let pump_label = label.to_string();
+        let mut tx = reach_p2p_tx;
+        context.child("reachability_out").spawn(move |_ctx| async move {
+            while let Some(event) = ev_rx.recv().await {
+                match event {
+                    reachability::ReachabilityEvent::Send { to, bytes } => {
+                        let _ = tx.send(Recipients::One(to), IoBuf::from(bytes), false);
+                    }
+                    reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
+                        println!(
+                            "[node {pump_label}] reachability: epoch {epoch} mesh verified"
+                        )
+                    }
+                    reachability::ReachabilityEvent::TunnelsApplied {
+                        epoch,
+                        interface,
+                        peers,
+                    } => match wireguard_effect {
+                        WireGuardEffectKind::Real => println!(
+                            "[node {pump_label}] reachability: epoch {epoch} tunnels applied \
+                             on {interface} ({peers} peer(s))"
+                        ),
+                        WireGuardEffectKind::Fake => println!(
+                            "[node {pump_label}] reachability: epoch {epoch} tunnel config \
+                             staged on {interface} ({peers} peer(s); fake effect — no real \
+                             interface)"
+                        ),
+                    },
+                    reachability::ReachabilityEvent::StandbyTunnelsApplied {
+                        epoch,
+                        interface,
+                        peers,
+                    } => println!(
+                        "[node {pump_label}] reachability: epoch {epoch} standby pre-warm \
+                         tunnels on {interface} ({peers} peer(s))"
+                    ),
+                    reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
+                        println!(
+                            "[node {pump_label}] reachability: peer {}: {reason}",
+                            hex_bytes(&peer.as_ref()[..4])
+                        )
+                    }
+                    reachability::ReachabilityEvent::EpochFailed { epoch, reason } => println!(
+                        "[node {pump_label}] reachability: epoch {epoch} failed: {reason}"
+                    ),
+                    reachability::ReachabilityEvent::MeshRestored {
+                        epoch,
+                        interface,
+                        peers,
+                    } => println!(
+                        "[node {pump_label}] reachability: persisted mesh (epoch {epoch}) \
+                         restored on {interface} ({peers} peer(s)) — awaiting live assembly"
+                    ),
+                    reachability::ReachabilityEvent::RestoreFailed { reason } => {
+                        println!(
+                            "[node {pump_label}] reachability: persisted mesh not restored \
+                             ({reason}); continuing on live assembly only"
+                        )
+                    }
+                    reachability::ReachabilityEvent::PersistFailed { reason } => {
+                        println!(
+                            "[node {pump_label}] reachability: WARNING: mesh state not \
+                             persisted ({reason}) — a cold restart will not restore this epoch"
+                        )
+                    }
+                }
+            }
+        });
+    }
+    cmd_tx
+}
+
 async fn reachability_plane(
     label: String,
     chain_id: String,
@@ -3385,6 +3533,12 @@ async fn reachability_plane(
     if let Some(reflexive) = resolver.reflexive() {
         println!("[node {label}] reachability: coordinator-observed reflexive {reflexive}");
     }
+    // a parked standby's gossip arrives under the network's derived lobby
+    // identity (its own key is untracked until the grant cutover) — admit
+    // that ingress; content signatures still authenticate every message.
+    // the namespace is a TOML-sourced string, so `as_bytes` reproduces the
+    // exact bytes the transport derived the lobby key from.
+    let gossip_ingress = Some(config::lobby_identity(chain_id.as_bytes()).public_key());
     let config = reachability::ReachabilityConfig {
         chain_id,
         signer,
@@ -3394,6 +3548,7 @@ async fn reachability_plane(
         coordinators: coords,
         port_policy: policy,
         persist_file: Some(mesh_state_file),
+        gossip_ingress,
     };
     // the boot `Retarget`'s record fan-out fires before the p2p actors have
     // a single live connection, and mesh sends are best-effort — when both
@@ -3953,16 +4108,44 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
-            // the reachability lane: only MEMBERS run the WireGuard plane; a
-            // parked joiner just keeps the channel legal — black-hole. (its
-            // promotion reboots the node into the validator path, which wires
-            // the plane for real.)
-            {
-                let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
-                context
-                    .child("blackhole_reachability")
-                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-            }
+            // the reachability lane: a parked joiner with a WireGuard config
+            // runs the plane in its STANDBY role — once observer standing
+            // lands (the park loop below drives Retargets off the manifest),
+            // it pre-warms tunnels with every member so activation, and the
+            // promotion reboot via the persisted mesh, start connected
+            // instead of assembling. Without `wireguard_listen` the channel
+            // just stays legal — black-hole.
+            let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
+                let (reach_tx, mut reach_rx) =
+                    network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+                match wireguard_listen {
+                    Some(wg_addr) => {
+                        let coordinators: Vec<Ingress> =
+                            coordinated.iter().map(|(_, c, _)| c.clone()).collect();
+                        Some(wire_reachability_plane(
+                            &context,
+                            &label,
+                            &chain_id,
+                            &signer,
+                            &wireguard_key_file,
+                            &mesh_state_file,
+                            wg_addr,
+                            wireguard_effect,
+                            advertised_reach,
+                            coordinators,
+                            reach_tx,
+                            reach_rx,
+                        ))
+                    }
+                    None => {
+                        context
+                            .child("blackhole_reachability")
+                            .spawn(move |_ctx| async move { while reach_rx.recv().await.is_ok() {} });
+                        drop(reach_tx);
+                        None
+                    }
+                }
+            };
             // the lobby lane: where this parked node announces its key. member
             // replies are drained by a printer task — purely informational.
             let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
@@ -4006,6 +4189,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
             let me_bytes = signer.public_key().as_ref().to_vec();
             let mut last_tracked = PEER_SET;
+            // the epoch the reachability plane last retargeted to (standby
+            // role) — one Retarget per observed epoch.
+            let mut last_plane_epoch: Option<u64> = None;
             let mut attempt = 0usize;
             let mut announce_round = 0usize;
             // once observer standing is seen, parking is the STEADY state
@@ -4258,6 +4444,44 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             .expect("a btree-set union has no duplicates"),
                     );
                     last_tracked = m.epoch;
+                }
+                // drive the reachability plane's standby role off the
+                // manifest: membership and observer standing come from the
+                // synced boundary, whose height doubles as the plane's
+                // freshness clock (the same app-height regime the members'
+                // ViewTicks run — within the advert TTL's generous window).
+                // Nothing is sent before standing: no member would admit the
+                // gossip yet.
+                if let Some(cmd) = &reach_cmd {
+                    if m.observers.iter().any(|k| k == &me_bytes) {
+                        let clock = m.view_base.max(m.height);
+                        let _ = cmd
+                            .send(reachability::ReachabilityCommand::ViewTick(clock))
+                            .await;
+                        if last_plane_epoch != Some(m.epoch) {
+                            let members: Vec<ed25519::PublicKey> = m
+                                .participants
+                                .iter()
+                                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                                .collect();
+                            let standbys: Vec<ed25519::PublicKey> = m
+                                .observers
+                                .iter()
+                                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                                .collect();
+                            let _ = cmd
+                                .send(reachability::ReachabilityCommand::Retarget(
+                                    reachability::MeshEpochEvent {
+                                        epoch: m.epoch,
+                                        members,
+                                        standbys,
+                                        current_view: clock,
+                                    },
+                                ))
+                                .await;
+                            last_plane_epoch = Some(m.epoch);
+                        }
+                    }
                 }
                 if !m.participants.iter().any(|k| k == &me_bytes) {
                     // the manifest names the CURRENT members — better announce
@@ -4533,6 +4757,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     std::process::exit(1);
                 }
             }
+            // tear the pre-warm interface down cleanly before the exec: the
+            // in-process boringtun device dies with the process either way,
+            // but only an orderly Shutdown unlinks its UAPI socket path —
+            // a stale one would fail the rebooted validator's restore-time
+            // create. Bounded: the reboot must not hang on a wedged plane.
+            if let Some(cmd) = &reach_cmd {
+                let _ = cmd.send(reachability::ReachabilityCommand::Shutdown).await;
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !cmd.is_closed() && std::time::Instant::now() < deadline {
+                    context.sleep(Duration::from_millis(20)).await;
+                }
+            }
             println!(
                 "[node {label}] promoted: validator at epoch {} boundary {} — rebooting",
                 boundary.epoch, boundary.height
@@ -4789,133 +5025,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> =
             match wireguard_listen {
                 Some(wg_addr) => {
-                    let (cmd_tx, cmd_rx) =
-                        tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(256);
-                    let (ev_tx, mut ev_rx) =
-                        tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
-
                     // rendezvous coordinators = every coordinated-reach hint's
                     // coordinator ingress; hostnames resolve once at plane start.
                     let coordinators: Vec<Ingress> =
                         coordinated.iter().map(|(_, c, _)| c.clone()).collect();
-                    let thread_label = label.clone();
-                    let reach_signer = signer.clone();
-                    let chain_id = chain_id.clone();
-                    let key_file = wireguard_key_file.clone();
-                    let state_file = mesh_state_file.clone();
-                    let nudge_tx = cmd_tx.clone();
-                    std::thread::Builder::new()
-                        .name("reachability".into())
-                        .spawn(move || {
-                            tokio::runtime::Builder::new_multi_thread()
-                                .enable_all()
-                                .build()
-                                .expect("reachability tokio runtime")
-                                .block_on(reachability_plane(
-                                    thread_label,
-                                    chain_id,
-                                    reach_signer,
-                                    key_file,
-                                    state_file,
-                                    wg_addr,
-                                    wireguard_effect,
-                                    advertised_reach,
-                                    coordinators,
-                                    cmd_rx,
-                                    nudge_tx,
-                                    ev_tx,
-                                ));
-                        })
-                        .expect("spawn reachability thread");
-
-                    // pump in: mesh datagrams -> orchestrator commands.
-                    {
-                        let cmd = cmd_tx.clone();
-                        context.child("reachability_in").spawn(move |_ctx| async move {
-                            while let Ok((peer, msg)) = reach_p2p_rx.recv().await {
-                                let bytes: Vec<u8> = msg.into();
-                                let deliver =
-                                    reachability::ReachabilityCommand::Deliver { from: peer, bytes };
-                                if cmd.send(deliver).await.is_err() {
-                                    break;
-                                }
-                            }
-                        });
-                    }
-                    // pump out: orchestrator sends -> mesh; everything else is
-                    // operator-visible progress.
-                    {
-                        let pump_label = label.clone();
-                        let mut tx = reach_p2p_tx;
-                        context.child("reachability_out").spawn(move |_ctx| async move {
-                            while let Some(event) = ev_rx.recv().await {
-                                match event {
-                                    reachability::ReachabilityEvent::Send { to, bytes } => {
-                                        let _ =
-                                            tx.send(Recipients::One(to), IoBuf::from(bytes), false);
-                                    }
-                                    reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
-                                        println!(
-                                            "[node {pump_label}] reachability: epoch {epoch} mesh \
-                                             verified"
-                                        )
-                                    }
-                                    reachability::ReachabilityEvent::TunnelsApplied {
-                                        epoch,
-                                        interface,
-                                        peers,
-                                    } => match wireguard_effect {
-                                        WireGuardEffectKind::Real => println!(
-                                            "[node {pump_label}] reachability: epoch {epoch} \
-                                             tunnels applied on {interface} ({peers} peer(s))"
-                                        ),
-                                        WireGuardEffectKind::Fake => println!(
-                                            "[node {pump_label}] reachability: epoch {epoch} \
-                                             tunnel config staged on {interface} ({peers} \
-                                             peer(s); fake effect — no real interface)"
-                                        ),
-                                    },
-                                    reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
-                                        println!(
-                                            "[node {pump_label}] reachability: peer {}: {reason}",
-                                            hex_bytes(&peer.as_ref()[..4])
-                                        )
-                                    }
-                                    reachability::ReachabilityEvent::EpochFailed {
-                                        epoch,
-                                        reason,
-                                    } => println!(
-                                        "[node {pump_label}] reachability: epoch {epoch} failed: \
-                                         {reason}"
-                                    ),
-                                    reachability::ReachabilityEvent::MeshRestored {
-                                        epoch,
-                                        interface,
-                                        peers,
-                                    } => println!(
-                                        "[node {pump_label}] reachability: persisted mesh \
-                                         (epoch {epoch}) restored on {interface} ({peers} \
-                                         peer(s)) — awaiting live assembly"
-                                    ),
-                                    reachability::ReachabilityEvent::RestoreFailed { reason } => {
-                                        println!(
-                                            "[node {pump_label}] reachability: persisted mesh \
-                                             not restored ({reason}); continuing on live \
-                                             assembly only"
-                                        )
-                                    }
-                                    reachability::ReachabilityEvent::PersistFailed { reason } => {
-                                        println!(
-                                            "[node {pump_label}] reachability: WARNING: mesh \
-                                             state not persisted ({reason}) — a cold restart \
-                                             will not restore this epoch"
-                                        )
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Some(cmd_tx)
+                    Some(wire_reachability_plane(
+                        &context,
+                        &label,
+                        &chain_id,
+                        &signer,
+                        &wireguard_key_file,
+                        &mesh_state_file,
+                        wg_addr,
+                        wireguard_effect,
+                        advertised_reach,
+                        coordinators,
+                        reach_p2p_tx,
+                        reach_p2p_rx,
+                    ))
                 }
                 None => {
                     context
@@ -4925,7 +5052,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     None
                 }
             };
-        // boot: target the resume epoch's member set immediately; cutovers
+        // boot: target the resume epoch's member set immediately (with the
+        // committed observer set as the pre-warm standbys); cutovers
         // retarget from the orchestrator loop below. the recovered view base
         // keeps advert expiries in the same view regime as live peers.
         if let Some(cmd) = &reach_cmd {
@@ -4934,6 +5062,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     reachability::MeshEpochEvent {
                         epoch: initial_resume_epoch,
                         members: initial_member_keys.clone(),
+                        standbys: initial_observer_keys.clone(),
                         current_view: resumed.as_ref().map(|r| r.view_base).unwrap_or(0),
                     },
                 ))
@@ -6092,10 +6221,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             let members = plan.valset().consensus_members();
                             let member_bytes: Vec<Vec<u8>> =
                                 members.iter().map(|k| k.as_ref().to_vec()).collect();
-                            let plan_observer_bytes: Vec<Vec<u8>> = plan
+                            let plan_observers: Vec<ed25519::PublicKey> = plan
                                 .valset()
                                 .transport_members()
                                 .difference(members)
+                                .cloned()
+                                .collect();
+                            let plan_observer_bytes: Vec<Vec<u8>> = plan_observers
+                                .iter()
                                 .map(|k| k.as_ref().to_vec())
                                 .collect();
                             // transport FIRST: the new epoch's mesh must admit
@@ -6107,7 +6240,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // cutovers.
                             mesh_oracle.track(plan.epoch(), mesh_at(plan.valset().transport_members()));
                             // the reachability plane retunnels for the new
-                            // member set the moment transport admits it.
+                            // member set the moment transport admits it —
+                            // with the epoch's observer tier as the pre-warm
+                            // standbys, so a registered joiner's tunnels
+                            // assemble ahead of its activation cutover.
                             // cutover_app_height IS the new epoch's absolute
                             // view at engine view 0 — the raw engine_view
                             // here would be epoch-local, a different clock
@@ -6119,6 +6255,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         reachability::MeshEpochEvent {
                                             epoch: plan.epoch(),
                                             members: members.iter().cloned().collect(),
+                                            standbys: plan_observers.clone(),
                                             current_view: plan.cutover_app_height(),
                                         },
                                     ))

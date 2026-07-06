@@ -74,19 +74,31 @@ What it deliberately does NOT cover: the FIRST join on a coordinated-only
 config (nothing persisted yet — the throwaway fronted hint in the join
 recipe above remains required for the join window).
 
+## Standby tunnel pre-warming (shipped)
+
+The plane's epochs still version ACTIVE members only (phase A's all-members
+rule stands — a registered-but-absent key must never stall an epoch), but
+the observer tier now rides a separate PRE-WARM layer with the opposite
+trade: never versioned, never handshaked, applied live. Every `Retarget`
+carries the epoch's observer set as `standbys`; a standby's owner-signed
+`EndpointRecord` (bound to the epoch tuple, policy-checked, nonce-superseded)
+installs a tunnel by re-applying the full interface config in place — the
+same record-derived trust model as the cold-restart restore — and a
+higher-nonce re-advertisement moves its endpoint live. The parked joiner
+runs the plane in the standby role off its manifest polls (its gossip is
+admitted under the derived lobby identity; replies route back over the
+delivering transport key), installs every member on its own interface, and
+persists the member adverts — so the promotion reboot restores full
+connectivity from disk before the new epoch's phase-A assembly replaces it
+with the verified mesh. Result: a joiner's tunnels exist BEFORE its
+activation cutover, not seconds after.
+
 ## What remains (this seam's follow-ons)
 
-1. **Standby tunnel pre-warming.** The reachability plane's epochs cover
-   ACTIVE members only: phase A's all-members rule means a registered-but-
-   absent standby key would stall every epoch's bring-up, so standby nodes
-   join the plane at activation instead — tunnels assemble in the seconds
-   after the activation cutover (relayed gossip + coordinator punch), not
-   before. Pre-warming standby tunnels wants phase B (live re-advertisement
-   / partial-mesh applies).
-2. **Coordinator-auth (§3.5 of the original doc).** Rendezvous messages still
+1. **Coordinator-auth (§3.5 of the original doc).** Rendezvous messages still
    carry no inviter-signed token; a compromised coordinator can deny service
    (never substitute keys — records pin WireGuard keys under the owner's
    ed25519 signature). The token design remains open.
-3. **Relay-bind caveat.** A coordinator behind `0.0.0.0` must advertise a
+2. **Relay-bind caveat.** A coordinator behind `0.0.0.0` must advertise a
    routable relay IP — `run_coordinator_advertised` exists; operator guidance
    in [`coordinator.md`](coordinator.md).

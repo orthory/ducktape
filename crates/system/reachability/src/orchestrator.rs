@@ -9,12 +9,24 @@
 //! channels. The future is not required to be `Send` — nothing here may
 //! assume `tokio::spawn` onto a shared runtime.
 //!
-//! Phase-A scope, deliberately: the record/advert set LOCKS once the epoch's
-//! mesh version is computed — a mid-epoch re-advertisement (NAT rebind, key
-//! rotation) retunnels at the NEXT cutover, not live. And a member that
-//! never shows up stalls its epoch's bring-up exactly like
+//! Phase-A scope, deliberately: the MEMBER record/advert set LOCKS once the
+//! epoch's mesh version is computed — a member's mid-epoch re-advertisement
+//! (NAT rebind, key rotation) retunnels at the NEXT cutover, not live. And a
+//! member that never shows up stalls its epoch's bring-up exactly like
 //! `MeshView::verify`'s all-members rule says it must; the previous epoch's
 //! tunnels stay up meanwhile.
+//!
+//! STANDBY identities (the valset observer tier — registered, quorum-exempt
+//! keys awaiting activation) ride a separate pre-warm layer with the
+//! opposite trade: never versioned, never handshaked, applied LIVE. A
+//! standby's owner-signed `EndpointRecord` for the current epoch installs a
+//! tunnel by re-applying the full interface config mid-epoch (the same
+//! record-derived trust model as the cold-restart restore: WireGuard key and
+//! endpoint pinned under the owner's ed25519 signature, overlay routes
+//! derived from `(chain_id, identity)`), and a higher-nonce
+//! re-advertisement updates that peer in place. So the tunnels to a joining
+//! node exist BEFORE its activation cutover — the new epoch's phase-A
+//! assembly then replaces them with the verified, versioned mesh.
 //!
 //! Transport reach is NOT assumed pairwise: two members with no direct mesh
 //! link (a coordinated-only joiner parked through one ingress) still
@@ -31,7 +43,9 @@ use std::time::Duration;
 use commonware_cryptography::{Signer as _, ed25519};
 use nat_traversal::{NatClient, NodeKey};
 use tokio::sync::mpsc;
-use wireguard_effect::{PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, apply_tunnel_plans};
+use wireguard_effect::{
+    PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, plan_peer_configs, update_peer_tunnels,
+};
 use wireguard_upgrade::{
     ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, Endpoint, MeshVersion, MeshView,
     OverlayPolicy, Perspective, PortPolicy, ReplayCache, SignedEndpointRecord, TunnelInstallPlan,
@@ -91,6 +105,13 @@ pub struct ReachabilityConfig {
     /// back for the cold-restart re-apply). `None` disables persistence —
     /// the plane then only ever assembles from live gossip.
     pub persist_file: Option<PathBuf>,
+    /// A transport identity whose DELIVERIES are admitted even though it is
+    /// no plane participant: the mesh's derived lobby key, which a parked
+    /// standby connects under while its own key is still untracked. Purely
+    /// an ingress allowance — every message still authenticates by its
+    /// owner's content signature, and standby-directed replies route back
+    /// over whichever transport identity delivered the standby's record.
+    pub gossip_ingress: Option<ed25519::PublicKey>,
 }
 
 /// A valset cutover (or boot) the orchestrator must retarget to.
@@ -100,6 +121,11 @@ pub struct MeshEpochEvent {
     /// The epoch's consensus members' ed25519 public keys, this node
     /// included. Order is irrelevant — every derived commitment sorts.
     pub members: Vec<ed25519::PublicKey>,
+    /// The epoch's STANDBY identities (the valset observer tier): registered
+    /// keys the pre-warm layer tunnels toward ahead of their activation.
+    /// Never part of the epoch's `ActiveValidatorSet` — a standby that never
+    /// shows up costs the epoch nothing.
+    pub standbys: Vec<ed25519::PublicKey>,
     /// The consensus view at the cutover; the freshness clock for expiries.
     pub current_view: u64,
 }
@@ -178,6 +204,14 @@ pub enum ReachabilityEvent {
     /// The epoch applied but its mesh could not be persisted; a cold restart
     /// would restore the PREVIOUS persisted epoch (or nothing).
     PersistFailed { reason: String },
+    /// Record-derived pre-warm tunnels merged onto the interface: `peers`
+    /// counts the standby<->member relationships now installed alongside
+    /// (on a member) or ahead of (on a standby) the phase-A mesh.
+    StandbyTunnelsApplied {
+        epoch: u64,
+        interface: String,
+        peers: usize,
+    },
 }
 
 /// How a peer's WireGuard endpoint was resolved.
@@ -367,16 +401,52 @@ struct RelaySlot {
     expires_at_view: u64,
 }
 
+/// Which side of the plane this node runs for the epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// In the epoch's `ActiveValidatorSet`: full phase-A assembly, plus the
+    /// pre-warm layer toward the epoch's standbys.
+    Member,
+    /// In the standby set only: record exchange and pre-warm tunnels toward
+    /// the members — no advert, no handshakes, no relay duty.
+    Standby,
+}
+
 /// Everything one epoch accumulates on the way to its `apply` call.
 struct EpochState {
     epoch: u64,
+    role: Role,
     set: ActiveValidatorSet,
     peers: Vec<ValidatorIdentity>,
+    /// The epoch's standby identities (never in `set`).
+    standbys: Vec<ValidatorIdentity>,
     pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+    /// The accepted nonce per pre-warm counterparty (standby records on a
+    /// member, member records on a standby). Higher nonce wins — the live
+    /// re-advertisement rule the phase-A member set deliberately does not
+    /// have; anything at or below drops silently (re-offers are routine).
+    prewarm_nonces: BTreeMap<ValidatorIdentity, u64>,
+    /// The standbys' owner-signed records as accepted (member role only) —
+    /// the form the nudge re-offers and the accept-gated flood relays.
+    standby_records: BTreeMap<ValidatorIdentity, SignedEndpointRecord>,
+    /// The tunnel parts derived from accepted pre-warm records (endpoint
+    /// resolved, overlay route derived) — merged over the interface's base
+    /// peers on every change.
+    prewarm_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
+    /// Standby-directed sends route to the transport identity that DELIVERED
+    /// the standby's record when that identity is not a member (the lobby
+    /// ingress a parked joiner connects under, or the standby's own key) —
+    /// a standby is not necessarily dialable under its record identity.
+    routes: HashMap<ValidatorIdentity, ed25519::PublicKey>,
     /// One strictly-monotonic counter for EVERYTHING this identity signs in
     /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
     /// advert duplicate rule wants strictly-increasing nonces too.
     nonce: u64,
+    /// This node's own signed record for the epoch — what the nudge
+    /// re-offers. In the member role it also lives in `records`; in the
+    /// standby role this field is its only home (a standby is never part of
+    /// the member record set).
+    own_record: SignedEndpointRecord,
     /// Owner-signed records as they arrived (our own included) — the form
     /// that can be re-gossiped to peers the owner has no link to.
     records: BTreeMap<ValidatorIdentity, SignedEndpointRecord>,
@@ -442,6 +512,13 @@ struct Driver<'a, E, R> {
     /// A previous epoch's interface is live and must be removed before (or
     /// instead of) the next apply.
     interface_live: bool,
+    /// The interface's BASE peers, keyed by identity: the validated plans of
+    /// the last epoch apply, or the restored mesh at boot. `Some` iff the
+    /// live interface carries a base the pre-warm layer may merge over;
+    /// pre-warm peers layer on top (same identity: the fresher pre-warm
+    /// entry wins). Survives retargets — the physical interface does too —
+    /// until the next apply replaces it.
+    base_peers: Option<BTreeMap<ValidatorIdentity, PeerTunnelConfig>>,
     /// The cold-restart re-apply runs at most once per process life, on the
     /// first `Retarget` (boot). Later retargets are live cutovers with a
     /// working transport — restoring over them would tear down good tunnels.
@@ -496,6 +573,7 @@ where
         view: 0,
         state: None,
         interface_live: false,
+        base_peers: None,
         restore_tried: false,
     };
     while let Some(command) = commands.recv().await {
@@ -537,11 +615,19 @@ where
         let Some(state) = &self.state else {
             return Ok(());
         };
-        let Some(pk) = state.pk_of.get(&to) else {
+        // a learned transport route wins over the identity itself: a parked
+        // standby may only be dialable under the ingress identity that
+        // delivered its record.
+        let Some(pk) = state
+            .routes
+            .get(&to)
+            .or_else(|| state.pk_of.get(&to))
+            .cloned()
+        else {
             return Ok(());
         };
         self.emit(ReachabilityEvent::Send {
-            to: pk.clone(),
+            to: pk,
             bytes: msg.encode(),
         })
         .await
@@ -567,21 +653,33 @@ where
         self.view = self.view.max(event.current_view);
         let identities: Vec<ValidatorIdentity> =
             event.members.iter().map(binding::identity_of).collect();
-        if !identities.contains(&self.me) {
-            // demotion normally exits the node before this; be inert, not
-            // wrong: drop epoch state and any live tunnel.
+        // members win over a stale standby listing; anything in neither set
+        // is inert (demotion normally exits the node before this).
+        let standby_ids: Vec<ValidatorIdentity> = event
+            .standbys
+            .iter()
+            .map(binding::identity_of)
+            .filter(|id| !identities.contains(id))
+            .collect();
+        let role = if identities.contains(&self.me) {
+            Role::Member
+        } else if standby_ids.contains(&self.me) {
+            Role::Standby
+        } else {
+            // be inert, not wrong: drop epoch state and any live tunnel.
             if self.interface_live {
                 let _ = self.effect.remove_interface();
                 self.interface_live = false;
             }
+            self.base_peers = None;
             self.state = None;
             return self
                 .emit(ReachabilityEvent::EpochFailed {
                     epoch: event.epoch,
-                    reason: "this node is not a member of the epoch".into(),
+                    reason: "this node is neither a member nor a standby of the epoch".into(),
                 })
                 .await;
-        }
+        };
         if !self.restore_tried {
             self.restore_tried = true;
             self.restore(&event).await?;
@@ -590,19 +688,47 @@ where
         let pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey> = event
             .members
             .iter()
+            .chain(event.standbys.iter())
             .map(|pk| (binding::identity_of(pk), pk.clone()))
             .collect();
+        // a member's gossip/handshake counterparties exclude itself; a
+        // standby's are exactly the members.
         let peers: Vec<ValidatorIdentity> = identities
             .iter()
             .copied()
             .filter(|id| *id != self.me)
             .collect();
+        let own = SignedEndpointRecord::sign(
+            EndpointRecord {
+                namespace: self.config.chain_id.clone(),
+                epoch: event.epoch,
+                valset_root: set.valset_root,
+                admission_root: set.admission_root,
+                validator_identity: self.me,
+                wireguard_public_key: self.keypair.public_key(),
+                control_endpoint: self.config.control_endpoint,
+                wireguard_endpoint: self.config.wireguard_listen,
+                capabilities: vec![],
+                expires_at_view: self.view + ADVERT_TTL_VIEWS,
+                // the epoch's first signed nonce; the counter below starts
+                // past it.
+                nonce: 1,
+            },
+            &self.config.signer,
+        );
         let mut state = EpochState {
             epoch: event.epoch,
+            role,
             set,
             peers,
+            standbys: standby_ids,
             pk_of,
-            nonce: 0,
+            prewarm_nonces: BTreeMap::new(),
+            standby_records: BTreeMap::new(),
+            prewarm_peers: BTreeMap::new(),
+            routes: HashMap::new(),
+            nonce: 1,
+            own_record: own.clone(),
             records: BTreeMap::new(),
             adverts: BTreeMap::new(),
             own_advert_sent: false,
@@ -616,31 +742,28 @@ where
             failed: HashSet::new(),
             applied: false,
         };
-        let own = SignedEndpointRecord::sign(
-            EndpointRecord {
-                namespace: self.config.chain_id.clone(),
-                epoch: state.epoch,
-                valset_root: state.set.valset_root,
-                admission_root: state.set.admission_root,
-                validator_identity: self.me,
-                wireguard_public_key: self.keypair.public_key(),
-                control_endpoint: self.config.control_endpoint,
-                wireguard_endpoint: self.config.wireguard_listen,
-                capabilities: vec![],
-                expires_at_view: self.view + ADVERT_TTL_VIEWS,
-                nonce: state.next_nonce(),
-            },
-            &self.config.signer,
-        );
-        state.records.insert(self.me, own.clone());
+        if role == Role::Member {
+            state.records.insert(self.me, own.clone());
+        }
         let peers = state.peers.clone();
+        let standbys = state.standbys.clone();
         self.state = Some(state);
         for peer in peers {
             self.send_msg(peer, &ReachabilityMsg::Record(own.clone()))
                 .await?;
         }
-        // a single-member network is a complete mesh already.
-        self.advance().await
+        if role == Role::Member {
+            // seed the pre-warm layer's counterparties too (a lost send
+            // heals by nudge; a standby with no route yet just misses this
+            // round).
+            for standby in standbys {
+                self.send_msg(standby, &ReachabilityMsg::Record(own.clone()))
+                    .await?;
+            }
+            // a single-member network is a complete mesh already.
+            return self.advance().await;
+        }
+        Ok(())
     }
 
     /// The cold-restart re-apply: bring the LAST applied epoch's tunnels
@@ -694,7 +817,7 @@ where
         if records.is_empty() {
             return Ok(());
         }
-        let mut peers = Vec::with_capacity(records.len());
+        let mut peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig> = BTreeMap::new();
         for record in &records {
             let advertised = record.wireguard_endpoint.socket_addr();
             let endpoint = match self
@@ -719,7 +842,7 @@ where
                 .overlay
                 .identity_allowed_ips(record.validator_identity)
                 .expect("the plane's overlay is ula_v6, which derives view-free");
-            peers.push(PeerTunnelConfig {
+            peers.insert(record.validator_identity, PeerTunnelConfig {
                 wireguard_public_key: record.wireguard_public_key,
                 endpoint,
                 allowed_ips,
@@ -731,16 +854,20 @@ where
             .identity_allowed_ips(self.me)
             .expect("the plane's overlay is ula_v6, which derives view-free");
         let peer_count = peers.len();
+        let parts: Vec<PeerTunnelConfig> = peers.values().cloned().collect();
         match apply_peer_tunnels(
             &mut self.effect,
             self.interface.clone(),
             self.keypair.private_key_base64(),
             self.config.wireguard_listen,
             &local_interface_ips,
-            &peers,
+            &parts,
         ) {
             Ok(()) => {
                 self.interface_live = true;
+                // the restored mesh is the interface's base — the pre-warm
+                // layer merges its record-derived peers over it.
+                self.base_peers = Some(peers);
                 self.emit(ReachabilityEvent::MeshRestored {
                     epoch: mesh.epoch,
                     interface: self.interface.clone(),
@@ -774,13 +901,27 @@ where
     /// peer's re-delivered response proves the ack was lost (see
     /// `on_response`), so retries terminate once both sides are done and the
     /// relay slots expire by view.
+    ///
+    /// The pre-warm layer re-offers in every member stage (it has no version
+    /// lock): member gossip to the standbys, known standby records to
+    /// everyone else. A standby's own nudge re-offers exactly its record.
     async fn nudge(&mut self) -> Result<(), ReachabilityError> {
         let view = self.view;
         let sends: Vec<(ValidatorIdentity, ReachabilityMsg)> = {
             let Some(state) = &mut self.state else {
                 return Ok(());
             };
-            if state.view_state.is_none() {
+            if state.role == Role::Standby {
+                // a standby re-offers exactly its own record, to every
+                // member: its single job is being installable, and member
+                // gossip flows back through the members' own re-offers.
+                let own = ReachabilityMsg::Record(state.own_record.clone());
+                state
+                    .peers
+                    .iter()
+                    .map(|peer| (*peer, own.clone()))
+                    .collect()
+            } else if state.view_state.is_none() {
                 // gossip stages: everything known to everyone (an advert
                 // doubles as a record carrier for members whose record
                 // gossip never reached a peer directly).
@@ -832,7 +973,48 @@ where
                 own.into_iter().chain(relayed).collect()
             }
         };
-        for (peer, msg) in sends {
+        // the pre-warm layer's re-offers, in BOTH member stages: member
+        // gossip (records + adverts) to every standby — a standby with one
+        // ingress link learns every member through it — and known standby
+        // records to member peers and the other standbys, so a lost relay
+        // heals. Receivers dedup by nonce; standbys are few.
+        let prewarm_sends: Vec<(ValidatorIdentity, ReachabilityMsg)> = {
+            let state = self.state.as_ref().expect("nudge checked state");
+            if state.role == Role::Member && !state.standbys.is_empty() {
+                let member_gossip: Vec<ReachabilityMsg> = state
+                    .records
+                    .values()
+                    .map(|record| ReachabilityMsg::Record(record.clone()))
+                    .chain(
+                        state
+                            .adverts
+                            .values()
+                            .map(|advert| ReachabilityMsg::Advert(advert.clone())),
+                    )
+                    .collect();
+                let to_standbys = state
+                    .standbys
+                    .iter()
+                    .flat_map(|standby| {
+                        member_gossip.iter().map(|msg| (*standby, msg.clone()))
+                    });
+                let standby_records = state.standby_records.values().flat_map(|record| {
+                    let owner = record.record.validator_identity;
+                    let msg = ReachabilityMsg::Record(record.clone());
+                    state
+                        .peers
+                        .iter()
+                        .chain(state.standbys.iter())
+                        .filter(move |target| **target != owner)
+                        .map(move |target| (*target, msg.clone()))
+                        .collect::<Vec<_>>()
+                });
+                to_standbys.chain(standby_records).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for (peer, msg) in sends.into_iter().chain(prewarm_sends) {
             self.send_msg(peer, &msg).await?;
         }
         Ok(())
@@ -853,11 +1035,16 @@ where
             // no active epoch (pre-boot traffic) — nothing to bind it to.
             return Ok(());
         };
-        if !state.pk_of.contains_key(&via) {
+        // membership gate on the DELIVERING identity: plane participants
+        // (members + standbys), plus the configured gossip ingress — the
+        // lobby key a parked standby connects under. Content signatures do
+        // the real authentication either way.
+        let ingress = self.config.gossip_ingress.as_ref() == Some(&from);
+        if !state.pk_of.contains_key(&via) && !ingress {
             return self
                 .emit(ReachabilityEvent::PeerFailed {
                     peer: from,
-                    reason: "reachability traffic from a non-member".into(),
+                    reason: "reachability traffic from a non-participant".into(),
                 })
                 .await;
         }
@@ -872,8 +1059,21 @@ where
                     .await;
             }
         };
+        if state.role == Role::Standby {
+            // a standby consumes gossip only: member records and adverts
+            // feed its pre-warm tunnels; handshake traffic (fanned blindly
+            // by members — senders cannot know which links exist) is not
+            // for it and carries no relay duty.
+            return match msg {
+                ReachabilityMsg::Record(record) => self.on_member_record(via, record).await,
+                ReachabilityMsg::Advert(advert) => self.on_member_advert(via, advert).await,
+                ReachabilityMsg::Request(_)
+                | ReachabilityMsg::Response(_)
+                | ReachabilityMsg::Ack(_) => Ok(()),
+            };
+        }
         match msg {
-            ReachabilityMsg::Record(record) => self.on_record(via, record).await,
+            ReachabilityMsg::Record(record) => self.on_record(via, from, record).await,
             ReachabilityMsg::Advert(advert) => self.on_advert(via, advert).await,
             ReachabilityMsg::Request(request) => {
                 let initiator = request.fields.initiator_identity;
@@ -963,7 +1163,7 @@ where
             return self.fail_peer(via, "relayed an unverifiable handshake message").await;
         }
         let state = self.state.as_mut().expect("deliver checked state");
-        if !state.pk_of.contains_key(&pair.0) || !state.pk_of.contains_key(&pair.1) {
+        if !state.set.contains(pair.0) || !state.set.contains(pair.1) {
             return self.fail_peer(via, "relayed a handshake for a non-member pair").await;
         }
         if expires_at_view < self.view {
@@ -996,6 +1196,7 @@ where
     async fn on_record(
         &mut self,
         via: ValidatorIdentity,
+        from: ed25519::PublicKey,
         signed: SignedEndpointRecord,
     ) -> Result<(), ReachabilityError> {
         let state = self.state.as_mut().expect("deliver checked state");
@@ -1005,8 +1206,18 @@ where
         if signed.verify().is_err() {
             return self.fail_peer(via, "record signature invalid").await;
         }
-        if !state.pk_of.contains_key(&owner) || signed.record.epoch != state.epoch {
-            return self.fail_peer(via, "record identity/epoch mismatch").await;
+        if state.standbys.contains(&owner) {
+            return self.on_standby_record(via, from, signed).await;
+        }
+        if !state.set.contains(owner) {
+            return self.fail_peer(via, "record from an unknown identity").await;
+        }
+        if signed.record.epoch != state.epoch {
+            // cutover skew, not a violation: nodes cross epoch boundaries at
+            // slightly different times (a just-activated standby above all),
+            // so gossip signed against the neighboring epoch is routine —
+            // its owner re-signs once it observes the boundary.
+            return Ok(());
         }
         if owner == self.me {
             // our own record echoed back around the relay ring.
@@ -1033,22 +1244,121 @@ where
         }
         if accepted {
             // relay the news: peers with no link to the owner only ever see
-            // its record through us. Accept-gated, so the flood terminates.
-            let targets: Vec<ValidatorIdentity> = self
-                .state
-                .as_ref()
-                .expect("still in epoch")
-                .peers
-                .iter()
-                .copied()
-                .filter(|peer| *peer != owner && *peer != via)
-                .collect();
+            // its record through us — the standbys included, whose pre-warm
+            // tunnels want every member's record. Accept-gated, so the
+            // flood terminates.
+            let targets: Vec<ValidatorIdentity> = {
+                let state = self.state.as_ref().expect("still in epoch");
+                state
+                    .peers
+                    .iter()
+                    .chain(state.standbys.iter())
+                    .copied()
+                    .filter(|peer| *peer != owner && *peer != via)
+                    .collect()
+            };
             for peer in targets {
                 self.send_msg(peer, &ReachabilityMsg::Record(signed.clone()))
                     .await?;
             }
         }
         self.advance().await
+    }
+
+    /// A standby's owner-signed record (member role): validate, resolve its
+    /// endpoint, and merge the tunnel onto the live interface — the pre-warm
+    /// layer's whole trick. A higher nonce supersedes in place (the live
+    /// re-advertisement rule); duplicates drop silently because every member
+    /// re-offers standby records on nudge.
+    async fn on_standby_record(
+        &mut self,
+        via: ValidatorIdentity,
+        from: ed25519::PublicKey,
+        signed: SignedEndpointRecord,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("deliver checked state");
+        let owner = signed.record.validator_identity;
+        // the record must bind to THIS epoch's member set — the same tuple
+        // its owner derives from the boundary it synced. Another chain's
+        // record is a violation; a neighboring epoch's is cutover skew (the
+        // standby re-signs once its manifest poll crosses the boundary).
+        if signed.record.namespace != state.set.namespace {
+            return self.fail_peer(via, "standby record from another chain").await;
+        }
+        if signed.record.epoch != state.set.epoch
+            || signed.record.valset_root != state.set.valset_root
+            || signed.record.admission_root != state.set.admission_root
+        {
+            return Ok(());
+        }
+        if let Err(err) = signed.record.check(&self.config.port_policy, self.view) {
+            return self
+                .fail_peer(via, &format!("standby record refused: {err:?}"))
+                .await;
+        }
+        match state.prewarm_nonces.get(&owner) {
+            Some(prev) if signed.record.nonce <= *prev => return Ok(()),
+            _ => {}
+        }
+        let first_contact = !state.prewarm_nonces.contains_key(&owner);
+        state.prewarm_nonces.insert(owner, signed.record.nonce);
+        state.standby_records.insert(owner, signed.clone());
+        // learn the transport route: a delivery straight off the standby's
+        // own link (via is no member) tells us which identity reaches it —
+        // its own key, or the shared lobby ingress it parks under.
+        if via != owner && !state.set.contains(via) {
+            state.routes.insert(owner, from);
+        } else if via == owner {
+            state.routes.remove(&owner);
+        }
+        let advertised = signed.record.wireguard_endpoint.socket_addr();
+        let endpoint = self.resolve_prewarm_endpoint(owner, advertised).await?;
+        let allowed_ips = self
+            .overlay
+            .identity_allowed_ips(owner)
+            .expect("the plane's overlay is ula_v6, which derives view-free");
+        let state = self.state.as_mut().expect("still in epoch");
+        state.prewarm_peers.insert(owner, PeerTunnelConfig {
+            wireguard_public_key: signed.record.wireguard_public_key,
+            endpoint,
+            allowed_ips,
+            keepalive_seconds: Some(KEEPALIVE_SECONDS),
+        });
+        self.sync_prewarm().await?;
+        if first_contact {
+            // the standby just appeared: hand it our own gossip directly —
+            // the nudge re-offers cover everything else it is missing.
+            let (own_record, own_advert) = {
+                let state = self.state.as_ref().expect("still in epoch");
+                (
+                    state.own_record.clone(),
+                    state.adverts.get(&self.me).cloned(),
+                )
+            };
+            self.send_msg(owner, &ReachabilityMsg::Record(own_record))
+                .await?;
+            if let Some(advert) = own_advert {
+                self.send_msg(owner, &ReachabilityMsg::Advert(advert)).await?;
+            }
+        }
+        // relay the accepted record onward — members with no link to the
+        // standby, and the other standbys, see it through us. Accept-gated,
+        // so the flood terminates.
+        let targets: Vec<ValidatorIdentity> = {
+            let state = self.state.as_ref().expect("still in epoch");
+            state
+                .peers
+                .iter()
+                .chain(state.standbys.iter())
+                .copied()
+                .filter(|peer| *peer != owner && *peer != via)
+                .collect()
+        };
+        for peer in targets {
+            self.send_msg(peer, &ReachabilityMsg::Record(signed.clone()))
+                .await?;
+        }
+        Ok(())
     }
 
     async fn on_advert(
@@ -1061,8 +1371,12 @@ where
         if advert.verify_signature().is_err() {
             return self.fail_peer(via, "advert signature invalid").await;
         }
-        if !state.pk_of.contains_key(&owner) || advert.record.epoch != state.epoch {
-            return self.fail_peer(via, "advert identity/epoch mismatch").await;
+        if !state.set.contains(owner) {
+            return self.fail_peer(via, "advert from an unknown identity").await;
+        }
+        if advert.record.epoch != state.epoch {
+            // cutover skew — same tolerance as records.
+            return Ok(());
         }
         if owner == self.me {
             return Ok(());
@@ -1083,21 +1397,138 @@ where
             self.send_msg(owner, &ReachabilityMsg::Advert(own)).await?;
         }
         if accepted {
-            let targets: Vec<ValidatorIdentity> = self
-                .state
-                .as_ref()
-                .expect("still in epoch")
-                .peers
-                .iter()
-                .copied()
-                .filter(|peer| *peer != owner && *peer != via)
-                .collect();
+            // standbys ride the advert flood too: the signed advert set is
+            // what they persist for their promotion reboot's restore.
+            let targets: Vec<ValidatorIdentity> = {
+                let state = self.state.as_ref().expect("still in epoch");
+                state
+                    .peers
+                    .iter()
+                    .chain(state.standbys.iter())
+                    .copied()
+                    .filter(|peer| *peer != owner && *peer != via)
+                    .collect()
+            };
             for peer in targets {
                 self.send_msg(peer, &ReachabilityMsg::Advert(advert.clone()))
                     .await?;
             }
         }
         self.advance().await
+    }
+
+    /// A member's record, received in the STANDBY role: validate and merge
+    /// the member's tunnel — the standby side of the pre-warm layer. Another
+    /// standby's record (members re-fan those to everyone) is silently not
+    /// for us; standby<->standby tunnels assemble after activation like any
+    /// member pair.
+    async fn on_member_record(
+        &mut self,
+        via: ValidatorIdentity,
+        signed: SignedEndpointRecord,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("deliver checked state");
+        let owner = signed.record.validator_identity;
+        if signed.verify().is_err() {
+            return self.fail_peer(via, "record signature invalid").await;
+        }
+        if owner == self.me || state.standbys.contains(&owner) {
+            return Ok(());
+        }
+        if !state.set.contains(owner) {
+            return self.fail_peer(via, "record identity/epoch mismatch").await;
+        }
+        self.merge_member_prewarm(&signed.record).await
+    }
+
+    /// A member's advertisement, received in the STANDBY role: the richer
+    /// form of its record — accepted for the SAME pre-warm merge, and
+    /// persisted, because the signed advert set is what the promotion
+    /// reboot's cold-restart restore reads back from disk.
+    async fn on_member_advert(
+        &mut self,
+        via: ValidatorIdentity,
+        advert: EndpointAdvertisement,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("deliver checked state");
+        let owner = advert.record.validator_identity;
+        if advert.verify_signature().is_err() {
+            return self.fail_peer(via, "advert signature invalid").await;
+        }
+        if owner == self.me || state.standbys.contains(&owner) {
+            return Ok(());
+        }
+        if !state.set.contains(owner) {
+            return self.fail_peer(via, "advert identity/epoch mismatch").await;
+        }
+        let accepted = match state.adverts.get(&owner) {
+            Some(prev) if advert.record.nonce <= prev.record.nonce => false,
+            _ => {
+                state.adverts.insert(owner, advert.clone());
+                true
+            }
+        };
+        if accepted && let Some(path) = &self.config.persist_file {
+            let state = self.state.as_ref().expect("still in epoch");
+            let mesh = PersistedMesh::new(
+                self.config.chain_id.clone(),
+                state.epoch,
+                state.adverts.values().cloned().collect(),
+            );
+            if let Err(err) = store::save(path, &mesh) {
+                self.emit(ReachabilityEvent::PersistFailed {
+                    reason: err.to_string(),
+                })
+                .await?;
+            }
+        }
+        let record = advert.record.clone();
+        self.merge_member_prewarm(&record).await
+    }
+
+    /// The standby side's shared merge: bind a member record to the epoch
+    /// tuple, dedup by nonce, resolve, and re-apply the interface.
+    async fn merge_member_prewarm(
+        &mut self,
+        record: &EndpointRecord,
+    ) -> Result<(), ReachabilityError> {
+        let state = self.state.as_mut().expect("pre-warm inside an epoch");
+        let owner = record.validator_identity;
+        if record.namespace != state.set.namespace {
+            return self.fail_peer(owner, "member record from another chain").await;
+        }
+        if record.epoch != state.set.epoch
+            || record.valset_root != state.set.valset_root
+            || record.admission_root != state.set.admission_root
+        {
+            // cutover skew: this standby's manifest poll and the members'
+            // boundary crossing are not synchronized.
+            return Ok(());
+        }
+        if let Err(err) = record.check(&self.config.port_policy, self.view) {
+            return self
+                .fail_peer(owner, &format!("member record refused: {err:?}"))
+                .await;
+        }
+        match state.prewarm_nonces.get(&owner) {
+            Some(prev) if record.nonce <= *prev => return Ok(()),
+            _ => {}
+        }
+        state.prewarm_nonces.insert(owner, record.nonce);
+        let advertised = record.wireguard_endpoint.socket_addr();
+        let endpoint = self.resolve_prewarm_endpoint(owner, advertised).await?;
+        let allowed_ips = self
+            .overlay
+            .identity_allowed_ips(owner)
+            .expect("the plane's overlay is ula_v6, which derives view-free");
+        let state = self.state.as_mut().expect("still in epoch");
+        state.prewarm_peers.insert(owner, PeerTunnelConfig {
+            wireguard_public_key: record.wireguard_public_key,
+            endpoint,
+            allowed_ips,
+            keepalive_seconds: Some(KEEPALIVE_SECONDS),
+        });
+        self.sync_prewarm().await
     }
 
     /// Move the epoch forward through every stage the accumulated state now
@@ -1173,18 +1604,39 @@ where
             let plans: Vec<TunnelInstallPlan> = state.plans.values().cloned().collect();
             let overrides = state.overrides.clone();
             let adverts: Vec<EndpointAdvertisement> = state.adverts.values().cloned().collect();
+            // the epoch's validated plans become the interface's new BASE;
+            // the pre-warm peers merge over it (same identity: the fresher
+            // pre-warm entry wins), so a standby tunnel that assembled
+            // during the epoch's bring-up survives the replace.
+            let base: BTreeMap<ValidatorIdentity, PeerTunnelConfig> = plans
+                .iter()
+                .map(TunnelInstallPlan::peer_identity)
+                .zip(plan_peer_configs(&plans, &overrides))
+                .collect();
+            let mut merged = base.clone();
+            merged.extend(state.prewarm_peers.clone());
+            merged.remove(&self.me);
+            let prewarm_count = state.prewarm_peers.len();
             if self.interface_live {
                 let _ = self.effect.remove_interface();
                 self.interface_live = false;
             }
-            if !plans.is_empty() {
-                if let Err(err) = apply_tunnel_plans(
+            self.base_peers = None;
+            if !merged.is_empty() {
+                let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
+                // the plane's overlay is ula_v6: the local side is the same
+                // identity-derived /128 every validated plan carries.
+                let local_interface_ips = self
+                    .overlay
+                    .identity_allowed_ips(self.me)
+                    .expect("the plane's overlay is ula_v6, which derives view-free");
+                if let Err(err) = apply_peer_tunnels(
                     &mut self.effect,
                     self.interface.clone(),
                     self.keypair.private_key_base64(),
                     self.config.wireguard_listen,
-                    &plans,
-                    &overrides,
+                    &local_interface_ips,
+                    &peers,
                 ) {
                     return self
                         .emit(ReachabilityEvent::EpochFailed {
@@ -1194,13 +1646,16 @@ where
                         .await;
                 }
                 self.interface_live = true;
+                self.base_peers = Some(base);
                 // the epoch's mesh is now REAL — remember it for the
-                // cold-restart re-apply. Only here: an all-peers-failed
-                // epoch (no interface) must not clobber the last mesh that
-                // actually carried tunnels.
-                if let Some(path) = &self.config.persist_file {
-                    let mesh =
-                        PersistedMesh::new(self.config.chain_id.clone(), epoch, adverts);
+                // cold-restart re-apply. Only with member plans: an
+                // all-peers-failed epoch must not clobber the last mesh that
+                // actually carried member tunnels (pre-warm peers alone are
+                // not it — their owners persist their own side).
+                if !plans.is_empty()
+                    && let Some(path) = &self.config.persist_file
+                {
+                    let mesh = PersistedMesh::new(self.config.chain_id.clone(), epoch, adverts);
                     if let Err(err) = store::save(path, &mesh) {
                         self.emit(ReachabilityEvent::PersistFailed {
                             reason: err.to_string(),
@@ -1209,13 +1664,21 @@ where
                     }
                 }
             }
-            return self
-                .emit(ReachabilityEvent::TunnelsApplied {
+            self.emit(ReachabilityEvent::TunnelsApplied {
+                epoch,
+                interface: self.interface.clone(),
+                peers: plans.len(),
+            })
+            .await?;
+            if prewarm_count > 0 {
+                self.emit(ReachabilityEvent::StandbyTunnelsApplied {
                     epoch,
                     interface: self.interface.clone(),
-                    peers: plans.len(),
+                    peers: prewarm_count,
                 })
-                .await;
+                .await?;
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -1299,6 +1762,116 @@ where
         }
     }
 
+    /// Resolve a pre-warm counterparty's dialable endpoint, with the same
+    /// contract as the restore path: a resolver failure surfaces as
+    /// `PeerFailed` and the peer rides its advertised endpoint.
+    async fn resolve_prewarm_endpoint(
+        &mut self,
+        peer: ValidatorIdentity,
+        advertised: SocketAddr,
+    ) -> Result<SocketAddr, ReachabilityError> {
+        match self
+            .resolver
+            .resolve(binding::node_key(peer), advertised)
+            .await
+        {
+            Ok(Resolution::Advertised) => Ok(advertised),
+            Ok(Resolution::Punched(addr)) | Ok(Resolution::Relayed(addr)) => Ok(addr),
+            Err(reason) => {
+                let pk = self
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.pk_of.get(&peer))
+                    .cloned();
+                if let Some(pk) = pk {
+                    self.emit(ReachabilityEvent::PeerFailed {
+                        peer: pk,
+                        reason: format!("pre-warm endpoint resolution: {reason}"),
+                    })
+                    .await?;
+                }
+                Ok(advertised)
+            }
+        }
+    }
+
+    /// Push the interface's full desired configuration — the phase-A base
+    /// (validated plans or the restored mesh) with the pre-warm peers merged
+    /// over it — onto the effect. Live interfaces reconfigure in place; a
+    /// standby with nothing applied yet brings its interface up here (its
+    /// interface exists purely for pre-warm). A member whose epoch is still
+    /// assembling holds off — its one epoch apply merges the pre-warm set.
+    async fn sync_prewarm(&mut self) -> Result<(), ReachabilityError> {
+        let state = self.state.as_ref().expect("pre-warm inside an epoch");
+        if state.prewarm_peers.is_empty() {
+            return Ok(());
+        }
+        let epoch = state.epoch;
+        let prewarm_count = state.prewarm_peers.len();
+        let mut merged = match (&self.base_peers, state.role) {
+            (Some(base), _) => base.clone(),
+            (None, Role::Standby) => BTreeMap::new(),
+            (None, Role::Member) => return Ok(()),
+        };
+        merged.extend(state.prewarm_peers.clone());
+        // the pre-warm layer never carries a tunnel to this node itself
+        // (records filter by owner class), but a restored base may still
+        // hold an entry for an identity that since became us — impossible
+        // today, cheap to keep impossible.
+        merged.remove(&self.me);
+        let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
+        let local_interface_ips = self
+            .overlay
+            .identity_allowed_ips(self.me)
+            .expect("the plane's overlay is ula_v6, which derives view-free");
+        let outcome = if self.interface_live {
+            update_peer_tunnels(
+                &mut self.effect,
+                self.interface.clone(),
+                self.keypair.private_key_base64(),
+                self.config.wireguard_listen,
+                &local_interface_ips,
+                &peers,
+            )
+        } else {
+            apply_peer_tunnels(
+                &mut self.effect,
+                self.interface.clone(),
+                self.keypair.private_key_base64(),
+                self.config.wireguard_listen,
+                &local_interface_ips,
+                &peers,
+            )
+            .inspect(|()| {
+                self.interface_live = true;
+                // the standby's interface is now live over an empty base —
+                // later merges reconfigure instead of re-creating.
+                if self.base_peers.is_none() {
+                    self.base_peers = Some(BTreeMap::new());
+                }
+            })
+        };
+        match outcome {
+            Ok(()) => {
+                self.emit(ReachabilityEvent::StandbyTunnelsApplied {
+                    epoch,
+                    interface: self.interface.clone(),
+                    peers: prewarm_count,
+                })
+                .await
+            }
+            Err(err) => {
+                // the interface keeps whatever configuration it had; the
+                // next accepted record (or nudge-driven re-offer) retries.
+                self.emit(ReachabilityEvent::EpochFailed {
+                    epoch,
+                    reason: format!("pre-warm tunnel apply: {err:?}"),
+                })
+                .await
+            }
+        }
+    }
+
     /// Responder side: answer a request with our signed response. A
     /// duplicate of the request we already answered (the initiator nudging —
     /// our single-shot response may be lost) re-sends the STORED response:
@@ -1315,7 +1888,7 @@ where
         if request.verify_signature().is_err() {
             return self.fail_peer(via, "request signature invalid").await;
         }
-        if !state.pk_of.contains_key(&sender) {
+        if !state.set.contains(sender) {
             return self.fail_peer(via, "request from a non-member initiator").await;
         }
         if state.failed.contains(&sender) {
@@ -1401,7 +1974,7 @@ where
         if response.verify_signature().is_err() {
             return self.fail_peer(via, "response signature invalid").await;
         }
-        if !state.pk_of.contains_key(&sender) {
+        if !state.set.contains(sender) {
             return self.fail_peer(via, "response from a non-member responder").await;
         }
         if state.failed.contains(&sender) {
@@ -1489,7 +2062,7 @@ where
         if ack.verify_signature().is_err() {
             return self.fail_peer(via, "ack signature invalid").await;
         }
-        if !state.pk_of.contains_key(&sender) {
+        if !state.set.contains(sender) {
             return self.fail_peer(via, "ack from a non-member initiator").await;
         }
         if state.failed.contains(&sender) {
