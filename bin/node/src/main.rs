@@ -868,6 +868,18 @@ async fn restore_host(
 /// the object-store ([`statesync::ObjectFetch`]) adapter over the live `files`
 /// module: the statesync possession driver owns the loop + the full-possession
 /// gate, this owns the duckfs `serve_sync` wire (refs image + `GetObjects`).
+///
+/// SCRATCH-NAMESPACE NOTE (deferred): unlike the qmdb modules — whose
+/// `sync_from` lands under an ATTEMPT-scoped runtime child (`sync_scratch_a{n}`)
+/// so a failed join's partial store never occupies the canonical namespace —
+/// `files` syncs straight into the CANONICAL `duckfs_dir`. wiring an
+/// attempt-scoped scratch dir for a plain filesystem odb would need a scratch
+/// path threaded through every sync call site plus a promote-on-success rename
+/// under live `DiskStore`/`DiskRefs` handles — a large, not-small change, so it
+/// is deferred. this is correctness-safe: a failed join NEVER goes live (the
+/// final app-hash check gates promotion), and a retry self-heals because every
+/// object is content-addressed and the refs image is verify-then-replace, so a
+/// re-`open` over the same dir converges rather than forking.
 struct FilesOdb<'a>(&'a mut Files);
 
 impl statesync::ObjectFetch for FilesOdb<'_> {

@@ -9,9 +9,17 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use common::{NetworkShapeCluster, serial};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use common::{NetworkShapeCluster, poll_until, serial};
+use files::{
+    Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind, RefsInfo,
+    decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
+    encode_query as files_encode_query, objects::object_id, to_hex,
+};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 
@@ -69,6 +77,236 @@ fn network_shape_joiner_parks_until_promote() {
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
 }
 
+// ---- duckfs joiner proof: full object possession over the REAL wire ---------
+//
+// the in-process `duckfs_resolver` test (statesync/tests) proves the resolver
+// moves bytes at the module level. THIS proves it end to end over the real mesh
+// transport: a founder holds non-trivial duckfs state (inline files, a putblob-
+// staged chunk-object file, and a pin), a fresh node joins through the real
+// `join`/`promote` ceremony, and its `sync_all_modules` pass loops GetObjects to
+// FULL object possession over the p2p statesync lane before the joiner reads a
+// file back BYTE-IDENTICAL. (`synced app_hash=` latches only after the resolver
+// reports `possession_complete`, so the promoted read is proof bytes crossed.)
+
+fn df_put_inline(path: &str, bytes: &[u8]) -> Change {
+    Change::Put {
+        path: path.into(),
+        exec: false,
+        meta: BTreeMap::new(),
+        content: Content::Inline {
+            b64: STANDARD.encode(bytes),
+        },
+    }
+}
+
+fn df_chunk_hex(bytes: &[u8]) -> String {
+    to_hex(&object_id(Kind::Chunk, bytes))
+}
+
+/// a distinctive, non-uniform byte pattern (251 is prime — a truncated or
+/// corrupt sync is caught, not masked by a run of a repeated byte).
+fn df_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+fn df_stat(cluster: &NetworkShapeCluster, idx: usize, path: &str) -> Option<EntryInfo> {
+    let reply = cluster.query(
+        idx,
+        "files",
+        &files_encode_query(&FilesQuery::Stat {
+            path: path.into(),
+            snapshot: None,
+        }),
+    )?;
+    match files_decode_reply(&reply).ok()? {
+        FilesReply::Stat(info) => info,
+        _ => None,
+    }
+}
+
+fn df_read(
+    cluster: &NetworkShapeCluster,
+    idx: usize,
+    path: &str,
+    offset: u64,
+    len: u64,
+) -> Option<Vec<u8>> {
+    let reply = cluster.query(
+        idx,
+        "files",
+        &files_encode_query(&FilesQuery::Read {
+            path: path.into(),
+            snapshot: None,
+            offset,
+            len,
+        }),
+    )?;
+    match files_decode_reply(&reply).ok()? {
+        FilesReply::Read { b64, .. } => STANDARD.decode(b64.as_bytes()).ok(),
+        _ => None,
+    }
+}
+
+fn df_refs(cluster: &NetworkShapeCluster, idx: usize) -> Option<RefsInfo> {
+    let reply = cluster.query(idx, "files", &files_encode_query(&FilesQuery::Refs {}))?;
+    match files_decode_reply(&reply).ok()? {
+        FilesReply::Refs(info) => Some(info),
+        _ => None,
+    }
+}
+
+fn df_head(cluster: &NetworkShapeCluster, idx: usize) -> Option<String> {
+    df_refs(cluster, idx)?.head
+}
+
+#[test]
+fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
+    let _serial = serial();
+    let mut cluster = NetworkShapeCluster::new();
+
+    let chain_id = cluster.init_founder("duckfs-joiner");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+
+    // ---- seed non-trivial duckfs state on the founder BEFORE the join, so the
+    //      boundary the friend syncs carries it -------------------------------
+    // (1) two inline files in nested dirs, one commit off the empty tree.
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: None,
+            message: "seed inline".into(),
+            changes: vec![
+                df_put_inline("/shared/a", b"alpha"),
+                df_put_inline("/shared/dir/b", b"beta"),
+            ],
+        }),
+    );
+    poll_until("founder inline files to finalize", CONVERGE, || {
+        df_stat(&cluster, 0, "/shared/a").map(|_| ())
+    });
+    let s1 = poll_until("founder head after inline commit", CONVERGE, || {
+        df_head(&cluster, 0)
+    });
+
+    // (2) a file whose bytes are STAGED as a chunk object via putblob and
+    // referenced by digest in a Chunks commit — the odb-object path (a full
+    // CHUNK_SIZE multi-chunk file's first chunk would be 1 MiB, over the p2p
+    // MAX_MESSAGE_SIZE op cap, so the >1-CHUNK graph stays covered in-process by
+    // duckfs_resolver). same-origin submits finalize in seq order. (128 KiB is a
+    // real, multi-page odb object under the p2p MAX_MESSAGE_SIZE op cap — the op
+    // expands ~3.5x on the transport, so ~290 KiB is the practical per-op ceiling.)
+    let chunk = df_pattern(128 * 1024);
+    let chunk_size = chunk.len() as u64;
+    cluster.submit(0, "files", &encode_putblob(&chunk));
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: Some(s1.clone()),
+            message: "seed chunked".into(),
+            changes: vec![Change::Put {
+                path: "/shared/big".into(),
+                exec: false,
+                meta: BTreeMap::new(),
+                content: Content::Chunks {
+                    size: chunk_size,
+                    chunks: vec![df_chunk_hex(&chunk)],
+                },
+            }],
+        }),
+    );
+    poll_until("founder chunked file to finalize", CONVERGE, || {
+        df_stat(&cluster, 0, "/shared/big")
+            .filter(|e| e.size == chunk_size)
+            .map(|_| ())
+    });
+    let s2 = poll_until("founder head after chunked commit", CONVERGE, || {
+        df_head(&cluster, 0)
+    });
+
+    // (3) pin the head — a gc root the joiner must reconstruct too.
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Pin {
+            snapshot: s2.clone(),
+            name: "release".into(),
+        }),
+    );
+    poll_until("founder pin to finalize", CONVERGE, || {
+        df_refs(&cluster, 0)
+            .filter(|r| r.pins.contains_key("release"))
+            .map(|_| ())
+    });
+    // the source bytes the joiner must reconstruct byte-for-byte.
+    let src_chunk =
+        df_read(&cluster, 0, "/shared/big", 0, chunk_size).expect("founder read chunked");
+    assert_eq!(src_chunk, chunk, "founder holds the seeded bytes");
+
+    // ---- invite -> park -> promote the friend (real join verb, real mesh) ----
+    let invite = cluster.invite_manual();
+    let friend_key = cluster.join_friend(&invite);
+    cluster.spawn(1);
+    cluster.wait_marker(1, "joiner mode: parking", Duration::from_secs(60));
+    cluster.wait_marker(1, "parked:", Duration::from_secs(60));
+
+    let (ok, out) = cluster.run_promote(&friend_key);
+    assert!(ok, "promote failed:\n{out}");
+    assert!(
+        out.contains("admitted"),
+        "unexpected promote output:\n{out}"
+    );
+
+    cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
+    cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
+    // `synced app_hash=` latches only AFTER `sync_all_modules` -> the duckfs
+    // resolver reaches FULL object possession over the real p2p statesync lane
+    // (it loops GetObjects until `possession_complete`). this marker alone is the
+    // production proof that every duckfs object crossed the wire.
+    cluster.wait_marker(1, "synced app_hash=", CONVERGE);
+    cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
+
+    // ---- THE property: the promoted joiner reads the founder's files back
+    // BYTE-IDENTICAL. it holds them only because the possession loop moved every
+    // chunk / file / tree / snapshot object over the wire and its post-promotion
+    // reboot recovered them from disk; an empty odb errors on Read.
+    let joined_chunk = poll_until("joiner to read the chunked file", CONVERGE, || {
+        df_read(&cluster, 1, "/shared/big", 0, chunk_size)
+    });
+    assert_eq!(
+        joined_chunk, chunk,
+        "joiner rebuilt the chunked file byte-identical over the wire"
+    );
+    assert_eq!(
+        df_read(&cluster, 1, "/shared/a", 0, 64).as_deref(),
+        Some(b"alpha".as_ref()),
+        "joiner rebuilt inline /shared/a"
+    );
+    assert_eq!(
+        df_read(&cluster, 1, "/shared/dir/b", 0, 64).as_deref(),
+        Some(b"beta".as_ref()),
+        "joiner rebuilt nested inline /shared/dir/b"
+    );
+    // head and pin (the refs image) match the source's exactly.
+    let refs = df_refs(&cluster, 1).expect("joiner refs");
+    assert_eq!(
+        refs.head.as_deref(),
+        Some(s2.as_str()),
+        "joiner head matches the source"
+    );
+    assert_eq!(
+        refs.pins.get("release").map(String::as_str),
+        Some(s2.as_str()),
+        "joiner pin matches the source"
+    );
+}
+
 /// the STAGED admission flow end-to-end: invite → observer (mesh + pre-sync,
 /// NO quorum seat) → promote → validator. the payoff assertions are the
 /// quorum ones the one-step flow could never make:
@@ -104,7 +342,10 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("staged-admission");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -153,9 +394,10 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
                 voting_period: 600_000,
             }),
         );
-        poll("the v3 proposal to open", Box::new(|| {
-            proposal_status(&cluster, &pid).is_some()
-        }));
+        poll(
+            "the v3 proposal to open",
+            Box::new(|| proposal_status(&cluster, &pid).is_some()),
+        );
         cluster.submit(
             0,
             "governance",
@@ -174,10 +416,10 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
                 proposal_id: pid.clone(),
             }),
         );
-        poll("the solo ballot to pass", Box::new(|| {
-            proposal_status(&cluster, &pid)
-                .is_some_and(|s| s != ProposalStatus::Open)
-        }));
+        poll(
+            "the solo ballot to pass",
+            Box::new(|| proposal_status(&cluster, &pid).is_some_and(|s| s != ProposalStatus::Open)),
+        );
         // did the schedule take? (a min-lead abort leaves no pending slot.)
         let took = {
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -204,11 +446,18 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             break;
         }
         lead *= 2;
-        assert!(attempt < 3, "could not schedule the v3 upgrade (lead {lead})");
+        assert!(
+            attempt < 3,
+            "could not schedule the v3 upgrade (lead {lead})"
+        );
     }
     cluster.wait_marker(0, "signaled ready name=observer-tier", CONVERGE);
     cluster.wait_marker(0, "upgrade armed name=observer-tier to_version=3", CONVERGE);
-    cluster.wait_marker(0, "upgrade activated name=observer-tier version=3", CONVERGE);
+    cluster.wait_marker(
+        0,
+        "upgrade activated name=observer-tier version=3",
+        CONVERGE,
+    );
     let _ = activation;
 
     // ---- invite → park → observer grant ------------------------------------
@@ -238,7 +487,11 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             other => panic!("expected Validators, got {other:?}"),
         })
         .expect("valset validators readable");
-    assert_eq!(validators.len(), 1, "the quorum still seats ONLY the founder");
+    assert_eq!(
+        validators.len(),
+        1,
+        "the quorum still seats ONLY the founder"
+    );
     let observers = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
         .and_then(|raw| valset::decode_reply(&raw).ok())
@@ -256,35 +509,49 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     // (2) the SERVING observer: the same local read surfaces a validator
     //     binds, answered from the observer's own pre-synced boundary.
     //     rpc status names the served boundary…
-    poll("the observer to serve rpc status", Box::new(|| {
-        let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
-        st["ok"] == serde_json::json!(true)
-            && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
-    }));
+    poll(
+        "the observer to serve rpc status",
+        Box::new(|| {
+            let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
+            st["ok"] == serde_json::json!(true)
+                && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
+        }),
+    );
     //     …module reads answer from the OBSERVER's surface (the tier split is
     //     visible through the observer itself, not just the founder)…
-    poll("the observer to serve valset reads", Box::new(|| {
-        cluster
-            .query(1, "valset", &valset::encode_query(&ValsetQuery::Observers))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(
-                r,
-                ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
-            ))
-    }));
+    poll(
+        "the observer to serve valset reads",
+        Box::new(|| {
+            cluster
+                .query(1, "valset", &valset::encode_query(&ValsetQuery::Observers))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| {
+                    matches!(
+                        r,
+                        ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
+                    )
+                })
+        }),
+    );
     //     …the http app surface answers its status route from the same host…
     {
         use std::io::{Read as _, Write as _};
-        let mut conn =
-            std::net::TcpStream::connect(("127.0.0.1", cluster.http_ports[1]))
-                .expect("connect the observer's app surface");
-        conn.set_read_timeout(Some(Duration::from_secs(15))).expect("http timeout");
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", cluster.http_ports[1]))
+            .expect("connect the observer's app surface");
+        conn.set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("http timeout");
         conn.write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .expect("http write");
         let mut raw = String::new();
         conn.read_to_string(&mut raw).expect("http read");
-        assert!(raw.starts_with("HTTP/1.1 200"), "observer /v1/status must answer 200:\n{raw}");
-        assert!(raw.contains("\"height\""), "observer /v1/status carries a height:\n{raw}");
+        assert!(
+            raw.starts_with("HTTP/1.1 200"),
+            "observer /v1/status must answer 200:\n{raw}"
+        );
+        assert!(
+            raw.contains("\"height\""),
+            "observer /v1/status carries a height:\n{raw}"
+        );
     }
     //     …a write is refused as reads-only…
     let refused = cluster.rpc(
@@ -298,9 +565,16 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             })),
         }),
     );
-    assert_eq!(refused["ok"], serde_json::json!(false), "observer must refuse writes: {refused}");
+    assert_eq!(
+        refused["ok"],
+        serde_json::json!(false),
+        "observer must refuse writes: {refused}"
+    );
     assert!(
-        refused["error"].as_str().unwrap_or_default().contains("reads only"),
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reads only"),
         "the refusal names the reads-only contract: {refused}"
     );
     //     …and the follow is CONTINUOUS: a value the founder finalizes now
@@ -313,46 +587,56 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             value: "fresh".into(),
         }),
     );
-    poll("the observer to serve the followed write", Box::new(|| {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "observer-follow".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
-    }));
+    poll(
+        "the observer to serve the followed write",
+        Box::new(|| {
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "observer-follow".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
+        }),
+    );
     //     …and the DERIVED tier follows the boundary too: the explorer
     //     records the followed boundary (an honest boundary row — verified
     //     height + app-hash, frame-derived fields empty)…
-    poll("the observer explorer to record a followed boundary", Box::new(|| {
-        let (status, body) = common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
-        status == 200
-            && body["blocks"].as_array().is_some_and(|rows| {
-                rows.iter().any(|b| {
-                    b["hash"] == serde_json::json!("")
-                        && b["height"].as_u64().is_some_and(|h| h > 0)
-                        && !b["commitHash"].as_str().unwrap_or_default().is_empty()
+    poll(
+        "the observer explorer to record a followed boundary",
+        Box::new(|| {
+            let (status, body) =
+                common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
+            status == 200
+                && body["blocks"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|b| {
+                        b["hash"] == serde_json::json!("")
+                            && b["height"].as_u64().is_some_and(|h| h > 0)
+                            && !b["commitHash"].as_str().unwrap_or_default().is_empty()
+                    })
                 })
-            })
-    }));
+        }),
+    );
     //     …and /v1/index/* answers from boundary-healed read models: every
     //     watermark sits at a followed boundary, visibly boundary-stamped
     //     (the backfill floor), with the store healthy. polled: a heal drops
     //     the watermark FIRST (crash-safety by re-trigger), so a read racing
     //     an in-flight heal legitimately sees 0 for a moment.
-    poll("the observer index to report boundary-stamped watermarks", Box::new(|| {
-        let (status, index_status) =
-            common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
-        let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
-        status == 200
-            && index_status["poisoned"] == serde_json::json!(false)
-            && watermark > 0
-            && index_status["backfilled"]["directory"].as_u64() == Some(watermark)
-    }));
+    poll(
+        "the observer index to report boundary-stamped watermarks",
+        Box::new(|| {
+            let (status, index_status) =
+                common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
+            let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
+            status == 200
+                && index_status["poisoned"] == serde_json::json!(false)
+                && watermark > 0
+                && index_status["backfilled"]["directory"].as_u64() == Some(watermark)
+        }),
+    );
 
     // (3) quorum untouched: kill the observer; the founder keeps finalizing.
     cluster.kill(1);
@@ -364,18 +648,21 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             value: "alive".into(),
         }),
     );
-    poll("a finalized op with the observer down", Box::new(|| {
-        cluster
-            .query(
-                0,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "observer-down-liveness".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
-    }));
+    poll(
+        "a finalized op with the observer down",
+        Box::new(|| {
+            cluster
+                .query(
+                    0,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "observer-down-liveness".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
+        }),
+    );
 
     // (4) a restarted observer parks straight back into observer mode — the
     //     pre-sync left NO checkpoint manifest behind. (the config-time
@@ -385,10 +672,12 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     //     it then SERVES again from a fresh pre-sync.
     cluster.spawn(1);
     cluster.wait_marker(1, "observer: pre-synced boundary", CONVERGE);
-    poll("the restarted observer to serve reads again", Box::new(|| {
-        cluster.rpc(1, serde_json::json!({ "cmd": "status" }))["ok"]
-            == serde_json::json!(true)
-    }));
+    poll(
+        "the restarted observer to serve reads again",
+        Box::new(|| {
+            cluster.rpc(1, serde_json::json!({ "cmd": "status" }))["ok"] == serde_json::json!(true)
+        }),
+    );
 
     // (5) observer-remove: the ceremony verb revokes standing. committed
     //     state clears, and the observer — whose respawned log is fresh, so
@@ -400,12 +689,15 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         out.contains("revoked observer standing"),
         "unexpected observer-remove output:\n{out}"
     );
-    poll("the revoke to clear observer standing", Box::new(|| {
-        cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, ValsetReply::Observers(v) if v.is_empty()))
-    }));
+    poll(
+        "the revoke to clear observer standing",
+        Box::new(|| {
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, ValsetReply::Observers(v) if v.is_empty()))
+        }),
+    );
     cluster.wait_marker(1, "parked: awaiting admission", CONVERGE);
     //     a second run is an honest no-op — the inverted guard, end to end.
     let (ok, out) = cluster.run_membership_verb("observer-remove", &friend_key);
@@ -425,15 +717,20 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         out.contains("granted observer standing"),
         "unexpected re-grant output:\n{out}"
     );
-    poll("the re-grant to restore observer standing", Box::new(|| {
-        cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(
-                r,
-                ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
-            ))
-    }));
+    poll(
+        "the re-grant to restore observer standing",
+        Box::new(|| {
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| {
+                    matches!(
+                        r,
+                        ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
+                    )
+                })
+        }),
+    );
     cluster.submit(
         0,
         "directory",
@@ -442,24 +739,30 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             value: "back".into(),
         }),
     );
-    poll("the re-granted observer to resume the follow", Box::new(|| {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "post-revoke-follow".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
-    }));
+    poll(
+        "the re-granted observer to resume the follow",
+        Box::new(|| {
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "post-revoke-follow".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
+        }),
+    );
 
     // (7) promote: the warm observer becomes a validator through the normal
     //     promotion path; valset Join clears its observer standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
-    assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
+    assert!(
+        out.contains("admitted"),
+        "unexpected promote output:\n{out}"
+    );
     cluster.wait_marker(1, "admitted at epoch", CONVERGE);
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
