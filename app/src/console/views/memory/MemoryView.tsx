@@ -273,7 +273,7 @@ function Rail({
   const [newName, setNewName] = useState("");
 
   const dirs = entries.filter(isDir);
-  const files = entries.filter((entry): entry is { File: FileStat } => !isDir(entry));
+  const files = entries.filter((entry): entry is { file: FileStat } => !isDir(entry));
 
   const submitSearch = (event: FormEvent) => {
     event.preventDefault();
@@ -585,23 +585,23 @@ function Rail({
             ) : null}
             {dirs.map((entry) => (
               <EntryRow
-                key={entry.Dir.path}
+                key={entry.dir.path}
                 icon="folder"
-                label={lastSeg(entry.Dir.path)}
-                ariaLabel={`Browse ${entry.Dir.path}`}
-                onClick={() => onBrowse(entry.Dir.path)}
+                label={lastSeg(entry.dir.path)}
+                ariaLabel={`Browse ${entry.dir.path}`}
+                onClick={() => onBrowse(entry.dir.path)}
               />
             ))}
             {files.map((entry) => (
               <EntryRow
-                key={entry.File.path}
+                key={entry.file.path}
                 icon="document"
-                label={lastSeg(entry.File.path)}
-                badge={`g${entry.File.latest_generation}`}
-                ariaLabel={`Open ${entry.File.path}`}
-                active={openPath === entry.File.path}
-                op={ops[opKey.memory(entry.File.path)]}
-                onClick={() => onOpen(entry.File.path)}
+                label={lastSeg(entry.file.path)}
+                badge={`g${entry.file.latest_generation}`}
+                ariaLabel={`Open ${entry.file.path}`}
+                active={openPath === entry.file.path}
+                op={ops[opKey.memory(entry.file.path)]}
+                onClick={() => onOpen(entry.file.path)}
               />
             ))}
             {dirs.length === 0 && files.length === 0 && path === "/" ? (

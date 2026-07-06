@@ -25,10 +25,10 @@ import { replyVariant } from "./wire";
 
 /** Origin discriminant shared across modules (saga-interface's SagaOrigin): an
  *  external submitter's raw key bytes, a follow-up module, or genesis/system. */
-export type SagaOrigin = { External: number[] } | { Module: string } | "System";
+export type SagaOrigin = { external: number[] } | { module: string } | "system";
 
 /** Whether an agent may engage new runs. */
-export type AgentStatus = "Active" | "Paused";
+export type AgentStatus = "active" | "paused";
 
 export interface AgentRecord {
   agent_id: string;
@@ -87,7 +87,7 @@ export const registerAgent = (
   transport.submit(
     TARGET,
     {
-      RegisterAgent: {
+      register_agent: {
         agent_id: params.agentId,
         display_name: params.displayName,
         capability: params.capability,
@@ -115,7 +115,7 @@ export const updateAgent = (
   transport.submit(
     TARGET,
     {
-      UpdateAgent: {
+      update_agent: {
         agent_id: params.agentId,
         display_name: params.displayName ?? null,
         capability: params.capability ?? null,
@@ -131,13 +131,13 @@ export const pauseAgent = (
   transport: NodeTransport,
   params: { agentId: string; origin: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { PauseAgent: { agent_id: params.agentId } }, params.origin);
+  transport.submit(TARGET, { pause_agent: { agent_id: params.agentId } }, params.origin);
 
 export const resumeAgent = (
   transport: NodeTransport,
   params: { agentId: string; origin: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { ResumeAgent: { agent_id: params.agentId } }, params.origin);
+  transport.submit(TARGET, { resume_agent: { agent_id: params.agentId } }, params.origin);
 
 // ── Queries (reads over committed state) ────────────────
 
@@ -145,8 +145,8 @@ export const resumeAgent = (
  *  string, like tasks-client's `List`. */
 export const agents = (transport: NodeTransport): Promise<AgentRecord[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "Agents"))
-    .then((reply) => replyVariant<AgentRecord[]>(reply, "Agents"));
+    .then(() => transport.query(TARGET, "agents"))
+    .then((reply) => replyVariant<AgentRecord[]>(reply, "agents"));
 
 /** One agent by id, or null when absent. */
 export const agent = (
@@ -154,5 +154,5 @@ export const agent = (
   agentId: string,
 ): Promise<AgentRecord | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { Agent: { agent_id: agentId } }))
-    .then((reply) => replyVariant<AgentRecord | null>(reply, "Agent"));
+    .then(() => transport.query(TARGET, { agent: { agent_id: agentId } }))
+    .then((reply) => replyVariant<AgentRecord | null>(reply, "agent"));

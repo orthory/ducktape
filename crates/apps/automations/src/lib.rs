@@ -10,11 +10,11 @@
 //! ## Origin-gated intake (spoof-proofing)
 //!
 //! dispatch is routed by the HOST-ASSIGNED origin, exactly like agent v2:
-//! - `Origin::Module("chat")` → the payload is a raw `chat_interface::ChatEvent`
+//! - `Origin::Module("chat")` → the payload is a raw `chat::ChatEvent`
 //!   (chat's generic hook fan-out delivers the event bytes verbatim, unwrapped),
 //!   decoded in the NO-FAIL hook arm.
 //! - `Origin::Module("memory")` → the payload is a raw
-//!   `memory_interface::MemoryEvent`, decoded in the same NO-FAIL arm style.
+//!   `memory::MemoryEvent`, decoded in the same NO-FAIL arm style.
 //! - every other origin → an [`AutomationsMsg`] admin op (rule CRUD). an
 //!   [`AutomationsMsg::HookEvent`] from a non-chat origin is rejected — only
 //!   chat's own follow-ups ever wear `Origin::Module("chat")`, so a submitter
@@ -49,7 +49,7 @@
 //!
 //! `DeliverInbox` is different: member/body caps are checked before emit, and
 //! inbox delivery is otherwise no-op tolerant. the one accepted residual abort
-//! path is inbox at [`inbox_interface::MAX_MEMBERS`] rejecting a brand-new member;
+//! path is inbox at [`inbox::MAX_MEMBERS`] rejecting a brand-new member;
 //! by P2 that aborts the whole block. this is rare and accepted by design.
 //!
 //! probes cannot catch everything: two rules composing the same id within one
@@ -78,29 +78,29 @@
 //! so oversized bytes never enter the root preimage (the repo's poison-value
 //! lesson).
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 
-use automations_interface::{
-    Action, AutomationsMsg, AutomationsQuery, AutomationsReply, Rule, RunRecord, Trigger,
-    decode_msg, decode_query, encode_reply,
-};
-use chat_interface::{
+use chat::{
     AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, decode_event as chat_decode_event,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
-use inbox_interface::{
+use inbox::{
     InboxMsg, MAX_BODY_BYTES as INBOX_MAX_BODY_BYTES, MAX_KIND_BYTES, MAX_MEMBER_BYTES,
     encode_msg as inbox_encode_msg,
 };
-use memory_interface::{
+use memory::{
     MAX_PATH_BYTES as MEMORY_MAX_PATH_BYTES, MAX_SEGMENT_BYTES as MEMORY_MAX_SEGMENT_BYTES,
     META_KIND, MemoryEvent, decode_event as memory_decode_event,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
-use tasks_interface::{
+use tasks::{
     TaskMsg, TaskQuery, TaskReply, decode_reply as tasks_decode_reply,
     encode_msg as tasks_encode_msg, encode_query as tasks_encode_query,
 };
@@ -628,7 +628,7 @@ impl Automations {
                     return Err("composed id exceeds cap".into());
                 }
                 // probe: the composed task id must be unused — tasks rejects
-                // duplicates, which would abort the block. tasks-interface only
+                // duplicates, which would abort the block. the tasks wire surface only
                 // exposes List today, so this is an O(n) scan; switch to a Get
                 // query when the interface grows one.
                 let req = tasks_encode_query(&TaskQuery::List);
@@ -1396,17 +1396,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use automations_interface::{AutomationsReply, decode_reply, encode_msg, encode_query};
-    use chat_interface::{
+    use crate::{AutomationsReply, decode_reply, encode_msg, encode_query};
+    use chat::{
         Block, Channel, Mark, MessageHead, MessageView, PostPolicy, Span,
         decode_msg as chat_decode_msg, decode_query as chat_decode_query,
         encode_event as chat_encode_event, encode_reply as chat_encode_reply,
     };
     use futures::executor::block_on;
-    use inbox_interface::{InboxMsg, decode_msg as inbox_decode_msg};
-    use memory_interface::{MemoryEvent, encode_event as memory_encode_event};
+    use inbox::{InboxMsg, decode_msg as inbox_decode_msg};
+    use memory::{MemoryEvent, encode_event as memory_encode_event};
     use sdk::{Effect, Env, Event};
-    use tasks_interface::{
+    use tasks::{
         Task, TaskStatus, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
     };
 

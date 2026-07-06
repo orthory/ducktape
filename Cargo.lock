@@ -22,24 +22,14 @@ dependencies = [
 name = "agent"
 version = "0.1.0"
 dependencies = [
- "agent-interface",
  "async-trait",
- "capability-interface",
+ "capability",
  "futures",
- "saga-interface",
+ "saga",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
-]
-
-[[package]]
-name = "agent-interface"
-version = "0.1.0"
-dependencies = [
- "saga-interface",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -387,28 +377,17 @@ name = "automations"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "automations-interface",
  "chat",
- "chat-interface",
  "commonware-runtime",
  "futures",
  "host",
  "inbox",
- "inbox-interface",
  "memory",
- "memory-interface",
  "sdk",
- "sha2",
- "tasks",
- "tasks-interface",
-]
-
-[[package]]
-name = "automations-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "tasks",
 ]
 
 [[package]]
@@ -715,11 +694,12 @@ name = "capability"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "capability-interface",
  "futures",
  "sdk",
+ "serde",
+ "serde_json",
  "sha2",
- "valset-interface",
+ "valset",
 ]
 
 [[package]]
@@ -727,19 +707,11 @@ name = "capability-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "capability-interface",
+ "capability",
  "serde",
  "serde_json",
  "tokio",
  "toml 0.8.23",
-]
-
-[[package]]
-name = "capability-interface"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -861,7 +833,6 @@ name = "chat"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chat-interface",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-parallel",
@@ -869,32 +840,14 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "host",
+ "indexer",
  "sdk",
  "serde",
  "serde_json",
  "statesync",
- "tagging-interface",
-]
-
-[[package]]
-name = "chat-index"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chat-interface",
- "indexer",
- "serde",
- "serde_json",
+ "tagging",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "chat-interface"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1401,10 +1354,8 @@ dependencies = [
  "commonware-runtime",
  "commonware-utils",
  "directory",
- "directory-interface",
  "host",
  "kv",
- "kv-interface",
  "node",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
@@ -1888,40 +1839,29 @@ name = "demo"
 version = "0.1.0"
 dependencies = [
  "agent",
- "agent-interface",
  "async-trait",
  "automations",
  "chat",
- "chat-interface",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
  "commonware-storage",
  "directory",
- "directory-interface",
  "dispatch",
- "dispatch-interface",
  "document",
- "document-interface",
  "files",
  "forge",
- "forge-interface",
  "futures",
  "git2",
  "greeter",
  "host",
  "inbox",
- "inbox-interface",
  "jobs",
- "jobs-interface",
  "kv",
- "kv-interface",
  "memory",
  "profiles",
  "runs",
- "runs-interface",
  "saga",
- "saga-interface",
  "sdk",
  "serde",
  "serde_json",
@@ -1930,7 +1870,6 @@ dependencies = [
  "tagging",
  "tasks",
  "valset",
- "valset-interface",
 ]
 
 [[package]]
@@ -1990,18 +1929,11 @@ name = "directory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "directory-interface",
  "futures",
  "sdk",
- "sha2",
-]
-
-[[package]]
-name = "directory-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2030,22 +1962,13 @@ name = "dispatch"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "capability-interface",
- "dispatch-interface",
+ "capability",
  "futures",
- "saga-interface",
+ "saga",
  "sdk",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "dispatch-interface"
-version = "0.1.0"
-dependencies = [
- "saga-interface",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2054,10 +1977,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "capability-host",
- "dispatch-interface",
+ "dispatch",
  "futures",
  "reactor",
- "saga-interface",
+ "saga",
  "sdk",
  "tokio",
 ]
@@ -2125,32 +2048,14 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
- "document-interface",
+ "indexer",
  "sdk",
+ "serde",
  "serde_json",
  "state",
  "statesync",
-]
-
-[[package]]
-name = "document-index"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "document-interface",
- "indexer",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "document-interface"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2411,17 +2316,9 @@ name = "files"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "files-interface",
  "futures",
  "host",
  "sdk",
- "sha2",
-]
-
-[[package]]
-name = "files-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
  "sha2",
@@ -2522,20 +2419,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "files",
- "forge-interface",
  "futures",
  "git2",
  "sdk",
- "sha2",
- "state",
-]
-
-[[package]]
-name = "forge-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "state",
 ]
 
 [[package]]
@@ -2942,22 +2832,13 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "futures",
- "governance-interface",
  "host",
  "sdk",
- "serde_json",
- "sha2",
- "upgrade-interface",
- "valset",
- "valset-interface",
-]
-
-[[package]]
-name = "governance-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "upgrade",
+ "valset",
 ]
 
 [[package]]
@@ -2988,8 +2869,8 @@ name = "greeter"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "directory-interface",
- "kv-interface",
+ "directory",
+ "kv",
  "sdk",
 ]
 
@@ -3146,22 +3027,16 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "directory",
- "directory-interface",
  "dispatch",
- "dispatch-interface",
  "futures",
  "greeter",
  "kv",
- "kv-interface",
  "saga",
- "saga-interface",
  "sdk",
  "serde_json",
  "state",
  "upgrade",
- "upgrade-interface",
  "valset",
- "valset-interface",
 ]
 
 [[package]]
@@ -3444,17 +3319,10 @@ dependencies = [
  "async-trait",
  "futures",
  "host",
- "inbox-interface",
  "sdk",
- "sha2",
-]
-
-[[package]]
-name = "inbox-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -3663,17 +3531,10 @@ dependencies = [
  "async-trait",
  "futures",
  "host",
- "jobs-interface",
  "sdk",
- "sha2",
-]
-
-[[package]]
-name = "jobs-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -3750,19 +3611,11 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
- "kv-interface",
  "sdk",
+ "serde",
  "serde_json",
  "state",
  "statesync",
-]
-
-[[package]]
-name = "kv-interface"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -3956,20 +3809,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "files",
- "files-interface",
  "futures",
  "host",
- "memory-interface",
  "sdk",
- "sha2",
-]
-
-[[package]]
-name = "memory-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -4161,13 +4006,10 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "directory",
- "directory-interface",
  "futures",
  "host",
  "kv",
- "kv-interface",
  "saga",
- "saga-interface",
  "sdk",
  "serde",
  "serde_json",
@@ -4180,15 +4022,12 @@ name = "node-bin"
 version = "0.1.0"
 dependencies = [
  "agent",
- "agent-interface",
  "async-trait",
  "automations",
  "base64 0.22.1",
  "capability",
  "capability-host",
- "capability-interface",
  "chat",
- "chat-interface",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
@@ -4198,23 +4037,18 @@ dependencies = [
  "commonware-utils",
  "consensus",
  "directory",
- "directory-interface",
  "dispatch",
- "dispatch-interface",
  "dispatch-oracle",
  "document",
  "files",
  "forge",
- "forge-interface",
  "futures",
  "governance",
- "governance-interface",
  "host",
  "inbox",
  "indexer",
  "jobs",
  "kv",
- "kv-interface",
  "memory",
  "node",
  "noded",
@@ -4225,9 +4059,7 @@ dependencies = [
  "reactor",
  "recovery",
  "runs",
- "runs-interface",
  "saga",
- "saga-interface",
  "sdk",
  "serde",
  "serde_json",
@@ -4239,9 +4071,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing-subscriber 0.3.23",
  "upgrade",
- "upgrade-interface",
  "valset",
- "valset-interface",
  "vaults",
  "wireguard-effect",
  "wireguard-upgrade",
@@ -4257,19 +4087,13 @@ dependencies = [
  "axum",
  "capability-host",
  "chat",
- "chat-index",
- "chat-interface",
  "commonware-runtime",
  "dispatch",
- "dispatch-interface",
  "dispatch-oracle",
  "document",
- "document-index",
  "files",
- "files-interface",
  "flate2",
  "forge",
- "forge-interface",
  "futures",
  "git2",
  "host",
@@ -4279,19 +4103,16 @@ dependencies = [
  "jobs",
  "memory",
  "pages",
- "pages-index",
  "profiles",
  "reactor",
  "runs",
  "saga",
- "saga-interface",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
  "tagging",
  "tasks",
- "tasks-index",
  "tempfile",
  "tokio",
  "tower",
@@ -4736,32 +4557,14 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
- "pages-interface",
+ "indexer",
  "sdk",
+ "serde",
  "serde_json",
  "state",
  "statesync",
-]
-
-[[package]]
-name = "pages-index"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "indexer",
- "pages-interface",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "pages-interface"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -5122,17 +4925,10 @@ dependencies = [
  "async-trait",
  "futures",
  "host",
- "profiles-interface",
  "sdk",
- "sha2",
-]
-
-[[package]]
-name = "profiles-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -5403,11 +5199,10 @@ name = "reactor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "dispatch-interface",
+ "dispatch",
  "futures",
  "host",
  "saga",
- "saga-interface",
  "sdk",
 ]
 
@@ -5428,7 +5223,6 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "directory",
- "directory-interface",
  "futures",
  "host",
  "node",
@@ -5436,7 +5230,7 @@ dependencies = [
  "sha2",
  "state",
  "thiserror 2.0.18",
- "upgrade-interface",
+ "upgrade",
 ]
 
 [[package]]
@@ -5623,38 +5417,21 @@ name = "runs"
 version = "0.1.0"
 dependencies = [
  "agent",
- "agent-interface",
  "async-trait",
  "chat",
- "chat-interface",
  "commonware-runtime",
  "dispatch",
- "dispatch-interface",
- "document-interface",
+ "document",
  "futures",
  "host",
  "jobs",
- "jobs-interface",
- "runs-interface",
  "saga",
- "saga-interface",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
  "tagging",
- "tagging-interface",
  "tasks",
- "tasks-interface",
-]
-
-[[package]]
-name = "runs-interface"
-version = "0.1.0"
-dependencies = [
- "saga-interface",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -5702,22 +5479,14 @@ name = "saga"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "capability-interface",
+ "capability",
  "futures",
  "host",
- "saga-interface",
  "sdk",
- "sha2",
- "valset",
- "valset-interface",
-]
-
-[[package]]
-name = "saga-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "valset",
 ]
 
 [[package]]
@@ -6109,13 +5878,9 @@ dependencies = [
  "automations",
  "axum",
  "chat",
- "chat-index",
- "chat-interface",
  "commonware-runtime",
  "dispatch",
- "dispatch-interface",
  "document",
- "document-index",
  "files",
  "forge",
  "futures",
@@ -6126,18 +5891,15 @@ dependencies = [
  "memory",
  "noded",
  "pages",
- "pages-index",
  "profiles",
  "reactor",
  "runs",
  "saga",
- "saga-interface",
  "sdk",
  "serde",
  "serde_json",
  "tagging",
  "tasks",
- "tasks-index",
  "tempfile",
  "tokio",
 ]
@@ -6280,7 +6042,6 @@ dependencies = [
  "host",
  "indexer",
  "kv",
- "kv-interface",
  "sdk",
  "tempfile",
  "thiserror 2.0.18",
@@ -6429,16 +6190,9 @@ dependencies = [
  "async-trait",
  "futures",
  "sdk",
- "sha2",
- "tagging-interface",
-]
-
-[[package]]
-name = "tagging-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -6505,30 +6259,13 @@ dependencies = [
  "async-trait",
  "futures",
  "host",
- "sdk",
- "sha2",
- "tasks-interface",
-]
-
-[[package]]
-name = "tasks-index"
-version = "0.1.0"
-dependencies = [
- "async-trait",
  "indexer",
+ "sdk",
  "serde",
  "serde_json",
- "tasks-interface",
+ "sha2",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "tasks-interface"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -7612,18 +7349,10 @@ dependencies = [
  "commonware-cryptography",
  "futures",
  "sdk",
- "serde_json",
- "sha2",
- "upgrade-interface",
- "valset-interface",
-]
-
-[[package]]
-name = "upgrade-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "valset",
 ]
 
 [[package]]
@@ -7684,22 +7413,6 @@ dependencies = [
  "commonware-cryptography",
  "futures",
  "sdk",
- "sha2",
- "valset-interface",
-]
-
-[[package]]
-name = "valset-interface"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "valset-mesh-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
  "sha2",
@@ -7721,16 +7434,9 @@ dependencies = [
  "futures",
  "host",
  "sdk",
- "sha2",
- "vaults-interface",
-]
-
-[[package]]
-name = "vaults-interface"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

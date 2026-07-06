@@ -30,6 +30,10 @@
 //! every size cap is enforced at execute time with rejection, so an oversized
 //! value never enters the root preimage.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
@@ -37,12 +41,6 @@ use std::sync::{Arc, Mutex};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
 
-use files_interface::{
-    FilesMsg, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp, MAX_CHUNK_SIZE, MAX_CHUNKS,
-    MAX_FILE_ID_BYTES, MAX_LIST_LIMIT, MAX_MANIFESTS, MAX_MIME_BYTES, MAX_NAME_BYTES,
-    MIN_CHUNK_SIZE, Manifest, decode_msg, decode_query, decode_sync_req, encode_reply,
-    encode_sync_resp,
-};
 
 /// node-local chunk bytes, keyed by their sha256 digest. explicitly NOT part of
 /// `root()` or state sync — durability of bytes is a per-node concern.

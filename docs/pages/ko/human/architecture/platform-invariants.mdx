@@ -7,7 +7,7 @@ app-hash를 계산하게 만드는 조건이다.
 ## Isolation
 
 product module은 `sdk::Module`을 구현하는 crate다. 일반적으로 `sdk`와
-대화해야 하는 모듈의 타입 전용 `*-interface` crate에만 의존한다. 호스트가
+대화해야 하는 모듈의 crate-root wire type에만 의존한다. 호스트가
 보는 것은 module id, `execute` entry point, optional read projection,
 commit/abort hook, 그리고 `root() -> StateRoot`이다.
 

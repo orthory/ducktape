@@ -87,7 +87,7 @@ use automations::Automations;
 use capability::CapabilityRegistry;
 use chat::Chat;
 use directory::Directory;
-use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use document::Document;
 use files::Files;
 use forge::Forge;
@@ -270,7 +270,7 @@ fn observer_bytes(
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
 async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
-    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
         .query("valset", &encode_query(&ValsetQuery::Validators))
         .await
@@ -287,7 +287,7 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
 /// called between drains, outside any block; same read point as
 /// [`read_valset_members`], so a boundary read sees one frozen state).
 async fn read_valset_observers(host: &Host) -> Vec<Vec<u8>> {
-    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
         .query("valset", &encode_query(&ValsetQuery::Observers))
         .await
@@ -308,7 +308,7 @@ async fn read_valset_observers(host: &Host) -> Vec<Vec<u8>> {
 /// (pre-retrofit) or the reply is unreadable, so this never forks on a decode slip
 /// — matching `Host::effective_version`'s graceful fallback.
 async fn read_upgrade_state(host: &Host) -> consensus::BoundaryUpgrade<ed25519::PublicKey> {
-    use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
     let baseline = || consensus::BoundaryUpgrade::baseline(host::BASELINE_VERSION);
     let Ok(reply) = host
         .query("upgrade", &encode_query(&UpgradeQuery::Status))
@@ -348,7 +348,7 @@ async fn read_upgrade_state(host: &Host) -> consensus::BoundaryUpgrade<ed25519::
 /// committed read (not the raw orchestrator state) means a checkpoint captures the
 /// same fields a live node would derive at that height.
 async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCoords>) {
-    use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
     let baseline = (host::BASELINE_VERSION, None);
     let Ok(reply) = host
         .query("upgrade", &encode_query(&UpgradeQuery::Status))
@@ -373,7 +373,7 @@ async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCo
 /// (host-routed read, between drains). an unreadable reply degrades to empty —
 /// callers treat that as "can't authorize anything right now", never a panic.
 async fn read_members_from_host(host: &Host) -> Vec<Vec<u8>> {
-    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(raw) = host
         .query("valset", &encode_query(&ValsetQuery::Validators))
         .await
@@ -390,8 +390,8 @@ async fn read_members_from_host(host: &Host) -> Vec<Vec<u8>> {
 /// between drains). `None` when the module is absent (pre-retrofit) or the reply
 /// is unreadable — so the transition-marker latches degrade to silent on a
 /// baseline net, never panicking.
-async fn read_upgrade_status_raw(host: &Host) -> Option<upgrade_interface::UpgradeStatus> {
-    use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+async fn read_upgrade_status_raw(host: &Host) -> Option<upgrade::UpgradeStatus> {
+    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
     let reply = host
         .query("upgrade", &encode_query(&UpgradeQuery::Status))
         .await
@@ -433,7 +433,7 @@ impl ReadinessSignaller {
     /// `None`. truthful (binary can execute `to_version`), member-gated (self is a
     /// current boundary member), and idempotent (module already holds our signal, or
     /// one is already in flight).
-    fn decide(&mut self, status: &upgrade_interface::UpgradeStatus) -> Option<(String, u32)> {
+    fn decide(&mut self, status: &upgrade::UpgradeStatus) -> Option<(String, u32)> {
         let pending = status.pending.as_ref()?;
         // never lie: a binary that cannot execute the target version stays silent so
         // the boundary cleanly aborts rather than arming onto an under-versioned node.
@@ -461,7 +461,7 @@ impl ReadinessSignaller {
     /// validator-origin `SignalReady` op. gracefully `None` when the module is
     /// absent (pre-retrofit) or the reply is unreadable — no panic on a baseline net.
     async fn maybe_signal(&mut self, host: &Host) -> Option<(Msg, String, u32)> {
-        use upgrade_interface::{
+        use upgrade::{
             UpgradeMsg, UpgradeQuery, UpgradeReply, decode_reply, encode_msg, encode_query,
         };
         let reply = host
@@ -534,7 +534,7 @@ impl CapabilityAnnouncer {
     /// build the external-origin `Announce` op. gracefully `None` when the
     /// module is absent (pre-retrofit net) or the reply is unreadable.
     async fn maybe_announce(&mut self, host: &Host) -> Option<Msg> {
-        use capability_interface::{
+        use capability::{
             CapabilityMsg, CapabilityQuery, CapabilityReply, decode_reply, encode_msg, encode_query,
         };
         let reply = host
@@ -560,7 +560,7 @@ impl CapabilityAnnouncer {
 /// the committed dispatch mailbox's undelivered-result count — the nudge
 /// pump's read. `0` when the module is absent or the mailbox is empty.
 async fn dispatch_pending_deliveries(host: &Host) -> u64 {
-    use dispatch_interface::{DispatchQuery, DispatchReply, decode_reply, encode_query};
+    use dispatch::{DispatchQuery, DispatchReply, decode_reply, encode_query};
     let Ok(reply) = host
         .query("dispatch", &encode_query(&DispatchQuery::PendingDeliveries))
         .await
@@ -577,7 +577,7 @@ async fn dispatch_pending_deliveries(host: &Host) -> u64 {
 /// crank pump's read. `None` when the module is absent or nothing pending
 /// carries one.
 async fn saga_next_expiry(host: &Host) -> Option<u64> {
-    use saga_interface::{SagaQuery, SagaReply, decode_reply, encode_query};
+    use saga::{SagaQuery, SagaReply, decode_reply, encode_query};
     let reply = host
         .query("saga", &encode_query(&SagaQuery::NextExpiry))
         .await
@@ -2635,7 +2635,7 @@ fn rpc_submit(addr: &str, target: &str, payload: &[u8]) -> Result<(), String> {
 }
 
 fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
-    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
     match decode_reply(&raw)? {
         ValsetReply::Validators(v) => Ok(v),
@@ -2644,7 +2644,7 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
 }
 
 fn read_observers(addr: &str) -> Result<Vec<Vec<u8>>, String> {
-    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Observers))?;
     match decode_reply(&raw)? {
         ValsetReply::Observers(v) => Ok(v),
@@ -2688,7 +2688,7 @@ fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 /// `max_supported` version this binary can execute. degrades gracefully on a net
 /// WITHOUT the module (pre-retrofit): the query errors and we report baseline.
 fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
     let (_, flags) = parse_flags(args)?;
     let cfg_path = config_path(&flags)?;
     let resolved = config::resolve(&cfg_path)?;
@@ -2737,8 +2737,8 @@ fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
 fn read_proposal(
     addr: &str,
     id: &str,
-) -> Result<Option<governance_interface::ProposalView>, String> {
-    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
+) -> Result<Option<governance::ProposalView>, String> {
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let raw = rpc_query(
         addr,
         "governance",
@@ -2758,8 +2758,8 @@ fn poll_proposal(
     addr: &str,
     id: &str,
     what: &str,
-    mut pred: impl FnMut(&Option<governance_interface::ProposalView>) -> bool,
-) -> Result<Option<governance_interface::ProposalView>, String> {
+    mut pred: impl FnMut(&Option<governance::ProposalView>) -> bool,
+) -> Result<Option<governance::ProposalView>, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let view = read_proposal(addr, id)?;
@@ -2794,10 +2794,10 @@ fn drive_membership_ceremony(
     pubkey_hex: &str,
     verb: &str,
     id_prefix: &str,
-    wanted: governance_interface::GovAction,
+    wanted: governance::GovAction,
 ) -> Result<CeremonyOutcome, Box<dyn std::error::Error>> {
-    use governance_interface::{GovMsg, ProposalStatus, encode_msg};
-    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
+    use governance::{GovMsg, ProposalStatus, encode_msg};
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
         rpc_addr,
         "governance",
@@ -2904,7 +2904,7 @@ fn drive_membership_ceremony(
 /// state on a stride cadence. promotion into the quorum is the separate,
 /// deliberate `promote` verb — run it once the observer is warm.
 fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use governance_interface::GovAction;
+    use governance::GovAction;
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
@@ -2972,7 +2972,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 /// quorum only ever gains a warm member. also serves DIRECT (un-staged)
 /// admission — exactly the pre-observer `invite-accept` semantics.
 fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use governance_interface::GovAction;
+    use governance::GovAction;
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
@@ -3030,7 +3030,7 @@ fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `invite-accept` re-grants. a seated validator is `member-remove`'s job —
 /// standing never overlaps (Grant refuses validators, Join clears standing).
 fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use governance_interface::GovAction;
+    use governance::GovAction;
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
@@ -3100,7 +3100,7 @@ fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
 /// deciding ballot executes. the passing proposal's valset Leave schedules the
 /// epoch cutover that drops the key from the tracked set.
 fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use governance_interface::{GovAction, GovMsg, ProposalStatus, encode_msg};
+    use governance::{GovAction, GovMsg, ProposalStatus, encode_msg};
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
@@ -3137,7 +3137,7 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     // adopt an existing OPEN proposal for exactly this action, else mint an
     // unused id (settled proposals keep their ids forever — a re-removed key
     // gets a fresh suffix).
-    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
         &rpc_addr,
         "governance",
@@ -6590,8 +6590,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 seq,
                                 Msg {
                                     target: "saga".into(),
-                                    payload: saga_interface::encode_msg(
-                                        &saga_interface::SagaMsg::Crank {},
+                                    payload: saga::encode_msg(
+                                        &saga::SagaMsg::Crank {},
                                     ),
                                 },
                             )
@@ -6627,8 +6627,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 seq,
                                 Msg {
                                     target: "dispatch".into(),
-                                    payload: dispatch_interface::encode_msg(
-                                        &dispatch_interface::DispatchMsg::Nudge {},
+                                    payload: dispatch::encode_msg(
+                                        &dispatch::DispatchMsg::Nudge {},
                                     ),
                                 },
                             )
@@ -7065,7 +7065,7 @@ mod tests {
     use super::*;
     use sdk::{Ctx, Error, Module, StateSyncHandle};
     use std::sync::{Arc, Mutex};
-    use upgrade_interface::{Upgrade, UpgradeStatus};
+    use upgrade::{ScheduledUpgrade, UpgradeStatus};
 
     fn test_root(byte: u8) -> StateRoot {
         StateRoot([byte; sdk::ROOT_LEN])
@@ -7715,7 +7715,7 @@ mod tests {
         let ready: Vec<Vec<u8>> = ready.iter().map(|m| m.to_vec()).collect();
         UpgradeStatus {
             current_version: 0,
-            pending: pending.map(|(name, activation_height, to_version)| Upgrade {
+            pending: pending.map(|(name, activation_height, to_version)| ScheduledUpgrade {
                 name: name.into(),
                 activation_height,
                 to_version,

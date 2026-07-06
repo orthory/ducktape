@@ -8,7 +8,8 @@ version.workspace = true
 # self-contained — no host `git` install needed.
 [dependencies]
 sdk = { workspace = true }
-forge-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # the node-local blob store forge fetches Push packfiles from by digest. only
 # its `BlobHandle` is used — the same node-local body plane files serves; the
 # packfile bytes never enter consensus (see the `Push` op in lib.rs).

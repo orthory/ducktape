@@ -31,15 +31,15 @@
 //! recomputes the root of whatever bytes arrived and refuses to adopt them
 //! unless it matches the expected root consensus already agreed on.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use capability_interface::{
-    CapabilityMsg, CapabilityQuery, CapabilityReply, decode_msg, decode_query, encode_reply,
-    validate_tag,
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use valset_interface::{
+use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_query as valset_encode_query,
 };
@@ -377,8 +377,8 @@ impl Module for CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capability_interface::{MAX_TAG_LEN, encode_msg, encode_query};
-    use valset_interface::encode_reply as valset_encode_reply;
+    use crate::{MAX_TAG_LEN, encode_msg, encode_query};
+    use valset::encode_reply as valset_encode_reply;
 
     /// a minimal Ctx: origin-configurable, and (optionally) answers the valset
     /// membership query so the member gate is testable.
@@ -442,7 +442,7 @@ mod tests {
             node: node.to_vec(),
         })))
         .unwrap();
-        match capability_interface::decode_reply(&reply).unwrap() {
+        match crate::decode_reply(&reply).unwrap() {
             CapabilityReply::Node(tags) => tags,
             other => panic!("expected Node reply, got {other:?}"),
         }
@@ -453,7 +453,7 @@ mod tests {
                 capability: capability.into(),
             })))
             .unwrap();
-        match capability_interface::decode_reply(&reply).unwrap() {
+        match crate::decode_reply(&reply).unwrap() {
             CapabilityReply::Providers(p) => p,
             other => panic!("expected Providers reply, got {other:?}"),
         }

@@ -31,13 +31,12 @@
 //! deterministic no-ops, never errors — a notification ack must never abort the
 //! block cascade that a delivering module started.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::BTreeMap;
 
-use inbox_interface::{
-    InboxMsg, InboxQuery, InboxReply, MAX_BODY_BYTES, MAX_ITEMS_PER_MEMBER, MAX_KIND_BYTES,
-    MAX_MEMBER_BYTES, MAX_MEMBERS, MAX_QUERY_LIMIT, Notification, decode_msg, decode_query,
-    encode_reply,
-};
 use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 

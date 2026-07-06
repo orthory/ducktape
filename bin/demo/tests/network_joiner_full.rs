@@ -13,22 +13,22 @@ use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};
 
 use chat::Chat;
-use chat_interface::{Block as ChatBlock, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
+use chat::{Block as ChatBlock, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
 use directory::Directory;
-use directory_interface::{DirMsg, encode_msg as dir_encode_msg};
+use directory::{DirMsg, encode_msg as dir_encode_msg};
 use document::Document;
-use document_interface::{Block, BlockKind, DocMsg, encode_msg as doc_encode_msg};
+use document::{Block, BlockKind, DocMsg, encode_msg as doc_encode_msg};
 use forge::Forge;
 use greeter::Greeter;
 use host::{FinalizedBlock, Host};
 use kv::Kv;
-use kv_interface::{KvMsg, encode as kv_encode};
+use kv::{KvMsg, encode as kv_encode};
 use saga::SagaModule;
-use saga_interface::{SagaMsg, encode_msg as saga_encode_msg};
+use saga::{SagaMsg, encode_msg as saga_encode_msg};
 use sdk::{Module, Msg, StateRoot};
 use state::global_root;
 use valset::Valset;
-use valset_interface::{ValsetMsg, encode_msg as valset_encode_msg};
+use valset::{ValsetMsg, encode_msg as valset_encode_msg};
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
@@ -181,7 +181,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             },
             Msg {
                 target: "forge".into(),
-                payload: forge_interface::encode_msg(&forge_interface::ForgeMsg::Commit {
+                payload: forge::encode_msg(&forge::ForgeMsg::Commit {
                     repo: String::new(),
                     path: "README.md".into(),
                     content: "# ducktape\n".into(),

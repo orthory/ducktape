@@ -49,7 +49,7 @@ pub const UPGRADE_MODULE_ID: &str = "upgrade";
 /// the genesis-constant module id the `dispatch` module registers under. read
 /// by the drain's delivery injection ([`Host::pending_deliveries`]); absent on
 /// a net without the module, in which case nothing is ever injected.
-pub const DISPATCH_MODULE_ID: &str = dispatch_interface::DEFAULT_DISPATCH_TARGET;
+pub const DISPATCH_MODULE_ID: &str = dispatch::DEFAULT_DISPATCH_TARGET;
 
 /// the block-constant consensus context for one [`Host::submit_at`]: the agreed
 /// `height` / `consensus_time` (identical on every validator — sourced from the
@@ -396,17 +396,17 @@ impl Host {
     /// therefore unchanged until the module is registered and a pending upgrade
     /// arms at its activation height.
     pub async fn effective_version(&self, height: u64) -> u32 {
-        let req = upgrade_interface::encode_query(&upgrade_interface::UpgradeQuery::Status);
+        let req = upgrade::encode_query(&upgrade::UpgradeQuery::Status);
         match self.query(UPGRADE_MODULE_ID, &req).await {
-            Ok(bytes) => match upgrade_interface::decode_reply(&bytes) {
-                Ok(upgrade_interface::UpgradeReply::Status(s)) => {
+            Ok(bytes) => match upgrade::decode_reply(&bytes) {
+                Ok(upgrade::UpgradeReply::Status(s)) => {
                     // the ONE shared predicate — the host stamps EXACTLY what the
                     // module's Advance arm check computes (both route through
-                    // upgrade_interface::effective_version), so dispatch and hashing
+                    // upgrade::effective_version), so dispatch and hashing
                     // can never diverge at the boundary (risk R4).
                     let ready: std::collections::BTreeMap<Vec<u8>, ()> =
                         s.ready.iter().map(|k| (k.clone(), ())).collect();
-                    upgrade_interface::effective_version(
+                    upgrade::effective_version(
                         height,
                         s.current_version,
                         s.pending.as_ref(),
@@ -453,15 +453,15 @@ impl Host {
     /// module is registered (the `Status` query errors → `None`), so the drain is
     /// byte-identical on a pre-retrofit net.
     async fn pending_advance(&self, height: u64) -> Option<Msg> {
-        let req = upgrade_interface::encode_query(&upgrade_interface::UpgradeQuery::Status);
+        let req = upgrade::encode_query(&upgrade::UpgradeQuery::Status);
         let bytes = self.query(UPGRADE_MODULE_ID, &req).await.ok()?;
-        let upgrade_interface::UpgradeReply::Status(status) =
-            upgrade_interface::decode_reply(&bytes).ok()?;
+        let upgrade::UpgradeReply::Status(status) =
+            upgrade::decode_reply(&bytes).ok()?;
         let pending = status.pending?;
         if height >= pending.activation_height {
             Some(Msg {
                 target: UPGRADE_MODULE_ID.into(),
-                payload: upgrade_interface::encode_msg(&upgrade_interface::UpgradeMsg::Advance),
+                payload: upgrade::encode_msg(&upgrade::UpgradeMsg::Advance),
             })
         } else {
             None
@@ -483,17 +483,17 @@ impl Host {
     /// the drain byte-identical on a net without dispatch.
     async fn pending_deliveries(&self) -> Option<Msg> {
         let req =
-            dispatch_interface::encode_query(&dispatch_interface::DispatchQuery::PendingDeliveries);
+            dispatch::encode_query(&dispatch::DispatchQuery::PendingDeliveries);
         let bytes = self.query(DISPATCH_MODULE_ID, &req).await.ok()?;
-        let dispatch_interface::DispatchReply::PendingDeliveries(pending) =
-            dispatch_interface::decode_reply(&bytes).ok()?
+        let dispatch::DispatchReply::PendingDeliveries(pending) =
+            dispatch::decode_reply(&bytes).ok()?
         else {
             return None;
         };
         (pending > 0).then(|| Msg {
             target: DISPATCH_MODULE_ID.into(),
-            payload: dispatch_interface::encode_msg(
-                &dispatch_interface::DispatchMsg::DeliverPending {},
+            payload: dispatch::encode_msg(
+                &dispatch::DispatchMsg::DeliverPending {},
             ),
         })
     }

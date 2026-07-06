@@ -12,7 +12,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Cluster, poll_until};
-use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 
 fn dir_set(key: &str, value: &str) -> Vec<u8> {
     encode_msg(&DirMsg::Set {

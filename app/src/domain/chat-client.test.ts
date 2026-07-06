@@ -35,8 +35,8 @@ const wireMessage = (over: Partial<MessageView["head"]> = {}): MessageView => ({
   seq: 1,
   head: {
     message_id: "m1",
-    author: { User: Array.from(new TextEncoder().encode("jess")) },
-    blocks: [{ Paragraph: [{ text: "hello", marks: [] }] }],
+    author: { user: Array.from(new TextEncoder().encode("jess")) },
+    blocks: [{ paragraph: [{ text: "hello", marks: [] }] }],
     created_at: 10,
     rev: 0,
     edited_at: null,
@@ -57,16 +57,16 @@ describe("chat msgs", () => {
     await createChannel(transport, {
       channelId: "general",
       name: "General",
-      postPolicy: "MembersOnly",
+      postPolicy: "members_only",
       origin: "jess",
     });
     expect(transport.submit).toHaveBeenCalledWith(
       "chat",
       {
-        CreateChannel: {
+        create_channel: {
           channel_id: "general",
           name: "General",
-          post_policy: "MembersOnly",
+          post_policy: "members_only",
         },
       },
       "jess",
@@ -78,16 +78,16 @@ describe("chat msgs", () => {
     await postMessage(transport, {
       channelId: "general",
       messageId: "m1",
-      blocks: [{ Paragraph: [{ text: "hello", marks: [] }] }],
+      blocks: [{ paragraph: [{ text: "hello", marks: [] }] }],
       origin: "jess",
     });
     expect(transport.submit).toHaveBeenCalledWith(
       "chat",
       {
-        PostMessage: {
+        post_message: {
           channel_id: "general",
           message_id: "m1",
-          blocks: [{ Paragraph: [{ text: "hello", marks: [] }] }],
+          blocks: [{ paragraph: [{ text: "hello", marks: [] }] }],
           thread: null,
           as_agent: null,
         },
@@ -101,12 +101,12 @@ describe("chat msgs", () => {
     await postMessage(transport, {
       channelId: "general",
       messageId: "m2",
-      blocks: [{ Paragraph: [{ text: "in thread", marks: [] }] }],
+      blocks: [{ paragraph: [{ text: "in thread", marks: [] }] }],
       origin: "jess",
       thread: 7,
     });
     const [, payload] = vi.mocked(transport.submit).mock.calls[0];
-    expect((payload as { PostMessage: { thread: number } }).PostMessage.thread).toBe(7);
+    expect((payload as { post_message: { thread: number } }).post_message.thread).toBe(7);
   });
 });
 
@@ -118,58 +118,58 @@ describe("chat queries", () => {
         name: "General",
         created_at: 1,
         head_seq: 3,
-        post_policy: "Open",
+        post_policy: "open",
         hooks: [],
         pinned: [],
       },
     ];
-    const transport = stubTransport({ Channels: wire });
+    const transport = stubTransport({ channels: wire });
     await expect(channels(transport)).resolves.toEqual(wire);
-    expect(transport.query).toHaveBeenCalledWith("chat", "Channels");
+    expect(transport.query).toHaveBeenCalledWith("chat", "channels");
   });
 
   it("queries MessagesLatest and decodes Messages", async () => {
     const wire = [wireMessage()];
-    const transport = stubTransport({ Messages: wire });
+    const transport = stubTransport({ messages: wire });
     await expect(latestMessages(transport, "general", 50)).resolves.toEqual(wire);
     expect(transport.query).toHaveBeenCalledWith("chat", {
-      MessagesLatest: { channel_id: "general", limit: 50 },
+      messages_latest: { channel_id: "general", limit: 50 },
     });
   });
 
   it("queries a Thread by root seq and passes null through", async () => {
-    const transport = stubTransport({ Thread: null });
+    const transport = stubTransport({ thread: null });
     await expect(
       thread(transport, { channelId: "general", rootSeq: 7 }),
     ).resolves.toBeNull();
     expect(transport.query).toHaveBeenCalledWith("chat", {
-      Thread: { channel_id: "general", root_seq: 7, from: 0, limit: 256 },
+      thread: { channel_id: "general", root_seq: 7, from: 0, limit: 256 },
     });
   });
 
   it("throws on a mismatched reply variant", async () => {
-    const transport = stubTransport({ Channels: [] });
+    const transport = stubTransport({ channels: [] });
     await expect(latestMessages(transport, "general")).rejects.toThrow(
-      "unexpected module reply: wanted Messages",
+      "unexpected module reply: wanted messages",
     );
   });
 });
 
 describe("rendering helpers", () => {
   it("decodes every AuthorRef variant to a display name", () => {
-    expect(authorName({ User: Array.from(new TextEncoder().encode("jess")) })).toBe("jess");
-    expect(authorName({ Agent: { module: "chat", agent_id: "duck" } })).toBe("chat/duck");
-    expect(authorName({ Module: "forge" })).toBe("forge");
-    expect(authorName("System")).toBe("system");
+    expect(authorName({ user: Array.from(new TextEncoder().encode("jess")) })).toBe("jess");
+    expect(authorName({ agent: { module: "chat", agent_id: "duck" } })).toBe("chat/duck");
+    expect(authorName({ module: "forge" })).toBe("forge");
+    expect(authorName("system")).toBe("system");
   });
 
   it("flattens block bodies to text", () => {
     expect(
       blocksText([
-        { Paragraph: [{ text: "one ", marks: [] }, { text: "two", marks: ["Bold"] }] },
-        "Divider",
-        { Code: { lang: null, text: "let x = 1;" } },
-        { Quote: [{ text: "said", marks: [] }] },
+        { paragraph: [{ text: "one ", marks: [] }, { text: "two", marks: ["bold"] }] },
+        "divider",
+        { code: { lang: null, text: "let x = 1;" } },
+        { quote: [{ text: "said", marks: [] }] },
       ]),
     ).toBe("one two\n———\nlet x = 1;\n> said");
   });

@@ -16,7 +16,7 @@ use std::rc::Rc;
 use commonware_runtime::{Runner as _, deterministic};
 use host::{BASELINE_VERSION, BlockContext, Host, UPGRADE_MODULE_ID};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
-use upgrade_interface::{Upgrade, UpgradeReply, UpgradeStatus, encode_reply};
+use upgrade::{ScheduledUpgrade, UpgradeReply, UpgradeStatus, encode_reply};
 
 /// a probe module that records the `protocol_version` it observed on EVERY
 /// dispatch, and whose `root()` deliberately IGNORES the version — it commits
@@ -228,7 +228,7 @@ fn effective_version_derivation_over_committed_state() {
     deterministic::Runner::default().start(|_| async move {
         let armed = UpgradeStatus {
             current_version: 1,
-            pending: Some(Upgrade {
+            pending: Some(ScheduledUpgrade {
                 name: "forge-multi-repo".into(),
                 activation_height: 10,
                 to_version: 2,

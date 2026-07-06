@@ -7,7 +7,7 @@
 //! real one lives in `main.rs` on a commonware tokio runner; router tests drive
 //! a fake actor on plain tokio. payloads stay opaque json: a submit/query body
 //! carries the module's own `*Msg`/`*Query` enum as a json value, encoded to the
-//! exact bytes the `*-interface` crates' `encode_*` helpers would produce
+//! exact bytes the modules' crate-root `encode_*` helpers would produce
 //! (`serde_json::to_vec`), so the daemon needs no per-module knowledge —
 //! with ONE deliberate exception: the files blob lane. chunk bytes must never
 //! transit consensus (no op carries them), so POST `/v1/files/blob` and GET
@@ -153,7 +153,7 @@ pub const PAYLOAD_PREVIEW_MAX: usize = 1024;
 /// dropped before decoding, so there are no contents to show): an applied op
 /// mutated state; a rejected op finalized but rolled back — a failed tx.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum BlockDisposition {
     Applied,
     Rejected,
@@ -260,7 +260,7 @@ pub struct ModuleStatus {
 /// id; it is not part of a module's consensus identity (that stays `id` +
 /// `root`) and never enters the app-hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ModuleCategory {
     Workspace,
     Developer,
@@ -491,7 +491,7 @@ pub fn router(handle: NodeHandle) -> Router {
             // one chunk per request, so the body cap IS the chunk cap. the
             // json routes keep axum's (smaller) default limit.
             post(put_blob).layer(DefaultBodyLimit::max(
-                files_interface::MAX_CHUNK_SIZE as usize,
+                files::MAX_CHUNK_SIZE as usize,
             )),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
@@ -633,10 +633,10 @@ pub fn open_index_store<S: AsRef<str>>(
         .map(|store| {
             Arc::new(
                 store
-                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
-                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
-                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
+                    .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
+                    .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
+                    .with_indexer(Box::new(document::index::DocumentIndex::new("document")))
+                    .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
             )
         })
         .map_err(|err| {
@@ -652,7 +652,7 @@ pub fn open_index_store<S: AsRef<str>>(
 /// author rendering assumes — on BOTH lanes. the validator's key-byte
 /// identities render the same way, because a mapper's from-state rebuild
 /// re-renders authors from canonical state with this exact convention
-/// (see chat-index `author_from_ref`): folded and rebuilt rows must match
+/// (see `chat::index` `author_from_ref`): folded and rebuilt rows must match
 /// byte-for-byte. hex-keyed identity belongs to the explorer row's
 /// `proposer`, not the index op rows.
 pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {
@@ -1205,7 +1205,7 @@ fn norm_repo(repo: &str) -> Option<String> {
 /// query the forge module for a repo's committed HEAD oid hex (`None` == unborn).
 /// errors surface as an http `Response` so callers can early-return them.
 async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, Response> {
-    let req = forge_interface::encode_query(&forge_interface::ForgeQuery::HeadOf {
+    let req = forge::encode_query(&forge::ForgeQuery::HeadOf {
         repo: repo.to_string(),
     });
     let (reply, rx) = oneshot::channel();
@@ -1220,8 +1220,8 @@ async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, R
         .await
         .map_err(|_| actor_gone())?
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err))?;
-    match forge_interface::decode_reply(&bytes) {
-        Ok(forge_interface::ForgeReply::Head(head)) => Ok(head),
+    match forge::decode_reply(&bytes) {
+        Ok(forge::ForgeReply::Head(head)) => Ok(head),
         Ok(_) => Err(error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected forge reply to HeadOf",
@@ -1473,7 +1473,7 @@ async fn git_receive_pack(
     let pack_digest = handle.blobs.put_chunk(pack.to_vec());
 
     // CAS the head through a forge Push op and await the block result.
-    let payload = forge_interface::encode_msg(&forge_interface::ForgeMsg::Push {
+    let payload = forge::encode_msg(&forge::ForgeMsg::Push {
         repo,
         prev_oid,
         new_oid,

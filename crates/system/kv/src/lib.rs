@@ -26,6 +26,10 @@
 //! the source root, and every fetched batch is merkle-verified against that root,
 //! so the source is untrusted — the root is the trust anchor.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -336,8 +340,8 @@ where
     /// this is replay-safe across validators. an over-cap key/value is rejected
     /// here (write time), never staged, never committed — see [`MAX_VALUE_LEN`].
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match kv_interface::decode(&msg.payload).map_err(Error::Module)? {
-            kv_interface::KvMsg::Set { key, value } => self.stage(key, value),
+        match crate::decode(&msg.payload).map_err(Error::Module)? {
+            crate::KvMsg::Set { key, value } => self.stage(key, value),
         }
     }
 
@@ -345,9 +349,9 @@ where
     /// serves STAGED-over-committed via `get`, so cross-module reads within a
     /// block observe this block's staged writes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match kv_interface::decode_query(req).map_err(Error::Module)? {
-            kv_interface::KvQuery::Get { key } => Ok(kv_interface::encode_reply(
-                &kv_interface::KvReply::Value(self.get(&key).await),
+        match crate::decode_query(req).map_err(Error::Module)? {
+            crate::KvQuery::Get { key } => Ok(crate::encode_reply(
+                &crate::KvReply::Value(self.get(&key).await),
             )),
         }
     }
@@ -516,7 +520,7 @@ mod tests {
             let r0 = kv.root();
 
             // value one byte over the cap -> rejected, nothing staged.
-            let huge_value = kv_interface::encode(&kv_interface::KvMsg::Set {
+            let huge_value = crate::encode(&crate::KvMsg::Set {
                 key: b"k".to_vec(),
                 value: vec![0u8; MAX_VALUE_LEN + 1],
             });
@@ -536,7 +540,7 @@ mod tests {
             );
 
             // key one byte over the cap -> rejected, nothing staged.
-            let huge_key = kv_interface::encode(&kv_interface::KvMsg::Set {
+            let huge_key = crate::encode(&crate::KvMsg::Set {
                 key: vec![b'k'; MAX_KEY_LEN + 1],
                 value: b"v".to_vec(),
             });

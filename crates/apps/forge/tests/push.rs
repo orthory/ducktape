@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
-use forge_interface::{ForgeMsg, ForgeQuery, ForgeReply, decode_reply, encode_msg, encode_query};
+use forge::{ForgeMsg, ForgeQuery, ForgeReply, decode_reply, encode_msg, encode_query};
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
 
 /// the module's canonical branch — the ref a materialized Push moves.

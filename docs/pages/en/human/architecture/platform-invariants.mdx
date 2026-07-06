@@ -7,7 +7,7 @@ same agreed operation order.
 ## Isolation
 
 A product module is a crate that implements `sdk::Module`. It normally depends
-only on `sdk` and the types-only `*-interface` crates of modules it talks to.
+only on `sdk` and the crate-root wire types of modules it talks to.
 The host sees a module id, an `execute` entry point, optional read projections,
 commit/abort hooks, and `root() -> StateRoot`.
 

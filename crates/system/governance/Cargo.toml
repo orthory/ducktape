@@ -11,16 +11,15 @@ version.workspace = true
 # tasks): low-volume, fully replicated, root == sha256 of the encoded state.
 [dependencies]
 sdk = { workspace = true }
-governance-interface = { workspace = true }
-valset-interface = { workspace = true }
-upgrade-interface = { workspace = true }
+serde = { workspace = true }
+valset = { workspace = true }
+upgrade = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
 host = { workspace = true }
-valset = { workspace = true }
 futures = "0.3"
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }

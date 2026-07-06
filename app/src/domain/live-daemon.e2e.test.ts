@@ -144,13 +144,13 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     await createChannel(transport, {
       channelId: "general",
       name: "General",
-      postPolicy: "Open",
+      postPolicy: "open",
       origin: "eddy",
     });
     const posted = await postMessage(transport, {
       channelId: "general",
       messageId: "m1",
-      blocks: [{ Paragraph: [{ text: "hello from the app domain layer", marks: [] }] }],
+      blocks: [{ paragraph: [{ text: "hello from the app domain layer", marks: [] }] }],
       origin: "eddy",
     });
     expect(posted.height).toBeGreaterThan(0);
@@ -170,7 +170,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     await postMessage(transport, {
       channelId: "general",
       messageId: "m2",
-      blocks: [{ Paragraph: [{ text: "a threaded reply", marks: [] }] }],
+      blocks: [{ paragraph: [{ text: "a threaded reply", marks: [] }] }],
       origin: "jess",
       thread: view.seq,
     });
@@ -189,11 +189,11 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     let tasks = await listTasks(transport);
     const created = tasks.find((t) => t.id === "t1");
     expect(created?.title).toBe("ship the e2e suite");
-    expect(created?.status).toBe("Open");
+    expect(created?.status).toBe("open");
 
-    await updateStatus(transport, { taskId: "t1", status: "Done" });
+    await updateStatus(transport, { taskId: "t1", status: "done" });
     tasks = await listTasks(transport);
-    expect(tasks.find((t) => t.id === "t1")?.status).toBe("Done");
+    expect(tasks.find((t) => t.id === "t1")?.status).toBe("done");
   });
 
   it("streams committed blocks over the websocket", async () => {
@@ -211,7 +211,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       await createChannel(transport, {
         channelId: "ws-probe",
         name: "Ws Probe",
-        postPolicy: "Open",
+        postPolicy: "open",
         origin: "eddy",
       });
       let event: BlockEvent | null = null;
@@ -219,7 +219,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
         await postMessage(transport, {
           channelId: "ws-probe",
           messageId: `probe-${probe}`,
-          blocks: [{ Paragraph: [{ text: "block event probe", marks: [] }] }],
+          blocks: [{ paragraph: [{ text: "block event probe", marks: [] }] }],
           origin: "eddy",
         });
         event = await Promise.race([

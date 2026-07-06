@@ -7,7 +7,7 @@
 //! membership records.
 
 use chat::Chat;
-use chat_interface::{Block, ChatMsg, ChatQuery, PostPolicy, encode_msg, encode_query};
+use chat::{Block, ChatMsg, ChatQuery, PostPolicy, encode_msg, encode_query};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
 

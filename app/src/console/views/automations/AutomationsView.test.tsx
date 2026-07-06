@@ -13,13 +13,13 @@ const rules: Rule[] = [
     rule_id: "rule-deploy-123456",
     enabled: true,
     trigger: {
-      MessagePosted: {
+      message_posted: {
         channel_id: "general",
         mention: null,
         text_contains: "deploy",
       },
     },
-    action: { PostMessage: { channel_id: "ops", template: "Heads up: {text}" } },
+    action: { post_message: { channel_id: "ops", template: "Heads up: {text}" } },
     created_at: 1_700_000_000,
     fire_count: 3,
   },

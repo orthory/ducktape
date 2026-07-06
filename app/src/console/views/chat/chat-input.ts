@@ -24,9 +24,9 @@ const parseInline = (text: string): Span[] => {
     const idx = match.index ?? 0;
     if (idx > last) spans.push({ text: text.slice(last, idx), marks: [] });
     const groups = match.groups ?? {};
-    if (groups.b !== undefined) spans.push({ text: groups.b, marks: ["Bold"] });
-    else if (groups.i !== undefined) spans.push({ text: groups.i, marks: ["Italic"] });
-    else if (groups.url !== undefined) spans.push({ text: groups.url, marks: [{ Link: groups.url }] });
+    if (groups.b !== undefined) spans.push({ text: groups.b, marks: ["bold"] });
+    else if (groups.i !== undefined) spans.push({ text: groups.i, marks: ["italic"] });
+    else if (groups.url !== undefined) spans.push({ text: groups.url, marks: [{ link: groups.url }] });
     last = idx + match[0].length;
   }
   if (last < text.length) spans.push({ text: text.slice(last), marks: [] });
@@ -45,22 +45,22 @@ export const parseMessageInput = (raw: string): ChatBlock[] => {
   const blocks: ChatBlock[] = [];
   const pushParagraphs = (chunk: string) => {
     const trimmed = chunk.trim();
-    if (trimmed) blocks.push({ Paragraph: parseInline(trimmed) });
+    if (trimmed) blocks.push({ paragraph: parseInline(trimmed) });
   };
   let last = 0;
   for (const match of text.matchAll(FENCE)) {
     const idx = match.index ?? 0;
     if (idx > last) pushParagraphs(text.slice(last, idx));
-    blocks.push({ Code: { lang: match[1] || null, text: match[2].replace(/\n$/, "") } });
+    blocks.push({ code: { lang: match[1] || null, text: match[2].replace(/\n$/, "") } });
     last = idx + match[0].length;
   }
   if (last < text.length) pushParagraphs(text.slice(last));
-  return blocks.length > 0 ? blocks : [{ Paragraph: [{ text: raw.trim(), marks: [] }] }];
+  return blocks.length > 0 ? blocks : [{ paragraph: [{ text: raw.trim(), marks: [] }] }];
 };
 
 const spanToInput = (span: Span): string => {
-  if (span.marks.includes("Bold")) return `**${span.text}**`;
-  if (span.marks.includes("Italic")) return `*${span.text}*`;
+  if (span.marks.includes("bold")) return `**${span.text}**`;
+  if (span.marks.includes("italic")) return `*${span.text}*`;
   // A Link mark's URL is already its own text; mentions render as their handle.
   return span.text;
 };
@@ -71,9 +71,9 @@ const spanToInput = (span: Span): string => {
 export const blocksToInput = (blocks: ChatBlock[]): string =>
   blocks
     .map((block) => {
-      if (block === "Divider") return "---";
-      if ("Code" in block) return "```" + (block.Code.lang ?? "") + "\n" + block.Code.text + "\n```";
-      if ("Quote" in block) return block.Quote.map((span) => `> ${span.text}`).join("\n");
-      return block.Paragraph.map(spanToInput).join("");
+      if (block === "divider") return "---";
+      if ("code" in block) return "```" + (block.code.lang ?? "") + "\n" + block.code.text + "\n```";
+      if ("quote" in block) return block.quote.map((span) => `> ${span.text}`).join("\n");
+      return block.paragraph.map(spanToInput).join("");
     })
     .join("\n\n");

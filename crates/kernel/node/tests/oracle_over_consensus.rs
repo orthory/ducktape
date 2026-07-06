@@ -28,7 +28,7 @@ use commonware_runtime::{Runner as _, deterministic};
 use host::Host;
 use node::{OrderedNode, Orderer, RoundOrderer};
 use saga::SagaModule;
-use saga_interface::{
+use saga::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply, decode_worker_request,
     encode_msg, encode_query,
 };

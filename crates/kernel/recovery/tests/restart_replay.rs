@@ -9,7 +9,7 @@
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
-use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use host::Host;
 use node::{Disposition, OrderedNode, RoundOrderer};
 use recovery::{Manifest, Recovery};

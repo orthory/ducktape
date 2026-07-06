@@ -4,7 +4,7 @@
 //! pass before its votes can count at the boundary height.
 //!
 //! the source drives real content through each module's own execute +
-//! commit_block path (payloads built via the *-interface crates, exactly as the
+//! commit_block path (payloads built via the modules' crate-root wire types, exactly as the
 //! demo binary does), including OVERWRITES in kv and document: a qmdb root is
 //! op-log ordered, so a naive "export current pairs and re-apply" could never
 //! reproduce it — only the real sync path can. the joiner rebuilds kv, document,
@@ -15,18 +15,18 @@
 //! refused without disturbing the already-installed state.
 
 use agent::AgentModule;
-use agent_interface::{
+use agent::{
     ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentStatus,
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
     encode_query as agent_encode_query,
 };
 use runs::RunsModule;
-use runs_interface::{
+use runs::{
     RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
     encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use chat::Chat;
-use chat_interface::{
+use chat::{
     Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, MessageView, PostPolicy,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
@@ -40,26 +40,26 @@ use demo::state_sync::{
     encode_request,
 };
 use directory::Directory;
-use directory_interface::{DirMsg, encode_msg as dir_encode_msg};
+use directory::{DirMsg, encode_msg as dir_encode_msg};
 use document::Document;
-use document_interface::{
+use document::{
     Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
     encode_msg as doc_encode_msg, encode_query as doc_encode_query,
 };
 use forge::Forge;
-use forge_interface::{ForgeMsg, encode_msg as forge_encode_msg};
+use forge::{ForgeMsg, encode_msg as forge_encode_msg};
 use greeter::Greeter;
 use kv::Kv;
-use kv_interface::{KvMsg, encode as kv_encode};
+use kv::{KvMsg, encode as kv_encode};
 use saga::SagaModule;
-use saga_interface::{
+use saga::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
     encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use state::global_root;
 use valset::Valset;
-use valset_interface::{
+use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
 };

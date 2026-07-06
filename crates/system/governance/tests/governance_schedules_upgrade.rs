@@ -16,13 +16,13 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 use governance::Governance;
-use governance_interface::{
+use governance::{
     GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, decode_reply as gov_decode,
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
-use upgrade_interface::{UpgradeMsg, decode_msg as upgrade_decode};
+use upgrade::{UpgradeMsg, decode_msg as upgrade_decode};
 use valset::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {

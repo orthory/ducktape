@@ -18,43 +18,43 @@
 //! finalizes the board item with the validated response.
 
 use agent::AgentModule;
-use agent_interface::{
+use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentQuery, AgentReply,
     AgentResponse, AgentStatus, ReplyBlock, decode_reply, encode_msg, encode_query,
     encode_response,
 };
 use runs::{RunsModule, dispatch_id_for, job_run_id_for, reply_message_id, run_id_for};
-use runs_interface::{
+use runs::{
     PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
     encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use chat::Chat;
-use chat_interface::{
+use chat::{
     AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
 use commonware_runtime::{Runner as _, deterministic};
 use dispatch::DispatchModule;
-use dispatch_interface::{
+use dispatch::{
     DispatchQuery, DispatchReply, DispatchStatus, decode_work_spec,
     encode_query as dispatch_encode_query,
 };
 use host::{BlockContext, Host};
 use jobs::Jobs;
-use jobs_interface::{
+use jobs::{
     Job, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_reply as jobs_decode_reply,
     encode_msg as jobs_encode_msg, encode_query as jobs_encode_query,
 };
 use saga::SagaModule;
-use saga_interface::{
+use saga::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
     decode_worker_request, encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
 use sdk::{Effect, Msg, Origin, StateRoot};
 use tagging::TaggingModule;
 use tasks::Tasks;
-use tasks_interface::{
+use tasks::{
     TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
 };
 
@@ -63,7 +63,7 @@ use tasks_interface::{
 fn canned_response(run_id: &str) -> Vec<u8> {
     encode_response(&AgentResponse {
         reply_blocks: vec![ReplyBlock {
-            kind: "Paragraph".into(),
+            kind: "paragraph".into(),
             text: format!("quack: handling {run_id}"),
             lang: None,
         }],
@@ -270,7 +270,7 @@ async fn saga_status(host: &Host, saga_id: &str) -> Option<SagaStatus> {
 
 /// a run's dispatch as the dispatch module sees it — the lifecycle ledger,
 /// including the INTERNAL saga id the failure tests feed oracle results to.
-async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch_interface::DispatchView {
+async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch::DispatchView {
     let reply = host
         .query(
             "dispatch",
@@ -281,7 +281,7 @@ async fn agent_dispatch(host: &Host, run_id: &str) -> dispatch_interface::Dispat
         )
         .await
         .unwrap();
-    match dispatch_interface::decode_reply(&reply).unwrap() {
+    match dispatch::decode_reply(&reply).unwrap() {
         DispatchReply::Dispatch(Some(view)) => view,
         other => panic!("expected the run's dispatch, got {other:?}"),
     }
@@ -295,7 +295,7 @@ async fn dispatch_saga_id(host: &Host, run_id: &str) -> String {
     }
 }
 
-async fn chat_message(host: &Host, message_id: &str) -> Option<chat_interface::MessageView> {
+async fn chat_message(host: &Host, message_id: &str) -> Option<chat::MessageView> {
     let reply = host
         .query(
             "chat",

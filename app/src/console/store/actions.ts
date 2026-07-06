@@ -713,9 +713,9 @@ export function createActions({
         ?.reactors.some(
           (author) =>
             typeof author === "object" &&
-            "User" in author &&
-            author.User.length === selfBytes.length &&
-            author.User.every((byte, i) => byte === selfBytes[i]),
+            "user" in author &&
+            author.user.length === selfBytes.length &&
+            author.user.every((byte, i) => byte === selfBytes[i]),
         );
       submitTracked(
         opKey.messageSeq(channelId, seq),
@@ -753,7 +753,7 @@ export function createActions({
 
     advanceTask: (taskId) => {
       const task = getState().tasks.find((t) => t.id === taskId);
-      if (!task || task.status === "Done") return;
+      if (!task || task.status === "done") return;
       const status = nextTaskStatus(task.status);
       submitTracked(
         opKey.task(taskId),
@@ -954,7 +954,7 @@ export function createActions({
       submitTracked(
         opKey.agent(agentId),
         (live) => agentClient.pauseAgent(live, { agentId, origin: getState().author }),
-        (prev) => optimistic.agentPatched(prev, agentId, { status: "Paused" }),
+        (prev) => optimistic.agentPatched(prev, agentId, { status: "paused" }),
       );
     },
 
@@ -963,7 +963,7 @@ export function createActions({
       submitTracked(
         opKey.agent(agentId),
         (live) => agentClient.resumeAgent(live, { agentId, origin: getState().author }),
-        (prev) => optimistic.agentPatched(prev, agentId, { status: "Active" }),
+        (prev) => optimistic.agentPatched(prev, agentId, { status: "active" }),
       );
     },
 
@@ -1066,7 +1066,7 @@ export function createActions({
       submitTracked(opKey.proposal(proposalId), (live) =>
         governanceClient.propose(live, {
           proposalId,
-          action: { Signal: { text: body } },
+          action: { signal: { text: body } },
         }),
       );
     },
@@ -1144,7 +1144,7 @@ export function createActions({
             // the module stamps the REAL submitter from the block origin; the
             // refresh replaces these placeholders with committed truth.
             submitter: prev.author,
-            status: "Pending",
+            status: "pending",
             attempt: 0,
             claim: null,
             result: null,
@@ -1159,7 +1159,7 @@ export function createActions({
       submitTracked(
         opKey.job(jobId),
         (live) => jobsClient.claimJob(live, { jobId, leaseViews }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "Processing" }),
+        (prev) => optimistic.jobPatched(prev, jobId, { status: "processing" }),
       );
     },
 
@@ -1170,7 +1170,7 @@ export function createActions({
         (live) => jobsClient.finalizeJob(live, { jobId, ok, payload }),
         (prev) =>
           optimistic.jobPatched(prev, jobId, {
-            status: ok ? "Done" : "Failed",
+            status: ok ? "done" : "failed",
             result: { ok, payload },
           }),
       );
@@ -1181,7 +1181,7 @@ export function createActions({
       submitTracked(
         opKey.job(jobId),
         (live) => jobsClient.releaseJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "Pending", claim: null }),
+        (prev) => optimistic.jobPatched(prev, jobId, { status: "pending", claim: null }),
       );
     },
 
@@ -1190,7 +1190,7 @@ export function createActions({
       submitTracked(
         opKey.job(jobId),
         (live) => jobsClient.reclaimJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "Pending", claim: null }),
+        (prev) => optimistic.jobPatched(prev, jobId, { status: "pending", claim: null }),
       );
     },
 
@@ -1199,7 +1199,7 @@ export function createActions({
       submitTracked(
         opKey.job(jobId),
         (live) => jobsClient.cancelJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "Cancelled" }),
+        (prev) => optimistic.jobPatched(prev, jobId, { status: "cancelled" }),
       );
     },
 

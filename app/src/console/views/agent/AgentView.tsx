@@ -35,14 +35,14 @@ const ACTION_HINT: Record<string, string> = {
   "tasks.update_status": "Allow task status updates",
 };
 
-const POLICY_KINDS = ["Mention", "All", "RoundRobin", "Assigned"] as const;
+const POLICY_KINDS = ["mention", "all", "round_robin", "assigned"] as const;
 type PolicyKind = (typeof POLICY_KINDS)[number];
 
 const POLICY_LABEL: Record<PolicyKind, string> = {
-  Mention: "Mention",
-  All: "All",
-  RoundRobin: "Round-robin",
-  Assigned: "Assigned",
+  mention: "Mention",
+  all: "All",
+  round_robin: "Round-robin",
+  assigned: "Assigned",
 };
 
 type Tone = { text: string; bg: string; border: string };
@@ -129,9 +129,9 @@ const shortText = (value: string): string =>
   value.length > 32 ? `${value.slice(0, 18)}…${value.slice(-8)}` : value;
 
 const ownerText = (origin: SagaOrigin): string => {
-  if (origin === "System") return "system";
-  if ("Module" in origin) return `module:${origin.Module}`;
-  return `external:${shortHex(origin.External)}`;
+  if (origin === "system") return "system";
+  if ("module" in origin) return `module:${origin.module}`;
+  return `external:${shortHex(origin.external)}`;
 };
 
 const channelLabel = (channels: Channel[], channelId: string): string =>
@@ -141,10 +141,10 @@ const agentLabel = (agents: AgentRecord[], agentId: string): string =>
   agents.find((agent) => agent.agent_id === agentId)?.display_name ?? agentId;
 
 const policyText = (policy: TurnPolicy, agents: AgentRecord[]): string => {
-  if (policy === "Mention") return "Mention";
-  if (policy === "All") return "All agents";
-  if (policy === "RoundRobin") return "Round-robin";
-  return `Assigned · ${agentLabel(agents, policy.Assigned)}`;
+  if (policy === "mention") return "mention";
+  if (policy === "all") return "All agents";
+  if (policy === "round_robin") return "Round-robin";
+  return `Assigned · ${agentLabel(agents, policy.assigned)}`;
 };
 
 /** Every listed entry is by definition awaiting its dispatch delivery — the
@@ -369,7 +369,7 @@ function AgentListButton({
   op: OpRecord | undefined;
   onSelect: (agentId: string) => void;
 }) {
-  const active = agent.status === "Active";
+  const active = agent.status === "active";
   return (
     <button
       type="button"
@@ -486,7 +486,7 @@ function AgentDetail({
     );
   }
 
-  const active = agent.status === "Active";
+  const active = agent.status === "active";
   return (
     <section aria-label="Agent detail" style={{ minWidth: 0 }}>
       <SectionLabel>AGENT DETAIL</SectionLabel>
@@ -1194,11 +1194,11 @@ function WatchForm({
   onWatch: (params: { channelId: string; policy: TurnPolicy }) => void;
 }) {
   const [channelId, setChannelId] = useState("");
-  const [kind, setKind] = useState<PolicyKind>("Mention");
+  const [kind, setKind] = useState<PolicyKind>("mention");
   const [assigned, setAssigned] = useState("");
 
   const policy: TurnPolicy | null =
-    kind === "Assigned" ? (assigned ? { Assigned: assigned } : null) : kind;
+    kind === "assigned" ? (assigned ? { assigned: assigned } : null) : kind;
   const ready = channelId !== "" && policy !== null;
 
   const submit = (event: FormEvent) => {
@@ -1206,7 +1206,7 @@ function WatchForm({
     if (!ready || !policy) return;
     onWatch({ channelId, policy });
     setChannelId("");
-    setKind("Mention");
+    setKind("mention");
     setAssigned("");
   };
 
@@ -1223,7 +1223,7 @@ function WatchForm({
         style={{
           display: "grid",
           gridTemplateColumns:
-            kind === "Assigned"
+            kind === "assigned"
               ? "minmax(0, 1fr) minmax(0, 1fr) minmax(120px, .8fr) auto"
               : "minmax(0, 1.1fr) minmax(130px, .8fr) auto",
           gap: 8,
@@ -1264,7 +1264,7 @@ function WatchForm({
             ))}
           </select>
         </div>
-        {kind === "Assigned" && (
+        {kind === "assigned" && (
           <div style={{ minWidth: 0 }}>
             <FieldLabel htmlFor="agent-watch-assigned">Assigned agent</FieldLabel>
             <select
@@ -1515,7 +1515,7 @@ export function AgentView() {
     state.agents.find((agent) => agent.agent_id === selectedAgentId) ??
     state.agents[0] ??
     null;
-  const activeCount = state.agents.filter((agent) => agent.status === "Active").length;
+  const activeCount = state.agents.filter((agent) => agent.status === "active").length;
 
   const toggleJobWorker = () => {
     const next = !jobWorkerOn;

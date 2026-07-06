@@ -66,21 +66,19 @@
 //! the decoded temporaries before adopting them — the consensus-agreed root,
 //! not the peer, is the trust anchor.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use capability_interface::{
+use capability::{
     CapabilityQuery, CapabilityReply, decode_reply as capability_decode_reply,
     encode_query as capability_encode_query,
 };
-use saga_interface::{
-    MAX_CAPABILITY_BYTES, MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES,
-    MAX_SPEC_BYTES, SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, SagaQuery, SagaReply,
-    SagaStatus, SagaView, WorkerRequest, decode_msg, decode_query, encode_callback, encode_reply,
-    encode_worker_request,
-};
 use sdk::{Ctx, Effect, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use valset_interface::{
+use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_query as valset_encode_query,
 };
@@ -1048,7 +1046,7 @@ impl Module for SagaModule {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use saga_interface::{
+    use crate::{
         decode_callback, decode_reply, decode_worker_request, encode_msg, encode_query,
     };
     use sdk::{Env, Event};
@@ -1131,13 +1129,13 @@ mod tests {
         async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
             match target {
                 "valset" => match &self.validators {
-                    Some(v) => Ok(valset_interface::encode_reply(&ValsetReply::Validators(
+                    Some(v) => Ok(valset::encode_reply(&ValsetReply::Validators(
                         v.clone(),
                     ))),
                     None => Err(Error::QueryUnsupported),
                 },
                 "capability" => match &self.providers {
-                    Some(p) => Ok(capability_interface::encode_reply(
+                    Some(p) => Ok(capability::encode_reply(
                         &CapabilityReply::Providers(p.clone()),
                     )),
                     None => Err(Error::QueryUnsupported),

@@ -58,12 +58,12 @@
 //! deliberate: the alternative (auto-retaining every finalized job forever) is
 //! unbounded state growth. pruning is the submitter's explicit opt-in to forget.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use jobs_interface::{
-    BoardCounts, Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
-    decode_msg, decode_query, encode_event, encode_reply,
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 

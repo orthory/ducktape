@@ -7,7 +7,7 @@
 //! torn-down engine's queue.
 
 use directory::Directory;
-use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use futures::executor::block_on;
 use host::Host;
 use node::{BlockSink, OrderedNode, RoundOrderer};

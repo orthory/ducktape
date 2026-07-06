@@ -15,7 +15,7 @@ import {
 const block = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
   parent: "p1",
   page: "p1",
-  kind: "Paragraph",
+  kind: "paragraph",
   text: "",
   checked: false,
   children: [],
@@ -24,12 +24,12 @@ const block = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
 
 // the preorder snapshot of: p1 > [a, b(toggle) > [c], d(1.), e(2.)]
 const TREE: PageBlock[] = [
-  block({ id: "p1", parent: null, kind: "Page", text: "Plan", children: ["a", "b", "d", "e"] }),
+  block({ id: "p1", parent: null, kind: "page", text: "Plan", children: ["a", "b", "d", "e"] }),
   block({ id: "a", text: "first" }),
-  block({ id: "b", kind: "Toggle", text: "details", children: ["c"] }),
+  block({ id: "b", kind: "toggle", text: "details", children: ["c"] }),
   block({ id: "c", parent: "b", text: "inside" }),
-  block({ id: "d", kind: "Numbered", text: "one" }),
-  block({ id: "e", kind: "Numbered", text: "two" }),
+  block({ id: "d", kind: "numbered", text: "one" }),
+  block({ id: "e", kind: "numbered", text: "two" }),
 ];
 
 describe("buildRows", () => {
@@ -79,14 +79,14 @@ describe("move targets", () => {
 
 describe("markdown shortcuts", () => {
   it("maps typed prefixes to kinds and keeps the remainder", () => {
-    expect(shortcutFor("# hi")).toEqual({ kind: "Heading1", rest: "hi" });
-    expect(shortcutFor("### deep")).toEqual({ kind: "Heading3", rest: "deep" });
-    expect(shortcutFor("- item")).toEqual({ kind: "Bulleted", rest: "item" });
-    expect(shortcutFor("1. one")).toEqual({ kind: "Numbered", rest: "one" });
-    expect(shortcutFor("[ ] buy")).toEqual({ kind: "Todo", rest: "buy" });
-    expect(shortcutFor("[] buy")).toEqual({ kind: "Todo", rest: "buy" });
-    expect(shortcutFor("> said")).toEqual({ kind: "Quote", rest: "said" });
-    expect(shortcutFor("--- ")).toEqual({ kind: "Divider", rest: "" });
+    expect(shortcutFor("# hi")).toEqual({ kind: "heading1", rest: "hi" });
+    expect(shortcutFor("### deep")).toEqual({ kind: "heading3", rest: "deep" });
+    expect(shortcutFor("- item")).toEqual({ kind: "bulleted", rest: "item" });
+    expect(shortcutFor("1. one")).toEqual({ kind: "numbered", rest: "one" });
+    expect(shortcutFor("[ ] buy")).toEqual({ kind: "todo", rest: "buy" });
+    expect(shortcutFor("[] buy")).toEqual({ kind: "todo", rest: "buy" });
+    expect(shortcutFor("> said")).toEqual({ kind: "quote", rest: "said" });
+    expect(shortcutFor("--- ")).toEqual({ kind: "divider", rest: "" });
   });
 
   it("requires the trailing space — a bare prefix stays literal text", () => {
@@ -98,17 +98,17 @@ describe("markdown shortcuts", () => {
 describe("slash menu + list continuation", () => {
   it("filters the catalogue by label or kind", () => {
     expect(filterSlashKinds("head").map((o) => o.kind)).toEqual([
-      "Heading1",
-      "Heading2",
-      "Heading3",
+      "heading1",
+      "heading2",
+      "heading3",
     ]);
     expect(filterSlashKinds("").length).toBeGreaterThan(8);
   });
 
   it("continues list kinds on Enter and resets the rest to paragraphs", () => {
-    expect(continuationKind("Bulleted")).toBe("Bulleted");
-    expect(continuationKind("Todo")).toBe("Todo");
-    expect(continuationKind("Heading1")).toBe("Paragraph");
-    expect(continuationKind("Quote")).toBe("Paragraph");
+    expect(continuationKind("bulleted")).toBe("bulleted");
+    expect(continuationKind("todo")).toBe("todo");
+    expect(continuationKind("heading1")).toBe("paragraph");
+    expect(continuationKind("quote")).toBe("paragraph");
   });
 });

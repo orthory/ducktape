@@ -30,10 +30,10 @@ use commonware_utils::{NZU32, NZUsize};
 
 use consensus::{ContentStore, Digest, SimplexOrderer};
 use directory::Directory;
-use directory_interface::{DirMsg, encode_msg};
+use directory::{DirMsg, encode_msg};
 use host::Host;
 use kv::Kv;
-use kv_interface::{KvMsg, encode};
+use kv::{KvMsg, encode};
 use node::OrderedNode;
 use sdk::Msg;
 

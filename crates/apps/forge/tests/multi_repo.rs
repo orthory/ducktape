@@ -6,8 +6,8 @@
 //!     the same heads reached in either order compose to the SAME root.
 //!   - PER-REPO CAS ISOLATION: a stale push on one repo is rejected without
 //!     touching any other repo.
-//!   - BACK-COMPAT: a legacy `{Commit:{path,content,message}}` (no `repo`)
-//!     targets the "default" repo; `"Head"`/`ListRepos` see it.
+//!   - REPO DEFAULTING: a `{commit:{path,content,message}}` with no `repo` key
+//!     targets the "default" repo; `"head"`/`list_repos` see it.
 //!   - NAME VALIDATION: a bad slug is rejected deterministically.
 //!   - SNAPSHOT ROUND-TRIP + PACK-LESS DETERMINISM: N repos snapshot -> install
 //!     to an identical composed root, and a node WITHOUT a push's pack still
@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
-use forge_interface::{
+use forge::{
     ForgeMsg, ForgeQuery, ForgeReply, RepoHead, decode_reply, encode_msg, encode_query,
 };
 use futures::executor::block_on;
@@ -277,8 +277,8 @@ fn legacy_commit_targets_default_and_is_addressable() {
     let base = tmp_base("compat");
     let mut f = Forge::init("forge", base.clone()).unwrap();
 
-    // the EXACT legacy wire: a Commit with NO `repo` key.
-    let legacy = br#"{"Commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
+    // the EXACT single-repo wire: a commit with NO `repo` key.
+    let legacy = br#"{"commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
     let msg = Msg {
         target: "forge".into(),
         payload: legacy.to_vec(),

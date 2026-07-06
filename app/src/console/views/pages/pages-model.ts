@@ -51,7 +51,7 @@ export function buildRows(
     if (hidden) continue;
 
     const row: Row = { block, depth: parentDepth + 1 };
-    if (block.kind === "Numbered") {
+    if (block.kind === "numbered") {
       // preorder emits siblings of one parent as a contiguous run only at the
       // same depth, so track the run per parent and reset on any other kind.
       const run = (numberRuns.get(block.parent) ?? 0) + 1;
@@ -74,17 +74,17 @@ export interface Shortcut {
 
 // longest-first so "### " wins over "## " wins over "# ".
 const SHORTCUTS: [string, BlockKind][] = [
-  ["[ ] ", "Todo"],
-  ["### ", "Heading3"],
-  ["--- ", "Divider"],
-  ["``` ", "Code"],
-  ["## ", "Heading2"],
-  ["[] ", "Todo"],
-  ["# ", "Heading1"],
-  ["- ", "Bulleted"],
-  ["* ", "Bulleted"],
-  ["1. ", "Numbered"],
-  ["> ", "Quote"],
+  ["[ ] ", "todo"],
+  ["### ", "heading3"],
+  ["--- ", "divider"],
+  ["``` ", "code"],
+  ["## ", "heading2"],
+  ["[] ", "todo"],
+  ["# ", "heading1"],
+  ["- ", "bulleted"],
+  ["* ", "bulleted"],
+  ["1. ", "numbered"],
+  ["> ", "quote"],
 ];
 
 /** Detect a just-typed markdown prefix. The caller applies it only when the
@@ -98,18 +98,18 @@ export function shortcutFor(text: string): Shortcut | null {
 
 /** The slash-menu catalogue: every insertable kind (Page is CreatePage-only). */
 export const SLASH_KINDS: { kind: BlockKind; label: string; hint: string }[] = [
-  { kind: "Paragraph", label: "Text", hint: "plain paragraph" },
-  { kind: "Heading1", label: "Heading 1", hint: "# " },
-  { kind: "Heading2", label: "Heading 2", hint: "## " },
-  { kind: "Heading3", label: "Heading 3", hint: "### " },
-  { kind: "Bulleted", label: "Bulleted list", hint: "- " },
-  { kind: "Numbered", label: "Numbered list", hint: "1. " },
-  { kind: "Todo", label: "To-do", hint: "[] " },
-  { kind: "Toggle", label: "Toggle", hint: "collapsible children" },
-  { kind: "Quote", label: "Quote", hint: "> " },
-  { kind: "Code", label: "Code", hint: "``` " },
-  { kind: "Callout", label: "Callout", hint: "highlighted box" },
-  { kind: "Divider", label: "Divider", hint: "--- " },
+  { kind: "paragraph", label: "Text", hint: "plain paragraph" },
+  { kind: "heading1", label: "Heading 1", hint: "# " },
+  { kind: "heading2", label: "Heading 2", hint: "## " },
+  { kind: "heading3", label: "Heading 3", hint: "### " },
+  { kind: "bulleted", label: "Bulleted list", hint: "- " },
+  { kind: "numbered", label: "Numbered list", hint: "1. " },
+  { kind: "todo", label: "To-do", hint: "[] " },
+  { kind: "toggle", label: "Toggle", hint: "collapsible children" },
+  { kind: "quote", label: "Quote", hint: "> " },
+  { kind: "code", label: "Code", hint: "``` " },
+  { kind: "callout", label: "Callout", hint: "highlighted box" },
+  { kind: "divider", label: "Divider", hint: "--- " },
 ];
 
 /** Filter the slash menu by the text typed after "/". */
@@ -192,6 +192,6 @@ export function moveDownTarget(
 /** List kinds continue on Enter (a fresh sibling keeps the kind); everything
  *  else splits into a plain paragraph. */
 export const continuationKind = (kind: BlockKind): BlockKind =>
-  kind === "Bulleted" || kind === "Numbered" || kind === "Todo"
+  kind === "bulleted" || kind === "numbered" || kind === "todo"
     ? kind
-    : "Paragraph";
+    : "paragraph";

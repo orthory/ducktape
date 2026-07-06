@@ -9,15 +9,14 @@ version.workspace = true
 # it runs live in the agent registry, read by query — never held here.
 [dependencies]
 sdk = { workspace = true }
-runs-interface = { workspace = true }
-agent-interface = { workspace = true }
-chat-interface = { workspace = true }
-saga-interface = { workspace = true }
-tagging-interface = { workspace = true }
-dispatch-interface = { workspace = true }
-document-interface = { workspace = true }
-tasks-interface = { workspace = true }
-jobs-interface = { workspace = true }
+agent = { workspace = true }
+chat = { workspace = true }
+saga = { workspace = true }
+tagging = { workspace = true }
+dispatch = { workspace = true }
+document = { workspace = true }
+tasks = { workspace = true }
+jobs = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,11 +25,4 @@ async-trait = { workspace = true }
 [dev-dependencies]
 futures = "0.3"
 host = { workspace = true }
-agent = { workspace = true }
-chat = { workspace = true }
-saga = { workspace = true }
-tagging = { workspace = true }
-dispatch = { workspace = true }
-tasks = { workspace = true }
-jobs = { workspace = true }
 commonware-runtime = { workspace = true }

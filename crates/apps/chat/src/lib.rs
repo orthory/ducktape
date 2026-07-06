@@ -16,16 +16,16 @@
 //! block and flushed to qmdb in one batch at `commit_block`; the module root is
 //! the real qmdb root and the joiner path is commonware storage sync.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+// the derived-tier materialized view; registered only by serving binaries.
+pub mod index;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use chat_interface::{
-    AuthorRef, Block, Channel, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_CHANNEL_RECORD_BYTES,
-    MAX_EMOJI_BYTES, MAX_HOOKS_PER_CHANNEL, MAX_MESSAGE_HEAD_BYTES, MAX_QUERY_LIMIT,
-    MAX_REACTION_EMOJIS, MAX_REVISIONS, MAX_THREAD_REPLIES, Mark, MessageHead, MessageView,
-    PostPolicy, ReactionSummary, Thread, decode_msg, decode_query, encode_event, encode_reply,
-};
 use commonware_codec::RangeCfg;
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::Sequential;
@@ -43,7 +43,7 @@ use sdk::{
     Ctx, Error, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot, StateSyncHandle,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use tagging_interface::{TagEvent, TaggingMsg};
+use tagging::{TagEvent, TaggingMsg};
 
 /// the qmdb key: a fixed-width digest of a logical chat record key.
 type ChatKey = <Sha256 as Hasher>::Digest;
@@ -186,25 +186,25 @@ fn collect_mentions(blocks: &[Block]) -> Vec<AuthorRef> {
 
 /// chat's author shape in the tagging plane's vocabulary — the edge
 /// translation the plane's module-agnosticism depends on.
-fn tag_author(author: &AuthorRef) -> tagging_interface::Author {
+fn tag_author(author: &AuthorRef) -> tagging::Author {
     match author {
-        AuthorRef::User(key) => tagging_interface::Author::User(key.clone()),
+        AuthorRef::User(key) => tagging::Author::User(key.clone()),
         AuthorRef::Agent { module, agent_id } => {
-            tagging_interface::Author::Entity(tagging_interface::EntityRef {
+            tagging::Author::Entity(tagging::EntityRef {
                 module: module.clone(),
                 entity: agent_id.clone(),
             })
         }
-        AuthorRef::Module(module) => tagging_interface::Author::Module(module.clone()),
-        AuthorRef::System => tagging_interface::Author::System,
+        AuthorRef::Module(module) => tagging::Author::Module(module.clone()),
+        AuthorRef::System => tagging::Author::System,
     }
 }
 
 /// the entity tag a mention names, if it names a module-hosted entity at all
 /// (user mentions address people, not module entities — no tag).
-fn tag_ref(mention: &AuthorRef) -> Option<tagging_interface::EntityRef> {
+fn tag_ref(mention: &AuthorRef) -> Option<tagging::EntityRef> {
     match mention {
-        AuthorRef::Agent { module, agent_id } => Some(tagging_interface::EntityRef {
+        AuthorRef::Agent { module, agent_id } => Some(tagging::EntityRef {
             module: module.clone(),
             entity: agent_id.clone(),
         }),
@@ -290,7 +290,7 @@ where
         }
     }
 
-    /// report every post to `tagging` as a [`tagging_interface::TagEvent`].
+    /// report every post to `tagging` as a [`tagging::TagEvent`].
     pub fn with_tagging(mut self, tagging: impl Into<ModuleId>) -> Self {
         self.tagging = Some(tagging.into());
         self
@@ -1123,7 +1123,7 @@ where
                 if let Some(tagging) = &self.tagging {
                     ctx.emit_msg(Msg {
                         target: tagging.clone(),
-                        payload: tagging_interface::encode_msg(&TaggingMsg::Tag(TagEvent {
+                        payload: tagging::encode_msg(&TaggingMsg::Tag(TagEvent {
                             container: channel_id,
                             content_seq: posted.seq,
                             author: tag_author(&author),

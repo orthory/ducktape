@@ -97,7 +97,7 @@ describe("opForMessage", () => {
     seq,
     head: {
       message_id: messageId,
-      author: "System",
+      author: "system",
       blocks: [],
       created_at: 0,
       rev: 0,
