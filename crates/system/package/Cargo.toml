@@ -1,0 +1,21 @@
+[package]
+name = "package"
+edition.workspace = true
+version.workspace = true
+
+# the consensus package registry: quack install lifecycle rows plus the
+# tag -> owner action-route table (snapshot-bytes substrate). saga supplies the
+# canonical origin mirror; memory the prompt-seed publish wire types (and the
+# path/body caps the seeds must fit); sha2 the state-based root and the
+# prompt-content pin check.
+[dependencies]
+sdk = { workspace = true }
+saga = { workspace = true }
+memory = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
