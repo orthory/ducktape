@@ -18,6 +18,42 @@ is native Rust rather than Wasm.
 - `Module` provides `id`, `root`, `execute`, read projections, `commit_block`,
   and `abort_block`.
 
+## Lifecycle
+
+A module's lifecycle is the host-owned path from genesis registration to
+committed state transitions. Ducktape does not currently have runtime
+install/enable/disable rows for modules: every registered genesis module is
+active, and changing the module set is a new genesis or coordinated upgrade
+concern.
+
+The operational lifecycle is:
+
+1. **Register.** Genesis wires a module instance under its stable `ModuleId`.
+   Its initial `root()` becomes part of the first global app-hash.
+2. **Read committed state.** Between blocks, `query`, `query_with`,
+   `serve_sync`, and `state_sync_handle` describe or read committed state only.
+   They must not observe staged writes.
+3. **Execute and stage.** For each agreed `Msg`, the host calls `execute` with
+   deterministic `Env` and `Ctx`. The module validates the payload, reads its own
+   substrate, may ask the host for read-only projections, and stages any durable
+   writes in its private overlay.
+4. **Drain follow-ups.** Any emitted `Msg` is queued by the host and dispatched
+   later in the same block as a local follow-up. This is the only write path
+   across module boundaries.
+5. **Close the block.** If the drain finishes cleanly, the host calls
+   `commit_block` once for every touched module, in registry order. After it
+   returns, `root()` must include the staged writes. If any dispatch rejects or
+   the dispatch budget is exceeded, the host calls `abort_block` for touched
+   modules and the failed block leaves roots unchanged.
+6. **Serve finalized state.** At finalized boundaries the node may capture or
+   serve each module's committed sync surface. Snapshot modules export
+   installable bytes; resolver-backed modules expose a verified backend-specific
+   path anchored by the committed root.
+
+A failure inside `commit_block` or `abort_block` is not a deterministic rejected
+operation. It is a node-local boundary fault: the node must stop applying blocks
+because its registry may no longer match its peers.
+
 ## State Ownership
 
 Each module chooses the state substrate that fits it:

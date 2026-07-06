@@ -17,6 +17,7 @@ const humanPages = [
   'roadmap/what-is-left.mdx',
   'reference/repository-map.mdx',
   'reference/implementation-status.mdx',
+  'reference/design-records.mdx',
   'reference/gotchas.mdx',
 ]
 const agentPages = [
@@ -29,6 +30,7 @@ const agentPages = [
   'roadmap/open-work.mdx',
   'reference/repository-map.mdx',
   'reference/verification-matrix.mdx',
+  'reference/design-records.mdx',
   'reference/gotchas.mdx',
 ]
 const required = [

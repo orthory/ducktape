@@ -41,15 +41,17 @@ directory다. local state가 recovery checkpoint 없이 존재하면 boot는 in-
 
 ## Agent/Reactor Product Path
 
-agent module은 존재하고 demo/test는 model output을 ordered op로 commit하는 pattern을
-보여준다. `bin/node`/`bin/noded`는 아직 agent LLM worker를 실행하지 않는다. node의
-worker set은 비어 있고, production genesis에는 `agent`가 없으며, live operator UX로
-tasks에 연결되어 있지 않다.
+live node는 이제 module set에 `agent`, `runs`, `jobs`, `dispatch`, `saga`,
+`capability`, `tagging`을 포함한다. local capability provider를 discover하고,
+truthful tag set을 announce하며, 자기 key에 assign된 lease만 dispatch worker로
+실행한다. 남은 product work는 기본 agent execution loop가 아니라 더 풍부한 operator
+UX와 package-level behavior다: packaged agent와 harness, 더 넓은 action vocabulary,
+task obligation, debug surface가 아닌 native하게 느껴지는 durable agent workflow.
 
 ## Module Integration Wave
 
-다음 module wave는 implementation 전에 design/spec work가 먼저다. automations가
+다음 module wave는 이미 존재하는 module 사이의 integration work다. automations가
 inbox `Deliver`를 emit하고, automations trigger source가 memory watch에서 오고, 64
-KiB를 넘는 memory body가 files manifest를 통해 이동하고, agent가 jobs를 claim하고,
-tasks가 deadline state, cure/escalation lineage, atomic cross-module creation을 갖춘
-obligation pattern이 되어야 한다.
+KiB를 넘는 memory body가 files manifest를 통해 이동하고, package harness가 agent와
+action route를 소유하고, tasks가 deadline state, cure/escalation lineage,
+atomic cross-module creation을 갖춘 obligation pattern이 되어야 한다.

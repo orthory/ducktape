@@ -57,4 +57,5 @@ per worktree:  Xvfb :11x → tauri dev (isolated $HOME) → x11vnc 127.0.0.1:591
   script (no lifecycle control in the UI — deferred by design).
 - Activity source is git/worktree churn (provider-agnostic — works for any
   agent). The `<ActivityFeed>` is pluggable if you want a richer source later.
-- Design spec: `docs/superpowers/specs/2026-07-03-agent-qa-fleet-dashboard-design.md`.
+- Agent QA automation lives in `skills/qa/SKILL.md`; this README is the
+  maintained operator reference for the fleet dashboard.

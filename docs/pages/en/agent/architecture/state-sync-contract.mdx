@@ -27,5 +27,7 @@ must not partially advance the local root.
 ## Proof Surface
 
 `cargo test -p demo --test joiner_rebuilds_global_app_hash` proves in-process
-module rebuild and global app-hash composition. It does not prove live network
-serving from a running node.
+module rebuild and global app-hash composition. `cargo test -p demo --test
+network_joiner_full`, `cargo test -p node-bin --test cluster_e2e`, and
+`cargo test -p node-bin --test invite_e2e` prove the same boundary over the live
+state-sync wire from running nodes.

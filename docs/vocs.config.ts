@@ -22,6 +22,7 @@ const humanEn = [
     items: [
       { text: 'Repository Map', link: '/en/human/reference/repository-map' },
       { text: 'Implementation Status', link: '/en/human/reference/implementation-status' },
+      { text: 'Design Records', link: '/en/human/reference/design-records' },
       { text: 'Gotchas', link: '/en/human/reference/gotchas' },
     ],
   },
@@ -49,6 +50,7 @@ const humanKo = [
     items: [
       { text: 'Repository Map', link: '/ko/human/reference/repository-map' },
       { text: 'Implementation Status', link: '/ko/human/reference/implementation-status' },
+      { text: 'Design Records', link: '/ko/human/reference/design-records' },
       { text: 'Gotchas', link: '/ko/human/reference/gotchas' },
     ],
   },
@@ -72,6 +74,7 @@ const agentEn = [
     items: [
       { text: 'Repository Map', link: '/en/agent/reference/repository-map' },
       { text: 'Verification Matrix', link: '/en/agent/reference/verification-matrix' },
+      { text: 'Design Records', link: '/en/agent/reference/design-records' },
       { text: 'Gotchas', link: '/en/agent/reference/gotchas' },
     ],
   },
@@ -95,6 +98,7 @@ const agentKo = [
     items: [
       { text: 'Repository Map', link: '/ko/agent/reference/repository-map' },
       { text: 'Verification Matrix', link: '/ko/agent/reference/verification-matrix' },
+      { text: 'Design Records', link: '/ko/agent/reference/design-records' },
       { text: 'Gotchas', link: '/ko/agent/reference/gotchas' },
     ],
   },
