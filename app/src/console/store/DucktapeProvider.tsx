@@ -33,6 +33,7 @@ import {
   resolveNode,
 } from "../../domain/node-bootstrap";
 import * as profilesClient from "../../domain/profiles-client";
+import * as runsClient from "../../domain/runs-client";
 import * as tasksClient from "../../domain/tasks-client";
 import * as valsetClient from "../../domain/valset-client";
 import type { BlockRecord, NodeTransport } from "../../domain/transport";
@@ -133,9 +134,9 @@ export function DucktapeProvider({
                 .catch((): PageBlock[] | null => null)
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
-          agentClient.watches(live),
+          runsClient.watches(live),
           // newest-first for the timeline; the wire orders by dispatch id.
-          agentClient
+          runsClient
             .pendingRuns(live)
             .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),

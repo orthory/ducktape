@@ -315,7 +315,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
         "owner",
       );
       await submitStepped(
-        "agent",
+        "runs",
         { WatchChannel: { channel_id: "general", policy: "Mention" } },
         "owner",
       );
@@ -331,7 +331,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
                   { text: "hey ", marks: [] },
                   {
                     text: "@quackbot",
-                    marks: [{ Mention: { Agent: { module: "agent", agent_id: "quackbot" } } }],
+                    marks: [{ Mention: { Agent: { module: "runs", agent_id: "quackbot" } } }],
                   },
                   { text: " can you handle this?", marks: [] },
                 ],

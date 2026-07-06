@@ -1,22 +1,18 @@
-// The agents surface over the node's `agent` module — the collaboration
-// loop's dispatch-plane consumer. It stays render-only over useDucktape:
-// roster, watches, pending runs, and composers all submit through the store
-// action facade. Run lifecycle lives in the dispatch module; this surface
-// shows only the in-flight entries (pruned when a result delivers).
+// The agents surface over the `agent` registry and the `runs` module — the
+// collaboration loop's record book and its actor. It stays render-only over
+// useDucktape: roster, watches, pending runs, and composers all submit
+// through the store action facade. Run lifecycle lives in the dispatch
+// module; this surface shows only the in-flight entries (pruned when a
+// result delivers).
 //
 // No optimistic state: every write goes through the store's submit-then-refresh.
 
 import { useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
-import type {
-  AgentRecord,
-  PendingRun,
-  SagaOrigin,
-  TurnPolicy,
-  WatchView,
-} from "../../../domain/agent-client";
+import type { AgentRecord, SagaOrigin } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
+import type { PendingRun, TurnPolicy, WatchView } from "../../../domain/runs-client";
 import type { Channel } from "../../../domain/chat-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";

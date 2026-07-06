@@ -83,7 +83,9 @@ const makeFakeNode = () => {
         return Promise.resolve({ Head: forgeHead });
       }
       if (target === "agent") {
-        if (query === "Agents") return Promise.resolve({ Agents: [] });
+        return Promise.resolve({ Agents: [] });
+      }
+      if (target === "runs") {
         if (query === "Watches") return Promise.resolve({ Watches: [] });
         return Promise.resolve({ PendingRuns: [] });
       }
