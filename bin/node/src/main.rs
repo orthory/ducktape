@@ -99,7 +99,8 @@ use jobs::Jobs;
 use kv::Kv;
 use memory::Memory;
 use node::OrderedNode;
-use package::PackageModule;
+// `::` disambiguates the `package` crate from this binary's `mod package` (CLI verbs).
+use ::package::PackageModule;
 use pages::Pages;
 use profiles::Profiles;
 use recovery::{Manifest, Recovery};
