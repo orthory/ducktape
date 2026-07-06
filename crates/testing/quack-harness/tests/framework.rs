@@ -483,6 +483,98 @@ fn every_golden_step_kind_fails_readably() {
         // an expect_run selector-free step is a fixture error.
         let fixture = fixture_of(json!([{"expect_run": {"exists": true}}]));
         assert!(run_golden(&mut bed, &capsule, &fixture).await.is_err());
+
+        // an oracle step must carry EXACTLY one of response/error.
+        for oracle in [
+            json!([{"oracle": {}}]),
+            json!([{"oracle": {"response": {"reply_blocks": [], "actions": []},
+                               "error": "boom"}}]),
+        ] {
+            let err = run_golden(&mut bed, &capsule, &fixture_of(oracle))
+                .await
+                .expect_err("ambiguous oracle step must fail");
+            assert!(err.to_string().contains("exactly one"), "{err}");
+        }
+
+        // an unknown job status selector is a fixture error.
+        let fixture = fixture_of(json!([{"expect_job": {"status": "exploded", "count": 0}}]));
+        let err = run_golden(&mut bed, &capsule, &fixture)
+            .await
+            .expect_err("unknown status selector must fail");
+        assert!(err.to_string().contains("exploded"), "{err}");
+    });
+}
+
+// ---- the sweep's honesty boundary ---------------------------------------------------
+
+/// a module whose snapshot bytes are NOT its root preimage — what the sweep
+/// must refuse to bless for a caller-supplied module.
+struct Misrooted;
+
+#[async_trait::async_trait(?Send)]
+impl Module for Misrooted {
+    fn id(&self) -> String {
+        "misrooted".into()
+    }
+    fn root(&self) -> sdk::StateRoot {
+        sdk::StateRoot([9u8; 32])
+    }
+    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+        Ok(sdk::StateSyncHandle::SnapshotBytes(
+            b"not the preimage".to_vec(),
+        ))
+    }
+    async fn execute(
+        &mut self,
+        _ctx: &mut dyn sdk::Ctx,
+        _msg: &sdk::Msg,
+    ) -> Result<(), sdk::Error> {
+        Ok(())
+    }
+}
+
+/// a module that declares NO state-sync surface at all.
+struct Opaque;
+
+#[async_trait::async_trait(?Send)]
+impl Module for Opaque {
+    fn id(&self) -> String {
+        "opaque".into()
+    }
+    fn root(&self) -> sdk::StateRoot {
+        sdk::StateRoot([7u8; 32])
+    }
+    async fn execute(
+        &mut self,
+        _ctx: &mut dyn sdk::Ctx,
+        _msg: &sdk::Msg,
+    ) -> Result<(), sdk::Error> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_sweep_refuses_dishonest_and_uncovered_modules() {
+    // sha256(snapshot) != root: the framework must NOT bless it — the module
+    // owes its own snapshot suite instead of faked coverage here.
+    PackageTestBed::run(vec![Box::new(Misrooted)], |bed| async move {
+        let err = bed
+            .snapshot_roundtrip_all()
+            .await
+            .expect_err("a dishonest snapshot must fail the sweep");
+        assert!(
+            err.contains("misrooted") && err.contains("do not hash"),
+            "{err}"
+        );
+    });
+
+    // no sync surface at all: the ADR requires round-trip coverage.
+    PackageTestBed::run(vec![Box::new(Opaque)], |bed| async move {
+        let err = bed
+            .snapshot_roundtrip_all()
+            .await
+            .expect_err("an uncovered module must fail the sweep");
+        assert!(err.contains("opaque"), "{err}");
     });
 }
 
