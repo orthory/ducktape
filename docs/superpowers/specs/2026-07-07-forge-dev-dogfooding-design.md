@@ -51,17 +51,29 @@ changing; no `files` / `Push` / consensus change is in scope.**
 ### 1. Reader-path bug (`app/src-tauri/src/forge_git.rs`)
 
 The desktop Forge view (`ForgeView.tsx` → `forge-git-client` → `forge_git.rs`)
-reads the on-disk materialized repo. But `repo_candidates` yields the **base
-container** `<storage>/forge-repo`, while the module materializes repos one level
-down at `<storage>/forge-repo/<name>`. So `open_forge_repo` never finds a repo
-and `forge_head()` always returns `None` on desktop today — the view is empty
-even after a successful push.
+reads the on-disk materialized repo. But the reader opened the **base container**
+`<storage>/forge-repo`, while the module materializes repos one level down at
+`<storage>/forge-repo/<name>`. So it never found a repo and `forge_head()` always
+returned `None` on desktop — the view was empty even after a successful push. It
+also **hardcoded** the single repo's identity as `"ducktape"`
+(`forge-git-client.ts`), which would mislabel whatever repo was actually opened.
 
-**Fix:** in `open_forge_repo`, for each storage base, first try the base itself
-(legacy single-repo), then **scan the base's immediate subdirs** and open the
-first one (sorted) that is a git repo (`<sub>/.git` exists). Generic over the
-repo name — supports `forge/<repo>` for any `<repo>` — so no name is hardcoded in
-the reader. (forge inits **non-bare** repos, so the `.git` check holds.)
+**Fix — repo-name-generic, end to end (no hardcoded name anywhere):**
+
+- `forge_list_repos` (new command): enumerate every repo materialized under the
+  base(s) by its **real on-disk directory name**, with its committed head
+  (`BTreeMap`-sorted, deduped, first base wins). Whatever was pushed
+  (`ducktape`, `default`, …) shows up under its own name. (forge inits
+  **non-bare** repos, so the `<sub>/.git` check holds.)
+- The read commands (`forge_head`/`forge_log`/`forge_tree`/`forge_read_file`/
+  `forge_diff`) take a `repo` param and open `<base>/<repo>` via `open_named_repo`
+  — the caller (the UI's repo selection) says which repo to read.
+- `forge-git-client.ts` returns the real repos from `forge_list_repos` and
+  threads the repo name into every read; the hardcoded `"ducktape"` label and the
+  single-repo `forgeRepoInfo` shim are deleted.
+- `ForgeView.tsx` (which already has full multi-repo UI — repo cards, a repo
+  menu, `selectedRepo`) threads the selected repo's real name into the tree/file
+  reads via an `activeRepoRef`. Nothing browses a repo under the wrong label.
 
 ### 2. Dev-mode dogfood trigger — a static `ducktape-dev` remote
 
@@ -109,7 +121,14 @@ them faithfully.
 
 ## Files touched
 
-- `app/src-tauri/src/forge_git.rs` — descend into `<base>/<repo>` (scan).
-- `ops/dogfood-forge.sh` — new; resolve URL, register remote, push.
+- `app/src-tauri/src/forge_git.rs` — `forge_list_repos` + `open_named_repo`; the
+  read commands take a `repo` param (open `<base>/<repo>`).
+- `app/src-tauri/src/main.rs` — register `forge_list_repos`.
+- `app/src/domain/forge-git-client.ts` — real repo enumeration; repo param on
+  every read; drop the hardcoded `"ducktape"` label.
+- `app/src/console/views/forge/ForgeView.tsx` — thread the selected repo's real
+  name into the reads (`activeRepoRef`).
+- `ops/dogfood-forge.sh` — new; resolve URL, register `ducktape-dev`, push
+  `SRC_REF` (default `HEAD`, not stale `main`); warn on cross-worktree repoint.
 - `Makefile` — new `dogfood-forge` target.
 - `docs/superpowers/specs/2026-07-07-forge-dev-dogfooding-design.md` — this doc.

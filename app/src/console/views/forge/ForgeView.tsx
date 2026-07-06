@@ -123,6 +123,9 @@ export function ForgeView() {
 
   const fileRequestRef = useRef(0);
   const dirTokenRef = useRef(0);
+  // the repo the tree/file readers target — the real on-disk name of the
+  // currently-opened repo, so lazy dir/file loads read the right repo.
+  const activeRepoRef = useRef<string | null>(null);
 
   const selectedRepo = useMemo(
     () => repos?.find((repo) => repo.id === selectedRepoId) ?? null,
@@ -131,12 +134,14 @@ export function ForgeView() {
   const displayHead = localHead ?? selectedRepo?.head ?? state.forgeHead;
 
   const loadFile = useCallback((filePath: string) => {
+    const repo = activeRepoRef.current;
+    if (!repo) return;
     const req = ++fileRequestRef.current;
     setSelected(filePath);
     setFileText(null);
     setFileError(null);
     setFileLoading(true);
-    forgeReadFile(filePath)
+    forgeReadFile(repo, filePath)
       .then((text) => {
         if (fileRequestRef.current !== req) return;
         setFileText(text);
@@ -151,8 +156,10 @@ export function ForgeView() {
   }, []);
 
   const loadDir = useCallback((dir: string) => {
+    const repo = activeRepoRef.current;
+    if (!repo) return;
     const token = dirTokenRef.current;
-    forgeTree(dir)
+    forgeTree(repo, dir)
       .then((entries) => {
         if (dirTokenRef.current !== token) return;
         setTreeCache((cache) => ({ ...cache, [dir]: entries }));
@@ -199,6 +206,7 @@ export function ForgeView() {
     const token = dirTokenRef.current + 1;
     dirTokenRef.current = token;
     fileRequestRef.current += 1;
+    activeRepoRef.current = selectedRepo.name;
     setRootLoading(true);
     setLocalHead(selectedRepo.head);
     setTreeError(null);
@@ -217,7 +225,11 @@ export function ForgeView() {
       };
     }
 
-    Promise.allSettled([readLocalHead(), forgeTree(""), forgeLog(32)])
+    Promise.allSettled([
+      readLocalHead(selectedRepo.name),
+      forgeTree(selectedRepo.name, ""),
+      forgeLog(selectedRepo.name, 32),
+    ])
       .then(([headResult, treeResult, logResult]) => {
         if (!alive || dirTokenRef.current !== token) return;
         if (headResult.status === "fulfilled") setLocalHead(headResult.value);

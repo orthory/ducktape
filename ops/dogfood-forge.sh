@@ -23,13 +23,26 @@
 #   DUCKTAPE_DEV_FORGE_URL  node base URL override (no trailing /forge/<repo>)
 #   FORGE_REPO              forge repo name in the URL   (default: ducktape)
 #   FORGE_REMOTE            local git remote name        (default: ducktape-dev)
-#   SRC_REF                 local ref pushed to main     (default: main)
+#   SRC_REF                 local ref pushed to main     (default: HEAD)
+#
+# SRC_REF defaults to HEAD (the currently checked-out branch), NOT `main`:
+# per this repo's branching rules `main` only advances on an explicit release
+# and lags the `dev` trunk, so pushing the literal `main` ref would dogfood a
+# stale snapshot. HEAD dogfoods whatever you're actually working on.
+#
+# NOTE: `ducktape-dev` is a normal git remote, and git stores remotes in the
+# SHARED .git/config (git-common-dir) — visible to every `git worktree` of this
+# repo. If you run several worktrees each with their own node, they share this
+# one remote; the script re-resolves and re-points it every run (and warns when
+# the URL changes) so a run always targets the resolved node, but a stale
+# `git push ducktape-dev` from another worktree could hit the wrong node. Set
+# FORGE_REMOTE to a per-worktree name if you run many nodes at once.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 FORGE_REPO="${FORGE_REPO:-ducktape}"
 FORGE_REMOTE="${FORGE_REMOTE:-ducktape-dev}"
-SRC_REF="${SRC_REF:-main}"
+SRC_REF="${SRC_REF:-HEAD}"
 
 log() { printf '\033[36m[dogfood]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[dogfood]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -71,9 +84,14 @@ if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
 fi
 
 # idempotent remote wiring: add, or re-point if it already exists.
-if git remote get-url "$FORGE_REMOTE" >/dev/null 2>&1; then
+if existing="$(git remote get-url "$FORGE_REMOTE" 2>/dev/null)"; then
+  if [ "$existing" != "$REMOTE_URL" ]; then
+    log "WARNING: '$FORGE_REMOTE' currently points at $existing"
+    log "         re-pointing to $REMOTE_URL — this remote is SHARED across all git"
+    log "         worktrees of this repo, so this also moves it for other worktrees."
+  fi
   git remote set-url "$FORGE_REMOTE" "$REMOTE_URL"
-  log "re-pointed remote '$FORGE_REMOTE' -> $REMOTE_URL"
+  log "remote '$FORGE_REMOTE' -> $REMOTE_URL"
 else
   git remote add "$FORGE_REMOTE" "$REMOTE_URL"
   log "added remote '$FORGE_REMOTE' -> $REMOTE_URL"

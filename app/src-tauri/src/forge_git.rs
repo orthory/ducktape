@@ -6,6 +6,7 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -53,6 +54,15 @@ pub struct FileDiff {
     hunks: Vec<DiffHunk>,
 }
 
+/// one materialized repo under a forge base — its ACTUAL on-disk directory name
+/// (never a hardcoded label) and committed `refs/heads/main`, or `None` if unborn.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoMeta {
+    name: String,
+    head: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct Registry {
     active: Option<String>,
@@ -63,17 +73,29 @@ struct NodeToml {
     storage_dir: Option<String>,
 }
 
+/// list the repos this node has materialized under its forge base(s), by their
+/// real on-disk names — the desktop Forge view's repo list. Repo-name-agnostic:
+/// whatever was pushed (`ducktape`, `default`, ...) shows up under its own name.
 #[tauri::command]
-pub fn forge_head(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    let Some(repo) = open_forge_repo(&app)? else {
-        return Ok(None);
-    };
-    Ok(main_oid(&repo)?.map(|oid| oid.to_string()))
+pub fn forge_list_repos(app: tauri::AppHandle) -> Result<Vec<RepoMeta>, String> {
+    list_forge_repos(&app)
 }
 
 #[tauri::command]
-pub fn forge_log(app: tauri::AppHandle, limit: usize) -> Result<Vec<CommitInfo>, String> {
-    let Some(repo) = open_forge_repo(&app)? else {
+pub fn forge_head(app: tauri::AppHandle, repo: String) -> Result<Option<String>, String> {
+    let Some(git) = open_named_repo(&app, &repo)? else {
+        return Ok(None);
+    };
+    Ok(main_oid(&git)?.map(|oid| oid.to_string()))
+}
+
+#[tauri::command]
+pub fn forge_log(
+    app: tauri::AppHandle,
+    repo: String,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, String> {
+    let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(Vec::new());
     };
     let Some(head) = main_oid(&repo)? else {
@@ -95,9 +117,13 @@ pub fn forge_log(app: tauri::AppHandle, limit: usize) -> Result<Vec<CommitInfo>,
 }
 
 #[tauri::command]
-pub fn forge_tree(app: tauri::AppHandle, path: String) -> Result<Vec<TreeEntry>, String> {
+pub fn forge_tree(
+    app: tauri::AppHandle,
+    repo: String,
+    path: String,
+) -> Result<Vec<TreeEntry>, String> {
     let path = clean_repo_path(&path, true)?;
-    let Some(repo) = open_forge_repo(&app)? else {
+    let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(Vec::new());
     };
     let Some(commit) = main_commit(&repo)? else {
@@ -133,9 +159,13 @@ pub fn forge_tree(app: tauri::AppHandle, path: String) -> Result<Vec<TreeEntry>,
 }
 
 #[tauri::command]
-pub fn forge_read_file(app: tauri::AppHandle, path: String) -> Result<Option<String>, String> {
+pub fn forge_read_file(
+    app: tauri::AppHandle,
+    repo: String,
+    path: String,
+) -> Result<Option<String>, String> {
     let path = clean_repo_path(&path, false)?;
-    let Some(repo) = open_forge_repo(&app)? else {
+    let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(None);
     };
     let Some(commit) = main_commit(&repo)? else {
@@ -161,10 +191,11 @@ pub fn forge_read_file(app: tauri::AppHandle, path: String) -> Result<Option<Str
 #[tauri::command]
 pub fn forge_diff(
     app: tauri::AppHandle,
+    repo: String,
     from: Option<String>,
     to: Option<String>,
 ) -> Result<Vec<FileDiff>, String> {
-    let Some(repo) = open_forge_repo(&app)? else {
+    let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(Vec::new());
     };
     let from_tree = tree_for_spec(&repo, from.as_deref(), false)?;
@@ -247,55 +278,67 @@ pub fn forge_diff(
     Ok(files.into_inner())
 }
 
-fn open_forge_repo(app: &tauri::AppHandle) -> Result<Option<Repository>, String> {
-    for base in repo_candidates(app)? {
-        if let Some(repo) = open_repo_in_base(&base)? {
-            return Ok(Some(repo));
+/// Open a forge repo BY NAME from the first base that has materialized it.
+///
+/// forge namespaces repos at `<base>/<name>` (a `Push`/`Commit` creates the dir
+/// lazily), so the on-disk repo lives ONE LEVEL DOWN. The caller passes the repo
+/// name it wants to read (from [`list_forge_repos`]/the UI's selection), so
+/// nothing here hardcodes or guesses a repo name.
+fn open_named_repo(app: &tauri::AppHandle, repo: &str) -> Result<Option<Repository>, String> {
+    for base in forge_base_dirs(app)? {
+        let dir = base.join(repo);
+        if dir.join(".git").exists() {
+            return Repository::open(&dir)
+                .map(Some)
+                .map_err(|e| format!("open forge repo {}: {e}", dir.display()));
         }
     }
     Ok(None)
 }
 
-/// Open the git repo the forge module materialized under `base`.
-///
-/// forge namespaces repos at `<base>/<name>` (a `Push`/`Commit` creates the dir
-/// lazily), so the on-disk repo lives ONE LEVEL DOWN — scanning the base is what
-/// makes the desktop Forge view see a pushed repo at all. A repo AT `base` is
-/// still accepted for the legacy single-repo layout. Repo-name-agnostic: opens
-/// the first repo dir in sorted order (dev dogfooding materializes exactly one),
-/// so nothing here hardcodes the `ducktape`/`default` name.
-fn open_repo_in_base(base: &Path) -> Result<Option<Repository>, String> {
-    // legacy: the base dir is itself a repo.
-    if base.join(".git").exists() {
-        return Repository::open(base)
-            .map(Some)
-            .map_err(|e| format!("open forge repo {}: {e}", base.display()));
-    }
-    // multi-repo: `<base>/<name>` per repo. pick the first git repo, sorted so
-    // the choice is deterministic across reads.
-    let read = match fs::read_dir(base) {
-        Ok(read) => read,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("scan forge base {}: {err}", base.display())),
-    };
-    let mut repo_dirs: Vec<PathBuf> = Vec::new();
-    for entry in read {
-        let entry = entry.map_err(|e| format!("scan forge base {}: {e}", base.display()))?;
-        let path = entry.path();
-        if path.join(".git").exists() {
-            repo_dirs.push(path);
+/// Enumerate every repo materialized under the forge base(s), by its REAL on-disk
+/// directory name, with its committed `refs/heads/main` (or `None` if unborn).
+/// Sorted by name and de-duplicated (the first base wins) so the list is
+/// deterministic. A missing base is simply empty; a single flaky dir entry is
+/// skipped, not fatal.
+fn list_forge_repos(app: &tauri::AppHandle) -> Result<Vec<RepoMeta>, String> {
+    let mut repos: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for base in forge_base_dirs(app)? {
+        let read = match fs::read_dir(&base) {
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("scan forge base {}: {err}", base.display())),
+        };
+        for entry in read.flatten() {
+            let dir = entry.path();
+            if !dir.join(".git").exists() {
+                continue;
+            }
+            let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            if repos.contains_key(&name) {
+                continue; // first base wins
+            }
+            // a corrupt/unreadable repo lists with an unborn head rather than
+            // failing the whole enumeration.
+            let head = Repository::open(&dir)
+                .ok()
+                .and_then(|repo| main_oid(&repo).ok().flatten())
+                .map(|oid| oid.to_string());
+            repos.insert(name, head);
         }
     }
-    repo_dirs.sort();
-    match repo_dirs.into_iter().next() {
-        Some(dir) => Repository::open(&dir)
-            .map(Some)
-            .map_err(|e| format!("open forge repo {}: {e}", dir.display())),
-        None => Ok(None),
-    }
+    Ok(repos
+        .into_iter()
+        .map(|(name, head)| RepoMeta { name, head })
+        .collect())
 }
 
-fn repo_candidates(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
+/// the forge base container dir(s) this node materializes repos under, in
+/// priority order (active workspace storage, then the app-data node dir). each
+/// holds repos at `<base>/<name>`.
+fn forge_base_dirs(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
     let mut storages = Vec::new();
     if let Some(active) = active_workspace_storage(app)? {
         storages.push(active);
