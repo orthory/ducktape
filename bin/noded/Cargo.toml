@@ -40,6 +40,7 @@ forge = { workspace = true }
 # route pair; every other route stays module-agnostic opaque json).
 files = { workspace = true }
 memory = { workspace = true }
+package = { workspace = true }
 reactor = { workspace = true }
 # the blob lane shares the files wire constants (chunk cap) and, in tests, the
 # manifest verification helpers.

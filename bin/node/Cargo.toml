@@ -48,6 +48,7 @@ automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
+package = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }

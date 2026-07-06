@@ -98,6 +98,7 @@ use jobs::Jobs;
 use kv::Kv;
 use memory::Memory;
 use node::OrderedNode;
+use package::PackageModule;
 use pages::Pages;
 use profiles::Profiles;
 use recovery::{Manifest, Recovery};
@@ -200,7 +201,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 22] = [
+const MODULE_IDS: [&str; 23] = [
     "kv",
     "pages",
     "chat",
@@ -223,6 +224,7 @@ const MODULE_IDS: [&str; 22] = [
     "jobs",
     "agent",
     "runs",
+    "package",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
@@ -603,6 +605,17 @@ fn hex(root: &StateRoot) -> String {
     hex_bytes(&root.0)
 }
 
+/// the built-in action routes seeded into the package registry at genesis:
+/// the tasks module's built-in actions become action specs (per the quack
+/// ADR), owned by the "tasks" module. identical on every node — the seed is
+/// part of the genesis app-hash.
+fn builtin_action_routes() -> Vec<(String, String)> {
+    vec![
+        ("tasks.create".into(), "tasks".into()),
+        ("tasks.update_status".into(), "tasks".into()),
+    ]
+}
+
 /// the PRODUCTION module set — genesis state, identical on every node (a
 /// different set composes a different app-hash and the network forks at
 /// genesis). system infrastructure (kv, valset seeded with the genesis
@@ -692,6 +705,14 @@ async fn genesis_host(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
+        )),
+        // the quack package registry: install lifecycle rows plus the
+        // tag -> owner action-route table, with the built-in task actions
+        // seeded as routes; prompt seeds publish into "memory".
+        Box::new(PackageModule::new(
+            "package",
+            "memory",
+            builtin_action_routes(),
         )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -844,6 +865,12 @@ async fn restore_host(
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
+    let mut package = PackageModule::new("package", "memory", builtin_action_routes());
+    let (bytes, root) = snapshot_of("package")?;
+    package
+        .install(bytes, root)
+        .map_err(|e| format!("package install: {e}"))?;
+
     let mut directory = Directory::new("directory");
     let (bytes, root) = snapshot_of("directory")?;
     directory
@@ -877,6 +904,7 @@ async fn restore_host(
         Box::new(jobs),
         Box::new(agent),
         Box::new(runs),
+        Box::new(package),
         Box::new(directory),
         Box::new(automations),
     ])
@@ -1088,6 +1116,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("package").await?;
+    let mut package = PackageModule::new("package", "memory", builtin_action_routes());
+    package
+        .install(&bytes, root)
+        .map_err(|e| format!("package install: {e}"))?;
+
     let (bytes, root) = snapshot_of("automations").await?;
     let mut automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
     automations
@@ -1133,6 +1167,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(jobs),
         Box::new(agent),
         Box::new(runs),
+        Box::new(package),
         Box::new(automations),
         Box::new(directory),
     ])

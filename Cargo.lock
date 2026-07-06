@@ -1871,6 +1871,7 @@ dependencies = [
  "jobs",
  "kv",
  "memory",
+ "package",
  "profiles",
  "runs",
  "saga",
@@ -4043,6 +4044,7 @@ dependencies = [
  "memory",
  "node",
  "noded",
+ "package",
  "pages",
  "profiles",
  "rand 0.8.6",
@@ -4092,6 +4094,7 @@ dependencies = [
  "indexer",
  "jobs",
  "memory",
+ "package",
  "pages",
  "profiles",
  "reactor",
@@ -4539,6 +4542,20 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "primeorder",
+ "sha2",
+]
+
+[[package]]
+name = "package"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "memory",
+ "saga",
+ "sdk",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -5884,6 +5901,7 @@ dependencies = [
  "jobs",
  "memory",
  "noded",
+ "package",
  "pages",
  "profiles",
  "reactor",
