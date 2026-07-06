@@ -1,6 +1,6 @@
-//! a runnable super-app demo: sixteen registered modules — a qmdb-backed kv, a
+//! a runnable super-app demo: fifteen registered modules — a qmdb-backed kv, a
 //! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
-//! qmdb-backed block DOCUMENT module, a qmdb-backed block-based CHAT module, an
+//! qmdb-backed block-based CHAT module, an
 //! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
 //! orchestrator, a TASKS ledger, the origin-gated PROFILES name registry, the
 //! AUTOMATIONS rule engine, the INBOX notification queues, a content-addressed
@@ -34,11 +34,6 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
-use document::Document;
-use document::{
-    Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
-    encode_msg as doc_encode_msg, encode_query as doc_encode_query,
-};
 use files::Files;
 use forge::Forge;
 use forge::{
@@ -75,7 +70,6 @@ fn main() {
 
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real chain).
-        let document = Document::init(context.child("document"), "document").await;
         let kv = kv::Kv::init(context.child("kv"), "kv").await;
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
@@ -103,7 +97,6 @@ fn main() {
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            Some("document".into()),
         );
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let mut host = Host::genesis(vec![
@@ -111,7 +104,6 @@ fn main() {
             Box::new(directory),
             Box::new(greeter),
             Box::new(forge),
-            Box::new(document),
             Box::new(chat),
             Box::new(valset),
             Box::new(saga),
@@ -129,7 +121,7 @@ fn main() {
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 19 registered modules over one host ===");
+        println!("=== super-app demo — 18 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -139,10 +131,6 @@ fn main() {
         println!(
             "genesis valset root (empty set)     : {:?}",
             host.module_root("valset").unwrap()
-        );
-        println!(
-            "genesis document root (no docs)     : {:?}",
-            host.module_root("document").unwrap()
         );
         println!(
             "genesis chat root (no channels)     : {:?}",
@@ -397,82 +385,7 @@ fn main() {
         );
         println!("  app-hash       : {:?}", out.app_hash);
 
-        // block 7: the DOCUMENT module (ducktape's founding product, reborn as a
-        // simple block-based store on qmdb). create a doc, insert two blocks, then
-        // update one. each op is its own block (documents emit no follow-ups), and
-        // the document's qmdb merkle root moves into the app-hash on every commit.
-        println!("\n[block 7] document <- CreateDoc + 2x InsertBlock + UpdateBlock");
-        host.submit(Msg {
-            target: "document".into(),
-            payload: doc_encode_msg(&DocMsg::CreateDoc {
-                doc_id: "readme".into(),
-            }),
-        })
-        .await
-        .expect("doc create");
-        host.submit(Msg {
-            target: "document".into(),
-            payload: doc_encode_msg(&DocMsg::InsertBlock {
-                doc_id: "readme".into(),
-                after: None,
-                block: Block {
-                    id: "title".into(),
-                    kind: BlockKind::Heading,
-                    text: "ducktape".into(),
-                },
-            }),
-        })
-        .await
-        .expect("doc insert 1");
-        host.submit(Msg {
-            target: "document".into(),
-            payload: doc_encode_msg(&DocMsg::InsertBlock {
-                doc_id: "readme".into(),
-                after: Some("title".into()),
-                block: Block {
-                    id: "intro".into(),
-                    kind: BlockKind::Paragraph,
-                    text: "a block document".into(),
-                },
-            }),
-        })
-        .await
-        .expect("doc insert 2");
-        let out = host
-            .submit(Msg {
-                target: "document".into(),
-                payload: doc_encode_msg(&DocMsg::UpdateBlock {
-                    doc_id: "readme".into(),
-                    block_id: "intro".into(),
-                    text: "a simple, block-based document on qmdb".into(),
-                }),
-            })
-            .await
-            .expect("doc update");
-        println!("  app-hash       : {:?}", out.app_hash);
-        println!(
-            "  document root  : {:?}",
-            host.module_root("document").unwrap()
-        );
-
-        // read the whole doc back out (typed query) — the ordered blocks.
-        let reply = host
-            .query(
-                "document",
-                &doc_encode_query(&DocQuery::GetDoc {
-                    doc_id: "readme".into(),
-                }),
-            )
-            .await
-            .expect("query document");
-        if let DocReply::Doc(Some(blocks)) = doc_decode_reply(&reply).unwrap() {
-            println!("  readme blocks  :");
-            for b in &blocks {
-                println!("    - [{:?}] {} = {:?}", b.kind, b.id, b.text);
-            }
-        }
-
-        // block 8: the agent-collaboration loop (design §3). register an agent
+        // block 7: the agent-collaboration loop (design §3). register an agent
         // (which model+prompt it runs is committed into the app-hash), watch
         // the chat channel under a Mention policy — the watch and chat's hook
         // registration commit atomically — enable the runs module as the
@@ -491,13 +404,12 @@ fn main() {
                     display_name: "Quackbot".into(),
                     capability: "mock-llm-1".into(),
                     prompt_hash: vec![7u8; 32],
-                    prompt_doc: None,
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                 }),
             },
         )
         .await
-        .expect("submit block 8 register");
+        .expect("submit block 7 register");
         host.submit_at(
             as_demo_user(),
             Msg {
@@ -506,7 +418,7 @@ fn main() {
             },
         )
         .await
-        .expect("submit block 8 enable jobs worker");
+        .expect("submit block 7 enable jobs worker");
         host.submit_at(
             as_demo_user(),
             Msg {
@@ -518,7 +430,7 @@ fn main() {
             },
         )
         .await
-        .expect("submit block 8 watch");
+        .expect("submit block 7 watch");
         let out = host
             .submit_at(
                 as_demo_user(),
@@ -546,9 +458,9 @@ fn main() {
                 },
             )
             .await
-            .expect("submit block 8 mention");
+            .expect("submit block 7 mention");
         println!(
-            "\n[block 8] agent <- Register; runs <- EnableJobWorker(true); runs <- Watch(Mention); chat <- PostMessage(@quackbot)"
+            "\n[block 7] agent <- Register; runs <- EnableJobWorker(true); runs <- Watch(Mention); chat <- PostMessage(@quackbot)"
         );
         println!(
             "  effects        : {} WorkerRequest (the off-consensus LLM seam)",
@@ -608,7 +520,7 @@ fn main() {
         );
         println!("  app-hash       : {:?}", out.app_hash);
 
-        // block 9: the INBOX notification queue. modules deliver to a member as
+        // block 8: the INBOX notification queue. modules deliver to a member as
         // a follow-up so the notification commits atomically with its cause; here
         // an external submitter self-delivers a note to show the air-gap-native
         // path (no external push service). the queue holds it as consensus state.
@@ -632,8 +544,8 @@ fn main() {
                 },
             )
             .await
-            .expect("submit block 9");
-        println!("\n[block 9] inbox <- Deliver(quackbot) — a notification as consensus state");
+            .expect("submit block 8");
+        println!("\n[block 8] inbox <- Deliver(quackbot) — a notification as consensus state");
         let reply = host
             .query(
                 "inbox",
@@ -660,7 +572,6 @@ fn main() {
             "agent",
             "chat",
             "directory",
-            "document",
             "files",
             "forge",
             "greeter",

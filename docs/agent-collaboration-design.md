@@ -48,10 +48,10 @@ to keep these seven promises cheap and the two non-promises honest.
   Happens-before within a channel = sequence order.
 - **P4 — Anchored generation.** The ENTIRE model input is composed in
   consensus — the bounded transcript window ending at the anchor, the
-  agent's prompt document (verified against the registered `prompt_hash`),
-  and the strict output contract — and rides the dispatch as committed
-  payload data. Any validator holds the exact prompt input as ordered state,
-  and a reply is never presented as ordered before its anchor.
+  agent's prompt framing (pinned by the registered `prompt_hash`), and the
+  strict output contract — and rides the dispatch as committed payload data.
+  Any validator holds the exact prompt input as ordered state, and a reply is
+  never presented as ordered before its anchor.
 - **P5 — Result singularity.** Exactly one oracle result transitions a saga;
   duplicates and stale attempts are deterministic no-ops keyed by
   `(saga_id, attempt)`.
@@ -192,12 +192,13 @@ again: the permanent-abort loop. The rules, as implemented:
 **`agent` — the record book.**
 
 - `AgentRecord{agent_id, owner (origin), display_name, capability,
-  prompt_hash, prompt_doc, allowed_actions, status}` — registration is an
-  ordered op, so *which capability and prompt an agent runs is part of the
-  app-hash* and auditable. `capability` names WHAT a run needs (an open-set
-  registry tag); HOW it executes — binary, flags, model — is host policy in
-  each provider's spec, invisible to consensus. Prompt CONTENT lives in
-  `document`; consensus commits to the hash.
+  prompt_hash, allowed_actions, status}` — registration is an ordered op, so
+  *which capability and prompt an agent runs is part of the app-hash* and
+  auditable. `capability` names WHAT a run needs (an open-set registry tag);
+  HOW it executes — binary, flags, model — is host policy in each provider's
+  spec, invisible to consensus. Prompt CONTENT is content-addressed in the
+  node's blob store under `prompt_hash`; consensus commits to the hash and the
+  host resolves the content.
 - Ops: `RegisterAgent`/`UpdateAgent`/`PauseAgent`/`ResumeAgent` (owner-gated
   by origin). Registration and capability changes notify the hook (§3).
 - The response wire spec (`AgentResponse{reply_blocks, actions[]}`) lives in

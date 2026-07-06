@@ -319,7 +319,7 @@ impl ModuleCategory {
     /// or unknown module always groups sensibly rather than breaking the view.
     pub fn of(id: &str) -> Self {
         match id {
-            "chat" | "tasks" | "inbox" | "document" | "pages" => Self::Workspace,
+            "chat" | "tasks" | "inbox" | "pages" => Self::Workspace,
             "forge" | "agent" => Self::Developer,
             "automations" | "jobs" => Self::Automation,
             _ => Self::System,
@@ -793,7 +793,6 @@ pub fn open_index_store<S: AsRef<str>>(
                 store
                     .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
                     .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(document::index::DocumentIndex::new("document")))
                     .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
             )
         })
@@ -2068,7 +2067,7 @@ mod tests {
     #[test]
     fn module_categories_group_the_genesis_set() {
         use ModuleCategory::*;
-        for id in ["chat", "tasks", "inbox", "document", "pages"] {
+        for id in ["chat", "tasks", "inbox", "pages"] {
             assert_eq!(ModuleCategory::of(id), Workspace, "{id}");
         }
         for id in ["forge", "agent"] {

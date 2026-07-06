@@ -1861,7 +1861,6 @@ dependencies = [
  "commonware-storage",
  "directory",
  "dispatch",
- "document",
  "files",
  "forge",
  "futures",
@@ -2049,27 +2048,6 @@ name = "doctest-file"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
-
-[[package]]
-name = "document"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-parallel",
- "commonware-runtime",
- "commonware-storage",
- "commonware-utils",
- "indexer",
- "sdk",
- "serde",
- "serde_json",
- "state",
- "statesync",
- "tempfile",
- "tokio",
-]
 
 [[package]]
 name = "dom_query"
@@ -4053,7 +4031,6 @@ dependencies = [
  "directory",
  "dispatch",
  "dispatch-oracle",
- "document",
  "files",
  "forge",
  "futures",
@@ -4104,7 +4081,6 @@ dependencies = [
  "commonware-runtime",
  "dispatch",
  "dispatch-oracle",
- "document",
  "files",
  "flate2",
  "forge",
@@ -5441,7 +5417,6 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch",
- "document",
  "futures",
  "host",
  "jobs",
@@ -5900,7 +5875,6 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch",
- "document",
  "files",
  "forge",
  "futures",

@@ -39,7 +39,6 @@ dispatch = { workspace = true }
 tagging = { workspace = true }
 dispatch-oracle = { workspace = true }
 forge = { workspace = true }
-document = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }

@@ -260,7 +260,7 @@ export function SearchModal() {
             autoCorrect="off"
             autoCapitalize="off"
             spellCheck={false}
-            placeholder="Search chat, docs, members, files…"
+            placeholder="Search chat, pages, members, files…"
             aria-label="Search"
             onChange={(event) => setText(event.target.value)}
           />
@@ -270,7 +270,7 @@ export function SearchModal() {
         <div style={scroll}>
           {!query && (
             <p style={{ margin: "4px 10px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
-              Type to search chat, docs, members, and files.
+              Type to search chat, pages, members, and files.
             </p>
           )}
 
@@ -300,7 +300,7 @@ export function SearchModal() {
           )}
 
           {docHits.length > 0 && (
-            <Group title="Docs" count={docHits.length}>
+            <Group title="Pages" count={docHits.length}>
               {docHits.map((hit) => (
                 <HitButton
                   key={hit.blockId}

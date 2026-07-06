@@ -163,7 +163,7 @@ describe("PagesView", () => {
   });
 });
 
-describe("Docs keyboard shortcuts & tab strip", () => {
+describe("Pages keyboard shortcuts & tab strip", () => {
   const withTabs = (patch: Partial<ConsoleState> = {}) =>
     renderPagesView({ openTabs: ["p1", "p2", "p3"], activePage: "p1", ...patch });
 
@@ -212,7 +212,7 @@ describe("Docs keyboard shortcuts & tab strip", () => {
 
   it("keeps the tab strip scrollable but hides the scrollbar chrome", () => {
     withTabs();
-    const strip = screen.getByRole("tablist", { name: "Open documents" });
+    const strip = screen.getByRole("tablist", { name: "Open pages" });
     // scroll is retained (overflow-x auto) …
     expect(strip).toHaveStyle({ overflowX: "auto" });
     // … while the .no-scrollbar utility suppresses the global 10px bar.

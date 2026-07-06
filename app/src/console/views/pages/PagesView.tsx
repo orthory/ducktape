@@ -643,7 +643,7 @@ function PageRail({
         >
           <Icon name="pages" size={14} strokeWidth={1.7} />
         </span>
-        <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Docs</div>
+        <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Pages</div>
         <button
           type="button"
           aria-label="Refresh pages"
@@ -971,7 +971,7 @@ export function PagesView() {
 
   return (
     <div
-      data-screen-label="Docs"
+      data-screen-label="Pages"
       style={{
         flex: 1,
         minWidth: 0,
@@ -1015,7 +1015,7 @@ export function PagesView() {
                 background: color.paper,
               }}
             >
-              <div style={{ font: `600 15px ${font.sans}`, color: color.dark }}>Docs</div>
+              <div style={{ font: `600 15px ${font.sans}`, color: color.dark }}>Pages</div>
               {root ? (
                 <>
                   <span style={{ color: color.muted2 }}>/</span>
