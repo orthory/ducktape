@@ -1,8 +1,8 @@
-// A joiner's waiting room: its node has parked on the mesh and cannot serve the
-// app until a member admits it and the epoch cuts over. We surface this
-// workspace's identity (to hand a member) and the live park→admitted→promoted
-// phase the store polls off the node log. Once the promoted node's surface
-// answers, the store swaps this out for the console.
+// A joiner's waiting room: its node is joining the network's VPN and cannot
+// serve the app until its invite redeems and it syncs. We surface this
+// workspace's identity and the live joining→redeemed→synced phase the store
+// polls off the node log. Once the node's surface answers, the store swaps
+// this out for the console.
 
 import { useState, type CSSProperties } from "react";
 
@@ -10,24 +10,25 @@ import { color, font, radius } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import type { OnboardingPhase } from "../../../domain/workspace-client";
 
-// The ordered steps shown; the node's phase maps onto one of these. A tokened
-// invite delivers this identity to the members automatically (the lobby
-// announce); the identity card below stays as the manual fallback.
+// The ordered steps shown; the node's phase maps onto one of these. The
+// invite is the admission: the node delivers this identity to the members
+// automatically and a member node redeems it — no approval step. The
+// identity card below stays as the manual fallback for token-less joins.
 const STEPS = [
   {
-    label: "Parked on invite mesh",
-    detail: "Requesting to join — a member approves in their Members view",
+    label: "Joining the network",
+    detail: "Tunnel and announce are up — the invite redeems automatically",
   },
   {
-    label: "Admitted by a member",
-    detail: "Admission is recorded in the network",
+    label: "Invite redeemed",
+    detail: "Full-node standing is recorded in the network",
   },
   {
     label: "Finalized history synced",
     detail: "Projection catches up locally",
   },
   {
-    label: "Promoted to validator",
+    label: "Running as a full node",
     detail: "The console opens automatically",
   },
 ] as const;

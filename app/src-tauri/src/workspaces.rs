@@ -888,14 +888,16 @@ pub fn workspace_phase(app: tauri::AppHandle, id: String) -> Result<PhaseReport,
 fn classify(log: &str) -> PhaseReport {
     // (phase, marker substring). the strings are a contract with
     // bin/node/src/main.rs (asserted by bin/node/tests/invite_e2e.rs).
+    // "parked" is the phase id the webview already maps; since auto-
+    // redemption the underlying markers read "joining:" (no member approval
+    // step — the invite redeems itself).
     const MARKERS: &[(&str, &str)] = &[
-        ("parked", "joiner mode: parking"),
-        ("parked", "parked:"),
+        ("parked", "joiner mode:"),
+        ("parked", "joining:"),
         ("admitted", "admitted at epoch"),
         ("synced", "synced app_hash="),
         ("promoted", "promoted:"),
         ("fatal", "FATAL"),
-        ("fatal", "not admitted after"),
     ];
     let mut latest: Option<(&str, String)> = None;
     for line in log.lines() {
