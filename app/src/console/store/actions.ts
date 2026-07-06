@@ -29,6 +29,7 @@ import {
 import type { Action } from "./reducer";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
+import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
 import {
   addTab,
   channelIdOf,
@@ -103,6 +104,12 @@ export interface ConsoleActions {
    *  and push it. Called by the provider whenever a refresh lands a new
    *  snapshot while a huddle is active; a no-op when not huddling. */
   syncHuddleRecipients(): void;
+  /** Pop the huddle out into its own desktop window (Tauri only) — the in-app
+   *  card yields while the window is open. No-op when not in a huddle. */
+  popOutHuddle(): void;
+  /** Return the huddle to the in-app card, closing the window. Also invoked
+   *  when Rust reports the window destroyed (any way it dies). */
+  popInHuddle(): void;
 
   commitForge(params: { path: string; content: string; message: string }): void;
 
@@ -358,7 +365,8 @@ export function createActions({
       stopVoice();
       if (channelId) submitLeaveHuddle(channelId);
       if (status === "closed") {
-        patch({ voice: { channelId: null, muted: false, status: "idle", error: null } });
+        closeHuddleWindow();
+        patch({ voice: { channelId: null, muted: false, status: "idle", error: null, popped: false } });
       } else {
         update((prev) => ({
           voice: { ...prev.voice, status: "error", error: error ?? "connection" },
@@ -886,7 +894,10 @@ export function createActions({
       // deliberate act.
       voice = createVoiceSession(onVoiceStatus);
       voice.setMuted(true);
-      patch({ voice: { channelId, muted: true, status: "connecting", error: null } });
+      // a retry from the popped window must keep it popped — spread, don't reset.
+      update((prev) => ({
+        voice: { ...prev.voice, channelId, muted: true, status: "connecting", error: null },
+      }));
       voice.start(voiceSocketUrl(nodeUrl, channelId));
       pushRecipients(channelId);
     },
@@ -894,7 +905,8 @@ export function createActions({
     leaveHuddle: () => {
       const channelId = getState().voice.channelId;
       stopVoice();
-      patch({ voice: { channelId: null, muted: false, status: "idle", error: null } });
+      closeHuddleWindow();
+      patch({ voice: { channelId: null, muted: false, status: "idle", error: null, popped: false } });
       if (channelId) submitLeaveHuddle(channelId);
     },
 
@@ -904,6 +916,17 @@ export function createActions({
     },
 
     syncHuddleRecipients: () => pushRecipients(),
+
+    popOutHuddle: () => {
+      if (!getState().voice.channelId) return;
+      openHuddleWindow();
+      update((prev) => ({ voice: { ...prev.voice, popped: true } }));
+    },
+
+    popInHuddle: () => {
+      closeHuddleWindow();
+      update((prev) => ({ voice: { ...prev.voice, popped: false } }));
+    },
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;

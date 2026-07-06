@@ -13,12 +13,13 @@ import "@fontsource/ibm-plex-sans-kr/500.css";
 
 import "./console/theme/global.css";
 import { DucktapeConsole } from "./console/DucktapeConsole";
+import { HuddleWindow } from "./console/views/huddle/HuddleWindow";
 import { TrayPopover } from "./console/views/tray/TrayPopover";
 
-// The frameless menu-bar window (macOS) loads `index.html?view=tray` and renders
-// the popover instead of the full console. Every other window is the console.
-const isTray =
-  new URLSearchParams(window.location.search).get("view") === "tray";
+// Auxiliary windows pick their surface via `?view=`: the frameless menu-bar
+// popover (macOS, `view=tray`) and the popped-out huddle card (`view=huddle`).
+// Every other window is the full console.
+const view = new URLSearchParams(window.location.search).get("view");
 
 // dev-only: connect the tauri-plugin-mcp guest bindings so the socket helper
 // (app/scripts/tauri-debug.mjs) can run JS / inspect the DOM in this webview.
@@ -31,6 +32,6 @@ if (import.meta.env.DEV) {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    {isTray ? <TrayPopover /> : <DucktapeConsole />}
+    {view === "tray" ? <TrayPopover /> : view === "huddle" ? <HuddleWindow /> : <DucktapeConsole />}
   </React.StrictMode>,
 );

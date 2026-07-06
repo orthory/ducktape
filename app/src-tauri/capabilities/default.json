@@ -1,7 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "IPC baseline for the console (main) and the macOS menu-bar popover (tray): node_* commands, the core event API the ducktape://block stream and ducktape://navigate ride on, plus title-bar window dragging (the custom 44px TitleBar is a data-tauri-drag-region).",
-  "windows": ["main", "tray"],
-  "permissions": ["core:default", "core:window:allow-start-dragging"]
+  "description": "IPC baseline for the console (main) and the macOS menu-bar popover (tray): node_* commands, the core event API the ducktape://block stream and ducktape://navigate ride on, plus title-bar window dragging (the custom 44px TitleBar is a data-tauri-drag-region), and window close for the huddle pop-in control.",
+  "windows": [
+    "main",
+    "tray",
+    "huddle"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close"
+  ]
 }

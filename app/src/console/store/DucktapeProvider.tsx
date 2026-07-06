@@ -34,6 +34,14 @@ import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
 import { hasFreshPending } from "./finalization";
+import {
+  HUDDLE_CLOSED_EVENT,
+  HUDDLE_CMD_EVENT,
+  HUDDLE_STATE_EVENT,
+  applyHuddleWindowCmd,
+  buildHuddleWindowState,
+} from "./huddle-window";
+import type { HuddleWindowCmd } from "./huddle-window";
 import { reducer } from "./reducer";
 import {
   applySnapshot,
@@ -380,6 +388,66 @@ export function DucktapeProvider({
     window.addEventListener("pagehide", leaveOnHide);
     return () => window.removeEventListener("pagehide", leaveOnHide);
   }, [state.voice.channelId, state.nodeUrl, state.author]);
+
+  // 2e. Huddle pop-out bridge, sender half (desktop): while the huddle window
+  //     is open, mirror the session's display state to it. A fingerprint
+  //     dedupes the per-block channels churn. Protocol: store/huddle-window.ts.
+  const huddleStateFp = useRef("");
+  useEffect(() => {
+    if (!state.voice.popped || !isTauri()) return;
+    const snapshot = buildHuddleWindowState(state.voice, state.channels, state.authorNames);
+    if (!snapshot) return;
+    const fp = JSON.stringify(snapshot);
+    if (fp === huddleStateFp.current) return;
+    huddleStateFp.current = fp;
+    void import("@tauri-apps/api/event")
+      .then(({ emit }) => emit(HUDDLE_STATE_EVENT, snapshot))
+      .catch(() => {});
+  }, [state.voice, state.channels, state.authorNames]);
+
+  // 2f. ...and the receiver half: apply the window's commands to the store,
+  //     replay state on its ready handshake, and re-mount the in-app card when
+  //     Rust reports the window destroyed. Also closes a stale window left
+  //     over from a previous main-window life — the ephemeral session it
+  //     mirrored died with the reload.
+  useEffect(() => {
+    if (!isTauri()) return;
+    actions.popInHuddle();
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+    const hold = (un: () => void) => {
+      if (cancelled) un();
+      else unlisteners.push(un);
+    };
+    void import("@tauri-apps/api/event")
+      .then(({ listen, emit }) =>
+        Promise.all([
+          listen(HUDDLE_CMD_EVENT, (event) => {
+            const cmd = event.payload as HuddleWindowCmd;
+            const current = stateRef.current;
+            if (cmd.op === "ready") {
+              const snapshot = buildHuddleWindowState(
+                current.voice,
+                current.channels,
+                current.authorNames,
+              );
+              if (snapshot) void emit(HUDDLE_STATE_EVENT, snapshot);
+              return;
+            }
+            applyHuddleWindowCmd(cmd, actions, current.voice.channelId);
+          }),
+          listen(HUDDLE_CLOSED_EVENT, () => actions.popInHuddle()),
+        ]),
+      )
+      .then((uns) => uns.forEach(hold))
+      .catch(() => {
+        // event API unavailable (non-tauri / test stub) — the bridge no-ops.
+      });
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((un) => un());
+    };
+  }, [actions]);
 
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {
