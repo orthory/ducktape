@@ -12,6 +12,7 @@ import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
+import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
@@ -180,6 +181,9 @@ export interface ConsoleActions {
   stopNode(): void;
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
   startNode(): void;
+  /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
+   *  scrape fails — best-effort, for the poll-driven Metrics view. */
+  readMetrics(): Promise<NodeMetrics | null>;
   dismissError(): void;
 
   // ── Onboarding / workspaces (desktop only) ──
@@ -462,6 +466,13 @@ export function createActions({
 
     setAccent: (accent) => patch({ accent }),
     setAuthor: (author) => patch({ author }),
+
+    readMetrics: () => {
+      const live = getNode();
+      return live
+        ? live.metrics().then(parseMetrics).catch(() => null)
+        : Promise.resolve(null);
+    },
 
     // Keep the local author identity (still the web-origin string) AND submit
     // SetName so the chosen name propagates: it's origin-gated, so passing our

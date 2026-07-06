@@ -15,10 +15,9 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
   getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
   status: vi.fn(),
-  telemetry: vi.fn(),
+  metrics: vi.fn(),
   blocks: vi.fn(),
   onBlock: vi.fn(),
-  onTelemetry: vi.fn(),
 });
 
 describe("capabilities", () => {

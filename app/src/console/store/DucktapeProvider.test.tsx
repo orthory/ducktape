@@ -22,6 +22,7 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
     putBlob: vi.fn().mockResolvedValue("00".repeat(32)),
     getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
     status: vi.fn().mockRejectedValue(new Error("empty test node")),
+    metrics: vi.fn().mockResolvedValue(""),
     blocks: vi.fn().mockResolvedValue([]),
     onBlock: vi.fn(() => () => {}),
   };
@@ -135,6 +136,7 @@ const makeFakeNode = () => {
       height: 1,
       modules: [{ id: "chat", root: "cc".repeat(32) }],
     }),
+    metrics: vi.fn().mockResolvedValue(""),
     onBlock: vi.fn((listener: (block: BlockEvent) => void) => {
       blockListeners.add(listener);
       return () => blockListeners.delete(listener);

@@ -126,6 +126,13 @@ export interface NodeTransport {
   getBlob(digest: string): Promise<Uint8Array<ArrayBuffer>>;
   status(): Promise<NodeStatus>;
   /**
+   * The node's Prometheus/OpenMetrics scrape (`GET /metrics`) as raw text —
+   * commonware's runtime series plus this node's `ducktape_*` block series
+   * (height, blocks, apply-latency histogram, per-module dispatch counters).
+   * Parse with `domain/metrics`. Rejects when the node has no metrics surface.
+   */
+  metrics(): Promise<string>;
+  /**
    * Recent non-empty blocks from the node's ring, oldest-first — the
    * explorer's backing read. `limit` caps the count (default: all buffered).
    */
@@ -252,6 +259,14 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
         .then((res) => {
           if (!res.ok) throw new Error(`node replied ${res.status}`);
           return res.json() as Promise<NodeStatus>;
+        }),
+    // OpenMetrics text exposition (not json, not under /v1) — the scrape body.
+    metrics: () =>
+      Promise.resolve()
+        .then(() => fetch(`${base}/metrics`))
+        .then((res) => {
+          if (!res.ok) throw new Error(`node replied ${res.status}`);
+          return res.text();
         }),
     blocks: (limit) =>
       Promise.resolve()

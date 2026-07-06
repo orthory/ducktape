@@ -217,8 +217,12 @@ impl NodeMetrics {
                 "ducktape_block_height",
                 "latest committed local block height",
             ),
+            // NB: the registry appends the OpenMetrics `_total` suffix to a
+            // counter, so the exposed names are `ducktape_blocks_total` and
+            // `ducktape_dispatch_total{…}` — DON'T put `_total` in the name here
+            // or it doubles.
             blocks_total: context.counter(
-                "ducktape_blocks_total",
+                "ducktape_blocks",
                 "committed local blocks since daemon start",
             ),
             apply_latency: context.histogram(
@@ -227,7 +231,7 @@ impl NodeMetrics {
                 LATENCY_BUCKETS.into_iter(),
             ),
             dispatch_total: context.family(
-                "ducktape_dispatch_total",
+                "ducktape_dispatch",
                 "module dispatches, by module and trigger-origin kind",
             ),
         }

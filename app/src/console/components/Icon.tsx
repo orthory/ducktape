@@ -43,6 +43,7 @@ const PATHS: Record<string, ReactNode> = {
   check: <path d="M5 12.5l4 4 10-10" />,
   chevronRight: <path d="M9 6l6 6-6 6" />,
   hash: <path d="M9 4L7 20M17 4l-2 16M5 9h15M4 15h15" />,
+  metrics: <path d="M6 20v-7M12 20V6M18 20v-4M4 20h16" />,
   forge: (
     <>
       <path d="M6 4.5v9" />
