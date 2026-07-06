@@ -193,17 +193,21 @@ bound node key 집합을 저장한다 — 한 사람이 여러 node를 같은 us
 있다.
 
 `BindNode`는 SUBMIT하는 node(검증된 origin이며 절대 payload field가 아니다)를
-user에 bind하며, chain-id와 nonce로 scope된 preimage 위의 user-key
+user에 bind하며, chain-id ‖ node-key ‖ nonce preimage 위의 user-key
 signature로 동의를 증명한다 — certificate는 다른 network로 절대 replay될 수
-없고, stale nonce(이전 bind/unbind에서 남은)는 reject된다. 네트워크에 연결된
+없고, node A를 위해 mint된 cert는 node B를 절대 bind할 수 없으며, stale
+nonce(이전 bind/unbind에서 남은)는 reject된다. 네트워크에 연결된
 node에서는 `BindNode`가 추가로 현재 member에게 gate된다: origin이 validator나
 observer여야 하므로, 아무 standing도 없는 node는 스스로에게 user를 mint할 수
 없다. `UnbindNode`는 이런 gate가 없고 어떤 external origin에서든 accept된다 —
 살아남은 device가 잃어버린 device를 evict할 수 있다는 뜻이다 — 그리고
 user의 nonce를 bump해서 evict된 node를 위해 잡혀 있던 bind certificate를
-영원히 죽인다. `SetUserName`은 origin-gated일 뿐이다(bound node는 신뢰된
+영원히 죽인다. user의 마지막 node를 unbind해도 user record는 남는다 — name과
+nonce가 zero node로 persist하므로, 나중의 bind는 같은 identity로 resolve된다.
+`SetUserName`은 origin-gated일 뿐이다(bound node는 신뢰된
 hardware이므로 user signature가 필요 없다): submit하는 node가 bound된 user의
-display name을 profiles와 같은 64바이트 한도로 설정한다.
+display name을 profiles와 같은 64바이트 한도로 설정하며, nonce는 bump하지
+않는다 — user signature를 소비하지 않기 때문이다.
 
 bind는 per-node로 남는 것들을 바꾸지 않는다: mesh tracking, valset seat,
 quorum arithmetic은 이 module의 영향을 받지 않는다. validator 셋을 굴리는
