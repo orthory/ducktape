@@ -15,6 +15,7 @@
 
 import type { NodeTransport } from "./transport";
 import { replyVariant } from "./wire";
+import { keyHex } from "./chat-client";
 
 const TARGET = "capability";
 
@@ -35,3 +36,15 @@ export const capabilities = (transport: NodeTransport): Promise<string[]> =>
       }
       return [...tags].sort();
     });
+
+/** The registry as a per-node map: hex node key -> the executor tags that node
+ *  announced. Same `All` query as `capabilities`, but keeps the node key so a
+ *  member row can show what THAT node runs. Empty map when nothing is
+ *  announced. */
+export const capabilitiesByNode = (
+  transport: NodeTransport,
+): Promise<Map<string, string[]>> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, "all"))
+    .then((reply) => replyVariant<RegistryEntry[]>(reply, "all"))
+    .then((entries) => new Map(entries.map(([key, tags]) => [keyHex(key), tags])));

@@ -5,7 +5,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { capabilities } from "./capability-client";
+import { capabilities, capabilitiesByNode } from "./capability-client";
 import type { NodeTransport } from "./transport";
 
 const stubTransport = (reply?: unknown): NodeTransport => ({
@@ -40,5 +40,25 @@ describe("capabilities", () => {
   it("throws loudly on a reply that is not the All variant", async () => {
     const transport = stubTransport({ providers: [] });
     await expect(capabilities(transport)).rejects.toThrow(/wanted all/);
+  });
+});
+
+describe("capabilitiesByNode", () => {
+  it("keeps the node key: hex(node) -> its announced tags", async () => {
+    const transport = stubTransport({
+      all: [
+        [[1, 2], ["codex", "claude"]],
+        [[3, 4], ["ollama"]],
+      ],
+    });
+    const map = await capabilitiesByNode(transport);
+    expect(map.get("0102")).toEqual(["codex", "claude"]);
+    expect(map.get("0304")).toEqual(["ollama"]);
+    expect(transport.query).toHaveBeenCalledWith("capability", "all");
+  });
+
+  it("reads an empty registry as an empty map", async () => {
+    const transport = stubTransport({ all: [] });
+    expect((await capabilitiesByNode(transport)).size).toBe(0);
   });
 });
