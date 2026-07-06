@@ -35,6 +35,7 @@
 
 pub mod flow;
 pub mod plane;
+pub mod real;
 #[cfg(feature = "sim")]
 pub mod sim;
 pub mod transport;
@@ -45,6 +46,7 @@ pub use plane::{
     AdmissionPolicy, DataPlane, DatagramFlow, OpenError, PlaneConfig, RegisterError, SendError,
     StatsSnapshot, StreamService,
 };
+pub use real::{AddressBook, OverlaySockets};
 pub use transport::{DataPlaneTransport, PeerId, TransportError};
 pub use wire::{Hello, MAX_DATAGRAM, MAX_DATAGRAM_PAYLOAD};
 
