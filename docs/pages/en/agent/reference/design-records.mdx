@@ -1,0 +1,41 @@
+# Design Records
+
+Use this page to decide whether to read, update, or prune a non-page doc.
+Maintained reader docs belong in `docs/pages`; older planning files stay only
+when they still carry a decision, protocol detail, or operator procedure.
+
+## Read These First
+
+| Need | Authoritative record |
+|---|---|
+| Run or modify node upgrades | `docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md` plus [Node Upgrades](/en/agent/network/node-upgrades). |
+| Change package/module sharing | `docs/adr/2026-07-07-quack-packaged-modules.mdx`. |
+| Touch dispatch, saga, agent runs, or no-fail intake | `docs/agent-collaboration-design.md`. |
+| Change capability provider specs | `docs/capability-spec.md` and `crates/kernel/capability-host/src/spec.rs`. |
+| Change QMDB search/index projections | `docs/indexable-spec.md` and `crates/kernel/indexer/src/lib.rs`. |
+| Change invite/join/admit or admission state sync | `docs/validator-onboarding.md`, [State Sync Contract](/en/agent/architecture/state-sync-contract), and `bin/node/tests/invite_e2e.rs`. |
+| Touch WireGuard tunnel plans | `docs/wireguard-tunnel-upgrade.md` and `crates/system/wireguard-upgrade`. |
+| Touch sentry/coordinator/private cutover | `docs/superpowers/specs/2026-07-04-pluggable-network-entry-design.md`, `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`, and `docs/deploy/*`. |
+| Touch video huddles | `docs/adr/2026-07-06-video-call-module.mdx`, `docs/superpowers/specs/2026-07-06-video-call-build.md`, `bin/node/src/voice.rs`, and `app/src/console/views/chat/Huddle.tsx`. |
+
+## Pruning Test
+
+Before keeping a plan under `docs/superpowers/plans`, ask four questions:
+
+1. Does an operator still execute it?
+2. Does a future implementer need unresolved decisions from it?
+3. Is it referenced by code, a skill, or an ADR?
+4. Is the behavior already proven by checked-in tests and summarized in Vocs?
+
+If the answer is only the fourth item, fold the durable summary into Vocs and
+delete the plan. If a code comment points at the plan, retarget it to the ADR,
+spec, test, or Vocs page that now owns the fact.
+
+## Current Pruned Set
+
+This housekeeping pass folds shipped plans for pages/comments, agent visibility,
+agent setup simplification, chat polish, huddle pop-out, video calls, and the
+upgrade implementation into the maintained docs. It also deletes historical
+admission-boundary and restart-recovery notes that are now represented by Vocs
+summaries and tests. The deleted files were task execution scaffolds, not active
+contracts.

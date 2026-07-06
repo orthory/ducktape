@@ -1,0 +1,39 @@
+# Design Records
+
+non-page doc을 읽을지, 수정할지, prune할지 판단하기 위한 page다. 유지되는 reader
+doc은 `docs/pages`에 둔다. 오래된 planning file은 decision, protocol detail,
+operator procedure를 아직 담고 있을 때만 남긴다.
+
+## Read These First
+
+| Need | Authoritative record |
+|---|---|
+| node upgrade를 실행하거나 수정 | `docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`와 [Node Upgrades](/ko/agent/network/node-upgrades). |
+| package/module sharing 변경 | `docs/adr/2026-07-07-quack-packaged-modules.mdx`. |
+| dispatch, saga, agent run, no-fail intake 변경 | `docs/agent-collaboration-design.md`. |
+| capability provider spec 변경 | `docs/capability-spec.md`, `crates/kernel/capability-host/src/spec.rs`. |
+| QMDB search/index projection 변경 | `docs/indexable-spec.md`, `crates/kernel/indexer/src/lib.rs`. |
+| invite/join/admit 또는 admission state sync 변경 | `docs/validator-onboarding.md`, [State Sync Contract](/ko/agent/architecture/state-sync-contract), `bin/node/tests/invite_e2e.rs`. |
+| WireGuard tunnel plan 변경 | `docs/wireguard-tunnel-upgrade.md`, `crates/system/wireguard-upgrade`. |
+| sentry/coordinator/private cutover 변경 | `docs/superpowers/specs/2026-07-04-pluggable-network-entry-design.md`, `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`, `docs/deploy/*`. |
+| video huddle 변경 | `docs/adr/2026-07-06-video-call-module.mdx`, `docs/superpowers/specs/2026-07-06-video-call-build.md`, `bin/node/src/voice.rs`, `app/src/console/views/chat/Huddle.tsx`. |
+
+## Pruning Test
+
+`docs/superpowers/plans` 아래의 plan을 남기기 전에 네 가지를 확인한다.
+
+1. operator가 아직 이 절차를 실행하는가?
+2. future implementer에게 unresolved decision이 필요한가?
+3. code, skill, ADR에서 참조하는가?
+4. behavior가 이미 checked-in test로 증명되고 Vocs에 요약되어 있는가?
+
+네 번째만 해당하면 durable summary를 Vocs로 옮기고 plan은 삭제한다. code comment가
+plan을 가리키면 이제 그 사실을 소유하는 ADR, spec, test, Vocs page로 retarget한다.
+
+## Current Pruned Set
+
+이번 housekeeping pass는 pages/comments, agent visibility, agent setup
+simplification, chat polish, huddle pop-out, video calls, upgrade implementation
+plan을 maintained docs로 접는다. admission-boundary와 restart recovery의 historical
+note도 이제 Vocs summary와 test가 소유하므로 삭제한다. 삭제된 파일은 active
+contract가 아니라 task execution scaffold였다.

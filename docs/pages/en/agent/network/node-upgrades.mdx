@@ -10,12 +10,13 @@ removing a module id is a harder class that is OUT of the base no-downtime
 guarantee — see Failure And Abort Handling — and MUST NOT be driven as a plain
 height-gated upgrade.
 
-Mechanism is design-of-record, not yet wired in Rust. The authoritative spec is
-`docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`; drive an
-upgrade only against a binary that already implements the `upgrade` module,
-`GovAction::ScheduleUpgrade`/`CancelUpgrade`, and `SignalReady`. Do not present
-this procedure as available on a network whose binaries predate the `upgrade`
-module.
+Mechanism is implemented in the current node: `crates/system/upgrade` is in the
+genesis module set, governance emits `ScheduleUpgrade`/`CancelUpgrade`
+follow-ups, validators self-signal readiness, and `bin/node upgrade-status`
+queries live state. The authoritative design is
+`docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`. Do not
+present this procedure as available on a network whose binaries predate the
+`upgrade` module.
 
 ## Invariants You MUST Preserve
 

@@ -20,6 +20,10 @@ This status page is grounded in checked-in code, tests, and binaries.
   payload memory (pinned own submissions, FIFO-capped peer cache) and the
   `ValsetOrchestrator` for epoch scheduling — cutovers armed at the changing
   block's view, the next participant set read from state at the boundary.
+- `upgrade` is registered in the node module set. Governance can schedule and
+  cancel height-gated protocol upgrades, validators self-signal readiness, and
+  the node stamps `protocol_version` from committed upgrade state at activation
+  boundaries.
 - `statesync` defines the network state-sync wire protocol (manifest with the
   boundary's consensus coordinates and finalization floor, chunked snapshots,
   remote qmdb resolver) and the p2p transport binding.
@@ -28,9 +32,10 @@ This status page is grounded in checked-in code, tests, and binaries.
 
 ## Module State
 
-- QMDB-backed modules (kv, document, chat) expose real authenticated roots
-  and answer network state-sync over `serve_sync`; chat stores one record
-  per entity (no whole-history value, no 1 MiB commit bomb) with computed-key
+- QMDB-backed modules (kv, pages, chat) expose real authenticated roots
+  and answer network state-sync over `serve_sync`; pages stores nested page
+  trees, blocks, and comment threads together, while chat stores one record per
+  entity (no whole-history value, no 1 MiB commit bomb) with computed-key
   pagination.
 - Forge derives a 32-byte state root from git state and verifies object closure
   before install.

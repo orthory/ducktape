@@ -9,13 +9,17 @@
 - `state`는 module root를 order-independent app-hash로 합성한다.
 - `node`는 host application과 transport 또는 ordered delivery를 연결한다.
 - `consensus`에는 commonware Simplex-backed orderer가 있다.
+- `upgrade`는 node module set에 등록되어 있다. governance가 height-gated protocol
+  upgrade를 schedule/cancel하고, validator는 readiness를 self-signal하며, node는
+  activation boundary에서 committed upgrade state로부터 `protocol_version`을 stamp한다.
 - `reactor`는 worker result를 일반 message로 submit하여 non-deterministic worker
   boundary를 닫는다.
 
 ## Module State
 
-- QMDB-backed module(`kv`, `document`, `chat`)은 실제 authenticated root와
-  state-sync target을 노출한다.
+- QMDB-backed module(`kv`, `pages`, `chat`)은 실제 authenticated root와
+  state-sync target을 노출한다. `pages`는 nested page tree, block, comment thread를
+  함께 저장하고, `chat`은 entity당 record 하나를 쓴다.
 - Forge는 git state에서 32바이트 state root를 계산하고 install 전에 object closure를
   verify한다.
 - Snapshot-style module(`valset`, `saga`, `tasks`, `governance`, `vaults`,

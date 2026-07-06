@@ -6,7 +6,8 @@ that fits its job.
 
 ## Built or Started
 
-- `document` stores block-based documents on QMDB and exposes QMDB state sync.
+- `pages` stores nested block-based pages, page tabs, and comment threads on
+  QMDB, and exposes QMDB state sync.
 - `forge` stores git-backed project state, with a root derived from the git head
   and pack install guarded by connectivity verification.
 - `chat` is the storage-owning chat module: channels, threads, edits, reactions,
@@ -24,6 +25,52 @@ that fits its job.
 - `jobs` is a consensus-native work board with first-claim-wins claims.
 - `kv`, `valset`, `saga`, `governance`, `directory`, and `greeter` support
   infrastructure, examples, and tests.
+
+## Chat And Huddles
+
+Chat owns channels, message threads, edits, reactions, membership, and hook
+fan-out. It stores one QMDB record per entity instead of one whole-history
+value, which keeps hot channels from becoming commit bombs and lets reads page
+by computed keys.
+
+Huddles are attached to chat channels. Consensus stores the roster with
+`join_huddle`, `leave_huddle`, and `sweep_huddle`; media state such as mute,
+camera, and peer beacons stays ephemeral. The live node has a typed call socket
+and voice/video hub: audio and control ride the voice lane, camera fragments ride
+their own video lane, and the app renders a docked or popped-out huddle card.
+Current admission is intentionally local-live-flow based; harder roster-derived
+media admission remains a security hardening seam.
+
+## Pages
+
+Pages is the block editor module. It stores page roots, nested page parents,
+blocks, and comment threads in the same QMDB-backed module, so page content and
+comments state-sync together. Writes go through `CreatePage`, `SetPageParent`,
+`DeletePage`, `InsertBlock`, `UpdateText`, `SetKind`, `SetChecked`,
+`MoveBlock`, `RemoveBlock`, `AddComment`, `EditComment`, `DeleteComment`, and
+`ResolveThread`; reads include page/block lookups, page lists, and comment-thread
+queries for a page or visible block set.
+
+The UI mirrors that shape: a nested page tree, page tabs backed by
+`openTabs`, focus-light block editing, per-block comment affordances, and a
+right-hand comments panel. Comments are plain text for now and live in `pages`
+rather than a separate `comments` crate, which is the implemented divergence from
+the earlier redesign plan.
+
+## Agents And Runs
+
+The agent stack is split deliberately. `agent` is the registry: display names,
+executor requirement, prompt pins, permissions, status, watches, and run records.
+`runs` composes prompts from chat context, submits dispatch recipes, records
+responses, watches channels, and can opt into the jobs board. `dispatch` and
+`saga` own capability-routed execution and strict leases, so model output returns
+as ordered data rather than hidden local state.
+
+The node discovers local capability providers from operator specs, announces the
+truthful tag set to the `capability` module, and runs a dispatch worker only for
+leases assigned to its own key. The console joins that state back together:
+members show announced executor tags, agents use a registry-backed **Runs on**
+picker, and in-flight runs can show the node currently holding the saga lease.
 
 ## Inbox
 
