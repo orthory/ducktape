@@ -183,6 +183,10 @@ export interface ConsoleState {
    *  down/bricked) — reveal the force-forget override so a workspace whose node
    *  can never start is still removable. Cleared on any fresh forget attempt. */
   forgetNeedsForce: boolean;
+  /** The picker-row counterpart of `forgetNeedsForce`: the id of the workspace
+   *  whose guarded delete couldn't confirm its node left the valset, so its row
+   *  offers the force override. Null when no delete is awaiting escalation. */
+  deleteNeedsForce: string | null;
   /** A joiner's live park→promote phase while its node is not yet a ready
    *  validator; null on the founder/member path and once the node answers. */
   onboardingPhase: PhaseReport | null;
@@ -341,6 +345,7 @@ export const createInitialState = (): ConsoleState => {
     needsOnboarding: false,
     onboardingBusy: false,
     forgetNeedsForce: false,
+    deleteNeedsForce: null,
     onboardingPhase: null,
     inviteBlob: null,
   };

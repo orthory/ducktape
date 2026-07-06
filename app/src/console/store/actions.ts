@@ -272,6 +272,14 @@ export interface ConsoleActions {
    *  call again with `force` to override that uncertainty (the backend still
    *  refuses to force-tear-down a reachable, provably-live multi-member node). */
   forgetWorkspace(force?: boolean): void;
+  /** Delete a workspace BY ID from the picker: stop its node and remove its
+   *  directory + registry entry (the same guarded backend as forgetWorkspace,
+   *  so a live multi-member validator is refused). Deleting the active
+   *  workspace tears down and falls back like forgetWorkspace; deleting any
+   *  other only drops it from the list. A refused delete that couldn't confirm
+   *  the node left its valset flags `state.deleteNeedsForce` with this id —
+   *  call again with `force` to override that uncertainty. */
+  deleteWorkspace(id: string, force?: boolean): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -534,16 +542,44 @@ export function createActions({
       workspace: target,
       needsOnboarding: false,
       onboardingBusy: false,
-      // a force-forget offer is scoped to the workspace it was raised for;
-      // switching targets clears it so it can never fire on the wrong one.
+      // a force-forget/delete offer is scoped to the workspace it was raised
+      // for; switching targets clears it so it can never fire on the wrong one.
       forgetNeedsForce: false,
+      deleteNeedsForce: null,
       inviteBlob: null,
       // per-node observability belonging to the workspace we're leaving; the
       // node effect re-hydrates blocks and re-follows the block stream once
       // the new node is set below.
       lastBlock: null,
       blocks: [],
+      // a non-member target parks first: seed the waiting-room phase NOW so
+      // the console shell (still holding the previous workspace's residual
+      // projections) can never flash during the async select/poll below.
+      onboardingPhase: target.member ? null : { phase: "starting", detail: null },
     });
+    // Adopt the answering node ONLY once it proves it is THIS workspace's
+    // node: /v1/status carries the node's identity key and the registry
+    // records the workspace's. A recycled port can be held by something else
+    // (say, a zombie node of a forgotten workspace) — adopting that would
+    // silently open another workspace's data. An absent key on either side
+    // (an older node build) trusts the port, as before.
+    const identityMatches = (got: string | undefined): boolean =>
+      !got || !target.pubkey || got.toLowerCase() === target.pubkey.toLowerCase();
+    const rejectImpostor = (): void => {
+      patch({
+        workspace: null,
+        nodeUrl: null,
+        managed: false,
+        needsOnboarding: true,
+        onboardingPhase: null,
+        onboardingBusy: false,
+      });
+      fail(
+        `the process answering on "${target.name}"'s node port reports a ` +
+          `different node identity — not connecting. Another node is likely ` +
+          `still running on this port; quit it and try again.`,
+      );
+    };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
       .then((sel) => {
@@ -554,8 +590,12 @@ export function createActions({
           // founder / already-admitted member: the surface comes up promptly.
           return bootstrap.waitUntilUp(transport).then(() => {
             if (stale()) return;
-            patch({ onboardingPhase: null });
-            setNode(transport);
+            return transport.status().then((s) => {
+              if (stale()) return;
+              if (!identityMatches(s.publicKey)) return rejectImpostor();
+              patch({ onboardingPhase: null });
+              setNode(transport);
+            });
           });
         }
         // joiner: the node parks (no surface) until a member admits it and
@@ -564,8 +604,9 @@ export function createActions({
         const tick = (): Promise<void> => {
           if (stale()) return Promise.resolve();
           return transport.status().then(
-            () => {
+            (s) => {
               if (stale()) return;
+              if (!identityMatches(s.publicKey)) return rejectImpostor();
               patch({ onboardingPhase: null });
               setNode(transport);
             },
@@ -1359,27 +1400,58 @@ export function createActions({
     selectWorkspace: (id) => {
       const target = getState().workspaces.find((w) => w.id === id);
       if (!target || target.id === getState().workspace?.id) return;
-      // drop the old node + its projections so the switch shows no stale state.
-      setNode(null);
-      patch({
-        connected: false,
-        status: null,
-        channels: [],
-        messages: [],
-        activeChannel: null,
-        activeThread: null,
-        authorNames: {},
-        pages: [],
-        activePage: null,
-        activePageBlocks: [],
-        agents: [],
-        watches: [],
-        pendingRuns: [],
-        files: [],
-        ops: {},
-        onboardingPhase: null,
-      });
-      connectActive(target).catch(fail);
+      const enter = (): void => {
+        // drop the old node + its projections so the switch shows no stale state.
+        setNode(null);
+        patch({
+          connected: false,
+          status: null,
+          channels: [],
+          messages: [],
+          activeChannel: null,
+          activeThread: null,
+          authorNames: {},
+          pages: [],
+          activePage: null,
+          activePageBlocks: [],
+          agents: [],
+          watches: [],
+          pendingRuns: [],
+          files: [],
+          ops: {},
+          onboardingPhase: null,
+        });
+        connectActive(target).catch(fail);
+      };
+      if (target.member) {
+        enter();
+        return;
+      }
+      // A non-member workspace can't serve the console — its node parks until a
+      // member admits it. Entering it from the picker would only strand the
+      // user in the waiting room, so refuse a parked/never-started/fatal one
+      // with the honest status and STAY PUT (no registry repoint, no spawn).
+      // Admission that is actually progressing (admitted/synced/promoted — the
+      // node was seen mid-onboarding) proceeds: promoted connects straight, the
+      // rest resume the waiting room the join flow opened.
+      Promise.resolve()
+        .then(() => ws.workspacePhase(target.id))
+        .then((report) => {
+          if (report.phase === "fatal") {
+            fail(report.detail ?? `"${target.name}" failed to join its network`);
+            return;
+          }
+          if (report.phase === "parked" || report.phase === "starting") {
+            fail(
+              `"${target.name}" hasn't been admitted to its network yet — its ` +
+                `node parks until a member approves it. Ask a member to admit ` +
+                `you (rejoin with a fresh invite), or delete this workspace.`,
+            );
+            return;
+          }
+          enter();
+        })
+        .catch(fail);
     },
 
     connectRemote: (rawUrl) => {
@@ -1545,6 +1617,62 @@ export function createActions({
           // A force attempt that still fails does NOT re-reveal (no loop): the
           // backend only refuses force for a reachable, provably-live node.
           patch({ onboardingBusy: false, forgetNeedsForce: !force });
+          fail(err);
+        });
+    },
+
+    deleteWorkspace: (id, force = false) => {
+      const target = getState().workspaces.find((w) => w.id === id);
+      if (!target) return;
+      patch({ error: null, deleteNeedsForce: null });
+      // Same guarded backend as forgetWorkspace — refused while the node is
+      // still a current validator of a set of two-or-more. Only touch local
+      // state once the backend has actually forgotten it.
+      Promise.resolve()
+        .then(() => ws.forgetWorkspace(target.id, force))
+        .then((next) => {
+          const wasActive = getState().workspace?.id === target.id;
+          update((prev) => ({
+            workspaces: prev.workspaces.filter((w) => w.id !== target.id),
+          }));
+          // Deleting a workspace we're not connected to only drops its row —
+          // the registry's active pointer and the live connection are untouched.
+          if (!wasActive) return;
+          // Deleted the active one: drop the live node + its projections
+          // (mirrors forgetWorkspace), then repoint or fall back to the gate.
+          setNode(null);
+          patch({
+            connected: false,
+            status: null,
+            channels: [],
+            messages: [],
+            activeChannel: null,
+            activeThread: null,
+            authorNames: {},
+            pages: [],
+            activePage: null,
+            activePageBlocks: [],
+            agents: [],
+            watches: [],
+            pendingRuns: [],
+            ops: {},
+            onboardingPhase: null,
+            inviteBlob: null,
+          });
+          if (next) return connectActive(next);
+          patch({
+            workspace: null,
+            needsOnboarding: true,
+            onboardingBusy: false,
+            managed: false,
+            nodeUrl: null,
+          });
+        })
+        .catch((err) => {
+          // The forgetWorkspace escalation contract, scoped to this row: an
+          // unconfirmable node reveals the force override for exactly this
+          // workspace; a force attempt that still fails does not re-reveal.
+          patch({ deleteNeedsForce: force ? null : target.id });
           fail(err);
         });
     },
