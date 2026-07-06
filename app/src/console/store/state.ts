@@ -19,7 +19,7 @@ import type {
   PageSearchHit,
   TargetThreads,
 } from "../../domain/pages-client";
-import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type { BlockRecord, NodeStatus } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -27,6 +27,17 @@ import type { PhaseReport, Workspace } from "../../domain/workspace-client";
  *  participant "user" apps and the "operator" node/network surfaces. Neither
  *  side confers authority — it is purely which surfaces the rail shows. */
 export type ViewMode = "user" | "operator";
+
+/** The ephemeral voice-huddle slice. Lives OUTSIDE ConsoleSnapshot (like
+ *  telemetry): the roster is committed consensus state on the channel, but
+ *  whether THIS client is in a live audio session — and its mic/connection
+ *  state — is per-client and never re-projected from the node. `channelId` is
+ *  the channel we're huddling in (null = not in a huddle). */
+export interface VoiceSlice {
+  channelId: string | null;
+  muted: boolean;
+  status: "idle" | "connecting" | "live" | "error";
+}
 
 /** One search round-trip across the modules that ship materialized views —
  *  chat and docs (the `pages` module) searched with the same text, grouped.
@@ -64,6 +75,9 @@ export interface ConsoleState {
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
    *  into author rendering so messages show chosen names, not hex handles. */
   authorNames: Record<string, string>;
+  /** This client's live voice-huddle session — ephemeral, never in the
+   *  committed snapshot (see VoiceSlice). */
+  voice: VoiceSlice;
 
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
@@ -102,6 +116,10 @@ export interface ConsoleState {
   // ── Agents ──
   /** Every registered agent, re-queried per block like tasks. */
   agents: AgentRecord[];
+  /** Distinct executor tags announced network-wide (the `capability` registry),
+   *  sorted. Feeds the agent view's "Runs on" picker; empty when no host has
+   *  announced or the node predates the module (best-effort in the snapshot). */
+  capabilities: string[];
   /** Every channel watch and its turn policy. */
   watches: WatchView[];
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
@@ -121,14 +139,15 @@ export interface ConsoleState {
   /** Every file manifest (List, prefix ""), re-queried per block. */
   files: Manifest[];
 
-  /** Recent per-block node telemetry, oldest-first (the view renders newest
-   *  first). Node-local observability — never re-queried from committed state;
-   *  backfilled from the node's ring on connect, then followed live over ws. */
-  telemetry: TelemetryFrame[];
+  /** The newest finalized height seen on the ws block stream — updated
+   *  UNGATED (unlike the refresh the same stream drives, which is held while
+   *  an op is in flight), so the console always knows the chain moved. Null
+   *  until the first frame on this connection. */
+  lastBlock: number | null;
 
   /** Recent NON-EMPTY blocks, oldest-first (the explorer renders newest
-   *  first). Node-local observability like telemetry — re-pulled from the
-   *  node's ring on every refresh; empty on a node without the surface. */
+   *  first). Node-local observability — re-pulled from the node's ring on
+   *  every refresh; empty on a node without the surface. */
   blocks: BlockRecord[];
 
   /** Height the explorer should open on next render — the finalization-mark
@@ -285,6 +304,7 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
+    voice: { channelId: null, muted: false, status: "idle" },
     members: [],
     observers: [],
     proposals: [],
@@ -295,13 +315,14 @@ export const createInitialState = (): ConsoleState => {
     openTabs: loadDocTabs(),
     pageThreads: [],
     agents: [],
+    capabilities: [],
     watches: [],
     pendingRuns: [],
     search: null,
     searchPending: false,
     searchOpen: false,
     files: [],
-    telemetry: [],
+    lastBlock: null,
     blocks: [],
     explorerFocus: null,
     ops: {},
@@ -330,6 +351,7 @@ export interface ConsoleSnapshot {
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
+  capabilities: string[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
   files: Manifest[];
@@ -352,6 +374,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
+  capabilities: snapshot.capabilities,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
   files: snapshot.files,

@@ -12,5 +12,4 @@ nat-traversal = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]
-nat-traversal = { workspace = true, features = ["simnat"] }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "process", "io-util"] }

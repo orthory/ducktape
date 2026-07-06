@@ -62,6 +62,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             root: "ef".repeat(32),
                             category: ModuleCategory::of("chat"),
                         }],
+                        public_key: "ab".repeat(32),
                     });
                 }
                 NodeCommand::Metrics { reply } => {

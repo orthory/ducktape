@@ -15,6 +15,7 @@ import { color, font, radius } from "../../theme/tokens";
 import { selfAuthorKeyOf } from "./chat-helpers";
 import { Composer } from "./Composer";
 import { HoverButton } from "./HoverButton";
+import { HuddleHeaderButton, HuddleRailBadge } from "./Huddle";
 import { MessageList } from "./MessageList";
 import { ThreadPanel } from "./ThreadPanel";
 
@@ -188,6 +189,7 @@ function ChannelRail() {
               <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {channel.name}
               </span>
+              <HuddleRailBadge channel={channel} />
             </button>
           );
         })}
@@ -392,6 +394,7 @@ export function ChatView() {
               <LockGlyph size={10} /> Members only
             </span>
           )}
+          {channel && <HuddleHeaderButton channel={channel} />}
         </div>
 
         {channel ? (

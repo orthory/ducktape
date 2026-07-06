@@ -1,36 +1,15 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use crate::advert::{AdvertBook, AdvertOutcome};
 use crate::{Msg, NodeKey};
 
-/// Which side of an unordered relay pair a caller is. The pair is stored in
-/// canonical (byte-sorted) key order; `A` is the smaller key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    A,
-    B,
-}
-
-struct RelaySession {
-    a: NodeKey,
-    b: NodeKey,
-    last_activity: u64,
-}
-
-fn canonical_pair(x: NodeKey, y: NodeKey) -> (NodeKey, NodeKey) {
-    if x.0 <= y.0 { (x, y) } else { (y, x) }
-}
-
 /// The untrusted entry helper. Maps a node key to the reflexive address the
 /// coordinator observed for it, and brokers a simultaneous-open. Holds no key
-/// material, no plaintext, no mesh authority.
+/// material, no plaintext, no mesh authority — and never carries peer traffic:
+/// rendezvous only, no relay.
 #[derive(Default)]
 pub struct Coordinator {
     adverts: AdvertBook,
-    relay_by_pair: HashMap<(NodeKey, NodeKey), u64>,
-    relay_sessions: HashMap<u64, RelaySession>,
-    next_session: u64,
 }
 
 impl Coordinator {
@@ -73,52 +52,13 @@ impl Coordinator {
                 out
             }
             // The coordinator never routes these through `handle`:
-            // BindResponse/LookupResponse/PunchSync/Punch are node-directed;
-            // RelayRequest is intercepted by the async loop (it must bind
-            // sockets); RelayGrant is node-directed. Ignore defensively.
+            // BindResponse/LookupResponse/PunchSync/Punch are node-directed.
+            // Ignore defensively.
             Msg::BindResponse { .. }
             | Msg::LookupResponse { .. }
             | Msg::PunchSync { .. }
-            | Msg::Punch { .. }
-            | Msg::RelayRequest { .. }
-            | Msg::RelayGrant { .. } => Vec::new(),
+            | Msg::Punch { .. } => Vec::new(),
         }
-    }
-
-    /// Reachability-plane relay allocation. Given the caller's observed source
-    /// and the peer key it wants to relay to, return the shared session id for
-    /// the unordered `{caller, peer}` pair and which side the caller is. The
-    /// caller must have registered (so its source can be bound to its key),
-    /// else `None`.
-    ///
-    /// This is deliberately NOT the wireguard-upgrade validator relay: it never
-    /// produces a `ValidatorIdentity` or a `DirectDialFailureEvidence` and
-    /// carries no consensus authority. It holds only public `NodeKey`s and a
-    /// session id.
-    pub fn request_relay(
-        &mut self,
-        caller_src: SocketAddr,
-        peer: NodeKey,
-        now: u64,
-    ) -> Option<(u64, Side)> {
-        let caller = self.adverts.key_for_src(caller_src)?;
-        let (a, b) = canonical_pair(caller, peer);
-        let session = match self.relay_by_pair.get(&(a, b)) {
-            Some(&s) => s,
-            None => {
-                let s = self.next_session;
-                self.next_session = self.next_session.wrapping_add(1);
-                self.relay_by_pair.insert((a, b), s);
-                s
-            }
-        };
-        let entry = self
-            .relay_sessions
-            .entry(session)
-            .or_insert(RelaySession { a, b, last_activity: now });
-        entry.last_activity = now;
-        let side = if caller == a { Side::A } else { Side::B };
-        Some((session, side))
     }
 
     /// Reachability-plane rebind re-advertisement. A node whose NAT rebound
@@ -126,41 +66,9 @@ impl Coordinator {
     /// under a strictly-higher `nonce` to supersede its stale reflexive; an
     /// equal-or-lower nonce is rejected as stale (a replay cannot clobber the
     /// fresh mapping). After a `Superseded`, a peer's `Lookup` resolves the new
-    /// reflexive. This never touches relay/validator state.
+    /// reflexive.
     pub fn readvertise(&mut self, key: NodeKey, src: SocketAddr, nonce: u64) -> AdvertOutcome {
         self.adverts.readvertise(key, src, nonce)
-    }
-
-    /// Reclaim a single relay session by id: drop it from both `relay_sessions`
-    /// and the `relay_by_pair` index. After this, a later `request_relay` for
-    /// the same unordered pair allocates a FRESH session id (so the async
-    /// coordinator re-binds live relay sockets) instead of handing back a
-    /// torn-down one. Idempotent: releasing an unknown id is a no-op.
-    pub fn release_relay(&mut self, session: u64) {
-        if let Some(s) = self.relay_sessions.remove(&session) {
-            self.relay_by_pair.remove(&(s.a, s.b));
-        }
-    }
-
-    /// Number of live relay sessions. Lets tests assert the idle prune keeps
-    /// relay state bounded. (Public; not dead code in a plain build.)
-    pub fn relay_session_count(&self) -> usize {
-        self.relay_sessions.len()
-    }
-
-    /// Drop relay sessions idle longer than `idle_ticks`. Keeps relay state
-    /// bounded: a session with no traffic is torn down so the coordinator never
-    /// accumulates unbounded `SocketAddr` pairs.
-    pub fn prune_relays(&mut self, now: u64, idle_ticks: u64) {
-        let expired: Vec<u64> = self
-            .relay_sessions
-            .iter()
-            .filter(|(_, s)| now.saturating_sub(s.last_activity) > idle_ticks)
-            .map(|(&id, _)| id)
-            .collect();
-        for id in expired {
-            self.release_relay(id);
-        }
     }
 }
 
@@ -270,77 +178,5 @@ mod tests {
         let missing = NodeKey([0xcc; 32]);
         let out = c.handle(a_src, Msg::Lookup { key: missing });
         assert_eq!(out, vec![(a_src, Msg::LookupResponse { key: missing, reflexive: None })]);
-    }
-
-    #[test]
-    fn relay_request_allocates_one_session_per_unordered_pair() {
-        let mut c = Coordinator::new();
-        let a_src = addr(1, 1111);
-        let b_src = addr(2, 2222);
-        let a = NodeKey([0xaa; 32]);
-        let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
-        c.handle(b_src, Msg::Register { key: b });
-
-        let (s_a, side_a) = c.request_relay(a_src, b, 0).expect("a side");
-        let (s_b, side_b) = c.request_relay(b_src, a, 0).expect("b side");
-        // Same unordered pair -> one shared session, opposite sides.
-        assert_eq!(s_a, s_b);
-        assert_ne!(side_a, side_b);
-    }
-
-    #[test]
-    fn relay_request_without_registration_is_none() {
-        let mut c = Coordinator::new();
-        let stranger = addr(9, 9999);
-        assert!(c.request_relay(stranger, NodeKey([0xbb; 32]), 0).is_none());
-    }
-
-    #[test]
-    fn release_relay_reclaims_session_so_re_request_allocates_a_fresh_id() {
-        let mut c = Coordinator::new();
-        let a_src = addr(1, 1111);
-        let a = NodeKey([0xaa; 32]);
-        let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
-
-        let (s0, _) = c.request_relay(a_src, b, 0).expect("session");
-        // The torn-down splice's session is reclaimed by id.
-        c.release_relay(s0);
-        // Re-requesting the same unordered pair must NOT reuse the reclaimed id
-        // (which the async coordinator maps to a dead relay port); it allocates
-        // a fresh session so a live splice is bound.
-        let (s1, _) = c.request_relay(a_src, b, 0).expect("session");
-        assert_ne!(s0, s1);
-        // Releasing an unknown id is a harmless no-op.
-        c.release_relay(9_999);
-    }
-
-    #[test]
-    fn prune_relays_returns_state_to_zero_bounded() {
-        let mut c = Coordinator::new();
-        let a_src = addr(1, 1111);
-        let a = NodeKey([0xaa; 32]);
-        let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
-        let _ = c.request_relay(a_src, b, 0).expect("session");
-        assert_eq!(c.relay_session_count(), 1);
-        c.prune_relays(100, 10);
-        assert_eq!(c.relay_session_count(), 0, "idle prune bounds relay state");
-    }
-
-    #[test]
-    fn prune_relays_drops_idle_sessions() {
-        let mut c = Coordinator::new();
-        let a_src = addr(1, 1111);
-        let a = NodeKey([0xaa; 32]);
-        let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
-
-        let (s0, _) = c.request_relay(a_src, b, 0).expect("session");
-        c.prune_relays(100, 10); // idle 100 > 10 -> gone
-        // A fresh request re-allocates a NEW session id (the old one was pruned).
-        let (s1, _) = c.request_relay(a_src, b, 200).expect("session");
-        assert_ne!(s0, s1);
     }
 }

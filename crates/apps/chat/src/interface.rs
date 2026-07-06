@@ -31,6 +31,10 @@ pub const MAX_HOOKS_PER_CHANNEL: usize = 8;
 pub const MAX_THREAD_REPLIES: usize = 4096;
 /// query page bound; larger limits are clamped down to this.
 pub const MAX_QUERY_LIMIT: u64 = 256;
+/// participants per channel huddle; further joins are rejected.
+pub const MAX_HUDDLE_MEMBERS: usize = 32;
+/// a huddle member's node key: raw ed25519 public key bytes.
+pub const HUDDLE_NODE_KEY_BYTES: usize = 32;
 
 /// who authored a message — derived from `Env.origin`, never from a payload.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,6 +110,17 @@ pub enum PostPolicy {
     MembersOnly,
 }
 
+/// one participant of a channel's live huddle. `node` is the raw ed25519 key
+/// of the member's node — where peers route this participant's voice frames
+/// (the media plane authenticates by transport identity; this is routing, not
+/// authorship). `user` derives from `Env.origin` like every chat author.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HuddleMember {
+    pub user: Vec<u8>,
+    pub node: Vec<u8>,
+    pub joined_at: u64,
+}
+
 /// the per-channel record: metadata plus the head sequence counter that
 /// assigns every message's position (P3 — gap-free, in-state, at execute time).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -120,6 +135,11 @@ pub struct Channel {
     pub hooks: Vec<String>,
     /// pinned message sequences (no pin op yet; carried for the record shape).
     pub pinned: Vec<u64>,
+    /// the channel's live huddle roster, join order. empty = no huddle. the
+    /// roster is consensus state (who is in the room); the audio itself rides
+    /// the off-consensus voice plane.
+    #[serde(default)]
+    pub huddle: Vec<HuddleMember>,
 }
 
 /// the mutable head of one message. prior contents live in immutable revision
@@ -231,6 +251,14 @@ pub enum ChatMsg {
         user: Vec<u8>,
         member: bool,
     },
+    /// join (or start) the channel's huddle. external users only — huddles are
+    /// human affordances; members-only channels gate like posting. idempotent:
+    /// re-joining updates `node` (the joiner's node key, [`HUDDLE_NODE_KEY_BYTES`]
+    /// raw ed25519 bytes) and stages nothing when unchanged.
+    JoinHuddle { channel_id: String, node: Vec<u8> },
+    /// leave the channel's huddle. leaving a huddle one is not in is a
+    /// deterministic no-op; an empty roster means no huddle.
+    LeaveHuddle { channel_id: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

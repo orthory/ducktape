@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { keyHex } from "../../domain/chat-client";
+import type { Channel } from "../../domain/chat-client";
 import type { PageBlock } from "../../domain/pages-client";
 import * as optimistic from "./optimistic";
 import { createInitialState } from "./state";
@@ -137,6 +139,56 @@ describe("page block projections", () => {
     });
     const out = optimistic.pageBlockPatched(prev, "root", { text: "Launch Plan" });
     expect(out.pages).toEqual([{ id: "root", title: "Launch Plan", parent: null }]);
+  });
+});
+
+describe("huddle projections", () => {
+  const channel = (huddle?: Channel["huddle"]): Channel => ({
+    id: "general",
+    name: "General",
+    created_at: 0,
+    head_seq: 0,
+    post_policy: "open",
+    hooks: [],
+    pinned: [],
+    huddle,
+  });
+  const selfNode = [1, 2, 3, 4];
+
+  it("adds our node to the roster on join, and is idempotent", () => {
+    const prev = base({ channels: [channel()] });
+    const out = optimistic.huddleJoined(prev, {
+      channelId: "general",
+      node: selfNode,
+      author: "jess",
+      at: 42,
+    });
+    expect(out.channels![0].huddle).toEqual([
+      { user: Array.from(new TextEncoder().encode("jess")), node: selfNode, joined_at: 42 },
+    ]);
+
+    // re-joining with the same node key doesn't duplicate us.
+    const again = optimistic.huddleJoined(base({ channels: out.channels! }), {
+      channelId: "general",
+      node: selfNode,
+      author: "jess",
+      at: 99,
+    });
+    expect(again).toEqual({});
+  });
+
+  it("drops our node from the roster on leave, keeping others", () => {
+    const other = [9, 9, 9];
+    const prev = base({
+      channels: [
+        channel([
+          { user: [], node: selfNode, joined_at: 1 },
+          { user: [], node: other, joined_at: 2 },
+        ]),
+      ],
+    });
+    const out = optimistic.huddleLeft(prev, "general", keyHex(selfNode));
+    expect(out.channels![0].huddle).toEqual([{ user: [], node: other, joined_at: 2 }]);
   });
 });
 

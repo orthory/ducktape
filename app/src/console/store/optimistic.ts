@@ -8,7 +8,8 @@
 //
 // Everything here is a pure function of (previous state, op params).
 
-import type { ChatBlock, MessageView } from "../../domain/chat-client";
+import { keyHex } from "../../domain/chat-client";
+import type { ChatBlock, HuddleMember, MessageView } from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
 import type { PageBlock } from "../../domain/pages-client";
 import type { ConsoleState } from "./state";
@@ -168,6 +169,43 @@ export const channelCreated = (
           },
         ],
       };
+
+/** Add ourselves to a channel's huddle roster the instant we join, so the pill
+ *  and dock react before the block lands. Idempotent on our node key; the
+ *  refresh replaces the roster (with the module-assigned join order) after. */
+export const huddleJoined = (
+  prev: ConsoleState,
+  params: { channelId: string; node: number[]; author: string; at: number },
+): Partial<ConsoleState> => {
+  const channel = prev.channels.find((c) => c.id === params.channelId);
+  if (!channel) return {};
+  const selfHex = keyHex(params.node);
+  const roster = channel.huddle ?? [];
+  if (roster.some((m) => keyHex(m.node) === selfHex)) return {};
+  const member: HuddleMember = {
+    user: Array.from(new TextEncoder().encode(params.author)),
+    node: params.node,
+    joined_at: params.at,
+  };
+  return {
+    channels: prev.channels.map((c) =>
+      c.id === params.channelId ? { ...c, huddle: [...roster, member] } : c,
+    ),
+  };
+};
+
+/** Drop our own node from a channel's huddle roster the instant we leave. */
+export const huddleLeft = (
+  prev: ConsoleState,
+  channelId: string,
+  selfNodeHex: string,
+): Partial<ConsoleState> => ({
+  channels: prev.channels.map((c) =>
+    c.id === channelId
+      ? { ...c, huddle: (c.huddle ?? []).filter((m) => keyHex(m.node) !== selfNodeHex) }
+      : c,
+  ),
+});
 
 // ── Pages ───────────────────────────────────────────────
 

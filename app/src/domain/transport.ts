@@ -43,48 +43,26 @@ export interface NodeStatus {
   appHash: string;
   height: number;
   modules: ModuleStatus[];
-}
-
-// ── Telemetry ───────────────────────────────────────────
-//
-// The node-local observability plane: one frame per finalized block, carrying
-// the host's deterministic dispatch trace decorated with this node's wall-clock
-// apply latency. Delivered live over the ws stream and pullable (recent ring)
-// via GET /v1/telemetry. Keyed by (height, source) — the same space the future
-// on-consensus telemetry module uses.
-
-/** One dispatch in a block's drain — a module ran, triggered by `origin`. */
-export interface TelemetryDispatch {
-  module: string;
-  /** `"external"`, `"external:<name>"`, `"system"`, or `"module:<id>"`. */
-  origin: string;
-  emittedMsgs: number;
-  emittedEvents: number;
-}
-
-/** One observability event a module emitted during the block. */
-export interface TelemetryEvent {
-  source: string;
-  /** Best-effort utf-8 preview of the module-defined payload. */
-  payload: string;
-}
-
-export interface TelemetryFrame {
-  height: number;
-  /** The block's agreed logical clock — NOT this node's wall clock. */
-  consensusTime: number;
-  /** Node-local cost of applying the block, microseconds (non-deterministic). */
-  latencyUs: number;
-  dispatches: TelemetryDispatch[];
-  events: TelemetryEvent[];
+  /** This node's mesh identity as 64-char hex — the voice fan-out address and
+   *  the `node` key a join_huddle op carries. Empty string / absent on a legacy
+   *  daemon that can't do voice; the ui hides every huddle affordance then. */
+  publicKey?: string;
 }
 
 // ── Blocks (explorer) ───────────────────────────────────
 //
 // The explorer plane: one record per NON-EMPTY finalized block — heartbeat
 // nops never enter the node's ring, so this is real history, not idle ticks.
-// Node-local observability like telemetry: pulled from the ring via
-// GET /v1/blocks; a node without the surface reads as "no blocks".
+// Pulled via GET /v1/blocks; a node without the surface reads as "no blocks".
+
+/** One dispatch in a block's drain — a module ran, triggered by `origin`. */
+export interface DispatchInfo {
+  module: string;
+  /** `"external"`, `"external:<name>"`, `"system"`, or `"module:<id>"`. */
+  origin: string;
+  emittedMsgs: number;
+  emittedEvents: number;
+}
 
 /** How a block's op landed: an applied op mutated state; a rejected op
  *  finalized but rolled back — a failed tx. */
@@ -104,7 +82,7 @@ export interface BlockRecord {
   target: string;
   /** The dispatch trace, in drain order — the transactions inside the block.
    *  Empty for a rejected op (a deterministic no-op leaves no trace). */
-  operations: TelemetryDispatch[];
+  operations: DispatchInfo[];
   /** Capped utf-8 preview of the root op's payload (module `*Msg` json). */
   payload: string;
   /** Hex content address of the root op — sha256 of the committed payload
@@ -152,11 +130,12 @@ export interface NodeTransport {
   getBlob(digest: string): Promise<Uint8Array<ArrayBuffer>>;
   status(): Promise<NodeStatus>;
   /**
-   * Recent per-block telemetry from the node's ring, oldest-first — the
-   * backfill a client pulls on connect before following the live stream.
-   * `limit` caps the count (default: all buffered).
+   * The node's Prometheus/OpenMetrics scrape (`GET /metrics`) as raw text —
+   * commonware's runtime series plus this node's `ducktape_*` block series
+   * (height, blocks, apply-latency histogram, per-module dispatch counters).
+   * Parse with `domain/metrics`. Rejects when the node has no metrics surface.
    */
-  telemetry(limit?: number): Promise<TelemetryFrame[]>;
+  metrics(): Promise<string>;
   /**
    * Recent non-empty blocks from the node's ring, oldest-first — the
    * explorer's backing read. `limit` caps the count (default: all buffered).
@@ -164,8 +143,6 @@ export interface NodeTransport {
   blocks(limit?: number): Promise<BlockRecord[]>;
   /** Subscribe to finalized blocks. Returns the unsubscribe. */
   onBlock(listener: (block: BlockEvent) => void): () => void;
-  /** Subscribe to live per-block telemetry frames. Returns the unsubscribe. */
-  onTelemetry(listener: (frame: TelemetryFrame) => void): () => void;
 }
 
 // ── The transport ───────────────────────────────────────
@@ -176,11 +153,7 @@ interface WsBlockFrame {
   appHash: string;
 }
 
-interface WsTelemetryFrame extends TelemetryFrame {
-  type: "telemetry";
-}
-
-type WsFrame = WsBlockFrame | WsTelemetryFrame;
+type WsFrame = WsBlockFrame;
 
 const RECONNECT_DELAY_MS = 2_000;
 
@@ -202,16 +175,27 @@ const postJson = <T>(url: string, body: unknown): Promise<T> =>
       throw new Error(detail || `node replied ${res.status}`);
     });
 
+/** A node base url in its websocket form: trailing slash stripped, http→ws
+ *  scheme swap — the ONE derivation both the block stream and the voice
+ *  socket dial through. */
+const wsBase = (baseUrl: string): string =>
+  baseUrl.replace(/\/$/, "").replace(/^http/, "ws");
+
+/** The voice websocket url for a channel on the node at `baseUrl` — same
+ *  host/port as the daemon's http/ws surface. The audio session
+ *  (voice-session.ts) dials this; kept here because this is where the base
+ *  url and its ws form live. */
+export const voiceSocketUrl = (baseUrl: string, channel: string): string =>
+  `${wsBase(baseUrl)}/v1/voice/ws?channel=${encodeURIComponent(channel)}`;
+
 export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
-  const wsUrl = `${base.replace(/^http/, "ws")}/v1/ws`;
+  const wsUrl = `${wsBase(baseUrl)}/v1/ws`;
 
-  // One shared socket for every subscriber (blocks + telemetry); reconnects
-  // while any remain, closes once all unsubscribe.
+  // One shared socket for every block subscriber; reconnects while any
+  // remain, closes once all unsubscribe.
   const blockListeners = new Set<(block: BlockEvent) => void>();
-  const telemetryListeners = new Set<(frame: TelemetryFrame) => void>();
-  const hasSubscribers = (): boolean =>
-    blockListeners.size > 0 || telemetryListeners.size > 0;
+  const hasSubscribers = (): boolean => blockListeners.size > 0;
   let socket: WebSocket | null = null;
 
   const connect = (): void => {
@@ -224,10 +208,6 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
         case "block": {
           const block = { height: frame.height, appHash: frame.appHash };
           blockListeners.forEach((notify) => notify(block));
-          break;
-        }
-        case "telemetry": {
-          telemetryListeners.forEach((notify) => notify(frame));
           break;
         }
         default:
@@ -297,22 +277,14 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
           if (!res.ok) throw new Error(`node replied ${res.status}`);
           return res.json() as Promise<NodeStatus>;
         }),
-    telemetry: (limit) =>
+    // OpenMetrics text exposition (not json, not under /v1) — the scrape body.
+    metrics: () =>
       Promise.resolve()
-        .then(() =>
-          fetch(
-            limit === undefined
-              ? `${base}/v1/telemetry`
-              : `${base}/v1/telemetry?limit=${limit}`,
-          ),
-        )
+        .then(() => fetch(`${base}/metrics`))
         .then((res) => {
           if (!res.ok) throw new Error(`node replied ${res.status}`);
-          return res.json() as Promise<{ frames?: TelemetryFrame[] }>;
-        })
-        // best-effort observability: a node without a telemetry surface (or a
-        // malformed body) reads as "no telemetry", not an error.
-        .then((body) => body.frames ?? []),
+          return res.text();
+        }),
     blocks: (limit) =>
       Promise.resolve()
         .then(() =>
@@ -326,22 +298,14 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
           if (!res.ok) throw new Error(`node replied ${res.status}`);
           return res.json() as Promise<{ blocks?: BlockRecord[] }>;
         })
-        // same best-effort contract as telemetry: a node without a blocks
-        // surface (or a malformed body) reads as "no blocks", not an error.
+        // best-effort observability: a node without a blocks surface (or a
+        // malformed body) reads as "no blocks", not an error.
         .then((body) => body.blocks ?? []),
     onBlock: (listener) => {
       blockListeners.add(listener);
       connect();
       return () => {
         blockListeners.delete(listener);
-        closeIfIdle();
-      };
-    },
-    onTelemetry: (listener) => {
-      telemetryListeners.add(listener);
-      connect();
-      return () => {
-        telemetryListeners.delete(listener);
         closeIfIdle();
       };
     },

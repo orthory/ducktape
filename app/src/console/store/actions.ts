@@ -12,8 +12,13 @@ import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-c
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
+import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
+import { voiceSocketUrl } from "../../domain/transport";
+import { createVoiceSession, huddleRecipients } from "../../domain/voice-session";
+import type { VoiceSession, VoiceStatus } from "../../domain/voice-session";
+import { keyBytes } from "../../domain/chat-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
@@ -80,6 +85,25 @@ export interface ConsoleActions {
    *  that emoji yet, removes it if we have. Refreshes the open thread panel
    *  too, since its replies are a separate snapshot from `state.messages`. */
   toggleReaction(seq: number, emoji: string): void;
+
+  // ── Huddle (voice over the chat channel's roster) ──
+  /** Join a channel's voice huddle: leave any current huddle first (leave op +
+   *  stop the old session), submit join_huddle carrying this node's key, start
+   *  the audio session, and push the current roster as the fan-out set. No-op
+   *  when the daemon can't do voice (no status.publicKey) or we're already in
+   *  this channel's huddle. */
+  joinHuddle(channelId: string): void;
+  /** Leave the active huddle: stop the audio session, clear the voice slice,
+   *  and submit leave_huddle for the channel. */
+  leaveHuddle(): void;
+  /** Mute / unmute the mic — stops forwarding captured frames without dropping
+   *  the track, so unmute is instant. */
+  setHuddleMuted(muted: boolean): void;
+  /** Recompute the live session's fan-out set from the active channel's roster
+   *  and push it. Called by the provider whenever a refresh lands a new
+   *  snapshot while a huddle is active; a no-op when not huddling. */
+  syncHuddleRecipients(): void;
+
   commitForge(params: { path: string; content: string; message: string }): void;
 
   // ── Docs (block-tree notebook over the `pages` module) ──
@@ -205,6 +229,9 @@ export interface ConsoleActions {
   stopNode(): void;
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
   startNode(): void;
+  /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
+   *  scrape fails — best-effort, for the poll-driven Metrics view. */
+  readMetrics(): Promise<NodeMetrics | null>;
   dismissError(): void;
 
   // ── Onboarding / workspaces (desktop only) ──
@@ -286,6 +313,67 @@ export function createActions({
   // current — so a slow or out-of-order response can never clobber a newer
   // query's results (or repopulate a cleared palette).
   let searchToken = 0;
+
+  // The live voice session (the browser audio graph + ws), or null when not in
+  // a huddle. Ephemeral and per-client — it lives here, not in state; the
+  // `voice` slice mirrors only its status for the ui.
+  let voice: VoiceSession | null = null;
+
+  /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
+   *  that can't do voice. */
+  const selfNodeHex = (): string => getState().status?.publicKey ?? "";
+
+  // The last fan-out set pushed into the live session — refresh() lands a new
+  // channels array every block, so pushes are deduped by value here rather
+  // than by effect identity upstream.
+  let lastRecipients: string | null = null;
+
+  /** Recompute + push the fan-out set for `channelId` (default: the active
+   *  huddle) into the live session. No-op when not huddling or unchanged. */
+  const pushRecipients = (channelId = getState().voice.channelId): void => {
+    if (!voice || !channelId) return;
+    const channel = getState().channels.find((c) => c.id === channelId);
+    const recipients = huddleRecipients(channel?.huddle ?? [], selfNodeHex());
+    const fingerprint = recipients.join(",");
+    if (fingerprint === lastRecipients) return;
+    lastRecipients = fingerprint;
+    voice.setRecipients(recipients);
+  };
+
+  /** Stop + drop the live audio session (no consensus write). Idempotent. */
+  const stopVoice = (): void => {
+    voice?.stop();
+    voice = null;
+    lastRecipients = null;
+  };
+
+  // Session lifecycle → the voice slice. Any terminal end reconciles the
+  // consensus roster (submit leave) so peers never keep showing a dead
+  // participant: 'closed' (the session was replaced) clears the slice
+  // entirely; 'error' (hub refusal, socket failure, mic denial) keeps the dock
+  // up in its error state so the failure is visible — Leave dismisses it.
+  const onVoiceStatus = (status: VoiceStatus): void => {
+    if (status === "closed" || status === "error") {
+      const channelId = getState().voice.channelId;
+      stopVoice();
+      if (channelId) submitLeaveHuddle(channelId);
+      if (status === "closed") {
+        patch({ voice: { channelId: null, muted: false, status: "idle" } });
+      } else {
+        update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+      }
+      return;
+    }
+    update((prev) => ({ voice: { ...prev.voice, status } }));
+  };
+
+  /** Submit a leave_huddle for `channelId` with the optimistic roster prune. */
+  const submitLeaveHuddle = (channelId: string) =>
+    submitTracked(
+      opKey.huddle(channelId),
+      (live) => chatClient.leaveHuddle(live, { channelId, origin: getState().author }),
+      (prev) => optimistic.huddleLeft(prev, channelId, selfNodeHex()),
+    );
 
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
@@ -435,12 +523,12 @@ export function createActions({
     // Choosing a local workspace supersedes any remembered remote — it becomes
     // what we reconnect to on next launch.
     clearRemoteUrl();
-    // Tear the old node down BEFORE clearing its projections, so its block /
-    // telemetry subscriptions can't fire a straggler frame into the just-cleared
-    // arrays during the async selectWorkspace/waitUntilUp window that follows
+    // Tear the old node down BEFORE clearing its projections, so its block
+    // subscription can't fire a straggler frame into the just-cleared state
+    // during the async selectWorkspace/waitUntilUp window that follows
     // (mirrors connectRemote). Without this teardown-first order, an old-node
-    // frame lands in the cleared telemetry and the backfill's retain-prev keeps
-    // it atop the NEW node's timeline — the exact staleness this clear prevents.
+    // block would re-set lastBlock right after the clear — the exact
+    // staleness this clear prevents.
     setNode(null);
     patch({
       workspace: target,
@@ -451,9 +539,9 @@ export function createActions({
       forgetNeedsForce: false,
       inviteBlob: null,
       // per-node observability belonging to the workspace we're leaving; the
-      // node effect re-hydrates blocks and re-backfills telemetry once the new
-      // node is set below.
-      telemetry: [],
+      // node effect re-hydrates blocks and re-follows the block stream once
+      // the new node is set below.
+      lastBlock: null,
       blocks: [],
     });
     return Promise.resolve()
@@ -548,6 +636,13 @@ export function createActions({
 
     setAccent: (accent) => patch({ accent }),
     setAuthor: (author) => patch({ author }),
+
+    readMetrics: () => {
+      const live = getNode();
+      return live
+        ? live.metrics().then(parseMetrics).catch(() => null)
+        : Promise.resolve(null);
+    },
 
     // Keep the local author identity (still the web-origin string) AND submit
     // SetName so the chosen name propagates: it's origin-gated, so passing our
@@ -742,6 +837,69 @@ export function createActions({
           .catch(fail);
       });
     },
+
+    // ── Huddle ──
+    joinHuddle: (channelId) => {
+      const state = getState();
+      const publicKey = state.status?.publicKey;
+      const nodeUrl = state.nodeUrl;
+      // no voice identity (legacy daemon) or no resolved node → nothing to do.
+      if (!publicKey || !nodeUrl || !channelId) return;
+      const active = state.voice.channelId;
+      if (active === channelId) return; // already in this huddle
+      // switching huddles: the server replaces the session, so leave the old on
+      // consensus and stop its audio before starting the new one.
+      if (active) submitLeaveHuddle(active);
+      stopVoice();
+      // submit the join carrying our node key bytes; optimistically add us to
+      // the roster so the pill/dock react instantly.
+      const node = keyBytes(publicKey);
+      void submitTracked(
+        opKey.huddle(channelId),
+        (live) => chatClient.joinHuddle(live, { channelId, node, origin: getState().author }),
+        (prev) =>
+          optimistic.huddleJoined(prev, {
+            channelId,
+            node,
+            author: prev.author,
+            at: Math.floor(Date.now() / 1000),
+          }),
+      ).then(() => {
+        // consensus refused the join (members-only, roster full): the audio
+        // session must not keep streaming into a huddle we are not in.
+        const settled = getState();
+        if (
+          settled.ops[opKey.huddle(channelId)]?.phase === "failed" &&
+          settled.voice.channelId === channelId
+        ) {
+          stopVoice();
+          update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+        }
+      });
+      // start the audio session and reflect "connecting"; push whatever roster
+      // we already know (others may be huddling), self excluded. joins start
+      // MUTED — joining a room must never be a hot-mic moment; unmuting is the
+      // deliberate act.
+      voice = createVoiceSession(onVoiceStatus);
+      voice.setMuted(true);
+      patch({ voice: { channelId, muted: true, status: "connecting" } });
+      voice.start(voiceSocketUrl(nodeUrl, channelId));
+      pushRecipients(channelId);
+    },
+
+    leaveHuddle: () => {
+      const channelId = getState().voice.channelId;
+      stopVoice();
+      patch({ voice: { channelId: null, muted: false, status: "idle" } });
+      if (channelId) submitLeaveHuddle(channelId);
+    },
+
+    setHuddleMuted: (muted) => {
+      voice?.setMuted(muted);
+      update((prev) => ({ voice: { ...prev.voice, muted } }));
+    },
+
+    syncHuddleRecipients: () => pushRecipients(),
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
@@ -1236,11 +1394,10 @@ export function createActions({
         workspace: null,
         connected: false,
         status: null,
-        // per-node observability: the live telemetry stream and the node's own
-        // durable block history. clear them on a node switch so the new node's
-        // timeline/explorer never shows the previous node's rows (the telemetry
-        // backfill retains prior frames when the new node returns none).
-        telemetry: [],
+        // per-node observability: the live chain tip and the node's own
+        // durable block history. clear them on a node switch so the new
+        // node's explorer never shows the previous node's rows.
+        lastBlock: null,
         blocks: [],
         channels: [],
         messages: [],

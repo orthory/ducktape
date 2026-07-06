@@ -635,8 +635,9 @@ pub struct DrainedOp {
     pub dispatches: Vec<host::DispatchRecord>,
     /// node-local wall-clock cost of applying this block, in microseconds —
     /// the ONE non-deterministic field. measured in THIS effectful node layer
-    /// (never inside the clock-free host) and fed only into telemetry, so it
-    /// can never enter consensus. differs per node.
+    /// (never inside the clock-free host) and fed only into node-local metrics
+    /// (the apply-latency histogram), so it can never enter consensus. differs
+    /// per node.
     pub latency_us: u64,
 }
 
@@ -1099,7 +1100,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // contributes no effects — same on every validator.
             let started = std::time::Instant::now();
             let result = self.host.submit_at(ctx, msg).await;
-            // node-local apply cost — the telemetry plane's one non-consensus
+            // node-local apply cost — the metrics plane's one non-consensus
             // signal, timed HERE in the effectful node layer (never inside the
             // clock-free host). tight span: no `.await` between start and stop.
             let latency_us = started.elapsed().as_micros() as u64;

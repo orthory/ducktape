@@ -22,10 +22,10 @@ NODE_BIN="$ROOT/target/debug/ducktape-node"
 # The app checks DUCKTAPE_NODE_BIN first (app/src-tauri/src/daemon.rs), so pin it
 # to our debug build — the exact binary this script rebuilds and restarts.
 export DUCKTAPE_NODE_BIN="$NODE_BIN"
-# Keep the idle dev chain quiet: no nop heartbeat blocks, so the telemetry panel
-# shows every block (all real activity) instead of a heartbeat stream, and an
-# idle node honestly reads as empty. dev is single-validator with no coordinated
-# upgrades, so the heartbeat earns nothing here (see bin/node/src/main.rs).
+# Keep the idle dev chain quiet: no nop heartbeat blocks, so every committed
+# block is real activity and the journal/logs carry no idle churn. dev is
+# single-validator with no coordinated upgrades, so the heartbeat earns nothing
+# here (see bin/node/src/main.rs).
 export DUCKTAPE_DISABLE_HEARTBEAT=1
 
 log() { printf '\033[36m[dev]\033[0m %s\n' "$*"; }
@@ -75,10 +75,10 @@ $CARGO build -p node-bin || {
 }
 
 # Stop any node left over from a previous session: the app ADOPTS an
-# already-running node by port (app/src-tauri/src/workspaces.rs), so a stale one
-# would be picked up instead of our fresh binary (no telemetry, still
-# heartbeating). Killing it makes the app spawn a fresh node — which inherits
-# DUCKTAPE_NODE_BIN + DUCKTAPE_DISABLE_HEARTBEAT from this shell.
+# already-running node by port (app/src-tauri/src/workspaces.rs), so a stale
+# binary would be picked up instead of our fresh build. Killing it makes the
+# app spawn a fresh node — which inherits DUCKTAPE_NODE_BIN +
+# DUCKTAPE_DISABLE_HEARTBEAT from this shell.
 if pkill -f 'ducktape-node --config' 2>/dev/null; then
   log "stopped a stale node from a previous session"
   sleep 0.5

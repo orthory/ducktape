@@ -14,6 +14,7 @@ import {
 import type { ReactNode } from "react";
 
 import * as agentClient from "../../domain/agent-client";
+import * as capabilityClient from "../../domain/capability-client";
 import * as chatClient from "../../domain/chat-client";
 import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
@@ -43,10 +44,6 @@ import {
 
 export type { ConsoleActions } from "./actions";
 export type { ConsoleContextValue } from "./context";
-
-/** How many recent telemetry frames the console keeps in memory (the node's
- *  ring holds more; this bounds the live view's buffer). */
-const TELEMETRY_KEEP = 200;
 
 /** How many recent non-empty blocks the explorer pulls per refresh. */
 const BLOCKS_KEEP = 200;
@@ -116,6 +113,11 @@ export function DucktapeProvider({
                 .catch((): PageBlock[] | null => null)
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
+          // the executor registry — best-effort like governance/files above, so
+          // a node without the capability module reads as "no executors" (the
+          // "Runs on" picker degrades to a text field) rather than a failed
+          // refresh.
+          capabilityClient.capabilities(live).catch((): string[] => []),
           runsClient.watches(live),
           // newest-first for the timeline; the wire orders by dispatch id.
           runsClient
@@ -126,8 +128,8 @@ export function DucktapeProvider({
           // reads as "empty", never a failed refresh (same contract as
           // governance above).
           filesClient.list(live, {}).catch(() => []),
-          // the explorer's ring pull — best-effort like telemetry, so a node
-          // without /v1/blocks reads as "no blocks yet".
+          // the explorer's ring pull — best-effort, so a node without
+          // /v1/blocks reads as "no blocks yet".
           live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
         ]),
       )
@@ -141,6 +143,7 @@ export function DucktapeProvider({
         pages,
         pageBlocks,
         agents,
+        capabilities,
         watches,
         pendingRuns,
         profiles,
@@ -197,6 +200,7 @@ export function DucktapeProvider({
                   pages,
                   activePageBlocks: pageBlocks ?? [],
                   agents,
+                  capabilities,
                   watches,
                   pendingRuns,
                   files,
@@ -285,32 +289,22 @@ export function DucktapeProvider({
     };
   }, [transport, actions, fail]);
 
-  // 2. Hydrate once the node is resolved, then follow the block stream and the
-  //    node-local telemetry stream (backfilled from the ring, then live). The
-  //    telemetry updaters stay pure (StrictMode double-invokes them): they append
-  //    idempotently and dedupe on the strictly-increasing block height.
+  // 2. Hydrate once the node is resolved, then follow the block stream. The
+  //    lastBlock updater stays pure (StrictMode double-invokes it): it only
+  //    moves forward on the strictly-increasing block height.
   useEffect(() => {
     if (!node) return;
     refresh();
 
-    // Backfill recent telemetry, then keep any newer live frames layered on top.
-    node
-      .telemetry(TELEMETRY_KEEP)
-      .then((frames) =>
-        dispatch({
-          type: "update",
-          fn: (prev) => {
-            const cutoff = frames.length ? frames[frames.length - 1].height : -1;
-            const newer = prev.telemetry.filter((f) => f.height > cutoff);
-            return { telemetry: [...frames, ...newer].slice(-TELEMETRY_KEEP) };
-          },
-        }),
-      )
-      .catch(() => {
-        /* telemetry is best-effort observability; a miss just leaves it empty */
+    const offBlock = node.onBlock((block) => {
+      // The live chain tip, UNGATED — recorded before the pending gate below,
+      // so the console always knows the chain moved even while an op of ours
+      // is in flight (a seam duplicate or reconnect replay never moves it back).
+      dispatch({
+        type: "update",
+        fn: (prev) =>
+          block.height > (prev.lastBlock ?? -1) ? { lastBlock: block.height } : {},
       });
-
-    const offBlock = node.onBlock(() => {
       // A block landing while one of OUR ops is still in flight would re-query
       // state that predates the op and clobber its preconfirmed projection —
       // and the op's own completion refresh follows immediately anyway. Stale
@@ -318,21 +312,7 @@ export function DucktapeProvider({
       if (hasFreshPending(stateRef.current.ops, Date.now())) return;
       refresh();
     });
-    const offTelemetry = node.onTelemetry((frame) => {
-      dispatch({
-        type: "update",
-        fn: (prev) => {
-          const last = prev.telemetry[prev.telemetry.length - 1];
-          // Heights strictly increase; drop a seam duplicate or a reconnect replay.
-          if (last && frame.height <= last.height) return {};
-          return { telemetry: [...prev.telemetry, frame].slice(-TELEMETRY_KEEP) };
-        },
-      });
-    });
-    return () => {
-      offBlock();
-      offTelemetry();
-    };
+    return offBlock;
   }, [node, refresh]);
 
   // 2b. Liveness heartbeat — the "no running node" detection AND recovery. The
@@ -365,6 +345,41 @@ export function DucktapeProvider({
     const timer = setInterval(beat, RECONNECT_POLL_MS);
     return () => clearInterval(timer);
   }, [node, state.needsOnboarding, state.onboardingPhase, refresh]);
+
+  // 2c. Keep a live huddle's voice fan-out in step with the consensus roster:
+  //     every refresh that lands a new channel snapshot may add/remove members,
+  //     so re-derive the recipient set and push it into the audio session. A
+  //     no-op when not huddling; the push itself dedupes by value (refresh
+  //     patches a fresh channels array every block).
+  useEffect(() => {
+    actions.syncHuddleRecipients();
+  }, [state.channels, state.voice.channelId, actions]);
+
+  // 2d. Best-effort roster reconciliation on the way out: quitting or
+  //     reloading mid-huddle can't run the normal leave path, so fire a
+  //     keepalive leave_huddle beacon — otherwise peers keep showing a
+  //     participant whose client is gone (the roster has no TTL).
+  useEffect(() => {
+    const channelId = state.voice.channelId;
+    const url = state.nodeUrl;
+    if (!channelId || !url) return;
+    const origin = state.author;
+    const leaveOnHide = () => {
+      const body = new Blob(
+        [
+          JSON.stringify({
+            target: "chat",
+            payload: { leave_huddle: { channel_id: channelId } },
+            origin,
+          }),
+        ],
+        { type: "application/json" },
+      );
+      navigator.sendBeacon(`${url.replace(/\/$/, "")}/v1/submit`, body);
+    };
+    window.addEventListener("pagehide", leaveOnHide);
+    return () => window.removeEventListener("pagehide", leaveOnHide);
+  }, [state.voice.channelId, state.nodeUrl, state.author]);
 
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {

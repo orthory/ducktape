@@ -77,14 +77,13 @@ use jobs::Jobs;
 use memory::Memory;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeStatus, TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame,
-    block_row, hex_bytes, hex_root, payload_preview,
+    NodeCommand, NodeHandle, NodeStatus, WsFrame, block_row, hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
-use sdk::{Effect, Event, Msg, Origin};
+use sdk::{Effect, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
 use tokio::sync::broadcast;
@@ -279,7 +278,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_storage = storage.clone();
     let actor_persona = persona.clone();
     let blobs = handle.blob_handle();
-    let telemetry = handle.telemetry_ring();
     std::thread::Builder::new()
         .name("sim-actor".into())
         .spawn(move || {
@@ -288,7 +286,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 forge_repo,
                 index,
                 blobs,
-                telemetry,
                 actor_persona,
                 auto,
                 echo_oracle,
@@ -351,7 +348,6 @@ struct Sim {
     oracle_queue: VecDeque<Msg>,
     workers: Vec<Box<dyn reactor::Worker>>,
     blobs: files::BlobHandle,
-    telemetry: TelemetryRing,
     index: Arc<IndexStore>,
     events: broadcast::Sender<WsFrame>,
 }
@@ -362,7 +358,6 @@ fn run_sim(
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
     blobs: files::BlobHandle,
-    telemetry: TelemetryRing,
     persona: Arc<Mutex<Persona>>,
     auto: bool,
     echo_oracle: bool,
@@ -444,7 +439,6 @@ fn run_sim(
                 Vec::new()
             },
             blobs,
-            telemetry,
             index,
             events,
         };
@@ -607,10 +601,9 @@ impl Sim {
     }
 
     /// the one commit point — noded's submit_one under the logical clock:
-    /// apply the op at the next height, publish the same frames a real node
-    /// publishes (telemetry ring, ws block + telemetry), stage the payload
-    /// (op hash == content address), and feed the durable block index that
-    /// serves GET /v1/blocks and /v1/index/*.
+    /// apply the op at the next height, publish the same ws block frame a real
+    /// node publishes, stage the payload (op hash == content address), and feed
+    /// the durable block index that serves GET /v1/blocks and /v1/index/*.
     async fn commit(&mut self, origin: Origin, msg: Msg) -> Result<Committed, String> {
         let target = msg.target.clone();
         let payload = payload_preview(&msg.payload);
@@ -644,19 +637,7 @@ impl Sim {
             app_hash: hex_root(&out.app_hash),
         };
         let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
-        let frame = TelemetryFrame {
-            height: self.height,
-            consensus_time,
-            // the real daemons measure wall-clock apply cost here — the
-            // telemetry plane's one non-deterministic signal. the sim reports
-            // zero instead of lying with a real measurement.
-            latency_us: 0,
-            dispatches: operations.clone(),
-            events: out.events.iter().map(event_preview).collect(),
-        };
-        self.telemetry.push(frame.clone());
         let _ = self.events.send(WsFrame::Block(block.clone()));
-        let _ = self.events.send(WsFrame::Telemetry(frame));
 
         // fold the block into the durable index LAST, like noded: canonical
         // state is already committed, so an index failure degrades the read
@@ -720,6 +701,9 @@ impl Sim {
             app_hash: hex_root(&self.host.app_hash()),
             height: self.height,
             modules,
+            // the sim node has no mesh identity — clients treat an empty key
+            // as "no peer-routed features here" (no huddle voice).
+            public_key: String::new(),
         }
     }
 
@@ -762,9 +746,9 @@ fn proposer_hex(origin: &Origin) -> String {
     }
 }
 
-/// map a deterministic dispatch record to its telemetry wire twin, keeping the
-/// submitter's readable name (`external:<name>`) like noded's frames do — the
-/// ring's `DispatchInfo::from` deliberately flattens to plain `external`.
+/// map a deterministic dispatch record to its explorer wire twin, keeping the
+/// submitter's readable name (`external:<name>`) like noded's rows do — the
+/// shared `DispatchInfo::from` deliberately flattens to plain `external`.
 fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
     DispatchInfo {
         module: record.module.clone(),
@@ -776,16 +760,6 @@ fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
         },
         emitted_msgs: record.emitted_msgs,
         emitted_events: record.emitted_events,
-    }
-}
-
-/// best-effort text preview of an emitted event's payload, capped like noded's.
-fn event_preview(ev: &Event) -> TelemetryEvent {
-    const PREVIEW_CAP: usize = 512;
-    let end = ev.payload.len().min(PREVIEW_CAP);
-    TelemetryEvent {
-        source: ev.source.clone(),
-        payload: String::from_utf8_lossy(&ev.payload[..end]).into_owned(),
     }
 }
 
