@@ -382,7 +382,6 @@ dependencies = [
  "futures",
  "host",
  "inbox",
- "memory",
  "sdk",
  "serde",
  "serde_json",

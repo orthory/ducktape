@@ -1,11 +1,14 @@
-//! deterministic user-defined automations over chat hooks and memory watches.
+//! deterministic user-defined automations over chat hooks.
 //!
-//! an operator registers rules — a [`Trigger`] (chat post filters or memory
-//! publish filters) plus an [`Action`] (post a chat message, create a task, or
-//! deliver an inbox notification). when chat fans a post out to its hooks, or
-//! memory fans a publish out to its watches, this module evaluates every enabled
-//! rule and emits the matching actions as follow-up [`sdk::Msg`]s in the SAME
-//! block as the event (P2).
+//! an operator registers rules — a [`Trigger`] (chat post filters) plus an
+//! [`Action`] (post a chat message, create a task, or deliver an inbox
+//! notification). when chat fans a post out to its hooks, this module evaluates
+//! every enabled rule and emits the matching actions as follow-up [`sdk::Msg`]s
+//! in the SAME block as the event (P2).
+//!
+//! [`Trigger`] stays an enum with a single `MessagePosted` variant: chat is the
+//! only event source today, but the enum shape leaves room for a future
+//! filesystem-change (duckfs) trigger without a wire break.
 //!
 //! ## Origin-gated intake (spoof-proofing)
 //!
@@ -13,8 +16,6 @@
 //! - `Origin::Module("chat")` → the payload is a raw `chat::ChatEvent`
 //!   (chat's generic hook fan-out delivers the event bytes verbatim, unwrapped),
 //!   decoded in the NO-FAIL hook arm.
-//! - `Origin::Module("memory")` → the payload is a raw
-//!   `memory::MemoryEvent`, decoded in the same NO-FAIL arm style.
 //! - every other origin → an [`AutomationsMsg`] admin op (rule CRUD). an
 //!   [`AutomationsMsg::HookEvent`] from a non-chat origin is rejected — only
 //!   chat's own follow-ups ever wear `Origin::Module("chat")`, so a submitter
@@ -26,8 +27,6 @@
 //! by modules or agents — including this module's own `PostMessage` follow-ups —
 //! never trigger rules, so an automation posting into a hooked channel cannot
 //! cascade. this mirrors the agent module's user-author-only decision.
-//! memory publish events whose author equals this module id are also skipped as
-//! a defense-in-depth loop guard (there is no memory-writing action today).
 //!
 //! ## No-fail hook arm, probes, and atomicity (P2)
 //!
@@ -63,10 +62,6 @@
 //! registering a rule does NOT subscribe this module to any channel. the operator
 //! separately submits `ChatMsg::RegisterHook { channel_id, module_id: "automations" }`
 //! to chat for each channel whose posts should reach these rules.
-//! memory rules likewise need a separate
-//! `MemoryMsg::RegisterWatch { prefix, module_id: "automations" }` op for each
-//! memory subtree whose publishes should reach these rules.
-//! memory-triggered [`RunRecord::channel_id`] values carry the memory path.
 //!
 //! ## State model
 //!
@@ -93,10 +88,6 @@ use chat::{
 use inbox::{
     InboxMsg, MAX_BODY_BYTES as INBOX_MAX_BODY_BYTES, MAX_KIND_BYTES, MAX_MEMBER_BYTES,
     encode_msg as inbox_encode_msg,
-};
-use memory::{
-    MAX_PATH_BYTES as MEMORY_MAX_PATH_BYTES, MAX_SEGMENT_BYTES as MEMORY_MAX_SEGMENT_BYTES,
-    META_KIND, MemoryEvent, decode_event as memory_decode_event,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
@@ -128,8 +119,6 @@ pub struct Automations {
     tasks: ModuleId,
     /// the inbox module id — the `DeliverInbox` follow-up target.
     inbox: ModuleId,
-    /// the memory module id — the trusted memory-watch origin.
-    memory: ModuleId,
     // committed state (the root preimage).
     rules: BTreeMap<String, Rule>,
     history: VecDeque<RunRecord>,
@@ -145,14 +134,12 @@ impl Automations {
         chat: impl Into<ModuleId>,
         tasks: impl Into<ModuleId>,
         inbox: impl Into<ModuleId>,
-        memory: impl Into<ModuleId>,
     ) -> Self {
         Self {
             id: id.into(),
             chat: chat.into(),
             tasks: tasks.into(),
             inbox: inbox.into(),
-            memory: memory.into(),
             rules: BTreeMap::new(),
             history: VecDeque::new(),
             pending_rules: BTreeMap::new(),
@@ -195,25 +182,6 @@ impl Automations {
                 }
                 if let Some(text_contains) = text_contains {
                     Self::validate_len("trigger text_contains", text_contains, MAX_FILTER_BYTES)?;
-                }
-            }
-            Trigger::MemoryPublished {
-                prefix,
-                meta_kind,
-                author_contains,
-            } => {
-                if let Some(prefix) = prefix {
-                    validate_memory_prefix(prefix)?;
-                }
-                if let Some(meta_kind) = meta_kind {
-                    Self::validate_len("trigger meta_kind", meta_kind, MAX_FILTER_BYTES)?;
-                }
-                if let Some(author_contains) = author_contains {
-                    Self::validate_len(
-                        "trigger author_contains",
-                        author_contains,
-                        MAX_FILTER_BYTES,
-                    )?;
                 }
             }
         }
@@ -464,74 +432,6 @@ impl Automations {
         Ok(())
     }
 
-    async fn on_memory_event(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
-        let Ok(MemoryEvent::Published {
-            path,
-            generation,
-            meta,
-            author,
-        }) = memory_decode_event(payload)
-        else {
-            // an undecodable event must not abort the publishing block.
-            return Ok(());
-        };
-        if author == self.id {
-            return Ok(());
-        }
-        let height = ctx.env().height;
-        let effective = self.effective_rules();
-        let vars = TemplateVars {
-            channel: "",
-            seq: None,
-            author: &author,
-            text: "",
-            mention: "",
-            path: &path,
-            generation: Some(generation),
-        };
-
-        let mut budget = 0usize;
-        let mut fired: Vec<(String, Rule)> = Vec::new();
-        let mut records: Vec<RunRecord> = Vec::new();
-        for (rule_id, rule) in &effective {
-            if !rule.enabled || !Self::matches_memory(rule, &path, &meta, &author) {
-                continue;
-            }
-            let record = |action_ok: bool, detail: String| RunRecord {
-                rule_id: rule_id.clone(),
-                channel_id: path.clone(),
-                seq: generation,
-                height,
-                action_ok,
-                detail,
-            };
-            if budget >= MAX_ACTIONS_PER_EVENT {
-                records.push(record(false, "action budget exceeded".into()));
-                continue;
-            }
-            match self
-                .build_and_emit(ctx, rule, &path, generation, &vars)
-                .await
-            {
-                Ok(detail) => {
-                    budget += 1;
-                    let mut updated = rule.clone();
-                    updated.fire_count = updated.fire_count.saturating_add(1);
-                    fired.push((rule_id.clone(), updated));
-                    records.push(record(true, detail));
-                }
-                Err(detail) => {
-                    records.push(record(false, detail));
-                }
-            }
-        }
-        for (rule_id, updated) in fired {
-            self.pending_rules.insert(rule_id, Some(updated));
-        }
-        self.pending_history.extend(records);
-        Ok(())
-    }
-
     /// build the action for a firing rule, PROBE its target, and emit it as a
     /// follow-up. returns the success `detail` on emit, or an error `detail`
     /// when the action is structurally impossible or a probe rejects it
@@ -702,14 +602,13 @@ impl Automations {
     }
 
     fn matches_channel_and_mention(rule: &Rule, channel_id: &str, mentions: &[AuthorRef]) -> bool {
+        // irrefutable while `Trigger` has a single variant; a future variant
+        // makes this a compile error that forces a match arm here.
         let Trigger::MessagePosted {
             channel_id: trig_channel,
             mention,
             ..
-        } = &rule.trigger
-        else {
-            return false;
-        };
+        } = &rule.trigger;
         if let Some(want) = trig_channel {
             if want != channel_id {
                 return false;
@@ -720,38 +619,6 @@ impl Automations {
                 .iter()
                 .any(|author| display_author(author).contains(want.as_str()))
             {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn matches_memory(
-        rule: &Rule,
-        path: &str,
-        meta: &std::collections::BTreeMap<String, String>,
-        author: &str,
-    ) -> bool {
-        let Trigger::MemoryPublished {
-            prefix,
-            meta_kind,
-            author_contains,
-        } = &rule.trigger
-        else {
-            return false;
-        };
-        if let Some(prefix) = prefix {
-            if !memory_prefix_matches(prefix, path) {
-                return false;
-            }
-        }
-        if let Some(kind) = meta_kind {
-            if meta.get(META_KIND) != Some(kind) {
-                return false;
-            }
-        }
-        if let Some(needle) = author_contains {
-            if !author.contains(needle.as_str()) {
                 return false;
             }
         }
@@ -923,60 +790,6 @@ fn substitute_vars(template: &str, vars: &TemplateVars<'_>) -> String {
     out
 }
 
-fn validate_memory_prefix(prefix: &str) -> Result<(), Error> {
-    normalize_memory_segments(prefix).map(|_| ())
-}
-
-fn normalize_memory_segments(path: &str) -> Result<Vec<&str>, Error> {
-    if path.is_empty() {
-        return Err(Error::Module("memory prefix must not be empty".into()));
-    }
-    if path.len() > MEMORY_MAX_PATH_BYTES {
-        return Err(Error::Module("memory prefix exceeds byte cap".into()));
-    }
-    let Some(rest) = path.strip_prefix('/') else {
-        return Err(Error::Module(
-            "memory prefix must be absolute (start with '/')".into(),
-        ));
-    };
-    if rest.is_empty() {
-        return Ok(Vec::new());
-    }
-    if rest.ends_with('/') {
-        return Err(Error::Module(
-            "memory prefix must not have a trailing slash".into(),
-        ));
-    }
-    let mut segments = Vec::new();
-    for seg in rest.split('/') {
-        if seg.is_empty() {
-            return Err(Error::Module(
-                "memory prefix must not contain empty segments".into(),
-            ));
-        }
-        if seg == "." || seg == ".." {
-            return Err(Error::Module(
-                "memory prefix must not contain '.' or '..'".into(),
-            ));
-        }
-        if seg.len() > MEMORY_MAX_SEGMENT_BYTES {
-            return Err(Error::Module(
-                "memory prefix segment exceeds byte cap".into(),
-            ));
-        }
-        segments.push(seg);
-    }
-    Ok(segments)
-}
-
-fn memory_prefix_matches(prefix: &str, path: &str) -> bool {
-    prefix == "/"
-        || path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
 // ---- canonical byte codec (root preimage) -----------------------------------
 
 fn encode_state(rules: &BTreeMap<String, Rule>, history: &VecDeque<RunRecord>) -> Vec<u8> {
@@ -1028,16 +841,6 @@ fn push_trigger(out: &mut Vec<u8>, trigger: &Trigger) {
             push_opt_string(out, channel_id);
             push_opt_string(out, mention);
             push_opt_string(out, text_contains);
-        }
-        Trigger::MemoryPublished {
-            prefix,
-            meta_kind,
-            author_contains,
-        } => {
-            out.push(1);
-            push_opt_string(out, prefix);
-            push_opt_string(out, meta_kind);
-            push_opt_string(out, author_contains);
         }
     }
 }
@@ -1192,29 +995,6 @@ fn read_trigger(bytes: &[u8], off: &mut usize) -> Result<Trigger, Error> {
                 text_contains,
             })
         }
-        1 => {
-            let prefix = read_opt_string(bytes, off)?;
-            if let Some(prefix) = &prefix {
-                validate_memory_prefix(prefix)?;
-            }
-            let meta_kind = read_opt_string(bytes, off)?;
-            if let Some(meta_kind) = &meta_kind {
-                Automations::validate_len("trigger meta_kind", meta_kind, MAX_FILTER_BYTES)?;
-            }
-            let author_contains = read_opt_string(bytes, off)?;
-            if let Some(author_contains) = &author_contains {
-                Automations::validate_len(
-                    "trigger author_contains",
-                    author_contains,
-                    MAX_FILTER_BYTES,
-                )?;
-            }
-            Ok(Trigger::MemoryPublished {
-                prefix,
-                meta_kind,
-                author_contains,
-            })
-        }
         other => Err(Error::Module(format!(
             "snapshot has unknown trigger discriminant {other}"
         ))),
@@ -1319,9 +1099,6 @@ impl Module for Automations {
             Origin::Module(module) if module == self.chat => {
                 self.on_chat_event(ctx, &msg.payload).await
             }
-            Origin::Module(module) if module == self.memory => {
-                self.on_memory_event(ctx, &msg.payload).await
-            }
             _ => match decode_msg(&msg.payload).map_err(Error::Module)? {
                 AutomationsMsg::CreateRule {
                     rule_id,
@@ -1404,7 +1181,6 @@ mod tests {
     };
     use futures::executor::block_on;
     use inbox::{InboxMsg, decode_msg as inbox_decode_msg};
-    use memory::{MemoryEvent, encode_event as memory_encode_event};
     use sdk::{Effect, Env, Event};
     use tasks::{
         Task, TaskStatus, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
@@ -1413,7 +1189,6 @@ mod tests {
     const CHAT: &str = "chat";
     const TASKS: &str = "tasks";
     const INBOX: &str = "inbox";
-    const MEMORY: &str = "memory";
     const ME: &str = "automations";
 
     /// a minimal `Ctx` capturing emitted msgs and serving canned chat
@@ -1436,7 +1211,8 @@ mod tests {
     impl CaptureCtx {
         fn new() -> Self {
             Self {
-                env: Env { protocol_version: 0,
+                env: Env {
+                    protocol_version: 0,
                     height: 7,
                     consensus_time: 42,
                     origin: Origin::System,
@@ -1570,7 +1346,7 @@ mod tests {
     // ---- fixtures -----------------------------------------------------------
 
     fn module() -> Automations {
-        Automations::new(ME, CHAT, TASKS, INBOX, MEMORY)
+        Automations::new(ME, CHAT, TASKS, INBOX)
     }
 
     fn user(byte: u8) -> AuthorRef {
@@ -1607,14 +1383,6 @@ mod tests {
         }
     }
 
-    fn memory_trigger(prefix: Option<&str>, meta_kind: Option<&str>) -> Trigger {
-        Trigger::MemoryPublished {
-            prefix: prefix.map(Into::into),
-            meta_kind: meta_kind.map(Into::into),
-            author_contains: None,
-        }
-    }
-
     fn admin(m: &AutomationsMsg) -> Msg {
         Msg {
             target: ME.into(),
@@ -1640,21 +1408,6 @@ mod tests {
                 thread_root: None,
                 author,
                 mentions,
-            }),
-        }
-    }
-
-    fn memory_published(path: &str, generation: u64, meta: &[(&str, &str)], author: &str) -> Msg {
-        Msg {
-            target: ME.into(),
-            payload: memory_encode_event(&MemoryEvent::Published {
-                path: path.into(),
-                generation,
-                meta: meta
-                    .iter()
-                    .map(|(key, value)| ((*key).into(), (*value).into()))
-                    .collect(),
-                author: author.into(),
             }),
         }
     }
@@ -1908,34 +1661,6 @@ mod tests {
             .is_err()
         );
 
-        // invalid memory prefix.
-        assert!(
-            exec(
-                &mut m,
-                &mut ctx,
-                &create(
-                    "bad-memory-prefix",
-                    memory_trigger(Some("relative"), None),
-                    inbox_action("alice", "memory", "body")
-                ),
-            )
-            .is_err()
-        );
-
-        // oversized memory prefix.
-        assert!(
-            exec(
-                &mut m,
-                &mut ctx,
-                &create(
-                    "big-memory-prefix",
-                    memory_trigger(Some(&format!("/{}", "p".repeat(512))), None),
-                    inbox_action("alice", "memory", "body")
-                ),
-            )
-            .is_err()
-        );
-
         assert!(list_rules(&m).is_empty(), "no rejected rule was staged");
     }
 
@@ -1991,48 +1716,6 @@ mod tests {
         block_on(m.commit_block()).expect("commit");
         assert_eq!(get_rule(&m, "r").expect("r").fire_count, 0);
         assert!(history(&m, "r", 16).is_empty());
-    }
-
-    #[test]
-    fn memory_events_only_from_memory_origin_and_self_author_is_loop_guarded() {
-        let mut m = module();
-        let mut ctx = CaptureCtx::new();
-        exec(
-            &mut m,
-            &mut ctx,
-            &create(
-                "mem",
-                memory_trigger(Some("/docs"), None),
-                inbox_action("alice", "memory", "published {path}"),
-            ),
-        )
-        .expect("create");
-        block_on(m.commit_block()).expect("commit");
-
-        // A raw MemoryEvent from chat origin is decoded as a chat event and must
-        // be a staged no-op, not a memory fire.
-        let mut wrong_origin = CaptureCtx::new().from_chat();
-        exec(
-            &mut m,
-            &mut wrong_origin,
-            &memory_published("/docs/a", 1, &[], "writer"),
-        )
-        .expect("wrong-origin raw event is no-op");
-        assert!(wrong_origin.msgs.is_empty());
-
-        // A memory event authored by this module is inert as a defense-in-depth
-        // loop guard even though automations has no memory-writing action.
-        let mut memory_ctx = CaptureCtx::new().from_origin(Origin::Module(MEMORY.into()));
-        exec(
-            &mut m,
-            &mut memory_ctx,
-            &memory_published("/docs/a", 1, &[], ME),
-        )
-        .expect("self-authored memory event is no-op");
-        assert!(memory_ctx.msgs.is_empty());
-        block_on(m.commit_block()).expect("commit");
-        assert_eq!(get_rule(&m, "mem").expect("mem").fire_count, 0);
-        assert!(history(&m, "mem", 16).is_empty());
     }
 
     // ---- matching + action emission ----------------------------------------
@@ -2298,68 +1981,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_trigger_matches_and_delivers_inbox_with_memory_placeholders() {
-        let mut m = module();
-        let mut ctx = CaptureCtx::new();
-        exec(
-            &mut m,
-            &mut ctx,
-            &create(
-                "notify-memory",
-                Trigger::MemoryPublished {
-                    prefix: Some("/docs".into()),
-                    meta_kind: Some("decision".into()),
-                    author_contains: Some("writer".into()),
-                },
-                inbox_action(
-                    "{author}",
-                    "memory",
-                    "channel=[{channel}] seq=[{seq}] author={author} text=[{text}] mention=[{mention}] path={path} generation={generation}",
-                ),
-            ),
-        )
-        .expect("create");
-        block_on(m.commit_block()).expect("commit");
-
-        // non-subtree prefix match must miss: /docs does not match /docs2.
-        let mut miss = CaptureCtx::new().from_origin(Origin::Module(MEMORY.into()));
-        exec(
-            &mut m,
-            &mut miss,
-            &memory_published("/docs2/a", 1, &[("kind", "decision")], "writer-1"),
-        )
-        .expect("prefix miss");
-        assert!(miss.msgs.is_empty());
-
-        let mut hit = CaptureCtx::new().from_origin(Origin::Module(MEMORY.into()));
-        exec(
-            &mut m,
-            &mut hit,
-            &memory_published("/docs/a", 3, &[("kind", "decision")], "writer-1"),
-        )
-        .expect("fire");
-        let delivered = hit.inbox_msgs();
-        assert_eq!(delivered.len(), 1);
-        let InboxMsg::Deliver { member, kind, body } = &delivered[0] else {
-            panic!("expected Deliver");
-        };
-        assert_eq!(member, "writer-1");
-        assert_eq!(kind, "memory");
-        assert_eq!(
-            body,
-            "channel=[] seq=[] author=writer-1 text=[] mention=[] path=/docs/a generation=3"
-        );
-
-        block_on(m.commit_block()).expect("commit");
-        assert_eq!(get_rule(&m, "notify-memory").expect("rule").fire_count, 1);
-        let recs = history(&m, "notify-memory", 16);
-        assert_eq!(recs.len(), 1);
-        assert!(recs[0].action_ok);
-        assert_eq!(recs[0].channel_id, "/docs/a");
-        assert_eq!(recs[0].seq, 3);
-    }
-
-    #[test]
     fn failed_text_fetch_is_recorded_not_guessed_empty() {
         let mut m = module();
         let mut ctx = CaptureCtx::new();
@@ -2470,22 +2091,24 @@ mod tests {
             &mut ctx,
             &create(
                 "member-cap",
-                memory_trigger(Some("/docs"), None),
-                inbox_action("{path}", "memory", "body"),
+                post_trigger(None, None),
+                inbox_action("{channel}", "chat", "body"),
             ),
         )
         .expect("create");
         block_on(m.commit_block()).expect("commit");
 
-        let long_path = format!("/docs/{}", "x".repeat(300));
-        let mut memory_ctx = CaptureCtx::new().from_origin(Origin::Module(MEMORY.into()));
+        // chat does not bound channel-id length, so a `{channel}` member can be
+        // substituted past the inbox member cap.
+        let long_channel = "c".repeat(MAX_MEMBER_BYTES + 1);
+        let mut chat_ctx = CaptureCtx::new().from_chat();
         exec(
             &mut m,
-            &mut memory_ctx,
-            &memory_published(&long_path, 1, &[], "writer"),
+            &mut chat_ctx,
+            &posted(&long_channel, 1, user(1), Vec::new()),
         )
         .expect("fire records failure");
-        assert!(memory_ctx.msgs.is_empty());
+        assert!(chat_ctx.msgs.is_empty());
         block_on(m.commit_block()).expect("commit");
 
         let recs = history(&m, "member-cap", 16);
@@ -2504,22 +2127,23 @@ mod tests {
             &mut ctx,
             &create(
                 "body-cap",
-                memory_trigger(Some("/docs"), None),
-                inbox_action("alice", "memory", "{author}"),
+                post_trigger(None, None),
+                inbox_action("alice", "chat", "{channel}"),
             ),
         )
         .expect("create");
         block_on(m.commit_block()).expect("commit");
 
-        let long_author = "a".repeat(16 * 1024 + 1);
-        let mut memory_ctx = CaptureCtx::new().from_origin(Origin::Module(MEMORY.into()));
+        // an unbounded `{channel}` body substitutes past the inbox body cap.
+        let long_channel = "c".repeat(INBOX_MAX_BODY_BYTES + 1);
+        let mut chat_ctx = CaptureCtx::new().from_chat();
         exec(
             &mut m,
-            &mut memory_ctx,
-            &memory_published("/docs/a", 1, &[], &long_author),
+            &mut chat_ctx,
+            &posted(&long_channel, 1, user(1), Vec::new()),
         )
         .expect("fire records failure");
-        assert!(memory_ctx.msgs.is_empty());
+        assert!(chat_ctx.msgs.is_empty());
         block_on(m.commit_block()).expect("commit");
 
         let recs = history(&m, "body-cap", 16);
@@ -2887,12 +2511,12 @@ mod tests {
             &mut ctx,
             &create(
                 "r3",
-                Trigger::MemoryPublished {
-                    prefix: Some("/docs".into()),
-                    meta_kind: Some("note".into()),
-                    author_contains: Some("writer".into()),
+                Trigger::MessagePosted {
+                    channel_id: None,
+                    mention: Some("ops".into()),
+                    text_contains: None,
                 },
-                inbox_action("{author}", "memory", "published {path}@{generation}"),
+                inbox_action("{author}", "notify", "posted {channel}@{seq}"),
             ),
         )
         .expect("create r3");

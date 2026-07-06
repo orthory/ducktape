@@ -8,7 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 /// what makes a rule fire. every `None` field is a wildcard; every `Some` field
-/// must match the triggering event.
+/// must match the triggering event. kept an enum (single variant today) so a
+/// future filesystem-change trigger can join without a wire break.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
@@ -21,15 +22,6 @@ pub enum Trigger {
         /// a case-sensitive substring tested against the post's concatenated
         /// text blocks; `None` = no text constraint.
         text_contains: Option<String>,
-    },
-    MemoryPublished {
-        /// a memory subtree prefix, or `None` for any published path. when set,
-        /// matching is segment-aware: `/a` matches `/a` and `/a/b`, never `/ab`.
-        prefix: Option<String>,
-        /// matches `event.meta["kind"]`; `None` = no kind constraint.
-        meta_kind: Option<String>,
-        /// case-sensitive substring tested against the memory event author.
-        author_contains: Option<String>,
     },
 }
 
@@ -75,8 +67,7 @@ pub struct Rule {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
     pub rule_id: String,
-    /// for chat-triggered records this is the triggering channel id; for
-    /// memory-triggered records this carries the triggering memory path.
+    /// the triggering channel id.
     pub channel_id: String,
     pub seq: u64,
     pub height: u64,

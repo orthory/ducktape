@@ -109,7 +109,7 @@ fn main() {
             Some("jobs".into()),
             Some("document".into()),
         );
-        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
