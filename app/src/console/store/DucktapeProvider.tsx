@@ -38,6 +38,7 @@ import {
   applySnapshot,
   createInitialState,
   loadRemoteUrl,
+  saveDocTabs,
 } from "./state";
 
 export type { ConsoleActions } from "./actions";
@@ -158,30 +159,44 @@ export function DucktapeProvider({
           current && channels.some((c) => c.id === current)
             ? current
             : (channels[0]?.id ?? null);
+        // reconcile doc tabs against the live enumeration: a tab whose page no
+        // longer exists (deleted here or elsewhere) drops, and a now-dead
+        // active page falls back to the first surviving tab.
+        const liveIds = new Set(pages.map((p) => p.id));
+        const prevTabs = stateRef.current.openTabs;
+        const openTabs = prevTabs.filter((id) => liveIds.has(id));
+        if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
+        const prevActive = stateRef.current.activePage;
+        const activePage =
+          prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
         return Promise.resolve()
           .then(() => (active ? chatClient.latestMessages(live, active) : []))
           .then((messages) =>
             dispatch({
               type: "patch",
-              patch: applySnapshot({
-                connected: true,
-                status,
-                channels,
-                members,
-                observers,
-                proposals,
-                forgeHead,
-                activeChannel: active,
-                messages,
-                authorNames,
-                pages,
-                activePageBlocks: pageBlocks ?? [],
-                agents,
-                watches,
-                pendingRuns,
-                files,
-                blocks,
-              }),
+              patch: {
+                ...applySnapshot({
+                  connected: true,
+                  status,
+                  channels,
+                  members,
+                  observers,
+                  proposals,
+                  forgeHead,
+                  activeChannel: active,
+                  messages,
+                  authorNames,
+                  pages,
+                  activePageBlocks: pageBlocks ?? [],
+                  agents,
+                  watches,
+                  pendingRuns,
+                  files,
+                  blocks,
+                }),
+                openTabs,
+                activePage,
+              },
             }),
           );
       })

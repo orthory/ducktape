@@ -41,8 +41,8 @@ const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
   const state = {
     ...createInitialState(),
     pages: [
-      { id: "p1", title: "Launch plan" },
-      { id: "p2", title: "Retro" },
+      { id: "p1", title: "Launch plan", parent: null },
+      { id: "p2", title: "Retro", parent: null },
     ],
     activePage: "p1",
     activePageBlocks: PAGE,

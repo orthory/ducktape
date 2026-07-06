@@ -14,6 +14,7 @@ import type {
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
+import type { AnchorThreads } from "../../domain/comments-client";
 import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
@@ -86,6 +87,13 @@ export interface ConsoleState {
   /** Preorder blocks of the active page — root first — re-queried per block /
    *  on open. The view derives depth/indent from the parent links. */
   activePageBlocks: PageBlock[];
+  /** Ordered ids of the open document tabs. `activePage` is the active tab.
+   *  Persisted (loadDocTabs) and reconciled against the live enumeration. */
+  openTabs: string[];
+  /** Comment threads for the open page's blocks + the page itself, grouped by
+   *  target. Loaded on page open and after any comment op. Not per-block
+   *  snapshot state. */
+  pageThreads: AnchorThreads[];
 
   // ── Agents ──
   /** Every registered agent, re-queried per block like tasks. */
@@ -181,6 +189,49 @@ export const saveViewMode = (mode: ViewMode): void => {
   }
 };
 
+// ── Doc tab persistence ─────────────────────────────────
+//
+// The open Docs tabs survive restart as a single id list; on load they are
+// filtered against the live page enumeration (a stale id from another workspace
+// simply drops), so no per-workspace keying is needed.
+const DOC_TABS_KEY = "ducktape.docTabs";
+
+export const loadDocTabs = (): string[] => {
+  try {
+    const raw = localStorage.getItem(DOC_TABS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+};
+
+export const saveDocTabs = (tabs: string[]): void => {
+  try {
+    localStorage.setItem(DOC_TABS_KEY, JSON.stringify(tabs));
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+/** Append `id` if absent (order preserved). */
+export const addTab = (tabs: string[], id: string): string[] =>
+  tabs.includes(id) ? tabs : [...tabs, id];
+
+/** Remove `id`; if it was active, pick the following neighbor (else previous,
+ *  else null) as the next active tab. */
+export const removeTab = (
+  tabs: string[],
+  active: string | null,
+  id: string,
+): { tabs: string[]; active: string | null } => {
+  const idx = tabs.indexOf(id);
+  const next = tabs.filter((t) => t !== id);
+  if (active !== id) return { tabs: next, active };
+  const neighbor = next[idx] ?? next[idx - 1] ?? null;
+  return { tabs: next, active: neighbor };
+};
+
 // ── Remote node persistence ─────────────────────────────
 //
 // The last remote node url the user dialed, so the desktop app reconnects to it
@@ -237,6 +288,8 @@ export const createInitialState = (): ConsoleState => {
     pages: [],
     activePage: null,
     activePageBlocks: [],
+    openTabs: loadDocTabs(),
+    pageThreads: [],
     agents: [],
     watches: [],
     pendingRuns: [],

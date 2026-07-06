@@ -173,9 +173,12 @@ export const channelCreated = (
 
 export const pageCreated = (
   prev: ConsoleState,
-  params: { pageId: string; title: string },
+  params: { pageId: string; title: string; parent?: string | null },
 ): Partial<ConsoleState> => ({
-  pages: [...prev.pages, { id: params.pageId, title: params.title }],
+  pages: [
+    ...prev.pages,
+    { id: params.pageId, title: params.title, parent: params.parent ?? null },
+  ],
 });
 
 /** Every id in `blockId`'s subtree (itself included), via the children links. */

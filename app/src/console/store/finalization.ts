@@ -73,6 +73,10 @@ export const opKey = {
   jobWorker: () => "agent/job-worker",
   proposal: (proposalId: string) => `governance/${proposalId}`,
   file: (fileId: string) => `file/${fileId}`,
+  /** A comment write (edit/delete) — keyed by the comment id. */
+  comment: (commentId: string) => `comment/${commentId}`,
+  /** A thread write (add first comment / reply / resolve) — keyed by thread. */
+  commentThread: (threadId: string) => `comment-thread/${threadId}`,
 };
 
 // ── Ledger transitions (pure) ───────────────────────────

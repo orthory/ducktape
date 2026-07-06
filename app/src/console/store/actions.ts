@@ -3,6 +3,7 @@ import type { Dispatch } from "react";
 import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
+import * as commentsClient from "../../domain/comments-client";
 import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
@@ -25,8 +26,11 @@ import type { Action } from "./reducer";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import {
+  addTab,
   channelIdOf,
   clearRemoteUrl,
+  removeTab,
+  saveDocTabs,
   saveRemoteUrl,
   saveViewMode,
 } from "./state";
@@ -84,8 +88,17 @@ export interface ConsoleActions {
   listPages(): void;
   /** Create a page (root block id minted here) and open it. */
   createPage(title: string): void;
-  /** Open a page, loading its preorder block tree. */
+  /** Create an untitled page (optionally nested under `parent`) and open it —
+   *  the instant Notion-style new-page flow. `parent` null == top level. */
+  createChildPage(parent: string | null): void;
+  /** Re-nest a page under a (possibly new) parent, or to top level with null. */
+  setPageParent(params: { pageId: string; parent: string | null }): void;
+  /** Delete a page (root + subtree; child pages promote up). */
+  deletePage(pageId: string): void;
+  /** Open a page, loading its preorder block tree and comment threads. */
   openPage(pageId: string): void;
+  /** Close a document tab; activates a neighbor if it was active. */
+  closeTab(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
    *  focus to the new block, so it must know the id before the round-trip). */
   insertPageBlock(params: {
@@ -109,6 +122,23 @@ export interface ConsoleActions {
   }): void;
   /** Remove a block and its whole subtree. */
   removePageBlock(blockId: string): void;
+
+  // ── Comments (threads over the `comments` module) ──
+  /** Load the open page's comment threads (page + every visible block). */
+  loadPageThreads(): void;
+  /** Add a comment: opens a new thread when `threadId` is omitted (a fresh id
+   *  is minted), else appends to that thread. */
+  addComment(params: {
+    threadId?: string;
+    anchor: { module: string; target: string };
+    text: string;
+  }): void;
+  /** Edit own comment text. */
+  editComment(params: { commentId: string; text: string }): void;
+  /** Tombstone own comment (removes the thread if it was the last live one). */
+  deleteComment(commentId: string): void;
+  /** Toggle a thread's resolved state. */
+  resolveThread(params: { threadId: string; resolved: boolean }): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
   /** Upload the prompt text to the blob store, then RegisterAgent with the
@@ -325,19 +355,58 @@ export function createActions({
       .catch(fail);
   };
 
-  // the single entry point into a page: make it active and load its preorder
-  // block tree — every path into a page (new-page, a rail click) goes here.
+  // load the comment threads for the open page (the page id + every visible
+  // block id) in one batch; refreshed on open and after any comment op.
+  const loadPageThreads = (): Promise<void> => {
+    const live = getNode();
+    const page = getState().activePage;
+    if (!live || !page) {
+      patch({ pageThreads: [] });
+      return Promise.resolve();
+    }
+    const targets = [page, ...getState().activePageBlocks.map((b) => b.id)];
+    return commentsClient
+      .threadsForAnchors(live, { module: "pages", targets })
+      .then((pageThreads) => patch({ pageThreads }))
+      .catch(fail);
+  };
+
+  // the single entry point into a page: make it active (opening a tab), load
+  // its preorder block tree, then its comment threads — every path into a page
+  // (new-page, a rail click, a tab click) goes here.
   const enterPage = (pageId: string) => {
     const live = getNode();
     if (!live || !pageId) return;
+    const tabs = addTab(getState().openTabs, pageId);
+    saveDocTabs(tabs);
     patch({
       activePage: pageId,
       activePageBlocks: [],
+      openTabs: tabs,
+      pageThreads: [],
     });
     Promise.resolve()
       .then(() => pagesClient.getPage(live, pageId))
       .then((blocks) => patch({ activePageBlocks: blocks ?? [] }))
+      .then(() => loadPageThreads())
       .catch(fail);
+  };
+
+  // close a document tab; if it was active, activate a neighbor (loading its
+  // tree) so the editor never lands on a closed page.
+  const closeTabLocal = (pageId: string) => {
+    const { tabs, active } = removeTab(getState().openTabs, getState().activePage, pageId);
+    saveDocTabs(tabs);
+    if (active && active !== getState().activePage) {
+      patch({ openTabs: tabs });
+      enterPage(active);
+      return;
+    }
+    patch({
+      openTabs: tabs,
+      activePage: active,
+      ...(active ? {} : { activePageBlocks: [], pageThreads: [] }),
+    });
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -680,18 +749,81 @@ export function createActions({
     },
 
     openPage: enterPage,
+    closeTab: closeTabLocal,
 
-    createPage: (title) => {
-      const clean = title.trim();
-      if (!clean) return;
-      // the page root's block id — minted here like task/job ids; the refresh
-      // re-enumerates ListPages so the rail shows it, then open it.
+    // create a page (optionally nested under `parent`) with an EMPTY title and
+    // open it — the doc title input is where naming happens (Notion-style
+    // instant page). `parent` null == top level.
+    createChildPage: (parent: string | null) => {
       const pageId = crypto.randomUUID();
       submitTracked(
         opKey.page(pageId),
-        (live) => pagesClient.createPage(live, { pageId, title: clean }),
-        (prev) => optimistic.pageCreated(prev, { pageId, title: clean }),
+        (live) => pagesClient.createPage(live, { pageId, title: "", parent }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: "" }),
       ).then(() => enterPage(pageId));
+    },
+
+    // kept for programmatic/test callers that pass a title.
+    createPage: (title) => {
+      const pageId = crypto.randomUUID();
+      submitTracked(
+        opKey.page(pageId),
+        (live) => pagesClient.createPage(live, { pageId, title: title.trim() }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: title.trim() }),
+      ).then(() => enterPage(pageId));
+    },
+
+    setPageParent: ({ pageId, parent }) => {
+      submitTracked(opKey.page(pageId), (live) =>
+        pagesClient.setPageParent(live, { pageId, parent }),
+      );
+    },
+
+    deletePage: (pageId) => {
+      if (!pageId) return;
+      submitTracked(opKey.page(pageId), (live) => pagesClient.deletePage(live, pageId))
+        .then(() => {
+          const live = getNode();
+          if (live) pagesClient.listPages(live).then((pages) => patch({ pages })).catch(fail);
+        })
+        .catch(fail);
+      // close its tab immediately (optimistic UX).
+      closeTabLocal(pageId);
+    },
+
+    // ── Comments ──
+    loadPageThreads: () => {
+      void loadPageThreads();
+    },
+
+    addComment: ({ threadId, anchor, text }) => {
+      const clean = text.trim();
+      if (!clean) return;
+      const tid = threadId ?? crypto.randomUUID();
+      const commentId = crypto.randomUUID();
+      submitTracked(opKey.commentThread(tid), (live) =>
+        commentsClient.addComment(live, { threadId: tid, commentId, anchor, text: clean }),
+      ).then(() => loadPageThreads());
+    },
+
+    editComment: ({ commentId, text }) => {
+      const clean = text.trim();
+      if (!clean) return;
+      submitTracked(opKey.comment(commentId), (live) =>
+        commentsClient.editComment(live, { commentId, text: clean }),
+      ).then(() => loadPageThreads());
+    },
+
+    deleteComment: (commentId) => {
+      submitTracked(opKey.comment(commentId), (live) =>
+        commentsClient.deleteComment(live, commentId),
+      ).then(() => loadPageThreads());
+    },
+
+    resolveThread: ({ threadId, resolved }) => {
+      submitTracked(opKey.commentThread(threadId), (live) =>
+        commentsClient.resolveThread(live, { threadId, resolved }),
+      ).then(() => loadPageThreads());
     },
 
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
