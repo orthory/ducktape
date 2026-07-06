@@ -8,6 +8,7 @@ const humanEn = [
     items: [
       { text: 'Platform Invariants', link: '/en/human/architecture/platform-invariants' },
       { text: 'Module Model', link: '/en/human/architecture/module-model' },
+      { text: 'Packages', link: '/en/human/architecture/packages' },
       { text: 'Consensus and Node', link: '/en/human/architecture/consensus-and-node' },
       { text: 'Async Engine', link: '/en/human/architecture/async-engine' },
       { text: 'State Sync', link: '/en/human/architecture/state-sync' },
@@ -36,6 +37,7 @@ const humanKo = [
     items: [
       { text: 'Platform Invariants', link: '/ko/human/architecture/platform-invariants' },
       { text: 'Module Model', link: '/ko/human/architecture/module-model' },
+      { text: 'Packages', link: '/ko/human/architecture/packages' },
       { text: 'Consensus and Node', link: '/ko/human/architecture/consensus-and-node' },
       { text: 'Async Engine', link: '/ko/human/architecture/async-engine' },
       { text: 'State Sync', link: '/ko/human/architecture/state-sync' },

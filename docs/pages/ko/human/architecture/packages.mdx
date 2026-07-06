@@ -1,0 +1,78 @@
+# Packages
+
+Quack package는 Ducktape module을 감싸는 portable product unit이다. Wasm(현재는
+native Rust)이 실행 artifact를 해결한다면, Quack은 쓸 만한 product module이 함께
+실어야 하는 나머지 전부 — interface metadata, seed state, prompt, agent skillset,
+action 권한, hook wiring, lifecycle 규칙, 그리고 package가 실제로 동작함을 증명하는
+deterministic harness — 를 해결한다. 표준은 ADR `2026-07-07-quack-packaged-modules`가
+고정했고, 이 페이지는 구축된 system base를 설명한다.
+
+## Capsule and Manifest
+
+package source는 root에 `quack.toml`이 있는 디렉터리다. `.quack` 파일은 그 디렉터리의
+deterministic ustar tar(경로 정렬, timestamp 0)라서 같은 source는 항상 같은 바이트를
+만든다. manifest는 필요한 platform module과 capability tag, package의 module(v1은
+`kind = "native"`, 코드는 node binary에 포함), hash-pinned prompt, owner module이
+지정된 action tag, agent 정의, engagement rule, install/uninstall policy를 선언한다.
+모든 파일 참조는 sha256 pin을 갖고, manifest 자체는 domain-separated namespace로
+hash되며, `signatures/package.sig`는 그 hash에 대한 ed25519 signature다.
+
+package-local module id는 logical이다. install이 실제 network module id로 매핑하므로
+package가 `pages`나 `agent` 같은 기존 id를 몰래 차지할 수 없다.
+
+## The `package` Module
+
+lifecycle과 routing은 `package` system module의 consensus state에 있다.
+
+- 설치된 package당 한 row: version, manifest hash, module map, harness id,
+  installer, lifecycle status (`Installing → Active → Suspended → Unplugging →
+  Inactive`);
+- action route table: open tag → owner module. built-in route
+  (`tasks.create`, `tasks.update_status` → `tasks`)도 여기 포함된다.
+
+install은 하나의 consensus op다. module이 spec을 검증하고, row와 route를 stage하고,
+hash-pinned prompt를 `memory`에 seed한 뒤, 같은 block 안에서 package의 harness
+module에 제어를 넘긴다. 나머지는 host-lent atomicity가 보장한다: 어느 단계든
+reject되면 block 전체가 abort되고 부분 설치는 남지 않는다. suspend, resume, unplug는
+같은 row에 대한 op이며, unplug는 route와 hook을 제거하고 package agent를 tombstone
+처리하되 user data는 기본적으로 보존하고 row는 audit용으로 계속 읽을 수 있다.
+
+## Harness Contract
+
+agent나 action이 있는 package는 harness module을 지정한다 — product event, agent
+run, module write 사이의 deterministic adapter다. `package` module은 `HarnessMsg`
+(install, suspend, resume, unplug)로 harness를 구동한다. harness가 module origin에서
+자기 agent와 hook을 직접 등록하기 때문에, registry는 이후 모든 변경을 harness
+자신에게만 허용하고, hook 등록은 tagging idiom을 따른다: module은 자기 자신만 wiring할
+수 있고 payload로 지정한 다른 대상은 불가능하다.
+
+agent prompt는 `PromptRef`다 — module, target, renderer, 그리고 consensus content에
+대한 sha256 pin (v1 renderer는 pinned `memory` generation을 읽는다). run composer가
+ref를 resolve하고 pin을 검증하며, 불일치 시 run을 deterministic하게 실패시킨다.
+
+## Action Routing
+
+model output은 action을 data로 요청한다: open tag + JSON payload. `runs`는 agent의
+grant를 검증하고, `package` module에서 tag의 owner를 조회하고, owner를 probe한 뒤
+(`Probe`는 read-only query: schema, target 존재, cap, idempotency), 수락된 action에
+대해서만 `Apply` follow-up을 emit한다. `Apply` arm은 delivery block에 실려 no-fail로
+동작한다: 늦은 conflict는 block을 오염시키는 대신 action failure row로 기록된다.
+수락된 action을 실제 module write로 바꾸는 것은 model도 `runs`도 아닌 harness다.
+
+## Proving a Package
+
+모든 package는 deterministic harness fixture를 싣는다. reference `docs` package는
+전체 loop를 한 테스트로 증명한다: install이 기대한 hash로 prompt를 seed하고 agent를
+등록한다; agent를 mention한 page comment가 정확히 하나의 job을 만든다; fake provider가
+요청한 action이 의도한 block을 수정한다; 권한 없는 action은 아무것도 바꾸지 않고
+failure를 기록한다; suspend는 새 job을 멈추되 pages를 보존한다; unplug는 route와
+hook을 걷어내되 user data는 남는다; snapshot은 동일한 root를 재현한다.
+`ducktape-node package inspect | build | verify | test`가 같은 검사를 CLI에서 실행한다.
+
+## What v1 Does Not Do
+
+Wasm loading, live network에 새 module code를 설치하는 것(module set은 app-hash의
+일부라서 coordinated upgrade의 영역으로 남는다), dynamic UI bundle, governance-gated
+install은 system base 범위에서 의도적으로 제외했다. capability provider spec,
+credential, local binary는 절대 package에 포함되지 않는다: manifest의 capability
+tag는 요구사항일 뿐이고, provider 매핑과 announce는 각 operator의 local config다.

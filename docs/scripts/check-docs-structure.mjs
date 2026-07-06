@@ -8,6 +8,7 @@ const humanPages = [
   'start/quick-start.mdx',
   'architecture/platform-invariants.mdx',
   'architecture/module-model.mdx',
+  'architecture/packages.mdx',
   'architecture/consensus-and-node.mdx',
   'architecture/async-engine.mdx',
   'architecture/state-sync.mdx',

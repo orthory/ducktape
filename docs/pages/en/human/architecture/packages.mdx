@@ -1,0 +1,85 @@
+# Packages
+
+A Quack package is the portable product unit around Ducktape modules. Wasm (or
+today, native Rust) solves the execution artifact; Quack solves everything else a
+usable product module ships with: interface metadata, seed state, prompts, agent
+skillsets, action permissions, hook wiring, lifecycle rules, and a deterministic
+harness that proves the package behaves. The standard is fixed by the ADR
+`2026-07-07-quack-packaged-modules`; this page describes the system base as built.
+
+## Capsule and Manifest
+
+A package source is a directory with `quack.toml` at the root; a `.quack` file is
+a deterministic ustar tar of that directory (sorted paths, zeroed timestamps), so
+the same source always produces the same bytes. The manifest declares required
+platform modules and capability tags, the package's modules (v1: `kind =
+"native"`, code ships in the node binary), hash-pinned prompts, action tags with
+their owner module, agent definitions, engagement rules, and install/uninstall
+policy. Every file reference carries a sha256 pin, the manifest itself is hashed
+under a domain-separated namespace, and `signatures/package.sig` is an ed25519
+signature over that hash.
+
+Package-local module ids are logical. Install maps them to concrete network
+module ids, so a package can never silently squat `pages` or `agent`.
+
+## The `package` Module
+
+Lifecycle and routing live in consensus state, in the `package` system module:
+
+- one row per installed package: version, manifest hash, module map, harness id,
+  installer, lifecycle status (`Installing → Active → Suspended → Unplugging →
+  Inactive`);
+- the action route table: open tag → owner module, including the built-in routes
+  (`tasks.create`, `tasks.update_status` → `tasks`).
+
+Install is one consensus op. The module validates the spec, stages the row and
+routes, seeds hash-pinned prompts into `memory`, and hands control to the
+package's harness module in the same block. Host-lent atomicity does the rest: if
+any step rejects, the whole block aborts and no partial package lands. Suspend,
+resume, and unplug are ops on the same row; unplug removes routes and hooks,
+tombstones package agents, and preserves user data by default while the row stays
+readable for audit.
+
+## Harness Contract
+
+Every package with agents or actions names a harness module — the deterministic
+adapter between product events, agent runs, and module writes. The `package`
+module drives it with `HarnessMsg` (install, suspend, resume, unplug). Because
+the harness registers its own agents and hooks from module origin, the registry
+gates every later mutation to the harness itself, and hook registration follows
+the tagging idiom: a module may only wire itself, never a payload-named target.
+
+Agent prompts are `PromptRef`s — module, target, renderer, and a sha256 pin over
+consensus content (v1 renderer reads a pinned `memory` generation). The run
+composer resolves the ref, verifies the pin, and fails the run deterministically
+on mismatch.
+
+## Action Routing
+
+Model output requests actions as data: open tags plus a JSON payload. `runs`
+validates the agent's grant, looks up the tag's owner in the `package` module,
+probes the owner (`Probe` is a read-only query: schema, target existence, caps,
+idempotency), and emits `Apply` follow-ups only for accepted actions. `Apply`
+arms ride the delivery block and are no-fail: a late conflict records an action
+failure row instead of poisoning the block. The harness — not the model, not
+`runs` — turns accepted actions into real module writes.
+
+## Proving a Package
+
+Every package ships deterministic harness fixtures. The reference `docs` package
+proves the full loop in one test: install seeds prompts and registers agents with
+expected hashes; a page comment mentioning the agent mints exactly one job; a
+fake provider's requested action edits the intended block; unauthorized actions
+mutate nothing and record failure; suspend stops new jobs while preserving pages;
+unplug tears down routes and hooks while user data survives; snapshots reproduce
+identical roots. `ducktape-node package inspect | build | verify | test` runs the
+same checks from the CLI.
+
+## What v1 Does Not Do
+
+Wasm loading, live-network installs of new module code (the module set is part of
+the app-hash, so that remains a coordinated-upgrade concern), dynamic UI bundles,
+and governance-gated install are deliberately out of scope for the system base.
+Capability provider specs, credentials, and local binaries are never part of a
+package: capability tags in a manifest are requirements, and each operator maps
+and announces providers through local config.
