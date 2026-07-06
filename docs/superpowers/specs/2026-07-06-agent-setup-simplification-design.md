@@ -45,6 +45,27 @@ stores is unchanged. Light theme only, inline-style + token system, flag-day
 
 ## Changes
 
+### E. Layout overhaul (supersedes the original "relabel in place")
+
+The first pass kept the four-quadrant console (roster │ detail + register on top,
+watches + runs below) and only softened its words. That still shows a novice four
+dense technical panels at once — the layout itself is the barrier. The view is
+now a calm **master–detail with tabs**:
+
+- A top segmented switch: **Agents · Auto-reply · Activity**, each carrying a
+  live count, plus a persistent **＋ Add agent** primary button in the header.
+- **Agents tab**: the roster on the left; the right pane shows exactly **one**
+  thing — the selected agent's detail, *or* the focused Add-agent card (opened
+  by ＋ Add agent, closed by Cancel / a successful submit), *or* a single
+  call-to-action when there are no agents. Never detail *and* a register form
+  competing side by side.
+- **Auto-reply** and **Activity** each get their own full-width tab instead of a
+  cramped quarter. The jobs-worker switch moves out of the header into its own
+  labelled row on Activity, where background work lives.
+
+The sub-panels (detail, register, watches, runs, the "Runs on" picker) are
+unchanged components — only the shell that arranges them changed.
+
 ### A. Resolve the "capability" collision (the core fix)
 - The **CAPABILITIES** checkbox group → **Permissions**, in all three sites
   (register form, edit form, detail panel), introduced as *"What this agent is
@@ -108,9 +129,9 @@ stores is unchanged. Light theme only, inline-style + token system, flag-day
 - No change to any node payload or wire type. `registerAgent`/`updateAgent`
   still send a `capability` tag + `allowed_actions`; only the UI producing them
   changes. No governance/dispatch behaviour change.
-- No stepped "add agent" wizard/modal and no curated preset templates
-  ("Triage bot", etc.) this pass — the in-place relabel + picker is the
-  lightweight path; presets can layer on later.
+- The Add-agent flow is an on-demand pane, not a stepped multi-screen wizard or
+  a modal overlay. No curated preset templates ("Triage bot", etc.) this pass —
+  presets can layer on later.
 - No dark mode (doesn't exist). No new capability *announce* UI — this only
   *reads* the registry to populate the picker.
 

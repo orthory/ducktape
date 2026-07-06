@@ -1001,6 +1001,7 @@ function RunRequestForm({
 function RegisterAgentForm({
   capabilities,
   onRegister,
+  onDone,
 }: {
   capabilities: string[];
   onRegister: (params: {
@@ -1010,6 +1011,9 @@ function RegisterAgentForm({
     prompt: string;
     allowedActions: string[];
   }) => void;
+  /** Called after a successful submit (and by Cancel) so the host can close
+   *  the create pane. */
+  onDone?: () => void;
 }) {
   const [displayName, setDisplayName] = useState("");
   const [agentIdInput, setAgentIdInput] = useState("");
@@ -1048,6 +1052,7 @@ function RegisterAgentForm({
     setPrompt("");
     setAllowedActions(["chat.post"]);
     setShowAdvanced(false);
+    onDone?.();
   };
 
   return (
@@ -1247,6 +1252,11 @@ function RegisterAgentForm({
             >
               saved as {agentId || "—"}
             </span>
+            {onDone && (
+              <button type="button" onClick={onDone} style={secondaryButton}>
+                Cancel
+              </button>
+            )}
             <button type="submit" disabled={!ready} style={primaryButton(ready)}>
               Register agent
             </button>
@@ -1662,20 +1672,177 @@ function RunsTimeline({
 
 // ── The view ────────────────────────────────────────────
 
+type AgentTab = "agents" | "auto-reply" | "activity";
+
+/** One pill in the top segmented switch — carries a live count so the operator
+ *  sees how much lives behind each surface without opening it. */
+function TabButton({
+  label,
+  count,
+  active,
+  onClick,
+}: {
+  label: string;
+  count: number;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      style={{
+        appearance: "none",
+        border: 0,
+        borderRadius: radius.sm,
+        background: active ? color.paper : "transparent",
+        boxShadow: active ? shadow.card : undefined,
+        cursor: "pointer",
+        padding: "6px 12px",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 7,
+        font: `600 12px ${font.sans}`,
+        color: active ? color.dark : color.muted2,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {label}
+      <span style={{ font: `600 10px ${font.mono}`, color: active ? accentVar : color.muted2 }}>
+        {count}
+      </span>
+    </button>
+  );
+}
+
+/** The daemon-lifecycle switch for job-board pickup — its own row on the
+ *  Activity tab, where background work lives. */
+function JobsWorkerRow({
+  on,
+  op,
+  onToggle,
+}: {
+  on: boolean;
+  op: OpRecord | undefined;
+  onToggle: () => void;
+}) {
+  return (
+    <GroupCard style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>Jobs worker</div>
+          <div style={{ marginTop: 2, font: `400 11px ${font.sans}`, color: color.muted2 }}>
+            Let agents pick up background jobs.
+          </div>
+        </div>
+        <FinalizationMark op={op} />
+        <button
+          type="button"
+          role="switch"
+          aria-checked={on}
+          aria-label="Jobs worker"
+          onClick={onToggle}
+          style={{
+            appearance: "none",
+            cursor: "pointer",
+            width: 40,
+            height: 22,
+            flexShrink: 0,
+            padding: 2,
+            borderRadius: 999,
+            border: `1px solid ${on ? color.dark : color.borderStrong}`,
+            background: on ? color.dark : color.chip,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: on ? "flex-end" : "flex-start",
+            transition: "background .12s, border-color .12s",
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 16,
+              height: 16,
+              borderRadius: "50%",
+              background: on ? color.onDark : color.muted,
+              boxShadow: shadow.card,
+            }}
+          />
+        </button>
+      </div>
+    </GroupCard>
+  );
+}
+
+/** The right pane when there are no agents at all — a single call to action
+ *  instead of an always-present form. */
+function NoAgentsPane({ onAdd }: { onAdd: () => void }) {
+  return (
+    <GroupCard>
+      <div
+        style={{
+          minHeight: 240,
+          padding: "40px 24px",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          textAlign: "center",
+          gap: 10,
+        }}
+      >
+        <span
+          style={{
+            width: 46,
+            height: 46,
+            borderRadius: radius.md,
+            background: color.dark,
+            color: color.onDark,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="agent" size={22} color="currentColor" strokeWidth={1.6} />
+        </span>
+        <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>No agents yet</div>
+        <div style={{ maxWidth: 320, font: `400 12px ${font.sans}`, color: color.muted2, lineHeight: 1.5 }}>
+          Add your first agent to start automating chats and tasks.
+        </div>
+        <button type="button" onClick={onAdd} style={{ ...primaryButton(true), marginTop: 4 }}>
+          + Add agent
+        </button>
+      </div>
+    </GroupCard>
+  );
+}
+
 export function AgentView() {
   const { state, actions } = useDucktape();
+  const [tab, setTab] = useState<AgentTab>("agents");
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
   const [jobWorkerOn, setJobWorkerOn] = useState(false);
   const selectedAgent =
     state.agents.find((agent) => agent.agent_id === selectedAgentId) ??
     state.agents[0] ??
     null;
-  const activeCount = state.agents.filter((agent) => agent.status === "active").length;
 
   const toggleJobWorker = () => {
     const next = !jobWorkerOn;
     setJobWorkerOn(next);
     actions.enableJobWorker(next);
+  };
+
+  const startAdding = () => {
+    setTab("agents");
+    setAdding(true);
+  };
+  const selectAgent = (id: string) => {
+    setSelectedAgentId(id);
+    setAdding(false);
   };
 
   return (
@@ -1696,7 +1863,7 @@ export function AgentView() {
           flexShrink: 0,
           display: "flex",
           alignItems: "center",
-          gap: 10,
+          gap: 12,
           padding: "0 22px",
           borderBottom: `1px solid ${color.borderSoft}`,
           background: color.paper,
@@ -1717,160 +1884,113 @@ export function AgentView() {
         >
           <Icon name="agent" size={16} color="currentColor" strokeWidth={1.7} />
         </span>
-        <h1 style={{ margin: 0, font: `600 16px ${font.sans}`, color: color.dark }}>
-          Agents
-        </h1>
-        <span style={{ font: `400 13px ${font.mono}`, color: color.muted2 }}>
-          {state.agents.length}
-        </span>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "flex-end",
-                lineHeight: 1.15,
-              }}
-            >
-              <span style={{ font: `600 11px ${font.sans}`, color: color.muted3 }}>
-                Jobs worker
-              </span>
-              <span style={{ font: `400 9px ${font.sans}`, color: color.muted2 }}>
-                let agents pick up background jobs
-              </span>
-            </div>
-            <FinalizationMark op={state.ops[opKey.jobWorker()]} />
-            <button
-              type="button"
-              role="switch"
-              aria-checked={jobWorkerOn}
-              aria-label="Jobs worker"
-              onClick={toggleJobWorker}
-              style={{
-                appearance: "none",
-                cursor: "pointer",
-                width: 40,
-                height: 22,
-                flexShrink: 0,
-                padding: 2,
-                borderRadius: 999,
-                border: `1px solid ${jobWorkerOn ? color.dark : color.borderStrong}`,
-                background: jobWorkerOn ? color.dark : color.chip,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: jobWorkerOn ? "flex-end" : "flex-start",
-                transition: "background .12s, border-color .12s",
-              }}
-            >
-              <span
-                aria-hidden="true"
-                style={{
-                  width: 16,
-                  height: 16,
-                  borderRadius: "50%",
-                  background: jobWorkerOn ? color.onDark : color.muted,
-                  boxShadow: shadow.card,
-                }}
-              />
-            </button>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <StatusPill label={`${activeCount} ACTIVE`} tone={statusTone.success} />
-            <StatusPill label={`${state.watches.length} AUTO-REPLY`} tone={statusTone.neutral} />
-            <StatusPill label={`${state.pendingRuns.length} IN PROGRESS`} tone={statusTone.warning} />
-          </div>
+        <h1 style={{ margin: 0, font: `600 16px ${font.sans}`, color: color.dark }}>Agents</h1>
+
+        <div
+          role="tablist"
+          aria-label="Agent views"
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            background: color.sidebar,
+            border: `1px solid ${color.border}`,
+            borderRadius: radius.md,
+            padding: 3,
+          }}
+        >
+          <TabButton
+            label="Agents"
+            count={state.agents.length}
+            active={tab === "agents"}
+            onClick={() => setTab("agents")}
+          />
+          <TabButton
+            label="Auto-reply"
+            count={state.watches.length}
+            active={tab === "auto-reply"}
+            onClick={() => setTab("auto-reply")}
+          />
+          <TabButton
+            label="Activity"
+            count={state.pendingRuns.length}
+            active={tab === "activity"}
+            onClick={() => setTab("activity")}
+          />
         </div>
+
+        <button type="button" onClick={startAdding} style={primaryButton(true)}>
+          + Add agent
+        </button>
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
-        <aside
-          aria-label="Agent roster"
-          style={{
-            width: "clamp(260px, 31%, 318px)",
-            minWidth: 250,
-            flexShrink: 0,
-            borderRight: `1px solid ${color.borderSoft}`,
-            background: color.sidebar,
-            display: "flex",
-            flexDirection: "column",
-          }}
-        >
-          <div
+      {tab === "agents" ? (
+        <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+          <aside
+            aria-label="Agent roster"
             style={{
-              padding: "14px 14px 9px",
+              width: "clamp(260px, 31%, 318px)",
+              minWidth: 250,
+              flexShrink: 0,
+              borderRight: `1px solid ${color.borderSoft}`,
+              background: color.sidebar,
               display: "flex",
-              alignItems: "center",
-              gap: 8,
+              flexDirection: "column",
             }}
           >
-            <SectionLabel>ROSTER</SectionLabel>
-            <span style={{ marginLeft: "auto", font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
-              {state.agents.length} total
-            </span>
-          </div>
-          <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
-            {state.agents.length === 0 ? (
-              <EmptyState
-                icon="agent"
-                title="No agents yet"
-                body="Add an agent to get started."
-              />
-            ) : (
-              state.agents.map((agent) => (
-                <AgentListButton
-                  key={agent.agent_id}
-                  agent={agent}
-                  selected={selectedAgent?.agent_id === agent.agent_id}
-                  op={state.ops[opKey.agent(agent.agent_id)]}
-                  onSelect={setSelectedAgentId}
+            <div style={{ padding: "14px 14px 9px", display: "flex", alignItems: "center", gap: 8 }}>
+              <SectionLabel>ROSTER</SectionLabel>
+              <span
+                style={{ marginLeft: "auto", font: `400 10.5px ${font.mono}`, color: color.muted2 }}
+              >
+                {state.agents.length} total
+              </span>
+            </div>
+            <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+              {state.agents.length === 0 ? (
+                <EmptyState icon="agent" title="No agents yet" body="Add an agent to get started." />
+              ) : (
+                state.agents.map((agent) => (
+                  <AgentListButton
+                    key={agent.agent_id}
+                    agent={agent}
+                    selected={!adding && selectedAgent?.agent_id === agent.agent_id}
+                    op={state.ops[opKey.agent(agent.agent_id)]}
+                    onSelect={selectAgent}
+                  />
+                ))
+              )}
+            </div>
+          </aside>
+
+          <main style={{ flex: 1, minWidth: 0, minHeight: 0, overflowY: "auto", padding: 22 }}>
+            <div style={{ maxWidth: 640, margin: "0 auto" }}>
+              {adding ? (
+                <RegisterAgentForm
+                  capabilities={state.capabilities}
+                  onRegister={actions.registerAgent}
+                  onDone={() => setAdding(false)}
                 />
-              ))
-            )}
-          </div>
-        </aside>
-
-        <main
-          style={{
-            flex: 1,
-            minWidth: 0,
-            minHeight: 0,
-            overflowY: "auto",
-            padding: 22,
-          }}
-        >
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 360px), 1fr))",
-              gap: 18,
-              alignItems: "start",
-            }}
-          >
-            <AgentDetail
-              agent={selectedAgent}
-              channels={state.channels}
-              capabilities={state.capabilities}
-              onPause={actions.pauseAgent}
-              onResume={actions.resumeAgent}
-              onUpdate={actions.updateAgent}
-              onRequestRun={actions.requestRun}
-            />
-            <RegisterAgentForm
-              capabilities={state.capabilities}
-              onRegister={actions.registerAgent}
-            />
-          </div>
-
-          <div
-            style={{
-              marginTop: 18,
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 360px), 1fr))",
-              gap: 18,
-              alignItems: "start",
-            }}
-          >
+              ) : selectedAgent ? (
+                <AgentDetail
+                  agent={selectedAgent}
+                  channels={state.channels}
+                  capabilities={state.capabilities}
+                  onPause={actions.pauseAgent}
+                  onResume={actions.resumeAgent}
+                  onUpdate={actions.updateAgent}
+                  onRequestRun={actions.requestRun}
+                />
+              ) : (
+                <NoAgentsPane onAdd={startAdding} />
+              )}
+            </div>
+          </main>
+        </div>
+      ) : tab === "auto-reply" ? (
+        <main style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 22 }}>
+          <div style={{ maxWidth: 720, margin: "0 auto" }}>
             <WatchesPanel
               channels={state.channels}
               agents={state.agents}
@@ -1878,6 +1998,16 @@ export function AgentView() {
               ops={state.ops}
               onWatch={actions.watchChannel}
               onUnwatch={actions.unwatchChannel}
+            />
+          </div>
+        </main>
+      ) : (
+        <main style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 22 }}>
+          <div style={{ maxWidth: 720, margin: "0 auto" }}>
+            <JobsWorkerRow
+              on={jobWorkerOn}
+              op={state.ops[opKey.jobWorker()]}
+              onToggle={toggleJobWorker}
             />
             <RunsTimeline
               runs={state.pendingRuns}
@@ -1888,7 +2018,7 @@ export function AgentView() {
             />
           </div>
         </main>
-      </div>
+      )}
     </div>
   );
 }

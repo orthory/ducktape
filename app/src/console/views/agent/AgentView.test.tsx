@@ -106,12 +106,15 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
   return { spies };
 };
 
+const openTab = (name: RegExp) => fireEvent.click(screen.getByRole("tab", { name }));
+
 describe("AgentView", () => {
-  it("renders a complete agent operations surface over real store data", () => {
+  it("shows the selected agent's detail and pauses/resumes it", () => {
     const { spies } = renderAgents();
 
     expect(screen.getByRole("heading", { name: "Agents" })).toBeInTheDocument();
 
+    // The Agents tab is the default; the first agent's detail shows without a click.
     fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
     const detail = screen.getByRole("region", { name: /agent detail/i });
     expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
@@ -127,6 +130,47 @@ describe("AgentView", () => {
     fireEvent.click(screen.getByRole("button", { name: /resume agent/i }));
     expect(spies.resumeAgent).toHaveBeenCalledWith("qa-agent");
 
+    // Ask-to-respond defaults to the channel's latest message (42), no anchor step.
+    fireEvent.change(screen.getByLabelText("Channel"), { target: { value: "general" } });
+    fireEvent.click(screen.getByRole("button", { name: /ask to respond/i }));
+    expect(spies.requestRun).toHaveBeenCalledWith({
+      agentId: "qa-agent",
+      channelId: "general",
+      anchorSeq: 42,
+    });
+  });
+
+  it("adds an agent through the focused Add-agent pane", () => {
+    const { spies } = renderAgents();
+
+    // No always-on register form: it opens on demand.
+    expect(screen.queryByLabelText("System prompt")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+
+    // Agent ID is auto-derived from the name; with no executors announced,
+    // "Runs on" degrades to a text field so setup is never blocked.
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+    fireEvent.change(screen.getByLabelText("System prompt"), {
+      target: { value: "Summarize incoming incidents." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith({
+      displayName: "Triage Agent",
+      agentId: "triage-agent",
+      capability: "beta",
+      prompt: "Summarize incoming incidents.",
+      allowedActions: ["chat.post"],
+    });
+  });
+
+  it("manages auto-reply on its own tab", () => {
+    const { spies } = renderAgents();
+
+    openTab(/auto-reply/i);
+
     fireEvent.change(screen.getByLabelText("Channel to watch"), {
       target: { value: "project" },
     });
@@ -141,41 +185,57 @@ describe("AgentView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /stop watching general/i }));
     expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
+  });
 
-    // No anchor step: the run defaults to the channel's latest message (42).
-    fireEvent.change(screen.getByLabelText("Channel"), {
-      target: { value: "general" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /ask to respond/i }));
-    expect(spies.requestRun).toHaveBeenCalledWith({
-      agentId: "qa-agent",
-      channelId: "general",
-      anchorSeq: 42,
-    });
+  it("cancels an in-progress run and toggles the jobs worker on the Activity tab", () => {
+    const { spies } = renderAgents();
+
+    openTab(/activity/i);
 
     fireEvent.click(screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }));
     expect(spies.cancelRun).toHaveBeenCalledWith("general/42/summarizer");
 
-    // Agent ID is auto-derived from the display name (no manual field). With no
-    // executors announced (empty capabilities), "Runs on" degrades to a text
-    // field, so setup is never blocked.
+    fireEvent.click(screen.getByRole("switch", { name: /jobs worker/i }));
+    expect(spies.enableJobWorker).toHaveBeenCalledWith(true);
+  });
+
+  it("offers announced executors as a Runs on picker, defaulting to the first", () => {
+    renderAgents({ capabilities: ["claude", "codex"] });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    const runsOn = screen.getByLabelText("Runs on");
+    expect(runsOn.tagName).toBe("SELECT");
+    // A single glance, no typing: the first announced executor is pre-selected.
+    expect(runsOn).toHaveValue("claude");
+    // Raw tags surface as friendly, title-cased labels.
+    expect(within(runsOn).getByRole("option", { name: "Claude" })).toBeInTheDocument();
+    expect(within(runsOn).getByRole("option", { name: "Codex" })).toBeInTheDocument();
+  });
+
+  it("keeps Agent ID out of the default flow, with an Advanced override", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+
+    // The id is derived, not asked for.
+    expect(screen.queryByLabelText("Agent ID")).toBeNull();
+
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage Agent" },
     });
-    fireEvent.change(screen.getByLabelText("Runs on"), {
-      target: { value: "beta" },
-    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
     fireEvent.change(screen.getByLabelText("System prompt"), {
-      target: { value: "Summarize incoming incidents." },
+      target: { value: "Do things." },
     });
+
+    // Power users can still pin a specific id under Advanced.
+    fireEvent.click(screen.getByRole("button", { name: /^advanced$/i }));
+    fireEvent.change(screen.getByLabelText("Agent ID"), { target: { value: "custom-id" } });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
-    expect(spies.registerAgent).toHaveBeenCalledWith({
-      displayName: "Triage Agent",
-      agentId: "triage-agent",
-      capability: "beta",
-      prompt: "Summarize incoming incidents.",
-      allowedActions: ["chat.post"],
-    });
+
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "custom-id", capability: "beta" }),
+    );
   });
 
   it("edits an agent through the inline Edit form", () => {
@@ -199,48 +259,5 @@ describe("AgentView", () => {
       capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
     });
-  });
-
-  it("toggles the agent module into jobs-board work", () => {
-    const { spies } = renderAgents();
-
-    fireEvent.click(screen.getByRole("switch", { name: /jobs worker/i }));
-    expect(spies.enableJobWorker).toHaveBeenCalledWith(true);
-  });
-
-  it("offers announced executors as a Runs on picker, defaulting to the first", () => {
-    renderAgents({ capabilities: ["claude", "codex"] });
-
-    const runsOn = screen.getByLabelText("Runs on");
-    expect(runsOn.tagName).toBe("SELECT");
-    // A single glance, no typing: the first announced executor is pre-selected.
-    expect(runsOn).toHaveValue("claude");
-    // Raw tags surface as friendly, title-cased labels.
-    expect(within(runsOn).getByRole("option", { name: "Claude" })).toBeInTheDocument();
-    expect(within(runsOn).getByRole("option", { name: "Codex" })).toBeInTheDocument();
-  });
-
-  it("keeps Agent ID out of the default flow, with an Advanced override", () => {
-    const { spies } = renderAgents();
-
-    // The id is derived, not asked for.
-    expect(screen.queryByLabelText("Agent ID")).toBeNull();
-
-    fireEvent.change(screen.getByLabelText("Agent display name"), {
-      target: { value: "Triage Agent" },
-    });
-    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
-    fireEvent.change(screen.getByLabelText("System prompt"), {
-      target: { value: "Do things." },
-    });
-
-    // Power users can still pin a specific id under Advanced.
-    fireEvent.click(screen.getByRole("button", { name: /^advanced$/i }));
-    fireEvent.change(screen.getByLabelText("Agent ID"), { target: { value: "custom-id" } });
-    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
-
-    expect(spies.registerAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ agentId: "custom-id", capability: "beta" }),
-    );
   });
 });
