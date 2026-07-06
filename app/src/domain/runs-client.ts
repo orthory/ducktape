@@ -1,0 +1,127 @@
+// Typed client for the node's `runs` module — the TS mirror of
+// `crates/apps/runs-interface`. The runs module is the collaboration loop's
+// actor: it watches chat channels, turns engaged posts into dispatches, and
+// validates each run's response before any cross-module write. The agents it
+// runs live in the agent registry (`agent-client`); this surface carries only
+// the acting half — watches, explicit runs, cancellation, the jobs-worker
+// toggle, and the in-flight correlation entries (PendingRuns), pruned when a
+// result delivers. Run LIFECYCLE is not runs state — a run is a dispatched
+// task whose status and outcome live in the dispatch module under receiver
+// "runs" + `dispatch_id`.
+//
+// Ownership is NEVER in a write payload — the module derives a run's
+// requester from the block's origin, so every write function takes an
+// `origin` and passes it to transport.submit, exactly like chat-client.
+//
+// Everything is a pure function over an injected NodeTransport.
+
+import type { SagaOrigin } from "./agent-client";
+import type { BlockEvent, NodeTransport } from "./transport";
+import { replyVariant } from "./wire";
+
+// ── Wire types (RunsReply records, verbatim) ─────────────
+
+/** How a watched channel selects which agents a user post engages. `Assigned`
+ *  names exactly one agent; the other three are structural (serde newtype: the
+ *  Assigned variant is `{ "Assigned": "<agent_id>" }` on the wire). */
+export type TurnPolicy = "Mention" | "All" | { Assigned: string } | "RoundRobin";
+
+export interface WatchView {
+  channel_id: string;
+  policy: TurnPolicy;
+}
+
+/** One in-flight run's correlation entry — everything the module keeps while
+ *  its dispatch is outstanding. NOT a lifecycle record: the entry prunes when
+ *  the result delivers; status and outcome live in the dispatch module under
+ *  receiver "runs" + `dispatch_id`. */
+export interface PendingRun {
+  run_id: string;
+  /** hex sha256 of `run_id` — the dispatch-plane id this entry correlates. */
+  dispatch_id: string;
+  agent_id: string;
+  /** Empty for job-backed runs. */
+  channel_id: string;
+  /** The message sequence this run answers; 0 for job-backed runs. */
+  anchor_seq: number;
+  /** The anchor's thread root, if it was a thread reply. */
+  thread_root: number | null;
+  /** Present for jobs-board runs; chat-triggered runs leave this null. */
+  job_id: string | null;
+  job_claim_height: number;
+  /** The run-creating origin — a cancel capability alongside the owner. */
+  requester: SagaOrigin;
+  created_at: number;
+}
+
+const TARGET = "runs";
+
+// ── Msgs (writes — one submit = one block; requester from origin) ──
+
+export const watchChannel = (
+  transport: NodeTransport,
+  params: { channelId: string; policy: TurnPolicy; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { WatchChannel: { channel_id: params.channelId, policy: params.policy } },
+    params.origin,
+  );
+
+export const unwatchChannel = (
+  transport: NodeTransport,
+  params: { channelId: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { UnwatchChannel: { channel_id: params.channelId } },
+    params.origin,
+  );
+
+export const enableJobWorker = (
+  transport: NodeTransport,
+  params: { enabled: boolean; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { EnableJobWorker: { enabled: params.enabled } },
+    params.origin,
+  );
+
+export const requestRun = (
+  transport: NodeTransport,
+  params: { agentId: string; channelId: string; anchorSeq: number; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    {
+      RequestRun: {
+        agent_id: params.agentId,
+        channel_id: params.channelId,
+        anchor_seq: params.anchorSeq,
+      },
+    },
+    params.origin,
+  );
+
+export const cancelRun = (
+  transport: NodeTransport,
+  params: { runId: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, { CancelRun: { run_id: params.runId } }, params.origin);
+
+// ── Queries (reads over committed state) ────────────────
+
+/** Every in-flight correlation entry, ascending by dispatch id. Bounded:
+ *  entries prune on delivery and every dispatch has a deadline.
+ *  `PendingRuns` is a unit-variant query — the bare string. */
+export const pendingRuns = (transport: NodeTransport): Promise<PendingRun[]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, "PendingRuns"))
+    .then((reply) => replyVariant<PendingRun[]>(reply, "PendingRuns"));
+
+/** Every channel watch. `Watches` is a unit-variant query — the bare string. */
+export const watches = (transport: NodeTransport): Promise<WatchView[]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, "Watches"))
+    .then((reply) => replyVariant<WatchView[]>(reply, "Watches"));

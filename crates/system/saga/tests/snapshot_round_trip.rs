@@ -28,7 +28,8 @@ struct TestCtx {
 impl TestCtx {
     fn new(height: u64, origin: Origin) -> Self {
         Self {
-            env: Env { protocol_version: 0,
+            env: Env {
+                protocol_version: 0,
                 height,
                 consensus_time: height,
                 origin,
@@ -68,11 +69,13 @@ fn get(m: &SagaModule, id: &str) -> Option<SagaView> {
     let reply = block_on(m.query(&encode_query(&SagaQuery::Get { saga_id: id.into() }))).unwrap();
     match decode_reply(&reply).unwrap() {
         SagaReply::Saga(v) => v,
+        other => panic!("expected Saga reply, got {other:?}"),
     }
 }
 
 fn trigger(id: &str, reply_to: Option<&str>, max_attempts: u32, deadline: Option<u64>) -> SagaMsg {
     SagaMsg::Trigger {
+        pinned_assignee: None,
         saga_id: id.into(),
         spec: format!("spec:{id}").into_bytes(),
         reply_to: reply_to.map(String::from),
@@ -80,6 +83,7 @@ fn trigger(id: &str, reply_to: Option<&str>, max_attempts: u32, deadline: Option
         deadline,
         max_attempts,
         lease_views: Some(4),
+        capability: None,
     }
 }
 
@@ -120,6 +124,25 @@ fn source() -> SagaModule {
         1,
         alice.clone(),
         &trigger("s-timedout", None, 1, Some(2)),
+    );
+    // a capability-tagged saga: the tag is committed state and must survive
+    // the round trip (with_valset has no capability registry, so it simply
+    // assigns nobody — the tag itself is what's under test here).
+    exec(
+        &mut m,
+        1,
+        alice.clone(),
+        &SagaMsg::Trigger {
+            pinned_assignee: None,
+            saga_id: "s-tagged".into(),
+            spec: b"tagged-spec".to_vec(),
+            reply_to: None,
+            reply_payload: Vec::new(),
+            deadline: None,
+            max_attempts: 1,
+            lease_views: None,
+            capability: Some("alpha".into()),
+        },
     );
     block_on(m.commit_block()).unwrap();
 
@@ -373,8 +396,10 @@ fn truncated_or_padded_snapshot_is_rejected() {
 /// payload, every option absent), with its id — the fixture the
 /// discriminant-tampering tests index into. the layout is pinned by the
 /// asserted length: count 8, id len 8 + 1, origin 1, reply_to tag 1,
-/// reply_payload len 8, spec len 8, status 1, attempt 4, max_attempts 4, six
-/// option tags at [44..50), created_at 8, updated_at 8 = 66 bytes.
+/// reply_payload len 8, spec len 8, capability tag 1, status 1, attempt 4,
+/// max_attempts 4, seven option tags at [45..52) (assignee, pinned_assignee,
+/// lease_views, lease_expires_at, deadline, result, error), created_at 8,
+/// updated_at 8 = 68 bytes.
 fn minimal_snapshot(id: &str) -> Vec<u8> {
     let mut m = SagaModule::new("saga");
     exec(
@@ -382,6 +407,7 @@ fn minimal_snapshot(id: &str) -> Vec<u8> {
         0,
         Origin::System,
         &SagaMsg::Trigger {
+            pinned_assignee: None,
             saga_id: id.into(),
             spec: Vec::new(),
             reply_to: None,
@@ -389,13 +415,14 @@ fn minimal_snapshot(id: &str) -> Vec<u8> {
             deadline: None,
             max_attempts: 1,
             lease_views: None,
+            capability: None,
         },
     );
     block_on(m.commit_block()).unwrap();
     let snap = m.snapshot();
     assert_eq!(
         snap.len(),
-        66,
+        68,
         "the minimal-saga layout this test indexes into"
     );
     snap
@@ -406,10 +433,10 @@ fn unknown_discriminants_and_tags_are_rejected() {
     let empty_root = SagaModule::new("saga").root();
     let snap = minimal_snapshot("a");
 
-    // origin discriminant (byte 17), status discriminant (byte 35), and an
-    // option tag (byte 44, the assignee) each admit exactly their known
+    // origin discriminant (byte 17), status discriminant (byte 36), and an
+    // option tag (byte 45, the assignee) each admit exactly their known
     // values — a state has ONE valid encoding.
-    for (index, what) in [(17usize, "origin"), (35, "status"), (44, "option tag")] {
+    for (index, what) in [(17usize, "origin"), (36, "status"), (45, "option tag")] {
         let mut bad = snap.clone();
         bad[index] = 9;
         let mut dst = SagaModule::new("saga");
@@ -461,6 +488,7 @@ fn non_ascending_or_duplicate_ids_are_rejected() {
                 0,
                 Origin::System,
                 &SagaMsg::Trigger {
+                    pinned_assignee: None,
                     saga_id: id.into(),
                     spec: Vec::new(),
                     reply_to: None,
@@ -468,6 +496,7 @@ fn non_ascending_or_duplicate_ids_are_rejected() {
                     deadline: None,
                     max_attempts: 1,
                     lease_views: None,
+                    capability: None,
                 },
             );
         }

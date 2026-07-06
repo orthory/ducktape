@@ -79,7 +79,7 @@ use commonware_storage::metadata;
 use commonware_utils::sequence::U64;
 use futures::{StreamExt as _, pin_mut};
 
-use host::{BlockContext, Host, SubmitError};
+use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use node::{BlockSeal, BlockSink, Disposition, decode_frame};
 use sdk::{ModuleId, StateRoot, UpgradeCoords};
 
@@ -285,6 +285,9 @@ pub enum Record {
         epoch: u64,
         view_base: u64,
         participants: Vec<Vec<u8>>,
+        /// the epoch's OBSERVER set (transport standing, no quorum seat) —
+        /// empty on records written before the staged-admission tier.
+        observers: Vec<Vec<u8>>,
     },
 }
 
@@ -322,11 +325,13 @@ impl Record {
                 epoch,
                 view_base,
                 participants,
+                observers,
             } => {
                 out.push(TAG_CUTOVER);
                 put_u64(&mut out, *epoch);
                 put_u64(&mut out, *view_base);
                 put_keys(&mut out, participants);
+                put_keys(&mut out, observers);
             }
         }
         out
@@ -357,11 +362,21 @@ impl Record {
                     app_hash,
                 }
             }
-            TAG_CUTOVER => Record::Cutover {
-                epoch: c.u64()?,
-                view_base: c.u64()?,
-                participants: get_keys(&mut c)?,
-            },
+            TAG_CUTOVER => {
+                let epoch = c.u64()?;
+                let view_base = c.u64()?;
+                let participants = get_keys(&mut c)?;
+                // ADDITIVE tail: a record written before the observer tier
+                // ends here — map the missing set to empty, like the
+                // manifest's version tail.
+                let observers = if c.at_end() { Vec::new() } else { get_keys(&mut c)? };
+                Record::Cutover {
+                    epoch,
+                    view_base,
+                    participants,
+                    observers,
+                }
+            }
             t => return Err(Error::Corrupt(format!("unknown record tag {t}"))),
         };
         c.done()?;
@@ -391,6 +406,10 @@ pub struct Manifest {
     /// set: the checkpointed valset snapshot may already hold a membership
     /// change whose cutover had not happened yet.
     pub participants: Vec<Vec<u8>>,
+    /// the epoch's OBSERVER set (transport standing, no quorum seat) — same
+    /// epoch-scoped discipline as `participants`. empty on checkpoints
+    /// written before the staged-admission tier (tolerant decode).
+    pub observers: Vec<Vec<u8>>,
     /// an epoch cutover armed but not yet crossed at checkpoint time (the
     /// ordered lane's discard-ceiling view). a restart re-arms the same
     /// deterministic boundary its peers are converging on.
@@ -468,6 +487,9 @@ impl Manifest {
             None => out.push(0),
         }
         put_u32(&mut out, self.required_min_version);
+        // --- ADDITIVE observer tail (after the version tail, same tolerant
+        // discipline) ---
+        put_keys(&mut out, &self.observers);
         out
     }
 
@@ -526,12 +548,16 @@ impl Manifest {
             let required_min_version = c.u32()?;
             (current_version, pending_upgrade, required_min_version)
         };
+        // ADDITIVE observer tail — absent on checkpoints written before the
+        // staged-admission tier.
+        let observers = if c.at_end() { Vec::new() } else { get_keys(&mut c)? };
         c.done()?;
         Ok(Self {
             height,
             epoch,
             view_base,
             participants,
+            observers,
             pending_cutover_view,
             app_hash,
             roots,
@@ -570,6 +596,7 @@ impl Manifest {
         epoch: u64,
         view_base: u64,
         participants: Vec<Vec<u8>>,
+        observers: Vec<Vec<u8>>,
         pending_cutover_view: Option<u64>,
         current_version: u32,
         pending_upgrade: Option<UpgradeCoords>,
@@ -608,6 +635,7 @@ impl Manifest {
             epoch,
             view_base,
             participants,
+            observers,
             pending_cutover_view,
             app_hash: host.app_hash(),
             roots,
@@ -984,11 +1012,13 @@ where
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
+        observers: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
         let record = Record::Cutover {
             epoch,
             view_base,
             participants: participants.to_vec(),
+            observers: observers.to_vec(),
         }
         .encode();
         async move {
@@ -1003,6 +1033,41 @@ where
 // boot-time replay.
 // ============================================================================
 
+/// one re-executed sealed block, as replay hands it to a [`ReplaySink`]: the
+/// SEALED frame bytes, how the block landed, the composed app-hash it left
+/// behind (the seal's recorded value), and the deterministic dispatch trace
+/// (empty for a rejected block). the frame + disposition + app-hash ride
+/// along because a node-layer observer (the explorer's blocks database)
+/// derives its row from the frame's content, not the dispatch trace — the
+/// trace alone cannot reproduce it.
+pub struct FoldedBlock<'a> {
+    pub height: u64,
+    pub frame: &'a [u8],
+    pub disposition: Disposition,
+    pub app_hash: StateRoot,
+    pub dispatches: &'a [DispatchRecord],
+}
+
+/// observer of every sealed block the journal replay walks, in height order —
+/// the seam a derived tier (the per-module read-model index) folds from, so a
+/// restart re-derives exactly what the live drain would have fed it.
+///
+/// two shapes, because replay cannot always reproduce a block's content:
+/// - a RE-EXECUTED block surfaces its sealed frame and the deterministic
+///   dispatch trace consensus applied ([`ReplaySink::folded_block`]; the
+///   trace is empty for a rejected block);
+/// - a block replay SKIPS — its state already durable, or root-idempotent —
+///   has no reproducible trace ([`ReplaySink::opaque_block`]). the observer
+///   decides what an unreproducible height means for its tier (the index
+///   stops folding and lets its from-state rebuild repair the gap).
+///
+/// observation is best-effort by design: sink calls return nothing and MUST
+/// not fail — recovery's own verification never depends on them.
+pub trait ReplaySink {
+    fn folded_block(&mut self, block: &FoldedBlock<'_>);
+    fn opaque_block(&mut self, height: u64);
+}
+
 /// what a completed recovery hands back to the boot path.
 #[derive(Debug)]
 pub struct Recovered {
@@ -1016,6 +1081,8 @@ pub struct Recovered {
     /// the epoch's engine participant set: the manifest's, superseded by any
     /// newer [`Record::Cutover`] the journal retained.
     pub participants: Vec<Vec<u8>>,
+    /// the epoch's observer set, recovered with the same precedence.
+    pub observers: Vec<Vec<u8>>,
     /// every retained frame's bytes (pins and blocks) — the boot path seeds
     /// the consensus content store with these so re-reported finalizations
     /// resolve locally instead of wedging the ordered gate.
@@ -1048,12 +1115,25 @@ where
         host: &mut Host,
         manifest: &Manifest,
     ) -> Result<Recovered, Error> {
+        self.recover_with_sink(host, manifest, None).await
+    }
+
+    /// [`Recovery::recover`], additionally reporting every sealed block the
+    /// replay walks to `sink` (see [`ReplaySink`]). recovery's own behavior
+    /// and verification are identical with or without an observer.
+    pub async fn recover_with_sink(
+        &mut self,
+        host: &mut Host,
+        manifest: &Manifest,
+        mut sink: Option<&mut dyn ReplaySink>,
+    ) -> Result<Recovered, Error> {
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.app_hash;
         let mut epoch = manifest.epoch;
         let mut view_base = manifest.view_base;
         let mut participants = manifest.participants.clone();
+        let mut observers = manifest.observers.clone();
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)> = Vec::new();
         let mut pending: Option<(u64, Vec<u8>)> = None;
@@ -1084,6 +1164,7 @@ where
                     epoch: e,
                     view_base: b,
                     participants: p,
+                    observers: o,
                 } => {
                     // monotone: a stale record retained from below the
                     // checkpoint must not regress the manifest's values.
@@ -1091,6 +1172,7 @@ where
                         epoch = e;
                         view_base = b;
                         participants = p;
+                        observers = o;
                     }
                 }
                 Record::Block { height, frame } => {
@@ -1150,6 +1232,22 @@ where
                         // to redo (re-applying could MOVE a history-committed
                         // root and fork us).
                         skipped += 1;
+                        if let Some(sink) = sink.as_deref_mut() {
+                            match disposition {
+                                // a rejected block never had content anywhere.
+                                Disposition::Rejected => sink.folded_block(&FoldedBlock {
+                                    height,
+                                    frame: &frame,
+                                    disposition,
+                                    app_hash,
+                                    dispatches: &[],
+                                }),
+                                // an applied block whose ops moved no root:
+                                // its trace existed at runtime but is not
+                                // re-executed here — unreproducible.
+                                _ => sink.opaque_block(height),
+                            }
+                        }
                     } else {
                         // the PRE-apply state was sealed under the PREVIOUS height's
                         // effective version — it differs from this block's version
@@ -1171,9 +1269,22 @@ where
                             .all(|(id, root)| host.module_root(id) == Some(*root));
                         if at_post {
                             skipped += 1; // a disk substrate already holds it.
+                            if let Some(sink) = sink.as_deref_mut() {
+                                sink.opaque_block(height);
+                            }
                         } else if at_pre {
-                            apply_block(host, height, &frame, protocol_version, Some(disposition))
-                                .await?;
+                            let (_, dispatches) =
+                                apply_block(host, height, &frame, protocol_version, Some(disposition))
+                                    .await?;
+                            if let Some(sink) = sink.as_deref_mut() {
+                                sink.folded_block(&FoldedBlock {
+                                    height,
+                                    frame: &frame,
+                                    disposition,
+                                    app_hash,
+                                    dispatches: &dispatches,
+                                });
+                            }
                             for (id, root) in &changed {
                                 let live = host.module_root(id);
                                 if live != Some(*root) {
@@ -1259,7 +1370,7 @@ where
                                      journal)"
                                 )));
                             }
-                            apply_block_committing(
+                            let (_, dispatches) = apply_block_committing(
                                 host,
                                 height,
                                 &frame,
@@ -1268,6 +1379,18 @@ where
                                 &commit_only,
                             )
                             .await?;
+                            if let Some(sink) = sink.as_deref_mut() {
+                                // the dispatch trace is the full deterministic
+                                // re-execution; only the COMMIT scope was
+                                // selective.
+                                sink.folded_block(&FoldedBlock {
+                                    height,
+                                    frame: &frame,
+                                    disposition,
+                                    app_hash,
+                                    dispatches: &dispatches,
+                                });
+                            }
                             // every changed module — the re-committed cohort AND
                             // the already-durable ones left untouched — must now
                             // stand at its sealed post-root.
@@ -1310,11 +1433,27 @@ where
                 .all(|(id, root)| expected.get(id) == Some(root));
             host.set_active_version(protocol_version);
             let disposition = if at_pre {
-                apply_block(host, height, &frame, protocol_version, None).await?
+                let (disposition, dispatches) =
+                    apply_block(host, height, &frame, protocol_version, None).await?;
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.folded_block(&FoldedBlock {
+                        height,
+                        frame: &frame,
+                        disposition,
+                        // the roll-forward seals from the observed outcome
+                        // below; this is that same post-block boundary.
+                        app_hash: host.app_hash(),
+                        dispatches: &dispatches,
+                    });
+                }
+                disposition
             } else {
                 // the apply completed before the crash; the roots that moved
                 // are its outcome. (single-disk-substrate blocks make this
                 // exact — see the crate doc on the multi-store limit.)
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.opaque_block(height);
+                }
                 Disposition::Applied
             };
             let seal = BlockSeal {
@@ -1358,6 +1497,7 @@ where
             epoch,
             view_base,
             participants,
+            observers,
             frames,
             blocks,
             applied,
@@ -1370,13 +1510,17 @@ where
 /// re-apply one journaled frame through the host at its original block
 /// coordinate. when `expect` is given, the outcome must reproduce the sealed
 /// disposition (the drain is deterministic — anything else is divergence).
+/// alongside the disposition, hands back the block's dispatch trace (empty
+/// for a rejected block) so a [`ReplaySink`] can fold what the drain would
+/// have fed it live.
 async fn apply_block(
     host: &mut Host,
     height: u64,
     frame: &[u8],
     protocol_version: u32,
     expect: Option<Disposition>,
-) -> Result<Disposition, Error> {
+) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
+    let mut dispatches = Vec::new();
     let outcome = match decode_frame(frame) {
         Ok((origin, msg)) => {
             // `protocol_version` is the PURE `effective_version(height)` over the
@@ -1394,7 +1538,10 @@ async fn apply_block(
                 origin,
             };
             match host.submit_at(ctx, msg).await {
-                Ok(_) => Disposition::Applied,
+                Ok(outcome) => {
+                    dispatches = outcome.dispatches;
+                    Disposition::Applied
+                }
                 Err(SubmitError::Rejected(_)) => Disposition::Rejected,
                 Err(SubmitError::Fatal(f)) => {
                     return Err(Error::Torn(format!("boundary fault during replay: {f}")));
@@ -1411,7 +1558,7 @@ async fn apply_block(
             )));
         }
     }
-    Ok(outcome)
+    Ok((outcome, dispatches))
 }
 
 /// re-apply one journaled frame like [`apply_block`], but commit ONLY the
@@ -1426,7 +1573,8 @@ async fn apply_block_committing(
     protocol_version: u32,
     expect: Option<Disposition>,
     commit_only: &BTreeSet<ModuleId>,
-) -> Result<Disposition, Error> {
+) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
+    let mut dispatches = Vec::new();
     let outcome = match decode_frame(frame) {
         Ok((origin, msg)) => {
             // stamp the block's effective version exactly like `apply_block`, so a
@@ -1439,7 +1587,10 @@ async fn apply_block_committing(
                 origin,
             };
             match host.submit_at_committing(ctx, msg, commit_only).await {
-                Ok(_) => Disposition::Applied,
+                Ok(outcome) => {
+                    dispatches = outcome.dispatches;
+                    Disposition::Applied
+                }
                 Err(SubmitError::Rejected(_)) => Disposition::Rejected,
                 Err(SubmitError::Fatal(f)) => {
                     return Err(Error::Torn(format!("boundary fault during torn replay: {f}")));
@@ -1455,7 +1606,7 @@ async fn apply_block_committing(
             )));
         }
     }
-    Ok(outcome)
+    Ok((outcome, dispatches))
 }
 
 #[cfg(test)]
@@ -1495,6 +1646,7 @@ mod tests {
                 epoch: 2,
                 view_base: 40,
                 participants: vec![vec![7u8; 32], vec![8u8; 32]],
+                observers: vec![vec![9u8; 32]],
             },
         ];
         for r in records {
@@ -1528,6 +1680,7 @@ mod tests {
             epoch: 1,
             view_base: 30,
             participants: vec![vec![7u8; 32], vec![8u8; 32]],
+            observers: vec![vec![9u8; 32]],
             pending_cutover_view: Some(15),
             app_hash: StateRoot([1; 32]),
             roots: roots(&[("directory", 2), ("valset", 3)]),
@@ -1569,27 +1722,48 @@ mod tests {
     #[test]
     fn manifest_decode_tolerates_old_format() {
         // an on-disk checkpoint written before the version fields existed: the
-        // encoding with its version tail truncated at `next_seq`. a new binary
-        // must map the missing tail to baseline defaults, not reject it.
-        let m = sample_manifest();
+        // encoding truncated at `next_seq`. a new binary must map BOTH missing
+        // tails (version fields, observer set) to baseline defaults.
+        let m = Manifest {
+            observers: vec![],
+            ..sample_manifest()
+        };
         let full = m.encode();
-        // the tail is `u32 current + 1-byte pending tag(None) + u32 required` =
-        // 9 bytes; drop them to simulate the prior format.
-        let old = &full[..full.len() - 9];
+        // the tails are `u32 current + 1-byte pending tag(None) + u32 required`
+        // = 9 bytes, then the empty observer keys = 8 bytes; drop both to
+        // simulate the pre-version format.
+        let old = &full[..full.len() - 17];
         let decoded = Manifest::decode(old).expect("old format decodes");
         assert_eq!(decoded.current_version, 0);
         assert_eq!(decoded.pending_upgrade, None);
         assert_eq!(decoded.required_min_version, 0);
-        // everything before the tail survives unchanged.
+        // everything before the tails survives unchanged.
+        assert_eq!(decoded, m);
+
+        // the MIDDLE format — version tail present, observer tail absent (a
+        // checkpoint from the version era, before the staged-admission tier):
+        // observers default to empty, version fields survive.
+        let middle = &full[..full.len() - 8];
+        let decoded = Manifest::decode(middle).expect("middle format decodes");
         assert_eq!(decoded, m);
     }
 
     #[test]
     fn manifest_decode_rejects_truncated_version_tail() {
         // a present-but-malformed tail (one byte into the version fields) must
-        // fail loud, never silently default.
+        // fail loud, never silently default. the observer tail sits after the
+        // version tail, so to tear inside the version fields drop the whole
+        // (empty) observer section — 8 bytes — plus half the required_min u32.
+        let m = Manifest {
+            observers: vec![],
+            ..sample_manifest()
+        };
+        let full = m.encode();
+        let torn = &full[..full.len() - 8 - 4];
+        assert!(Manifest::decode(torn).is_err());
+        // and a torn OBSERVER tail fails loud too.
         let full = sample_manifest().encode();
-        let torn = &full[..full.len() - 4]; // half of the required_min u32.
+        let torn = &full[..full.len() - 4]; // inside the observer key bytes.
         assert!(Manifest::decode(torn).is_err());
     }
 

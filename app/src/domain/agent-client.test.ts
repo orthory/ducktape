@@ -1,37 +1,33 @@
 // The agent client mirrors agent-interface: AgentMsg encoding (ownership from
 // the block origin, never in a payload; snake_case fields) + AgentReply
-// decoding for the Agents / Agent / Runs / Run / Watches queries, including the
-// null (absent agent/run) cases. The prompt-upload flow itself lives in the
-// store; here we only prove the wire shapes and the hex→bytes hash helper.
+// decoding for the Agents / Agent queries, including the null (absent agent)
+// case. The prompt-upload flow itself lives in the store; here we only prove
+// the wire shapes and the hex→bytes hash helper. The acting half (watches,
+// runs) is runs-client — see runs-client.test.
 
 import { describe, expect, it, vi } from "vitest";
 
 import {
   agent,
   agents,
-  cancelRun,
   hexToBytes,
   pauseAgent,
   registerAgent,
-  requestRun,
   resumeAgent,
-  run,
-  runs,
-  unwatchChannel,
   updateAgent,
-  watchChannel,
-  watches,
 } from "./agent-client";
-import type { AgentRecord, RunView, WatchView } from "./agent-client";
+import type { AgentRecord } from "./agent-client";
 import type { NodeTransport } from "./transport";
 
 const stubTransport = (reply?: unknown): NodeTransport => ({
   submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
   query: vi.fn().mockResolvedValue(reply),
+  view: vi.fn(),
   putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
   getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
   status: vi.fn(),
   telemetry: vi.fn(),
+  blocks: vi.fn(),
   onBlock: vi.fn(),
   onTelemetry: vi.fn(),
 });
@@ -56,7 +52,7 @@ describe("agent msgs", () => {
     await registerAgent(transport, {
       agentId: "helper",
       displayName: "Helper",
-      modelRef: "gpt-5.1",
+      capability: "alpha",
       promptHash,
       allowedActions: ["chat.post"],
       origin: "operator",
@@ -67,8 +63,9 @@ describe("agent msgs", () => {
         RegisterAgent: {
           agent_id: "helper",
           display_name: "Helper",
-          model_ref: "gpt-5.1",
+          capability: "alpha",
           prompt_hash: promptHash,
+          prompt_doc: null,
           allowed_actions: ["chat.post"],
         },
       },
@@ -89,8 +86,9 @@ describe("agent msgs", () => {
         UpdateAgent: {
           agent_id: "helper",
           display_name: "Helper 2",
-          model_ref: null,
+          capability: null,
           prompt_hash: null,
+          prompt_doc: null,
           allowed_actions: null,
         },
       },
@@ -115,62 +113,6 @@ describe("agent msgs", () => {
       "operator",
     );
   });
-
-  it("encodes WatchChannel — a unit policy and the Assigned newtype", async () => {
-    const transport = stubTransport();
-
-    await watchChannel(transport, {
-      channelId: "general",
-      policy: "Mention",
-      origin: "operator",
-    });
-    expect(transport.submit).toHaveBeenCalledWith(
-      "agent",
-      { WatchChannel: { channel_id: "general", policy: "Mention" } },
-      "operator",
-    );
-
-    await watchChannel(transport, {
-      channelId: "general",
-      policy: { Assigned: "helper" },
-      origin: "operator",
-    });
-    expect(transport.submit).toHaveBeenCalledWith(
-      "agent",
-      { WatchChannel: { channel_id: "general", policy: { Assigned: "helper" } } },
-      "operator",
-    );
-  });
-
-  it("encodes UnwatchChannel / RequestRun / CancelRun with the origin", async () => {
-    const transport = stubTransport();
-
-    await unwatchChannel(transport, { channelId: "general", origin: "operator" });
-    expect(transport.submit).toHaveBeenCalledWith(
-      "agent",
-      { UnwatchChannel: { channel_id: "general" } },
-      "operator",
-    );
-
-    await requestRun(transport, {
-      agentId: "helper",
-      channelId: "general",
-      anchorSeq: 12,
-      origin: "operator",
-    });
-    expect(transport.submit).toHaveBeenCalledWith(
-      "agent",
-      { RequestRun: { agent_id: "helper", channel_id: "general", anchor_seq: 12 } },
-      "operator",
-    );
-
-    await cancelRun(transport, { runId: "run-1", origin: "operator" });
-    expect(transport.submit).toHaveBeenCalledWith(
-      "agent",
-      { CancelRun: { run_id: "run-1" } },
-      "operator",
-    );
-  });
 });
 
 describe("agent queries", () => {
@@ -178,8 +120,9 @@ describe("agent queries", () => {
     agent_id: "helper",
     owner: { External: [1, 2, 3] },
     display_name: "Helper",
-    model_ref: "gpt-5.1",
+    capability: "alpha",
     prompt_hash: hexToBytes("cd".repeat(32)),
+    prompt_doc: null,
     allowed_actions: ["chat.post"],
     status: "Active",
     created_at: 1,
@@ -201,44 +144,5 @@ describe("agent queries", () => {
 
     const absent = stubTransport({ Agent: null });
     await expect(agent(absent, "ghost")).resolves.toBeNull();
-  });
-
-  it("sends Runs{channel_id,limit} and decodes the timeline", async () => {
-    const view: RunView = {
-      run_id: "run-1",
-      agent_id: "helper",
-      channel_id: "general",
-      anchor_seq: 4,
-      thread_root: null,
-      job_id: null,
-      job_claim_height: 0,
-      requester: { External: [1] },
-      status: { AwaitingOracle: { saga_id: "s1" } },
-      context_hash: hexToBytes("ef".repeat(32)),
-      created_at: 1,
-      updated_at: 1,
-    };
-    const transport = stubTransport({ Runs: [view] });
-    await expect(
-      runs(transport, { channelId: null, limit: 50 }),
-    ).resolves.toEqual([view]);
-    expect(transport.query).toHaveBeenCalledWith("agent", {
-      Runs: { channel_id: null, limit: 50 },
-    });
-  });
-
-  it("sends Run{run_id} and decodes Run:null as an absent run", async () => {
-    const transport = stubTransport({ Run: null });
-    await expect(run(transport, "ghost")).resolves.toBeNull();
-    expect(transport.query).toHaveBeenCalledWith("agent", {
-      Run: { run_id: "ghost" },
-    });
-  });
-
-  it("sends the bare string Watches and decodes the watches", async () => {
-    const watch: WatchView = { channel_id: "general", policy: "All" };
-    const transport = stubTransport({ Watches: [watch] });
-    await expect(watches(transport)).resolves.toEqual([watch]);
-    expect(transport.query).toHaveBeenCalledWith("agent", "Watches");
   });
 });

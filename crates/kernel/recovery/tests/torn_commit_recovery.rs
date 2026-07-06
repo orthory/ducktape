@@ -306,7 +306,7 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
         // GENESIS manifest (height None): records preF/preD roots and fanout's
         // snapshot bytes (diskish is resolver-backed → no snapshot stored).
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], None, 0, None, pos, 1)
+        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
             .expect("capture");
         assert!(
             manifest0.snapshot("fanout").is_some(),
@@ -533,7 +533,7 @@ fn a_multi_disk_torn_block_fail_stops() {
         // genesis manifest: fanout's snapshot rides it; both disks are
         // resolver-backed (no snapshot).
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], None, 0, None, pos, 1)
+        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
             .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest0)
@@ -831,6 +831,7 @@ fn a_boundary_torn_block_heals_under_the_pre_activation_version() {
             Some(checkpoint_height),
             0,
             0,
+            vec![],
             vec![],
             None,
             0,

@@ -1,0 +1,18 @@
+# chat's materialized view on the derived tier: full-text message search.
+# depends on the indexer contract and chat's types-only interface — NEVER the
+# chat module implementation.
+[package]
+name = "chat-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+indexer = { workspace = true }
+chat-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

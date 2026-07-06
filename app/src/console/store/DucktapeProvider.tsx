@@ -33,12 +33,14 @@ import {
   resolveNode,
 } from "../../domain/node-bootstrap";
 import * as profilesClient from "../../domain/profiles-client";
+import * as runsClient from "../../domain/runs-client";
 import * as tasksClient from "../../domain/tasks-client";
 import * as valsetClient from "../../domain/valset-client";
-import type { NodeTransport } from "../../domain/transport";
+import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
+import { hasFreshPending } from "./finalization";
 import { reducer } from "./reducer";
 import {
   applySnapshot,
@@ -52,6 +54,9 @@ export type { ConsoleContextValue } from "./context";
 /** How many recent telemetry frames the console keeps in memory (the node's
  *  ring holds more; this bounds the live view's buffer). */
 const TELEMETRY_KEEP = 200;
+
+/** How many recent non-empty blocks the explorer pulls per refresh. */
+const BLOCKS_KEEP = 200;
 
 /** How often to re-poll a resolved-but-unanswering node until it comes back. */
 const RECONNECT_POLL_MS = 3_000;
@@ -104,7 +109,13 @@ export function DucktapeProvider({
           live.status(),
           chatClient.channels(live),
           tasksClient.listTasks(live),
-          valsetClient.validators(live),
+          // valset only exists on the NETWORKED node (the local daemon has no
+          // validator set) — best-effort like governance below, so a local
+          // node reads as "no members" instead of never connecting.
+          valsetClient.validators(live).catch((): number[][] => []),
+          // the observer tier (staged admission) — same best-effort contract:
+          // a pre-observer node (protocol < 3) reads as "no observers".
+          valsetClient.observers(live).catch((): number[][] => []),
           // governance is a first-class operator surface but best-effort in the
           // snapshot: a node/build without it just reads as "no proposals"
           // rather than failing the whole refresh.
@@ -123,11 +134,11 @@ export function DucktapeProvider({
                 .catch((): PageBlock[] | null => null)
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
-          agentClient.watches(live),
-          // newest-first for the timeline; Runs is ascending on the wire.
-          agentClient
-            .runs(live, { channelId: null, limit: 50 })
-            .then((list) => [...list].reverse()),
+          runsClient.watches(live),
+          // newest-first for the timeline; the wire orders by dispatch id.
+          runsClient
+            .pendingRuns(live)
+            .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
           // ── unexposed-until-now modules — every one best-effort so a node
           //    that does not register the module reads as "empty", never a
@@ -139,6 +150,9 @@ export function DucktapeProvider({
           automationsClient.listRules(live).catch(() => []),
           memoryClient.ls(live, { path: memoryPath }).catch(() => []),
           filesClient.list(live, {}).catch(() => []),
+          // the explorer's ring pull — best-effort like telemetry, so a node
+          // without /v1/blocks reads as "no blocks yet".
+          live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
         ]),
       )
       .then(([
@@ -146,6 +160,7 @@ export function DucktapeProvider({
         channels,
         tasks,
         validators,
+        observerKeys,
         proposals,
         forgeHead,
         docIds,
@@ -154,7 +169,7 @@ export function DucktapeProvider({
         pageBlocks,
         agents,
         watches,
-        runs,
+        pendingRuns,
         profiles,
         inbox,
         inboxUnread,
@@ -163,6 +178,7 @@ export function DucktapeProvider({
         rules,
         memoryEntries,
         files,
+        blocks,
       ]) => {
         // Profile.key is the origin bytes — the same bytes AuthorRef::User
         // carries — so hex(key) is exactly authorName's AuthorNames key.
@@ -170,6 +186,7 @@ export function DucktapeProvider({
           profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
         );
         const members = validators.map(valsetClient.validatorHex);
+        const observers = observerKeys.map(valsetClient.validatorHex);
         const current = stateRef.current.activeChannel;
         const active =
           current && channels.some((c) => c.id === current)
@@ -186,6 +203,7 @@ export function DucktapeProvider({
                 channels,
                 tasks,
                 members,
+                observers,
                 proposals,
                 forgeHead,
                 activeChannel: active,
@@ -197,7 +215,7 @@ export function DucktapeProvider({
                 activePageBlocks: pageBlocks ?? [],
                 agents,
                 watches,
-                runs,
+                pendingRuns,
                 inbox,
                 inboxUnread,
                 jobs,
@@ -205,6 +223,7 @@ export function DucktapeProvider({
                 rules,
                 memoryEntries,
                 files,
+                blocks,
               }),
             }),
           );
@@ -312,6 +331,11 @@ export function DucktapeProvider({
       });
 
     const offBlock = node.onBlock(() => {
+      // A block landing while one of OUR ops is still in flight would re-query
+      // state that predates the op and clobber its preconfirmed projection —
+      // and the op's own completion refresh follows immediately anyway. Stale
+      // pendings (a hung submit) stop gating so the stream can't be starved.
+      if (hasFreshPending(stateRef.current.ops, Date.now())) return;
       refresh();
     });
     const offTelemetry = node.onTelemetry((frame) => {

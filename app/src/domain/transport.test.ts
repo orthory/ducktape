@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { remoteTransport } from "./transport";
-import type { BlockEvent, TelemetryFrame } from "./transport";
+import type { BlockEvent, BlockRecord, TelemetryFrame } from "./transport";
 
 // ── Fake websocket (records instances, scriptable) ──────
 
@@ -128,8 +128,10 @@ describe("remoteTransport", () => {
       { height: 1, consensusTime: 100, latencyUs: 42, dispatches: [], events: [] },
     ];
     // a Response body reads once, and this test fetches twice — hand back a
-    // fresh Response per call.
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, { frames })));
+    // fresh Response per call. the url param types mock.calls for assertions.
+    const fetchMock = vi.fn((_url: string) =>
+      Promise.resolve(jsonResponse(200, { frames })),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     const transport = remoteTransport("http://node.example:8844");
@@ -140,6 +142,49 @@ describe("remoteTransport", () => {
     expect(fetchMock.mock.calls[1][0]).toBe(
       "http://node.example:8844/v1/telemetry?limit=50",
     );
+  });
+
+  it("fetches GET /v1/blocks and returns the records, with an optional limit", async () => {
+    const records: BlockRecord[] = [
+      {
+        height: 7,
+        hash: "aa".repeat(32),
+        commitHash: "bb".repeat(32),
+        proposer: "cc".repeat(32),
+        disposition: "applied",
+        target: "chat",
+        operations: [
+          { module: "chat", origin: "external", emittedMsgs: 0, emittedEvents: 0 },
+        ],
+        payload: '{"Post":{}}',
+        opHash: "dd".repeat(32),
+      },
+    ];
+    // a Response body reads once, and this test fetches twice — hand back a
+    // fresh Response per call. the url param types mock.calls for assertions.
+    const fetchMock = vi.fn((_url: string) =>
+      Promise.resolve(jsonResponse(200, { blocks: records })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = remoteTransport("http://node.example:8844");
+    await expect(transport.blocks()).resolves.toEqual(records);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://node.example:8844/v1/blocks");
+
+    await transport.blocks(50);
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://node.example:8844/v1/blocks?limit=50",
+    );
+  });
+
+  it("reads a node without a blocks surface as no blocks, not an error", async () => {
+    // an older node has no /v1/blocks route — a malformed (non-{blocks}) body
+    // must degrade to empty, matching telemetry's best-effort contract.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, {})));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = remoteTransport("http://node.example:8844");
+    await expect(transport.blocks()).resolves.toEqual([]);
   });
 
   it("streams telemetry over the shared ws and ignores unknown frame kinds", () => {

@@ -1,0 +1,1533 @@
+//! Orchestrator e2e over an in-memory message router: N `run()` instances,
+//! each with its own keystore + fake effect, wired Send->Deliver exactly the
+//! way bin/node's reachability channel will wire them. Proves the whole
+//! orchestration pipeline — record gossip -> signed adverts -> converged mesh
+//! version -> pairwise handshakes -> ONE apply per node — with no real
+//! sockets and no real WireGuard.
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+use defguard_wireguard_rs::net::IpAddrMask;
+use nat_traversal::NodeKey;
+use reachability::{
+    EndpointResolver as _, MeshEpochEvent, ReachabilityCommand, ReachabilityConfig,
+    ReachabilityEvent, ReachabilityMsg, Resolution, StaticResolver, WireGuardKeypair, binding,
+};
+use tokio::sync::mpsc;
+use tokio::task::LocalSet;
+use wireguard_effect::{FakeWireGuardEffect, FakeWireGuardEffectError, WireGuardEffect};
+use wireguard_upgrade::{Endpoint, PortPolicy, Transport, ValidatorIdentity};
+
+/// `run()` owns its effect; tests need to inspect it afterwards — a shared
+/// handle delegating to the fake underneath.
+#[derive(Clone, Default)]
+struct SharedFake(Arc<Mutex<FakeWireGuardEffect>>);
+
+impl WireGuardEffect for SharedFake {
+    type Error = FakeWireGuardEffectError;
+
+    fn create_interface(&mut self) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().create_interface()
+    }
+
+    fn apply(
+        &mut self,
+        config: &defguard_wireguard_rs::InterfaceConfiguration,
+    ) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().apply(config)
+    }
+
+    fn remove_interface(&mut self) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().remove_interface()
+    }
+}
+
+const CHAIN: &str = "net#e2e";
+
+struct TestNode {
+    signer: PrivateKey,
+    identity: ValidatorIdentity,
+    octet: u8,
+    cmd: mpsc::Sender<ReachabilityCommand>,
+    effect: SharedFake,
+}
+
+fn endpoint(policy: &PortPolicy, octet: u8, port: u16, transport: Transport) -> Endpoint {
+    Endpoint::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, octet)),
+        port,
+        transport,
+        policy,
+    )
+    .unwrap()
+}
+
+/// Spin up `seeds.len()` orchestrators on the local set, wired through an
+/// in-memory router; returns the node handles and the collected non-Send
+/// event stream as `(node index, event)`.
+fn spawn_mesh(
+    local: &LocalSet,
+    dir: &std::path::Path,
+    seeds: &[u64],
+    resolvers: Vec<StaticResolver>,
+) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
+    let always_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    spawn_mesh_gated(local, dir, seeds, resolvers, always_up)
+}
+
+/// [`spawn_mesh`] with a link gate: while `links_up` is false the router
+/// DROPS every `Send` instead of delivering it — the real transport's
+/// behavior for a datagram fired before any p2p connection exists (exactly
+/// the boot `Retarget` window in `bin/node`).
+fn spawn_mesh_gated(
+    local: &LocalSet,
+    dir: &std::path::Path,
+    seeds: &[u64],
+    resolvers: Vec<StaticResolver>,
+    links_up: Arc<std::sync::atomic::AtomicBool>,
+) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
+    let filter: DeliveryFilter = Rc::new(move |_, _, _| {
+        usize::from(links_up.load(std::sync::atomic::Ordering::Relaxed))
+    });
+    spawn_mesh_filtered(local, dir, seeds, resolvers, filter)
+}
+
+/// How many copies of a routed message to deliver: 0 models a lost datagram
+/// (best-effort mesh sends), 2 a transport-level redelivery. Args are
+/// `(from node index, to node index, decoded message)`.
+type DeliveryFilter = Rc<dyn Fn(usize, usize, &ReachabilityMsg) -> usize>;
+
+/// [`spawn_mesh`] with a per-message [`DeliveryFilter`] on the router — the
+/// loss/duplication harness the handshake-retry tests drive.
+fn spawn_mesh_filtered(
+    local: &LocalSet,
+    dir: &std::path::Path,
+    seeds: &[u64],
+    resolvers: Vec<StaticResolver>,
+    filter: DeliveryFilter,
+) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
+    spawn_mesh_transported(local, dir, seeds, resolvers, filter, vec![], None)
+}
+
+/// The full-parameter core: `transport_pks[i]`, when set, is the identity
+/// node i's deliveries arrive UNDER (and are routed back to) — the parked
+/// standby's lobby shape, where the transport key and the record identity
+/// differ. `gossip_ingress` lands in every node's `ReachabilityConfig`.
+fn spawn_mesh_transported(
+    local: &LocalSet,
+    dir: &std::path::Path,
+    seeds: &[u64],
+    resolvers: Vec<StaticResolver>,
+    filter: DeliveryFilter,
+    transport_pks: Vec<Option<commonware_cryptography::ed25519::PublicKey>>,
+    gossip_ingress: Option<commonware_cryptography::ed25519::PublicKey>,
+) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
+    let policy = PortPolicy::production();
+    let signers: Vec<PrivateKey> = seeds.iter().map(|s| PrivateKey::from_seed(*s)).collect();
+    let pks: Vec<_> = signers.iter().map(|s| s.public_key()).collect();
+    let transports: Vec<_> = pks
+        .iter()
+        .enumerate()
+        .map(|(i, pk)| {
+            transport_pks
+                .get(i)
+                .and_then(|t| t.clone())
+                .unwrap_or_else(|| pk.clone())
+        })
+        .collect();
+    let (collected_tx, collected_rx) = mpsc::channel(256);
+
+    let mut cmds = Vec::new();
+    let mut events = Vec::new();
+    for _ in seeds {
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (ev_tx, ev_rx) = mpsc::channel(256);
+        cmds.push(cmd_tx);
+        events.push(Some((cmd_rx, ev_tx, ev_rx)));
+    }
+
+    let mut nodes = Vec::new();
+    for (i, signer) in signers.iter().cloned().enumerate() {
+        let octet = 10 * (i as u8 + 1);
+        let (cmd_rx, ev_tx, ev_rx) = events[i].take().unwrap();
+        let effect = SharedFake::default();
+        let config = ReachabilityConfig {
+            chain_id: CHAIN.into(),
+            signer: signer.clone(),
+            wireguard_key_file: dir.join(format!("wg-{i}.key")),
+            wireguard_listen: endpoint(&policy, octet, 51820, Transport::Udp),
+            control_endpoint: endpoint(&policy, octet, 443, Transport::Tcp),
+            coordinators: vec![],
+            port_policy: policy.clone(),
+            // every node persists into the shared test dir — respawning
+            // from the same dir IS the cold-restart scenario.
+            persist_file: Some(dir.join(format!("mesh-{i}.json"))),
+            gossip_ingress: gossip_ingress.clone(),
+        };
+        let resolver = resolvers
+            .get(i)
+            .map(|r| StaticResolver(r.0.clone()))
+            .unwrap_or_default();
+        local.spawn_local(reachability::run(
+            config,
+            effect.clone(),
+            resolver,
+            cmd_rx,
+            ev_tx,
+        ));
+
+        // the router: this node's Send events become Deliver commands on the
+        // target (as many copies as the filter says); everything else is
+        // collected for assertions. Targets match by record identity OR
+        // transport identity — exactly like the real mesh, where a send to
+        // the lobby key lands on whichever joiner holds that connection.
+        let all_cmds = cmds.clone();
+        let all_pks = pks.clone();
+        let all_transports = transports.clone();
+        let my_transport = transports[i].clone();
+        let collected = collected_tx.clone();
+        let filter = filter.clone();
+        let mut ev_rx = ev_rx;
+        local.spawn_local(async move {
+            while let Some(event) = ev_rx.recv().await {
+                match event {
+                    ReachabilityEvent::Send { to, bytes } => {
+                        let Some(j) = all_pks
+                            .iter()
+                            .position(|pk| *pk == to)
+                            .or_else(|| all_transports.iter().position(|pk| *pk == to))
+                        else {
+                            continue;
+                        };
+                        let msg = ReachabilityMsg::decode(&bytes)
+                            .expect("orchestrators send valid frames");
+                        for _ in 0..filter(i, j, &msg) {
+                            let _ = all_cmds[j]
+                                .send(ReachabilityCommand::Deliver {
+                                    from: my_transport.clone(),
+                                    bytes: bytes.clone(),
+                                })
+                                .await;
+                        }
+                    }
+                    other => {
+                        let _ = collected.send((i, other)).await;
+                    }
+                }
+            }
+        });
+
+        nodes.push(TestNode {
+            identity: binding::identity_of(&pks[i]),
+            signer,
+            octet,
+            cmd: cmds[i].clone(),
+            effect,
+        });
+    }
+    (nodes, collected_rx)
+}
+
+async fn retarget_all(
+    nodes: &[TestNode],
+    members: &[usize],
+    standbys: &[usize],
+    epoch: u64,
+    view: u64,
+) {
+    let pks: Vec<_> = members
+        .iter()
+        .map(|i| nodes[*i].signer.public_key())
+        .collect();
+    let standby_pks: Vec<_> = standbys
+        .iter()
+        .map(|i| nodes[*i].signer.public_key())
+        .collect();
+    for i in members.iter().chain(standbys.iter()) {
+        nodes[*i]
+            .cmd
+            .send(ReachabilityCommand::Retarget(MeshEpochEvent {
+                epoch,
+                members: pks.clone(),
+                standbys: standby_pks.clone(),
+                current_view: view,
+            }))
+            .await
+            .unwrap();
+    }
+}
+
+/// Drain collected events until every node in `want` has emitted
+/// `TunnelsApplied` for `epoch`; returns the `MeshReady` versions seen.
+/// A healthy convergence emits NO failure events — `PeerFailed` here means
+/// a retry replayed or a duplicate was mistaken for a violation.
+async fn await_applied(
+    collected: &mut mpsc::Receiver<(usize, ReachabilityEvent)>,
+    want: &[usize],
+    epoch: u64,
+) -> HashMap<usize, Vec<u8>> {
+    let mut versions = HashMap::new();
+    let mut applied: Vec<usize> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while applied.len() < want.len() {
+            let (i, event) = collected.recv().await.expect("event stream open");
+            match event {
+                ReachabilityEvent::MeshReady {
+                    epoch: e, version, ..
+                } if e == epoch => {
+                    versions.insert(i, version.0.to_vec());
+                }
+                ReachabilityEvent::TunnelsApplied { epoch: e, .. } if e == epoch => {
+                    applied.push(i);
+                }
+                ReachabilityEvent::EpochFailed { reason, .. } => {
+                    panic!("epoch failed on node {i}: {reason}");
+                }
+                ReachabilityEvent::PeerFailed { reason, .. } => {
+                    panic!("peer failed on node {i}: {reason}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("mesh converged in time");
+    versions
+}
+
+/// bin/node's nudge ticker, at test cadence, for every node.
+fn spawn_nudgers(local: &LocalSet, nodes: &[TestNode]) {
+    for node in nodes {
+        let cmd = node.cmd.clone();
+        local.spawn_local(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tick.tick().await;
+                if cmd.send(ReachabilityCommand::Nudge).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn ula(identity: ValidatorIdentity) -> IpAddrMask {
+    IpAddrMask::new(
+        std::net::IpAddr::V6(wireguard_upgrade::ula_v6_member_addr(CHAIN, identity)),
+        128,
+    )
+}
+
+#[tokio::test]
+async fn three_member_mesh_converges_and_applies() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            // node 0 resolves node 2 through a "punched" path; every other
+            // pairing rides advertised endpoints.
+            let punched: std::net::SocketAddr = "203.0.113.7:40001".parse().unwrap();
+            let identity_of_seed =
+                |seed: u64| binding::identity_of(&PrivateKey::from_seed(seed).public_key());
+            let mut r0 = StaticResolver::default();
+            r0.0.insert(
+                NodeKey(identity_of_seed(3).0),
+                Resolution::Punched(punched),
+            );
+            let (nodes, mut collected) = spawn_mesh(
+                &local,
+                dir.path(),
+                &[1, 2, 3],
+                vec![r0, StaticResolver::default(), StaticResolver::default()],
+            );
+
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+            let versions = await_applied(&mut collected, &[0, 1, 2], 1).await;
+
+            // one content-derived mesh version, byte-identical on every node.
+            assert_eq!(versions.len(), 3);
+            assert_eq!(versions[&0], versions[&1]);
+            assert_eq!(versions[&0], versions[&2]);
+
+            let ifname = binding::interface_name(CHAIN);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.create_calls, 1, "node {i}: one interface");
+                assert_eq!(fake.applied.len(), 1, "node {i}: one apply");
+                let config = &fake.applied[0];
+                assert_eq!(config.name, ifname);
+                assert_eq!(config.port, 51820);
+                // interface address: exactly this node's identity-hash /128.
+                assert_eq!(config.addresses, vec![ula(node.identity)]);
+                // the persisted keystore is what the interface runs.
+                let (keypair, generated) =
+                    WireGuardKeypair::load_or_generate(&dir.path().join(format!("wg-{i}.key")))
+                        .unwrap();
+                assert!(!generated, "node {i}: run() created the key");
+                assert_eq!(config.prvkey, keypair.private_key_base64());
+                // both peers present, each routing ONLY its own /128 and
+                // keyed by ITS persisted public key.
+                assert_eq!(config.peers.len(), 2);
+                for (j, peer_node) in nodes.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    let (peer_keys, _) = WireGuardKeypair::load_or_generate(
+                        &dir.path().join(format!("wg-{j}.key")),
+                    )
+                    .unwrap();
+                    let entry = config
+                        .peers
+                        .iter()
+                        .find(|p| p.allowed_ips == vec![ula(peer_node.identity)])
+                        .unwrap_or_else(|| panic!("node {i}: no peer entry for node {j}"));
+                    assert_eq!(entry.public_key.as_array(), peer_keys.public_key().0);
+                    let expected = if i == 0 && j == 2 {
+                        punched
+                    } else {
+                        format!("8.8.8.{}:51820", peer_node.octet).parse().unwrap()
+                    };
+                    assert_eq!(entry.endpoint, Some(expected), "node {i} -> node {j}");
+                }
+            }
+
+            // shutdown tears the live interface down.
+            nodes[0]
+                .cmd
+                .send(ReachabilityCommand::Shutdown)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if nodes[0].effect.0.lock().unwrap().remove_calls == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shutdown removed the interface");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn epoch_cutover_replaces_the_interface_with_the_reduced_mesh() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+            await_applied(&mut collected, &[0, 1, 2], 1).await;
+
+            // epoch 2: node 2 departs.
+            retarget_all(&nodes, &[0, 1], &[], 2, 20).await;
+            await_applied(&mut collected, &[0, 1], 2).await;
+
+            for i in [0usize, 1] {
+                let fake = nodes[i].effect.0.lock().unwrap();
+                assert_eq!(
+                    fake.remove_calls, 1,
+                    "node {i}: epoch 1's interface was removed"
+                );
+                assert_eq!(fake.applied.len(), 2);
+                let second = &fake.applied[1];
+                assert_eq!(second.peers.len(), 1, "node {i}: reduced mesh");
+                let other = &nodes[1 - i];
+                assert_eq!(second.peers[0].allowed_ips, vec![ula(other.identity)]);
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn single_member_mesh_and_stranger_traffic_are_inert() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1], vec![]);
+
+            retarget_all(&nodes, &[0], &[], 1, 10).await;
+            await_applied(&mut collected, &[0], 1).await;
+            {
+                let fake = nodes[0].effect.0.lock().unwrap();
+                assert_eq!(
+                    fake.create_calls, 0,
+                    "a peerless mesh brings up no interface"
+                );
+            }
+
+            // a well-formed message from a key outside the member set is
+            // refused loudly, never processed.
+            let stranger = PrivateKey::from_seed(99);
+            nodes[0]
+                .cmd
+                .send(ReachabilityCommand::Deliver {
+                    from: stranger.public_key(),
+                    bytes: b"junk".to_vec(),
+                })
+                .await
+                .unwrap();
+            let reason = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some((_, ReachabilityEvent::PeerFailed { reason, .. })) =
+                        collected.recv().await
+                    {
+                        break reason;
+                    }
+                }
+            })
+            .await
+            .expect("stranger traffic surfaced");
+            assert!(reason.contains("non-participant"), "{reason}");
+        })
+        .await;
+}
+
+/// The production resolver against a REAL coordinator + two real UDP
+/// clients on loopback: register, lookup, simultaneous-open punch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nat_resolver_punches_over_loopback() {
+    let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = coord_sock.local_addr().unwrap();
+    tokio::spawn(nat_traversal::client::run_coordinator(coord_sock));
+
+    let key_a = NodeKey([0xaa; 32]);
+    let key_b = NodeKey([0xbb; 32]);
+    let mut a = reachability::NatResolver::bind(key_a, vec![coord_addr])
+        .await
+        .unwrap();
+    let mut b = reachability::NatResolver::bind(key_b, vec![coord_addr])
+        .await
+        .unwrap();
+    assert!(a.reflexive().is_some(), "bind discovered the reflexive");
+
+    let dummy: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let (ra, rb) = tokio::join!(a.resolve(key_b, dummy), b.resolve(key_a, dummy));
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    // loopback "NAT": the punched address IS the peer's socket, and both
+    // sides punched through.
+    match (ra, rb) {
+        (Resolution::Punched(to_b), Resolution::Punched(to_a)) => {
+            assert_eq!(to_b, b.reflexive().unwrap());
+            assert_eq!(to_a, a.reflexive().unwrap());
+        }
+        other => panic!("expected punched/punched, got {other:?}"),
+    }
+}
+
+/// An empty coordinator set degrades to pass-through resolution.
+#[tokio::test]
+async fn nat_resolver_without_coordinators_is_pass_through() {
+    let mut r = reachability::NatResolver::bind(NodeKey([1; 32]), vec![])
+        .await
+        .unwrap();
+    assert_eq!(r.reflexive(), None);
+    let advertised: std::net::SocketAddr = "8.8.8.10:51820".parse().unwrap();
+    assert_eq!(
+        r.resolve(NodeKey([2; 32]), advertised).await.unwrap(),
+        Resolution::Advertised
+    );
+}
+
+/// the boot race: every node's `Retarget` record fan-out fires before the
+/// transport has any live connection, so BOTH sides of every link lose their
+/// initial `EndpointRecord` — `on_record`'s first-contact heal never fires
+/// and, without nudges, the epoch stalls in record gossip forever. periodic
+/// `Nudge` commands (bin/node's ticker) re-offer the stored gossip once the
+/// links are up, and the mesh must then converge to a full apply.
+#[tokio::test]
+async fn boot_window_record_loss_heals_by_nudge() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) = spawn_mesh_gated(
+                &local,
+                dir.path(),
+                &[1, 2],
+                vec![StaticResolver::default(), StaticResolver::default()],
+                links_up.clone(),
+            );
+
+            // both boot Retargets fire into the dead transport.
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            tokio::task::yield_now().await;
+
+            // the links come up AFTER the initial fan-out was lost.
+            links_up.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            spawn_nudgers(&local, &nodes);
+
+            let versions = await_applied(&mut collected, &[0, 1], 1).await;
+            assert_eq!(versions[&0], versions[&1]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.create_calls, 1, "node {i}: one interface");
+                assert_eq!(fake.applied.len(), 1, "node {i}: one apply");
+                assert_eq!(fake.applied[0].peers.len(), 1);
+            }
+        })
+        .await;
+}
+
+/// Drop the FIRST message matched by `hit`, deliver everything else — the
+/// single-shot handshake-loss scenarios.
+fn drop_first(hit: fn(&ReachabilityMsg) -> bool) -> (DeliveryFilter, Rc<Cell<bool>>) {
+    let dropped = Rc::new(Cell::new(false));
+    let flag = dropped.clone();
+    let filter: DeliveryFilter = Rc::new(move |_, _, msg| {
+        if !flag.get() && hit(msg) {
+            flag.set(true);
+            0
+        } else {
+            1
+        }
+    });
+    (filter, dropped)
+}
+
+/// Run a 2-node mesh whose router applies `filter`, with nudge tickers
+/// running, and require full convergence with zero failure events — the
+/// shared body of the handshake-retry tests.
+async fn converges_despite(filter: DeliveryFilter) {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) =
+                spawn_mesh_filtered(&local, dir.path(), &[1, 2], vec![], filter);
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_applied(&mut collected, &[0, 1], 1).await;
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.applied.len(), 1, "node {i}: exactly one apply");
+                assert_eq!(fake.applied[0].peers.len(), 1);
+            }
+        })
+        .await;
+}
+
+/// A lost `TunnelUpgradeRequest` used to stall its pair for the whole epoch
+/// (handshake messages were single-shot): the initiator waits for a response
+/// that can never come. The nudge ticker must re-offer the stored request
+/// verbatim and the mesh must still converge, with no failure noise.
+#[tokio::test]
+async fn dropped_handshake_request_heals_by_nudge() {
+    let (filter, dropped) = drop_first(|m| matches!(m, ReachabilityMsg::Request(_)));
+    converges_despite(filter).await;
+    assert!(dropped.get(), "a request was actually dropped");
+}
+
+/// A lost `TunnelUpgradeResponse` strands BOTH sides: the initiator awaits
+/// the response, the responder awaits an ack for it. The initiator's nudged
+/// request re-offer must elicit the responder's STORED response (never a
+/// re-signed one — the replay cache and the ack's response_hash both pin it).
+#[tokio::test]
+async fn dropped_handshake_response_heals_by_nudge() {
+    let (filter, dropped) = drop_first(|m| matches!(m, ReachabilityMsg::Response(_)));
+    converges_despite(filter).await;
+    assert!(dropped.get(), "a response was actually dropped");
+}
+
+/// A lost `TunnelUpgradeAck` is the asymmetric case: the initiator already
+/// validated its plan and applies, while the responder waits forever. The
+/// responder's nudged response re-offer must make the completed initiator
+/// re-send its stored ack verbatim.
+#[tokio::test]
+async fn dropped_handshake_ack_heals_by_nudge() {
+    let (filter, dropped) = drop_first(|m| matches!(m, ReachabilityMsg::Ack(_)));
+    converges_despite(filter).await;
+    assert!(dropped.get(), "an ack was actually dropped");
+}
+
+/// Transport-level redelivery: EVERY message arrives twice. Duplicates must
+/// be recognized as such (by hash, answered by verbatim re-sends at most) —
+/// never re-validated into the shared per-epoch `ReplayCache`, never
+/// mistaken for protocol violations, and never re-signed into a second
+/// response that desynchronizes the ack.
+#[tokio::test]
+async fn duplicated_delivery_is_tolerated_end_to_end() {
+    converges_despite(Rc::new(|_, _, _| 2)).await;
+}
+
+/// The kitchen sink: a 3-node mesh where the FIRST copy of every
+/// (sender, receiver, message kind) is lost — record, advert, request,
+/// response, and ack alike. Nudge re-offers must heal every stage.
+#[tokio::test]
+async fn every_message_kind_dropped_once_still_converges() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            type SeenKey = (usize, usize, &'static str);
+            let seen: Rc<RefCell<HashSet<SeenKey>>> = Rc::default();
+            let filter: DeliveryFilter = Rc::new(move |from, to, msg| {
+                let kind = match msg {
+                    ReachabilityMsg::Record(_) => "record",
+                    ReachabilityMsg::Advert(_) => "advert",
+                    ReachabilityMsg::Request(_) => "request",
+                    ReachabilityMsg::Response(_) => "response",
+                    ReachabilityMsg::Ack(_) => "ack",
+                };
+                usize::from(!seen.borrow_mut().insert((from, to, kind)))
+            });
+            let (nodes, mut collected) =
+                spawn_mesh_filtered(&local, dir.path(), &[1, 2, 3], vec![], filter);
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            let versions = await_applied(&mut collected, &[0, 1, 2], 1).await;
+            assert_eq!(versions[&0], versions[&1]);
+            assert_eq!(versions[&0], versions[&2]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.applied.len(), 1, "node {i}: exactly one apply");
+                assert_eq!(fake.applied[0].peers.len(), 2);
+            }
+        })
+        .await;
+}
+
+/// The joiner topology: node 2 has a live link ONLY to node 0 (its inviter's
+/// ingress) — nodes 1 and 2 have no transport path in either direction, the
+/// exact shape of a coordinated-only joiner parked through one ephemeral
+/// ingress. Gossip must relay through node 0 (records, adverts, and the 1<->2
+/// handshake alike) and the full mesh must still converge on every node.
+#[tokio::test]
+async fn star_topology_relays_gossip_through_the_hub() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let filter: DeliveryFilter = Rc::new(|from, to, _| {
+                usize::from(!matches!((from, to), (1, 2) | (2, 1)))
+            });
+            let (nodes, mut collected) =
+                spawn_mesh_filtered(&local, dir.path(), &[1, 2, 3], vec![], filter);
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            let versions = await_applied(&mut collected, &[0, 1, 2], 1).await;
+            assert_eq!(versions[&0], versions[&1]);
+            assert_eq!(versions[&0], versions[&2]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.applied.len(), 1, "node {i}: exactly one apply");
+                assert_eq!(fake.applied[0].peers.len(), 2, "node {i}: full mesh");
+            }
+        })
+        .await;
+}
+
+/// With relaying, a record's authenticity comes from its OWNER's signature,
+/// not the delivering link: a member forwarding a record whose signature
+/// does not verify (tampered in flight, or outright forged) is refused
+/// loudly, attributed to the DELIVERING member.
+#[tokio::test]
+async fn forged_relayed_record_is_refused() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2], vec![]);
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+
+            let policy = PortPolicy::production();
+            let forged = wireguard_upgrade::SignedEndpointRecord {
+                record: wireguard_upgrade::EndpointRecord {
+                    namespace: CHAIN.into(),
+                    epoch: 1,
+                    valset_root: wireguard_upgrade::Root([1; 32]),
+                    admission_root: wireguard_upgrade::AdmissionRoot([2; 32]),
+                    validator_identity: nodes[1].identity,
+                    wireguard_public_key: wireguard_upgrade::X25519PublicKey([4; 32]),
+                    control_endpoint: endpoint(&policy, 20, 443, Transport::Tcp),
+                    wireguard_endpoint: endpoint(&policy, 20, 51820, Transport::Udp),
+                    capabilities: vec![],
+                    expires_at_view: 100,
+                    nonce: 9,
+                },
+                signature: wireguard_upgrade::SignatureBytes(vec![0; 64]),
+            };
+            nodes[0]
+                .cmd
+                .send(ReachabilityCommand::Deliver {
+                    from: nodes[1].signer.public_key(),
+                    bytes: ReachabilityMsg::Record(forged).encode(),
+                })
+                .await
+                .unwrap();
+
+            let (peer, reason) = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some((0, ReachabilityEvent::PeerFailed { peer, reason })) =
+                        collected.recv().await
+                    {
+                        break (peer, reason);
+                    }
+                }
+            })
+            .await
+            .expect("forged record surfaced");
+            assert!(reason.contains("record signature invalid"), "{reason}");
+            assert_eq!(peer, nodes[1].signer.public_key());
+        })
+        .await;
+}
+
+/// Drain collected events until every node in `want` has emitted
+/// `MeshRestored`; returns node -> (restored epoch, restored peer count).
+/// Any failure event during a restore window is a bug.
+async fn await_restored(
+    collected: &mut mpsc::Receiver<(usize, ReachabilityEvent)>,
+    want: &[usize],
+) -> HashMap<usize, (u64, usize)> {
+    let mut restored = HashMap::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while restored.len() < want.len() {
+            let (i, event) = collected.recv().await.expect("event stream open");
+            match event {
+                ReachabilityEvent::MeshRestored { epoch, peers, .. } if want.contains(&i) => {
+                    restored.insert(i, (epoch, peers));
+                }
+                ReachabilityEvent::RestoreFailed { reason } => {
+                    panic!("restore failed on node {i}: {reason}");
+                }
+                ReachabilityEvent::PersistFailed { reason } => {
+                    panic!("persist failed on node {i}: {reason}");
+                }
+                ReachabilityEvent::EpochFailed { reason, .. } => {
+                    panic!("epoch failed on node {i}: {reason}");
+                }
+                ReachabilityEvent::PeerFailed { reason, .. } => {
+                    panic!("peer failed on node {i}: {reason}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("mesh restored in time");
+    restored
+}
+
+/// THE cold-restart brick, healed from disk alone: converge a mesh in one
+/// process life, then respawn every orchestrator from the same directory
+/// with the router gate DOWN — the exact restart topology where no TCP link
+/// exists, so no gossip can flow and (before persistence) nothing could ever
+/// apply. Every node must re-apply the persisted mesh purely locally, with
+/// FRESH resolver-provided endpoints, and once links return the boot epoch's
+/// own assembly must replace the restored interface.
+#[tokio::test]
+async fn cold_restart_restores_the_mesh_with_no_transport_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let ifname = binding::interface_name(CHAIN);
+
+    // life 1: a normal three-member convergence persists each node's mesh.
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+                retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+                await_applied(&mut collected, &[0, 1, 2], 1).await;
+            })
+            .await;
+        // dropping the LocalSet kills every run() mid-flight — a process
+        // exit, tunnels gone with it.
+    }
+    for i in 0..3 {
+        assert!(
+            dir.path().join(format!("mesh-{i}.json")).exists(),
+            "node {i} persisted its mesh"
+        );
+    }
+
+    // life 2: same directory, ZERO transport. node 0 re-resolves node 1
+    // through a fresh "punched" path — the persisted world never contained
+    // this address, so seeing it applied proves resolution ran fresh at
+    // boot rather than replaying stale observations.
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let fresh_punch: std::net::SocketAddr = "203.0.113.99:40009".parse().unwrap();
+            let identity_of_seed =
+                |seed: u64| binding::identity_of(&PrivateKey::from_seed(seed).public_key());
+            let mut r0 = StaticResolver::default();
+            r0.0.insert(
+                NodeKey(identity_of_seed(2).0),
+                Resolution::Punched(fresh_punch),
+            );
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) = spawn_mesh_gated(
+                &local,
+                dir.path(),
+                &[1, 2, 3],
+                vec![r0, StaticResolver::default(), StaticResolver::default()],
+                links_up.clone(),
+            );
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+
+            let restored = await_restored(&mut collected, &[0, 1, 2]).await;
+            for i in 0..3 {
+                assert_eq!(restored[&i], (1, 2), "node {i}: full mesh from epoch 1");
+            }
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.applied.len(), 1, "node {i}: the restore apply");
+                let config = &fake.applied[0];
+                assert_eq!(config.name, ifname);
+                assert_eq!(config.addresses, vec![ula(node.identity)]);
+                for (j, peer_node) in nodes.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    let (peer_keys, _) = WireGuardKeypair::load_or_generate(
+                        &dir.path().join(format!("wg-{j}.key")),
+                    )
+                    .unwrap();
+                    let entry = config
+                        .peers
+                        .iter()
+                        .find(|p| p.allowed_ips == vec![ula(peer_node.identity)])
+                        .unwrap_or_else(|| panic!("node {i}: no peer entry for node {j}"));
+                    assert_eq!(entry.public_key.as_array(), peer_keys.public_key().0);
+                    let expected = if i == 0 && j == 1 {
+                        fresh_punch
+                    } else {
+                        format!("8.8.8.{}:51820", peer_node.octet).parse().unwrap()
+                    };
+                    assert_eq!(entry.endpoint, Some(expected), "node {i} -> node {j}");
+                }
+            }
+
+            // the restored mesh is a bootstrap, not the destination: once
+            // links exist, the boot epoch assembles live and replaces it.
+            spawn_nudgers(&local, &nodes);
+            links_up.store(true, std::sync::atomic::Ordering::Relaxed);
+            await_applied(&mut collected, &[0, 1, 2], 1).await;
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(
+                    fake.remove_calls, 1,
+                    "node {i}: the restored interface was replaced"
+                );
+                assert_eq!(fake.applied.len(), 2, "node {i}: restore, then live apply");
+            }
+        })
+        .await;
+}
+
+/// A boot whose member set shrank since the mesh was persisted restores
+/// only the intersection: the departed member's tunnel is never applied.
+#[tokio::test]
+async fn cold_restart_filters_departed_members() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+                retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+                await_applied(&mut collected, &[0, 1, 2], 1).await;
+            })
+            .await;
+    }
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) = spawn_mesh_gated(
+                &local,
+                dir.path(),
+                &[1, 2, 3],
+                vec![],
+                links_up,
+            );
+            // the resumed epoch dropped node 2.
+            retarget_all(&nodes, &[0, 1], &[], 2, 20).await;
+
+            let restored = await_restored(&mut collected, &[0, 1]).await;
+            for i in 0..2 {
+                assert_eq!(restored[&i], (1, 1), "node {i}: only the surviving peer");
+            }
+            for i in 0..2 {
+                let fake = nodes[i].effect.0.lock().unwrap();
+                let other = &nodes[1 - i];
+                assert_eq!(fake.applied.len(), 1);
+                assert_eq!(fake.applied[0].peers.len(), 1);
+                assert_eq!(fake.applied[0].peers[0].allowed_ips, vec![ula(other.identity)]);
+            }
+        })
+        .await;
+}
+
+/// A tampered state file is refused (surfaced as `RestoreFailed`), never
+/// applied — and the node still converges live once transport exists,
+/// exactly the pre-persistence behavior.
+#[tokio::test]
+async fn tampered_mesh_state_is_refused_and_live_assembly_still_converges() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2], vec![]);
+                retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+                await_applied(&mut collected, &[0, 1], 1).await;
+            })
+            .await;
+    }
+    // flip the epochs inside node 0's file: every owner signature now
+    // disowns its record.
+    let path = dir.path().join("mesh-0.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replace("\"epoch\": 1", "\"epoch\": 9")).unwrap();
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2], vec![]);
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+
+            let mut refused = false;
+            let mut applied: HashSet<usize> = HashSet::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !refused || applied.len() < 2 {
+                    let (i, event) = collected.recv().await.expect("event stream open");
+                    match event {
+                        ReachabilityEvent::RestoreFailed { reason } => {
+                            assert_eq!(i, 0, "only node 0's file was tampered");
+                            assert!(reason.contains("signature"), "{reason}");
+                            refused = true;
+                        }
+                        ReachabilityEvent::TunnelsApplied { epoch: 1, .. } => {
+                            applied.insert(i);
+                        }
+                        ReachabilityEvent::EpochFailed { reason, .. } => {
+                            panic!("epoch failed on node {i}: {reason}");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("refusal surfaced and the mesh still converged");
+
+            // node 0 never applied the tampered mesh: its only apply is the
+            // live epoch's.
+            let fake = nodes[0].effect.0.lock().unwrap();
+            assert_eq!(fake.applied.len(), 1);
+        })
+        .await;
+}
+
+/// Drain collected events until every member in `members` has applied
+/// `epoch` AND every `(node, at_least_n_peers)` pair in `standby_want` has
+/// been satisfied by a `StandbyTunnelsApplied` for `epoch` — ONE pass over
+/// the shared event stream, because a standby apply that rides the member's
+/// epoch apply lands in the same drain (pre-warm applies are incremental, so
+/// a node may report a partial count before its full set). Failure events
+/// during a pre-warm window are bugs.
+async fn await_prewarmed(
+    collected: &mut mpsc::Receiver<(usize, ReachabilityEvent)>,
+    members: &[usize],
+    standby_want: &[(usize, usize)],
+    epoch: u64,
+) {
+    let mut applied: HashSet<usize> = HashSet::new();
+    let mut latest: HashMap<usize, usize> = HashMap::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while members.iter().any(|i| !applied.contains(i))
+            || standby_want
+                .iter()
+                .any(|(i, n)| latest.get(i).is_none_or(|have| have < n))
+        {
+            let (i, event) = collected.recv().await.expect("event stream open");
+            match event {
+                ReachabilityEvent::TunnelsApplied { epoch: e, .. } if e == epoch => {
+                    applied.insert(i);
+                }
+                ReachabilityEvent::StandbyTunnelsApplied {
+                    epoch: e, peers, ..
+                } if e == epoch => {
+                    latest.insert(i, peers);
+                }
+                ReachabilityEvent::EpochFailed { reason, .. } => {
+                    panic!("epoch failed on node {i}: {reason}");
+                }
+                ReachabilityEvent::PeerFailed { reason, .. } => {
+                    panic!("peer failed on node {i}: {reason}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("pre-warm tunnels applied in time");
+}
+
+/// A node's LATEST applied interface config — pre-warm applies reconfigure
+/// in place, so the last config is the interface's current truth.
+fn latest_config(node: &TestNode) -> defguard_wireguard_rs::InterfaceConfiguration {
+    let fake = node.effect.0.lock().unwrap();
+    fake.applied.last().expect("node applied at least once").clone()
+}
+
+/// The pre-warm headline: a standby's tunnels exist on BOTH sides before its
+/// activation. Members merge the standby's record-derived peer onto their
+/// live interface without tearing it down; the standby brings up its own
+/// interface carrying every member; and the activation cutover then folds it
+/// into the verified member mesh.
+#[tokio::test]
+async fn standby_tunnels_prewarm_before_activation() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+            retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            // each member applies the epoch and ends up with the one
+            // standby installed; the standby installs both members.
+            await_prewarmed(&mut collected, &[0, 1], &[(0, 1), (1, 1), (2, 2)], 1).await;
+
+            let standby = &nodes[2];
+            let (standby_keys, _) =
+                WireGuardKeypair::load_or_generate(&dir.path().join("wg-2.key")).unwrap();
+            for i in [0usize, 1] {
+                let config = latest_config(&nodes[i]);
+                assert_eq!(config.peers.len(), 2, "member {i}: member peer + standby");
+                let entry = config
+                    .peers
+                    .iter()
+                    .find(|p| p.allowed_ips == vec![ula(standby.identity)])
+                    .unwrap_or_else(|| panic!("member {i}: no standby peer entry"));
+                assert_eq!(entry.public_key.as_array(), standby_keys.public_key().0);
+                assert_eq!(
+                    entry.endpoint,
+                    Some("8.8.8.30:51820".parse().unwrap()),
+                    "member {i}: the standby's advertised endpoint"
+                );
+                let fake = nodes[i].effect.0.lock().unwrap();
+                assert_eq!(fake.create_calls, 1, "member {i}: one interface");
+                assert_eq!(
+                    fake.remove_calls, 0,
+                    "member {i}: the pre-warm merge never tears down"
+                );
+            }
+            {
+                let config = latest_config(standby);
+                assert_eq!(config.addresses, vec![ula(standby.identity)]);
+                assert_eq!(config.peers.len(), 2, "standby: both members installed");
+                for member in &nodes[..2] {
+                    assert!(
+                        config
+                            .peers
+                            .iter()
+                            .any(|p| p.allowed_ips == vec![ula(member.identity)]),
+                        "standby: missing member peer"
+                    );
+                }
+                let fake = standby.effect.0.lock().unwrap();
+                assert_eq!(fake.create_calls, 1, "standby: one interface");
+                assert_eq!(fake.remove_calls, 0);
+            }
+
+            // activation: the standby joins the member set at the next
+            // cutover and the verified phase-A mesh replaces the pre-warm
+            // layer on every node.
+            retarget_all(&nodes, &[0, 1, 2], &[], 2, 20).await;
+            let versions = await_applied(&mut collected, &[0, 1, 2], 2).await;
+            assert_eq!(versions[&0], versions[&2], "the activated node versions");
+            for (i, node) in nodes.iter().enumerate() {
+                let config = latest_config(node);
+                assert_eq!(config.peers.len(), 2, "node {i}: the full member mesh");
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(
+                    fake.remove_calls, 1,
+                    "node {i}: the epoch apply replaced the pre-warm interface"
+                );
+            }
+        })
+        .await;
+}
+
+/// A standby record that lands while the members' epoch is still assembling
+/// rides the epoch's ONE apply instead of forcing an early interface — and
+/// the pre-warm layer works through partial links: the standby exchanges
+/// gossip with member 0 alone while member 1 is still down.
+#[tokio::test]
+async fn standby_record_before_the_epoch_apply_rides_it() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+            let member_pks: Vec<_> = [0usize, 1]
+                .iter()
+                .map(|i| nodes[*i].signer.public_key())
+                .collect();
+            let standby_pks = vec![nodes[2].signer.public_key()];
+            // member 0 and the standby retarget; member 1 stays dark, so
+            // member 0's epoch CANNOT apply yet.
+            for i in [0usize, 2] {
+                nodes[i]
+                    .cmd
+                    .send(ReachabilityCommand::Retarget(MeshEpochEvent {
+                        epoch: 1,
+                        members: member_pks.clone(),
+                        standbys: standby_pks.clone(),
+                        current_view: 10,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            spawn_nudgers(&local, &nodes);
+            // the standby installs member 0 (proof its record reached member
+            // 0 and the first-contact reply flowed back) while member 0
+            // holds the record for the epoch apply.
+            await_prewarmed(&mut collected, &[], &[(2, 1)], 1).await;
+            {
+                let fake = nodes[0].effect.0.lock().unwrap();
+                assert!(
+                    fake.applied.is_empty(),
+                    "member 0 holds the pre-warm peer until its epoch applies"
+                );
+            }
+
+            // member 1 arrives; the epoch completes; member 0's FIRST apply
+            // already carries the standby peer.
+            nodes[1]
+                .cmd
+                .send(ReachabilityCommand::Retarget(MeshEpochEvent {
+                    epoch: 1,
+                    members: member_pks.clone(),
+                    standbys: standby_pks.clone(),
+                    current_view: 10,
+                }))
+                .await
+                .unwrap();
+            await_prewarmed(&mut collected, &[0, 1], &[(1, 1), (2, 2)], 1).await;
+            let standby = &nodes[2];
+            {
+                let fake = nodes[0].effect.0.lock().unwrap();
+                let first = &fake.applied[0];
+                assert_eq!(
+                    first.peers.len(),
+                    2,
+                    "member 0's first apply carries member 1 AND the standby"
+                );
+                assert!(
+                    first
+                        .peers
+                        .iter()
+                        .any(|p| p.allowed_ips == vec![ula(standby.identity)]),
+                    "the standby rode the epoch apply"
+                );
+            }
+        })
+        .await;
+}
+
+/// Live re-advertisement: a standby's higher-nonce record moves its tunnel
+/// endpoint in place on every member, and a stale lower-nonce replay is
+/// silently ignored.
+#[tokio::test]
+async fn standby_readvertisement_updates_the_endpoint_live() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+            retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_prewarmed(&mut collected, &[0, 1], &[(0, 1), (1, 1)], 1).await;
+
+            // the standby re-advertises from a new address (a NAT rebind):
+            // same identity and WireGuard key, higher nonce, new endpoint.
+            let policy = PortPolicy::production();
+            let set = reachability::active_set(
+                CHAIN,
+                1,
+                vec![nodes[0].identity, nodes[1].identity],
+            )
+            .unwrap();
+            let (standby_keys, _) =
+                WireGuardKeypair::load_or_generate(&dir.path().join("wg-2.key")).unwrap();
+            let rebind = |nonce: u64, octet: u8| {
+                wireguard_upgrade::SignedEndpointRecord::sign(
+                    wireguard_upgrade::EndpointRecord {
+                        namespace: CHAIN.into(),
+                        epoch: 1,
+                        valset_root: set.valset_root,
+                        admission_root: set.admission_root,
+                        validator_identity: nodes[2].identity,
+                        wireguard_public_key: standby_keys.public_key(),
+                        control_endpoint: endpoint(&policy, 30, 443, Transport::Tcp),
+                        wireguard_endpoint: Endpoint::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, octet)),
+                            51820,
+                            Transport::Udp,
+                            &policy,
+                        )
+                        .unwrap(),
+                        capabilities: vec![],
+                        expires_at_view: 10 + reachability::ADVERT_TTL_VIEWS,
+                        nonce,
+                    },
+                    &nodes[2].signer,
+                )
+            };
+            nodes[0]
+                .cmd
+                .send(ReachabilityCommand::Deliver {
+                    from: nodes[2].signer.public_key(),
+                    bytes: ReachabilityMsg::Record(rebind(5, 42)).encode(),
+                })
+                .await
+                .unwrap();
+            // both members converge on the new endpoint — member 1 through
+            // member 0's accept-gated relay of the fresher record.
+            let moved: std::net::SocketAddr = "9.9.9.42:51820".parse().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let both = [0usize, 1].iter().all(|i| {
+                        latest_config(&nodes[*i])
+                            .peers
+                            .iter()
+                            .any(|p| p.endpoint == Some(moved))
+                    });
+                    if both {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("both members moved the standby's endpoint");
+
+            // a stale replay (lower nonce, yet another address) changes
+            // nothing: deliver it, then prove the endpoint still stands.
+            nodes[0]
+                .cmd
+                .send(ReachabilityCommand::Deliver {
+                    from: nodes[2].signer.public_key(),
+                    bytes: ReachabilityMsg::Record(rebind(3, 77)).encode(),
+                })
+                .await
+                .unwrap();
+            // drive a full nudge round so the stale record would have had
+            // every chance to mis-apply.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let config = latest_config(&nodes[0]);
+            let entry = config
+                .peers
+                .iter()
+                .find(|p| p.allowed_ips == vec![ula(nodes[2].identity)])
+                .expect("standby entry present");
+            assert_eq!(entry.endpoint, Some(moved), "the stale replay was ignored");
+        })
+        .await;
+}
+
+/// A record from an identity in NEITHER class — however well-signed — is
+/// refused loudly and installs nothing.
+#[tokio::test]
+async fn record_from_neither_member_nor_standby_is_refused() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2], vec![]);
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            await_applied(&mut collected, &[0, 1], 1).await;
+
+            let stranger = PrivateKey::from_seed(99);
+            let policy = PortPolicy::production();
+            let set =
+                reachability::active_set(CHAIN, 1, vec![nodes[0].identity, nodes[1].identity])
+                    .unwrap();
+            let forged = wireguard_upgrade::SignedEndpointRecord::sign(
+                wireguard_upgrade::EndpointRecord {
+                    namespace: CHAIN.into(),
+                    epoch: 1,
+                    valset_root: set.valset_root,
+                    admission_root: set.admission_root,
+                    validator_identity: binding::identity_of(&stranger.public_key()),
+                    wireguard_public_key: wireguard_upgrade::X25519PublicKey([9; 32]),
+                    control_endpoint: endpoint(&policy, 99, 443, Transport::Tcp),
+                    wireguard_endpoint: endpoint(&policy, 99, 51820, Transport::Udp),
+                    capabilities: vec![],
+                    expires_at_view: 1000,
+                    nonce: 1,
+                },
+                &stranger,
+            );
+            // relayed by a MEMBER, so the via-gate passes and the identity
+            // check itself must refuse it.
+            nodes[0]
+                .cmd
+                .send(ReachabilityCommand::Deliver {
+                    from: nodes[1].signer.public_key(),
+                    bytes: ReachabilityMsg::Record(forged).encode(),
+                })
+                .await
+                .unwrap();
+            let reason = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some((0, ReachabilityEvent::PeerFailed { reason, .. })) =
+                        collected.recv().await
+                    {
+                        break reason;
+                    }
+                }
+            })
+            .await
+            .expect("the stranger record surfaced");
+            assert!(reason.contains("unknown identity"), "{reason}");
+            let fake = nodes[0].effect.0.lock().unwrap();
+            assert_eq!(fake.applied.len(), 1, "nothing beyond the member mesh applied");
+        })
+        .await;
+}
+
+/// The lobby shape: the standby's transport identity is the network's shared
+/// ingress key, not its record identity. Members must admit its gossip via
+/// `gossip_ingress`, learn the route, and address every standby-directed
+/// reply to the ingress identity — full pre-warm convergence on both sides.
+#[tokio::test]
+async fn standby_gossip_rides_the_lobby_ingress_identity() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let lobby = PrivateKey::from_seed(77).public_key();
+            let deliver_all: DeliveryFilter = Rc::new(|_, _, _| 1);
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2, 3],
+                vec![],
+                deliver_all,
+                vec![None, None, Some(lobby.clone())],
+                Some(lobby),
+            );
+            retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_prewarmed(&mut collected, &[0, 1], &[(0, 1), (1, 1), (2, 2)], 1).await;
+
+            let standby = &nodes[2];
+            for i in [0usize, 1] {
+                let config = latest_config(&nodes[i]);
+                assert!(
+                    config
+                        .peers
+                        .iter()
+                        .any(|p| p.allowed_ips == vec![ula(standby.identity)]),
+                    "member {i}: standby tunnel installed via the lobby ingress"
+                );
+            }
+            assert_eq!(latest_config(standby).peers.len(), 2);
+        })
+        .await;
+}
+
+/// The promotion-reboot payoff: a standby persists the member adverts it
+/// collected while pre-warming, and its next process life — booting as a
+/// MEMBER of the widened epoch with ZERO transport — restores every member
+/// tunnel from disk alone. A mid-standby cold restart restores the same way.
+#[tokio::test]
+async fn standby_persists_the_member_mesh_for_its_promotion_reboot() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // life 1: pre-warm as a standby; the member adverts land on disk.
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+                retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+                spawn_nudgers(&local, &nodes);
+                await_prewarmed(&mut collected, &[0, 1], &[(2, 2)], 1).await;
+                // the standby persists on advert acceptance; both member
+                // adverts must be on disk before this life ends.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let full = reachability::store::load(
+                            &dir.path().join("mesh-2.json"),
+                            CHAIN,
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some_and(|mesh| mesh.adverts.len() == 2);
+                        if full {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("the standby persisted both member adverts");
+            })
+            .await;
+    }
+
+    // life 2: a mid-standby cold restart — same standby role, no transport.
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (nodes, mut collected) =
+                    spawn_mesh_gated(&local, dir.path(), &[1, 2, 3], vec![], links_up);
+                retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+                let restored = await_restored(&mut collected, &[2]).await;
+                assert_eq!(restored[&2], (1, 2), "both member tunnels from disk");
+            })
+            .await;
+    }
+
+    // life 3: the promotion reboot — the standby boots as a MEMBER of the
+    // widened epoch, still with no transport, and the pre-warm era's
+    // persisted mesh carries its first gossip.
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) =
+                spawn_mesh_gated(&local, dir.path(), &[1, 2, 3], vec![], links_up);
+            retarget_all(&nodes, &[0, 1, 2], &[], 2, 20).await;
+            let restored = await_restored(&mut collected, &[2]).await;
+            assert_eq!(
+                restored[&2],
+                (1, 2),
+                "the promoted node restored both member tunnels from its standby era"
+            );
+            let config = latest_config(&nodes[2]);
+            assert_eq!(config.peers.len(), 2);
+            for member in &nodes[..2] {
+                assert!(
+                    config
+                        .peers
+                        .iter()
+                        .any(|p| p.allowed_ips == vec![ula(member.identity)]),
+                    "restored peer for each member"
+                );
+            }
+        })
+        .await;
+}

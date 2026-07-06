@@ -17,9 +17,14 @@ document-interface = { workspace = true }
 chat = { workspace = true }
 chat-interface = { workspace = true }
 agent = { workspace = true }
+runs = { workspace = true }
 agent-interface = { workspace = true }
+runs-interface = { workspace = true }
 saga = { workspace = true }
 saga-interface = { workspace = true }
+dispatch = { workspace = true }
+dispatch-interface = { workspace = true }
+tagging = { workspace = true }
 tasks = { workspace = true }
 profiles = { workspace = true }
 automations = { workspace = true }

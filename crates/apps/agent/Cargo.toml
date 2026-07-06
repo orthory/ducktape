@@ -3,25 +3,19 @@ name = "agent"
 edition.workspace = true
 version.workspace = true
 
-# the agent orchestrator: registry, channel watches, run lifecycle, context
-# pinning, and deterministic LLM-output validation over chat + saga + tasks.
+# the agent registry: a self-contained record book (owner, capability tag,
+# prompt pin, granted actions, status). saga-interface supplies the canonical
+# origin mirror; capability-interface the shared capability-tag shape rule.
+# everything that ACTS on agents lives in the runs module.
 [dependencies]
 sdk = { workspace = true }
 agent-interface = { workspace = true }
-chat-interface = { workspace = true }
 saga-interface = { workspace = true }
-tasks-interface = { workspace = true }
-jobs-interface = { workspace = true }
+capability-interface = { workspace = true }
 sha2 = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"
-host = { workspace = true }
-reactor = { workspace = true }
-chat = { workspace = true }
-saga = { workspace = true }
-tasks = { workspace = true }
-jobs = { workspace = true }
-commonware-runtime = { workspace = true }

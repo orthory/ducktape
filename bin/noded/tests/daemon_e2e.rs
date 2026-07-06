@@ -11,9 +11,11 @@
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use sha2::{Digest as _, Sha256};
 
 /// a running daemon, killed on drop so failures never leak an orphan (the
 /// REAL orphan lifecycle — outliving a client — is the desktop shell's
@@ -36,14 +38,21 @@ impl Daemon {
     /// a leaked dir plus a recycled pid would reopen stale qmdb state and
     /// fail this suite spuriously.
     fn spawn(storage: &Path) -> Self {
-        Self::spawn_inner(storage, false)
+        Self::spawn_inner(storage, false, &[])
     }
 
     fn spawn_with_echo_oracle(storage: &Path) -> Self {
-        Self::spawn_inner(storage, true)
+        Self::spawn_inner(storage, true, &[])
     }
 
-    fn spawn_inner(storage: &Path, echo_oracle: bool) -> Self {
+    /// spawn with extra process env — how a test puts REAL script-backed
+    /// providers (an operator spec dir plus detect overrides) on the daemon's
+    /// in-process dispatch worker.
+    fn spawn_with_env(storage: &Path, env: &[(String, String)]) -> Self {
+        Self::spawn_inner(storage, false, env)
+    }
+
+    fn spawn_inner(storage: &Path, echo_oracle: bool, env: &[(String, String)]) -> Self {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"));
         cmd.arg("--listen")
@@ -57,6 +66,9 @@ impl Daemon {
             .stderr(Stdio::inherit());
         if echo_oracle {
             cmd.env("DUCKTAPE_NODED_ECHO_ORACLE", "1");
+        }
+        for (key, value) in env {
+            cmd.env(key, value);
         }
         let child = cmd.spawn().expect("spawn ducktape-noded");
         let mut daemon = Self { child, port };
@@ -296,7 +308,7 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
                         "text": format!("@{agent_id}"),
                         "marks": [{
                             "Mention": {
-                                "Agent": { "module": "agent", "agent_id": agent_id }
+                                "Agent": { "module": "runs", "agent_id": agent_id }
                             }
                         }]
                     },
@@ -329,11 +341,14 @@ fn full_surface_blocks_authorship_and_ws() {
         [
             "chat",
             "saga",
+            "dispatch",
+            "tagging",
             "tasks",
             "inbox",
             "automations",
             "jobs",
             "agent",
+            "runs",
             "document",
             "pages",
             "forge",
@@ -452,7 +467,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
             "RegisterAgent": {
                 "agent_id": "quackbot",
                 "display_name": "Quackbot",
-                "model_ref": "echo-model",
+                "capability": "echo-model",
                 "prompt_hash": prompt_hash,
                 "allowed_actions": ["chat.post"]
             }
@@ -462,7 +477,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     assert_eq!(code, 200, "register agent failed: {block}");
 
     let (code, block) = daemon.submit(
-        "agent",
+        "runs",
         serde_json::json!({
             "WatchChannel": {
                 "channel_id": "general",
@@ -479,16 +494,42 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
         Some("eddy"),
     );
     assert_eq!(code, 200, "mention post failed: {block}");
+    // the receipt reports the block that INCLUDED the post, not the drain tail…
     assert_eq!(
-        block["height"], 5,
-        "the post block plus oracle follow-up block should both drain"
+        block["height"], 4,
+        "the receipt should carry the post's inclusion block"
+    );
+    // …while the drain tail runs behind it: the oracle follow-up block (5)
+    // commits the result into the dispatch mailbox, and the nudge block (6)
+    // carries the DeliverPending injection that posts the reply — the
+    // never-pop-stack rule made visible in the block arithmetic.
+    assert_eq!(
+        daemon.status()["height"],
+        6,
+        "post + oracle follow-up + delivery nudge should all drain"
     );
 
     let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
-    let run = daemon.query("agent", serde_json::json!({ "Run": { "run_id": run_id } }));
+    // the run's lifecycle lives in the dispatch module; the runs module's
+    // pending entry pruned when the delivery landed.
+    let pending = daemon.query("runs", serde_json::json!("PendingRuns"));
     assert_eq!(
-        run["Run"]["status"], "Done",
-        "run should settle Done: {run}"
+        pending["PendingRuns"].as_array().map(Vec::len),
+        Some(0),
+        "the delivered run must leave no pending entry: {pending}"
+    );
+    let dispatch = daemon.query(
+        "dispatch",
+        serde_json::json!({
+            "Dispatch": {
+                "receiver": "runs",
+                "dispatch_id": runs::dispatch_id_for(run_id),
+            }
+        }),
+    );
+    assert_eq!(
+        dispatch["Dispatch"]["status"], "Delivered",
+        "the dispatch record is the run's history: {dispatch}"
     );
 
     let reply = daemon.query(
@@ -501,11 +542,305 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
     assert_eq!(
         agent_reply["author"],
-        serde_json::json!({ "Agent": { "module": "agent", "agent_id": "quackbot" } })
+        serde_json::json!({ "Agent": { "module": "runs", "agent_id": "quackbot" } })
     );
+    let text = agent_reply["blocks"][0]["Paragraph"][0]["text"]
+        .as_str()
+        .expect("reply text");
+    assert!(
+        text.starts_with("echo: handling dispatch "),
+        "the reply is the echo worker's dispatch-lane answer, normalized \
+         into a paragraph by the runs module: {text}"
+    );
+}
+
+// ============================================================================
+// consensus-resident prompts, live: an agent registered with `prompt_doc`
+// composes every dispatch payload from a REAL document-module doc, verified
+// against the registered prompt_hash. the providers are script CLIs wired
+// through the full capability-host path (operator spec dir -> discovery ->
+// the daemon's in-process dispatch worker -> spawned CLI) that CAPTURE their
+// stdin — the verbatim payload the dispatch plane fed them — so the
+// composition rule (doc text leads, contract follows) is asserted on the
+// exact bytes a real provider receives, for the chat lane AND the job lane.
+// ============================================================================
+
+/// one script-backed provider staged into the shared operator spec dir: the
+/// script keeps its stdin as `payload_file` (the composition evidence), then
+/// answers `stdout`. the spec's `detect.env` names a per-tag variable, so the
+/// daemon provides this tag exactly when its process env points at the script.
+struct CaptureProvider {
+    env_var: String,
+    script: PathBuf,
+    payload_file: PathBuf,
+}
+
+impl CaptureProvider {
+    fn stage(root: &Path, spec_dir: &Path, tag: &str, stdout: &str) -> Self {
+        let payload_file = root.join(format!("{tag}.payload"));
+        let script = root.join(format!("{tag}.sh"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 # a test executor: keep the payload as evidence, then answer.\n\
+                 cat > {payload}\n\
+                 printf '%s\\n' '{stdout}'\n",
+                payload = payload_file.display(),
+            ),
+        )
+        .expect("write provider script");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod provider script");
+
+        let env_var = format!(
+            "DUCKTAPE_TEST_{}_BIN",
+            tag.replace(['-', '.'], "_").to_uppercase()
+        );
+        std::fs::write(
+            spec_dir.join(format!("{tag}.toml")),
+            format!(
+                "spec = 1\n\
+                 [capability]\n\
+                 tag = \"{tag}\"\n\
+                 description = \"prompt-doc e2e script executor\"\n\
+                 [detect]\n\
+                 bin = \"{tag}-nonexistent-cli\"\n\
+                 env = \"{env_var}\"\n\
+                 [invoke]\n\
+                 args = []\n\
+                 prompt = \"stdin\"\n\
+                 timeout_secs = 30\n\
+                 [output]\n\
+                 format = \"text\"\n"
+            ),
+        )
+        .expect("write provider spec");
+        Self {
+            env_var,
+            script,
+            payload_file,
+        }
+    }
+
+    /// the detect override that makes the daemon provide this tag.
+    fn env(&self) -> (String, String) {
+        (self.env_var.clone(), self.script.display().to_string())
+    }
+
+    /// the verbatim payload the dispatch worker piped into the script.
+    fn payload(&self) -> String {
+        std::fs::read_to_string(&self.payload_file).expect("provider captured a payload")
+    }
+}
+
+#[test]
+fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
+    let spec_dir = fixtures.path().join("specs");
+    std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
+
+    // two providers, one per lane: the chat lane answers plain text (a normal
+    // chat reply); the job lane answers an actions-only response — job runs
+    // drop reply blocks, so a bare-text answer would fail-finalize the job.
+    let chat_provider = CaptureProvider::stage(
+        fixtures.path(),
+        &spec_dir,
+        "duck-chat-model",
+        "the doc led my payload",
+    );
+    let job_provider = CaptureProvider::stage(
+        fixtures.path(),
+        &spec_dir,
+        "duck-job-model",
+        r#"{"reply_blocks":[],"actions":[{"CreateTask":{"task_id":"t-from-job","title":"filed by the job run"}}]}"#,
+    );
+
+    // hermetic: hide any host claude/codex CLIs behind a missing path so this
+    // daemon provides exactly the two staged tags (the dispatch_e2e rule).
+    let missing = fixtures.path().join("missing-executor");
+    let daemon = Daemon::spawn_with_env(
+        storage.path(),
+        &[
+            (
+                "DUCKTAPE_CAPABILITY_DIR".into(),
+                spec_dir.display().to_string(),
+            ),
+            ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
+            ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
+            chat_provider.env(),
+            job_provider.env(),
+        ],
+    );
+
+    // the consensus-resident prompt: a REAL document-module doc. two blocks of
+    // different kinds pin the canonical rendering (kind-agnostic block texts
+    // joined by blank lines) — prompt_hash is sha256 of exactly that string.
+    let heading = "You are DUCK-LIVE, a terse consensus-resident reviewer.";
+    let body = "Reply in one short sentence.";
+    let prompt_text = format!("{heading}\n\n{body}");
+    let prompt_hash = Sha256::digest(prompt_text.as_bytes()).to_vec();
+    let (code, block) = daemon.submit(
+        "document",
+        serde_json::json!({ "CreateDoc": { "doc_id": "prompts/duck" } }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "create doc failed: {block}");
+    let inserts = [
+        serde_json::json!({ "InsertBlock": {
+            "doc_id": "prompts/duck",
+            "after": null,
+            "block": { "id": "b1", "kind": "Heading", "text": heading },
+        } }),
+        serde_json::json!({ "InsertBlock": {
+            "doc_id": "prompts/duck",
+            "after": "b1",
+            "block": { "id": "b2", "kind": "Paragraph", "text": body },
+        } }),
+    ];
+    for op in inserts {
+        let (code, block) = daemon.submit("document", op, Some("owner"));
+        assert_eq!(code, 200, "insert block failed: {block}");
+    }
+
+    // ---- the chat lane ------------------------------------------------------
+
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "CreateChannel": { "channel_id": "general", "name": "General", "post_policy": "Open" }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+    let (code, block) = daemon.submit(
+        "agent",
+        serde_json::json!({
+            "RegisterAgent": {
+                "agent_id": "duck-live",
+                "display_name": "Duck Live",
+                "capability": "duck-chat-model",
+                "prompt_hash": prompt_hash.clone(),
+                "prompt_doc": "prompts/duck",
+                "allowed_actions": ["chat.post"],
+            }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "register chat agent failed: {block}");
+    let (code, block) = daemon.submit(
+        "runs",
+        serde_json::json!({ "WatchChannel": { "channel_id": "general", "policy": "Mention" } }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "watch channel failed: {block}");
+
+    // one msg = one committed block, and the submit reply lands only after the
+    // FULL drain — mention, provider execution, result, delivery — so the
+    // captured payload is complete the moment this returns.
+    let (code, block) = daemon.submit(
+        "chat",
+        post_mention("general", "m1", "duck-live"),
+        Some("eddy"),
+    );
+    assert_eq!(code, 200, "mention post failed: {block}");
+
+    // THE assertion: the payload the provider actually received leads with the
+    // doc's canonical text, with the strict-output contract right behind it.
+    let payload = chat_provider.payload();
+    assert!(
+        payload.starts_with(&format!("{prompt_text}\n\nReturn ONLY a JSON object")),
+        "the chat payload must lead with the prompt doc text: {payload}"
+    );
+    assert!(
+        payload.contains("can you handle this?"),
+        "the pinned transcript rides behind the prompt: {payload}"
+    );
+
+    // and the loop closed: the provider's stdout posted as the agent's reply.
+    let run_id = runs::run_id_for("general", 1, "duck-live");
+    let reply = daemon.query(
+        "chat",
+        serde_json::json!({ "MessagesLatest": { "channel_id": "general", "limit": 16 } }),
+    );
+    let messages = reply["Messages"].as_array().expect("Messages reply");
+    let agent_reply = &messages.last().expect("mention plus reply")["head"];
+    assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
     assert_eq!(
         agent_reply["blocks"][0]["Paragraph"][0]["text"],
-        format!("echo: handling {run_id}")
+        "the doc led my payload"
+    );
+
+    // ---- the job lane -------------------------------------------------------
+
+    let (code, block) = daemon.submit(
+        "agent",
+        serde_json::json!({
+            "RegisterAgent": {
+                "agent_id": "duck-jobs",
+                "display_name": "Duck Jobs",
+                "capability": "duck-job-model",
+                "prompt_hash": prompt_hash,
+                "prompt_doc": "prompts/duck",
+                "allowed_actions": ["tasks.create"],
+            }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "register job agent failed: {block}");
+    let (code, block) = daemon.submit(
+        "runs",
+        serde_json::json!({ "EnableJobWorker": { "enabled": true } }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "enable job worker failed: {block}");
+    let (code, block) = daemon.submit(
+        "jobs",
+        serde_json::json!({ "Submit": {
+            "job_id": "job-1",
+            "kind": "agent/duck-jobs",
+            "spec": "summarize the duck ledger",
+        } }),
+        Some("eddy"),
+    );
+    assert_eq!(code, 200, "job submit failed: {block}");
+
+    // the same composition rule on the job lane: doc text first, contract
+    // next, then the job's coordinates and its full spec.
+    let payload = job_provider.payload();
+    assert!(
+        payload.starts_with(&format!("{prompt_text}\n\nReturn ONLY a JSON object")),
+        "the job payload must lead with the prompt doc text: {payload}"
+    );
+    assert!(
+        payload.contains("Job job-1"),
+        "the job coordinates ride the payload: {payload}"
+    );
+    assert!(
+        payload.contains("summarize the duck ledger"),
+        "the full job spec rides the payload: {payload}"
+    );
+
+    // the run finalized the job off the actions-only response...
+    let reply = daemon.query("jobs", serde_json::json!({ "Get": { "job_id": "job-1" } }));
+    let job = &reply["Job"];
+    assert_eq!(
+        job["status"], "Done",
+        "the job run must finalize ok: {reply}"
+    );
+    assert_eq!(job["result"]["ok"], true, "the run succeeded: {reply}");
+
+    // ...and the response's action actually executed.
+    let reply = daemon.query("tasks", serde_json::json!("List"));
+    let tasks = reply["Tasks"].as_array().expect("Tasks reply");
+    assert!(
+        tasks.iter().any(|t| t["id"] == "t-from-job"),
+        "the CreateTask action landed: {reply}"
     );
 }
 
@@ -550,10 +885,12 @@ fn state_persists_across_restart() {
         }
     }
 
-    // a fresh daemon over the SAME storage root: qmdb state must survive; the
-    // height counter is a local block counter and restarts at 0 by design.
+    // a fresh daemon over the SAME storage root: qmdb state must survive, and
+    // the local block counter resumes ABOVE the per-module index watermark
+    // (two blocks were indexed) — a counter restarting at 0 would re-use
+    // indexed heights and every new block would be silently skipped.
     let daemon = Daemon::spawn(storage.path());
-    assert_eq!(daemon.status()["height"], 0);
+    assert_eq!(daemon.status()["height"], 2);
     let reply = daemon.query(
         "chat",
         serde_json::json!({ "MessagesLatest": { "channel_id": "durable", "limit": 16 } }),
@@ -564,6 +901,146 @@ fn state_persists_across_restart() {
         messages[0]["head"]["blocks"][0]["Paragraph"][0]["text"],
         "written before restart"
     );
+
+    // the explorer survives too: /v1/blocks reads the durable block index,
+    // not an in-memory ring, so both pre-restart blocks are still served.
+    let (code, blocks) = daemon.request("GET", "/v1/blocks", None);
+    assert_eq!(code, 200, "blocks failed: {blocks}");
+    let blocks = blocks["blocks"].as_array().expect("blocks array").clone();
+    assert_eq!(blocks.len(), 2, "pre-restart blocks survive: {blocks:?}");
+    assert_eq!(blocks[0]["height"], 1);
+    let post = &blocks[1];
+    assert_eq!(post["height"], 2);
+    assert_eq!(post["target"], "chat");
+    assert_eq!(post["disposition"], "applied");
+    // this lane frames and signs nothing: the hash is honestly empty, and
+    // the proposer is the SUBMITTER's origin bytes as hex ("eddy").
+    assert_eq!(post["hash"], "");
+    assert_eq!(post["proposer"], "65646479");
+    assert!(
+        post["operations"].as_array().is_some_and(|ops| !ops.is_empty()),
+        "the dispatch trace rides the row: {post}"
+    );
+}
+
+#[test]
+fn per_module_index_serves_ops_and_views() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let hits_of = |reply: &serde_json::Value| -> Vec<serde_json::Value> {
+        reply["hits"].as_array().expect("hits reply").clone()
+    };
+
+    let pre_restart_height;
+    {
+        let daemon = Daemon::spawn(storage.path());
+        let (code, _) = daemon.submit(
+            "chat",
+            serde_json::json!({
+                "CreateChannel": { "channel_id": "eng", "name": "Eng", "post_policy": "Open" }
+            }),
+            None,
+        );
+        assert_eq!(code, 200);
+        let (code, _) = daemon.submit("chat", post_message("eng", "m1", "fluent index demo"), Some("eddy"));
+        assert_eq!(code, 200);
+        let (code, _) = daemon.submit(
+            "tasks",
+            serde_json::json!({ "CreateTask": { "task_id": "t1", "title": "wire the indexer" } }),
+            None,
+        );
+        assert_eq!(code, 200);
+
+        // the raw op log: every applied chat op, oldest-first, json envelopes.
+        let (code, ops) = daemon.request("GET", "/v1/index/chat/ops?limit=10", None);
+        assert_eq!(code, 200, "ops failed: {ops}");
+        let rows = ops["ops"].as_array().expect("ops array");
+        assert_eq!(rows.len(), 2, "create-channel and post: {ops}");
+        // the payload is the module op VERBATIM (chat's wire is snake_case);
+        // the envelope itself (origin/height/seq) is the indexer's camelCase.
+        assert_eq!(rows[1]["payload"]["PostMessage"]["message_id"], "m1");
+        assert_eq!(rows[1]["origin"]["kind"], "external");
+        assert_eq!(rows[1]["height"], 2);
+
+        // chat's OWN endpoint: the materialized search view.
+        let (code, reply) = daemon.request(
+            "POST",
+            "/v1/index/chat/view",
+            Some(&serde_json::json!({ "search": { "text": "fluent" } })),
+        );
+        assert_eq!(code, 200, "chat view failed: {reply}");
+        let hits = hits_of(&reply);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["messageId"], "m1");
+        assert_eq!(hits[0]["author"], "user:eddy");
+
+        // tasks' endpoint: the by-status partition.
+        let (code, reply) = daemon.request(
+            "POST",
+            "/v1/index/tasks/view",
+            Some(&serde_json::json!({ "byStatus": { "status": "Open" } })),
+        );
+        assert_eq!(code, 200, "tasks view failed: {reply}");
+        let tasks = reply["tasks"]["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["title"], "wire the indexer");
+
+        // a module with no materialized view answers 404 — forge's substrate
+        // is already a queryable git repo; it never registers one.
+        let (code, _) = daemon.request(
+            "POST",
+            "/v1/index/forge/view",
+            Some(&serde_json::json!({ "anything": {} })),
+        );
+        assert_eq!(code, 404);
+
+        // the watermark surface: all three blocks indexed, nothing poisoned.
+        // EVERY module's watermark tracks the last applied block — chat reads
+        // 3 even though its last op landed in block 2 — so a watermark below
+        // the tip always means missing blocks, never a quiet module.
+        let (code, status) = daemon.request("GET", "/v1/index/status", None);
+        assert_eq!(code, 200);
+        assert_eq!(status["poisoned"], false);
+        assert_eq!(status["modules"]["chat"], 3);
+        assert_eq!(status["modules"]["tasks"], 3);
+
+        pre_restart_height = daemon.status()["height"].as_u64().expect("height");
+
+        let (code, _) = daemon.request("POST", "/v1/shutdown", None);
+        assert_eq!(code, 200);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut daemon = daemon;
+        while daemon.child.try_wait().expect("poll daemon").is_none() {
+            assert!(Instant::now() < deadline, "daemon ignored /v1/shutdown");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // restart over the same storage: the index survives, the block counter
+    // resumes above its watermark, and NEW blocks keep indexing.
+    let daemon = Daemon::spawn(storage.path());
+    assert_eq!(
+        daemon.status()["height"].as_u64().expect("height"),
+        pre_restart_height
+    );
+    let (code, reply) = daemon.request(
+        "POST",
+        "/v1/index/chat/view",
+        Some(&serde_json::json!({ "search": { "text": "fluent" } })),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(hits_of(&reply).len(), 1, "index survives a restart");
+
+    let (code, _) = daemon.submit("chat", post_message("eng", "m2", "fresh after restart"), Some("eddy"));
+    assert_eq!(code, 200);
+    let (code, reply) = daemon.request(
+        "POST",
+        "/v1/index/chat/view",
+        Some(&serde_json::json!({ "search": { "text": "fresh" } })),
+    );
+    assert_eq!(code, 200);
+    let hits = hits_of(&reply);
+    assert_eq!(hits.len(), 1, "post-restart blocks keep indexing");
+    assert_eq!(hits[0]["messageId"], "m2");
 }
 
 #[test]

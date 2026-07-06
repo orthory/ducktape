@@ -478,6 +478,28 @@ pub fn workspace_invite_blob(app: tauri::AppHandle, id: String) -> Result<String
     run_verb(&node_bin, &["invite", "--config", &cfg.to_string_lossy()]).map(|out| last_line(&out))
 }
 
+/// the join requests parked joiners delivered to this member's running node
+/// over the lobby channel — the queue the Members view renders with an
+/// "Approve" button (approve = [`workspace_admit`], the normal governance
+/// ballot). raw JSON array from the `join-requests` verb, parsed here so the
+/// frontend gets typed rows.
+#[tauri::command]
+pub fn workspace_join_requests(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
+    let out = run_verb(
+        &node_bin,
+        &["join-requests", "--config", &cfg.to_string_lossy()],
+    )?;
+    serde_json::from_str(last_line(&out).trim())
+        .map_err(|e| format!("join-requests output is not json: {e}"))
+}
+
 /// admit a joiner by pubkey: drive the governance AddValidator through THIS
 /// running member node's local rpc. the node must be started (a member serves
 /// rpc); the joiner's parked node promotes itself once the epoch cuts over.
@@ -516,6 +538,54 @@ pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Re
     run_verb(
         &node_bin,
         &["member-remove", &pubkey, "--config", &cfg.to_string_lossy()],
+    )
+    .map(|_| ())
+}
+
+/// promote an observer into the consensus quorum by pubkey: drive the
+/// governance AddValidator through THIS running member node's local rpc. the
+/// second, deliberate step of staged admission — [`workspace_admit`] grants
+/// observer standing; this seats the (pre-synced, warm) key as a validator at
+/// the next epoch cutover. same majority ceremony as every membership change.
+#[tauri::command]
+pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
+    let pubkey = pubkey.trim().to_string();
+    if pubkey.is_empty() {
+        return Err("provide the observer's public key to promote".into());
+    }
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
+    run_verb(
+        &node_bin,
+        &["promote", &pubkey, "--config", &cfg.to_string_lossy()],
+    )
+    .map(|_| ())
+}
+
+/// revoke observer standing by pubkey: drive the governance RemoveObserver
+/// through THIS running member node's local rpc. the undo of
+/// [`workspace_admit`] — the key drops off the mesh at the next epoch cutover
+/// and its node parks again; re-granting is another admit. a seated validator
+/// is [`workspace_demote`]'s job (the tiers never overlap).
+#[tauri::command]
+pub fn workspace_observer_remove(
+    app: tauri::AppHandle,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
+    let pubkey = pubkey.trim().to_string();
+    if pubkey.is_empty() {
+        return Err("provide the observer's public key to revoke".into());
+    }
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
+    run_verb(
+        &node_bin,
+        &["observer-remove", &pubkey, "--config", &cfg.to_string_lossy()],
     )
     .map(|_| ())
 }

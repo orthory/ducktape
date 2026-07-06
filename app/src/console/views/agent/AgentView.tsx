@@ -1,23 +1,23 @@
-// The agents surface over the node's `agent` module — the collaboration-loop
-// orchestrator. It stays render-only over useDucktape: roster, watches, recent
-// runs, and composers all submit through the store action facade.
+// The agents surface over the `agent` registry and the `runs` module — the
+// collaboration loop's record book and its actor. It stays render-only over
+// useDucktape: roster, watches, pending runs, and composers all submit
+// through the store action facade. Run lifecycle lives in the dispatch
+// module; this surface shows only the in-flight entries (pruned when a
+// result delivers).
 //
 // No optimistic state: every write goes through the store's submit-then-refresh.
 
 import { useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
-import type {
-  AgentRecord,
-  RunStatus,
-  RunView,
-  SagaOrigin,
-  TurnPolicy,
-  WatchView,
-} from "../../../domain/agent-client";
+import type { AgentRecord, SagaOrigin } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
+import type { PendingRun, TurnPolicy, WatchView } from "../../../domain/runs-client";
 import type { Channel } from "../../../domain/chat-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
+import type { OpLedger, OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -147,31 +147,10 @@ const policyText = (policy: TurnPolicy, agents: AgentRecord[]): string => {
   return `Assigned · ${agentLabel(agents, policy.Assigned)}`;
 };
 
-const isAwaiting = (
-  status: RunStatus,
-): status is { AwaitingOracle: { saga_id: string } } =>
-  typeof status === "object" && "AwaitingOracle" in status;
-
-const runTone = (status: RunStatus): Tone => {
-  if (status === "Done") return statusTone.success;
-  if (status === "Cancelled") return statusTone.neutral;
-  if (isAwaiting(status)) return statusTone.warning;
-  return statusTone.danger;
-};
-
-const runLabel = (status: RunStatus): string => {
-  if (status === "Done") return "DONE";
-  if (status === "Cancelled") return "CANCELLED";
-  if (isAwaiting(status)) return "AWAITING ORACLE";
-  return "FAILED";
-};
-
-const runDetail = (status: RunStatus): string => {
-  if (status === "Done") return "completed";
-  if (status === "Cancelled") return "cancelled";
-  if (isAwaiting(status)) return `saga ${status.AwaitingOracle.saga_id}`;
-  return status.Failed.reason;
-};
+/** Every listed entry is by definition awaiting its dispatch delivery — the
+ *  node prunes entries the moment a result lands. */
+const runDetail = (run: PendingRun): string =>
+  `dispatch ${run.dispatch_id.slice(0, 12)}…`;
 
 // ── Shared UI atoms ─────────────────────────────────────
 
@@ -381,10 +360,13 @@ function Chip({ text, tone = statusTone.neutral }: { text: string; tone?: Tone }
 function AgentListButton({
   agent,
   selected,
+  op,
   onSelect,
 }: {
   agent: AgentRecord;
   selected: boolean;
+  /** The agent's finalization record — the status line draws the mark. */
+  op: OpRecord | undefined;
   onSelect: (agentId: string) => void;
 }) {
   const active = agent.status === "Active";
@@ -459,6 +441,7 @@ function AgentListButton({
           <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted3 }}>
             {active ? "Active" : "Paused"}
           </span>
+          <FinalizationMark op={op} />
         </span>
       </span>
     </button>
@@ -480,7 +463,7 @@ function AgentDetail({
   onUpdate: (params: {
     agentId: string;
     displayName?: string;
-    modelRef?: string;
+    capability?: string;
     prompt?: string;
     allowedActions?: string[];
   }) => void;
@@ -574,7 +557,7 @@ function AgentDetail({
               gap: 8,
             }}
           >
-            <InfoRow label="model" value={agent.model_ref} />
+            <InfoRow label="capability" value={agent.capability} />
             <InfoRow label="owner" value={ownerText(agent.owner)} />
             <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
             <InfoRow label="updated" value={String(agent.updated_at)} />
@@ -623,14 +606,14 @@ function AgentEditForm({
   onUpdate: (params: {
     agentId: string;
     displayName?: string;
-    modelRef?: string;
+    capability?: string;
     prompt?: string;
     allowedActions?: string[];
   }) => void;
   onClose: () => void;
 }) {
   const [displayName, setDisplayName] = useState(agent.display_name);
-  const [modelRef, setModelRef] = useState(agent.model_ref);
+  const [capability, setCapability] = useState(agent.capability);
   const [prompt, setPrompt] = useState("");
   const [allowedActions, setAllowedActions] = useState<string[]>(agent.allowed_actions);
 
@@ -644,7 +627,7 @@ function AgentEditForm({
     onUpdate({
       agentId: agent.agent_id,
       displayName: displayName.trim(),
-      modelRef: modelRef.trim(),
+      capability: capability.trim(),
       allowedActions,
       ...(prompt.trim() ? { prompt } : {}),
     });
@@ -685,15 +668,15 @@ function AgentEditForm({
           />
         </div>
         <div>
-          <FieldLabel htmlFor="agent-edit-model-ref">Edit model reference</FieldLabel>
+          <FieldLabel htmlFor="agent-edit-capability">Edit capability</FieldLabel>
           <input
-            id="agent-edit-model-ref"
-            name="agent-edit-model-ref"
+            id="agent-edit-capability"
+            name="agent-edit-capability"
             type="text"
             autoComplete="off"
             spellCheck={false}
-            value={modelRef}
-            onChange={(event) => setModelRef(event.target.value)}
+            value={capability}
+            onChange={(event) => setCapability(event.target.value)}
             style={monoInputStyle}
           />
         </div>
@@ -896,14 +879,14 @@ function RegisterAgentForm({
   onRegister: (params: {
     displayName: string;
     agentId: string;
-    modelRef: string;
+    capability: string;
     prompt: string;
     allowedActions: string[];
   }) => void;
 }) {
   const [displayName, setDisplayName] = useState("");
   const [agentIdInput, setAgentIdInput] = useState("");
-  const [modelRef, setModelRef] = useState("gpt-5.5-codex");
+  const [capability, setCapability] = useState("");
   const [prompt, setPrompt] = useState("");
   const [allowedActions, setAllowedActions] = useState<string[]>(["chat.post"]);
 
@@ -911,7 +894,7 @@ function RegisterAgentForm({
   const ready =
     displayName.trim() !== "" &&
     agentId !== "" &&
-    modelRef.trim() !== "" &&
+    capability.trim() !== "" &&
     prompt.trim() !== "" &&
     allowedActions.length > 0;
 
@@ -926,13 +909,13 @@ function RegisterAgentForm({
     onRegister({
       displayName: displayName.trim(),
       agentId,
-      modelRef: modelRef.trim(),
+      capability: capability.trim(),
       prompt,
       allowedActions,
     });
     setDisplayName("");
     setAgentIdInput("");
-    setModelRef("gpt-5.5-codex");
+    setCapability("");
     setPrompt("");
     setAllowedActions(["chat.post"]);
   };
@@ -998,16 +981,16 @@ function RegisterAgentForm({
               />
             </div>
             <div>
-              <FieldLabel htmlFor="agent-model-ref">Model reference</FieldLabel>
+              <FieldLabel htmlFor="agent-capability">Capability</FieldLabel>
               <input
-                id="agent-model-ref"
-                name="agent-model-ref"
+                id="agent-capability"
+                name="agent-capability"
                 type="text"
                 autoComplete="off"
                 spellCheck={false}
-                value={modelRef}
-                onChange={(event) => setModelRef(event.target.value)}
-                placeholder="model…"
+                value={capability}
+                onChange={(event) => setCapability(event.target.value)}
+                placeholder="capability tag…"
                 style={monoInputStyle}
               />
             </div>
@@ -1124,11 +1107,14 @@ function WatchRow({
   watch,
   channels,
   agents,
+  op,
   onUnwatch,
 }: {
   watch: WatchView;
   channels: Channel[];
   agents: AgentRecord[];
+  /** The watch's finalization record (watch/unwatch key by channel). */
+  op: OpRecord | undefined;
   onUnwatch: (id: string) => void;
 }) {
   const label = channelLabel(channels, watch.channel_id);
@@ -1172,8 +1158,18 @@ function WatchRow({
         >
           {label}
         </div>
-        <div style={{ marginTop: 2, font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+        <div
+          style={{
+            marginTop: 2,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            font: `400 11.5px ${font.sans}`,
+            color: color.muted2,
+          }}
+        >
           {policyText(watch.policy, agents)}
+          <FinalizationMark op={op} />
         </div>
       </div>
       <button
@@ -1300,12 +1296,15 @@ function WatchesPanel({
   channels,
   agents,
   watches,
+  ops,
   onWatch,
   onUnwatch,
 }: {
   channels: Channel[];
   agents: AgentRecord[];
   watches: WatchView[];
+  /** The store's finalization ledger — watch rows draw their marks. */
+  ops: OpLedger;
   onWatch: (params: { channelId: string; policy: TurnPolicy }) => void;
   onUnwatch: (id: string) => void;
 }) {
@@ -1331,6 +1330,7 @@ function WatchesPanel({
               watch={watch}
               channels={channels}
               agents={agents}
+              op={ops[opKey.watch(watch.channel_id)]}
               onUnwatch={onUnwatch}
             />
           ))
@@ -1341,23 +1341,26 @@ function WatchesPanel({
   );
 }
 
-// ── Runs timeline ───────────────────────────────────────
+// ── Pending runs timeline ───────────────────────────────
 
 function RunRow({
   run,
   agents,
   channels,
+  op,
   onCancel,
 }: {
-  run: RunView;
+  run: PendingRun;
   agents: AgentRecord[];
   channels: Channel[];
+  /** The run's finalization record (a cancel keys by run id). */
+  op: OpRecord | undefined;
   onCancel: (id: string) => void;
 }) {
-  const tone = runTone(run.status);
-  const awaiting = isAwaiting(run.status);
   const agentName = agentLabel(agents, run.agent_id);
-  const label = channelLabel(channels, run.channel_id);
+  const label = run.job_id
+    ? `job ${run.job_id}`
+    : `${channelLabel(channels, run.channel_id)} @${run.anchor_seq}`;
   return (
     <div
       style={{
@@ -1407,28 +1410,26 @@ function RunRow({
           >
             {agentName}
           </span>
-          <StatusPill label={runLabel(run.status)} tone={tone} />
+          <StatusPill label="AWAITING RESULT" tone={statusTone.warning} />
           <StatusPill label={run.job_id ? "JOB" : "CHAT"} tone={run.job_id ? statusTone.agent : statusTone.blue} />
-          {awaiting && (
-            <button
-              type="button"
-              onClick={() => onCancel(run.run_id)}
-              aria-label={`Cancel run ${run.run_id}`}
-              style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28, color: color.red }}
-            >
-              Cancel
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => onCancel(run.run_id)}
+            aria-label={`Cancel run ${run.run_id}`}
+            style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28, color: color.red }}
+          >
+            Cancel
+          </button>
         </div>
         <div style={{ padding: "11px 12px" }}>
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
             <Chip text={shortText(run.run_id)} />
-            <Chip text={`${label} @${run.anchor_seq}`} tone={statusTone.blue} />
+            <FinalizationMark op={op} />
+            <Chip text={label} tone={statusTone.blue} />
             {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
-            {run.job_id && <Chip text={shortText(run.job_id)} tone={statusTone.agent} />}
           </div>
           <div
-            title={runDetail(run.status)}
+            title={runDetail(run)}
             style={{
               marginTop: 7,
               font: `400 11px ${font.mono}`,
@@ -1438,7 +1439,7 @@ function RunRow({
               whiteSpace: "nowrap",
             }}
           >
-            {runDetail(run.status)} · updated {run.updated_at}
+            {runDetail(run)} · created {run.created_at}
           </div>
         </div>
       </GroupCard>
@@ -1450,17 +1451,20 @@ function RunsTimeline({
   runs,
   agents,
   channels,
+  ops,
   onCancel,
 }: {
-  runs: RunView[];
+  runs: PendingRun[];
   agents: AgentRecord[];
   channels: Channel[];
+  /** The store's finalization ledger — run rows draw their marks. */
+  ops: OpLedger;
   onCancel: (id: string) => void;
 }) {
   return (
-    <section aria-label="Runs timeline" style={{ minWidth: 0 }}>
+    <section aria-label="Pending runs" style={{ minWidth: 0 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <SectionLabel>RUNS TIMELINE</SectionLabel>
+        <SectionLabel>PENDING RUNS</SectionLabel>
         <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
           {runs.length}
         </span>
@@ -1469,8 +1473,8 @@ function RunsTimeline({
         <GroupCard style={{ marginTop: 9 }}>
           <EmptyState
             icon="agent"
-            title="No runs yet"
-            body="Watched channels and explicit requests will appear here newest-first."
+            title="No runs in flight"
+            body="Engagements and explicit requests appear here until their result delivers; history lives on the dispatch plane."
           />
         </GroupCard>
       ) : (
@@ -1491,6 +1495,7 @@ function RunsTimeline({
               run={run}
               agents={agents}
               channels={channels}
+              op={ops[opKey.run(run.run_id)]}
               onCancel={onCancel}
             />
           ))}
@@ -1580,6 +1585,7 @@ export function AgentView() {
                 opts the agent module into job-board work
               </span>
             </div>
+            <FinalizationMark op={state.ops[opKey.jobWorker()]} />
             <button
               type="button"
               role="switch"
@@ -1617,7 +1623,7 @@ export function AgentView() {
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <StatusPill label={`${activeCount} ACTIVE`} tone={statusTone.success} />
             <StatusPill label={`${state.watches.length} WATCHES`} tone={statusTone.neutral} />
-            <StatusPill label={`${state.runs.length} RUNS`} tone={statusTone.warning} />
+            <StatusPill label={`${state.pendingRuns.length} PENDING`} tone={statusTone.warning} />
           </div>
         </div>
       </div>
@@ -1661,6 +1667,7 @@ export function AgentView() {
                   key={agent.agent_id}
                   agent={agent}
                   selected={selectedAgent?.agent_id === agent.agent_id}
+                  op={state.ops[opKey.agent(agent.agent_id)]}
                   onSelect={setSelectedAgentId}
                 />
               ))
@@ -1709,13 +1716,15 @@ export function AgentView() {
               channels={state.channels}
               agents={state.agents}
               watches={state.watches}
+              ops={state.ops}
               onWatch={actions.watchChannel}
               onUnwatch={actions.unwatchChannel}
             />
             <RunsTimeline
-              runs={state.runs}
+              runs={state.pendingRuns}
               agents={state.agents}
               channels={state.channels}
+              ops={state.ops}
               onCancel={actions.cancelRun}
             />
           </div>

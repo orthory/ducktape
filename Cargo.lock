@@ -24,49 +24,22 @@ version = "0.1.0"
 dependencies = [
  "agent-interface",
  "async-trait",
- "chat",
- "chat-interface",
- "commonware-runtime",
+ "capability-interface",
  "futures",
- "host",
- "jobs",
- "jobs-interface",
- "reactor",
- "saga",
  "saga-interface",
  "sdk",
+ "serde",
  "serde_json",
  "sha2",
- "tasks",
- "tasks-interface",
 ]
 
 [[package]]
 name = "agent-interface"
 version = "0.1.0"
 dependencies = [
- "chat-interface",
  "saga-interface",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "agent-oracle"
-version = "0.1.0"
-dependencies = [
- "agent-interface",
- "async-trait",
- "chat-interface",
- "files",
- "reactor",
- "reqwest 0.12.28",
- "saga-interface",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
 ]
 
 [[package]]
@@ -738,6 +711,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "capability"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-interface",
+ "futures",
+ "sdk",
+ "sha2",
+ "valset-interface",
+]
+
+[[package]]
+name = "capability-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-interface",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "capability-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cargo-platform"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -868,6 +873,20 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
+ "tagging-interface",
+]
+
+[[package]]
+name = "chat-index"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chat-interface",
+ "indexer",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1427,6 +1446,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinator-bin"
+version = "0.1.0"
+dependencies = [
+ "nat-traversal",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1617,6 +1644,16 @@ version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
 dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-skiplist"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df29de440c58ca2cc6e587ec3d22347551a32435fbde9d2bff64e78a9ffa151b"
+dependencies = [
+ "crossbeam-epoch",
  "crossbeam-utils",
 ]
 
@@ -1862,6 +1899,8 @@ dependencies = [
  "commonware-storage",
  "directory",
  "directory-interface",
+ "dispatch",
+ "dispatch-interface",
  "document",
  "document-interface",
  "files",
@@ -1879,6 +1918,8 @@ dependencies = [
  "kv-interface",
  "memory",
  "profiles",
+ "runs",
+ "runs-interface",
  "saga",
  "saga-interface",
  "sdk",
@@ -1886,6 +1927,7 @@ dependencies = [
  "serde_json",
  "state",
  "statesync",
+ "tagging",
  "tasks",
  "valset",
  "valset-interface",
@@ -1984,6 +2026,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-interface",
+ "dispatch-interface",
+ "futures",
+ "saga-interface",
+ "sdk",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "dispatch-interface"
+version = "0.1.0"
+dependencies = [
+ "saga-interface",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dispatch-oracle"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-host",
+ "dispatch-interface",
+ "futures",
+ "reactor",
+ "saga-interface",
+ "sdk",
+ "tokio",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2051,6 +2130,19 @@ dependencies = [
  "serde_json",
  "state",
  "statesync",
+]
+
+[[package]]
+name = "document-index"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "document-interface",
+ "indexer",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2355,6 +2447,19 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+]
+
+[[package]]
+name = "fluent31"
+version = "0.1.0"
+source = "git+https://github.com/orthory/fluent31#442aaecc0e2d9555ff4d67e0262d1207583f4c99"
+dependencies = [
+ "crc32fast",
+ "crossbeam-skiplist",
+ "io-uring",
+ "libc",
+ "lz4_flex",
+ "parking_lot",
 ]
 
 [[package]]
@@ -3042,10 +3147,14 @@ dependencies = [
  "commonware-runtime",
  "directory",
  "directory-interface",
+ "dispatch",
+ "dispatch-interface",
  "futures",
  "greeter",
  "kv",
  "kv-interface",
+ "saga",
+ "saga-interface",
  "sdk",
  "serde_json",
  "state",
@@ -3129,22 +3238,6 @@ dependencies = [
  "smallvec",
  "tokio",
  "want",
-]
-
-[[package]]
-name = "hyper-rustls"
-version = "0.27.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
-dependencies = [
- "http",
- "hyper",
- "hyper-util",
- "rustls",
- "tokio",
- "tokio-rustls",
- "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3365,6 +3458,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fluent31",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3418,6 +3524,17 @@ dependencies = [
  "tokio",
  "widestring 1.2.1",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -3787,10 +3904,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "lru-slab"
-version = "0.1.2"
+name = "lz4_flex"
+version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 
 [[package]]
 name = "markup5ever"
@@ -3917,6 +4034,15 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nat-traversal"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -4054,10 +4180,13 @@ name = "node-bin"
 version = "0.1.0"
 dependencies = [
  "agent",
- "agent-oracle",
+ "agent-interface",
  "async-trait",
  "automations",
  "base64 0.22.1",
+ "capability",
+ "capability-host",
+ "capability-interface",
  "chat",
  "chat-interface",
  "commonware-codec",
@@ -4070,6 +4199,9 @@ dependencies = [
  "consensus",
  "directory",
  "directory-interface",
+ "dispatch",
+ "dispatch-interface",
+ "dispatch-oracle",
  "document",
  "files",
  "forge",
@@ -4079,6 +4211,7 @@ dependencies = [
  "governance-interface",
  "host",
  "inbox",
+ "indexer",
  "jobs",
  "kv",
  "kv-interface",
@@ -4088,13 +4221,18 @@ dependencies = [
  "pages",
  "profiles",
  "rand 0.8.6",
+ "reachability",
  "reactor",
  "recovery",
+ "runs",
+ "runs-interface",
  "saga",
+ "saga-interface",
  "sdk",
  "serde",
  "serde_json",
  "statesync",
+ "tagging",
  "tasks",
  "tempfile",
  "tokio",
@@ -4105,6 +4243,8 @@ dependencies = [
  "valset",
  "valset-interface",
  "vaults",
+ "wireguard-effect",
+ "wireguard-upgrade",
 ]
 
 [[package]]
@@ -4112,15 +4252,19 @@ name = "noded"
 version = "0.1.0"
 dependencies = [
  "agent",
- "agent-interface",
- "agent-oracle",
  "async-trait",
  "automations",
  "axum",
+ "capability-host",
  "chat",
+ "chat-index",
  "chat-interface",
  "commonware-runtime",
+ "dispatch",
+ "dispatch-interface",
+ "dispatch-oracle",
  "document",
+ "document-index",
  "files",
  "files-interface",
  "flate2",
@@ -4131,17 +4275,23 @@ dependencies = [
  "host",
  "http-body-util",
  "inbox",
+ "indexer",
  "jobs",
  "memory",
  "pages",
+ "pages-index",
  "profiles",
  "reactor",
+ "runs",
  "saga",
  "saga-interface",
  "sdk",
  "serde",
  "serde_json",
+ "sha2",
+ "tagging",
  "tasks",
+ "tasks-index",
  "tempfile",
  "tokio",
  "tower",
@@ -4591,6 +4741,19 @@ dependencies = [
  "serde_json",
  "state",
  "statesync",
+]
+
+[[package]]
+name = "pages-index"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "indexer",
+ "pages-interface",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -5082,61 +5245,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quinn"
-version = "0.11.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
-dependencies = [
- "bytes",
- "cfg_aliases",
- "pin-project-lite",
- "quinn-proto",
- "quinn-udp",
- "rustc-hash",
- "rustls",
- "socket2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "quinn-proto"
-version = "0.11.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
-dependencies = [
- "bytes",
- "getrandom 0.3.4",
- "lru-slab",
- "rand 0.9.4",
- "ring",
- "rustc-hash",
- "rustls",
- "rustls-pki-types",
- "slab",
- "thiserror 2.0.18",
- "tinyvec",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "quinn-udp"
-version = "0.5.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
-dependencies = [
- "cfg_aliases",
- "libc",
- "once_cell",
- "socket2",
- "tracing",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5271,10 +5379,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "reachability"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "commonware-cryptography",
+ "defguard_wireguard_rs",
+ "nat-traversal",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "wireguard-effect",
+ "wireguard-upgrade",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "reactor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dispatch-interface",
  "futures",
  "host",
  "saga",
@@ -5412,31 +5541,23 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
- "hyper-rustls",
  "hyper-util",
  "js-sys",
  "log",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
- "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tokio-rustls",
- "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.4.2",
  "web-sys",
- "webpki-roots",
 ]
 
 [[package]]
@@ -5469,7 +5590,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.5.0",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -5495,6 +5616,45 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "runs"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "agent-interface",
+ "async-trait",
+ "chat",
+ "chat-interface",
+ "commonware-runtime",
+ "dispatch",
+ "dispatch-interface",
+ "document-interface",
+ "futures",
+ "host",
+ "jobs",
+ "jobs-interface",
+ "runs-interface",
+ "saga",
+ "saga-interface",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tagging",
+ "tagging-interface",
+ "tasks",
+ "tasks-interface",
+]
+
+[[package]]
+name = "runs-interface"
+version = "0.1.0"
+dependencies = [
+ "saga-interface",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5526,41 +5686,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls"
-version = "0.23.41"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
-dependencies = [
- "once_cell",
- "ring",
- "rustls-pki-types",
- "rustls-webpki",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "rustls-pki-types"
-version = "1.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
-dependencies = [
- "web-time",
- "zeroize",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.103.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
-dependencies = [
- "ring",
- "rustls-pki-types",
- "untrusted 0.9.0",
-]
-
-[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5577,6 +5702,7 @@ name = "saga"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "capability-interface",
  "futures",
  "host",
  "saga-interface",
@@ -5975,6 +6101,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
+name = "simnode"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "async-trait",
+ "automations",
+ "axum",
+ "chat",
+ "chat-index",
+ "chat-interface",
+ "commonware-runtime",
+ "dispatch",
+ "dispatch-interface",
+ "document",
+ "document-index",
+ "files",
+ "forge",
+ "futures",
+ "host",
+ "inbox",
+ "indexer",
+ "jobs",
+ "memory",
+ "noded",
+ "pages",
+ "pages-index",
+ "profiles",
+ "reactor",
+ "runs",
+ "saga",
+ "saga-interface",
+ "sdk",
+ "serde",
+ "serde_json",
+ "tagging",
+ "tasks",
+ "tasks-index",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6110,9 +6278,11 @@ dependencies = [
  "commonware-utils",
  "futures",
  "host",
+ "indexer",
  "kv",
  "kv-interface",
  "sdk",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -6253,6 +6423,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tagging"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "sdk",
+ "sha2",
+ "tagging-interface",
+]
+
+[[package]]
+name = "tagging-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tao"
 version = "0.35.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6319,6 +6508,19 @@ dependencies = [
  "sdk",
  "sha2",
  "tasks-interface",
+]
+
+[[package]]
+name = "tasks-index"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "indexer",
+ "serde",
+ "serde_json",
+ "tasks-interface",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -6777,16 +6979,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "tokio-rustls"
-version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
-dependencies = [
- "rustls",
- "tokio",
 ]
 
 [[package]]
@@ -7670,19 +7862,6 @@ dependencies = [
 
 [[package]]
 name = "wasm-streams"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "wasm-streams"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
@@ -7768,15 +7947,6 @@ dependencies = [
  "pkg-config",
  "soup3-sys",
  "system-deps",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]
@@ -8316,6 +8486,16 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "wireguard-effect"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "defguard_wireguard_rs",
+ "nat-traversal",
+ "wireguard-upgrade",
 ]
 
 [[package]]

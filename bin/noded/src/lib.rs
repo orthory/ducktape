@@ -51,6 +51,19 @@ pub struct BlockSummary {
     pub app_hash: String,
 }
 
+/// the `/v1/submit` reply: the block that INCLUDED the caller's op, plus the
+/// op's content address — sha256 of the exact payload bytes the host committed.
+/// the bytes are staged in the node-local blob store under that digest, so
+/// `GET /v1/files/blob/{op_hash}` serves them back: the hash is addressable,
+/// not just informational.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitReceipt {
+    pub height: u64,
+    pub app_hash: String,
+    pub op_hash: String,
+}
+
 /// how many recent telemetry frames the daemon retains for `GET /v1/telemetry`.
 /// a client connecting mid-stream pulls this backfill, then follows the ws.
 pub const TELEMETRY_RING_CAP: usize = 256;
@@ -126,6 +139,101 @@ impl TelemetryRing {
         let take = limit.map_or(ring.len(), |n| n.min(ring.len()));
         ring.iter().skip(ring.len() - take).cloned().collect()
     }
+}
+
+/// how many recent blocks `GET /v1/blocks` serves when the caller names no
+/// `limit` — a bounded default page over the durable block index.
+pub const BLOCKS_DEFAULT_LIMIT: usize = 256;
+
+/// cap on the payload-preview characters a block record carries.
+pub const PAYLOAD_PREVIEW_MAX: usize = 1024;
+
+/// how a block's op landed, as the explorer surface reports it. only
+/// journaled outcomes appear (a frame discarded at an epoch cutover is
+/// dropped before decoding, so there are no contents to show): an applied op
+/// mutated state; a rejected op finalized but rolled back — a failed tx.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockDisposition {
+    Applied,
+    Rejected,
+}
+
+/// one non-empty finalized block, as the explorer reads it: the block's
+/// consensus coordinates (height, frame content hash, post-block app-hash),
+/// its authenticated proposer, and the op it carried with the deterministic
+/// dispatch trace. stored as the block's row in the index store's blocks
+/// database ([`indexer::BlockOps::record`]) and served by `GET /v1/blocks`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockRecord {
+    pub height: u64,
+    /// hex of the frame's content address (sha256 over the exact bytes the
+    /// orderer carried) — the block's hash on this surface. empty on the
+    /// embedded daemon's lane: nothing is framed or signed there, so the
+    /// field stays honest rather than carrying a fabricated digest.
+    pub hash: String,
+    /// hex of the composed app-hash after this block settled — the commit.
+    pub commit_hash: String,
+    /// hex of the proposing validator's ed25519 public key — the frame's
+    /// VERIFIED signer, not a claimed identity. on the embedded daemon's
+    /// frameless lane this is the SUBMITTER's origin bytes instead
+    /// (unverified — that lane authenticates nothing).
+    pub proposer: String,
+    pub disposition: BlockDisposition,
+    /// the root op's target module.
+    pub target: String,
+    /// the dispatch trace, in drain order — the "transactions" inside the
+    /// block. empty for a rejected op (a deterministic no-op leaves no trace).
+    pub operations: Vec<DispatchInfo>,
+    /// best-effort utf-8 preview of the root op's payload (module `*Msg` json
+    /// on this lane), capped at [`PAYLOAD_PREVIEW_MAX`] chars.
+    pub payload: String,
+    /// hex of the root op's content address — sha256 of the exact payload
+    /// bytes the host committed, staged in the node-local blob store as the
+    /// record is ringed, so `GET /v1/files/blob/{op_hash}` serves the full
+    /// bytes back. same semantics as [`SubmitReceipt::op_hash`]; this is the
+    /// only place the NETWORKED surface exposes it (its submit reply carries
+    /// height only until the noded→ordered-node convergence).
+    pub op_hash: String,
+}
+
+/// the explorer's wire rendering of one dispatch. `Origin::External` renders
+/// as plain `"external"`: the block-level `proposer` field already carries
+/// the key, and raw ed25519 bytes are not utf-8 (telemetry's
+/// `external:<name>` convention assumes the embedded daemon's readable
+/// names).
+impl From<&host::DispatchRecord> for DispatchInfo {
+    fn from(record: &host::DispatchRecord) -> Self {
+        DispatchInfo {
+            module: record.module.clone(),
+            origin: match &record.origin {
+                sdk::Origin::External(_) => "external".to_string(),
+                sdk::Origin::Module(id) => format!("module:{id}"),
+                sdk::Origin::System => "system".to_string(),
+            },
+            emitted_msgs: record.emitted_msgs,
+            emitted_events: record.emitted_events,
+        }
+    }
+}
+
+/// best-effort utf-8 preview of an op payload, capped at
+/// [`PAYLOAD_PREVIEW_MAX`] chars. binary bytes render lossily — payloads on
+/// this lane are module `*Msg` json, so the common case is readable.
+pub fn payload_preview(payload: &[u8]) -> String {
+    let text = String::from_utf8_lossy(payload);
+    match text.char_indices().nth(PAYLOAD_PREVIEW_MAX) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.into_owned(),
+    }
+}
+
+/// encode a [`BlockRecord`] as its stored index row ([`indexer::BlockOps::record`]).
+/// both binaries feed rows through this one seam so `GET /v1/blocks` reads a
+/// single shape regardless of which lane wrote it.
+pub fn block_row(record: &BlockRecord) -> Vec<u8> {
+    serde_json::to_vec(record).expect("a plain record struct serializes")
 }
 
 /// the status projection: daemon build version, global app-hash, and each
@@ -259,6 +367,13 @@ pub struct NodeHandle {
     /// that never serves the git lane (the router tests' fake actor), which
     /// makes upload-pack a clean 500 there rather than a panic.
     forge_repo: Option<PathBuf>,
+    /// the per-module derived index (fluent31-backed read models). node-local
+    /// like `blobs`/`telemetry`: the actor is the one WRITER as blocks commit;
+    /// the `/v1/index/*` handlers read it directly through MVCC snapshots, so
+    /// an index scan never crosses the actor command lane. `None` on a handle
+    /// whose embedder configured no index (the router tests' fake actor) —
+    /// index routes answer 503 there.
+    index: Option<Arc<indexer::IndexStore>>,
 }
 
 impl NodeHandle {
@@ -280,6 +395,7 @@ impl NodeHandle {
             blobs: files::BlobHandle::default(),
             telemetry: TelemetryRing::default(),
             forge_repo: None,
+            index: None,
         };
         (handle, cmd_rx, event_tx)
     }
@@ -290,6 +406,14 @@ impl NodeHandle {
     /// so the http fetch lane reads exactly the repos consensus materializes.
     pub fn with_forge_repo(mut self, base: impl Into<PathBuf>) -> Self {
         self.forge_repo = Some(base.into());
+        self
+    }
+
+    /// point this handle at the per-module derived index so the `/v1/index/*`
+    /// routes can serve snapshot reads. the daemon passes the SAME store its
+    /// actor feeds block-by-block.
+    pub fn with_index_store(mut self, index: Arc<indexer::IndexStore>) -> Self {
+        self.index = Some(index);
         self
     }
 
@@ -326,7 +450,8 @@ pub fn hex_root(root: &StateRoot) -> String {
     hex_bytes(&root.0)
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
+/// hex-encode arbitrary wire bytes (frame content hashes, proposer keys).
+pub fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -348,6 +473,15 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
         .route("/v1/telemetry", get(telemetry))
+        .route("/v1/blocks", get(blocks))
+        // the derived read-model tier: snapshot reads of the per-module
+        // fluent31 indexes the actor materializes as blocks commit.
+        .route("/v1/index/status", get(index_status))
+        .route("/v1/index/{module}/ops", get(index_ops))
+        .route("/v1/index/{module}/scan", get(index_scan))
+        // the module's OWN endpoint on the derived tier: an opaque
+        // module-defined view request, answered by its registered mapper.
+        .route("/v1/index/{module}/view", post(index_view))
         // Prometheus scrape convention: root `/metrics`, not under `/v1`.
         .route("/metrics", get(metrics))
         .route("/v1/shutdown", post(shutdown))
@@ -396,7 +530,7 @@ async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>
     if let Err(resp) = handle
         .send(NodeCommand::Submit {
             target: req.target,
-            payload,
+            payload: payload.clone(),
             origin,
             reply,
         })
@@ -405,7 +539,18 @@ async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>
         return resp;
     }
     match rx.await {
-        Ok(Ok(block)) => Json(block).into_response(),
+        Ok(Ok(block)) => {
+            // stage the op's bytes only AFTER the commit so a rejected op leaves
+            // nothing behind. put_chunk keys by sha256, so the digest IS the
+            // op's content address (fetchable via /v1/files/blob/{op_hash}).
+            let op_hash = hex_bytes(&handle.blobs.put_chunk(payload));
+            Json(SubmitReceipt {
+                height: block.height,
+                app_hash: block.app_hash,
+                op_hash,
+            })
+            .into_response()
+        }
         Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
         Err(_) => actor_gone(),
     }
@@ -467,6 +612,401 @@ async fn telemetry(
 ) -> Response {
     let frames = handle.telemetry.recent(params.limit);
     Json(serde_json::json!({ "frames": frames })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// the derived-index tier: shared construction + from-state rebuild triggers.
+// noded and the consensus validator (bin/node) both reuse this router, so
+// they share the store setup too — one construction site, identical
+// /v1/index/* behavior, each binary passing its own genesis module list.
+// ---------------------------------------------------------------------------
+
+/// open the per-module index store under `<storage>/index` with every view
+/// mapper registered. an open failure is fatal-with-remedy for the caller:
+/// the tier is rebuildable, so the fix is always "delete the directory".
+pub fn open_index_store<S: AsRef<str>>(
+    storage: &std::path::Path,
+    module_ids: &[S],
+) -> Result<Arc<indexer::IndexStore>, String> {
+    let index_dir = storage.join("index");
+    indexer::IndexStore::open(&index_dir, module_ids)
+        .map(|store| {
+            Arc::new(
+                store
+                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
+                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
+                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
+                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
+            )
+        })
+        .map_err(|err| {
+            format!(
+                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
+                index_dir.display()
+            )
+        })
+}
+
+/// flatten a dispatch origin into the index's plain origin tag: external
+/// submitter identities render lossily as utf-8, exactly what the mappers'
+/// author rendering assumes — on BOTH lanes. the validator's key-byte
+/// identities render the same way, because a mapper's from-state rebuild
+/// re-renders authors from canonical state with this exact convention
+/// (see chat-index `author_from_ref`): folded and rebuilt rows must match
+/// byte-for-byte. hex-keyed identity belongs to the explorer row's
+/// `proposer`, not the index op rows.
+pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {
+    match origin {
+        sdk::Origin::External(id) => indexer::OriginTag::external(String::from_utf8_lossy(id)),
+        sdk::Origin::Module(id) => indexer::OriginTag::module(id.clone()),
+        sdk::Origin::System => indexer::OriginTag::system(),
+    }
+}
+
+/// one sealed block's dispatch trace as the indexer's fold input. `time` is
+/// the block's consensus time — noded passes its submit context's clock, the
+/// consensus validator stamps `consensus_time = height`. an empty trace is a
+/// real block (a rejected frame consumed its height): folding it advances
+/// every module's watermark so staleness checks stay exact.
+///
+/// `record` starts [`None`]: a caller holding a block the explorer shows
+/// grafts its [`block_row`] on via struct update. the live drain builds it
+/// from the decoded frame; the validator's boot folds (journal replay, frame
+/// catch-up) rebuild the SAME row from the sealed frame bytes riding the
+/// replay observer — the row is not reproducible from the dispatch trace
+/// alone, so a fold without frame content leaves it `None`.
+pub fn index_block_ops(
+    height: u64,
+    time: u64,
+    dispatches: &[host::DispatchRecord],
+) -> indexer::BlockOps {
+    indexer::BlockOps {
+        height,
+        time,
+        ops: dispatches
+            .iter()
+            .map(|d| indexer::AppliedOp {
+                origin: index_origin(&d.origin),
+                module: d.module.clone(),
+                payload: d.payload.clone(),
+            })
+            .collect(),
+        record: None,
+    }
+}
+
+/// one module's canonical state as the indexer's [`indexer::StateReader`]:
+/// [`host::Host::query`] adapted onto the bytes-in/bytes-out rebuild surface,
+/// module errors mapped into [`indexer::Error::State`].
+pub struct HostStateReader<'a> {
+    pub host: &'a host::Host,
+    pub module: &'a str,
+}
+
+#[async_trait::async_trait(?Send)]
+impl indexer::StateReader for HostStateReader<'_> {
+    async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
+        self.host
+            .query(self.module, req)
+            .await
+            .map_err(|err| indexer::Error::State(err.to_string()))
+    }
+}
+
+/// heal every module whose watermark trails `boundary` from VERIFIED
+/// canonical state: a mapper that declares a from-state rebuild re-derives
+/// its read model; a module without one is stamped backfilled, its content
+/// visibly beginning at the boundary. call wherever canonical state advanced
+/// without the op stream — after state-sync installs a boundary, after
+/// recovery skipped re-executing durable blocks, or over a wiped index
+/// directory. returns `(module, rows)` per re-derived view.
+pub async fn rebuild_stale_modules(
+    index: &indexer::IndexStore,
+    host: &host::Host,
+    boundary: indexer::RebuildMeta,
+) -> Result<Vec<(String, u64)>, indexer::Error> {
+    let modules: Vec<String> = index.module_ids().map(str::to_string).collect();
+    let mut rebuilt = Vec::new();
+    for module in modules {
+        if index.applied_height(&module)? >= boundary.height {
+            continue;
+        }
+        let state = HostStateReader {
+            host,
+            module: &module,
+        };
+        match index.rebuild_module(&module, &state, boundary).await {
+            Ok(rows) => rebuilt.push((module, rows)),
+            Err(indexer::Error::RebuildUnsupported) => index.mark_backfilled(&module, boundary)?,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(rebuilt)
+}
+
+// ---------------------------------------------------------------------------
+// the derived-index read lane. like the blob and telemetry lanes these
+// handlers never cross the actor: the store is `Send + Sync` and every read
+// runs at its own MVCC snapshot, concurrent with the actor's block writes.
+// ---------------------------------------------------------------------------
+
+/// query params for `GET /v1/index/{module}/scan` and `…/ops`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexScanParams {
+    /// key prefix to scan under. ignored by `…/ops` (pinned to the op log).
+    pub prefix: Option<String>,
+    /// opaque page cursor: the `nextAfter` of the previous page.
+    pub after: Option<String>,
+    /// page size; the store clamps oversized asks.
+    pub limit: Option<usize>,
+}
+
+/// default page size when a client sends no `limit`.
+const INDEX_DEFAULT_LIMIT: usize = 100;
+
+/// one scanned entry. values written by this tier are json (`value`); a
+/// derived value that is not valid json ships as `valueHex` instead.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexEntry {
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Box<serde_json::value::RawValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_hex: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexScanResponse {
+    entries: Vec<IndexEntry>,
+    has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_after: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexOpsResponse {
+    /// stored op-row envelopes, verbatim (height/seq/time/origin + payload).
+    ops: Vec<Box<serde_json::value::RawValue>>,
+    has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_after: Option<String>,
+}
+
+fn index_store(handle: &NodeHandle) -> Result<&Arc<indexer::IndexStore>, Response> {
+    handle.index.as_ref().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no index store configured",
+        )
+    })
+}
+
+fn index_error(err: indexer::Error) -> Response {
+    let status = match err {
+        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => {
+            StatusCode::NOT_FOUND
+        }
+        indexer::Error::View(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, &err.to_string())
+}
+
+/// GET /v1/index/status — each module's applied watermark plus the poison
+/// flag. a poisoned index keeps serving (stale but consistent) reads; the
+/// remedy is a rebuild, which this surface makes visible. modules re-derived
+/// from canonical state also report their backfill floor: content below it
+/// was never folded from ops (heights are boundary-stamped, the op log
+/// starts above it) — the gap stays visible instead of papered over.
+async fn index_status(State(handle): State<NodeHandle>) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let mut modules = serde_json::Map::new();
+    let mut backfilled = serde_json::Map::new();
+    for id in store.module_ids() {
+        match store.applied_height(id) {
+            Ok(height) => {
+                modules.insert(id.to_string(), height.into());
+            }
+            Err(err) => return index_error(err),
+        }
+        match store.backfill_height(id) {
+            Ok(Some(floor)) => {
+                backfilled.insert(id.to_string(), floor.into());
+            }
+            Ok(None) => {}
+            Err(err) => return index_error(err),
+        }
+    }
+    Json(serde_json::json!({
+        "poisoned": store.is_poisoned(),
+        "modules": modules,
+        "backfilled": backfilled,
+    }))
+    .into_response()
+}
+
+/// GET /v1/index/{module}/ops?after=&limit= — one page of the module's op
+/// log, oldest-first. rows are the stored envelopes verbatim; page forward by
+/// echoing `nextAfter` as the next call's `after`.
+async fn index_ops(
+    State(handle): State<NodeHandle>,
+    Path(module): Path<String>,
+    Query(params): Query<IndexScanParams>,
+) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let page = match store.scan(
+        &module,
+        indexer::OP_PREFIX.as_bytes(),
+        params.after.as_deref().map(str::as_bytes),
+        params.limit.unwrap_or(INDEX_DEFAULT_LIMIT),
+    ) {
+        Ok(page) => page,
+        Err(err) => return index_error(err),
+    };
+    let mut ops = Vec::with_capacity(page.entries.len());
+    for (_key, value) in &page.entries {
+        match serde_json::from_slice(value) {
+            Ok(row) => ops.push(row),
+            // rows are written as json by construction; failing one means the
+            // store is damaged — say so instead of silently dropping it.
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "stored op row was not json — rebuild the index",
+                );
+            }
+        }
+    }
+    Json(IndexOpsResponse {
+        ops,
+        has_more: page.has_more,
+        next_after: page.next_after,
+    })
+    .into_response()
+}
+
+/// POST /v1/index/{module}/view — the module's materialized view, served by
+/// its registered mapper. request body and reply are module-defined json
+/// (chat: `{"search": {…}}` → `{"hits": […]}`), exactly as opaque to the
+/// daemon as `/v1/query` payloads are. modules with no view answer 404 —
+/// some never will (forge's substrate is already a queryable git repo).
+async fn index_view(
+    State(handle): State<NodeHandle>,
+    Path(module): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
+    match store.view(&module, &req_bytes) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "view reply was not json",
+            ),
+        },
+        Err(err) => index_error(err),
+    }
+}
+
+/// GET /v1/index/{module}/scan?prefix=&after=&limit= — one page of raw index
+/// keys, for a module's derived read models (everything a registered
+/// `ModuleIndexer` materialized outside the reserved op/meta spaces).
+async fn index_scan(
+    State(handle): State<NodeHandle>,
+    Path(module): Path<String>,
+    Query(params): Query<IndexScanParams>,
+) -> Response {
+    let store = match index_store(&handle) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let prefix = params.prefix.unwrap_or_default();
+    let page = match store.scan(
+        &module,
+        prefix.as_bytes(),
+        params.after.as_deref().map(str::as_bytes),
+        params.limit.unwrap_or(INDEX_DEFAULT_LIMIT),
+    ) {
+        Ok(page) => page,
+        Err(err) => return index_error(err),
+    };
+    let entries = page
+        .entries
+        .iter()
+        .map(|(key, value)| {
+            let json: Option<Box<serde_json::value::RawValue>> =
+                serde_json::from_slice(value).ok();
+            IndexEntry {
+                key: String::from_utf8_lossy(key).into_owned(),
+                value_hex: json.is_none().then(|| hex_bytes(value)),
+                value: json,
+            }
+        })
+        .collect();
+    Json(IndexScanResponse {
+        entries,
+        has_more: page.has_more,
+        next_after: page.next_after,
+    })
+    .into_response()
+}
+
+/// query params for `GET /v1/blocks`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlocksParams {
+    /// cap the response to the most recent N blocks (default:
+    /// [`BLOCKS_DEFAULT_LIMIT`]).
+    pub limit: Option<usize>,
+}
+
+/// GET /v1/blocks — recent non-empty blocks, oldest-first: `{"blocks":[…]}`.
+///
+/// reads the index store's durable blocks database directly (no actor
+/// round-trip), the same discipline as the other `/v1/index/*` reads — so
+/// history survives a restart. heartbeat nops never get a row, so an empty
+/// reply means no real ops have finalized, not an idle chain. a handle with
+/// no index store configured serves the same "no blocks yet" shape.
+async fn blocks(
+    State(handle): State<NodeHandle>,
+    Query(params): Query<BlocksParams>,
+) -> Response {
+    let Some(store) = handle.index.as_ref() else {
+        return Json(serde_json::json!({ "blocks": [] })).into_response();
+    };
+    let rows = match store.recent_block_rows(params.limit.unwrap_or(BLOCKS_DEFAULT_LIMIT)) {
+        Ok(rows) => rows,
+        Err(err) => return index_error(err),
+    };
+    let mut blocks: Vec<Box<serde_json::value::RawValue>> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match serde_json::from_slice(row) {
+            Ok(block) => blocks.push(block),
+            // rows are written as json by construction; failing one means the
+            // store is damaged — say so instead of silently dropping it.
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "stored block row was not json — rebuild the index",
+                );
+            }
+        }
+    }
+    Json(serde_json::json!({ "blocks": blocks })).into_response()
 }
 
 /// the OpenMetrics content type a Prometheus scraper negotiates for `/metrics`.
@@ -1200,6 +1740,44 @@ mod tests {
             ring.recent(Some(TELEMETRY_RING_CAP + 100)).len(),
             TELEMETRY_RING_CAP,
         );
+    }
+
+    /// the explorer row round-trips through its stored index encoding — the
+    /// one seam both binaries write and `GET /v1/blocks` reads.
+    #[test]
+    fn block_row_round_trips() {
+        let record = BlockRecord {
+            height: 7,
+            hash: String::new(),
+            commit_hash: "aa".repeat(32),
+            proposer: "bb".repeat(32),
+            disposition: BlockDisposition::Applied,
+            target: "directory".into(),
+            operations: Vec::new(),
+            payload: "{}".into(),
+            op_hash: "ee".repeat(32),
+        };
+        let row = block_row(&record);
+        let back: BlockRecord = serde_json::from_slice(&row).expect("row is json");
+        assert_eq!(back.height, 7);
+        assert_eq!(back.hash, "", "frameless lanes keep an honest empty hash");
+        assert_eq!(back.proposer, "bb".repeat(32));
+        assert_eq!(back.op_hash, "ee".repeat(32));
+        // the wire keys stay camelCase — the app reads these fields verbatim.
+        let json: serde_json::Value = serde_json::from_slice(&row).unwrap();
+        assert!(json.get("commitHash").is_some());
+        assert!(json.get("opHash").is_some());
+    }
+
+    #[test]
+    fn payload_preview_caps_and_marks_truncation() {
+        assert_eq!(payload_preview(b"{\"k\":\"v\"}"), "{\"k\":\"v\"}");
+        let long = "x".repeat(PAYLOAD_PREVIEW_MAX + 10);
+        let preview = payload_preview(long.as_bytes());
+        assert_eq!(preview.chars().count(), PAYLOAD_PREVIEW_MAX + 1);
+        assert!(preview.ends_with('…'), "truncation is visible");
+        // invalid utf-8 renders lossily rather than erroring.
+        assert_eq!(payload_preview(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
     }
 
     #[test]

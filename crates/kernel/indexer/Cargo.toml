@@ -1,0 +1,21 @@
+# the derived read-model tier: per-module fluent31 databases materialized from
+# the finalized op stream. domain-agnostic by design — this crate must never
+# depend on `sdk`, `host`, or any module crate; the node layer maps its block
+# outcomes into this crate's plain-data input types.
+[package]
+name = "indexer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# async-trait is the one allowed exception, same as sdk: rebuild_from_state
+# awaits the node layer's canonical-state reads through a boxed dyn future.
+async-trait = { workspace = true }
+fluent31 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

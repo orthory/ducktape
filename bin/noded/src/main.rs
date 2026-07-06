@@ -13,20 +13,26 @@
 //! run: `cargo run -p noded -- [--listen 127.0.0.1:8844] [--storage <dir>]`
 //!
 //! without `--storage` state lives in a fresh temp dir (clean run each boot).
-//! with it, qmdb modules and the forge repo persist; the height counter still
-//! restarts at 0 — it is a local block counter, not consensus state.
+//! with it, qmdb modules, the forge repo, and the per-module index persist;
+//! the local block counter resumes ABOVE the index's watermark, so op-log
+//! heights stay monotonic across restarts (a counter restarting at 0 would
+//! make every new block look already-indexed and be silently skipped).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
-use agent_oracle::{AuthStore, LlmWorker};
+use runs::RunsModule;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
+use dispatch::DispatchModule;
+use tagging::TaggingModule;
+use dispatch_oracle::DispatchWorker;
 use document::Document;
 use files::Files;
 use forge::Forge;
@@ -34,11 +40,13 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use inbox::Inbox;
+use indexer::IndexStore;
 use jobs::Jobs;
 use memory::Memory;
 use noded::{
-    BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus,
-    TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame, hex_root,
+    BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
+    NodeCommand, NodeHandle, NodeStatus, TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame,
+    block_row, hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
 use profiles::Profiles;
@@ -50,14 +58,17 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 13] = [
+const MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
+    "dispatch",
+    "tagging",
     "tasks",
     "inbox",
     "automations",
     "jobs",
     "agent",
+    "runs",
     "document",
     "pages",
     "forge",
@@ -166,8 +177,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same path — the actor to materialize into, the http handle to serve from.
     let forge_repo = storage.join("forge-git");
 
+    // the per-module derived index: one fluent31 database per module under
+    // <storage>/index/<module>/, with each module's view mapper registered.
+    // an open failure is fatal-with-remedy rather than a silent no-index run:
+    // the tier is rebuildable, so the fix is always "delete <storage>/index".
+    let index = noded::open_index_store(&storage, &MODULE_IDS)?;
+
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
-    let handle = handle.with_forge_repo(forge_repo.clone());
+    let handle = handle
+        .with_forge_repo(forge_repo.clone())
+        .with_index_store(index.clone());
 
     // the node actor gets its own thread: commonware's tokio runner owns that
     // thread's runtime, and the host must never leave it. the blob handle and
@@ -176,6 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // into the ring, while the http layer reads both through its own clones.
     let actor_storage = storage.clone();
     let actor_forge_repo = forge_repo.clone();
+    let actor_index = index.clone();
     let blobs = handle.blob_handle();
     let telemetry = handle.telemetry_ring();
     std::thread::Builder::new()
@@ -184,6 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_node(
                 actor_storage,
                 actor_forge_repo,
+                actor_index,
                 blobs,
                 telemetry,
                 cmd_rx,
@@ -213,6 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
+    index: Arc<IndexStore>,
     blobs: files::BlobHandle,
     telemetry: TelemetryRing,
     mut cmds: mpsc::Receiver<NodeCommand>,
@@ -230,18 +252,30 @@ fn run_node(
         // files registers over the
         // http layer's blob handle so uploads land in the store `serve_sync`
         // reads — the bytes themselves never touch consensus.
-        let chat = Chat::init(context.child("chat"), "chat").await;
+        let chat = Chat::init(context.child("chat"), "chat")
+            .await
+            .with_tagging("tagging");
         let saga = SagaModule::new("saga");
+        // the task plane: recipe manifests + capability dispatch with
+        // next-block result delivery.
+        let dispatch = DispatchModule::new("dispatch", "saga");
+        // the engagement plane: tag reports in, engagement events out.
+        let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let jobs = Jobs::new("jobs");
-        let agent = AgentModule::new(
-            "agent",
+        let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+        let runs = RunsModule::new(
+            "runs",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
+            "agent",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         );
         let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
@@ -249,7 +283,11 @@ fn run_node(
         // the blob lane before the op is submitted — materializes locally; the
         // pack bytes never enter consensus (root stays sha256(head oid)).
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
-        let worker_blobs = blobs.clone();
+        // the block loop's own handle: each block's root payload is staged as
+        // its explorer row is built, so op hashes stay dereferencable via the
+        // blob lane (worker follow-ups included — the http submit handler only
+        // stages what clients POST).
+        let op_blobs = blobs.clone();
         let files = Files::with_blobs("files", blobs);
         let memory = Memory::new("memory", "files");
         // the origin-gated display-name registry: maps each verified submit
@@ -258,11 +296,14 @@ fn run_node(
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
+            Box::new(dispatch),
+            Box::new(tagging),
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
             Box::new(jobs),
             Box::new(agent),
+            Box::new(runs),
             Box::new(document),
             Box::new(pages),
             Box::new(forge),
@@ -279,8 +320,42 @@ fn run_node(
         // runtime metrics. the handles are retained for the block loop's life.
         let metrics = NodeMetrics::register(&context);
 
-        let workers = oracle_workers(worker_blobs);
-        let mut height = 0u64;
+        let workers = oracle_workers();
+        // resume the local block counter ABOVE the index watermark: the op
+        // log persists under --storage, and a counter restarting at 0 would
+        // re-use indexed heights — every new block silently skipped.
+        let mut height = index.resume_height().expect("read index watermarks");
+        if height > 0 {
+            println!("[noded] module index resumes at height {height}");
+        }
+        // heal modules whose watermark trails the resume floor — a wiped (or
+        // torn) per-module database that forward folding can never refill,
+        // because its heights are already spent above it. views re-derive
+        // from local canonical state at the floor; module-level op history
+        // below it starts over at the boundary, visibly via /v1/index/status.
+        match noded::rebuild_stale_modules(
+            &index,
+            &host,
+            indexer::RebuildMeta { height, time: 0 },
+        )
+        .await
+        {
+            Ok(rebuilt) => {
+                for (module, rows) in rebuilt {
+                    println!(
+                        "[noded] module index for {module} re-derived from state at height {height} ({rows} rows)"
+                    );
+                }
+            }
+            Err(err) => {
+                // poisoned, not fatal: reads stay up, writes refuse, and the
+                // wipe-to-rebuild remedy is the same one the fold error names.
+                eprintln!(
+                    "[noded] module index rebuild failed: {err} — wipe {} to rebuild",
+                    index.base().display()
+                );
+            }
+        }
         while let Some(cmd) = cmds.next().await {
             match cmd {
                 NodeCommand::Submit {
@@ -293,6 +368,8 @@ fn run_node(
                         &mut host,
                         &workers,
                         &mut height,
+                        &index,
+                        &op_blobs,
                         &events,
                         &telemetry,
                         &metrics,
@@ -347,48 +424,72 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn oracle_workers(blobs: files::BlobHandle) -> Vec<Box<dyn reactor::Worker>> {
+fn oracle_workers() -> Vec<Box<dyn reactor::Worker>> {
     #[cfg(debug_assertions)]
     {
         if std::env::var_os("DUCKTAPE_NODED_ECHO_ORACLE").is_some() {
             return vec![Box::new(EchoWorker)];
         }
     }
-    vec![Box::new(LlmWorker::new(
-        blobs,
-        AuthStore::from_default_path(),
-        // the ChatGPT/Codex subscription endpoint rejects gpt-5.1 (400 "not
-        // supported when using Codex with a ChatGPT account") — default to a
-        // model the account can serve; per-agent model_ref overrides this.
-        "gpt-5.3-codex-spark".into(),
+    vec![Box::new(DispatchWorker::new(
+        // BYO: run whatever executor CLIs the capability specs describe and
+        // this host has installed — no credential handling here (see
+        // docs/capability-spec.md). a broken operator spec is a boot error.
+        capability_host::discover()
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
+        // the daemon's oracle identity: its worker follow-ups are
+        // submitted under ORACLE_ORIGIN, so an Accept claim records that
+        // key as the assignee and the re-emitted request must match it.
+        ORACLE_ORIGIN.to_vec(),
     ))]
 }
 
+/// commit the caller's op, then drain worker follow-ups (each its own block).
+/// the returned summary is the block that INCLUDED the caller's op — follow-up
+/// blocks reach clients over the ws stream, not this reply.
 async fn submit_and_drain(
     host: &mut Host,
     workers: &[Box<dyn reactor::Worker>],
     height: &mut u64,
+    index: &IndexStore,
+    blobs: &files::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
     telemetry: &TelemetryRing,
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
-    let (mut last, effects) =
-        match submit_one(host, height, events, telemetry, metrics, origin, msg).await {
-            Ok(out) => out,
-            Err(SubmitError::Fatal(err)) => {
-                eprintln!("[noded] FATAL: {err} — halting");
-                std::process::exit(1);
-            }
-            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
-        };
+    let (included, effects) = match submit_one(
+        host, height, index, blobs, events, telemetry, metrics, origin, msg,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(SubmitError::Fatal(err)) => {
+            eprintln!("[noded] FATAL: {err} — halting");
+            std::process::exit(1);
+        }
+        Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+    };
 
     let mut queue = VecDeque::new();
     offer_effects(workers, effects, &mut queue).await;
     let mut rounds = 1u32;
 
-    while let Some(follow) = queue.pop_front() {
+    loop {
+        let Some(follow) = queue.pop_front() else {
+            // the never-pop-stack tail: results committed into the dispatch
+            // mailbox deliver in a LATER block, and this block-per-op daemon
+            // ticks no other blocks — nudge one flush block per pending batch.
+            if !host.has_pending_deliveries().await {
+                break;
+            }
+            queue.push_back(Msg {
+                target: dispatch_interface::DEFAULT_DISPATCH_TARGET.into(),
+                payload: dispatch_interface::encode_msg(&dispatch_interface::DispatchMsg::Nudge {}),
+            });
+            continue;
+        };
         rounds += 1;
         if rounds > MAX_WORKER_ROUNDS {
             return Err("worker-round budget exceeded".into());
@@ -396,6 +497,8 @@ async fn submit_and_drain(
         match submit_one(
             host,
             height,
+            index,
+            blobs,
             events,
             telemetry,
             metrics,
@@ -404,8 +507,7 @@ async fn submit_and_drain(
         )
         .await
         {
-            Ok((block, effects)) => {
-                last = block;
+            Ok((_block, effects)) => {
                 offer_effects(workers, effects, &mut queue).await;
             }
             Err(SubmitError::Fatal(err)) => {
@@ -418,12 +520,14 @@ async fn submit_and_drain(
         }
     }
 
-    Ok(last)
+    Ok(included)
 }
 
 async fn submit_one(
     host: &mut Host,
     height: &mut u64,
+    index: &IndexStore,
+    blobs: &files::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
     telemetry: &TelemetryRing,
     metrics: &NodeMetrics,
@@ -431,7 +535,25 @@ async fn submit_one(
     msg: Msg,
 ) -> Result<(BlockSummary, Vec<Effect>), SubmitError> {
     let consensus_time = unix_millis();
-    let ctx = BlockContext { protocol_version: 0,
+    // the explorer row's identity: capture the root op's coordinates before
+    // ctx/msg consume them. this lane frames and signs nothing, so the
+    // "proposer" is the SUBMITTER's origin bytes, hex like the networked
+    // lane's keys (the profiles registry is keyed the same way, so the
+    // console resolves it to a display name).
+    let proposer = match &origin {
+        Origin::External(id) => hex_bytes(id),
+        Origin::Module(id) => format!("module:{id}"),
+        Origin::System => "system".into(),
+    };
+    let target = msg.target.clone();
+    let payload = payload_preview(&msg.payload);
+    // staging IS hashing: put_chunk keys the blob by sha256, so this both
+    // computes the op's content address and keeps it dereferencable via
+    // GET /v1/files/blob/{op_hash} — receipt-parity with the submit reply,
+    // and coverage for worker follow-ups no client ever POSTed.
+    let op_hash = hex_bytes(&blobs.put_chunk(msg.payload.clone()));
+    let ctx = BlockContext {
+        protocol_version: 0,
         height: *height + 1,
         consensus_time,
         origin,
@@ -448,11 +570,12 @@ async fn submit_one(
         height: *height,
         app_hash: hex_root(&out.app_hash),
     };
+    let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
     let frame = TelemetryFrame {
         height: *height,
         consensus_time,
         latency_us,
-        dispatches: out.dispatches.iter().map(dispatch_info).collect(),
+        dispatches: operations.clone(),
         events: out.events.iter().map(event_preview).collect(),
     };
     // fold this block into the Prometheus series (before `out` is consumed).
@@ -463,6 +586,36 @@ async fn submit_one(
     telemetry.push(frame.clone());
     let _ = events.send(WsFrame::Block(block.clone()));
     let _ = events.send(WsFrame::Telemetry(frame));
+
+    // fold the block into the derived per-module index LAST: canonical state
+    // is already committed, so an index failure degrades the read models and
+    // never the block. the store poisons itself on error (contiguity over
+    // coverage) and stays loud on every later block until rebuilt.
+    let block_ops = indexer::BlockOps {
+        // the explorer row. every block on this lane is applied — a rejected
+        // submit never increments the height, so it never was a block. the
+        // frame hash stays empty: nothing is framed on this lane, and an
+        // invented digest would claim a verification that never happened.
+        record: Some(block_row(&BlockRecord {
+            height: *height,
+            hash: String::new(),
+            commit_hash: hex_root(&out.app_hash),
+            proposer,
+            disposition: BlockDisposition::Applied,
+            target,
+            operations,
+            payload,
+            op_hash,
+        })),
+        ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
+    };
+    if let Err(err) = index.apply_block(&block_ops) {
+        eprintln!(
+            "[noded] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
+            *height
+        );
+    }
+
     Ok((block, out.effects))
 }
 
@@ -506,12 +659,12 @@ async fn offer_effects(
         let mut claimed = false;
         for w in workers {
             match w.run(&eff).await {
-                Ok(Some(follow)) => {
-                    queue.push_back(follow);
+                Ok(reactor::WorkOutcome::Handled(follow)) => {
+                    queue.extend(follow);
                     claimed = true;
                     break;
                 }
-                Ok(None) => {}
+                Ok(reactor::WorkOutcome::NotMine) => {}
                 Err(err) => {
                     eprintln!("[noded] worker error: {err}");
                     claimed = true;
@@ -534,30 +687,23 @@ struct EchoWorker;
 #[cfg(debug_assertions)]
 #[async_trait::async_trait(?Send)]
 impl reactor::Worker for EchoWorker {
-    async fn run(&self, effect: &Effect) -> Result<Option<Msg>, reactor::Error> {
+    async fn run(&self, effect: &Effect) -> Result<reactor::WorkOutcome, reactor::Error> {
         let request = match saga_interface::decode_worker_request(&effect.0) {
             Ok(request) => request,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
         };
-        let llm = match agent_interface::decode_llm_request(&request.spec) {
-            Ok(llm) => llm,
-            Err(_) => return Ok(None),
+        // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
+        // module judged a Text contract; the agent module normalizes).
+        let Ok(work) = dispatch_interface::decode_work_spec(&request.spec) else {
+            return Ok(reactor::WorkOutcome::NotMine);
         };
-        Ok(Some(Msg {
+        Ok(reactor::WorkOutcome::Handled(Some(Msg {
             target: "saga".into(),
             payload: saga_interface::encode_msg(&saga_interface::SagaMsg::OracleResult {
                 saga_id: request.saga_id,
                 attempt: request.attempt,
-                outcome: Ok(agent_interface::encode_output(
-                    &agent_interface::AgentOutput {
-                        reply_blocks: vec![chat_interface::Block::paragraph(format!(
-                            "echo: handling {}",
-                            llm.run_id
-                        ))],
-                        actions: Vec::new(),
-                    },
-                )),
+                outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
             }),
-        }))
+        })))
     }
 }

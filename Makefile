@@ -49,11 +49,13 @@ install-app: app
 ## every push): the rust workspace including the process-level e2e suites
 ## (bin/node spawns a real 4-node cluster over localhost TCP, bin/noded drives
 ## a real spawned daemon over http/ws), then the app suites with the daemon
-## binary staged so the live-daemon wire-parity e2e RUNS instead of skipping.
+## binary staged so the live-daemon wire-parity e2e RUNS instead of skipping,
+## and the sim node staged so the provider scenario suite runs too.
 test: app/node_modules
 	$(CARGO) test --workspace
-	$(CARGO) build -p noded
-	cd app && DUCKTAPE_NODED_BIN=$(abspath target/debug/ducktape-noded) $(BUN) run test
+	$(CARGO) build -p noded -p simnode
+	cd app && $(BUN) run typecheck
+	cd app && DUCKTAPE_NODED_BIN=$(abspath target/debug/ducktape-noded) DUCKTAPE_SIMNODE_BIN=$(abspath target/debug/ducktape-simnode) $(BUN) run test
 
 clean:
 	$(CARGO) clean

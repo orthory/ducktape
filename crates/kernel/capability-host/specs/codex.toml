@@ -1,0 +1,45 @@
+# Capability spec: OpenAI Codex CLI.
+#
+# This file is EMBEDDED in the capability-host crate as a built-in default and
+# parsed by the exact same code path as operator-provided specs — it is the
+# reference example of the format. An operator spec with `tag = "codex"` in
+# $DUCKTAPE_CAPABILITY_DIR overrides this file entirely (no field merging).
+#
+# Which MODEL codex runs is host policy, not consensus data: this default
+# spec passes no --model flag, so the CLI uses whatever the operator
+# configured in codex itself. Pinning a model = overriding this spec (or
+# adding a finer-tagged one) with a literal `"--model", "<name>"` in args.
+#
+# Format reference: docs/capability-spec.md
+
+spec = 1
+
+[capability]
+tag = "codex"
+description = "OpenAI Codex CLI, non-interactive one-shot exec mode (BYO auth: the CLI manages its own login)"
+
+[detect]
+# Probed on PATH; DUCKTAPE_CODEX_BIN points at an explicit binary instead
+# (an explicit override that does not exist is a loud warning + absent
+# capability, never a silent fallback to PATH).
+bin = "codex"
+env = "DUCKTAPE_CODEX_BIN"
+
+[invoke]
+# One-shot exec, most-restricted sandbox, machine-readable event stream.
+# The trailing "-" tells codex to read the prompt from stdin (fed
+# concurrently, then EOF). Args are fully literal — no placeholders.
+args = [
+    "exec",
+    "--json",
+    "--sandbox",
+    "read-only",
+    "--skip-git-repo-check",
+    "-",
+]
+prompt = "stdin"
+timeout_secs = 300
+
+[output]
+# The `codex exec --json` JSONL event stream: the LAST agent_message wins.
+format = "jsonl-events"

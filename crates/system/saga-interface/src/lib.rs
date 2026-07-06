@@ -1,7 +1,7 @@
 //! the saga module's public wire surface — types only.
 //!
 //! saga v2 is the deterministic async-RPC ledger: one effect, one agreed
-//! result, with attempts, leases, deadlines, and a requester callback. five op
+//! result, with attempts, leases, deadlines, and a requester callback. six op
 //! shapes cross this surface, all as [`SagaMsg`]:
 //!
 //! - `Trigger` STARTS a saga. the module records a pending saga and emits a
@@ -12,6 +12,12 @@
 //!   AGREED result through the same ordered path. the `(saga_id, attempt)`
 //!   pair is the idempotency key: exactly one result transitions a given
 //!   attempt; duplicates and stale attempts are deterministic no-ops.
+//! - `Accept` CLAIMS an unassigned attempt: an UNASSIGNED [`WorkerRequest`]
+//!   (empty/unavailable provider pool) is an ANNOUNCEMENT, not a work order —
+//!   a capable node answers it with `Accept` under its own key, the first
+//!   accept in consensus order becomes the assignee, and the saga re-emits
+//!   the effect naming the winner. one execution, however many nodes could
+//!   have run it.
 //! - `Crank` is the permissionless liveness op: it deterministically fires
 //!   past-deadline timeouts and expires stale leases (retry or fail). anyone
 //!   may crank; safety never depends on who does.
@@ -36,8 +42,11 @@ pub const MAX_RESULT_BYTES: usize = 256 * 1024;
 
 /// hard cap on a trigger's work spec — the same commit-into-the-root-preimage
 /// class as [`MAX_RESULT_BYTES`]: the spec is stored on the saga AND re-emitted
-/// inside every retry's `WorkerRequest`. enforced at trigger time.
-pub const MAX_SPEC_BYTES: usize = 256 * 1024;
+/// inside every retry's `WorkerRequest`. enforced at trigger time. sized to
+/// clear the largest inline module payload (dispatch's 10 MiB `Dispatch`
+/// payload) plus its spec envelope; specs are derived module-origin state, so
+/// this bounds saga state and snapshots, never a wire message.
+pub const MAX_SPEC_BYTES: usize = 12 * 1024 * 1024;
 
 /// hard cap on a trigger's `reply_payload` — stored on the saga and echoed in
 /// the terminal callback. enforced at trigger time.
@@ -47,6 +56,13 @@ pub const MAX_REPLY_PAYLOAD_BYTES: usize = 64 * 1024;
 /// preimage and echoes it in the callback. enforced at execute time; a larger
 /// error ABORTS its block, exactly like an oversized `Ok` result.
 pub const MAX_ERROR_BYTES: usize = 16 * 1024;
+
+/// hard cap on a trigger's `capability` tag — stored on the saga, in the root
+/// preimage. the saga module treats the tag as opaque (no charset rules; a
+/// tag no provider announced simply assigns nobody), but its SIZE is bounded
+/// like every other stored trigger field. matches the capability registry's
+/// own tag cap.
+pub const MAX_CAPABILITY_BYTES: usize = 64;
 
 /// the canonical, serializable, orderable mirror of `sdk::Origin`, recorded on
 /// every saga at trigger time. it gates `Cancel` and `Prune` (only the
@@ -72,7 +88,7 @@ pub enum SagaMsg {
     /// callback-poison rule) and `max_attempts` must be >= 1.
     Trigger {
         saga_id: SagaId,
-        /// opaque work spec (e.g. an LlmRequest), echoed to the worker.
+        /// opaque work spec (e.g. a dispatch WorkSpec), echoed to the worker.
         spec: Vec<u8>,
         /// callback target: on EVERY terminal transition the module sends
         /// this module a [`SagaCallback`] in the same block. `None` = fire
@@ -89,6 +105,21 @@ pub enum SagaMsg {
         /// lease window in views for each attempt. `None` defaults to
         /// `DEFAULT_LEASE_VIEWS` when an assignee exists, else no lease.
         lease_views: Option<u64>,
+        /// the capability the work requires. when set (and the ledger is
+        /// configured with a capability registry) each attempt is
+        /// rendezvous-assigned over the tag's ANNOUNCED PROVIDERS instead of
+        /// the raw validator set — only nodes that can actually execute the
+        /// work hold its lease. `None` keeps valset assignment. an opaque
+        /// tag to this module: bounded, never interpreted.
+        capability: Option<String>,
+        /// static binding: when set, EVERY attempt leases to exactly this
+        /// node key — no rendezvous, no pool query; `capability` (if also
+        /// set) is recorded but does not influence assignment. a dark pinned
+        /// node burns attempts through lease expiry until the saga fails or
+        /// times out — that is what static binding means. must be non-empty
+        /// when set. defaults to `None` so pre-existing encodings decode.
+        #[serde(default)]
+        pinned_assignee: Option<Vec<u8>>,
     },
     /// worker completion for one attempt, submitted as an op. `outcome` is
     /// the agreed result (`Ok`, capped at [`MAX_RESULT_BYTES`]) or the
@@ -99,6 +130,18 @@ pub enum SagaMsg {
         /// [`WorkerRequest`]; a stale attempt is a deterministic no-op.
         attempt: u32,
         outcome: Result<Vec<u8>, String>,
+    },
+    /// claim an UNASSIGNED attempt: the first accept in consensus order
+    /// becomes the attempt's assignee (its lease starts) and the saga
+    /// re-emits the [`WorkerRequest`] effect naming the winner — only the
+    /// winner runs. submitted by a capable node under its own external key.
+    /// unknown/terminal sagas, stale attempts, and already-assigned attempts
+    /// are deterministic no-ops (late accepts lose quietly).
+    Accept {
+        saga_id: SagaId,
+        /// the attempt being claimed — echoed from the announcement
+        /// [`WorkerRequest`].
+        attempt: u32,
     },
     /// permissionless deterministic sweep: fire past-deadline timeouts and
     /// expire stale leases (retry or fail), bounded per op.
@@ -115,7 +158,10 @@ pub enum SagaMsg {
 /// host-owned worker's work order. `(saga_id, attempt)` is the idempotency key
 /// the worker echoes back in its `OracleResult`; `assignee` is the lease
 /// holder that should execute (advisory under the open policy, enforced under
-/// strict).
+/// strict). an `assignee` of `None` is an ANNOUNCEMENT: under the strict
+/// policy no result can land for it — a capable worker answers with
+/// [`SagaMsg::Accept`] instead of running, and the accept's re-emitted
+/// request (now naming the winner) is the actual work order.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRequest {
     pub saga_id: SagaId,
@@ -171,12 +217,20 @@ pub struct SagaCallback {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SagaQuery {
-    Get { saga_id: SagaId },
+    Get {
+        saga_id: SagaId,
+    },
+    /// the earliest lease-expiry or deadline view over all PENDING sagas
+    /// (committed state) — `None` when nothing pending carries one. the read
+    /// a host-side crank pump polls: when the committed next expiry is at or
+    /// past the current view, submitting a `Crank` will transition something.
+    NextExpiry,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SagaReply {
     Saga(Option<SagaView>),
+    NextExpiry(Option<u64>),
 }
 
 /// a saga's observable state — the full read projection.
@@ -186,10 +240,14 @@ pub struct SagaView {
     pub reply_to: Option<String>,
     pub reply_payload: Vec<u8>,
     pub spec: Vec<u8>,
+    pub capability: Option<String>,
     pub status: SagaStatus,
     pub attempt: u32,
     pub max_attempts: u32,
     pub assignee: Option<Vec<u8>>,
+    /// the trigger's static binding, echoed onto every attempt's lease.
+    #[serde(default)]
+    pub pinned_assignee: Option<Vec<u8>>,
     pub lease_views: Option<u64>,
     pub lease_expires_at: Option<u64>,
     pub deadline: Option<u64>,

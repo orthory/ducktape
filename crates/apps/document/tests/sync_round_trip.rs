@@ -148,7 +148,7 @@ fn synced_store_reconstructs_source_root() {
 
         // JOINER: reconstruct on a FRESH context + namespace by pulling from the
         // resolver. no ops are applied in application order on this side.
-        let synced = Document::sync_from(context.child("dst"), "dst", target, resolver).await;
+        let synced = Document::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
 
         // THE PROPERTY: identical qmdb root — the app-hash linkage a joiner needs
         // to be accepted as a consensus participant at the boundary height.
@@ -199,7 +199,7 @@ fn synced_store_reproduces_the_doc_index() {
         let resolver = src.into_resolver();
 
         // JOINER: reconstruct from the resolver — no ops replayed in app order.
-        let synced = Document::sync_from(context.child("dst"), "dst", target, resolver).await;
+        let synced = Document::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
 
         // the reserved index key rode through sync with every doc: enumeration
         // on the synced store returns the identical known-doc set.

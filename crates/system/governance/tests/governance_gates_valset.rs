@@ -75,6 +75,7 @@ async fn validators(host: &Host) -> Vec<Vec<u8>> {
         .expect("valset query");
     match valset_decode(&reply).expect("decode") {
         ValsetReply::Validators(v) => v,
+        other => panic!("expected Validators, got {other:?}"),
     }
 }
 

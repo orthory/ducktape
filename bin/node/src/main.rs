@@ -50,21 +50,25 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent::AgentModule;
-use agent_oracle::{AuthStore, LlmWorker};
+use runs::RunsModule;
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::{Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
+use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
+use dispatch::DispatchModule;
+use tagging::TaggingModule;
+use dispatch_oracle::DispatchWorker;
 use futures::{FutureExt as _, StreamExt as _};
 
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
 mod config;
-use config::{Resolved, hex_bytes, unhex};
+mod lobby;
+use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
@@ -75,10 +79,12 @@ const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 /// `ReadinessSignaller` truthfully signals readiness for a pending upgrade iff
 /// `MAX_PROTOCOL_VERSION >= to_version`, and the boot preflight refuses a boundary
 /// whose `required_min_version` exceeds it. Phase 9 raised this to 2 when the
-/// forge v2 dual path landed — this binary can execute a scheduled `to_version=2`
-/// (the forge multi-repo-v2 root/snapshot divergence) and truthfully `SignalReady`.
-const MAX_PROTOCOL_VERSION: u32 = 2;
+/// forge v2 dual path landed; the staged-admission observer tier raised it to
+/// 3 — this binary can execute a scheduled `to_version=3` (valset/governance
+/// observer ops, gated below 3) and truthfully `SignalReady`.
+const MAX_PROTOCOL_VERSION: u32 = 3;
 use automations::Automations;
+use capability::CapabilityRegistry;
 use chat::Chat;
 use directory::Directory;
 use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
@@ -95,7 +101,7 @@ use node::OrderedNode;
 use pages::Pages;
 use profiles::Profiles;
 use recovery::{Manifest, Recovery};
-use saga::SagaModule;
+use saga::{LeasePolicy, SagaModule};
 use sdk::{ModuleId, Msg, StateRoot};
 use statesync::p2p::P2pSyncClient;
 use statesync::qmdb::RemoteQmdbResolver;
@@ -130,6 +136,12 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// enough to let discovery links warm, but bounded so boot cannot hang forever
 /// before the statesync server bridge is installed.
 const BOOT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+/// how often the reachability plane re-offers whatever it still waits on —
+/// un-acked gossip while assembling, stalled handshake messages after
+/// verification (`ReachabilityCommand::Nudge`). fast enough that a lost
+/// message costs one beat of mesh convergence, slow enough to be noise-free
+/// — the nudge is a no-op once the epoch's handshakes have all completed.
+const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
 /// post-reboot catch-up should close the reboot gap, not chase a live chain
 /// forever. any tiny lag left after this cap is handled by the normal engine.
 const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
@@ -139,9 +151,31 @@ const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
 const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
+/// pump drain cadence: how often the pump applies finalized frames (and runs
+/// everything that rides the drain arm — checkpoints, valset orchestration,
+/// the epoch cutover, the heartbeat). enforced as a FLOOR via an absolute
+/// deadline in the pump loop: ingress load can delay one drain by one
+/// request's service time, but can never starve the arm.
+const DRAIN_TICK: Duration = Duration::from_millis(100);
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 const CHANNEL_STATE_SYNC: u64 = 4;
+/// the lobby channel: a not-yet-admitted joiner (connected as the derived
+/// lobby identity) announces `{invite token, pubkey, proof}` here; members
+/// verify and RECORD the join request for manual approval, and answer with an
+/// informational reply. see the `lobby` module.
+const CHANNEL_LOBBY: u64 = 5;
+/// the reachability channel: members gossip WireGuard endpoint records and
+/// signed advertisements and run the tunnel-upgrade handshake here (the
+/// `reachability` crate's staged node-driven WireGuard plane). registered in
+/// EVERY mode — an unregistered channel is a protocol violation that kills
+/// the sender's connection — and black-holed where the plane does not run.
+const CHANNEL_REACHABILITY: u64 = 6;
+/// while parked and un-admitted, re-announce every N park-loop attempts
+/// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
+/// survive member restarts (the request queue is in-memory), quiet enough to
+/// stay out of the members' way.
+const LOBBY_ANNOUNCE_EVERY: usize = 5;
 /// how many epochs of engine channels are PRE-REGISTERED. discovery channels
 /// can only be registered before `network.start()`, and every epoch's respawned
 /// engine needs FRESH channels (an aborted old engine must never collide with
@@ -156,7 +190,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 19] = [
+const MODULE_IDS: [&str; 23] = [
     "kv",
     "document",
     "pages",
@@ -166,6 +200,9 @@ const MODULE_IDS: [&str; 19] = [
     "governance",
     "upgrade",
     "saga",
+    "capability",
+    "dispatch",
+    "tagging",
     "tasks",
     "vaults",
     "profiles",
@@ -176,6 +213,7 @@ const MODULE_IDS: [&str; 19] = [
     "memory",
     "jobs",
     "agent",
+    "runs",
 ];
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
@@ -219,6 +257,16 @@ fn participant_bytes(
         .collect()
 }
 
+fn observer_bytes(
+    orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
+) -> Vec<Vec<u8>> {
+    orchestrator
+        .current_observers()
+        .iter()
+        .map(|k| k.as_ref().to_vec())
+        .collect()
+}
+
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
 async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
@@ -231,7 +279,24 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
     };
     match decode_reply(&reply) {
         Ok(ValsetReply::Validators(v)) => v,
-        Err(_) => Vec::new(),
+        Ok(_) | Err(_) => Vec::new(),
+    }
+}
+
+/// read the valset module's current OBSERVER projection (committed state —
+/// called between drains, outside any block; same read point as
+/// [`read_valset_members`], so a boundary read sees one frozen state).
+async fn read_valset_observers(host: &Host) -> Vec<Vec<u8>> {
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("valset", &encode_query(&ValsetQuery::Observers))
+        .await
+    else {
+        return Vec::new();
+    };
+    match decode_reply(&reply) {
+        Ok(ValsetReply::Observers(v)) => v,
+        Ok(_) | Err(_) => Vec::new(),
     }
 }
 
@@ -302,6 +367,23 @@ async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCo
         to_version: up.to_version,
     });
     (status.current_version, pending)
+}
+
+/// the CURRENT member set from the valset module's committed+staged projection
+/// (host-routed read, between drains). an unreadable reply degrades to empty —
+/// callers treat that as "can't authorize anything right now", never a panic.
+async fn read_members_from_host(host: &Host) -> Vec<Vec<u8>> {
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    let Ok(raw) = host
+        .query("valset", &encode_query(&ValsetQuery::Validators))
+        .await
+    else {
+        return Vec::new();
+    };
+    match decode_reply(&raw) {
+        Ok(ValsetReply::Validators(v)) => v,
+        Ok(_) | Err(_) => Vec::new(),
+    }
 }
 
 /// read the upgrade module's raw committed [`UpgradeStatus`] (committed state,
@@ -400,6 +482,112 @@ impl ReadinessSignaller {
     }
 }
 
+/// the capability self-announcer: the state-driven twin of
+/// [`ReadinessSignaller`] for the capability registry. it polls the committed
+/// registry each pump tick and, when this node's announced set differs from
+/// what discovery found locally, self-submits ONE declarative
+/// [`CapabilityMsg::Announce`]. state-driven (survives restart/late-join) and
+/// idempotent: once the committed set matches, it stays quiet. a node with no
+/// providers announces nothing.
+struct CapabilityAnnouncer {
+    /// this node's own validator pubkey bytes — the registry identity.
+    me: Vec<u8>,
+    /// the capability tags discovery found on this host, sorted — the truthful
+    /// set to announce. empty means this node provides nothing.
+    capabilities: Vec<String>,
+    /// the set we last SUBMITTED (not yet observed committed), latched so an
+    /// in-flight announce is not re-sent every tick.
+    announced: Option<Vec<String>>,
+}
+
+impl CapabilityAnnouncer {
+    fn new(me: Vec<u8>, capabilities: Vec<String>) -> Self {
+        Self {
+            me,
+            capabilities,
+            announced: None,
+        }
+    }
+
+    /// the PURE decision core: given this node's committed announced set,
+    /// decide whether to (re)announce. `None` when the registry already matches
+    /// what we'd announce, or an identical announce is already in flight.
+    fn decide(&mut self, committed: &[String]) -> Option<Vec<String>> {
+        // nothing to provide and nothing recorded: stay silent (genesis state).
+        if self.capabilities.is_empty() && committed.is_empty() {
+            return None;
+        }
+        // the registry already reflects our providers — nothing to do.
+        if committed == self.capabilities.as_slice() {
+            self.announced = None;
+            return None;
+        }
+        // an announce for this exact set is already in flight.
+        if self.announced.as_deref() == Some(self.capabilities.as_slice()) {
+            return None;
+        }
+        self.announced = Some(self.capabilities.clone());
+        Some(self.capabilities.clone())
+    }
+
+    /// query this node's committed capability set and, when an announce is due,
+    /// build the external-origin `Announce` op. gracefully `None` when the
+    /// module is absent (pre-retrofit net) or the reply is unreadable.
+    async fn maybe_announce(&mut self, host: &Host) -> Option<Msg> {
+        use capability_interface::{
+            CapabilityMsg, CapabilityQuery, CapabilityReply, decode_reply, encode_msg, encode_query,
+        };
+        let reply = host
+            .query(
+                "capability",
+                &encode_query(&CapabilityQuery::Node {
+                    node: self.me.clone(),
+                }),
+            )
+            .await
+            .ok()?;
+        let CapabilityReply::Node(committed) = decode_reply(&reply).ok()? else {
+            return None;
+        };
+        let capabilities = self.decide(&committed)?;
+        Some(Msg {
+            target: "capability".into(),
+            payload: encode_msg(&CapabilityMsg::Announce { capabilities }),
+        })
+    }
+}
+
+/// the committed dispatch mailbox's undelivered-result count — the nudge
+/// pump's read. `0` when the module is absent or the mailbox is empty.
+async fn dispatch_pending_deliveries(host: &Host) -> u64 {
+    use dispatch_interface::{DispatchQuery, DispatchReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("dispatch", &encode_query(&DispatchQuery::PendingDeliveries))
+        .await
+    else {
+        return 0;
+    };
+    match decode_reply(&reply) {
+        Ok(DispatchReply::PendingDeliveries(n)) => n,
+        _ => 0,
+    }
+}
+
+/// the committed saga ledger's earliest pending lease-expiry/deadline — the
+/// crank pump's read. `None` when the module is absent or nothing pending
+/// carries one.
+async fn saga_next_expiry(host: &Host) -> Option<u64> {
+    use saga_interface::{SagaQuery, SagaReply, decode_reply, encode_query};
+    let reply = host
+        .query("saga", &encode_query(&SagaQuery::NextExpiry))
+        .await
+        .ok()?;
+    match decode_reply(&reply).ok()? {
+        SagaReply::NextExpiry(v) => v,
+        _ => None,
+    }
+}
+
 /// hex-encode a state root for a stable, greppable log line.
 fn hex(root: &StateRoot) -> String {
     hex_bytes(&root.0)
@@ -419,7 +607,9 @@ async fn genesis_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
-    let chat = Chat::init(context.child("chat"), "chat").await;
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
     // forge shares the files body plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge =
@@ -445,7 +635,28 @@ async fn genesis_host(
         // upgrade + per-validator readiness set (valset-gated). its mere
         // presence in the registry is its genesis app-hash contribution.
         Box::new(Upgrade::new("upgrade", "valset")),
-        Box::new(SagaModule::new("saga")),
+        // capability-aware strict leases: a saga whose trigger names a
+        // capability is assigned over that tag's announced providers, and
+        // only the assignee's result lands. an UNASSIGNED attempt (empty
+        // provider pool) accepts no result at all: its WorkerRequest is an
+        // announcement a capable node must first claim via `SagaMsg::Accept`.
+        Box::new(SagaModule::with_assignment(
+            "saga",
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        )),
+        // the network-wide registry of node host capabilities ("codex",
+        // "claude", ...): member-gated self-announcements, so every node holds
+        // an identical view of who can run what. its genesis contribution is an
+        // empty registry (ZERO root) until nodes announce.
+        Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
+        // the task plane: recipe manifests + capability-routed dispatch with
+        // next-block result delivery (the host's DeliverPending injection).
+        Box::new(DispatchModule::new("dispatch", "saga")),
+        // the engagement plane: content modules report tags, subscriber
+        // modules receive engagement events — router only, module-agnostic.
+        Box::new(TaggingModule::new("tagging")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
         // the origin-gated display-name registry: each verified submit origin
@@ -459,12 +670,21 @@ async fn genesis_host(
         // write-once publish, immutable generations, snapshots, and watches.
         Box::new(Memory::new("memory", "files")),
         Box::new(Jobs::new("jobs")),
-        Box::new(AgentModule::new(
-            "agent",
+        // the agent registry: a self-contained record book; its hook keeps
+        // each agent's dispatch recipe in lockstep via the runs module.
+        Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
+        // the collaboration loop's actor: watches, engagement, composition,
+        // dispatch, and response delivery — reads the registry by query.
+        Box::new(RunsModule::new(
+            "runs",
             "chat",
             "saga",
+            "tagging",
+            "dispatch",
+            "agent",
             Some("tasks".into()),
             Some("jobs".into()),
+            Some("document".into()),
         )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -493,7 +713,9 @@ async fn restore_host(
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
-    let chat = Chat::init(context.child("chat"), "chat").await;
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
     // forge shares the files body plane (see genesis_host) for Push materialization.
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
         .map_err(|e| format!("forge: {e}"))?;
@@ -532,10 +754,28 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("upgrade install: {e}"))?;
 
-    let mut saga = SagaModule::new("saga");
+    let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
     let (bytes, root) = snapshot_of("saga")?;
     saga.install(bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
+
+    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    let (bytes, root) = snapshot_of("capability")?;
+    capability
+        .install(bytes, root)
+        .map_err(|e| format!("capability install: {e}"))?;
+
+    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    let (bytes, root) = snapshot_of("dispatch")?;
+    dispatch
+        .install(bytes, root)
+        .map_err(|e| format!("dispatch install: {e}"))?;
+
+    let mut tagging = TaggingModule::new("tagging");
+    let (bytes, root) = snapshot_of("tagging")?;
+    tagging
+        .install(bytes, root)
+        .map_err(|e| format!("tagging install: {e}"))?;
 
     let mut tasks = Tasks::new("tasks");
     let (bytes, root) = snapshot_of("tasks")?;
@@ -578,17 +818,26 @@ async fn restore_host(
     jobs.install(bytes, root)
         .map_err(|e| format!("jobs install: {e}"))?;
 
-    let mut agent = AgentModule::new(
-        "agent",
-        "chat",
-        "saga",
-        Some("tasks".into()),
-        Some("jobs".into()),
-    );
+    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()));
     let (bytes, root) = snapshot_of("agent")?;
     agent
         .install(bytes, root)
         .map_err(|e| format!("agent install: {e}"))?;
+
+    let mut runs = RunsModule::new(
+        "runs",
+        "chat",
+        "saga",
+        "tagging",
+        "dispatch",
+        "agent",
+        Some("tasks".into()),
+        Some("jobs".into()),
+        Some("document".into()),
+    );
+    let (bytes, root) = snapshot_of("runs")?;
+    runs.install(bytes, root)
+        .map_err(|e| format!("runs install: {e}"))?;
 
     let mut directory = Directory::new("directory");
     let (bytes, root) = snapshot_of("directory")?;
@@ -612,6 +861,9 @@ async fn restore_host(
         Box::new(governance),
         Box::new(upgrade),
         Box::new(saga),
+        Box::new(capability),
+        Box::new(dispatch),
+        Box::new(tagging),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -620,6 +872,7 @@ async fn restore_host(
         Box::new(memory),
         Box::new(jobs),
         Box::new(agent),
+        Box::new(runs),
         Box::new(directory),
         Box::new(automations),
     ])
@@ -687,7 +940,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await?;
 
     let (target, resolver) = fetch_target("document").await?;
     let document = Document::sync_from(
@@ -696,7 +949,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await?;
 
     let (target, resolver) = fetch_target("pages").await?;
     let pages = Pages::sync_from(
@@ -705,7 +958,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await?;
 
     let (target, resolver) = fetch_target("chat").await?;
     let chat = Chat::sync_from(
@@ -714,7 +967,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         target,
         resolver,
     )
-    .await;
+    .await?
+    .with_tagging("tagging");
 
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
@@ -744,9 +998,27 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("valset install: {e}"))?;
 
     let (bytes, root) = snapshot_of("saga").await?;
-    let mut saga = SagaModule::new("saga");
+    let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
     saga.install(&bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("capability").await?;
+    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    capability
+        .install(&bytes, root)
+        .map_err(|e| format!("capability install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("dispatch").await?;
+    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    dispatch
+        .install(&bytes, root)
+        .map_err(|e| format!("dispatch install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("tagging").await?;
+    let mut tagging = TaggingModule::new("tagging");
+    tagging
+        .install(&bytes, root)
+        .map_err(|e| format!("tagging install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance = Governance::new("governance", "valset", "upgrade");
@@ -802,16 +1074,25 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("jobs install: {e}"))?;
 
     let (bytes, root) = snapshot_of("agent").await?;
-    let mut agent = AgentModule::new(
-        "agent",
-        "chat",
-        "saga",
-        Some("tasks".into()),
-        Some("jobs".into()),
-    );
+    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()));
     agent
         .install(&bytes, root)
         .map_err(|e| format!("agent install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("runs").await?;
+    let mut runs = RunsModule::new(
+        "runs",
+        "chat",
+        "saga",
+        "tagging",
+        "dispatch",
+        "agent",
+        Some("tasks".into()),
+        Some("jobs".into()),
+        Some("document".into()),
+    );
+    runs.install(&bytes, root)
+        .map_err(|e| format!("runs install: {e}"))?;
 
     let (bytes, root) = snapshot_of("automations").await?;
     let mut automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
@@ -847,6 +1128,9 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(governance),
         Box::new(upgrade),
         Box::new(saga),
+        Box::new(capability),
+        Box::new(dispatch),
+        Box::new(tagging),
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
@@ -855,6 +1139,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(memory),
         Box::new(jobs),
         Box::new(agent),
+        Box::new(runs),
         Box::new(automations),
         Box::new(directory),
     ])
@@ -1044,11 +1329,293 @@ fn recovery_frame_to_sync(
     })
 }
 
+// ---------------------------------------------------------------------------
+// the derived-index boot fold. consensus never depends on it: fold errors
+// poison the store and log, heal errors log — recovery and the drain proceed
+// identically with or without the index.
+// ---------------------------------------------------------------------------
+
+/// build one explorer row ([`noded::BlockRecord`] json) from a block's
+/// decoded parts — THE row construction seam, shared by the live drain and
+/// the boot fold so both writers produce byte-identical rows. staging the
+/// payload IS computing `op_hash` (put_chunk keys the blob by sha256), and
+/// on the fold path the re-staging is load-bearing: the blob store is
+/// in-memory, so the live drain's staging dies with the process and this is
+/// what makes `GET /v1/files/blob/{op_hash}` answer again after a restart.
+#[allow(clippy::too_many_arguments)]
+fn explorer_block_row(
+    blobs: &files::BlobHandle,
+    height: u64,
+    frame_hash: &node::FrameId,
+    app_hash: &StateRoot,
+    origin: &sdk::Origin,
+    target: &str,
+    payload: &[u8],
+    dispatches: &[host::DispatchRecord],
+    disposition: noded::BlockDisposition,
+) -> Vec<u8> {
+    noded::block_row(&noded::BlockRecord {
+        height,
+        hash: noded::hex_bytes(frame_hash),
+        commit_hash: hex(app_hash),
+        proposer: match origin {
+            sdk::Origin::External(key) => noded::hex_bytes(key),
+            // frames only carry verified External authorship; label the
+            // impossible rest.
+            sdk::Origin::Module(id) => format!("module:{id}"),
+            sdk::Origin::System => "system".into(),
+        },
+        disposition,
+        target: target.to_string(),
+        operations: dispatches.iter().map(noded::DispatchInfo::from).collect(),
+        payload: noded::payload_preview(payload),
+        op_hash: noded::hex_bytes(&blobs.put_chunk(payload.to_vec())),
+    })
+}
+
+/// rebuild the explorer row for a replayed sealed frame — the boot fold's
+/// equivalent of the drain's row construction, fed from the journal instead
+/// of the live decode. `None` mirrors the drain's gates exactly: an
+/// undecodable frame never had a row (its drain `op` was `None`), the
+/// heartbeat nop is the deliberately-empty block the explorer hides, and a
+/// discarded frame is never journaled (the arm keeps this total anyway).
+fn sealed_frame_block_row(
+    blobs: &files::BlobHandle,
+    block: &recovery::FoldedBlock<'_>,
+) -> Option<Vec<u8>> {
+    let (origin, msg) = node::decode_frame(block.frame).ok()?;
+    if msg.target == NOP_TARGET {
+        return None;
+    }
+    let disposition = match block.disposition {
+        node::Disposition::Applied => noded::BlockDisposition::Applied,
+        node::Disposition::Rejected => noded::BlockDisposition::Rejected,
+        node::Disposition::Discarded => return None,
+    };
+    Some(explorer_block_row(
+        blobs,
+        block.height,
+        &node::frame_id(block.frame),
+        &block.app_hash,
+        &origin,
+        &msg.target,
+        &msg.payload,
+        block.dispatches,
+        disposition,
+    ))
+}
+
+/// the observer's explorer row: a followed BOUNDARY, not a sealed frame. the
+/// populated fields are verified truth — the boundary height and the
+/// app-hash the manifest check passed — and every frame-derived field stays
+/// honestly empty, because an observer never sees the frames between
+/// boundaries (the same degradation rule that keeps the frameless daemon
+/// lane's `hash` empty rather than fabricated).
+fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
+    noded::block_row(&noded::BlockRecord {
+        height,
+        hash: String::new(),
+        commit_hash: hex(app_hash),
+        proposer: String::new(),
+        disposition: noded::BlockDisposition::Applied,
+        target: String::new(),
+        operations: Vec::new(),
+        payload: String::new(),
+        op_hash: String::new(),
+    })
+}
+
+/// folds sealed blocks into the derived per-module index during boot (journal
+/// replay + post-reboot frame catch-up), with the GAP DISCIPLINE: once one
+/// sealed height's content is unreproducible (opaque) above some module's
+/// watermark, folding stops for good. advancing watermarks past the hole
+/// would hide it from the post-boot heal, which re-derives from verified
+/// state exactly when a watermark trails the boot tip. a re-executed block
+/// carries its sealed frame, so the fold also rebuilds the explorer row the
+/// live drain wrote — the blocks database is the one derived tier a
+/// from-state rebuild can NOT repair (rows are node-layer observations, not
+/// canonical state), so the crash-window suffix must be re-derived here or
+/// `GET /v1/blocks` loses those heights for good.
+struct IndexFold<'a> {
+    index: &'a indexer::IndexStore,
+    blobs: files::BlobHandle,
+    stopped: bool,
+}
+
+impl<'a> IndexFold<'a> {
+    fn new(index: &'a indexer::IndexStore, blobs: files::BlobHandle) -> Self {
+        Self {
+            index,
+            blobs,
+            stopped: false,
+        }
+    }
+
+    /// the LOWEST module watermark: an opaque height at or below it is
+    /// already reflected everywhere; above it, at least one module would be
+    /// folded past a hole.
+    fn min_watermark(&self) -> Option<u64> {
+        let mut min: Option<u64> = None;
+        for id in self.index.module_ids() {
+            match self.index.applied_height(id) {
+                Ok(h) => min = Some(min.map_or(h, |m| m.min(h))),
+                Err(_) => return None,
+            }
+        }
+        min
+    }
+}
+
+impl recovery::ReplaySink for IndexFold<'_> {
+    fn folded_block(&mut self, block: &recovery::FoldedBlock<'_>) {
+        if self.stopped {
+            return;
+        }
+        let height = block.height;
+        let ops = indexer::BlockOps {
+            record: sealed_frame_block_row(&self.blobs, block),
+            // the validator's consensus time IS the height (see BlockContext).
+            ..noded::index_block_ops(height, height, block.dispatches)
+        };
+        if let Err(err) = self.index.apply_block(&ops) {
+            eprintln!("[node] module index fold failed at height {height}: {err}");
+            self.stopped = true;
+        }
+    }
+
+    fn opaque_block(&mut self, height: u64) {
+        if self.stopped {
+            return;
+        }
+        match self.min_watermark() {
+            Some(watermark) if height <= watermark => {}
+            _ => self.stopped = true,
+        }
+    }
+}
+
+/// re-derive every index module whose watermark trails `boundary` from the
+/// host's VERIFIED canonical state (checkpoint-restored, state-synced, or
+/// replay-verified — every boot caller sits after a root/app-hash check).
+/// failures poison the store and log; the node boots regardless.
+async fn heal_index(index: &indexer::IndexStore, host: &Host, boundary: u64, label: &str) {
+    let meta = indexer::RebuildMeta {
+        height: boundary,
+        // the validator's consensus time IS the height.
+        time: boundary,
+    };
+    match noded::rebuild_stale_modules(index, host, meta).await {
+        Ok(rebuilt) => {
+            for (module, rows) in rebuilt {
+                println!(
+                    "[node {label}] index for {module} re-derived from state at height \
+                     {boundary} ({rows} rows)"
+                );
+            }
+        }
+        Err(err) => eprintln!(
+            "[node {label}] index heal at height {boundary} failed: {err} — wipe \
+             <storage>/index to rebuild"
+        ),
+    }
+}
+
+/// cut and frame every derived-index database (modules + the blocks db) for
+/// the shipped-index lane (indexable spec §7 lane 2). a database that fails
+/// to cut is skipped — whatever a joiner does not receive, its staleness
+/// heal re-derives — and a poisoned store cuts nothing, so the shipment
+/// comes back empty and the joiner falls back entirely.
+fn ship_index_blobs(
+    index: &indexer::IndexStore,
+    label: &str,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut blobs = std::collections::BTreeMap::new();
+    let dbs: Vec<String> = index
+        .module_ids()
+        .map(str::to_string)
+        .chain(std::iter::once(indexer::BLOCKS_DB_ID.to_string()))
+        .collect();
+    for db in dbs {
+        match index.checkpoint_files(&db) {
+            Ok(files) => {
+                blobs.insert(db, statesync::encode_index_archive(&files));
+            }
+            Err(err) => eprintln!("[node {label}] shipped index skips {db}: {err}"),
+        }
+    }
+    blobs
+}
+
+/// fetch the sync source's shipped-index checkpoints and stage them for
+/// adoption at the promoted reboot — the OPTIONAL, UNVERIFIED warm start
+/// over the from-state rebuild (indexable spec §7 lane 2). every outcome
+/// short of a staged-and-committed install converges on the same fallback:
+/// the boot heal re-derives whatever the watermarks say is missing, so
+/// failures here log and fall through, never abort the promotion.
+async fn stage_shipped_index<C: statesync::SyncClient>(
+    client: &C,
+    boundary: statesync::BoundaryId,
+    storage: &std::path::Path,
+    label: &str,
+) {
+    let index_base = storage.join("index");
+    let known: std::collections::BTreeSet<&str> = MODULE_IDS
+        .iter()
+        .copied()
+        .chain(std::iter::once(indexer::BLOCKS_DB_ID))
+        .collect();
+    let staged: Result<usize, String> = async {
+        // a retry of the promotion loop may have staged a partial set
+        // already; start clean so attempts never interleave.
+        indexer::discard_staged(&index_base).map_err(|e| e.to_string())?;
+        let entries = statesync::fetch_index_modules(client, boundary)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut staged = 0usize;
+        for (db, _) in &entries {
+            // a db this binary does not know (version skew) would sit
+            // unopened on disk forever — skip it, its module heals instead.
+            if !known.contains(db.as_str()) {
+                println!("[node {label}] shipped index skips unknown db {db:?}");
+                continue;
+            }
+            let blob = statesync::fetch_index_db(client, boundary, db)
+                .await
+                .map_err(|e| format!("{db}: {e}"))?;
+            let files = statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
+            indexer::stage_shipped_db(&index_base, db, &files).map_err(|e| e.to_string())?;
+            staged += 1;
+        }
+        if staged > 0 {
+            indexer::commit_staged(&index_base).map_err(|e| e.to_string())?;
+        }
+        Ok(staged)
+    }
+    .await;
+    match staged {
+        Ok(0) => println!("[node {label}] source ships no index — views heal from verified state"),
+        Ok(n) => println!(
+            "[node {label}] shipped index staged ({n} databases) — adopted at the promoted \
+             reboot; contents are trusted from the source, not verified (spec §7 lane 2)"
+        ),
+        Err(e) => {
+            eprintln!(
+                "[node {label}] shipped index fetch failed: {e} — views heal from verified \
+                 state instead"
+            );
+            if let Err(e) = indexer::discard_staged(&index_base) {
+                eprintln!("[node {label}] shipped index staging cleanup failed: {e}");
+            }
+        }
+    }
+}
+
 async fn apply_verified_suffix_frame(
     host: &mut Host,
     served: &statesync::FinalizedFrame,
-) -> Result<(), String> {
+) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
+    let mut dispatches = Vec::new();
     let outcome = match node::decode_frame(&served.frame) {
         Ok((origin, msg)) => {
             let protocol_version = host.effective_version(served.height).await;
@@ -1060,7 +1627,10 @@ async fn apply_verified_suffix_frame(
                 origin,
             };
             match host.submit_at(ctx, msg).await {
-                Ok(_) => node::Disposition::Applied,
+                Ok(outcome) => {
+                    dispatches = outcome.dispatches;
+                    node::Disposition::Applied
+                }
                 Err(host::SubmitError::Rejected(_)) => node::Disposition::Rejected,
                 Err(host::SubmitError::Fatal(f)) => {
                     return Err(format!("fatal host error applying suffix frame: {f}"));
@@ -1092,13 +1662,14 @@ async fn apply_verified_suffix_frame(
             hex(&served.app_hash)
         ));
     }
-    Ok(())
+    Ok(dispatches)
 }
 
 async fn apply_and_journal_verified_frame<E>(
     recovery: &mut Recovery<E>,
     host: &mut Host,
     frame: &statesync::FinalizedFrame,
+    fold: Option<&mut IndexFold<'_>>,
 ) -> Result<(), String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -1106,7 +1677,7 @@ where
     node::BlockSink::pre_apply(recovery, frame.height, &frame.frame)
         .await
         .map_err(|e| format!("catch-up WAL write: {e}"))?;
-    apply_verified_suffix_frame(host, frame).await?;
+    let dispatches = apply_verified_suffix_frame(host, frame).await?;
     let seal = node::BlockSeal {
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),
@@ -1116,6 +1687,16 @@ where
     node::BlockSink::seal(recovery, &seal)
         .await
         .map_err(|e| format!("catch-up seal write: {e}"))?;
+    if let Some(fold) = fold {
+        use recovery::ReplaySink as _;
+        fold.folded_block(&recovery::FoldedBlock {
+            height: frame.height,
+            frame: &frame.frame,
+            disposition: seal.disposition,
+            app_hash: seal.app_hash,
+            dispatches: &dispatches,
+        });
+    }
     Ok(())
 }
 
@@ -1132,6 +1713,7 @@ async fn apply_post_reboot_catchup_frames<E>(
     from_height: u64,
     to_height: u64,
     frames: Vec<statesync::FinalizedFrame>,
+    mut fold: Option<&mut IndexFold<'_>>,
 ) -> Result<PostRebootCatchupApply, String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -1165,7 +1747,7 @@ where
                 frame.height
             ));
         }
-        apply_and_journal_verified_frame(recovery, host, &frame).await?;
+        apply_and_journal_verified_frame(recovery, host, &frame, fold.as_deref_mut()).await?;
         last = frame.height;
         applied.applied += 1;
         applied.frames.push(frame.frame.clone());
@@ -1228,6 +1810,7 @@ where
         target.epoch,
         target.view_base,
         target.participants.clone(),
+        target.observers.clone(),
         pending_cutover_view,
         target.current_version,
         target.pending_upgrade.clone(),
@@ -1268,6 +1851,7 @@ async fn catch_up_post_reboot_frames<C, E>(
     client: &C,
     recovery: &mut Recovery<E>,
     host: &mut Host,
+    fold: Option<&mut IndexFold<'_>>,
     recovered_height: u64,
     max_iterations: usize,
 ) -> Result<PostRebootCatchup, PostRebootCatchupError>
@@ -1275,6 +1859,7 @@ where
     C: statesync::SyncClient,
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
 {
+    let mut fold = fold;
     let mut current_height = recovered_height;
     let mut total_frames = 0usize;
     let mut target = None;
@@ -1328,10 +1913,16 @@ where
                 )));
             }
         };
-        let applied =
-            apply_post_reboot_catchup_frames(recovery, host, current_height, tip.height, frames)
-                .await
-                .map_err(PostRebootCatchupError::Fatal)?;
+        let applied = apply_post_reboot_catchup_frames(
+            recovery,
+            host,
+            current_height,
+            tip.height,
+            frames,
+            fold.as_deref_mut(),
+        )
+        .await
+        .map_err(PostRebootCatchupError::Fatal)?;
         if host.app_hash() != tip.app_hash {
             return Err(PostRebootCatchupError::Fatal(format!(
                 "catch-up frames landed at {}, target manifest {}",
@@ -1490,6 +2081,25 @@ fn resume_member_keys(
     Ok(keys)
 }
 
+/// the recovered epoch's OBSERVER keys — empty on a fresh boot (genesis has
+/// no observers) and on checkpoints written before the staged-admission tier.
+fn resume_observer_keys(
+    resumed: Option<&recovery::Recovered>,
+) -> Result<Vec<ed25519::PublicKey>, String> {
+    let raw: Vec<Vec<u8>> = match resumed {
+        Some(rec) => rec.observers.clone(),
+        None => Vec::new(),
+    };
+    let mut keys = Vec::with_capacity(raw.len());
+    for k in &raw {
+        keys.push(
+            ed25519::PublicKey::decode(k.as_slice())
+                .map_err(|e| format!("recovered observer set holds a non-ed25519 key: {e}"))?,
+        );
+    }
+    Ok(keys)
+}
+
 fn advance_next_seq_from_frames(next_seq: &mut u64, frames: &[Vec<u8>], me: &[u8]) {
     for frame in frames {
         if let Some((origin, seq)) = node::frame_origin_seq(frame) {
@@ -1560,8 +2170,37 @@ enum RpcRequest {
     Query { target: String, req_hex: String },
     /// node status: latest applied boundary + every module root.
     Status,
+    /// the verified join requests parked joiners announced to THIS member —
+    /// the queue the approve button (or `invite-accept`) settles.
+    JoinRequests,
     /// graceful stop: replies ok, then exits 0 after the current pump turn.
     Shutdown,
+}
+
+/// one verified, unapproved join announce (node-local, in-memory; the parked
+/// joiner re-announces every few seconds, so nothing here is durable state).
+struct JoinRequestRecord {
+    issuer: Vec<u8>,
+    first_seen_ms: u64,
+    last_seen_ms: u64,
+}
+
+/// the rpc/console projection of one [`JoinRequestRecord`].
+#[derive(serde::Serialize)]
+struct JoinRequestView {
+    /// the key asking to join, hex.
+    joiner: String,
+    /// the member whose invite token authorized the announce, hex.
+    issuer: String,
+    first_seen_ms: u64,
+    last_seen_ms: u64,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(serde::Serialize)]
@@ -1573,6 +2212,8 @@ struct RpcReply {
     reply_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<RpcStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    join_requests: Option<Vec<JoinRequestView>>,
 }
 
 #[derive(serde::Serialize)]
@@ -1589,6 +2230,7 @@ impl RpcReply {
             error: None,
             reply_hex: None,
             status: None,
+            join_requests: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -1597,6 +2239,7 @@ impl RpcReply {
             error: Some(msg.into()),
             reply_hex: None,
             status: None,
+            join_requests: None,
         }
     }
 }
@@ -1659,6 +2302,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
+        Some("promote") => return cmd_promote(&args[1..]),
+        Some("observer-remove") => return cmd_observer_remove(&args[1..]),
+        Some("join-requests") => return cmd_join_requests(&args[1..]),
         Some("member-remove") => return cmd_member_remove(&args[1..]),
         Some("member-leave") => return cmd_member_leave(&args[1..]),
         Some("member-status") => return cmd_member_status(&args[1..]),
@@ -1667,26 +2313,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
-    // the run path: `--config <path> [--sync-only]`.
+    // the run path: `--config <path> | -n/--network <chain id> [--sync-only]`.
     let mut cfg_path: Option<PathBuf> = None;
+    let mut network: Option<String> = None;
     let mut sync_only = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" => cfg_path = it.next().map(PathBuf::from),
+            "-n" | "--network" => network = it.next().cloned(),
             "--sync-only" => sync_only = true,
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|member-remove|member-leave|\
-                     member-status|join — or \
-                     --config <path> [--sync-only])"
+                     keygen|init|invite|admit|invite-accept|promote|observer-remove|\
+                     join-requests|member-remove|member-leave|member-status|join|\
+                     upgrade-status — or \
+                     --config <path> | -n/--network <chain id> [--sync-only])"
                 )
                 .into());
             }
         }
     }
-    let cfg_path = cfg_path.ok_or("missing --config <path>")?;
+    // `--network` addresses a workspace by its chain id through the registry;
+    // `--config` stays the explicit path. exactly one selects the node.
+    let cfg_path = match (network, cfg_path) {
+        (Some(needle), None) => config::find_workspace_config(&needle)?,
+        (None, Some(path)) => path,
+        (Some(_), Some(_)) => {
+            return Err("pass either --network <chain id> or --config <path>, not both".into());
+        }
+        (None, None) => {
+            return Err("missing --config <path> (or -n/--network <chain id>)".into());
+        }
+    };
 
     // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
     tracing_subscriber::fmt()
@@ -1701,7 +2361,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // onboarding verbs — keygen / init / invite / admit / join.
 // ============================================================================
 
-/// tiny flag parser: `--name value` pairs plus positionals; no deps.
+/// tiny flag parser: `--name value` pairs plus positionals; no deps. `-n` is
+/// the one short alias (for `--network`, the workspace selector every verb
+/// takes).
 fn parse_flags(
     args: &[String],
 ) -> Result<(Vec<String>, std::collections::BTreeMap<String, String>), String> {
@@ -1709,7 +2371,11 @@ fn parse_flags(
     let mut flags = std::collections::BTreeMap::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if let Some(name) = a.strip_prefix("--") {
+        let name = match a.as_str() {
+            "-n" => Some("network"),
+            other => other.strip_prefix("--"),
+        };
+        if let Some(name) = name {
             let v = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
             flags.insert(name.to_string(), v.clone());
         } else {
@@ -1717,6 +2383,22 @@ fn parse_flags(
         }
     }
     Ok((positional, flags))
+}
+
+/// the config a verb operates on: `-n`/`--network <chain id>` resolves through
+/// the workspace registry (`~/.ducktape/workspaces`), `--config <path>` is the
+/// explicit escape hatch, and the default is ./node.toml — the pre-registry
+/// behavior, unchanged.
+fn config_path(flags: &std::collections::BTreeMap<String, String>) -> Result<PathBuf, String> {
+    if let Some(needle) = flags.get("network") {
+        return config::find_workspace_config(needle);
+    }
+    Ok(PathBuf::from(
+        flags
+            .get("config")
+            .map(String::as_str)
+            .unwrap_or("node.toml"),
+    ))
 }
 
 /// `keygen [--out <path>]` — generate (or reuse) a persisted ed25519 identity.
@@ -1783,6 +2465,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         scheme: config::SCHEME_ED25519.into(),
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
+        reach: Vec::new(),
     };
     if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -1804,20 +2487,33 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `invite [--config node.toml]` — emit the one-line paste blob: the network
-/// descriptor with THIS member's dial hint folded in (and persisted, so every
-/// future invite carries it).
+/// `invite [--config node.toml] [--manual]` — emit the one-line paste blob:
+/// the network descriptor with THIS member's dial hint folded in (and
+/// persisted, so every future invite carries it), plus an INVITE TOKEN. the
+/// token lets the joiner's parked node deliver its pubkey over the lobby
+/// channel automatically — the join request then awaits member approval
+/// (`invite-accept`, or the app's approve button); a token never admits by
+/// itself. `--manual` omits the token: the joiner's pubkey travels out-of-band
+/// exactly as before. any current member may invite (the blob is a low-trust
+/// doorbell, gated by the descriptor's genesis fingerprint and the admission
+/// ballot — not a signed genesis-only credential).
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
+    // `--manual` is a bare boolean; strip it before the `--flag value` parser.
+    let mut manual = false;
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| {
+            let is_manual = a.as_str() == "--manual";
+            manual |= is_manual;
+            !is_manual
+        })
+        .cloned()
+        .collect();
+    let (pos, flags) = parse_flags(&args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
         .network
@@ -1828,8 +2524,15 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
     match config::dialable(raw.advertised.as_deref(), &raw.listen)? {
         Some(addr) => descriptor.add_bootstrap(&key.public_key(), &addr),
-        // an invite must carry SOME dialable member.
-        None if descriptor.bootstrap.is_empty() => {
+        // an invite must carry SOME dialable member. a member that joined via a
+        // v3 invite holds its dial hints as `reach` (bootstrap is empty), so
+        // check the union, not just bootstrap — else a reachable NAT'd member
+        // is wrongly refused.
+        None if descriptor
+            .reach_hints()
+            .map(|h| h.is_empty())
+            .unwrap_or(true) =>
+        {
             return Err(
                 "no dialable address: give node.toml a concrete `listen` port or an \
                         `advertised` addr so a joiner can reach the network"
@@ -1839,7 +2542,9 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     descriptor.save(&descriptor_path)?;
-    println!("{}", config::encode_invite(&descriptor)?);
+    let token = (!manual)
+        .then(|| config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes()));
+    println!("{}", config::encode_invite(&descriptor, token.as_ref())?);
     Ok(())
 }
 
@@ -1852,12 +2557,7 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("admit needs exactly one <hex pubkey>".into());
     };
     let key = config::decode_key(pubkey_hex)?;
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
         .network
@@ -1939,7 +2639,47 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
     match decode_reply(&raw)? {
         ValsetReply::Validators(v) => Ok(v),
+        other => Err(format!("expected Validators, got {other:?}")),
     }
+}
+
+fn read_observers(addr: &str) -> Result<Vec<Vec<u8>>, String> {
+    use valset_interface::{ValsetQuery, ValsetReply, decode_reply, encode_query};
+    let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Observers))?;
+    match decode_reply(&raw)? {
+        ValsetReply::Observers(v) => Ok(v),
+        other => Err(format!("expected Observers, got {other:?}")),
+    }
+}
+
+/// `join-requests [--config node.toml]` — the verified join announces parked
+/// joiners delivered to THIS member's running node, as one JSON array on
+/// stdout (machine-parseable — the app's members view renders it). approving
+/// is a separate, deliberate act: `invite-accept <joiner>` (or the app's
+/// approve button) casts this member's governance ballot, and a strict
+/// majority admits.
+fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let cfg_path = config_path(&flags)?;
+    let resolved = config::resolve(&cfg_path)?;
+    let addr = resolved
+        .rpc_listen
+        .ok_or("join-requests reads the node's local rpc — set `rpc_listen` in node.toml")?;
+    let reply = rpc_call(&addr, &serde_json::json!({ "cmd": "join_requests" }))?;
+    if reply["ok"] != true {
+        return Err(format!("join-requests: {}", reply["error"]).into());
+    }
+    println!(
+        "{}",
+        reply
+            .get("join_requests")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]))
+    );
+    Ok(())
 }
 
 /// `upgrade-status [--config node.toml]` — query the upgrade module Status over
@@ -1950,12 +2690,7 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
 fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use upgrade_interface::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
     let (_, flags) = parse_flags(args)?;
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let resolved = config::resolve(&cfg_path)?;
     let addr = resolved
         .rpc_listen
@@ -2038,15 +2773,138 @@ fn poll_proposal(
     }
 }
 
-/// `invite-accept <hex pubkey> [--config node.toml]` — post-genesis
-/// admission: drive a governance AddValidator proposal for `pubkey` through
-/// this member's own RUNNING node. idempotent across members — each runs the
-/// same command (propose if absent, cast a yes ballot, execute once
-/// decidable); the run that lands the deciding ballot executes. the passing
-/// proposal's valset Join schedules the epoch cutover that re-tracks the
-/// mesh, at which point the parked joiner syncs and promotes itself.
+/// how a driven membership ceremony left the proposal.
+enum CeremonyOutcome {
+    /// passed and executed — the set changes at the next epoch cutover.
+    Passed,
+    /// this ballot landed but a strict majority is still outstanding.
+    AwaitingBallots,
+}
+
+/// drive a strict-majority governance membership ceremony for `wanted`
+/// through this member's own running node: adopt an existing OPEN proposal
+/// for exactly this action (else mint an unused `<id_prefix><key>:<n>` id and
+/// propose), cast a yes ballot, and execute once decidable. idempotent across
+/// members — each runs the same verb; the run landing the deciding ballot
+/// executes. shared by `invite-accept` (AddObserver), `promote`
+/// (AddValidator), and `observer-remove` (RemoveObserver).
+fn drive_membership_ceremony(
+    rpc_addr: &str,
+    me_bytes: &[u8],
+    pubkey_hex: &str,
+    verb: &str,
+    id_prefix: &str,
+    wanted: governance_interface::GovAction,
+) -> Result<CeremonyOutcome, Box<dyn std::error::Error>> {
+    use governance_interface::{GovMsg, ProposalStatus, encode_msg};
+    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
+    let proposals = match decode_reply(&rpc_query(
+        rpc_addr,
+        "governance",
+        &encode_query(&GovQuery::Proposals),
+    )?)? {
+        GovReply::Proposals(views) => views,
+        other => return Err(format!("unexpected governance reply: {other:?}").into()),
+    };
+    let proposal_id = match proposals
+        .iter()
+        .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
+    {
+        Some(p) => {
+            eprintln!("joining open proposal {}", p.proposal_id);
+            p.proposal_id.clone()
+        }
+        None => {
+            let prefix: String = pubkey_hex.chars().take(16).collect();
+            let id = (0u64..)
+                .map(|n| format!("{id_prefix}{prefix}:{n}"))
+                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
+                .expect("the id space is unbounded");
+            rpc_submit(
+                rpc_addr,
+                "governance",
+                &encode_msg(&GovMsg::Propose {
+                    proposal_id: id.clone(),
+                    action: wanted,
+                    // a far horizon in consensus-time units (heights advance
+                    // about one per finalized op): admission must not expire
+                    // under a slow second ballot.
+                    voting_period: 1_000_000,
+                }),
+            )?;
+            poll_proposal(rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
+            eprintln!("proposed {id}");
+            id
+        }
+    };
+
+    rpc_submit(
+        rpc_addr,
+        "governance",
+        &encode_msg(&GovMsg::Vote {
+            proposal_id: proposal_id.clone(),
+            approve: true,
+        }),
+    )?;
+    let after_vote = poll_proposal(rpc_addr, &proposal_id, "this ballot to finalize", |p| {
+        p.as_ref().is_some_and(|v| {
+            v.status != ProposalStatus::Open
+                || v.votes
+                    .iter()
+                    .any(|(voter, yes)| voter == me_bytes && *yes)
+        })
+    })?
+    .expect("the poll only accepts a present proposal");
+    eprintln!("ballot cast as {}", hex_bytes(me_bytes));
+
+    // execute only when decidable — a strict-majority shortfall is the
+    // normal n>=2 intermediate state, not an error.
+    let members = read_members(rpc_addr)?;
+    let yes = members
+        .iter()
+        .filter(|m| {
+            after_vote
+                .votes
+                .iter()
+                .any(|(voter, approve)| voter == *m && *approve)
+        })
+        .count();
+    let majority = members.len() / 2 + 1;
+    if after_vote.status == ProposalStatus::Open && yes < majority {
+        eprintln!(
+            "{yes} of {majority} required ballots — waiting on other members. each runs:\n    \
+             ducktape-node {verb} {pubkey_hex} --config <their node.toml>"
+        );
+        return Ok(CeremonyOutcome::AwaitingBallots);
+    }
+    if after_vote.status == ProposalStatus::Open {
+        rpc_submit(
+            rpc_addr,
+            "governance",
+            &encode_msg(&GovMsg::Execute {
+                proposal_id: proposal_id.clone(),
+            }),
+        )?;
+    }
+    let settled = poll_proposal(rpc_addr, &proposal_id, "the tally to settle", |p| {
+        p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
+    })?
+    .expect("the poll only accepts a present proposal");
+    match settled.status {
+        ProposalStatus::Passed => Ok(CeremonyOutcome::Passed),
+        status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
+    }
+}
+
+/// `invite-accept <hex pubkey> [--config node.toml]` — approve a join request
+/// as OBSERVER standing (the staged-admission tier): drive a governance
+/// AddObserver proposal for `pubkey` through this member's own RUNNING node.
+/// the passing proposal's valset Grant schedules the epoch cutover that
+/// admits the key to the mesh, at which point its parked node PRE-SYNCS
+/// state on a stride cadence. promotion into the quorum is the separate,
+/// deliberate `promote` verb — run it once the observer is warm.
 fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use governance_interface::{GovAction, GovMsg, ProposalStatus, encode_msg};
+    use governance_interface::GovAction;
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
@@ -2054,12 +2912,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     };
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     // full config resolution (network- or dev-shape) so the verb derives the
     // SAME identity the running node signs with — the ballots this verb
     // casts are signed by the NODE (the ordered lane signs every rpc
@@ -2076,122 +2929,163 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
     }
+    if read_observers(&rpc_addr)?.contains(&key_bytes) {
+        eprintln!(
+            "{pubkey_hex} already holds observer standing — promote with \
+             `ducktape-node promote {pubkey_hex}` once it is synced"
+        );
+        return Ok(());
+    }
     if !members.contains(&me_bytes) {
         return Err(
             "this node's identity is not a current member — only members admit \
+                    observers"
+                .into(),
+        );
+    }
+
+    match drive_membership_ceremony(
+        &rpc_addr,
+        &me_bytes,
+        pubkey_hex,
+        "invite-accept",
+        "observe:",
+        GovAction::AddObserver { key: key_bytes },
+    )? {
+        CeremonyOutcome::Passed => {
+            eprintln!(
+                "granted observer standing to {pubkey_hex}: the mesh admits it at the next \
+                 epoch cutover and its parked node pre-syncs state. promote it into the \
+                 quorum once warm:\n    ducktape-node promote {pubkey_hex}"
+            );
+            Ok(())
+        }
+        CeremonyOutcome::AwaitingBallots => Ok(()),
+    }
+}
+
+/// `promote <hex pubkey> [--config node.toml]` — seat a key in the consensus
+/// quorum: drive a governance AddValidator proposal through this member's own
+/// RUNNING node. the passing proposal's valset Join clears any observer
+/// standing in the same block and schedules the epoch cutover; a pre-synced
+/// observer then catches up a small delta and reboots as a validator, so the
+/// quorum only ever gains a warm member. also serves DIRECT (un-staged)
+/// admission — exactly the pre-observer `invite-accept` semantics.
+fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use governance_interface::GovAction;
+
+    let (pos, flags) = parse_flags(args)?;
+    let [pubkey_hex] = pos.as_slice() else {
+        return Err("promote needs exactly one <hex pubkey>".into());
+    };
+    let key = config::decode_key(pubkey_hex)?;
+    let key_bytes = key.as_ref().to_vec();
+    let cfg_path = config_path(&flags)?;
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("promote drives the node's local rpc — set `rpc_listen` in node.toml")?;
+    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+
+    let members = read_members(&rpc_addr)?;
+    if members.contains(&key_bytes) {
+        eprintln!("{pubkey_hex} is already a validator — nothing to do");
+        return Ok(());
+    }
+    if !members.contains(&me_bytes) {
+        return Err(
+            "this node's identity is not a current member — only members promote \
                     validators"
                 .into(),
         );
     }
 
-    // adopt an existing OPEN proposal for exactly this action, else mint an
-    // unused id (settled proposals keep their ids forever — a re-admitted
-    // key gets a fresh suffix).
-    use governance_interface::{GovQuery, GovReply, decode_reply, encode_query};
-    let proposals = match decode_reply(&rpc_query(
+    match drive_membership_ceremony(
         &rpc_addr,
-        "governance",
-        &encode_query(&GovQuery::Proposals),
-    )?)? {
-        GovReply::Proposals(views) => views,
-        other => return Err(format!("unexpected governance reply: {other:?}").into()),
-    };
-    let wanted = GovAction::AddValidator {
-        key: key_bytes.clone(),
-    };
-    let proposal_id = match proposals
-        .iter()
-        .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
-    {
-        Some(p) => {
-            eprintln!("joining open proposal {}", p.proposal_id);
-            p.proposal_id.clone()
-        }
-        None => {
-            let prefix: String = pubkey_hex.chars().take(16).collect();
-            let id = (0u64..)
-                .map(|n| format!("admit:{prefix}:{n}"))
-                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
-                .expect("the id space is unbounded");
-            rpc_submit(
-                &rpc_addr,
-                "governance",
-                &encode_msg(&GovMsg::Propose {
-                    proposal_id: id.clone(),
-                    action: wanted,
-                    // a far horizon in consensus-time units (heights advance
-                    // about one per finalized op): admission must not expire
-                    // under a slow second ballot.
-                    voting_period: 1_000_000,
-                }),
-            )?;
-            poll_proposal(&rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
-            eprintln!("proposed {id}");
-            id
-        }
-    };
-
-    rpc_submit(
-        &rpc_addr,
-        "governance",
-        &encode_msg(&GovMsg::Vote {
-            proposal_id: proposal_id.clone(),
-            approve: true,
-        }),
-    )?;
-    let after_vote = poll_proposal(&rpc_addr, &proposal_id, "this ballot to finalize", |p| {
-        p.as_ref().is_some_and(|v| {
-            v.status != ProposalStatus::Open
-                || v.votes
-                    .iter()
-                    .any(|(voter, yes)| voter == &me_bytes && *yes)
-        })
-    })?
-    .expect("the poll only accepts a present proposal");
-    eprintln!("ballot cast as {}", hex_bytes(&me_bytes));
-
-    // execute only when decidable — a strict-majority shortfall is the
-    // normal n>=2 intermediate state, not an error.
-    let members = read_members(&rpc_addr)?;
-    let yes = members
-        .iter()
-        .filter(|m| {
-            after_vote
-                .votes
-                .iter()
-                .any(|(voter, approve)| voter == *m && *approve)
-        })
-        .count();
-    let majority = members.len() / 2 + 1;
-    if after_vote.status == ProposalStatus::Open && yes < majority {
-        eprintln!(
-            "{yes} of {majority} required ballots — waiting on other members. each runs:\n    \
-             ducktape-node invite-accept {pubkey_hex} --config <their node.toml>"
-        );
-        return Ok(());
-    }
-    if after_vote.status == ProposalStatus::Open {
-        rpc_submit(
-            &rpc_addr,
-            "governance",
-            &encode_msg(&GovMsg::Execute {
-                proposal_id: proposal_id.clone(),
-            }),
-        )?;
-    }
-    let settled = poll_proposal(&rpc_addr, &proposal_id, "the tally to settle", |p| {
-        p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
-    })?
-    .expect("the poll only accepts a present proposal");
-    match settled.status {
-        ProposalStatus::Passed => {
+        &me_bytes,
+        pubkey_hex,
+        "promote",
+        "admit:",
+        GovAction::AddValidator { key: key_bytes },
+    )? {
+        CeremonyOutcome::Passed => {
             eprintln!(
-                "admitted {pubkey_hex}: the validator set changes at the next epoch cutover, \
-                 and the joiner's parked node will sync and promote itself"
+                "admitted {pubkey_hex} as STANDBY: the joiner's parked node will verify a \
+                 state sync, announce itself online, and join the consensus quorum at the \
+                 activation cutover — no quorum slot is spent until the node is actually up"
             );
             Ok(())
         }
-        status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
+        CeremonyOutcome::AwaitingBallots => Ok(()),
+    }
+}
+
+/// `observer-remove <hex pubkey> [--config node.toml]` — revoke observer
+/// standing: drive a governance RemoveObserver proposal through this member's
+/// own RUNNING node. the mirror of `invite-accept` with inverted guards — a
+/// no-op when the key holds no observer standing, and only members may drive
+/// it. the passing proposal's valset Revoke schedules the epoch cutover that
+/// drops the key from the mesh; its node falls back to a parked joiner, and
+/// `invite-accept` re-grants. a seated validator is `member-remove`'s job —
+/// standing never overlaps (Grant refuses validators, Join clears standing).
+fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use governance_interface::GovAction;
+
+    let (pos, flags) = parse_flags(args)?;
+    let [pubkey_hex] = pos.as_slice() else {
+        return Err("observer-remove needs exactly one <hex pubkey>".into());
+    };
+    let key = config::decode_key(pubkey_hex)?;
+    let key_bytes = key.as_ref().to_vec();
+    let cfg_path = config_path(&flags)?;
+    // full config resolution so the verb derives the SAME identity the running
+    // node signs with — the ballots this verb casts are signed by the NODE, and
+    // that key must be a current member.
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("observer-remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
+    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+
+    let members = read_members(&rpc_addr)?;
+    if members.contains(&key_bytes) {
+        eprintln!(
+            "{pubkey_hex} is a seated validator, not an observer — remove it with \
+             `ducktape-node member-remove {pubkey_hex}`"
+        );
+        return Ok(());
+    }
+    if !read_observers(&rpc_addr)?.contains(&key_bytes) {
+        eprintln!("{pubkey_hex} holds no observer standing — nothing to do");
+        return Ok(());
+    }
+    if !members.contains(&me_bytes) {
+        return Err(
+            "this node's identity is not a current member — only members remove \
+                    observers"
+                .into(),
+        );
+    }
+
+    match drive_membership_ceremony(
+        &rpc_addr,
+        &me_bytes,
+        pubkey_hex,
+        "observer-remove",
+        "revoke:",
+        GovAction::RemoveObserver { key: key_bytes },
+    )? {
+        CeremonyOutcome::Passed => {
+            eprintln!(
+                "revoked observer standing from {pubkey_hex}: the mesh drops it at the next \
+                 epoch cutover and its node parks again. a member re-grants with:\n    \
+                 ducktape-node invite-accept {pubkey_hex}"
+            );
+            Ok(())
+        }
+        CeremonyOutcome::AwaitingBallots => Ok(()),
     }
 }
 
@@ -2214,12 +3108,7 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     };
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     // full config resolution so the verb derives the SAME identity the running
     // node signs with — the ballots this verb casts are signed by the NODE, and
     // that key must be a current member.
@@ -2345,9 +3234,7 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     .expect("the poll only accepts a present proposal");
     match settled.status {
         ProposalStatus::Passed => {
-            eprintln!(
-                "removed {pubkey_hex}: the validator set changes at the next epoch cutover"
-            );
+            eprintln!("removed {pubkey_hex}: the validator set changes at the next epoch cutover");
             Ok(())
         }
         status => Err(format!("proposal {proposal_id} settled as {status:?}").into()),
@@ -2372,12 +3259,7 @@ fn cmd_member_leave(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !pos.is_empty() {
         return Err(format!("member-leave takes no positional args (got {pos:?})").into());
     }
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     // resolve the running node's identity — the key it signs ballots with, and
     // the one this verb submits for removal.
     let resolved = config::resolve(&cfg_path)?;
@@ -2415,12 +3297,7 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     if !pos.is_empty() {
         return Err(format!("member-status takes no positional args (got {pos:?})").into());
     }
-    let cfg_path = PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    );
+    let cfg_path = config_path(&flags)?;
     let resolved = config::resolve(&cfg_path)?;
     let rpc_addr = resolved
         .rpc_listen
@@ -2442,7 +3319,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let [blob] = pos.as_slice() else {
         return Err("join needs exactly one <invite blob>".into());
     };
-    let descriptor = config::decode_invite(blob)?;
+    let (descriptor, token) = config::decode_invite(blob)?;
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
     config::guard_join_descriptor(&dir, &descriptor)?;
@@ -2463,6 +3340,11 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
     config::write_node_toml(&dir, &plumbing)?;
+    if let Some(token) = &token {
+        // the bearer credential the parked node announces with; a re-join
+        // with a fresh invite replaces a stale one.
+        config::save_invite_token(&dir, token)?;
+    }
     eprintln!(
         "{} identity {me_hex}",
         if generated { "generated" } else { "reusing" }
@@ -2475,6 +3357,15 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if descriptor.validators.contains(&me_hex) {
         eprintln!(
             "this identity is a member — start: ducktape-node --config {}/node.toml",
+            dir.display()
+        );
+    } else if token.is_some() {
+        eprintln!(
+            "NOT yet a member. start now — `ducktape-node --config {}/node.toml` parks on \
+             the mesh and DELIVERS this identity to the members automatically (the invite \
+             carries a token); a member then approves the join request (the app's approve \
+             button, or `ducktape-node invite-accept {me_hex}`), and this node promotes \
+             itself.",
             dir.display()
         );
     } else {
@@ -2492,6 +3383,351 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// the reachability plane's thread body: derive the plane's endpoints, bind
+/// the nat client against the coordinated-reach coordinators, and drive
+/// `reachability::run` with the configured WireGuard effect — real (an
+/// actual interface via the userspace WireGuard runtime) by default,
+/// in-memory fake when `wireguard_effect = "fake"` opts out. every failure
+/// path prints and returns — the plane is an overlay on a working node,
+/// never a reason to take the node down.
+#[allow(clippy::too_many_arguments)]
+/// Wire the staged WireGuard reachability plane onto an already-registered
+/// mesh channel: the orchestrator runs on its own plain-tokio OS thread (the
+/// app-surface split exactly), and two pump tasks bridge it — mesh datagrams
+/// in as `Deliver` commands, `Send` events out as mesh datagrams, everything
+/// else printed as operator-visible progress. Returns the plane's command
+/// sender. Shared by the validator path and the parked standby path (which
+/// pre-warms its tunnels ahead of activation); the callers differ only in
+/// where their `Retarget`/`ViewTick` commands come from.
+#[allow(clippy::too_many_arguments)]
+fn wire_reachability_plane<S, R>(
+    context: &commonware_runtime::tokio::Context,
+    label: &str,
+    chain_id: &str,
+    signer: &ed25519::PrivateKey,
+    wireguard_key_file: &std::path::Path,
+    mesh_state_file: &std::path::Path,
+    wireguard_listen: std::net::SocketAddr,
+    wireguard_effect: WireGuardEffectKind,
+    advertised: Ingress,
+    coordinators: Vec<Ingress>,
+    reach_p2p_tx: S,
+    mut reach_p2p_rx: R,
+) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey> + Send + Sync + 'static,
+    R: P2pReceiver<PublicKey = ed25519::PublicKey> + Send + 'static,
+{
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(256);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
+
+    let thread_label = label.to_string();
+    let reach_signer = signer.clone();
+    let plane_chain_id = chain_id.to_string();
+    let key_file = wireguard_key_file.to_path_buf();
+    let state_file = mesh_state_file.to_path_buf();
+    let nudge_tx = cmd_tx.clone();
+    std::thread::Builder::new()
+        .name("reachability".into())
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("reachability tokio runtime")
+                .block_on(reachability_plane(
+                    thread_label,
+                    plane_chain_id,
+                    reach_signer,
+                    key_file,
+                    state_file,
+                    wireguard_listen,
+                    wireguard_effect,
+                    advertised,
+                    coordinators,
+                    cmd_rx,
+                    nudge_tx,
+                    ev_tx,
+                ));
+        })
+        .expect("spawn reachability thread");
+
+    // pump in: mesh datagrams -> orchestrator commands.
+    {
+        let cmd = cmd_tx.clone();
+        context.child("reachability_in").spawn(move |_ctx| async move {
+            while let Ok((peer, msg)) = reach_p2p_rx.recv().await {
+                let bytes: Vec<u8> = msg.into();
+                let deliver = reachability::ReachabilityCommand::Deliver { from: peer, bytes };
+                if cmd.send(deliver).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // pump out: orchestrator sends -> mesh; everything else is
+    // operator-visible progress.
+    {
+        let pump_label = label.to_string();
+        let mut tx = reach_p2p_tx;
+        context.child("reachability_out").spawn(move |_ctx| async move {
+            while let Some(event) = ev_rx.recv().await {
+                match event {
+                    reachability::ReachabilityEvent::Send { to, bytes } => {
+                        let _ = tx.send(Recipients::One(to), IoBuf::from(bytes), false);
+                    }
+                    reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
+                        println!(
+                            "[node {pump_label}] reachability: epoch {epoch} mesh verified"
+                        )
+                    }
+                    reachability::ReachabilityEvent::TunnelsApplied {
+                        epoch,
+                        interface,
+                        peers,
+                    } => match wireguard_effect {
+                        WireGuardEffectKind::Real => println!(
+                            "[node {pump_label}] reachability: epoch {epoch} tunnels applied \
+                             on {interface} ({peers} peer(s))"
+                        ),
+                        WireGuardEffectKind::Fake => println!(
+                            "[node {pump_label}] reachability: epoch {epoch} tunnel config \
+                             staged on {interface} ({peers} peer(s); fake effect — no real \
+                             interface)"
+                        ),
+                    },
+                    reachability::ReachabilityEvent::StandbyTunnelsApplied {
+                        epoch,
+                        interface,
+                        peers,
+                    } => println!(
+                        "[node {pump_label}] reachability: epoch {epoch} standby pre-warm \
+                         tunnels on {interface} ({peers} peer(s))"
+                    ),
+                    reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
+                        println!(
+                            "[node {pump_label}] reachability: peer {}: {reason}",
+                            hex_bytes(&peer.as_ref()[..4])
+                        )
+                    }
+                    reachability::ReachabilityEvent::EpochFailed { epoch, reason } => println!(
+                        "[node {pump_label}] reachability: epoch {epoch} failed: {reason}"
+                    ),
+                    reachability::ReachabilityEvent::MeshRestored {
+                        epoch,
+                        interface,
+                        peers,
+                    } => println!(
+                        "[node {pump_label}] reachability: persisted mesh (epoch {epoch}) \
+                         restored on {interface} ({peers} peer(s)) — awaiting live assembly"
+                    ),
+                    reachability::ReachabilityEvent::RestoreFailed { reason } => {
+                        println!(
+                            "[node {pump_label}] reachability: persisted mesh not restored \
+                             ({reason}); continuing on live assembly only"
+                        )
+                    }
+                    reachability::ReachabilityEvent::PersistFailed { reason } => {
+                        println!(
+                            "[node {pump_label}] reachability: WARNING: mesh state not \
+                             persisted ({reason}) — a cold restart will not restore this epoch"
+                        )
+                    }
+                }
+            }
+        });
+    }
+    cmd_tx
+}
+
+async fn reachability_plane(
+    label: String,
+    chain_id: String,
+    signer: ed25519::PrivateKey,
+    wireguard_key_file: PathBuf,
+    // where the plane persists each applied epoch's verified mesh and
+    // re-applies it from at boot (the cold-restart path).
+    mesh_state_file: PathBuf,
+    wireguard_listen: std::net::SocketAddr,
+    effect_kind: WireGuardEffectKind,
+    advertised: Ingress,
+    coordinators: Vec<Ingress>,
+    commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
+    // a clone of the `commands` sender, for the plane's own nudge ticker.
+    nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
+    events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
+) {
+    use std::net::ToSocketAddrs as _;
+    let policy = reachability::open_port_policy();
+    // the plane's records carry IP literals only (the endpoint parser
+    // rejects DNS); a hostname ingress resolves ONCE at plane start.
+    let resolve_ingress = |ingress: &Ingress| match ingress {
+        Ingress::Socket(addr) => Some(*addr),
+        Ingress::Dns { host, port } => (host.as_str(), *port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next()),
+    };
+    let Some(control_addr) = resolve_ingress(&advertised) else {
+        eprintln!(
+            "[node {label}] reachability: advertised {advertised:?} did not resolve — plane \
+             not started"
+        );
+        return;
+    };
+    let control_endpoint = match wireguard_upgrade::Endpoint::new(
+        control_addr.ip(),
+        control_addr.port(),
+        wireguard_upgrade::Transport::Tcp,
+        &policy,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: advertised control endpoint rejected ({err:?}) — \
+                 set `advertised` to a dialable address; plane not started"
+            );
+            return;
+        }
+    };
+    let wireguard_endpoint = match wireguard_upgrade::Endpoint::new(
+        wireguard_listen.ip(),
+        wireguard_listen.port(),
+        wireguard_upgrade::Transport::Udp,
+        &policy,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: wireguard_listen rejected ({err:?}) — plane not \
+                 started"
+            );
+            return;
+        }
+    };
+    let mut coords: Vec<std::net::SocketAddr> = Vec::new();
+    for ingress in &coordinators {
+        match resolve_ingress(ingress) {
+            Some(addr) if !coords.contains(&addr) => coords.push(addr),
+            Some(_) => {}
+            None => eprintln!(
+                "[node {label}] reachability: coordinator {ingress:?} did not resolve — skipped"
+            ),
+        }
+    }
+    let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
+    let resolver = match reachability::NatResolver::bind(me, coords.clone()).await {
+        Ok(resolver) => resolver,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: nat client bind failed: {err} — plane not started"
+            );
+            return;
+        }
+    };
+    if let Some(reflexive) = resolver.reflexive() {
+        println!("[node {label}] reachability: coordinator-observed reflexive {reflexive}");
+    }
+    // a parked standby's gossip arrives under the network's derived lobby
+    // identity (its own key is untracked until the grant cutover) — admit
+    // that ingress; content signatures still authenticate every message.
+    // the namespace is a TOML-sourced string, so `as_bytes` reproduces the
+    // exact bytes the transport derived the lobby key from.
+    let gossip_ingress = Some(config::lobby_identity(chain_id.as_bytes()).public_key());
+    let config = reachability::ReachabilityConfig {
+        chain_id,
+        signer,
+        wireguard_key_file,
+        wireguard_listen: wireguard_endpoint,
+        control_endpoint,
+        coordinators: coords,
+        port_policy: policy,
+        persist_file: Some(mesh_state_file),
+        gossip_ingress,
+    };
+    // the boot `Retarget`'s record fan-out fires before the p2p actors have
+    // a single live connection, and mesh sends are best-effort — when both
+    // sides of a link lose that first datagram the plane deadlocks in record
+    // gossip. the nudge re-offers un-acked gossip until the epoch assembles
+    // (a no-op afterwards). the ticker holds only a WEAK sender: the plane's
+    // exit is "every command sender dropped", and a strong clone here would
+    // keep its own channel alive forever.
+    let nudges = {
+        let weak = nudges.downgrade();
+        // the strong param must die NOW — holding it for the plane's
+        // lifetime would itself keep the channel open.
+        drop(nudges);
+        weak
+    };
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(NUDGE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(tx) = nudges.upgrade() else { break };
+            if tx
+                .send(reachability::ReachabilityCommand::Nudge)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    match effect_kind {
+        WireGuardEffectKind::Fake => {
+            println!(
+                "[node {label}] reachability: wireguard_effect = \"fake\" — tunnel configs are \
+                 recorded in memory; no real interface is touched"
+            );
+            if let Err(err) = reachability::run(
+                config,
+                wireguard_effect::FakeWireGuardEffect::default(),
+                resolver,
+                commands,
+                events,
+            )
+            .await
+            {
+                eprintln!("[node {label}] reachability plane exited: {err}");
+            }
+        }
+        WireGuardEffectKind::Real => {
+            #[cfg(unix)]
+            {
+                // same name the orchestrator writes into every
+                // InterfaceConfiguration it applies — the WGApi handle and
+                // the configs it receives must agree on the interface.
+                let ifname = reachability::interface_name(&config.chain_id);
+                let effect = match wireguard_effect::DefguardWireGuardEffect::new(&ifname) {
+                    Ok(effect) => effect,
+                    Err(err) => {
+                        eprintln!(
+                            "[node {label}] reachability: wireguard api handle for {ifname:?} \
+                             failed ({err}) — plane not started; set wireguard_effect = \
+                             \"fake\" to run without a real interface"
+                        );
+                        return;
+                    }
+                };
+                println!("[node {label}] reachability: driving wireguard interface {ifname}");
+                if let Err(err) =
+                    reachability::run(config, effect, resolver, commands, events).await
+                {
+                    eprintln!("[node {label}] reachability plane exited: {err}");
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!(
+                    "[node {label}] reachability: the real wireguard effect needs a unix host — \
+                     plane not started; set wireguard_effect = \"fake\" to run without a real \
+                     interface"
+                );
+            }
+        }
+    }
+}
+
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
 /// or until state sync completes (`--sync-only`).
 ///
@@ -2507,13 +3743,20 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         mesh: peers,
         validators,
         bootstrappers,
+        coordinated,
         listen,
         advertised,
         storage_dir: storage,
         rpc_listen,
         http_listen,
+        wireguard_listen,
+        wireguard_effect,
+        wireguard_key_file,
         dev_demo,
         checkpoint_blocks,
+        invite_token,
+        sync_index,
+        announce_capabilities,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -2532,19 +3775,75 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         .unwrap_or(false);
     let joiner = !sync_only && !validators.contains(&signer.public_key()) && !promoted;
     if joiner {
-        println!(
-            "[node {label}] identity {} is not in the genesis validator set — joiner mode: \
-             parking on the mesh until a member runs `ducktape-node invite-accept {}`",
-            hex_bytes(signer.public_key().as_ref()),
-            hex_bytes(signer.public_key().as_ref())
-        );
+        if invite_token.is_some() {
+            println!(
+                "[node {label}] identity {} is not in the genesis validator set — joiner \
+                 mode: parking on the mesh and announcing this key with the invite token; \
+                 a member approves the join request (the app, or `ducktape-node \
+                 invite-accept {}`)",
+                hex_bytes(signer.public_key().as_ref()),
+                hex_bytes(signer.public_key().as_ref())
+            );
+        } else {
+            println!(
+                "[node {label}] identity {} is not in the genesis validator set — joiner \
+                 mode: parking on the mesh until a member runs `ducktape-node \
+                 invite-accept {}`",
+                hex_bytes(signer.public_key().as_ref()),
+                hex_bytes(signer.public_key().as_ref())
+            );
+        }
     }
 
     // keep the raw (key, addr) pairs for statesync source selection before
     // discovery's bootstrapper list converts to its own ingress address type.
     let sync_candidates = bootstrappers.clone();
+    // cold-restart dial seeding: the persisted mesh's control endpoints (the
+    // chain-derived ULAs for overlay-advertised members) join the dial
+    // hints, so a member restarting with every configured ingress gone
+    // still dials its peers over the tunnels the reachability plane
+    // re-applies at boot. Config hints win: a peer that already has a
+    // configured entry gets no seed, in case discovery keeps one ingress
+    // per key — a possibly-dead persisted address must never displace a
+    // live operator-provided one. Load refusals (tamper, format, chain) are
+    // the plane's to surface at its restore; here they just mean no seeds.
+    let chain_id = String::from_utf8_lossy(&namespace).to_string();
+    let mesh_state_file = storage.join("mesh-state.json");
+    let mesh_dial_seeds: Vec<(ed25519::PublicKey, Ingress)> =
+        match reachability::store::load(&mesh_state_file, &chain_id) {
+            Ok(Some(mesh)) => {
+                let me = reachability::identity_of(&signer.public_key());
+                let seeds: Vec<(ed25519::PublicKey, Ingress)> = mesh
+                    .adverts
+                    .iter()
+                    .map(|advert| &advert.record)
+                    .filter(|record| record.validator_identity != me)
+                    .filter_map(|record| {
+                        let pk = ed25519::PublicKey::decode(&record.validator_identity.0[..])
+                            .ok()?;
+                        if bootstrappers.iter().any(|(hinted, _)| *hinted == pk) {
+                            return None;
+                        }
+                        Some((
+                            pk,
+                            Ingress::Socket(record.control_endpoint.socket_addr()),
+                        ))
+                    })
+                    .collect();
+                if !seeds.is_empty() {
+                    println!(
+                        "[node {label}] {} mesh dial seed(s) from the persisted mesh (epoch {})",
+                        seeds.len(),
+                        mesh.epoch
+                    );
+                }
+                seeds
+            }
+            _ => Vec::new(),
+        };
     let bootstrappers: Vec<(ed25519::PublicKey, _)> = bootstrappers
         .into_iter()
+        .chain(mesh_dial_seeds)
         .map(|(k, a)| (k, a.into()))
         .collect();
 
@@ -2562,11 +3861,63 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         String::from_utf8_lossy(&namespace),
         storage.display()
     );
+    // coordinated reach targets are split OUT of the TCP mesh dialer (a
+    // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
+    // there was a silent no-op). reaching them is the reachability plane's
+    // job: gossip relays through whatever mesh links exist, the nat client
+    // hole-punches/relays the WireGuard path through the coordinator, and
+    // once tunnels apply the mesh dials the target's advertised overlay
+    // address over the tunnel (the target sets `advertised = "overlay"`).
+    // what still needs a TCP foothold is the gossip itself: with ZERO
+    // bootstrap links nothing carries this node's records anywhere. a
+    // RESTART has one without config: the persisted mesh re-applies at boot
+    // and its ULA seeds joined `bootstrappers` above. what remains uncovered
+    // is the FIRST join (nothing persisted yet) on a coordinated-only
+    // config — surface that loudly rather than park silently.
+    if !coordinated.is_empty() {
+        if bootstrappers.is_empty() {
+            println!(
+                "[node {label}] WARNING: {} coordinated reach target(s) but NO direct/fronted \
+                 bootstrap link and no persisted mesh — tunnel bring-up gossip has no path to \
+                 ride, so these peers stay unreachable. add at least one direct/fronted hint \
+                 (an ephemeral ingress is enough) for the join window; after the first \
+                 converged mesh, restarts ride the persisted state.",
+                coordinated.len()
+            );
+        } else {
+            println!(
+                "[node {label}] {} coordinated reach target(s): mesh traffic flows over the \
+                 WireGuard tunnel once the reachability plane converges.",
+                coordinated.len()
+            );
+        }
+        for (target, coord, _coord_key) in &coordinated {
+            println!(
+                "[node {label}]   coordinated target {} via coordinator {coord:?}",
+                hex_bytes(&target.as_ref()[..4])
+            );
+        }
+    }
+    if let Some(wg) = &wireguard_listen {
+        match wireguard_effect {
+            WireGuardEffectKind::Real => println!(
+                "[node {label}] reachability plane: advertising WireGuard endpoint udp/{wg}"
+            ),
+            WireGuardEffectKind::Fake => println!(
+                "[node {label}] reachability plane: advertising WireGuard endpoint udp/{wg}; \
+                 records, advertisements, and tunnel handshakes run for real, the interface \
+                 effect is the in-memory fake (no real tunnel)."
+            ),
+        }
+    }
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
-    // so a bind failure is a clean startup error, not an async surprise.
+    // so a bind failure is a clean startup error, not an async surprise. a
+    // JOINER binds too: the park loop pumps the same surface — an observer
+    // serves local reads from its pre-synced boundary, a still-parked joiner
+    // answers with a clear not-admitted error instead of a dead port.
     let rpc_listener = match rpc_listen.as_deref() {
-        Some(addr) if !sync_only && !joiner => Some(std::net::TcpListener::bind(addr)?),
+        Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
         _ => None,
     };
 
@@ -2575,13 +3926,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    // the derived per-module index (noded's exact store, <storage>/index),
+    // plus the blocks database the explorer reads: the pump folds sealed
+    // blocks into it, boot heals it from verified state at sync/recovery
+    // boundaries, an observer's follow arm heals it at every state-changing
+    // boundary it serves, and the already-routed GET /v1/blocks +
+    // /v1/index/* lanes light up through the handle below. an open failure
+    // is fatal-with-remedy rather than a silent no-index run: the tier is
+    // rebuildable, so the fix is always "delete <storage>/index".
+    let index = noded::open_index_store(&storage, &MODULE_IDS)?;
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
-    let http_handle = http_handle.with_forge_repo(storage.join("forge-repo"));
+    let http_handle = http_handle
+        .with_forge_repo(storage.join("forge-repo"))
+        .with_index_store(index.clone());
     let blobs = http_handle.blob_handle();
+    // (like the rpc surface above, a joiner binds and the park loop pumps —
+    // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
-        Some(addr) if !sync_only && !joiner => {
+        Some(addr) if !sync_only => {
             let listener = std::net::TcpListener::bind(addr)?;
             listener.set_nonblocking(true)?;
             println!(
@@ -2644,8 +4008,31 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // switching to a preset with allow_private_ips:false would reject the
         // forwarded connection from a private source IP — use a public-IP sentry
         // or a reverse tunnel then.
+        //
+        // TRANSPORT IDENTITY: a parked joiner's own key is usually untracked
+        // on every member (that is what admission changes), so it would be
+        // bounced at the handshake and could neither announce itself nor poll
+        // the statesync manifest. such a joiner connects AS the network's
+        // derived LOBBY identity — the one key every member tracks that any
+        // invite holder can derive. its REAL key still signs everything that
+        // matters (the join proof, and consensus after the promotion reboot).
+        // the door only exists where the mesh tracks it: the network shape
+        // folds the lobby key into every member's mesh, so `peers` carries it
+        // here too (both sides derive the same mesh). a mesh WITHOUT a lobby
+        // key (the dev-seed shape) keeps the old behavior — the joiner parks
+        // under its real identity, refused until the cutover re-tracks it.
+        let lobby = config::lobby_identity(&namespace);
+        let p2p_signer = if joiner && peers.contains(&lobby.public_key()) {
+            lobby
+        } else {
+            signer.clone()
+        };
+        // the staged reachability plane derives its advertised control
+        // endpoint from the mesh `advertised`; keep a copy — discovery's
+        // config consumes the original.
+        let advertised_reach = advertised.clone();
         let p2p_cfg = discovery::Config::local(
-            signer.clone(),
+            p2p_signer,
             &namespace,
             listen,
             advertised,
@@ -2684,6 +4071,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            // the lobby lane: a sync-only observer never announces or answers,
+            // but an unregistered channel is a protocol violation — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+                context.child("blackhole_lobby").spawn(move |_ctx| async move {
+                    while rx.recv().await.is_ok() {}
+                });
+            }
+            // the reachability lane: a sync-only observer runs no WireGuard
+            // plane, but the channel must exist — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_reachability")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
             network.start();
 
             let Some(server_peer) = sync_source else {
@@ -2800,6 +4203,63 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            // the reachability lane: a parked joiner with a WireGuard config
+            // runs the plane in its STANDBY role — once observer standing
+            // lands (the park loop below drives Retargets off the manifest),
+            // it pre-warms tunnels with every member so activation, and the
+            // promotion reboot via the persisted mesh, start connected
+            // instead of assembling. Without `wireguard_listen` the channel
+            // just stays legal — black-hole.
+            let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
+                let (reach_tx, mut reach_rx) =
+                    network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+                match wireguard_listen {
+                    Some(wg_addr) => {
+                        let coordinators: Vec<Ingress> =
+                            coordinated.iter().map(|(_, c, _)| c.clone()).collect();
+                        Some(wire_reachability_plane(
+                            &context,
+                            &label,
+                            &chain_id,
+                            &signer,
+                            &wireguard_key_file,
+                            &mesh_state_file,
+                            wg_addr,
+                            wireguard_effect,
+                            advertised_reach,
+                            coordinators,
+                            reach_tx,
+                            reach_rx,
+                        ))
+                    }
+                    None => {
+                        context
+                            .child("blackhole_reachability")
+                            .spawn(move |_ctx| async move { while reach_rx.recv().await.is_ok() {} });
+                        drop(reach_tx);
+                        None
+                    }
+                }
+            };
+            // the lobby lane: where this parked node announces its key. member
+            // replies are drained by a printer task — purely informational.
+            let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+            {
+                let label = label.clone();
+                context.child("lobby_replies").spawn(move |_ctx| async move {
+                    while let Ok((peer, msg)) = lobby_rx.recv().await {
+                        let bytes: Vec<u8> = msg.into();
+                        match lobby::decode_msg(&bytes) {
+                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail }) => println!(
+                                "[node {label}] member {}: {}{detail}",
+                                hex_bytes(&peer.as_ref()[..4]),
+                                if recorded { "" } else { "join request refused — " },
+                            ),
+                            Ok(_) | Err(_) => {}
+                        }
+                    }
+                });
+            }
             network.start();
 
             let Some(server_peer) = sync_source else {
@@ -2812,14 +4272,92 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let client =
                 P2pSyncClient::new(context.child("sync_client"), sync_tx, sync_rx, server_peer);
 
+            // the announce, built once: this key + the invite token + the
+            // proof-of-possession binding them. re-sent (round-robin over the
+            // known members) until the manifest shows this key admitted —
+            // members keep the request queue in memory, so a member restart
+            // just gets the next re-announce.
+            let announce_frame = invite_token
+                .as_ref()
+                .map(|t| IoBuf::from(lobby::encode_msg(&lobby::join_request(&signer, &namespace, t))));
+            let mut announce_targets: Vec<ed25519::PublicKey> = validators.clone();
+
             let me_bytes = signer.public_key().as_ref().to_vec();
             let mut last_tracked = PEER_SET;
+            // the epoch the reachability plane last retargeted to (standby
+            // role) — one Retarget per observed epoch.
+            let mut last_plane_epoch: Option<u64> = None;
             let mut attempt = 0usize;
+            let mut announce_round = 0usize;
+            // once observer standing is seen, parking is the STEADY state
+            // (awaiting a deliberate promote) — the not-admitted bail below
+            // must never fire.
+            let mut observer_standing = false;
+            let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
+                let Some(frame) = &announce_frame else { return };
+                if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
+                    return;
+                }
+                let target = targets[announce_round % targets.len()].clone();
+                announce_round += 1;
+                let attempted = lobby_tx.send(Recipients::One(target.clone()), frame.clone(), false);
+                if !attempted.is_empty() {
+                    println!(
+                        "[node {label}] join request sent to member {} — awaiting approval",
+                        hex_bytes(&target.as_ref()[..4])
+                    );
+                }
+            };
+
+            // ---- the OBSERVER's serving lanes ------------------------------
+            //
+            // the same two local surfaces a validator exposes, pumped by the
+            // park loop's serve window below: an observer answers reads from
+            // its last pre-synced boundary; a still-parked joiner answers
+            // with a clear not-admitted error instead of a dead port. writes
+            // are refused — ops enter the chain through validators only.
+            // promotion re-execs this process (`reboot_self`), which closes
+            // these listeners (CLOEXEC) and re-binds them on the validator
+            // path.
+            let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
+            if let Some(listener) = rpc_listener {
+                println!(
+                    "[node {label}] rpc listening on {}",
+                    listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                );
+                spawn_rpc_listener(listener, rpc_tx);
+            } else {
+                drop(rpc_tx); // rpc off: the ingress arm stays terminated.
+            }
+            let mut http_ingress = http_cmds;
+            // the last pre-synced boundary this observer serves reads from:
+            // (boundary height, the composed host). exactly ONE live host may
+            // exist — the sync path reopens the same on-disk partitions, so
+            // this is dropped before every re-sync.
+            let mut serving: Option<(u64, Host)> = None;
+            // the app-hash of the last boundary the derived tier followed:
+            // the index feed (heal + explorer row + ws event) fires only when
+            // the verified app-hash MOVED. an unchanged hash is an idle
+            // stride — state is byte-identical, the read models are already
+            // exact, and the explorer stays as quiet as the validator's nop
+            // gate keeps it. in-memory on purpose: after a restart the first
+            // boundary re-fires and every write below is idempotent.
+            let mut last_indexed_root: Option<StateRoot> = None;
+            let not_serving = |standing: bool| -> String {
+                if standing {
+                    "observer: no boundary pre-synced yet — retry shortly".into()
+                } else {
+                    "parked: not admitted yet — no state to serve (a member must run \
+                     `invite-accept` for this key)"
+                        .into()
+                }
+            };
             let (boundary, host, floor) = loop {
                 attempt += 1;
-                if attempt > 900 {
+                if attempt > 900 && !observer_standing {
                     // ~30 minutes of 2s retries: parking forever is operator
-                    // guidance territory, not a silent spin.
+                    // guidance territory, not a silent spin. (an OBSERVER
+                    // parks indefinitely by design — that bail is gated off.)
                     eprintln!(
                         "[node {label}] FATAL: still not admitted after {attempt} attempts — \
                          has a member run `ducktape-node invite-accept {}`?",
@@ -2827,7 +4365,134 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                context.sleep(Duration::from_secs(2)).await;
+                // the serve window: between manifest polls, pump the local
+                // read surfaces from the last pre-synced boundary. the tick
+                // both paces the polls and bounds a not-yet-serving joiner's
+                // wait. (a sync in flight below queues jobs here — bounded by
+                // the rpc bridge's buffer and the listener's reply timeout —
+                // so every answer reflects a whole boundary, never a torn one.)
+                {
+                    let tick = context.sleep(Duration::from_secs(2)).fuse();
+                    futures::pin_mut!(tick);
+                    loop {
+                        futures::select_biased! {
+                            job = rpc_ingress.next() => {
+                                let Some((req, reply)) = job else { continue };
+                                let resp = match req {
+                                    RpcRequest::Submit { .. } => RpcReply::err(
+                                        "this node is not a validator: observer standing \
+                                         serves reads only — submit ops via a validator",
+                                    ),
+                                    RpcRequest::Query { target, req_hex } => match &serving {
+                                        Some((_, host)) => match unhex(&req_hex) {
+                                            Ok(req_bytes) => {
+                                                match host.query(&target, &req_bytes).await {
+                                                    Ok(bytes) => RpcReply {
+                                                        reply_hex: Some(hex_bytes(&bytes)),
+                                                        ..RpcReply::ok()
+                                                    },
+                                                    Err(e) => RpcReply::err(format!(
+                                                        "query failed: {e}"
+                                                    )),
+                                                }
+                                            }
+                                            Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
+                                        },
+                                        None => RpcReply::err(not_serving(observer_standing)),
+                                    },
+                                    RpcRequest::Status => match &serving {
+                                        Some((height, host)) => {
+                                            let mut modules = std::collections::BTreeMap::new();
+                                            for m in MODULE_IDS {
+                                                if let Some(root) = host.module_root(m) {
+                                                    modules.insert(m.to_string(), hex(&root));
+                                                }
+                                            }
+                                            RpcReply {
+                                                status: Some(RpcStatus {
+                                                    height: Some(*height),
+                                                    app_hash: hex(&host.app_hash()),
+                                                    modules,
+                                                }),
+                                                ..RpcReply::ok()
+                                            }
+                                        }
+                                        None => RpcReply::err(not_serving(observer_standing)),
+                                    },
+                                    RpcRequest::JoinRequests => RpcReply::err(
+                                        "this node is not a member — join requests queue on \
+                                         validators",
+                                    ),
+                                    RpcRequest::Shutdown => {
+                                        // an observer writes no checkpoint — nothing to
+                                        // flush; a restart parks straight back here.
+                                        let _ = reply.send(RpcReply::ok());
+                                        println!(
+                                            "[node {label}] shutdown requested via rpc — exiting"
+                                        );
+                                        std::process::exit(0);
+                                    }
+                                };
+                                let _ = reply.send(resp);
+                            }
+                            cmd = http_ingress.next() => {
+                                let Some(cmd) = cmd else { continue };
+                                match cmd {
+                                    noded::NodeCommand::Submit { reply, .. } => {
+                                        let _ = reply.send(Err(
+                                            "this node is not a validator: observer standing \
+                                             serves reads only — submit ops via a validator"
+                                                .into(),
+                                        ));
+                                    }
+                                    noded::NodeCommand::Query { target, req, reply } => {
+                                        let result = match &serving {
+                                            Some((_, host)) => host
+                                                .query(&target, &req)
+                                                .await
+                                                .map_err(|e| e.to_string()),
+                                            None => Err(not_serving(observer_standing)),
+                                        };
+                                        let _ = reply.send(result);
+                                    }
+                                    noded::NodeCommand::Status { reply } => {
+                                        // pre-first-sync the surface still answers (the
+                                        // app's liveness heartbeat): a zeroed status is
+                                        // honest — no boundary is served yet.
+                                        let (height, app_hash, modules) = match &serving {
+                                            Some((height, host)) => (
+                                                *height,
+                                                hex(&host.app_hash()),
+                                                MODULE_IDS
+                                                    .iter()
+                                                    .map(|m| noded::ModuleStatus {
+                                                        id: (*m).into(),
+                                                        root: host
+                                                            .module_root(m)
+                                                            .map(|r| hex(&r))
+                                                            .unwrap_or_default(),
+                                                        category: noded::ModuleCategory::of(m),
+                                                    })
+                                                    .collect(),
+                                            ),
+                                            None => (0, String::new(), Vec::new()),
+                                        };
+                                        let _ = reply.send(noded::NodeStatus {
+                                            version: env!("CARGO_PKG_VERSION").into(),
+                                            app_hash,
+                                            height,
+                                            modules,
+                                        });
+                                    }
+                                    noded::NodeCommand::Metrics { reply } => {
+                                        let _ = reply.send(context.encode());
+                                    }
+                                }
+                            }
+                            _ = tick => break,
+                        }
+                    }
+                }
                 let m = match fetch_manifest(&client).await {
                     Ok(m) => m,
                     Err(e) => {
@@ -2844,6 +4509,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                              unreachable) — a member must run `invite-accept` for this \
                              key; see the joiner-mode banner above. retrying ({e})"
                         );
+                        send_announce(&announce_targets, attempt);
                         continue;
                     }
                 };
@@ -2874,12 +4540,148 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     last_tracked = m.epoch;
                 }
+                // drive the reachability plane's standby role off the
+                // manifest: membership and observer standing come from the
+                // synced boundary, whose height doubles as the plane's
+                // freshness clock (the same app-height regime the members'
+                // ViewTicks run — within the advert TTL's generous window).
+                // Nothing is sent before standing: no member would admit the
+                // gossip yet.
+                if let Some(cmd) = &reach_cmd {
+                    if m.observers.iter().any(|k| k == &me_bytes) {
+                        let clock = m.view_base.max(m.height);
+                        let _ = cmd
+                            .send(reachability::ReachabilityCommand::ViewTick(clock))
+                            .await;
+                        if last_plane_epoch != Some(m.epoch) {
+                            let members: Vec<ed25519::PublicKey> = m
+                                .participants
+                                .iter()
+                                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                                .collect();
+                            let standbys: Vec<ed25519::PublicKey> = m
+                                .observers
+                                .iter()
+                                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                                .collect();
+                            let _ = cmd
+                                .send(reachability::ReachabilityCommand::Retarget(
+                                    reachability::MeshEpochEvent {
+                                        epoch: m.epoch,
+                                        members,
+                                        standbys,
+                                        current_view: clock,
+                                    },
+                                ))
+                                .await;
+                            last_plane_epoch = Some(m.epoch);
+                        }
+                    }
+                }
                 if !m.participants.iter().any(|k| k == &me_bytes) {
+                    // the manifest names the CURRENT members — better announce
+                    // targets than the genesis descriptor's list.
+                    let current: Vec<ed25519::PublicKey> = m
+                        .participants
+                        .iter()
+                        .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                        .collect();
+                    if !current.is_empty() {
+                        announce_targets = current;
+                    }
+                    if m.observers.iter().any(|k| k == &me_bytes) {
+                        if !observer_standing {
+                            observer_standing = true;
+                            println!(
+                                "[node {label}] observer: standing granted — following \
+                                 boundaries and serving local reads"
+                            );
+                        }
+                        // OBSERVER standing (staged admission): granted, so
+                        // stop knocking — and FOLLOW: every boundary advance
+                        // re-syncs the warm substrates (the qmdb lanes fetch
+                        // deltas; snapshots re-install), then serves reads
+                        // from the fresh host through the serve window above.
+                        // no checkpoint manifest is written (a restart parks
+                        // again cleanly), and `promote` catches up only a
+                        // small delta.
+                        if serving.as_ref().map_or(true, |(h, _)| m.height > *h) {
+                            if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
+                                eprintln!(
+                                    "[node {label}] FATAL: cannot observe this network — {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                            println!(
+                                "[node {label}] observer: pre-syncing boundary {} ({} modules)",
+                                m.height,
+                                m.entries.len()
+                            );
+                            // drop the served host FIRST: the sync reopens the
+                            // same on-disk partitions, and exactly one live
+                            // handle may exist. reads queue in the serve window
+                            // until the fresh host lands.
+                            serving = None;
+                            match sync_all_modules(&context, &client, &m, &forge_repo, attempt)
+                                .await
+                            {
+                                Ok(host) => {
+                                    let root = host.app_hash();
+                                    println!(
+                                        "[node {label}] observer: pre-synced boundary {} app_hash={}",
+                                        m.height,
+                                        hex(&root)
+                                    );
+                                    // the DERIVED tier follows the boundary
+                                    // too: read models re-derive from the
+                                    // verified state (an observer folds no
+                                    // blocks, so every module's watermark
+                                    // trails), the explorer records the one
+                                    // thing an observer observes — the
+                                    // boundary — and ws subscribers learn
+                                    // the advance. index failures poison and
+                                    // log; canonical reads keep serving.
+                                    if last_indexed_root.as_ref() != Some(&root) {
+                                        heal_index(&index, &host, m.height, &label).await;
+                                        if let Err(err) = index.apply_block_record(
+                                            m.height,
+                                            boundary_block_row(m.height, &root),
+                                        ) {
+                                            eprintln!(
+                                                "[node {label}] observer: explorer row at \
+                                                 boundary {} refused: {err}",
+                                                m.height
+                                            );
+                                        }
+                                        let _ = http_events.send(noded::WsFrame::Block(
+                                            noded::BlockSummary {
+                                                height: m.height,
+                                                app_hash: hex(&root),
+                                            },
+                                        ));
+                                        println!(
+                                            "[node {label}] observer: derived index follows \
+                                             boundary {}",
+                                            m.height
+                                        );
+                                        last_indexed_root = Some(root);
+                                    }
+                                    serving = Some((m.height, host));
+                                }
+                                Err(e) => println!(
+                                    "[node {label}] observer pre-sync at boundary {} failed: {e}",
+                                    m.height
+                                ),
+                            }
+                        }
+                        continue;
+                    }
                     println!(
                         "[node {label}] parked: awaiting admission (epoch {} has {} validators)",
                         m.epoch,
                         m.participants.len()
                     );
+                    send_announce(&announce_targets, attempt);
                     continue;
                 }
                 // in the epoch set. a boundary PAST the epoch base needs its
@@ -2908,6 +4710,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     eprintln!("[node {label}] FATAL: cannot promote — {e}");
                     std::process::exit(1);
                 }
+                // a promoted observer stops serving: drop the served host
+                // before the promotion sync reopens the same partitions.
+                serving = None;
                 match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
                     Ok(host) => {
                         let latest = match fetch_manifest(&client).await {
@@ -2985,6 +4790,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             };
             println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
 
+            // the optional shipped-index warm start rides the same sync
+            // connection, staged BEFORE the promotion checkpoint lands: a
+            // crash mid-fetch reboots back into joiner mode and refetches,
+            // and a torn staging directory is discarded at adoption. the
+            // promoted reboot's IndexStore::open adopts what committed here.
+            if sync_index {
+                stage_shipped_index(&client, boundary.boundary_id(), &storage_for_sync, &label)
+                    .await;
+            }
+
             // fabricate the checkpoint a restart would have left; the normal
             // recovery boot turns it into a live validator. next_seq starts
             // at 1 — this identity never framed ops on this network. (a
@@ -3014,6 +4829,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 boundary.epoch,
                 boundary.view_base,
                 boundary.participants.clone(),
+                boundary.observers.clone(),
                 None,
                 cv,
                 pu,
@@ -3036,6 +4852,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     std::process::exit(1);
                 }
             }
+            // tear the pre-warm interface down cleanly before the exec: the
+            // in-process boringtun device dies with the process either way,
+            // but only an orderly Shutdown unlinks its UAPI socket path —
+            // a stale one would fail the rebooted validator's restore-time
+            // create. Bounded: the reboot must not hang on a wedged plane.
+            if let Some(cmd) = &reach_cmd {
+                let _ = cmd.send(reachability::ReachabilityCommand::Shutdown).await;
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !cmd.is_closed() && std::time::Instant::now() < deadline {
+                    context.sleep(Duration::from_millis(20)).await;
+                }
+            }
             println!(
                 "[node {label}] promoted: validator at epoch {} boundary {} — rebooting",
                 boundary.epoch, boundary.height
@@ -3043,6 +4871,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             reboot_self();
         }
         // (host, recovered-state, next local submit seq, last checkpoint
+        // ONE index fold for the whole boot (journal replay + post-reboot
+        // catch-up + post-sync refreshes): its stop flag must persist across
+        // phases — a later phase folding past a gap an earlier phase detected
+        // would advance watermarks over the hole and hide it from the final
+        // heal below.
+        let mut boot_fold = IndexFold::new(&index, blobs.clone());
         // (height, oplog position) for the pump's prune bookkeeping, and the
         // manifest that recovery used as its replay baseline).
         let (
@@ -3082,6 +4916,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         0,
                         0,
                         genesis_participants,
+                        Vec::new(),
                         None,
                         cv,
                         pu,
@@ -3123,7 +4958,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         std::process::exit(1);
                     }
                 };
-                let rec = match recovery.recover(&mut host, &manifest).await {
+                // heal the derived index against the CHECKPOINT boundary
+                // BEFORE replay: a wiped or trailing per-module database
+                // re-derives from the verified checkpoint state, so the
+                // journal-suffix fold lands contiguously on top instead of
+                // folding forward over a pre-checkpoint hole.
+                if let Some(ckpt_height) = manifest.height {
+                    heal_index(&index, &host, ckpt_height, &label).await;
+                }
+                let rec = match recovery
+                    .recover_with_sink(&mut host, &manifest, Some(&mut boot_fold))
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!(
@@ -3178,13 +5024,27 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         }
         let initial_resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
 
+        // the TRANSPORT baseline adds the committed OBSERVER set (granted,
+        // quorum-exempt keys the mesh must admit so they can sync). read
+        // LIVE from the recovered host, unlike the frozen participant set
+        // above: an observer grant arms its own cutover, so within any epoch
+        // the observer set is constant — except a reboot inside that cutover
+        // window, where this node briefly tracks the wider set alone; the
+        // boundary re-tracks identically a few views later.
+        let initial_observer_keys: Vec<ed25519::PublicKey> = read_valset_observers(&host)
+            .await
+            .iter()
+            .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
+            .collect();
+
         // the validator-owned transport mesh, tracked at index = epoch: the
-        // epoch's participants ∪ the descriptor mesh (genesis members + [dev]
-        // extras — kept authorized so demoted members and pre-genesis peers
-        // can still reach the statesync service). the SAME set on every node
-        // at this index: discovery kills peers whose bit-vector length
-        // disagrees at a shared index, and epoch participant sets are the
-        // only membership every node agrees on epoch-for-epoch.
+        // epoch's TRANSPORT members (participants ∪ standby registrants) ∪
+        // the descriptor mesh (genesis members + [dev] extras — kept
+        // authorized so demoted members and pre-genesis peers can still
+        // reach the statesync service). the SAME set on every node at this
+        // index: discovery kills peers whose bit-vector length disagrees at
+        // a shared index, and boundary-read membership is the only set every
+        // node agrees on epoch-for-epoch.
         let mesh_at = {
             let descriptor_mesh = peers.clone();
             move |epoch_members: &std::collections::BTreeSet<ed25519::PublicKey>| {
@@ -3198,7 +5058,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut mesh_oracle = oracle.clone();
         mesh_oracle.track(
             initial_resume_epoch,
-            mesh_at(&initial_member_keys.iter().cloned().collect()),
+            mesh_at(
+                &initial_member_keys
+                    .iter()
+                    .chain(initial_observer_keys.iter())
+                    .cloned()
+                    .collect(),
+            ),
         );
 
         // lanes for epochs BELOW the resume epoch are registered and
@@ -3238,6 +5104,65 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             })
             .collect();
         let (mut sync_tx, mut sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+        // the lobby lane: parked joiners announce their keys here (connected
+        // as the derived lobby identity); this member verifies each announce
+        // against the invite token it carries and RECORDS it for approval.
+        let (mut lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+
+        // the reachability lane + the staged WireGuard plane. the channel is
+        // registered unconditionally (an unregistered channel is a protocol
+        // violation that kills the sender's connection); the plane itself
+        // runs only when `wireguard_listen` is configured, on its OWN
+        // plain-tokio OS thread (the app-surface split exactly), talking to
+        // the mesh through the two pump tasks below.
+        let (reach_p2p_tx, mut reach_p2p_rx) =
+            network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> =
+            match wireguard_listen {
+                Some(wg_addr) => {
+                    // rendezvous coordinators = every coordinated-reach hint's
+                    // coordinator ingress; hostnames resolve once at plane start.
+                    let coordinators: Vec<Ingress> =
+                        coordinated.iter().map(|(_, c, _)| c.clone()).collect();
+                    Some(wire_reachability_plane(
+                        &context,
+                        &label,
+                        &chain_id,
+                        &signer,
+                        &wireguard_key_file,
+                        &mesh_state_file,
+                        wg_addr,
+                        wireguard_effect,
+                        advertised_reach,
+                        coordinators,
+                        reach_p2p_tx,
+                        reach_p2p_rx,
+                    ))
+                }
+                None => {
+                    context
+                        .child("blackhole_reachability")
+                        .spawn(move |_ctx| async move { while reach_p2p_rx.recv().await.is_ok() {} });
+                    drop(reach_p2p_tx);
+                    None
+                }
+            };
+        // boot: target the resume epoch's member set immediately (with the
+        // committed observer set as the pre-warm standbys); cutovers
+        // retarget from the orchestrator loop below. the recovered view base
+        // keeps advert expiries in the same view regime as live peers.
+        if let Some(cmd) = &reach_cmd {
+            let _ = cmd
+                .send(reachability::ReachabilityCommand::Retarget(
+                    reachability::MeshEpochEvent {
+                        epoch: initial_resume_epoch,
+                        members: initial_member_keys.clone(),
+                        standbys: initial_observer_keys.clone(),
+                        current_view: resumed.as_ref().map(|r| r.view_base).unwrap_or(0),
+                    },
+                ))
+                .await;
+        }
 
         // start the network actors (dialer/listener/router/tracker). registered
         // receivers buffer regardless, so starting before the engine is fine.
@@ -3261,6 +5186,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &client,
                     &mut recovery,
                     &mut host,
+                    Some(&mut boot_fold),
                     recovered_height,
                     POST_REBOOT_CATCHUP_MAX_ITERS,
                 )
@@ -3304,6 +5230,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
+                                &target.observers,
                             )
                             .await
                             {
@@ -3347,7 +5274,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         prev_ckpt = (ckpt.height, ckpt.oplog_pos);
-                        let refreshed = match recovery.recover(&mut host, &ckpt).await {
+                        let refreshed = match recovery
+                            .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
+                            .await
+                        {
                             Ok(rec) => rec,
                             Err(e) => {
                                 eprintln!(
@@ -3421,6 +5351,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
+                                &target.observers,
                             )
                             .await
                             {
@@ -3437,6 +5368,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             target.epoch,
                             target.view_base,
                             target.participants.clone(),
+                            target.observers.clone(),
                             None,
                             target.current_version,
                             target.pending_upgrade.clone(),
@@ -3471,7 +5403,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                         prev_ckpt = (ckpt.height, ckpt.oplog_pos);
-                        let refreshed = match recovery.recover(&mut host, &ckpt).await {
+                        let refreshed = match recovery
+                            .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
+                            .await
+                        {
                             Ok(rec) => rec,
                             Err(e) => {
                                 eprintln!(
@@ -3515,6 +5450,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     std::process::exit(1);
                 }
             }
+        }
+
+        // the FINAL index heal, at the boot tip every path converged on:
+        // whatever the replay/catch-up fold could not reproduce (opaque
+        // blocks, a state-sync jump, a stopped fold) re-derives here from
+        // state that has verified against the boundary app-hash.
+        drop(boot_fold);
+        if let Some(boot_height) = resumed.as_ref().and_then(|r| r.height) {
+            heal_index(&index, &host, boot_height, &label).await;
         }
 
         let member_keys = match resume_member_keys(resumed.as_ref(), &validators) {
@@ -3610,6 +5554,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             let _ = bridge_tx.try_send((peer, bytes));
                         }
                         Err(_) => return, // network shutdown — nothing to serve.
+                    }
+                }
+            }
+        });
+        // the lobby lane rides the same bridge pattern: announces are consumed
+        // by the pump between drains. drop-on-full is doubly safe here — a
+        // parked joiner re-announces every few seconds anyway.
+        let (lobby_bridge_tx, mut lobby_ingress) =
+            futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
+        context.child("lobby_ingress").spawn(move |_ctx| {
+            let mut receiver = lobby_rx;
+            let mut bridge_tx = lobby_bridge_tx;
+            async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok((peer, msg)) => {
+                            let bytes: Vec<u8> = msg.into();
+                            let _ = bridge_tx.try_send((peer, bytes));
+                        }
+                        Err(_) => return,
                     }
                 }
             }
@@ -3774,9 +5738,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // schedules deterministic epoch cutovers. it resumes at the recovered
         // epoch coordinates over the epoch's ENGINE PARTICIPANT SET, and
         // re-arms a cutover the pre-crash process had scheduled.
+        let observer_keys = match resume_observer_keys(resumed.as_ref()) {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("[node {label}] FATAL: {e}");
+                std::process::exit(1);
+            }
+        };
         let mut orchestrator = consensus::ValsetOrchestrator::resume(
             CUTOVER_DELAY,
             member_keys.clone(),
+            observer_keys.clone(),
             resume_epoch,
             view_base,
             pending_boot,
@@ -3863,20 +5835,43 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         > = std::collections::HashMap::new();
         let mut last_published: Option<u64> = None;
         let mut sync_server = SyncServer::new();
+        // verified-but-unapproved join requests, keyed by joiner key. NODE-
+        // LOCAL and in-memory by design: this is a doorbell, not state — the
+        // parked joiner re-announces every few seconds, so a restart loses
+        // nothing durable. read by the `join-requests` rpc; entries whose key
+        // has since become a member are dropped at read time.
+        let mut join_requests: std::collections::BTreeMap<Vec<u8>, JoinRequestRecord> =
+            std::collections::BTreeMap::new();
         // recovery cadence: sealed blocks since the last checkpoint manifest.
         let mut blocks_since_checkpoint: u64 = 0;
+        // the last absolute view ticked to the reachability plane — one
+        // ViewTick per actual advance, not one per 100ms drain pass.
+        let mut last_reach_view: Option<u64> = None;
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
+        // throttle for the saga crank pump below.
+        let mut last_crank = std::time::Instant::now();
+        // throttle for the dispatch delivery-nudge pump below.
+        let mut last_nudge = std::time::Instant::now();
         // the host-owned worker set (reactor seam): effects of finalized
         // blocks are offered here, and claimed follow-ups re-enter the ordered
         // lane as their own blocks.
-        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(LlmWorker::new(
-            blobs.clone(),
-            AuthStore::from_default_path(),
-            // the ChatGPT/Codex subscription endpoint rejects gpt-5.1 (400 "not
-            // supported when using Codex with a ChatGPT account") — default to a
-            // model the account can serve; per-agent model_ref overrides this.
-            "gpt-5.3-codex-spark".into(),
+        // load capability specs and discover this host's installed executor
+        // CLIs (BYO — no credential handling here). the discovered tag set is
+        // BOTH what the oracle worker can run and what this node announces to
+        // the capability registry, so an announce can never claim more than
+        // the host provides (`announce_capabilities = false` narrows the
+        // announced set to nothing — never the reverse). routing and
+        // default models live in the specs (docs/capability-spec.md); a broken
+        // operator spec is a boot error, not a silently dropped executor.
+        let providers = capability_host::discover()
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+        let my_capabilities = providers.capabilities();
+        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(DispatchWorker::new(
+            providers,
+            // this node's submit key: WorkerRequests leased to another
+            // node's key are skipped, not double-run.
+            signer.public_key().as_ref().to_vec(),
         ))];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
         // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
@@ -3884,6 +5879,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // one-shot effect). inert before the module is registered.
         let mut signaller =
             ReadinessSignaller::new(MAX_PROTOCOL_VERSION, signer.public_key().as_ref().to_vec());
+        // the capability self-announcer: publishes this node's discovered
+        // provider set into the capability registry once (state-driven,
+        // idempotent). inert when this host installed no executor CLIs.
+        let mut announcer =
+            CapabilityAnnouncer::new(signer.public_key().as_ref().to_vec(), my_capabilities);
         // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
         // modeled on the `converged` latch: `upgrade armed …` fires when readiness
         // first reaches R==n (every current boundary member signaled) for the
@@ -3945,6 +5945,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         orchestrator.epoch(),
                         orchestrator.epoch_base(),
                         participant_bytes(&orchestrator),
+                        observer_bytes(&orchestrator),
                         orchestrator.pending_cutover().map(|c| c.cutover_view()),
                         cv,
                         pu,
@@ -3957,6 +5958,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let _ = node.sink_mut().sync().await;
             }};
         }
+        // the drain deadline (see the drain arm): ABSOLUTE, so the
+        // per-iteration select rebuild cannot reset it under ingress load.
+        let mut next_drain = context.current() + DRAIN_TICK;
         loop {
             // resolve on whichever signal stream installed; if neither did,
             // this arm simply never fires (pending forever) and the loop runs
@@ -3987,6 +5991,742 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     graceful_checkpoint!();
                     std::process::exit(0);
+                }
+                // DRAIN CADENCE — an ABSOLUTE deadline, hoisted ABOVE the ingress
+                // arms. this select is rebuilt every loop iteration, so an
+                // arm-local `sleep(100ms)` restarts from zero whenever any other
+                // arm completes first — a saturating rpc-submit stream (requests
+                // landing well inside 100ms) then resets the timer forever and
+                // the drain NEVER runs: heights and status freeze, held submit
+                // replies starve, and the epoch cutover (`respawn_if_due` below
+                // is drain-driven) stalls for exactly as long as the flood lasts
+                // while the armed boundary's discard window swallows every
+                // accepted op. an absolute deadline survives the select rebuild,
+                // and sitting above the ingress arms makes `select_biased!` take
+                // it the moment it is due — load can delay one drain by one
+                // request's service time, never starve it.
+                _ = context.sleep_until(next_drain).fuse() => {
+                    next_drain = context.current() + DRAIN_TICK;
+                    // FAIL-STOP: a drain error is a node-local block-boundary
+                    // fault — this node's state is indeterminate relative to its
+                    // peers, so applying even one more finalized op could
+                    // silently fork it. exit loudly; an operator (or supervisor)
+                    // restarts the node, which then re-joins via state sync.
+                    applied += match node.drain_delivered().await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("[node {label}] FATAL: {e} — halting");
+                            std::process::exit(1);
+                        }
+                    };
+                    // resolve held app-surface submits against what this
+                    // drain finished with; every disposition is deterministic,
+                    // so the reply faithfully reports the op's consensus fate.
+                    let drained = node.take_drained();
+                    // sealed = journaled: applied and rejected frames both got
+                    // recovery seals; discarded frames were never journaled.
+                    blocks_since_checkpoint += drained
+                        .iter()
+                        .filter(|d| d.disposition != node::Disposition::Discarded)
+                        .count() as u64;
+                    // fold every SEALED frame into the derived per-module
+                    // index: an applied frame contributes its dispatch trace,
+                    // a rejected one folds EMPTY (it still consumed its
+                    // height, and every module's watermark must track the
+                    // sealed tip or restart staleness checks would rebuild
+                    // spuriously). discarded frames never sealed a height.
+                    // a frame the explorer shows — a decoded op that isn't
+                    // the heartbeat nop (the deliberately-empty block that
+                    // only ticks an idle chain) — additionally carries its
+                    // explorer row, so GET /v1/blocks survives restarts.
+                    // canonical state committed above, so an index failure
+                    // degrades read models only — the store poisons itself
+                    // and stays loud until rebuilt.
+                    for d in &drained {
+                        if d.disposition == node::Disposition::Discarded {
+                            continue;
+                        }
+                        let dispatches: &[host::DispatchRecord] = match (&d.disposition, &d.op) {
+                            (node::Disposition::Applied, Some(op)) => &op.dispatches,
+                            _ => &[],
+                        };
+                        let record = match &d.op {
+                            Some(op) if op.target != NOP_TARGET => {
+                                let disposition = match d.disposition {
+                                    node::Disposition::Applied => noded::BlockDisposition::Applied,
+                                    node::Disposition::Rejected => noded::BlockDisposition::Rejected,
+                                    // unreachable — filtered at the loop top —
+                                    // but stay total on this observability
+                                    // lane rather than panic.
+                                    node::Disposition::Discarded => continue,
+                                };
+                                Some(explorer_block_row(
+                                    &blobs,
+                                    d.height,
+                                    &d.id,
+                                    &d.app_hash,
+                                    &op.origin,
+                                    &op.target,
+                                    &op.payload,
+                                    // == op.dispatches: a rejected frame's
+                                    // trace is empty on both bindings.
+                                    dispatches,
+                                    disposition,
+                                ))
+                            }
+                            _ => None,
+                        };
+                        let ops = indexer::BlockOps {
+                            record,
+                            // this lane's agreed clock IS the height: the
+                            // drain stamps BlockContext { consensus_time:
+                            // height } for every frame.
+                            ..noded::index_block_ops(d.height, d.height, dispatches)
+                        };
+                        if let Err(err) = index.apply_block(&ops) {
+                            eprintln!(
+                                "[node {label}] module index apply failed at height {}: {err} \
+                                 — wipe <storage>/index to rebuild",
+                                d.height
+                            );
+                        }
+                    }
+                    for d in drained {
+                        // a DISCARD is not this hold's outcome: the cutover
+                        // carries the frame into the new epoch under the SAME
+                        // FrameId, so the hold stays open until the carried
+                        // frame finalizes there (or SUBMIT_HOLD expires into
+                        // the truthful re-query reply).
+                        if d.disposition == node::Disposition::Discarded {
+                            continue;
+                        }
+                        let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
+                        let _ = reply.send(match d.disposition {
+                            node::Disposition::Applied => Ok(noded::BlockSummary {
+                                height: d.height,
+                                // the PER-BLOCK boundary this frame settled at
+                                // (not the end-of-drain hash — a drain can
+                                // apply several blocks).
+                                app_hash: hex(&d.app_hash),
+                            }),
+                            node::Disposition::Rejected => {
+                                Err("op finalized but rejected (deterministic no-op)".into())
+                            }
+                            // unreachable — filtered at the loop top — but
+                            // stay total rather than panic.
+                            node::Disposition::Discarded => continue,
+                        });
+                    }
+                    // expire holds the mesh never finalized in time. the op may
+                    // still land later — clients re-query on block events.
+                    if !pending_submits.is_empty() {
+                        let now = std::time::Instant::now();
+                        let expired: Vec<node::FrameId> = pending_submits
+                            .iter()
+                            .filter(|(_, (_, deadline))| *deadline <= now)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for k in expired {
+                            if let Some((reply, _)) = pending_submits.remove(&k) {
+                                let _ = reply.send(Err(
+                                    "timed out awaiting finalization — re-query on the next block"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                    // publish each newly-applied boundary to ws subscribers
+                    // (send only errs when nobody is subscribed — fine). the
+                    // validator serves block frames only — telemetry frames come
+                    // from the local `noded` daemon, which owns the dispatch
+                    // trace this finalized-boundary seam does not carry.
+                    if let Some(f) = node.finalized() {
+                        if last_published != Some(f.height) {
+                            let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
+                                height: f.height,
+                                app_hash: hex(&f.app_hash),
+                            }));
+                            last_published = Some(f.height);
+                        }
+                    }
+
+                    // persist the finalization floor once everything at or
+                    // below it has drained. read the certificate FIRST, the
+                    // gate second: releases happen only on this thread, so a
+                    // zero gate proves the cert's view is fully applied — a
+                    // floor ahead of app state would suppress replay of
+                    // finalized ops a restart still needs.
+                    if let Some((view, cert)) = node.orderer().latest_finalization() {
+                        if view != 0 && node.orderer().unreleased_len() == 0 {
+                            let height = orchestrator.app_height(view);
+                            if last_cert_height.is_none_or(|h| height > h) {
+                                let fc = recovery::FloorCert {
+                                    epoch: orchestrator.epoch(),
+                                    height,
+                                    cert,
+                                };
+                                match node.sink_mut().write_floor_cert(&fc).await {
+                                    Ok(()) => {
+                                        last_cert_height = Some(height);
+                                        latest_floor = Some(fc);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[node {label}] floor cert write failed (will retry): {e}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
+                    // periodic checkpoint: snapshot the in-memory cohort and
+                    // prune the op journal below the PREVIOUS checkpoint once
+                    // the persisted floor has passed it (pruned frames must
+                    // never be needed to resolve a re-reported finalization).
+                    if blocks_since_checkpoint >= checkpoint_blocks {
+                        if let Some(f) = node.finalized() {
+                            let pos = node.sink_mut().oplog_pos().await;
+                            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
+                            let captured = Manifest::capture(
+                                node.host(),
+                                Some(f.height),
+                                orchestrator.epoch(),
+                                orchestrator.epoch_base(),
+                                participant_bytes(&orchestrator),
+                                observer_bytes(&orchestrator),
+                                orchestrator.pending_cutover().map(|c| c.cutover_view()),
+                                cv,
+                                pu,
+                                pos,
+                                next_seq,
+                            );
+                            match captured {
+                                Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                                    Ok(()) => {
+                                        blocks_since_checkpoint = 0;
+                                        let floor_passed = matches!(
+                                            node.sink_mut().floor_cert(),
+                                            Ok(Some(fc))
+                                                if prev_ckpt.0.is_none_or(|h| fc.height >= h)
+                                        );
+                                        if floor_passed {
+                                            if let Err(e) =
+                                                node.sink_mut().prune_oplog(prev_ckpt.1).await
+                                            {
+                                                eprintln!(
+                                                    "[node {label}] oplog prune failed: {e}"
+                                                );
+                                            }
+                                        }
+                                        prev_ckpt = (m.height, pos);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[node {label}] checkpoint write failed (will retry): {e}"
+                                    ),
+                                },
+                                Err(e) => eprintln!(
+                                    "[node {label}] checkpoint capture failed (will retry): {e}"
+                                ),
+                            }
+                        }
+                    }
+
+                    // the VALSET ORCHESTRATION step: observe the finalized
+                    // membership projection; a change schedules a deterministic
+                    // cutover (arming the discard ceiling), and crossing the
+                    // cutover view tears the engine down and respawns it over
+                    // the set read AT the boundary. the observation barrier
+                    // guarantees this tick's last view IS the changing block's
+                    // view when membership moved.
+                    if let Some(engine_view) = node.last_engine_view() {
+                        // tick the reachability plane's freshness clock.
+                        // engine views are EPOCH-LOCAL (they reset at every
+                        // cutover), so convert to the absolute app-height
+                        // clock (`epoch_base + view`) — the regime the boot
+                        // Retarget's `view_base` put the plane's advert and
+                        // handshake expiries in.
+                        if let Some(cmd) = &reach_cmd {
+                            let absolute_view = orchestrator.app_height(engine_view);
+                            if last_reach_view.is_none_or(|v| v < absolute_view) {
+                                let _ = cmd
+                                    .send(reachability::ReachabilityCommand::ViewTick(
+                                        absolute_view,
+                                    ))
+                                    .await;
+                                last_reach_view = Some(absolute_view);
+                            }
+                        }
+                        let members_raw = read_valset_members(node.host()).await;
+                        let mut observed: Vec<ed25519::PublicKey> = Vec::new();
+                        for key in &members_raw {
+                            if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
+                                observed.push(pk);
+                            }
+                        }
+                        // the OBSERVER projection, read at the same frozen
+                        // point: a grant/revoke arms the same single cutover
+                        // slot (mesh admission is epoch-scoped).
+                        let observers_raw = read_valset_observers(node.host()).await;
+                        let mut observed_observers: Vec<ed25519::PublicKey> = Vec::new();
+                        for key in &observers_raw {
+                            if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
+                                observed_observers.push(pk);
+                            }
+                        }
+                        if let consensus::ObservationOutcome::Scheduled(cutover) =
+                            orchestrator.observe_members(
+                                engine_view,
+                                observed.iter().cloned(),
+                                observed_observers.iter().cloned(),
+                            )
+                        {
+                            println!(
+                                "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
+                                cutover.observed_view(),
+                                cutover.next_epoch(),
+                                cutover.cutover_view()
+                            );
+                            node.set_view_ceiling(cutover.cutover_view());
+                        }
+                        // a pending upgrade arms the SAME single cutover slot at its
+                        // activation height (design §"One boundary carries both
+                        // concerns") — never a competing arm: when a membership
+                        // cutover already holds the slot `observe_upgrade` returns
+                        // Pending and the version flip rides that boundary via the
+                        // boundary read in `respawn_if_due`. inert until the module is
+                        // registered (`read_upgrade_state` returns baseline/no-pending).
+                        let boundary_upgrade = read_upgrade_state(node.host()).await;
+                        if let Some(pending) = &boundary_upgrade.pending {
+                            if let consensus::ObservationOutcome::Scheduled(cutover) =
+                                orchestrator.observe_upgrade(engine_view, pending.activation_height)
+                            {
+                                println!(
+                                    "[node {label}] upgrade '{}' armed — cutover to epoch {} at view {} (activation height {})",
+                                    pending.name,
+                                    cutover.next_epoch(),
+                                    cutover.cutover_view(),
+                                    pending.activation_height
+                                );
+                                node.set_view_ceiling(cutover.cutover_view());
+                            }
+                        }
+                        if let Some(plan) = orchestrator.respawn_if_due(
+                            engine_view,
+                            observed,
+                            observed_observers,
+                            boundary_upgrade,
+                        ) {
+                            let members = plan.valset().consensus_members();
+                            let member_bytes: Vec<Vec<u8>> =
+                                members.iter().map(|k| k.as_ref().to_vec()).collect();
+                            let plan_observers: Vec<ed25519::PublicKey> = plan
+                                .valset()
+                                .transport_members()
+                                .difference(members)
+                                .cloned()
+                                .collect();
+                            let plan_observer_bytes: Vec<Vec<u8>> = plan_observers
+                                .iter()
+                                .map(|k| k.as_ref().to_vec())
+                                .collect();
+                            // transport FIRST: the new epoch's mesh must admit
+                            // its members (a fresh joiner — or a granted
+                            // observer — above all) before anything is
+                            // expected of them. the mesh tracks the TRANSPORT
+                            // union; the engine below gets validators only.
+                            // index = epoch, strictly increasing across
+                            // cutovers.
+                            mesh_oracle.track(plan.epoch(), mesh_at(plan.valset().transport_members()));
+                            // the reachability plane retunnels for the new
+                            // member set the moment transport admits it —
+                            // with the epoch's observer tier as the pre-warm
+                            // standbys, so a registered joiner's tunnels
+                            // assemble ahead of its activation cutover.
+                            // cutover_app_height IS the new epoch's absolute
+                            // view at engine view 0 — the raw engine_view
+                            // here would be epoch-local, a different clock
+                            // than the ViewTicks above and the boot
+                            // Retarget's view_base.
+                            if let Some(cmd) = &reach_cmd {
+                                let _ = cmd
+                                    .send(reachability::ReachabilityCommand::Retarget(
+                                        reachability::MeshEpochEvent {
+                                            epoch: plan.epoch(),
+                                            members: members.iter().cloned().collect(),
+                                            standbys: plan_observers.clone(),
+                                            current_view: plan.cutover_app_height(),
+                                        },
+                                    ))
+                                    .await;
+                            }
+                            if !members.contains(&signer.public_key()) {
+                                println!(
+                                    "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
+                                    plan.epoch()
+                                );
+                                std::process::exit(0);
+                            }
+                            let participants: Set<ed25519::PublicKey> = Set::try_from(
+                                members.iter().cloned().collect::<Vec<_>>(),
+                            )
+                            .expect("orchestrator membership has no duplicates");
+                            // a fresh epoch: new store (pins of the torn-down
+                            // epoch die with it), genesis floor.
+                            let orderer = spawn_epoch(
+                                &mut channel_bank,
+                                plan.epoch(),
+                                participants,
+                                ContentStore::new(),
+                                None,
+                            );
+                            match node
+                                .cutover(
+                                    orderer,
+                                    plan.epoch(),
+                                    plan.cutover_app_height(),
+                                    &member_bytes,
+                                    &plan_observer_bytes,
+                                )
+                                .await
+                            {
+                                // the accept contract crossing the boundary:
+                                // every locally-accepted op the old epoch
+                                // never resolved was re-proposed into the
+                                // new engine.
+                                Ok(carried) if carried > 0 => println!(
+                                    "[node {label}] carried {carried} accepted ops across the cutover into epoch {}",
+                                    plan.epoch()
+                                ),
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!("[node {label}] FATAL: {e} — halting");
+                                    std::process::exit(1);
+                                }
+                            }
+                            // ACTIVATION (design §4): realize the agreed boundary
+                            // protocol version into every dual-path module's
+                            // active_version (branch selector) at H. driven ONLY by
+                            // the agreed `plan.boundary_version()` — deterministic,
+                            // non-hashed. the upgrade module's OWN committed
+                            // reconciliation (current_version flip + pending clear on
+                            // ARM, clear-only on ABORT) is NOT done here: it rides the
+                            // single in-block System `Advance` the host drain injects
+                            // at the same finalized view (Task 6.3), so both concerns
+                            // land at ONE boundary and every node agrees. do NOT branch
+                            // a separate abort-only follow-up — the one Advance owns both.
+                            node.host_mut().set_active_version(plan.boundary_version());
+                            match plan.upgrade_verdict() {
+                                consensus::UpgradeVerdict::Armed { name, to_version } => println!(
+                                    "[node {label}] upgrade activated name={name} version={to_version} at height {}",
+                                    plan.cutover_app_height()
+                                ),
+                                consensus::UpgradeVerdict::Abort { name } => println!(
+                                    "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
+                                    plan.cutover_app_height(),
+                                    plan.boundary_version()
+                                ),
+                                consensus::UpgradeVerdict::None => {}
+                            }
+                            // checkpoint IMMEDIATELY: the manifest must record
+                            // the new epoch's participant set (the journal's
+                            // cutover record alone covers only the crash
+                            // window until this write lands).
+                            let pos = node.sink_mut().oplog_pos().await;
+                            // post-boundary committed version fields: after an armed
+                            // Advance the module holds `current_version = to_version`
+                            // + no pending, so this checkpoint stamps the new baseline.
+                            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
+                            let captured = Manifest::capture(
+                                node.host(),
+                                node.finalized().map(|f| f.height),
+                                orchestrator.epoch(),
+                                orchestrator.epoch_base(),
+                                participant_bytes(&orchestrator),
+                                observer_bytes(&orchestrator),
+                                None,
+                                cv,
+                                pu,
+                                pos,
+                                next_seq,
+                            );
+                            match captured {
+                                Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                                    Ok(()) => {
+                                        blocks_since_checkpoint = 0;
+                                        prev_ckpt = (m.height, pos);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[node {label}] post-cutover checkpoint write failed \
+                                         (the journal's cutover record covers a restart): {e}"
+                                    ),
+                                },
+                                Err(e) => eprintln!(
+                                    "[node {label}] post-cutover checkpoint capture failed \
+                                     (the journal's cutover record covers a restart): {e}"
+                                ),
+                            }
+                            println!(
+                                "[node {label}] cutover complete: epoch {} with {} validators (app height base {})",
+                                plan.epoch(),
+                                members.len(),
+                                plan.cutover_app_height()
+                            );
+                        }
+                    }
+
+                    // heartbeat: finalized views only advance with ops, so an
+                    // idle network freezes — its height never ticks, and a
+                    // pending cutover (which crosses only when finalized views
+                    // REACH it) would park at the armed boundary forever. push a
+                    // deterministically-rejected nop (unknown module target:
+                    // rejects identically on every node, leaves no state) once
+                    // per block-time so the chain — and the height the console
+                    // shows — keeps moving whether or not anyone is active.
+                    //
+                    // GATE on an EMPTY pending FIFO: the queue is strictly serial
+                    // (one frame finalized per block), so a nop pushed while real
+                    // frames are pending only builds a backlog that starves real
+                    // ops after any finalization stall (a flapping quorum peer piles
+                    // nops at 1/s; recovery then drains them ahead of real work —
+                    // minutes of head-of-line latency). a nop only ticks an IDLE
+                    // chain, and an idle chain has an empty queue, so beat only when
+                    // the FIFO is empty — at most one nop outstanding, and only when
+                    // it is alone. the reset stays inside the taken branch: when the
+                    // gate skips, the timer stays elapsed, so the first tick after
+                    // the queue drains injects the next nop immediately.
+                    if last_nop.elapsed() >= HEARTBEAT_INTERVAL
+                        && node.orderer().pending_len() == 0
+                    {
+                        last_nop = std::time::Instant::now();
+                        let seq = next_seq;
+                        next_seq += 1;
+                        if let Err(e) = node
+                            .submit(
+                                &signer,
+                                seq,
+                                Msg { target: NOP_TARGET.into(), payload: Vec::new() },
+                            )
+                            .await
+                        {
+                            eprintln!("[node {label}] heartbeat nop submit failed: {e}");
+                        }
+                    }
+
+                    // READINESS SIGNAL (design §3 / plan Task 7.1): a current
+                    // boundary member whose binary can execute the pending upgrade
+                    // self-submits ONE `SignalReady`. gated to a current member (the
+                    // R = n readiness denominator); the signaller's own committed
+                    // read + local latch keep it idempotent. inert on a baseline net.
+                    if orchestrator
+                        .current_members()
+                        .contains(&signer.public_key())
+                        && let Some((msg, name, to_version)) =
+                            signaller.maybe_signal(node.host()).await
+                    {
+                        let seq = next_seq;
+                        next_seq += 1;
+                        match node.submit(&signer, seq, msg).await {
+                            Ok(_) => println!(
+                                "[node {label}] signaled ready name={name} to_version={to_version}"
+                            ),
+                            Err(e) => {
+                                // un-latch so a transient submit failure retries on
+                                // the next tick (the module stays idempotent).
+                                signaller.signaled = None;
+                                eprintln!("[node {label}] readiness signal submit failed: {e}");
+                            }
+                        }
+                    }
+
+                    // CAPABILITY ANNOUNCE: a current member whose discovered
+                    // provider set differs from the committed registry
+                    // self-submits ONE declarative `Announce`. member-gated (the
+                    // module rejects non-members) and idempotent (committed-read
+                    // + local latch). inert on a host with no executor CLIs, and
+                    // suppressed entirely under `announce_capabilities = false`
+                    // (the accept-lane-only provider: this node still executes
+                    // what it can, but only by claiming unassigned announcements
+                    // — it never enters a tag's rendezvous pool).
+                    if announce_capabilities
+                        && orchestrator
+                            .current_members()
+                            .contains(&signer.public_key())
+                        && let Some(msg) = announcer.maybe_announce(node.host()).await
+                    {
+                        let seq = next_seq;
+                        next_seq += 1;
+                        match node.submit(&signer, seq, msg).await {
+                            Ok(_) => println!(
+                                "[node {label}] announced capabilities {:?}",
+                                announcer.capabilities
+                            ),
+                            Err(e) => {
+                                // un-latch so a transient submit failure retries.
+                                announcer.announced = None;
+                                eprintln!("[node {label}] capability announce submit failed: {e}");
+                            }
+                        }
+                    }
+
+                    // SAGA CRANK (P7 liveness, host side): nothing else ever
+                    // submits `SagaMsg::Crank`, and under strict leases a
+                    // saga whose assignee went dark advances ONLY via a crank
+                    // (lease re-lease or deadline timeout). state-driven:
+                    // when the committed next expiry is at or past the latest
+                    // finalized height, push one permissionless crank —
+                    // throttled like the heartbeat, since a backlog wider
+                    // than CRANK_BUDGET legitimately needs several. duplicate
+                    // cranks from other nodes are deterministic no-ops.
+                    if last_crank.elapsed() >= HEARTBEAT_INTERVAL
+                        && let Some(finalized_height) = node.finalized().map(|f| f.height)
+                        && let Some(expiry) = saga_next_expiry(node.host()).await
+                        && expiry <= finalized_height
+                    {
+                        last_crank = std::time::Instant::now();
+                        let seq = next_seq;
+                        next_seq += 1;
+                        if let Err(e) = node
+                            .submit(
+                                &signer,
+                                seq,
+                                Msg {
+                                    target: "saga".into(),
+                                    payload: saga_interface::encode_msg(
+                                        &saga_interface::SagaMsg::Crank {},
+                                    ),
+                                },
+                            )
+                            .await
+                        {
+                            eprintln!("[node {label}] saga crank submit failed: {e}");
+                        } else {
+                            println!(
+                                "[node {label}] saga crank submitted \
+                                 (next expiry {expiry} <= height {finalized_height})"
+                            );
+                        }
+                    }
+
+                    // DISPATCH DELIVERY NUDGE (never-pop-stack liveness): a
+                    // result committed into the dispatch mailbox delivers via
+                    // the drain's DeliverPending injection in the NEXT
+                    // successful block — and heartbeat nops are rejected
+                    // frames that never apply, so a quiet chain would sit on
+                    // its mailbox. state-driven: while the committed mailbox
+                    // is non-empty, push one permissionless Nudge — a no-op
+                    // whose block carries the injection. duplicate nudges
+                    // from other nodes are free.
+                    if last_nudge.elapsed() >= HEARTBEAT_INTERVAL
+                        && dispatch_pending_deliveries(node.host()).await > 0
+                    {
+                        last_nudge = std::time::Instant::now();
+                        let seq = next_seq;
+                        next_seq += 1;
+                        if let Err(e) = node
+                            .submit(
+                                &signer,
+                                seq,
+                                Msg {
+                                    target: "dispatch".into(),
+                                    payload: dispatch_interface::encode_msg(
+                                        &dispatch_interface::DispatchMsg::Nudge {},
+                                    ),
+                                },
+                            )
+                            .await
+                        {
+                            eprintln!("[node {label}] dispatch nudge submit failed: {e}");
+                        } else {
+                            println!("[node {label}] dispatch delivery nudge submitted");
+                        }
+                    }
+
+                    // UPGRADE TRANSITION MARKERS (one-shot, committed-state driven):
+                    // the greppable proof surface the e2e keys on. `armed` is the
+                    // module's own R==n verdict (pending set, boundary non-empty,
+                    // every current member signaled), so this fires exactly when
+                    // readiness first reaches the full set — before H is crossed.
+                    if let Some(st) = read_upgrade_status_raw(node.host()).await {
+                        match &st.pending {
+                            Some(up) => {
+                                upgrade_pending_seen = Some(up.name.clone());
+                                let key = (up.name.clone(), up.to_version);
+                                if st.armed && upgrade_armed_latch.as_ref() != Some(&key) {
+                                    println!(
+                                        "[node {label}] upgrade armed name={} to_version={} height={}",
+                                        up.name, up.to_version, up.activation_height
+                                    );
+                                    upgrade_armed_latch = Some(key);
+                                }
+                            }
+                            None => {
+                                if let Some(name) = upgrade_pending_seen.take() {
+                                    // the boundary Advance reconciled the pending
+                                    // (ARM flip or ABORT clear) — the slot is free.
+                                    println!("[node {label}] upgrade cleared name={name}");
+                                    upgrade_armed_latch = None;
+                                }
+                            }
+                        }
+                    }
+
+                    // the reactor seam: offer each finalized block's effects to
+                    // the host-owned workers; a claiming worker's follow-up op
+                    // re-enters through the ordered lane as its own block (the
+                    // oracle-as-op). unclaimed effects are logged, not silently
+                    // dropped — a saga stuck Pending should be visible.
+                    for eff in node.take_effects() {
+                        let mut claimed = false;
+                        for w in &workers {
+                            match w.run(&eff).await {
+                                Ok(reactor::WorkOutcome::Handled(Some(follow))) => {
+                                    let seq = next_seq;
+                                    next_seq += 1;
+                                    if let Err(e) =
+                                        node.submit(&signer, seq, follow).await
+                                    {
+                                        eprintln!("[node {label}] worker follow-up submit failed: {e}");
+                                    }
+                                    claimed = true;
+                                    break;
+                                }
+                                // a deliberate skip (e.g. leased to another
+                                // node): claimed, nothing to submit.
+                                Ok(reactor::WorkOutcome::Handled(None)) => {
+                                    claimed = true;
+                                    break;
+                                }
+                                Ok(reactor::WorkOutcome::NotMine) => {}
+                                Err(e) => {
+                                    eprintln!("[node {label}] worker error: {e}");
+                                    claimed = true; // errored ≠ unclaimed; don't double-log
+                                    break;
+                                }
+                            }
+                        }
+                        if !claimed {
+                            println!(
+                                "[node {label}] effect with no worker ({} bytes) — dropped",
+                                eff.0.len()
+                            );
+                        }
+                    }
+                    if dev_demo && !converged && applied >= expected {
+                        let h = node.app_hash();
+                        println!("[node {label}] converged app_hash={}", hex(&h));
+                        // dump every directory key so the demo can eyeball the ops
+                        // (each node ends holding the op it originated AND the peer's).
+                        for k in 0..expected {
+                            let reply = node
+                                .host()
+                                .query("directory", &encode_query(&DirQuery::Get { key: format!("k{k}") }))
+                                .await
+                                .expect("directory query");
+                            if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
+                                println!("[node {label}]   directory k{k}={v:?}");
+                            }
+                        }
+                        converged = true;
+                    }
                 }
                 job = rpc_ingress.next() => {
                     let Some((req, reply)) = job else { continue };
@@ -4033,6 +6773,29 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 ..RpcReply::ok()
                             }
                         }
+                        RpcRequest::JoinRequests => {
+                            // read-time hygiene: an approved joiner holds
+                            // STANDING now (observer or already validator) —
+                            // its request is settled, drop it.
+                            let members = read_members_from_host(node.host()).await;
+                            let observers_now = read_valset_observers(node.host()).await;
+                            join_requests.retain(|joiner, _| {
+                                !members.contains(joiner) && !observers_now.contains(joiner)
+                            });
+                            let views = join_requests
+                                .iter()
+                                .map(|(joiner, r)| JoinRequestView {
+                                    joiner: hex_bytes(joiner),
+                                    issuer: hex_bytes(&r.issuer),
+                                    first_seen_ms: r.first_seen_ms,
+                                    last_seen_ms: r.last_seen_ms,
+                                })
+                                .collect();
+                            RpcReply {
+                                join_requests: Some(views),
+                                ..RpcReply::ok()
+                            }
+                        }
                         RpcRequest::Shutdown => {
                             // best-effort final checkpoint + journal barrier so
                             // the restart replays a minimal suffix; a failure
@@ -4045,6 +6808,78 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     };
                     let _ = reply.send(resp);
+                }
+                announce = lobby_ingress.next() => {
+                    let Some((peer, bytes)) = announce else { continue };
+                    let mut send_reply = |recorded: bool, detail: String| {
+                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
+                        let _ = lobby_tx.send(
+                            Recipients::One(peer.clone()),
+                            IoBuf::from(lobby::encode_msg(&msg)),
+                            false,
+                        );
+                    };
+                    let msg = match lobby::decode_msg(&bytes) {
+                        Ok(m) => m,
+                        Err(_) => continue, // junk on the doorbell — drop.
+                    };
+                    // crypto first (pure, cheap): the token must verify for
+                    // THIS network and the announced key must prove itself.
+                    let verified = match lobby::verify_join_request(&msg, &namespace) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            send_reply(false, e);
+                            continue;
+                        }
+                    };
+                    // then membership: the issuer must still be a member (a
+                    // removed member's outstanding invites die with it), and a
+                    // joiner that already holds standing — VALIDATOR or
+                    // OBSERVER — has nothing pending.
+                    let members = read_members_from_host(node.host()).await;
+                    let observers_now = read_valset_observers(node.host()).await;
+                    let joiner_bytes = verified.joiner.as_ref().to_vec();
+                    if members.contains(&joiner_bytes) {
+                        send_reply(false, "already a validator".into());
+                        continue;
+                    }
+                    if observers_now.contains(&joiner_bytes) {
+                        send_reply(
+                            false,
+                            "already an observer — a member promotes it into the quorum".into(),
+                        );
+                        continue;
+                    }
+                    if !members.contains(&verified.issuer.as_ref().to_vec()) {
+                        send_reply(
+                            false,
+                            "the inviting member is no longer part of this network".into(),
+                        );
+                        continue;
+                    }
+                    let now = unix_ms();
+                    let fresh = !join_requests.contains_key(&joiner_bytes);
+                    let record = join_requests
+                        .entry(joiner_bytes)
+                        .or_insert(JoinRequestRecord {
+                            issuer: verified.issuer.as_ref().to_vec(),
+                            first_seen_ms: now,
+                            last_seen_ms: now,
+                        });
+                    record.last_seen_ms = now;
+                    if fresh {
+                        println!(
+                            "[node {label}] join request: {} asks to join (invited by {}) — \
+                             approve in the app, or run `ducktape-node invite-accept {}`",
+                            hex_bytes(verified.joiner.as_ref()),
+                            hex_bytes(&record.issuer),
+                            hex_bytes(verified.joiner.as_ref())
+                        );
+                    }
+                    send_reply(
+                        true,
+                        "join request recorded — awaiting member approval".into(),
+                    );
                 }
                 cmd = http_ingress.next() => {
                     let Some(cmd) = cmd else { continue };
@@ -4163,6 +6998,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             statesync::encode_response(&response)
                         }
                         Ok(req) => {
+                            // the shipped-index lane cuts lazily: the FIRST
+                            // index request for a boundary checkpoints the
+                            // derived databases and attaches the archives to
+                            // that capture, so joiners that never opt in cost
+                            // nothing. an unleased boundary cannot hold an
+                            // attachment — handle() below answers it with the
+                            // proper refetch error either way.
+                            if let statesync::SyncRequest::IndexModules { boundary } = &req {
+                                if !sync_server.index_attached(*boundary) {
+                                    let _ = sync_server
+                                        .attach_index(*boundary, ship_index_blobs(&index, &label));
+                                }
+                            }
                             // the boundary's consensus coordinates ride the manifest.
                             // the floor certificate is served only when it certifies
                             // exactly the current boundary — a cert behind the
@@ -4177,6 +7025,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 epoch: orchestrator.epoch(),
                                 view_base: orchestrator.epoch_base(),
                                 participants: participant_bytes(&orchestrator),
+                                observers: observer_bytes(&orchestrator),
                                 current_version: bc_current,
                                 pending_upgrade: bc_pending,
                                 floor_cert: latest_floor
@@ -4203,464 +7052,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
                         false,
                     );
-                }
-                _ = context.sleep(Duration::from_millis(100)).fuse() => {
-                    // FAIL-STOP: a drain error is a node-local block-boundary
-                    // fault — this node's state is indeterminate relative to its
-                    // peers, so applying even one more finalized op could
-                    // silently fork it. exit loudly; an operator (or supervisor)
-                    // restarts the node, which then re-joins via state sync.
-                    applied += match node.drain_delivered().await {
-                        Ok(n) => n,
-                        Err(e) => {
-                            eprintln!("[node {label}] FATAL: {e} — halting");
-                            std::process::exit(1);
-                        }
-                    };
-                    // resolve held app-surface submits against what this
-                    // drain finished with; every disposition is deterministic,
-                    // so the reply faithfully reports the op's consensus fate.
-                    let boundary_hash = hex(&node.app_hash());
-                    let drained = node.take_drained();
-                    // sealed = journaled: applied and rejected frames both got
-                    // recovery seals; discarded frames were never journaled.
-                    blocks_since_checkpoint += drained
-                        .iter()
-                        .filter(|d| d.disposition != node::Disposition::Discarded)
-                        .count() as u64;
-                    for d in drained {
-                        let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
-                        let _ = reply.send(match d.disposition {
-                            node::Disposition::Applied => Ok(noded::BlockSummary {
-                                height: d.height,
-                                app_hash: boundary_hash.clone(),
-                            }),
-                            node::Disposition::Rejected => {
-                                Err("op finalized but rejected (deterministic no-op)".into())
-                            }
-                            node::Disposition::Discarded => {
-                                Err("op discarded at an epoch cutover — resubmit".into())
-                            }
-                        });
-                    }
-                    // expire holds the mesh never finalized in time. the op may
-                    // still land later — clients re-query on block events.
-                    if !pending_submits.is_empty() {
-                        let now = std::time::Instant::now();
-                        let expired: Vec<node::FrameId> = pending_submits
-                            .iter()
-                            .filter(|(_, (_, deadline))| *deadline <= now)
-                            .map(|(k, _)| *k)
-                            .collect();
-                        for k in expired {
-                            if let Some((reply, _)) = pending_submits.remove(&k) {
-                                let _ = reply.send(Err(
-                                    "timed out awaiting finalization — re-query on the next block"
-                                        .into(),
-                                ));
-                            }
-                        }
-                    }
-                    // publish each newly-applied boundary to ws subscribers
-                    // (send only errs when nobody is subscribed — fine). the
-                    // validator serves block frames only — telemetry frames come
-                    // from the local `noded` daemon, which owns the dispatch
-                    // trace this finalized-boundary seam does not carry.
-                    if let Some(f) = node.finalized() {
-                        if last_published != Some(f.height) {
-                            let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
-                                height: f.height,
-                                app_hash: hex(&f.app_hash),
-                            }));
-                            last_published = Some(f.height);
-                        }
-                    }
-
-                    // persist the finalization floor once everything at or
-                    // below it has drained. read the certificate FIRST, the
-                    // gate second: releases happen only on this thread, so a
-                    // zero gate proves the cert's view is fully applied — a
-                    // floor ahead of app state would suppress replay of
-                    // finalized ops a restart still needs.
-                    if let Some((view, cert)) = node.orderer().latest_finalization() {
-                        if view != 0 && node.orderer().unreleased_len() == 0 {
-                            let height = orchestrator.app_height(view);
-                            if last_cert_height.is_none_or(|h| height > h) {
-                                let fc = recovery::FloorCert {
-                                    epoch: orchestrator.epoch(),
-                                    height,
-                                    cert,
-                                };
-                                match node.sink_mut().write_floor_cert(&fc).await {
-                                    Ok(()) => {
-                                        last_cert_height = Some(height);
-                                        latest_floor = Some(fc);
-                                    }
-                                    Err(e) => eprintln!(
-                                        "[node {label}] floor cert write failed (will retry): {e}"
-                                    ),
-                                }
-                            }
-                        }
-                    }
-
-                    // periodic checkpoint: snapshot the in-memory cohort and
-                    // prune the op journal below the PREVIOUS checkpoint once
-                    // the persisted floor has passed it (pruned frames must
-                    // never be needed to resolve a re-reported finalization).
-                    if blocks_since_checkpoint >= checkpoint_blocks {
-                        if let Some(f) = node.finalized() {
-                            let pos = node.sink_mut().oplog_pos().await;
-                            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
-                            let captured = Manifest::capture(
-                                node.host(),
-                                Some(f.height),
-                                orchestrator.epoch(),
-                                orchestrator.epoch_base(),
-                                participant_bytes(&orchestrator),
-                                orchestrator.pending_cutover().map(|c| c.cutover_view()),
-                                cv,
-                                pu,
-                                pos,
-                                next_seq,
-                            );
-                            match captured {
-                                Ok(m) => match node.sink_mut().write_manifest(&m).await {
-                                    Ok(()) => {
-                                        blocks_since_checkpoint = 0;
-                                        let floor_passed = matches!(
-                                            node.sink_mut().floor_cert(),
-                                            Ok(Some(fc))
-                                                if prev_ckpt.0.is_none_or(|h| fc.height >= h)
-                                        );
-                                        if floor_passed {
-                                            if let Err(e) =
-                                                node.sink_mut().prune_oplog(prev_ckpt.1).await
-                                            {
-                                                eprintln!(
-                                                    "[node {label}] oplog prune failed: {e}"
-                                                );
-                                            }
-                                        }
-                                        prev_ckpt = (m.height, pos);
-                                    }
-                                    Err(e) => eprintln!(
-                                        "[node {label}] checkpoint write failed (will retry): {e}"
-                                    ),
-                                },
-                                Err(e) => eprintln!(
-                                    "[node {label}] checkpoint capture failed (will retry): {e}"
-                                ),
-                            }
-                        }
-                    }
-
-                    // the VALSET ORCHESTRATION step: observe the finalized
-                    // membership projection; a change schedules a deterministic
-                    // cutover (arming the discard ceiling), and crossing the
-                    // cutover view tears the engine down and respawns it over
-                    // the set read AT the boundary. the observation barrier
-                    // guarantees this tick's last view IS the changing block's
-                    // view when membership moved.
-                    if let Some(engine_view) = node.last_engine_view() {
-                        let members_raw = read_valset_members(node.host()).await;
-                        let mut observed: Vec<ed25519::PublicKey> = Vec::new();
-                        for key in &members_raw {
-                            if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
-                                observed.push(pk);
-                            }
-                        }
-                        if let consensus::ObservationOutcome::Scheduled(cutover) =
-                            orchestrator.observe_members(engine_view, observed.iter().cloned())
-                        {
-                            println!(
-                                "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
-                                cutover.observed_view(),
-                                cutover.next_epoch(),
-                                cutover.cutover_view()
-                            );
-                            node.set_view_ceiling(cutover.cutover_view());
-                        }
-                        // a pending upgrade arms the SAME single cutover slot at its
-                        // activation height (design §"One boundary carries both
-                        // concerns") — never a competing arm: when a membership
-                        // cutover already holds the slot `observe_upgrade` returns
-                        // Pending and the version flip rides that boundary via the
-                        // boundary read in `respawn_if_due`. inert until the module is
-                        // registered (`read_upgrade_state` returns baseline/no-pending).
-                        let boundary_upgrade = read_upgrade_state(node.host()).await;
-                        if let Some(pending) = &boundary_upgrade.pending {
-                            if let consensus::ObservationOutcome::Scheduled(cutover) =
-                                orchestrator.observe_upgrade(engine_view, pending.activation_height)
-                            {
-                                println!(
-                                    "[node {label}] upgrade '{}' armed — cutover to epoch {} at view {} (activation height {})",
-                                    pending.name,
-                                    cutover.next_epoch(),
-                                    cutover.cutover_view(),
-                                    pending.activation_height
-                                );
-                                node.set_view_ceiling(cutover.cutover_view());
-                            }
-                        }
-                        if let Some(plan) =
-                            orchestrator.respawn_if_due(engine_view, observed, boundary_upgrade)
-                        {
-                            let members = plan.valset().consensus_members();
-                            let member_bytes: Vec<Vec<u8>> =
-                                members.iter().map(|k| k.as_ref().to_vec()).collect();
-                            // transport FIRST: the new epoch's mesh must admit
-                            // its members (a fresh joiner above all) before
-                            // anything is expected of them. index = epoch,
-                            // strictly increasing across cutovers.
-                            mesh_oracle.track(plan.epoch(), mesh_at(members));
-                            if !members.contains(&signer.public_key()) {
-                                println!(
-                                    "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
-                                    plan.epoch()
-                                );
-                                std::process::exit(0);
-                            }
-                            let participants: Set<ed25519::PublicKey> = Set::try_from(
-                                members.iter().cloned().collect::<Vec<_>>(),
-                            )
-                            .expect("orchestrator membership has no duplicates");
-                            // a fresh epoch: new store (pins of the torn-down
-                            // epoch die with it), genesis floor.
-                            let orderer = spawn_epoch(
-                                &mut channel_bank,
-                                plan.epoch(),
-                                participants,
-                                ContentStore::new(),
-                                None,
-                            );
-                            if let Err(e) = node
-                                .cutover(
-                                    orderer,
-                                    plan.epoch(),
-                                    plan.cutover_app_height(),
-                                    &member_bytes,
-                                )
-                                .await
-                            {
-                                eprintln!("[node {label}] FATAL: {e} — halting");
-                                std::process::exit(1);
-                            }
-                            // ACTIVATION (design §4): realize the agreed boundary
-                            // protocol version into every dual-path module's
-                            // active_version (branch selector) at H. driven ONLY by
-                            // the agreed `plan.boundary_version()` — deterministic,
-                            // non-hashed. the upgrade module's OWN committed
-                            // reconciliation (current_version flip + pending clear on
-                            // ARM, clear-only on ABORT) is NOT done here: it rides the
-                            // single in-block System `Advance` the host drain injects
-                            // at the same finalized view (Task 6.3), so both concerns
-                            // land at ONE boundary and every node agrees. do NOT branch
-                            // a separate abort-only follow-up — the one Advance owns both.
-                            node.host_mut().set_active_version(plan.boundary_version());
-                            match plan.upgrade_verdict() {
-                                consensus::UpgradeVerdict::Armed { name, to_version } => println!(
-                                    "[node {label}] upgrade activated name={name} version={to_version} at height {}",
-                                    plan.cutover_app_height()
-                                ),
-                                consensus::UpgradeVerdict::Abort { name } => println!(
-                                    "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
-                                    plan.cutover_app_height(),
-                                    plan.boundary_version()
-                                ),
-                                consensus::UpgradeVerdict::None => {}
-                            }
-                            // checkpoint IMMEDIATELY: the manifest must record
-                            // the new epoch's participant set (the journal's
-                            // cutover record alone covers only the crash
-                            // window until this write lands).
-                            let pos = node.sink_mut().oplog_pos().await;
-                            // post-boundary committed version fields: after an armed
-                            // Advance the module holds `current_version = to_version`
-                            // + no pending, so this checkpoint stamps the new baseline.
-                            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
-                            let captured = Manifest::capture(
-                                node.host(),
-                                node.finalized().map(|f| f.height),
-                                orchestrator.epoch(),
-                                orchestrator.epoch_base(),
-                                participant_bytes(&orchestrator),
-                                None,
-                                cv,
-                                pu,
-                                pos,
-                                next_seq,
-                            );
-                            match captured {
-                                Ok(m) => match node.sink_mut().write_manifest(&m).await {
-                                    Ok(()) => {
-                                        blocks_since_checkpoint = 0;
-                                        prev_ckpt = (m.height, pos);
-                                    }
-                                    Err(e) => eprintln!(
-                                        "[node {label}] post-cutover checkpoint write failed \
-                                         (the journal's cutover record covers a restart): {e}"
-                                    ),
-                                },
-                                Err(e) => eprintln!(
-                                    "[node {label}] post-cutover checkpoint capture failed \
-                                     (the journal's cutover record covers a restart): {e}"
-                                ),
-                            }
-                            println!(
-                                "[node {label}] cutover complete: epoch {} with {} validators (app height base {})",
-                                plan.epoch(),
-                                members.len(),
-                                plan.cutover_app_height()
-                            );
-                        }
-                    }
-
-                    // heartbeat: finalized views only advance with ops, so an
-                    // idle network freezes — its height never ticks, and a
-                    // pending cutover (which crosses only when finalized views
-                    // REACH it) would park at the armed boundary forever. push a
-                    // deterministically-rejected nop (unknown module target:
-                    // rejects identically on every node, leaves no state) once
-                    // per block-time so the chain — and the height the console
-                    // shows — keeps moving whether or not anyone is active.
-                    //
-                    // GATE on an EMPTY pending FIFO: the queue is strictly serial
-                    // (one frame finalized per block), so a nop pushed while real
-                    // frames are pending only builds a backlog that starves real
-                    // ops after any finalization stall (a flapping quorum peer piles
-                    // nops at 1/s; recovery then drains them ahead of real work —
-                    // minutes of head-of-line latency). a nop only ticks an IDLE
-                    // chain, and an idle chain has an empty queue, so beat only when
-                    // the FIFO is empty — at most one nop outstanding, and only when
-                    // it is alone. the reset stays inside the taken branch: when the
-                    // gate skips, the timer stays elapsed, so the first tick after
-                    // the queue drains injects the next nop immediately.
-                    if last_nop.elapsed() >= HEARTBEAT_INTERVAL
-                        && node.orderer().pending_len() == 0
-                    {
-                        last_nop = std::time::Instant::now();
-                        let seq = next_seq;
-                        next_seq += 1;
-                        if let Err(e) = node
-                            .submit(
-                                &signer,
-                                seq,
-                                Msg { target: NOP_TARGET.into(), payload: Vec::new() },
-                            )
-                            .await
-                        {
-                            eprintln!("[node {label}] heartbeat nop submit failed: {e}");
-                        }
-                    }
-
-                    // READINESS SIGNAL (design §3 / plan Task 7.1): a current
-                    // boundary member whose binary can execute the pending upgrade
-                    // self-submits ONE `SignalReady`. gated to a current member (the
-                    // R = n readiness denominator); the signaller's own committed
-                    // read + local latch keep it idempotent. inert on a baseline net.
-                    if orchestrator
-                        .current_members()
-                        .contains(&signer.public_key())
-                        && let Some((msg, name, to_version)) =
-                            signaller.maybe_signal(node.host()).await
-                    {
-                        let seq = next_seq;
-                        next_seq += 1;
-                        match node.submit(&signer, seq, msg).await {
-                            Ok(_) => println!(
-                                "[node {label}] signaled ready name={name} to_version={to_version}"
-                            ),
-                            Err(e) => {
-                                // un-latch so a transient submit failure retries on
-                                // the next tick (the module stays idempotent).
-                                signaller.signaled = None;
-                                eprintln!("[node {label}] readiness signal submit failed: {e}");
-                            }
-                        }
-                    }
-
-                    // UPGRADE TRANSITION MARKERS (one-shot, committed-state driven):
-                    // the greppable proof surface the e2e keys on. `armed` is the
-                    // module's own R==n verdict (pending set, boundary non-empty,
-                    // every current member signaled), so this fires exactly when
-                    // readiness first reaches the full set — before H is crossed.
-                    if let Some(st) = read_upgrade_status_raw(node.host()).await {
-                        match &st.pending {
-                            Some(up) => {
-                                upgrade_pending_seen = Some(up.name.clone());
-                                let key = (up.name.clone(), up.to_version);
-                                if st.armed && upgrade_armed_latch.as_ref() != Some(&key) {
-                                    println!(
-                                        "[node {label}] upgrade armed name={} to_version={} height={}",
-                                        up.name, up.to_version, up.activation_height
-                                    );
-                                    upgrade_armed_latch = Some(key);
-                                }
-                            }
-                            None => {
-                                if let Some(name) = upgrade_pending_seen.take() {
-                                    // the boundary Advance reconciled the pending
-                                    // (ARM flip or ABORT clear) — the slot is free.
-                                    println!("[node {label}] upgrade cleared name={name}");
-                                    upgrade_armed_latch = None;
-                                }
-                            }
-                        }
-                    }
-
-                    // the reactor seam: offer each finalized block's effects to
-                    // the host-owned workers; a claiming worker's follow-up op
-                    // re-enters through the ordered lane as its own block (the
-                    // oracle-as-op). unclaimed effects are logged, not silently
-                    // dropped — a saga stuck Pending should be visible.
-                    for eff in node.take_effects() {
-                        let mut claimed = false;
-                        for w in &workers {
-                            match w.run(&eff).await {
-                                Ok(Some(follow)) => {
-                                    let seq = next_seq;
-                                    next_seq += 1;
-                                    if let Err(e) =
-                                        node.submit(&signer, seq, follow).await
-                                    {
-                                        eprintln!("[node {label}] worker follow-up submit failed: {e}");
-                                    }
-                                    claimed = true;
-                                    break;
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    eprintln!("[node {label}] worker error: {e}");
-                                    claimed = true; // errored ≠ unclaimed; don't double-log
-                                    break;
-                                }
-                            }
-                        }
-                        if !claimed {
-                            println!(
-                                "[node {label}] effect with no worker ({} bytes) — dropped",
-                                eff.0.len()
-                            );
-                        }
-                    }
-                    if dev_demo && !converged && applied >= expected {
-                        let h = node.app_hash();
-                        println!("[node {label}] converged app_hash={}", hex(&h));
-                        // dump every directory key so the demo can eyeball the ops
-                        // (each node ends holding the op it originated AND the peer's).
-                        for k in 0..expected {
-                            let reply = node
-                                .host()
-                                .query("directory", &encode_query(&DirQuery::Get { key: format!("k{k}") }))
-                                .await
-                                .expect("directory query");
-                            if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
-                                println!("[node {label}]   directory k{k}={v:?}");
-                            }
-                        }
-                        converged = true;
-                    }
                 }
             }
         }
@@ -4695,6 +7086,7 @@ mod tests {
             epoch: 0,
             view_base: 0,
             participants: vec![test_me()],
+            observers: vec![],
             floor_cert,
             current_version: host::BASELINE_VERSION,
             pending_upgrade: None,
@@ -5123,10 +7515,16 @@ mod tests {
             let mut recovery = Recovery::open(context.child("post_catchup_ok"))
                 .await
                 .expect("open recovery");
-            let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone())
-                    .await
-                    .expect("catch up");
+            let applied = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                2,
+                frames.clone(),
+                None,
+            )
+            .await
+            .expect("catch up");
 
             assert_eq!(applied.applied, 2);
             assert_eq!(host.app_hash(), expected.app_hash());
@@ -5155,6 +7553,7 @@ mod tests {
                 0,
                 0,
                 vec![test_me()],
+                vec![],
                 None,
                 host::BASELINE_VERSION,
                 None,
@@ -5171,6 +7570,7 @@ mod tests {
                 epoch: 0,
                 view_base: 0,
                 participants: vec![test_me()],
+                observers: vec![],
                 floor_cert: Some(vec![1, 2, 3]),
                 current_version: host::BASELINE_VERSION,
                 pending_upgrade: None,
@@ -5186,10 +7586,16 @@ mod tests {
                 .write_manifest(&base_manifest)
                 .await
                 .expect("write base manifest");
-            let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served])
-                    .await
-                    .expect("catch up");
+            let applied = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                1,
+                vec![served],
+                None,
+            )
+            .await
+            .expect("catch up");
 
             assert_eq!(applied.applied, 1);
             assert_eq!(
@@ -5198,13 +7604,24 @@ mod tests {
                 "disk cohort committed the catch-up block durably"
             );
 
+            // an old-base replay reconciles the torn sealed block via selective
+            // replay (the still-at-pre memory cohort recommits, the already-
+            // durable disk cohort aborts) rather than fail-stopping; the
+            // checkpoint's value below is recovering WITHOUT that replay.
             let mut torn_host =
                 restore_mixed_durability_host(durable_store.clone(), &base_manifest);
-            let err = recovery
+            let healed = recovery
                 .recover(&mut torn_host, &base_manifest)
                 .await
-                .expect_err("old base replay should see torn mixed durability");
-            assert!(matches!(err, recovery::Error::Torn(_)));
+                .expect("old base replay heals the torn sealed block selectively");
+            assert_eq!(healed.height, Some(1));
+            assert_eq!(healed.app_hash, target.app_hash);
+            assert_eq!(healed.applied, 1, "the torn suffix frame was replayed");
+            assert_eq!(
+                durable_store.get(),
+                7,
+                "disk cohort stays at its durable post-state"
+            );
 
             let ckpt = write_post_reboot_catchup_checkpoint(
                 &mut recovery,
@@ -5245,10 +7662,16 @@ mod tests {
             let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
                 .await
                 .expect("open recovery");
-            let err =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served])
-                    .await
-                    .expect_err("seal mismatch must abort");
+            let err = apply_post_reboot_catchup_frames(
+                &mut recovery,
+                &mut host,
+                0,
+                1,
+                vec![served],
+                None,
+            )
+            .await
+            .expect_err("seal mismatch must abort");
 
             assert!(
                 err.contains("served seal"),
@@ -5267,7 +7690,7 @@ mod tests {
                 .await
                 .expect("open recovery");
             let applied =
-                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 5, 5, Vec::new())
+                apply_post_reboot_catchup_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
                     .await
                     .expect("noop catch up");
 
@@ -5323,7 +7746,11 @@ mod tests {
         assert_eq!(s.decide(&st), None, "the latch suppresses re-emission");
         // once the module records our signal, still silent even if the latch reset.
         s.signaled = None;
-        let st_ready = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&me], &[&me]);
+        let st_ready = status(
+            Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)),
+            &[&me],
+            &[&me],
+        );
         assert_eq!(s.decide(&st_ready), None, "module already holds our signal");
     }
 
@@ -5332,7 +7759,11 @@ mod tests {
         let me = vec![7u8; 32];
         let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
         // to_version beyond what this binary can execute: never lie about readiness.
-        let st = status(Some(("forge-v3", 100, MAX_PROTOCOL_VERSION + 1)), &[&me], &[]);
+        let st = status(
+            Some(("forge-v3", 100, MAX_PROTOCOL_VERSION + 1)),
+            &[&me],
+            &[],
+        );
         assert_eq!(s.decide(&st), None);
     }
 
@@ -5342,7 +7773,11 @@ mod tests {
         let other = vec![9u8; 32];
         let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me);
         // self is not in the boundary member set (not in the R = n denominator).
-        let st = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&other], &[]);
+        let st = status(
+            Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)),
+            &[&other],
+            &[],
+        );
         assert_eq!(s.decide(&st), None);
     }
 
@@ -5361,7 +7796,9 @@ mod tests {
     #[test]
     fn boot_preflight_refuses_under_versioned_binary() {
         // a boundary needing one version beyond this build must be refused.
-        assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION).is_err());
+        assert!(
+            sdk::check_required_version(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION).is_err()
+        );
         // exactly at the build ceiling, and below it, boots.
         assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION).is_ok());
         if MAX_PROTOCOL_VERSION > 0 {
@@ -5369,5 +7806,142 @@ mod tests {
                 sdk::check_required_version(MAX_PROTOCOL_VERSION - 1, MAX_PROTOCOL_VERSION).is_ok()
             );
         }
+    }
+
+    // ---- explorer-row rebuild (boot fold == live drain) ---------------------
+
+    fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRecord> {
+        vec![host::DispatchRecord {
+            module: "directory".into(),
+            origin: origin.clone(),
+            payload: payload.to_vec(),
+            emitted_msgs: 0,
+            emitted_events: 0,
+        }]
+    }
+
+    /// the fold's row (rebuilt from sealed frame bytes) must be byte-identical
+    /// to the drain's row (built from its live decode) — GET /v1/blocks reads
+    /// one shape regardless of which writer survived the crash.
+    #[test]
+    fn boot_fold_rebuilds_the_drain_row_byte_identical() {
+        let signer = ed25519::PrivateKey::from_seed(42);
+        let payload = br#"{"set":{"key":"who","value":"ducktape"}}"#.to_vec();
+        let msg = Msg {
+            target: "directory".into(),
+            payload: payload.clone(),
+        };
+        let frame = node::encode_frame(&signer, 1, &msg);
+        let (origin, decoded) = node::decode_frame(&frame).expect("frame decodes");
+        let dispatches = row_dispatches(&payload, &origin);
+        let app_hash = test_root(9);
+
+        // the drain's construction: decoded parts straight from its DrainedOp.
+        let drain_blobs = files::BlobHandle::default();
+        let drain_row = explorer_block_row(
+            &drain_blobs,
+            7,
+            &node::frame_id(&frame),
+            &app_hash,
+            &origin,
+            &decoded.target,
+            &decoded.payload,
+            &dispatches,
+            noded::BlockDisposition::Applied,
+        );
+
+        // the boot fold's construction: nothing but what the journal seals.
+        let fold_blobs = files::BlobHandle::default();
+        let fold_row = sealed_frame_block_row(
+            &fold_blobs,
+            &recovery::FoldedBlock {
+                height: 7,
+                frame: &frame,
+                disposition: node::Disposition::Applied,
+                app_hash,
+                dispatches: &dispatches,
+            },
+        )
+        .expect("an applied non-nop frame rebuilds its row");
+        assert_eq!(fold_row, drain_row, "fold row must equal the drain row byte-for-byte");
+
+        // field spot-checks through the served json shape.
+        let row: serde_json::Value = serde_json::from_slice(&fold_row).expect("row json");
+        assert_eq!(row["height"], 7);
+        assert_eq!(row["hash"], noded::hex_bytes(&node::frame_id(&frame)));
+        assert_eq!(row["commitHash"], hex(&app_hash));
+        assert_eq!(
+            row["proposer"],
+            noded::hex_bytes(signer.public_key().as_ref())
+        );
+        assert_eq!(row["target"], "directory");
+
+        // the rebuild re-staged the payload: op_hash is dereferencable again
+        // from the FOLD's (fresh, post-restart) blob store.
+        let op_digest = drain_blobs.put_chunk(payload.clone());
+        assert_eq!(row["opHash"], noded::hex_bytes(&op_digest));
+        assert!(fold_blobs.has_chunk(&op_digest));
+    }
+
+    /// the fold's `None` gates mirror the drain's: a heartbeat nop and an
+    /// undecodable frame produce no explorer row (the drain's `op` is `None` /
+    /// nop-filtered for exactly these).
+    #[test]
+    fn boot_fold_skips_nop_and_undecodable_frames() {
+        let blobs = files::BlobHandle::default();
+        let signer = ed25519::PrivateKey::from_seed(43);
+        let nop = node::encode_frame(
+            &signer,
+            1,
+            &Msg {
+                target: NOP_TARGET.into(),
+                payload: Vec::new(),
+            },
+        );
+        for frame in [nop.as_slice(), b"not a frame".as_slice()] {
+            assert!(
+                sealed_frame_block_row(
+                    &blobs,
+                    &recovery::FoldedBlock {
+                        height: 3,
+                        frame,
+                        disposition: node::Disposition::Applied,
+                        app_hash: test_root(1),
+                        dispatches: &[],
+                    },
+                )
+                .is_none()
+            );
+        }
+    }
+
+    /// a REJECTED sealed frame still gets its row (the drain writes one for a
+    /// decoded non-nop reject), with an empty dispatch trace.
+    #[test]
+    fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
+        let blobs = files::BlobHandle::default();
+        let signer = ed25519::PrivateKey::from_seed(44);
+        let frame = node::encode_frame(
+            &signer,
+            2,
+            &Msg {
+                target: "directory".into(),
+                payload: b"garbage-the-module-rejects".to_vec(),
+            },
+        );
+        let row = sealed_frame_block_row(
+            &blobs,
+            &recovery::FoldedBlock {
+                height: 5,
+                frame: &frame,
+                disposition: node::Disposition::Rejected,
+                app_hash: test_root(2),
+                dispatches: &[],
+            },
+        )
+        .expect("a decoded non-nop reject still shows in the explorer");
+        let row: serde_json::Value = serde_json::from_slice(&row).expect("row json");
+        assert_eq!(row["disposition"], "rejected");
+        assert_eq!(row["operations"].as_array().map(Vec::len), Some(0));
     }
 }

@@ -6,7 +6,9 @@ import { useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 
 import type { Notification } from "../../../domain/inbox-client";
+import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
@@ -302,6 +304,7 @@ export function InboxView() {
             flexWrap: "wrap",
           }}
         >
+          <FinalizationMark op={state.ops[opKey.inbox()]} />
           <HeaderButton
             label="Mark all read"
             disabled={state.inboxUnread === 0}

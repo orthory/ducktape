@@ -9,6 +9,8 @@ version.workspace = true
 sdk = { workspace = true }
 statesync = { workspace = true }
 chat-interface = { workspace = true }
+# types-only: the tag-report edge (chat translates its shapes, the plane routes).
+tagging-interface = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

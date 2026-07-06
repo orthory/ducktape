@@ -16,8 +16,19 @@ where
     Member: Ord + Clone,
 {
     pub fn from_validator_set(members: impl IntoIterator<Item = Member>) -> Self {
-        let consensus_members: BTreeSet<Member> = members.into_iter().collect();
-        let transport_members = consensus_members.clone();
+        Self::from_sets(members, std::iter::empty())
+    }
+
+    /// the two-tier epoch membership: `validators` seat the consensus engine;
+    /// `observers` (the staged-admission tier) hold transport standing only.
+    /// transport is the UNION — the seam where the two fields diverge.
+    pub fn from_sets(
+        validators: impl IntoIterator<Item = Member>,
+        observers: impl IntoIterator<Item = Member>,
+    ) -> Self {
+        let consensus_members: BTreeSet<Member> = validators.into_iter().collect();
+        let mut transport_members = consensus_members.clone();
+        transport_members.extend(observers);
         Self {
             consensus_members,
             transport_members,
@@ -197,6 +208,10 @@ pub struct ValsetOrchestrator<Member> {
     epoch: u64,
     epoch_base: u64,
     current: BTreeSet<Member>,
+    /// the current epoch's OBSERVER set (transport standing, no quorum seat).
+    /// an observer change arms the same single cutover slot as a validator
+    /// change — mesh admission rides the epoch boundary.
+    current_observers: BTreeSet<Member>,
     pending: Option<ScheduledCutover>,
 }
 
@@ -205,18 +220,20 @@ where
     Member: Ord + Clone,
 {
     pub fn new(cutover_delay: u64, initial: impl IntoIterator<Item = Member>) -> Self {
-        Self::resume(cutover_delay, initial, 0, 0, None)
+        Self::resume(cutover_delay, initial, std::iter::empty(), 0, 0, None)
     }
 
     /// resume at recovered `(epoch, epoch_base)` coordinates instead of
-    /// genesis. `initial` is the recovered epoch's ENGINE PARTICIPANT SET
-    /// (from the recovery manifest — not the instantaneous valset, which may
-    /// already include a change awaiting cutover); `pending_cutover_view`
-    /// re-arms a cutover the pre-restart process had scheduled, so a node
-    /// that crashed mid-window rejoins the same deterministic boundary.
+    /// genesis. `initial` is the recovered epoch's ENGINE PARTICIPANT SET and
+    /// `initial_observers` its observer set (both from the recovery manifest —
+    /// not the instantaneous valset, which may already include a change
+    /// awaiting cutover); `pending_cutover_view` re-arms a cutover the
+    /// pre-restart process had scheduled, so a node that crashed mid-window
+    /// rejoins the same deterministic boundary.
     pub fn resume(
         cutover_delay: u64,
         initial: impl IntoIterator<Item = Member>,
+        initial_observers: impl IntoIterator<Item = Member>,
         epoch: u64,
         epoch_base: u64,
         pending_cutover_view: Option<u64>,
@@ -235,6 +252,7 @@ where
             epoch,
             epoch_base,
             current: initial.into_iter().collect(),
+            current_observers: initial_observers.into_iter().collect(),
             pending,
         }
     }
@@ -250,6 +268,11 @@ where
     /// the current epoch's engine participant set.
     pub fn current_members(&self) -> &BTreeSet<Member> {
         &self.current
+    }
+
+    /// the current epoch's observer set (transport standing only).
+    pub fn current_observers(&self) -> &BTreeSet<Member> {
+        &self.current_observers
     }
 
     pub fn pending_cutover(&self) -> Option<&ScheduledCutover> {
@@ -274,13 +297,18 @@ where
 
     /// observe the finalized valset projection at `finalized_view` (the last
     /// drained view — the observation barrier guarantees this is exactly the
-    /// changing block's view when membership moved). a change against the
-    /// current epoch's participant set arms a cutover `cutover_delay` views
-    /// out; the caller mirrors it into the ordered lane's discard ceiling.
+    /// changing block's view when membership moved). a change in EITHER tier
+    /// against the current epoch — the participant set or the observer set —
+    /// arms a cutover `cutover_delay` views out; the caller mirrors it into
+    /// the ordered lane's discard ceiling. observer changes ride the same
+    /// boundary because transport membership is epoch-scoped (per-epoch mesh
+    /// tracking + channel bank), and a respawn with an unchanged participant
+    /// set is safe: the boundary carry re-proposes accepted ops.
     pub fn observe_members(
         &mut self,
         finalized_view: u64,
         members: impl IntoIterator<Item = Member>,
+        observers: impl IntoIterator<Item = Member>,
     ) -> ObservationOutcome {
         if let Some(cutover) = self.pending {
             // an armed boundary never moves: a further change inside the
@@ -289,7 +317,8 @@ where
         }
 
         let observed: BTreeSet<Member> = members.into_iter().collect();
-        if observed == self.current {
+        let observed_observers: BTreeSet<Member> = observers.into_iter().collect();
+        if observed == self.current && observed_observers == self.current_observers {
             return ObservationOutcome::Unchanged;
         }
 
@@ -394,17 +423,20 @@ where
     }
 
     /// cross the armed boundary once `finalized_view` reaches it.
-    /// `boundary_members` is the valset projection read from app state NOW —
-    /// the discard ceiling froze state at the boundary, so every honest node
-    /// reads the identical set. `boundary_upgrade` is the upgrade module's state
-    /// read from that SAME frozen boundary, so ONE respawn applies BOTH a
-    /// membership change AND a pending-upgrade-at-`H` at a single finalized view.
-    /// commits the cutover: the new epoch's participant set, base, coordinates,
-    /// the boundary version, and the once-evaluated arm/abort verdict.
+    /// `boundary_members` and `boundary_observers` are the valset projections
+    /// read from app state NOW — the discard ceiling froze state at the
+    /// boundary, so every honest node reads the identical sets.
+    /// `boundary_upgrade` is the upgrade module's state read from that SAME
+    /// frozen boundary, so ONE respawn applies membership changes (both
+    /// tiers) AND a pending-upgrade-at-`H` at a single finalized view.
+    /// commits the cutover: the new epoch's participant + observer sets,
+    /// base, coordinates, the boundary version, and the once-evaluated
+    /// arm/abort verdict.
     pub fn respawn_if_due(
         &mut self,
         finalized_view: u64,
         boundary_members: impl IntoIterator<Item = Member>,
+        boundary_observers: impl IntoIterator<Item = Member>,
         boundary_upgrade: BoundaryUpgrade<Member>,
     ) -> Option<RespawnPlan<Member>> {
         let cutover = self.pending.as_ref()?;
@@ -414,7 +446,7 @@ where
 
         let cutover = self.pending.take().expect("checked pending");
         let cutover_app_height = self.app_height(cutover.cutover_view);
-        let valset = EpochMembership::from_validator_set(boundary_members);
+        let valset = EpochMembership::from_sets(boundary_members, boundary_observers);
         // read the boundary version at the SAME frozen boundary set + app height:
         // evaluate the arm/abort verdict EXACTLY ONCE here (no timers, no
         // node-local readiness view). ONE respawn carries both concerns.
@@ -423,6 +455,11 @@ where
         self.epoch = cutover.next_epoch;
         self.epoch_base = cutover_app_height;
         self.current = valset.consensus_members().clone();
+        self.current_observers = valset
+            .transport_members()
+            .difference(valset.consensus_members())
+            .cloned()
+            .collect();
 
         Some(RespawnPlan {
             epoch: self.epoch,

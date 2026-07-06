@@ -20,6 +20,13 @@
 //! 4. **Frames** — fetch a bounded recovery-journal suffix: finalized,
 //!    non-discarded frame bytes plus their seal roots/app-hash, so a promoted
 //!    joiner can persist the same replay suffix a restart would have.
+//! 5. **IndexModules / IndexChunk** — the OPTIONAL shipped-index lane
+//!    (indexable spec §7 lane 2): fluent31 checkpoint archives of the
+//!    serving node's derived per-module read models, for an instant warm
+//!    start. see the trust model — this is the one lane that is not
+//!    verifiable, which is why it stays opt-in and why every consumer must
+//!    treat a failed or refused fetch as "fall back to the from-state
+//!    rebuild", never as an error.
 //!
 //! ## trust model
 //!
@@ -30,6 +37,13 @@
 //! sync engine; snapshot installs re-derive the root before adopting bytes.
 //! (the manifest app-hash itself is cross-checked against consensus when the
 //! joiner later participates — a fabricated world still cannot vote.)
+//!
+//! the ONE exception is the shipped-index lane: the derived tier has no root
+//! by design (it is never part of the app-hash), so its archives cannot be
+//! verified — a joiner that opts in trusts the serving node for VIEW bytes
+//! only. consensus state is untouched either way, a lying archive can never
+//! fork the node, and the honest remedy for a bad shipment is the same as
+//! for any damaged index: rebuild from verified state.
 //!
 //! ## wire format
 //!
@@ -243,6 +257,11 @@ pub struct Manifest {
     /// necessarily the valset projection at `height`, which may already
     /// stage a change awaiting its cutover.
     pub participants: Vec<Vec<u8>>,
+    /// the epoch's OBSERVER set (transport standing, no quorum seat). rides
+    /// an ADDITIVE wire tail — omitted when empty, so pre-observer binaries
+    /// interoperate until the first grant (which the v3 gate defers past the
+    /// upgrade that replaces those binaries anyway).
+    pub observers: Vec<Vec<u8>>,
     /// the scheme-encoded finalization certificate for exactly `height`,
     /// when the serving node holds one (`None` right after a cutover, when
     /// the epoch has not finalized past its base — the joiner then spawns on
@@ -306,6 +325,20 @@ pub enum SyncRequest {
         after_height: u64,
         up_to_height: u64,
     },
+    /// list the shipped-index databases attached at a leased boundary — the
+    /// UNVERIFIED warm-start lane (indexable spec §7 lane 2). the derived
+    /// tier has no root by design, so nothing here composes into the
+    /// app-hash check: a joiner that opts in trusts the serving node's
+    /// bytes; one that doesn't never sends this request and heals via the
+    /// from-state rebuild instead.
+    IndexModules { boundary: BoundaryId },
+    /// fetch a chunk of one shipped-index database's archive blob. same
+    /// trust caveat as [`SyncRequest::IndexModules`].
+    IndexChunk {
+        boundary: BoundaryId,
+        db: String,
+        offset: u64,
+    },
 }
 
 /// a state-sync response.
@@ -324,6 +357,11 @@ pub enum SyncResponse {
         requested_after: u64,
         retained_from: u64,
     },
+    /// the shipped-index databases attached at a boundary: `(db, blob_len)`
+    /// pairs, in db order. empty means the source ships nothing (index off,
+    /// poisoned, or nothing attached) — the joiner just falls back to the
+    /// from-state rebuild. chunks come back as [`SyncResponse::Chunk`].
+    IndexModules { entries: Vec<(String, u64)> },
     Error(String),
 }
 
@@ -335,6 +373,7 @@ impl SyncResponse {
             Self::Module(_) => "Module",
             Self::Frames { .. } => "Frames",
             Self::RangePruned { .. } => "RangePruned",
+            Self::IndexModules { .. } => "IndexModules",
             Self::Error(_) => "Error",
         }
     }
@@ -376,6 +415,22 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             out.extend_from_slice(&after_height.to_le_bytes());
             out.extend_from_slice(&up_to_height.to_le_bytes());
         }
+        SyncRequest::IndexModules { boundary } => {
+            out.push(4u8);
+            out.extend_from_slice(&boundary.height.to_le_bytes());
+            out.extend_from_slice(boundary.app_hash.as_bytes());
+        }
+        SyncRequest::IndexChunk {
+            boundary,
+            db,
+            offset,
+        } => {
+            out.push(5u8);
+            out.extend_from_slice(&boundary.height.to_le_bytes());
+            out.extend_from_slice(boundary.app_hash.as_bytes());
+            wire::put_str(&mut out, db);
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
     }
     out
 }
@@ -404,6 +459,20 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
         3 => SyncRequest::Frames {
             after_height: wire::take_u64(&mut buf)?,
             up_to_height: wire::take_u64(&mut buf)?,
+        },
+        4 => SyncRequest::IndexModules {
+            boundary: BoundaryId {
+                height: wire::take_u64(&mut buf)?,
+                app_hash: StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?),
+            },
+        },
+        5 => SyncRequest::IndexChunk {
+            boundary: BoundaryId {
+                height: wire::take_u64(&mut buf)?,
+                app_hash: StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?),
+            },
+            db: wire::take_str(&mut buf)?,
+            offset: wire::take_u64(&mut buf)?,
         },
         other => return Err(WireError::BadTag("SyncRequest", other)),
     };
@@ -460,6 +529,17 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                     None => out.push(0),
                 }
             }
+            // ADDITIVE observer tail — omitted when empty so the byte stream
+            // is identical to the pre-observer wire until a grant exists (a
+            // pre-observer decoder rejects trailing bytes, but it can only
+            // meet a non-empty set on a >=v3 net, which its boot preflight
+            // refuses right after this decode anyway).
+            if !m.observers.is_empty() {
+                out.extend_from_slice(&(m.observers.len() as u64).to_le_bytes());
+                for o in &m.observers {
+                    wire::put_bytes(&mut out, o);
+                }
+            }
         }
         SyncResponse::Chunk { total, bytes } => {
             out.push(1u8);
@@ -496,6 +576,18 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
         SyncResponse::Error(msg) => {
             out.push(5u8);
             wire::put_str(&mut out, msg);
+        }
+        // tag 6, appended after Error: an OLD binary answering a new joiner
+        // never emits it, and a new joiner asking an old server just gets the
+        // old decoder's BadTag turned into an Error — the optional lane
+        // degrades to lane 1 instead of wedging a mixed-version sync.
+        SyncResponse::IndexModules { entries } => {
+            out.push(6u8);
+            out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+            for (db, len) in entries {
+                wire::put_str(&mut out, db);
+                out.extend_from_slice(&len.to_le_bytes());
+            }
         }
     }
     out
@@ -574,12 +666,30 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                     resolver_target,
                 });
             }
+            // ADDITIVE observer tail — absent on the pre-observer wire.
+            let observers = if buf.is_empty() {
+                Vec::new()
+            } else {
+                let o = wire::take_u64(&mut buf)?;
+                if o == 0 || o > (buf.len() / 8) as u64 {
+                    return Err(WireError::Codec(format!(
+                        "observer count {o} invalid against the {} remaining bytes",
+                        buf.len()
+                    )));
+                }
+                let mut observers = Vec::with_capacity(o as usize);
+                for _ in 0..o {
+                    observers.push(wire::take_bytes(&mut buf)?.to_vec());
+                }
+                observers
+            };
             SyncResponse::Manifest(Manifest {
                 height,
                 app_hash,
                 epoch,
                 view_base,
                 participants,
+                observers,
                 floor_cert,
                 current_version,
                 pending_upgrade,
@@ -634,6 +744,22 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
             retained_from: wire::take_u64(&mut buf)?,
         },
         5 => SyncResponse::Error(wire::take_str(&mut buf)?),
+        6 => {
+            let n = wire::take_u64(&mut buf)?;
+            // each entry costs at least its name length prefix + blob length,
+            // so a forged count can never drive allocation past the buffer.
+            if n > (buf.len() / 16) as u64 {
+                return Err(WireError::Codec(format!(
+                    "index db count {n} exceeds the {} remaining bytes",
+                    buf.len()
+                )));
+            }
+            let mut entries = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                entries.push((wire::take_str(&mut buf)?, wire::take_u64(&mut buf)?));
+            }
+            SyncResponse::IndexModules { entries }
+        }
         other => return Err(WireError::BadTag("SyncResponse", other)),
     };
     wire::expect_empty(buf)?;
@@ -696,11 +822,12 @@ struct CapturedModule {
 /// and the consensus wiring) supplies them per request; the floor-cert
 /// contract is the caller's: pass it only when it certifies exactly the
 /// current finalized height.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BoundaryCoords {
     pub epoch: u64,
     pub view_base: u64,
     pub participants: Vec<Vec<u8>>,
+    pub observers: Vec<Vec<u8>>,
     pub floor_cert: Option<Vec<u8>>,
     /// the agreed protocol version active at the served boundary. the caller
     /// stamps it from live upgrade-module state, like `epoch`/`view_base`.
@@ -715,6 +842,12 @@ struct Capture {
     app_hash: StateRoot,
     coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
+    /// shipped-index archive blobs, keyed by database name — the unverified
+    /// warm-start lane. `None` until the serving node attaches them (cut
+    /// lazily on the first index request, so joiners that never opt in cost
+    /// nothing); riding the capture ties their lifetime to its lease/evict
+    /// lifecycle.
+    index_blobs: Option<BTreeMap<String, Vec<u8>>>,
 }
 
 /// the server side of the protocol: capture consistent boundary views on
@@ -745,6 +878,40 @@ impl SyncServer {
         self.evict_unleased_overflow();
     }
 
+    /// whether shipped-index blobs are already attached at `id` — the caller
+    /// (who owns the index store; this crate deliberately does not) checks
+    /// this on an [`SyncRequest::IndexModules`] and cuts + attaches first
+    /// when they are not.
+    pub fn index_attached(&self, id: BoundaryId) -> bool {
+        self.captures
+            .get(&id)
+            .is_some_and(|c| c.index_blobs.is_some())
+    }
+
+    /// attach shipped-index archive blobs (database name → encoded archive)
+    /// to a leased capture. they are served by [`SyncRequest::IndexModules`]
+    /// / [`SyncRequest::IndexChunk`] and live exactly as long as the capture.
+    /// an empty map is a valid attachment: "this source ships nothing".
+    pub fn attach_index(
+        &mut self,
+        id: BoundaryId,
+        blobs: BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), String> {
+        if !self.leased.contains_key(&id) {
+            return Err(format!(
+                "boundary {} {} is not leased (refetch manifest)",
+                id.height,
+                hex_root(&id.app_hash)
+            ));
+        }
+        let capture = self
+            .captures
+            .get_mut(&id)
+            .ok_or_else(|| format!("no capture at boundary {}", id.height))?;
+        capture.index_blobs = Some(blobs);
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn insert_capture_for_test(&mut self, id: BoundaryId) {
         self.captures.insert(
@@ -753,6 +920,7 @@ impl SyncServer {
                 app_hash: id.app_hash,
                 coords: BoundaryCoords::default(),
                 modules: BTreeMap::new(),
+                index_blobs: None,
             },
         );
     }
@@ -782,6 +950,7 @@ impl SyncServer {
                 app_hash: id.app_hash,
                 coords: BoundaryCoords::default(),
                 modules,
+                index_blobs: None,
             },
         );
     }
@@ -873,6 +1042,7 @@ impl SyncServer {
                     epoch: capture.coords.epoch,
                     view_base: capture.coords.view_base,
                     participants: capture.coords.participants.clone(),
+                    observers: capture.coords.observers.clone(),
                     floor_cert: capture.coords.floor_cert.clone(),
                     current_version: capture.coords.current_version,
                     pending_upgrade: capture.coords.pending_upgrade.clone(),
@@ -937,6 +1107,50 @@ impl SyncServer {
             SyncRequest::Frames { .. } => {
                 Err("frame range requests require the recovery journal".into())
             }
+            SyncRequest::IndexModules { boundary } => {
+                let capture = self.leased_capture(boundary)?;
+                let Some(blobs) = &capture.index_blobs else {
+                    // the caller intercepts this request to cut + attach
+                    // first; reaching here unattached means it chose not to
+                    // (no index store, or shipping refused) — an EMPTY list,
+                    // not an error, so the joiner cleanly falls back.
+                    return Ok(SyncResponse::IndexModules {
+                        entries: Vec::new(),
+                    });
+                };
+                Ok(SyncResponse::IndexModules {
+                    entries: blobs
+                        .iter()
+                        .map(|(db, blob)| (db.clone(), blob.len() as u64))
+                        .collect(),
+                })
+            }
+            SyncRequest::IndexChunk {
+                boundary,
+                db,
+                offset,
+            } => {
+                let capture = self.leased_capture(boundary)?;
+                let blob = capture
+                    .index_blobs
+                    .as_ref()
+                    .and_then(|blobs| blobs.get(&db))
+                    .ok_or_else(|| {
+                        format!("no shipped index db {db} in capture {}", boundary.height)
+                    })?;
+                let total = blob.len() as u64;
+                if offset > total {
+                    return Err(format!(
+                        "offset {offset} past the {total}-byte index archive of {db}"
+                    ));
+                }
+                let start = offset as usize;
+                let end = (start + CHUNK_LEN).min(blob.len());
+                Ok(SyncResponse::Chunk {
+                    total,
+                    bytes: blob[start..end].to_vec(),
+                })
+            }
         }
     }
 
@@ -973,7 +1187,18 @@ impl SyncServer {
             height: finalized.height,
             app_hash: snapshot.app_hash,
         };
-        if self.captures.contains_key(&id) {
+        if let Some(capture) = self.captures.get_mut(&id) {
+            // same boundary STATE, possibly new consensus ADDRESS: an epoch
+            // cutover at a stalled boundary (a 1->2 admission is the canonical
+            // case — epoch 1 cannot finalize until the joiner arrives) changes
+            // the coordinates without changing (height, app_hash). a capture
+            // taken just before the cutover would otherwise serve its stale
+            // epoch/participants forever, and the parked joiner it describes
+            // would never learn it was admitted. the payload bytes are
+            // identical either way; only the coordinates are refreshed.
+            if &capture.coords != coords {
+                capture.coords = coords.clone();
+            }
             return Ok(id);
         }
 
@@ -1015,6 +1240,7 @@ impl SyncServer {
                 app_hash: snapshot.app_hash,
                 coords: coords.clone(),
                 modules,
+                index_blobs: None,
             },
         );
         Ok(id)
@@ -1115,6 +1341,85 @@ pub async fn fetch_snapshot<C: SyncClient>(
     }
 }
 
+// ---- the shipped-index archive framing ------------------------------------
+// one shipped database travels as a single blob: `(file name, file bytes)`
+// pairs in the store's file order, wire-framed like everything else here.
+// the joiner hands the decoded set to the indexer's staging writer, which is
+// where hostile names (traversal, hidden files, the engine lock) are refused
+// — one enforcement point, at the trust boundary that touches disk.
+
+/// flatten one database's checkpoint file set into an archive blob.
+pub fn encode_index_archive(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, bytes) in files {
+        wire::put_str(&mut out, name);
+        wire::put_bytes(&mut out, bytes);
+    }
+    out
+}
+
+/// decode an archive blob back into its file set. structural only — name
+/// policy is the staging writer's.
+pub fn decode_index_archive(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, WireError> {
+    let mut buf = bytes;
+    let mut files = Vec::new();
+    while !buf.is_empty() {
+        let name = wire::take_str(&mut buf)?;
+        let bytes = wire::take_bytes(&mut buf)?.to_vec();
+        files.push((name, bytes));
+    }
+    Ok(files)
+}
+
+/// list the shipped-index databases a source attached at a boundary. empty
+/// means the source ships nothing — fall back to the from-state rebuild.
+pub async fn fetch_index_modules<C: SyncClient>(
+    client: &C,
+    boundary: BoundaryId,
+) -> Result<Vec<(String, u64)>, SyncError> {
+    match client.request(SyncRequest::IndexModules { boundary }).await? {
+        SyncResponse::IndexModules { entries } => Ok(entries),
+        SyncResponse::Error(e) => Err(SyncError::Server(e)),
+        other => Err(SyncError::UnexpectedResponse(other.kind_name())),
+    }
+}
+
+/// fetch one shipped-index database's full archive blob, chunk by chunk —
+/// the index twin of [`fetch_snapshot`].
+pub async fn fetch_index_db<C: SyncClient>(
+    client: &C,
+    boundary: BoundaryId,
+    db: &str,
+) -> Result<Vec<u8>, SyncError> {
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let resp = client
+            .request(SyncRequest::IndexChunk {
+                boundary,
+                db: db.to_string(),
+                offset: out.len() as u64,
+            })
+            .await?;
+        match resp {
+            SyncResponse::Chunk { total, bytes } => {
+                if bytes.is_empty() && out.len() < total as usize {
+                    return Err(SyncError::Module {
+                        module: db.to_string(),
+                        reason: "server returned an empty index chunk mid-payload".into(),
+                    });
+                }
+                out.extend_from_slice(&bytes);
+                if out.len() as u64 >= total {
+                    out.truncate(total as usize);
+                    return Ok(out);
+                }
+            }
+            SyncResponse::Error(e) => return Err(SyncError::Server(e)),
+            other => return Err(SyncError::UnexpectedResponse(other.kind_name())),
+        }
+    }
+}
+
 /// fetch a finite, ordered recovery-frame suffix in bounded batches.
 pub async fn fetch_frames<C: SyncClient>(
     client: &C,
@@ -1205,6 +1510,20 @@ mod tests {
                 after_height: 42,
                 up_to_height: 48,
             },
+            SyncRequest::IndexModules {
+                boundary: BoundaryId {
+                    height: 42,
+                    app_hash: StateRoot([4u8; ROOT_LEN]),
+                },
+            },
+            SyncRequest::IndexChunk {
+                boundary: BoundaryId {
+                    height: 42,
+                    app_hash: StateRoot([4u8; ROOT_LEN]),
+                },
+                db: "_blocks".into(),
+                offset: 1 << 18,
+            },
         ] {
             let bytes = encode_request(&req);
             assert_eq!(decode_request(&bytes).unwrap(), req);
@@ -1220,6 +1539,8 @@ mod tests {
                 epoch: 2,
                 view_base: 5,
                 participants: vec![vec![3u8; 32], vec![4u8; 32]],
+                // non-empty: exercises the additive observer wire tail.
+                observers: vec![vec![5u8; 32]],
                 floor_cert: Some(vec![0xCC; 96]),
                 // a pending upgrade set: exercise the Some arm of the tail.
                 current_version: 3,
@@ -1257,6 +1578,7 @@ mod tests {
                 epoch: 1,
                 view_base: 12,
                 participants: vec![vec![3u8; 32]],
+                observers: vec![],
                 floor_cert: None,
                 current_version: 0,
                 pending_upgrade: None,
@@ -1282,10 +1604,29 @@ mod tests {
                 retained_from: 12,
             },
             SyncResponse::Error("nope".into()),
+            SyncResponse::IndexModules {
+                entries: vec![("chat".into(), 4096), ("_blocks".into(), 0)],
+            },
+            SyncResponse::IndexModules { entries: vec![] },
         ] {
             let bytes = encode_response(&resp);
             assert_eq!(decode_response(&bytes).unwrap(), resp);
         }
+    }
+
+    #[test]
+    fn index_archive_round_trips_and_rejects_truncation() {
+        let files = vec![
+            ("manifest-000001".to_string(), vec![1u8, 2, 3]),
+            ("sst-000001.tbl".to_string(), vec![0xAB; 300]),
+            ("vlog-000001.vlog".to_string(), Vec::new()),
+        ];
+        let blob = encode_index_archive(&files);
+        assert_eq!(decode_index_archive(&blob).unwrap(), files);
+        assert_eq!(decode_index_archive(&[]).unwrap(), Vec::new());
+        // any cut inside a frame is a loud decode error, not a short file.
+        assert!(decode_index_archive(&blob[..blob.len() - 1]).is_err());
+        assert!(decode_index_archive(&blob[..9]).is_err());
     }
 
     #[test]
@@ -1355,6 +1696,7 @@ mod tests {
             epoch: 2,
             view_base: 5,
             participants: vec![],
+            observers: vec![],
             floor_cert: None,
             current_version: 3,
             pending_upgrade: None,
@@ -1381,6 +1723,7 @@ mod tests {
             epoch: 0,
             view_base: 0,
             participants: vec![],
+            observers: vec![],
             floor_cert: None,
             current_version: 3,
             pending_upgrade: None,

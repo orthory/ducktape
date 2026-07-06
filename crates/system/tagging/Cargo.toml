@@ -1,0 +1,17 @@
+[package]
+name = "tagging"
+edition.workspace = true
+version.workspace = true
+
+# the cross-module engagement router: subscription scopes + tag fan-out.
+# router only (no engagement policy), and 100% module-agnostic — content
+# modules translate their shapes at their own edge; this crate imports no
+# content module's interface, ever.
+[dependencies]
+sdk = { workspace = true }
+tagging-interface = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"

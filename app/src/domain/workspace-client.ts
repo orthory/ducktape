@@ -54,6 +54,18 @@ export interface PhaseReport {
   detail: string | null;
 }
 
+/** One pending join request a parked joiner delivered over the lobby channel.
+ *  Snake_case: these rows pass through verbatim from the NODE's
+ *  `join-requests` JSON (not the registry's camelCase structs). */
+export interface JoinRequest {
+  /** The key asking to join, hex. */
+  joiner: string;
+  /** The member whose invite token authorized the announce, hex. */
+  issuer: string;
+  first_seen_ms: number;
+  last_seen_ms: number;
+}
+
 // ── Guard ───────────────────────────────────────────────
 
 /** The registry is desktop-only; the web build never calls these. */
@@ -81,6 +93,12 @@ export const workspacePhase = (id: string): Promise<PhaseReport> =>
 export const inviteBlob = (id: string): Promise<string> =>
   invoke<string>("workspace_invite_blob", { id });
 
+/** The verified join requests parked joiners announced to this member's
+ *  running node — what the Members view renders with an Approve button.
+ *  Approving is admitMember (the normal governance ballot). */
+export const joinRequests = (id: string): Promise<JoinRequest[]> =>
+  invoke<JoinRequest[]>("workspace_join_requests", { id });
+
 // ── Writes ──────────────────────────────────────────────
 
 /** Found a new network; returns the recorded (now active) workspace. */
@@ -92,9 +110,21 @@ export const createWorkspace = (name: string): Promise<Workspace> =>
 export const joinWorkspace = (name: string, blob: string): Promise<Workspace> =>
   invoke<Workspace>("workspace_join", { name, blob });
 
-/** Admit a joiner by pubkey through this running member node's governance. */
+/** Admit a joiner by pubkey through this running member node's governance.
+ *  Grants OBSERVER standing (mesh + statesync, no quorum seat) — the first
+ *  step of staged admission; [`promoteMember`] seats it once warm. */
 export const admitMember = (id: string, pubkey: string): Promise<void> =>
   invoke<void>("workspace_admit", { id, pubkey });
+
+/** Promote an observer into the consensus quorum by pubkey through this
+ *  running member node's governance — staged admission's second step. */
+export const promoteMember = (id: string, pubkey: string): Promise<void> =>
+  invoke<void>("workspace_promote", { id, pubkey });
+
+/** Revoke observer standing by pubkey through this running member node's
+ *  governance — the undo of [`admitMember`]; the key's node parks again. */
+export const removeObserver = (id: string, pubkey: string): Promise<void> =>
+  invoke<void>("workspace_observer_remove", { id, pubkey });
 
 /** Remove a validator by pubkey through this running member node's governance.
  *  Opens a RemoveValidator proposal and casts this node's yes-ballot; the

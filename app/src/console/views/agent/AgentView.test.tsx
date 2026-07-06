@@ -42,8 +42,9 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         agent_id: "summarizer",
         owner: "System" as const,
         display_name: "Summary Agent",
-        model_ref: "gpt-5.5",
+        capability: "alpha",
         prompt_hash: bytes(0xab),
+        prompt_doc: null,
         allowed_actions: ["chat.post", "tasks.create"],
         status: "Active" as const,
         created_at: 10,
@@ -53,8 +54,9 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         agent_id: "qa-agent",
         owner: "System" as const,
         display_name: "QA Agent",
-        model_ref: "gpt-5.5-codex",
+        capability: "beta",
         prompt_hash: bytes(0xcd),
+        prompt_doc: null,
         allowed_actions: ["chat.post"],
         status: "Paused" as const,
         created_at: 11,
@@ -62,9 +64,10 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
       },
     ],
     watches: [{ channel_id: "general", policy: { Assigned: "summarizer" } }],
-    runs: [
+    pendingRuns: [
       {
         run_id: "general/42/summarizer",
+        dispatch_id: "ef".repeat(32),
         agent_id: "summarizer",
         channel_id: "general",
         anchor_seq: 42,
@@ -72,10 +75,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         job_id: null,
         job_claim_height: 0,
         requester: "System" as const,
-        status: { AwaitingOracle: { saga_id: "saga-1" } },
-        context_hash: bytes(0xef),
         created_at: 30,
-        updated_at: 40,
       },
     ],
     ...patch,
@@ -116,7 +116,7 @@ describe("AgentView", () => {
     const detail = screen.getByRole("region", { name: /agent detail/i });
     expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
     expect(within(detail).getByText("summarizer")).toBeInTheDocument();
-    expect(within(detail).getByText("gpt-5.5")).toBeInTheDocument();
+    expect(within(detail).getByText("alpha")).toBeInTheDocument();
     expect(within(detail).getByText("Post to chat")).toBeInTheDocument();
     expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
 
@@ -164,8 +164,8 @@ describe("AgentView", () => {
     fireEvent.change(screen.getByLabelText("Agent ID"), {
       target: { value: "Triage Agent" },
     });
-    fireEvent.change(screen.getByLabelText("Model reference"), {
-      target: { value: "gpt-5.5-codex" },
+    fireEvent.change(screen.getByLabelText("Capability"), {
+      target: { value: "beta" },
     });
     fireEvent.change(screen.getByLabelText("System prompt"), {
       target: { value: "Summarize incoming incidents." },
@@ -174,7 +174,7 @@ describe("AgentView", () => {
     expect(spies.registerAgent).toHaveBeenCalledWith({
       displayName: "Triage Agent",
       agentId: "triage-agent",
-      modelRef: "gpt-5.5-codex",
+      capability: "beta",
       prompt: "Summarize incoming incidents.",
       allowedActions: ["chat.post"],
     });
@@ -198,7 +198,7 @@ describe("AgentView", () => {
     expect(spies.updateAgent).toHaveBeenCalledWith({
       agentId: "summarizer",
       displayName: "Renamed Agent",
-      modelRef: "gpt-5.5",
+      capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
     });
   });

@@ -92,7 +92,8 @@ impl Module for Recorder {
 }
 
 fn at(height: u64, origin: Origin) -> BlockContext {
-    BlockContext { protocol_version: 0,
+    BlockContext {
+        protocol_version: 0,
         height,
         consensus_time: height,
         origin,
@@ -103,6 +104,7 @@ fn trigger(id: &str, reply_to: Option<&str>) -> Msg {
     Msg {
         target: "saga".into(),
         payload: encode_msg(&SagaMsg::Trigger {
+            pinned_assignee: None,
             saga_id: id.into(),
             spec: b"work".to_vec(),
             reply_to: reply_to.map(String::from),
@@ -110,6 +112,7 @@ fn trigger(id: &str, reply_to: Option<&str>) -> Msg {
             deadline: None,
             max_attempts: 1,
             lease_views: None,
+            capability: None,
         }),
     }
 }
@@ -135,6 +138,7 @@ async fn saga_view(host: &Host, id: &str) -> Option<SagaView> {
         .unwrap();
     match decode_reply(&reply).unwrap() {
         SagaReply::Saga(v) => v,
+        other => panic!("expected Saga reply, got {other:?}"),
     }
 }
 

@@ -40,11 +40,18 @@
 //! submitter's result accepted (first agreed one wins), lease windows still
 //! tracked when the trigger asks (so `Crank` can retry a silent worker).
 //! [`SagaModule::with_valset`] additionally rendezvous-assigns each attempt to
-//! `validators[H(saga_id ‖ attempt ‖ height) % n]` via the valset module's
-//! query surface; under [`LeasePolicy::Strict`] a result is accepted only from
-//! the assignee's external origin. when the validator set is empty or
-//! unavailable the assignee is `None` and strict degrades to accept-any for
-//! that attempt — the honest fallback until membership is authenticated.
+//! `pool[H(saga_id ‖ attempt ‖ height) % n]` over the valset module's
+//! membership; [`SagaModule::with_assignment`] adds a capability registry,
+//! and a trigger that names a capability then draws its pool from that tag's
+//! ANNOUNCED PROVIDERS instead — only nodes that can execute the work ever
+//! hold its lease, and a tag nobody provides assigns nobody (never the raw
+//! valset). under [`LeasePolicy::Strict`] a result is accepted only from the
+//! assignee's external origin. when the pool is empty or unavailable the
+//! assignee is `None` and the emitted [`WorkerRequest`] is an ANNOUNCEMENT:
+//! no result can land for it under strict — a capable node claims it with
+//! `Accept` (first in consensus order wins the lease, and the re-emitted
+//! request names the winner), so N capable nodes never each pay for the
+//! same execution.
 //!
 //! ## GC
 //!
@@ -61,10 +68,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use capability_interface::{
+    CapabilityQuery, CapabilityReply, decode_reply as capability_decode_reply,
+    encode_query as capability_encode_query,
+};
 use saga_interface::{
-    MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES, MAX_SPEC_BYTES, SagaCallback,
-    SagaMsg, SagaOrigin, SagaOutcome, SagaQuery, SagaReply, SagaStatus, SagaView, WorkerRequest,
-    decode_msg, decode_query, encode_callback, encode_reply, encode_worker_request,
+    MAX_CAPABILITY_BYTES, MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES,
+    MAX_SPEC_BYTES, SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, SagaQuery, SagaReply,
+    SagaStatus, SagaView, WorkerRequest, decode_msg, decode_query, encode_callback, encode_reply,
+    encode_worker_request,
 };
 use sdk::{Ctx, Effect, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
@@ -89,8 +101,9 @@ pub enum LeasePolicy {
     /// signature-verified.
     Open,
     /// a result is accepted only from the assignee's external origin; a
-    /// non-assignee result is a deterministic no-op. degrades to accept-any
-    /// for an attempt whose assignee is `None` (empty/unavailable set).
+    /// non-assignee result is a deterministic no-op. an attempt whose
+    /// assignee is `None` (empty/unavailable set) accepts NO result until a
+    /// node claims it via `Accept` — the announcement lane.
     Strict,
 }
 
@@ -105,6 +118,10 @@ struct Saga {
     reply_payload: Vec<u8>,
     /// opaque work spec, echoed to the worker on every attempt.
     spec: Vec<u8>,
+    /// the capability the work requires, when the trigger named one: each
+    /// attempt is then rendezvous-assigned over the tag's announced providers
+    /// instead of the raw validator set. opaque to this module.
+    capability: Option<String>,
     status: SagaStatus,
     /// the current attempt (0-based); the half of the idempotency key that
     /// makes retried work distinguishable from stale results.
@@ -113,6 +130,9 @@ struct Saga {
     max_attempts: u32,
     /// the current attempt's lease holder, if assignment is configured.
     assignee: Option<Vec<u8>>,
+    /// the trigger's static binding: when set, every attempt's assignee IS
+    /// this key — no pool query, no rendezvous.
+    pinned_assignee: Option<Vec<u8>>,
     /// the trigger's requested lease window in views, echoed onto every
     /// retry so re-leases reproduce the original grant deterministically.
     lease_views: Option<u64>,
@@ -176,6 +196,7 @@ fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
         put_opt_bytes(&mut out, s.reply_to.as_ref().map(|m| m.as_bytes()));
         put_bytes(&mut out, &s.reply_payload);
         put_bytes(&mut out, &s.spec);
+        put_opt_bytes(&mut out, s.capability.as_ref().map(|c| c.as_bytes()));
         out.push(match s.status {
             SagaStatus::Pending => 0,
             SagaStatus::Done => 1,
@@ -186,6 +207,7 @@ fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
         out.extend_from_slice(&s.attempt.to_le_bytes());
         out.extend_from_slice(&s.max_attempts.to_le_bytes());
         put_opt_bytes(&mut out, s.assignee.as_deref());
+        put_opt_bytes(&mut out, s.pinned_assignee.as_deref());
         put_opt_u64(&mut out, s.lease_views);
         put_opt_u64(&mut out, s.lease_expires_at);
         put_opt_u64(&mut out, s.deadline);
@@ -292,10 +314,11 @@ fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
 fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
     let count = take_u64(&mut buf)?;
     // every saga costs at least its fixed-width fields — the id length prefix,
-    // one origin discriminant, six option tags, three length prefixes, status,
-    // two u32s, and two u64s — so a count the input cannot possibly hold is
-    // rejected before the loop builds anything.
-    const MIN_SAGA_BYTES: u64 = 8 + 1 + 1 + 8 + 8 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
+    // one origin discriminant, nine option tags, three length prefixes,
+    // status, two u32s, and two u64s — so a count the input cannot possibly
+    // hold is rejected before the loop builds anything.
+    const MIN_SAGA_BYTES: u64 =
+        8 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
     if count
         .checked_mul(MIN_SAGA_BYTES)
         .map_or(true, |need| need > buf.len() as u64)
@@ -319,6 +342,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
         let reply_to = take_opt_string(&mut buf)?;
         let reply_payload = take_lp_bytes(&mut buf)?;
         let spec = take_lp_bytes(&mut buf)?;
+        let capability = take_opt_string(&mut buf)?;
         let status = match take(&mut buf, 1)?[0] {
             0 => SagaStatus::Pending,
             1 => SagaStatus::Done,
@@ -330,6 +354,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
         let attempt = take_u32(&mut buf)?;
         let max_attempts = take_u32(&mut buf)?;
         let assignee = take_opt_bytes(&mut buf)?;
+        let pinned_assignee = take_opt_bytes(&mut buf)?;
         let lease_views = take_opt_u64(&mut buf)?;
         let lease_expires_at = take_opt_u64(&mut buf)?;
         let deadline = take_opt_u64(&mut buf)?;
@@ -344,10 +369,12 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
                 reply_to,
                 reply_payload,
                 spec,
+                capability,
                 status,
                 attempt,
                 max_attempts,
                 assignee,
+                pinned_assignee,
                 lease_views,
                 lease_expires_at,
                 deadline,
@@ -389,6 +416,11 @@ pub struct SagaModule {
     /// the valset module rendezvous assignment queries — `None` disables
     /// assignment entirely. genesis config, not state.
     valset: Option<ModuleId>,
+    /// the capability registry consulted when a trigger names a capability:
+    /// assignment then draws from the tag's announced providers instead of
+    /// the raw validator set. `None` = capability-tagged sagas assign nobody
+    /// (accept-any). genesis config, not state.
+    capability_registry: Option<ModuleId>,
     /// genesis config, not state: identical on every node by construction.
     policy: LeasePolicy,
     /// committed state — what `root()` and the app-hash commit to.
@@ -406,6 +438,7 @@ impl SagaModule {
         Self {
             id: id.into(),
             valset: None,
+            capability_registry: None,
             policy: LeasePolicy::Open,
             sagas: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -422,9 +455,26 @@ impl SagaModule {
         Self {
             id: id.into(),
             valset: Some(valset.into()),
+            capability_registry: None,
             policy,
             sagas: BTreeMap::new(),
             pending: BTreeMap::new(),
+        }
+    }
+
+    /// [`SagaModule::with_valset`] plus capability-aware assignment: an
+    /// attempt of a saga whose trigger named a capability is
+    /// rendezvous-assigned over `capability_registry`'s announced providers
+    /// of that tag; untagged sagas keep valset assignment.
+    pub fn with_assignment(
+        id: impl Into<ModuleId>,
+        valset: impl Into<ModuleId>,
+        capability_registry: impl Into<ModuleId>,
+        policy: LeasePolicy,
+    ) -> Self {
+        Self {
+            capability_registry: Some(capability_registry.into()),
+            ..Self::with_valset(id, valset, policy)
         }
     }
 
@@ -466,10 +516,12 @@ impl SagaModule {
             reply_to: saga.reply_to.clone(),
             reply_payload: saga.reply_payload.clone(),
             spec: saga.spec.clone(),
+            capability: saga.capability.clone(),
             status: saga.status,
             attempt: saga.attempt,
             max_attempts: saga.max_attempts,
             assignee: saga.assignee.clone(),
+            pinned_assignee: saga.pinned_assignee.clone(),
             lease_views: saga.lease_views,
             lease_expires_at: saga.lease_expires_at,
             deadline: saga.deadline,
@@ -480,35 +532,73 @@ impl SagaModule {
         }
     }
 
-    /// rendezvous-assign one attempt: `validators[H(saga_id ‖ attempt-le ‖
-    /// height-le) % n]` over the valset module's (sorted) committed set. every
-    /// input is agreed, so every validator derives the same assignee. an
-    /// empty or unavailable set yields `None` — no assignment, and strict
-    /// degrades to accept-any for the attempt.
+    /// the candidate pool one attempt is assigned from. a saga that names a
+    /// capability draws from that tag's ANNOUNCED PROVIDERS (the capability
+    /// registry's sorted committed view) — never from the raw valset, so a
+    /// node that cannot execute the work never holds its lease. an untagged
+    /// saga draws from the valset as before. every failure path — module not
+    /// configured, query unavailable, empty set — yields `None`: no
+    /// assignment, and strict degrades to accept-any for the attempt.
+    async fn assignment_pool(
+        &self,
+        ctx: &dyn Ctx,
+        capability: Option<&str>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let pool = match capability {
+            Some(tag) => {
+                let registry = self.capability_registry.as_deref()?;
+                let reply = ctx
+                    .query(
+                        registry,
+                        &capability_encode_query(&CapabilityQuery::Providers {
+                            capability: tag.to_string(),
+                        }),
+                    )
+                    .await
+                    .ok()?;
+                match capability_decode_reply(&reply).ok()? {
+                    CapabilityReply::Providers(providers) => providers,
+                    _ => return None,
+                }
+            }
+            None => {
+                let valset = self.valset.as_deref()?;
+                let reply = ctx
+                    .query(valset, &valset_encode_query(&ValsetQuery::Validators))
+                    .await
+                    .ok()?;
+                match valset_decode_reply(&reply).ok()? {
+                    ValsetReply::Validators(validators) => validators,
+                    // the module answered a different query — no pool.
+                    _ => return None,
+                }
+            }
+        };
+        (!pool.is_empty()).then_some(pool)
+    }
+
+    /// rendezvous-assign one attempt: `pool[H(saga_id ‖ attempt-le ‖
+    /// height-le) % n]` over the (sorted) assignment pool. every input is
+    /// agreed, so every validator derives the same assignee. `None` when no
+    /// pool is available — no assignment, and strict degrades to accept-any
+    /// for the attempt.
     async fn compute_assignee(
         &self,
         ctx: &dyn Ctx,
         saga_id: &str,
+        capability: Option<&str>,
         attempt: u32,
         height: u64,
     ) -> Option<Vec<u8>> {
-        let valset = self.valset.as_deref()?;
-        let reply = ctx
-            .query(valset, &valset_encode_query(&ValsetQuery::Validators))
-            .await
-            .ok()?;
-        let ValsetReply::Validators(validators) = valset_decode_reply(&reply).ok()?;
-        if validators.is_empty() {
-            return None;
-        }
+        let pool = self.assignment_pool(ctx, capability).await?;
         let mut hasher = Sha256::new();
         hasher.update(saga_id.as_bytes());
         hasher.update(attempt.to_le_bytes());
         hasher.update(height.to_le_bytes());
         let digest = hasher.finalize();
         let pick = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
-        let index = (pick % validators.len() as u64) as usize;
-        Some(validators[index].clone())
+        let index = (pick % pool.len() as u64) as usize;
+        Some(pool[index].clone())
     }
 
     /// the P6 promise: on a terminal transition, hand the requester its
@@ -527,12 +617,24 @@ impl SagaModule {
     }
 
     /// grant the current attempt's lease and ask the worker to run it: the
-    /// shared tail of trigger, error-retry, and lease-expiry-retry.
+    /// shared tail of trigger, error-retry, and lease-expiry-retry. a pinned
+    /// saga leases every attempt to its pinned key; everything else is
+    /// rendezvous-assigned from the pool.
     async fn lease_and_request(&mut self, ctx: &mut dyn Ctx, saga_id: String, mut saga: Saga) {
         let height = ctx.env().height;
-        saga.assignee = self
-            .compute_assignee(ctx, &saga_id, saga.attempt, height)
-            .await;
+        saga.assignee = match &saga.pinned_assignee {
+            Some(key) => Some(key.clone()),
+            None => {
+                self.compute_assignee(
+                    ctx,
+                    &saga_id,
+                    saga.capability.as_deref(),
+                    saga.attempt,
+                    height,
+                )
+                .await
+            }
+        };
         saga.lease_expires_at = lease_expiry(height, &saga.assignee, saga.lease_views);
         ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
             saga_id: saga_id.clone(),
@@ -604,6 +706,8 @@ impl Module for SagaModule {
                 deadline,
                 max_attempts,
                 lease_views,
+                capability,
+                pinned_assignee,
             } => {
                 // a duplicate saga_id — staged this block or already committed
                 // — is a DETERMINISTIC NO-OP. (v1 silently reset the saga and
@@ -630,6 +734,33 @@ impl Module for SagaModule {
                         reply_payload.len()
                     )));
                 }
+                // the tag is opaque here (no charset rules — an unannounced
+                // tag simply assigns nobody) but its SIZE is bounded like
+                // every other stored field; an empty Some is a caller bug,
+                // rejected rather than silently read as "no capability".
+                if let Some(tag) = &capability {
+                    if tag.is_empty() {
+                        return Err(Error::Module(
+                            "trigger capability must be non-empty when set".into(),
+                        ));
+                    }
+                    if tag.len() > MAX_CAPABILITY_BYTES {
+                        return Err(Error::Module(format!(
+                            "trigger capability is {} bytes; the cap is {MAX_CAPABILITY_BYTES}",
+                            tag.len()
+                        )));
+                    }
+                }
+                // an empty pinned key is a caller bug, rejected rather than
+                // silently read as "no binding" (the same rule as an empty
+                // capability tag).
+                if let Some(key) = &pinned_assignee {
+                    if key.is_empty() {
+                        return Err(Error::Module(
+                            "trigger pinned_assignee must be non-empty when set".into(),
+                        ));
+                    }
+                }
                 // the callback-poison rule (design §4): a callback aimed at an
                 // unknown module — or at this module itself, which cannot
                 // decode its own callback — would abort every future terminal
@@ -653,10 +784,12 @@ impl Module for SagaModule {
                     reply_to,
                     reply_payload,
                     spec,
+                    capability,
                     status: SagaStatus::Pending,
                     attempt: 0,
                     max_attempts,
                     assignee: None,
+                    pinned_assignee,
                     lease_views,
                     lease_expires_at: None,
                     deadline,
@@ -682,18 +815,24 @@ impl Module for SagaModule {
                 if current.status.is_terminal() || attempt != current.attempt {
                     return Ok(());
                 }
-                // the lease gate: under Strict an ASSIGNED attempt accepts a
-                // result only from the assignee's external origin; anyone
-                // else is a no-op (never an error — a finalized foreign
-                // result must not abort the block). an unassigned attempt
-                // degrades to accept-any even under Strict.
+                // the lease gate: under Strict a result lands only from the
+                // assignee's external origin; anyone else is a no-op (never
+                // an error — a finalized foreign result must not abort the
+                // block). an UNASSIGNED attempt accepts no result at all
+                // under Strict: its request was an announcement, and the
+                // work is claimed via Accept first.
                 if self.policy == LeasePolicy::Strict {
-                    if let Some(assignee) = &current.assignee {
-                        let held =
-                            matches!(&ctx.env().origin, Origin::External(key) if key == assignee);
-                        if !held {
-                            return Ok(());
+                    match &current.assignee {
+                        Some(assignee) => {
+                            let held = matches!(
+                                &ctx.env().origin,
+                                Origin::External(key) if key == assignee
+                            );
+                            if !held {
+                                return Ok(());
+                            }
                         }
+                        None => return Ok(()),
                     }
                 }
                 // an oversized error string is the same abort-don't-commit
@@ -737,6 +876,48 @@ impl Module for SagaModule {
                         self.stage(saga_id, saga);
                     }
                 }
+            }
+            SagaMsg::Accept { saga_id, attempt } => {
+                // the claim lane for UNASSIGNED attempts: first accept in
+                // consensus order wins the lease; everything else — unknown
+                // or terminal saga, stale attempt, an attempt someone (or
+                // rendezvous) already assigned — is a deterministic no-op,
+                // never an error (a finalized late accept must not abort
+                // the block).
+                let Origin::External(key) = &ctx.env().origin else {
+                    return Err(Error::Module(
+                        "Accept requires an external origin (the accepting node's key)".into(),
+                    ));
+                };
+                if key.is_empty() {
+                    return Err(Error::Module(
+                        "Accept requires a non-empty submitter id".into(),
+                    ));
+                }
+                let Some(current) = self.get(&saga_id) else {
+                    return Ok(());
+                };
+                if current.status.is_terminal()
+                    || attempt != current.attempt
+                    || current.assignee.is_some()
+                {
+                    return Ok(());
+                }
+                let height = ctx.env().height;
+                let mut saga = current.clone();
+                saga.assignee = Some(key.clone());
+                saga.lease_expires_at = lease_expiry(height, &saga.assignee, saga.lease_views);
+                saga.updated_at = ctx.env().consensus_time;
+                // the actual work order: the announcement's request, re-emitted
+                // naming the winner — every other node's worker skips it.
+                ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
+                    saga_id: saga_id.clone(),
+                    attempt: saga.attempt,
+                    spec: saga.spec.clone(),
+                    deadline: saga.deadline,
+                    assignee: saga.assignee.clone(),
+                })));
+                self.stage(saga_id, saga);
             }
             SagaMsg::Crank {} => {
                 // PERMISSIONLESS: any origin may crank — P7's liveness comes
@@ -826,6 +1007,20 @@ impl Module for SagaModule {
             SagaQuery::Get { saga_id } => Ok(encode_reply(&SagaReply::Saga(
                 self.get(&saga_id).map(Self::view),
             ))),
+            SagaQuery::NextExpiry => {
+                // the crank pump's read: the earliest lease-expiry or
+                // deadline over PENDING sagas — once the current view reaches
+                // it, a Crank is guaranteed to transition something.
+                let next = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id))
+                    .filter(|saga| !saga.status.is_terminal())
+                    .flat_map(|saga| [saga.lease_expires_at, saga.deadline])
+                    .flatten()
+                    .min();
+                Ok(encode_reply(&SagaReply::NextExpiry(next)))
+            }
         }
     }
 
@@ -865,15 +1060,18 @@ mod tests {
         env: Env,
         /// module ids `module_root` resolves (reply_to validation).
         known_modules: BTreeSet<String>,
-        /// a canned validator set served for any `query` when present.
+        /// a canned validator set served for a "valset" query when present.
         validators: Option<Vec<Vec<u8>>>,
+        /// canned capability providers served for a "capability" query.
+        providers: Option<Vec<Vec<u8>>>,
         msgs: Vec<Msg>,
         effects: Vec<Effect>,
     }
     impl CaptureCtx {
         fn new() -> Self {
             Self {
-                env: Env { protocol_version: 0,
+                env: Env {
+                    protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: Origin::System,
@@ -881,6 +1079,7 @@ mod tests {
                 },
                 known_modules: BTreeSet::new(),
                 validators: None,
+                providers: None,
                 msgs: Vec::new(),
                 effects: Vec::new(),
             }
@@ -900,6 +1099,10 @@ mod tests {
         }
         fn with_validators(mut self, validators: Vec<Vec<u8>>) -> Self {
             self.validators = Some(validators);
+            self
+        }
+        fn with_providers(mut self, providers: Vec<Vec<u8>>) -> Self {
+            self.providers = Some(providers);
             self
         }
         fn callbacks(&self) -> Vec<SagaCallback> {
@@ -925,12 +1128,21 @@ mod tests {
                 .contains(target)
                 .then_some(StateRoot::ZERO)
         }
-        async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-            match &self.validators {
-                Some(v) => Ok(valset_interface::encode_reply(&ValsetReply::Validators(
-                    v.clone(),
-                ))),
-                None => Err(Error::QueryUnsupported),
+        async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
+            match target {
+                "valset" => match &self.validators {
+                    Some(v) => Ok(valset_interface::encode_reply(&ValsetReply::Validators(
+                        v.clone(),
+                    ))),
+                    None => Err(Error::QueryUnsupported),
+                },
+                "capability" => match &self.providers {
+                    Some(p) => Ok(capability_interface::encode_reply(
+                        &CapabilityReply::Providers(p.clone()),
+                    )),
+                    None => Err(Error::QueryUnsupported),
+                },
+                _ => Err(Error::QueryUnsupported),
             }
         }
         fn emit_msg(&mut self, msg: Msg) {
@@ -945,6 +1157,7 @@ mod tests {
     /// a trigger with fire-and-forget defaults; tests override fields inline.
     fn trigger_msg(id: &str, spec: &[u8]) -> SagaMsg {
         SagaMsg::Trigger {
+            pinned_assignee: None,
             saga_id: id.into(),
             spec: spec.to_vec(),
             reply_to: None,
@@ -952,6 +1165,7 @@ mod tests {
             deadline: None,
             max_attempts: 1,
             lease_views: None,
+            capability: None,
         }
     }
     fn msg(m: &SagaMsg) -> Msg {
@@ -978,6 +1192,14 @@ mod tests {
             block_on(m.query(&encode_query(&SagaQuery::Get { saga_id: id.into() }))).unwrap();
         match decode_reply(&reply).unwrap() {
             SagaReply::Saga(v) => v,
+            other => panic!("expected Saga reply, got {other:?}"),
+        }
+    }
+    fn next_expiry(m: &SagaModule) -> Option<u64> {
+        let reply = block_on(m.query(&encode_query(&SagaQuery::NextExpiry))).unwrap();
+        match decode_reply(&reply).unwrap() {
+            SagaReply::NextExpiry(v) => v,
+            other => panic!("expected NextExpiry reply, got {other:?}"),
         }
     }
     fn exec(m: &mut SagaModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error> {
@@ -996,6 +1218,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"hello".to_vec(),
                 reply_to: None,
@@ -1003,6 +1226,7 @@ mod tests {
                 deadline: Some(99),
                 max_attempts: 3,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap();
@@ -1081,6 +1305,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: None,
@@ -1088,6 +1313,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 0,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap_err();
@@ -1106,6 +1332,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: Some("nope".into()),
@@ -1113,6 +1340,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap_err();
@@ -1127,6 +1355,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s2".into(),
                 spec: Vec::new(),
                 reply_to: Some("saga".into()),
@@ -1134,6 +1363,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap_err();
@@ -1147,6 +1377,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s3".into(),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
@@ -1154,6 +1385,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap();
@@ -1168,6 +1400,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"work".to_vec(),
                 reply_to: Some("agent".into()),
@@ -1175,6 +1408,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap();
@@ -1212,6 +1446,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"work".to_vec(),
                 reply_to: None,
@@ -1219,6 +1454,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 2,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap();
@@ -1274,6 +1510,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
@@ -1281,6 +1518,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap();
@@ -1315,6 +1553,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: None,
@@ -1322,6 +1561,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 3,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap();
@@ -1382,6 +1622,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: vec![0u8; MAX_SPEC_BYTES + 1],
                 reply_to: None,
@@ -1389,6 +1630,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap_err();
@@ -1403,6 +1645,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"w".to_vec(),
                 reply_to: None,
@@ -1410,6 +1653,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap_err();
@@ -1491,6 +1735,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
@@ -1500,6 +1745,7 @@ mod tests {
                 // checked first this would retry — the deadline must win.
                 max_attempts: 5,
                 lease_views: Some(4),
+                capability: None,
             }),
         )
         .unwrap();
@@ -1549,6 +1795,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"w".to_vec(),
                 reply_to: None,
@@ -1556,6 +1803,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 2,
                 lease_views: Some(5),
+                capability: None,
             }),
         )
         .unwrap();
@@ -1600,6 +1848,7 @@ mod tests {
                 &mut m,
                 &mut ctx,
                 &msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
                     saga_id: format!("s{i:02}"),
                     spec: Vec::new(),
                     reply_to: None,
@@ -1607,6 +1856,7 @@ mod tests {
                     deadline: Some(10),
                     max_attempts: 1,
                     lease_views: None,
+                    capability: None,
                 }),
             )
             .unwrap();
@@ -1651,6 +1901,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
@@ -1658,6 +1909,7 @@ mod tests {
                 deadline: None,
                 max_attempts: 1,
                 lease_views: None,
+                capability: None,
             }),
         )
         .unwrap();
@@ -1850,9 +2102,11 @@ mod tests {
     }
 
     #[test]
-    fn strict_policy_degrades_to_accept_any_without_an_assignee() {
-        // valset configured but EMPTY: assignee is None, and strict must
-        // degrade to accept-any for the attempt — the documented fallback.
+    fn strict_unassigned_attempts_are_announcements_claimed_by_accept() {
+        // valset configured but EMPTY: assignee is None. under strict the
+        // emitted request is an ANNOUNCEMENT — no result lands until a node
+        // claims the attempt, first accept in consensus order wins, and only
+        // the winner's result counts.
         let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
         let mut ctx = CaptureCtx::new().with_validators(Vec::new());
         exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
@@ -1864,12 +2118,419 @@ mod tests {
             "no assignee and no window -> no lease"
         );
 
+        // an unclaimed result is a no-op — the accept-any hole is closed.
+        let pending_root = m.root();
         let mut ctx = CaptureCtx::new()
             .from_origin(Origin::External(b"anyone".to_vec()))
             .with_validators(Vec::new());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
+        assert_eq!(m.root(), pending_root, "no result lands unclaimed");
+        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+
+        // the FIRST accept claims the attempt: assignee + lease + the actual
+        // work order re-emitted naming the winner.
+        let mut ctx = CaptureCtx::new()
+            .at(7)
+            .from_origin(Origin::External(b"node-a".to_vec()))
+            .with_validators(Vec::new());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        let requests = ctx.worker_requests();
+        assert_eq!(requests.len(), 1, "the accept re-emits the work order");
+        assert_eq!(requests[0].assignee, Some(b"node-a".to_vec()));
+        assert_eq!(requests[0].attempt, 0);
+        commit(&mut m);
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.assignee, Some(b"node-a".to_vec()));
+        assert_eq!(
+            v.lease_expires_at,
+            Some(7 + DEFAULT_LEASE_VIEWS),
+            "the claim starts the lease clock"
+        );
+
+        // a late accept loses quietly: nothing staged, no second work order.
+        let claimed_root = m.root();
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"node-b".to_vec()))
+            .with_validators(Vec::new());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        assert!(ctx.worker_requests().is_empty(), "a late accept is a no-op");
+        commit(&mut m);
+        assert_eq!(m.root(), claimed_root);
+
+        // the loser's result is a no-op; the winner's lands.
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"node-b".to_vec()))
+            .with_validators(Vec::new());
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stolen".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"node-a".to_vec()))
+            .with_validators(Vec::new());
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
+        commit(&mut m);
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.status, SagaStatus::Done);
+        assert_eq!(v.result, Some(b"legit".to_vec()));
+    }
+
+    #[test]
+    fn accept_rejects_bad_origins_and_no_ops_on_assigned_or_stale_targets() {
+        let validators = vec![vec![1u8; 32]];
+        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new().with_validators(validators.clone());
+        exec(&mut m, &mut ctx, &trigger("assigned", b"w")).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get(&m, "assigned").unwrap().assignee,
+            Some(validators[0].clone()),
+            "a one-node pool rendezvous-assigns that node"
+        );
+
+        // module / system / empty-key origins have no claim surface.
+        for origin in [
+            Origin::Module("dispatch".into()),
+            Origin::System,
+            Origin::External(Vec::new()),
+        ] {
+            let mut ctx = CaptureCtx::new()
+                .from_origin(origin)
+                .with_validators(validators.clone());
+            assert!(
+                exec(
+                    &mut m,
+                    &mut ctx,
+                    &msg(&SagaMsg::Accept {
+                        saga_id: "assigned".into(),
+                        attempt: 0,
+                    }),
+                )
+                .is_err()
+            );
+            block_on(m.abort_block()).unwrap();
+        }
+
+        // an already-assigned attempt, an unknown saga, and a stale attempt
+        // are all quiet no-ops.
+        let before = m.root();
+        for (saga_id, attempt) in [("assigned", 0u32), ("ghost", 0), ("assigned", 9)] {
+            let mut ctx = CaptureCtx::new()
+                .from_origin(Origin::External(b"node-x".to_vec()))
+                .with_validators(validators.clone());
+            exec(
+                &mut m,
+                &mut ctx,
+                &msg(&SagaMsg::Accept {
+                    saga_id: saga_id.into(),
+                    attempt,
+                }),
+            )
+            .unwrap();
+            assert!(ctx.worker_requests().is_empty(), "{saga_id}/{attempt}");
+            commit(&mut m);
+            assert_eq!(m.root(), before, "{saga_id}/{attempt} staged nothing");
+        }
+    }
+
+    /// a trigger that names a capability; assignment must draw from the
+    /// capability registry's providers, never the valset.
+    fn capability_trigger(id: &str, tag: &str) -> Msg {
+        msg(&SagaMsg::Trigger {
+            pinned_assignee: None,
+            saga_id: id.into(),
+            spec: b"w".to_vec(),
+            reply_to: None,
+            reply_payload: Vec::new(),
+            deadline: None,
+            max_attempts: 1,
+            lease_views: None,
+            capability: Some(tag.into()),
+        })
+    }
+
+    #[test]
+    fn capability_tagged_sagas_assign_over_providers_not_the_valset() {
+        let validators = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
+        // the sole provider is DISJOINT from the valset, so any valset leak
+        // in pool selection fails the assertion.
+        let provider = vec![9u8; 32];
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new()
+            .at(4)
+            .with_validators(validators.clone())
+            .with_providers(vec![provider.clone()]);
+        exec(&mut m, &mut ctx, &capability_trigger("s1", "alpha")).unwrap();
+        commit(&mut m);
+
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.capability.as_deref(), Some("alpha"));
+        assert_eq!(
+            v.assignee,
+            Some(provider.clone()),
+            "the provider pool decides the lease holder"
+        );
+        assert_eq!(v.lease_expires_at, Some(4 + DEFAULT_LEASE_VIEWS));
+        assert_eq!(ctx.worker_requests()[0].assignee, Some(provider.clone()));
+
+        // strict: a validator that is NOT a provider cannot land the result...
+        let pending_root = m.root();
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(validators[0].clone()))
+            .with_validators(validators.clone())
+            .with_providers(vec![provider.clone()]);
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"intruder".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(m.root(), pending_root, "a non-provider result is a no-op");
+
+        // ... the provider can.
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(provider))
+            .with_validators(validators)
+            .with_providers(vec![vec![9u8; 32]]);
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
+        commit(&mut m);
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.status, SagaStatus::Done);
+        assert_eq!(v.result, Some(b"legit".to_vec()));
+    }
+
+    #[test]
+    fn a_capability_nobody_provides_assigns_nobody_and_waits_for_a_claim() {
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new()
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(Vec::new());
+        exec(&mut m, &mut ctx, &capability_trigger("s1", "alpha")).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get(&m, "s1").unwrap().assignee,
+            None,
+            "no providers -> no assignee (the valset is NOT a fallback pool)"
+        );
+
+        // unclaimed: no result lands under strict.
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"anyone".to_vec()))
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(Vec::new());
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+
+        // a node that CAN run the capability claims it, then its result lands.
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"provider".to_vec()))
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(Vec::new());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let mut ctx = CaptureCtx::new()
+            .from_origin(Origin::External(b"provider".to_vec()))
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(Vec::new());
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
+        commit(&mut m);
         assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Done);
+    }
+
+    #[test]
+    fn untagged_sagas_keep_valset_assignment_under_with_assignment() {
+        let validators = vec![vec![1u8; 32], vec![2u8; 32]];
+        let mut m = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Open);
+        let mut ctx = CaptureCtx::new()
+            .with_validators(validators.clone())
+            .with_providers(vec![vec![9u8; 32]]);
+        exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
+        commit(&mut m);
+        let assignee = get(&m, "s1").unwrap().assignee.expect("assigned");
+        assert!(
+            validators.contains(&assignee),
+            "untagged work stays on the valset"
+        );
+    }
+
+    #[test]
+    fn a_pinned_trigger_leases_every_attempt_to_the_pinned_key() {
+        // the pinned key is disjoint from the valset AND the provider pool,
+        // so any rendezvous leak in assignment fails the assertions.
+        let pinned = vec![7u8; 32];
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new()
+            .at(4)
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(vec![vec![9u8; 32]]);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 2,
+                lease_views: None,
+                capability: Some("alpha".into()),
+                pinned_assignee: Some(pinned.clone()),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.assignee, Some(pinned.clone()), "attempt 0 leases pinned");
+        assert_eq!(v.pinned_assignee, Some(pinned.clone()));
+        assert_eq!(v.lease_expires_at, Some(4 + DEFAULT_LEASE_VIEWS));
+
+        // strict: the announced provider does NOT hold this lease...
+        let pending_root = m.root();
+        let mut ctx = CaptureCtx::new().from_origin(Origin::External(vec![9u8; 32]));
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"foreign".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(m.root(), pending_root, "a non-pinned result is a no-op");
+
+        // ... and the pinned key's Err consumes the attempt: the RETRY is
+        // leased to the pinned key again, never rendezvous-reassigned.
+        let mut ctx = CaptureCtx::new()
+            .at(5)
+            .from_origin(Origin::External(pinned.clone()))
+            .with_validators(vec![vec![1u8; 32]])
+            .with_providers(vec![vec![9u8; 32]]);
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Err("transient".into()))).unwrap();
+        commit(&mut m);
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.attempt, 1);
+        assert_eq!(v.assignee, Some(pinned.clone()), "the retry stays pinned");
+        assert_eq!(ctx.worker_requests()[0].assignee, Some(pinned));
+    }
+
+    #[test]
+    fn an_empty_pinned_assignee_is_rejected() {
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new();
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: Vec::new(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
+                capability: None,
+                pinned_assignee: Some(Vec::new()),
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pinned_assignee"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_and_oversized_capability_tags_are_rejected() {
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new();
+        let oversized = "x".repeat(MAX_CAPABILITY_BYTES + 1);
+        for bad in ["", oversized.as_str()] {
+            let err = exec(
+                &mut m,
+                &mut ctx,
+                &msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
+                    saga_id: "s1".into(),
+                    spec: Vec::new(),
+                    reply_to: None,
+                    reply_payload: Vec::new(),
+                    deadline: None,
+                    max_attempts: 1,
+                    lease_views: None,
+                    capability: Some(bad.to_string()),
+                }),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
+        }
+        assert!(ctx.effects.is_empty(), "rejected triggers fire no worker");
+        assert_eq!(get(&m, "s1"), None, "nothing was staged");
+    }
+
+    #[test]
+    fn next_expiry_reports_the_earliest_pending_expiry() {
+        let mut m = SagaModule::new("saga");
+        assert_eq!(next_expiry(&m), None, "an empty ledger has no expiry");
+
+        let mut ctx = CaptureCtx::new();
+        // a deadline at 50, a lease at 7, and one saga with neither.
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: "a".into(),
+                spec: Vec::new(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: Some(50),
+                max_attempts: 1,
+                lease_views: None,
+                capability: None,
+            }),
+        )
+        .unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: "b".into(),
+                spec: Vec::new(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: Some(7),
+                capability: None,
+            }),
+        )
+        .unwrap();
+        exec(&mut m, &mut ctx, &trigger("c", b"w")).unwrap();
+        commit(&mut m);
+        assert_eq!(next_expiry(&m), Some(7), "the lease at view 7 is earliest");
+
+        // resolving the leased saga drops it out; the deadline remains.
+        let mut ctx = CaptureCtx::new();
+        exec(&mut m, &mut ctx, &oracle("b", 0, Ok(b"r".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(next_expiry(&m), Some(50), "terminal sagas carry no expiry");
     }
 
     #[test]
@@ -1880,6 +2541,7 @@ mod tests {
         fn script() -> Vec<Vec<Msg>> {
             let alice = |saga_id: &str, max_attempts: u32, deadline: Option<u64>| {
                 msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
                     saga_id: saga_id.into(),
                     spec: b"spec".to_vec(),
                     reply_to: None,
@@ -1887,6 +2549,7 @@ mod tests {
                     deadline,
                     max_attempts,
                     lease_views: Some(3),
+                    capability: None,
                 })
             };
             vec![
@@ -1894,6 +2557,19 @@ mod tests {
                     alice("a", 2, None),
                     alice("b", 1, Some(6)),
                     alice("c", 1, None),
+                    // a capability-tagged saga: the tag rides the committed
+                    // encoding, so it must replay byte-identically too.
+                    msg(&SagaMsg::Trigger {
+                        pinned_assignee: None,
+                        saga_id: "d".into(),
+                        spec: b"spec".to_vec(),
+                        reply_to: None,
+                        reply_payload: Vec::new(),
+                        deadline: None,
+                        max_attempts: 1,
+                        lease_views: None,
+                        capability: Some("alpha".into()),
+                    }),
                 ],
                 vec![
                     oracle("a", 0, Err("retry me".into())),

@@ -3,10 +3,16 @@
 // state that must survive screen boundaries (screen, accent, author identity,
 // thread panel).
 
-import type { AgentRecord, RunView, WatchView } from "../../domain/agent-client";
+import type { AgentRecord } from "../../domain/agent-client";
+import type { PendingRun, WatchView } from "../../domain/runs-client";
 import type { Rule } from "../../domain/automations-client";
-import type { Channel, ChatThread, MessageView } from "../../domain/chat-client";
-import type { Block } from "../../domain/document-client";
+import type {
+  Channel,
+  ChatSearchHit,
+  ChatThread,
+  MessageView,
+} from "../../domain/chat-client";
+import type { Block, DocSearchHit } from "../../domain/document-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type { Notification } from "../../domain/inbox-client";
@@ -17,15 +23,25 @@ import type {
   GrepHit,
   LsEntry,
 } from "../../domain/memory-client";
-import type { PageBlock, PageMeta } from "../../domain/pages-client";
+import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
 import type { Task, TaskStatus } from "../../domain/tasks-client";
-import type { NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
 /** The two sidebar partitions the view-mode toggle switches between: the
  *  participant "user" apps and the "operator" node/network surfaces. Neither
  *  side confers authority — it is purely which surfaces the rail shows. */
 export type ViewMode = "user" | "operator";
+
+/** One search round-trip across the modules that ship materialized views —
+ *  chat, docs, and pages searched with the same text, results grouped. */
+export interface SearchResults {
+  query: string;
+  chat: ChatSearchHit[];
+  docs: DocSearchHit[];
+  pages: PageSearchHit[];
+}
 
 // ── State shape ─────────────────────────────────────────
 
@@ -61,6 +77,10 @@ export interface ConsoleState {
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
   members: string[];
+  /** Hex-encoded observer public keys from the `valset` module — the
+   *  staged-admission tier (mesh + statesync, no quorum seat). Disjoint from
+   *  `members`: valset's Grant refuses validators, Join clears standing. */
+  observers: string[];
 
   // ── Governance ──
   /** Every proposal from the `governance` module, sorted by id. Re-queried per
@@ -96,8 +116,9 @@ export interface ConsoleState {
   agents: AgentRecord[];
   /** Every channel watch and its turn policy. */
   watches: WatchView[];
-  /** Recent runs across all channels, newest-first for the timeline. */
-  runs: RunView[];
+  /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
+   *  history lives in the dispatch module, not here. */
+  pendingRuns: PendingRun[];
 
   // ── Inbox ──
   /** This member's notification queue (List for the local author identity),
@@ -127,6 +148,13 @@ export interface ConsoleState {
   /** Active grep hits, or null when no search is running. */
   memoryMatches: GrepHit[] | null;
 
+  // ── Search (cross-module reads over the node's derived index) ──
+  /** The last search's results, or null before any search ran. Query-driven
+   *  like `memoryMatches` — never part of the per-block snapshot. */
+  search: SearchResults | null;
+  /** A search round-trip is in flight (three module views fan out). */
+  searchPending: boolean;
+
   // ── Files (content-addressed manifests) ──
   /** Every file manifest (List, prefix ""), re-queried per block. */
   files: Manifest[];
@@ -135,6 +163,22 @@ export interface ConsoleState {
    *  first). Node-local observability — never re-queried from committed state;
    *  backfilled from the node's ring on connect, then followed live over ws. */
   telemetry: TelemetryFrame[];
+
+  /** Recent NON-EMPTY blocks, oldest-first (the explorer renders newest
+   *  first). Node-local observability like telemetry — re-pulled from the
+   *  node's ring on every refresh; empty on a node without the surface. */
+  blocks: BlockRecord[];
+
+  /** Height the explorer should open on next render — the finalization-mark
+   *  cross-link's hand-off (openExplorerAt sets it, the explorer consumes it
+   *  once `blocks` has data and clears it). Null when nothing is pending. */
+  explorerFocus: number | null;
+
+  /** Per-operation finalization ledger (entity key → newest op touching that
+   *  row): pending while a write is in flight, then finalized with the
+   *  inclusion height + addressable op hash from the submit receipt. Client
+   *  bookkeeping, never committed state — node switches reset it. */
+  ops: OpLedger;
 
   error: string | null;
 
@@ -238,6 +282,7 @@ export const createInitialState = (): ConsoleState => {
     authorNames: {},
     tasks: [],
     members: [],
+    observers: [],
     proposals: [],
     forgeHead: null,
     docIds: [],
@@ -248,7 +293,7 @@ export const createInitialState = (): ConsoleState => {
     activePageBlocks: [],
     agents: [],
     watches: [],
-    runs: [],
+    pendingRuns: [],
     inbox: [],
     inboxUnread: 0,
     jobs: [],
@@ -258,8 +303,13 @@ export const createInitialState = (): ConsoleState => {
     memoryEntries: [],
     memoryOpen: null,
     memoryMatches: null,
+    search: null,
+    searchPending: false,
     files: [],
     telemetry: [],
+    blocks: [],
+    explorerFocus: null,
+    ops: {},
     error: null,
     workspaces: [],
     workspace: null,
@@ -277,6 +327,7 @@ export interface ConsoleSnapshot {
   channels: Channel[];
   tasks: Task[];
   members: string[];
+  observers: string[];
   proposals: ProposalView[];
   forgeHead: string | null;
   activeChannel: string | null;
@@ -288,7 +339,7 @@ export interface ConsoleSnapshot {
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
   watches: WatchView[];
-  runs: RunView[];
+  pendingRuns: PendingRun[];
   inbox: Notification[];
   inboxUnread: number;
   jobs: Job[];
@@ -296,6 +347,7 @@ export interface ConsoleSnapshot {
   rules: Rule[];
   memoryEntries: LsEntry[];
   files: Manifest[];
+  blocks: BlockRecord[];
 }
 
 /** Project a committed node snapshot onto store data fields. Global UI,
@@ -307,6 +359,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   channels: snapshot.channels,
   tasks: snapshot.tasks,
   members: snapshot.members,
+  observers: snapshot.observers,
   proposals: snapshot.proposals,
   forgeHead: snapshot.forgeHead,
   activeChannel: snapshot.activeChannel,
@@ -318,7 +371,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
   watches: snapshot.watches,
-  runs: snapshot.runs,
+  pendingRuns: snapshot.pendingRuns,
   inbox: snapshot.inbox,
   inboxUnread: snapshot.inboxUnread,
   jobs: snapshot.jobs,
@@ -326,6 +379,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   rules: snapshot.rules,
   memoryEntries: snapshot.memoryEntries,
   files: snapshot.files,
+  blocks: snapshot.blocks,
 });
 
 // ── Pure helpers ────────────────────────────────────────

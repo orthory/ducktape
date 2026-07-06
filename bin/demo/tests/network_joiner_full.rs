@@ -204,6 +204,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
                     saga_id: "greet".into(),
                     spec: b"reverse hello".to_vec(),
                     reply_to: None,
@@ -211,6 +212,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                     deadline: None,
                     max_attempts: 1,
                     lease_views: None,
+                    capability: None,
                 }),
             },
         ];
@@ -270,7 +272,8 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 target,
                 resolver,
             )
-            .await;
+            .await
+            .expect("sync_from");
             assert_eq!(join_kv.root(), kv_root);
             assert_eq!(
                 join_kv.get(b"motd").await.as_deref(),
@@ -288,7 +291,8 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 target,
                 resolver,
             )
-            .await;
+            .await
+            .expect("sync_from");
             assert_eq!(join_document.root(), doc_root);
 
             let chat_entry = manifest.entry("chat").unwrap();
@@ -302,7 +306,8 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 target,
                 resolver,
             )
-            .await;
+            .await
+            .expect("sync_from");
             assert_eq!(join_chat.root(), chat_root);
 
             // --- snapshot lane: directory, valset, saga, forge ----------------

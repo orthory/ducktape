@@ -11,6 +11,7 @@ import {
   createChannel,
   latestMessages,
   postMessage,
+  searchMessages,
   thread,
 } from "./chat-client";
 import type { MessageView } from "./chat-client";
@@ -19,10 +20,12 @@ import type { NodeTransport } from "./transport";
 const stubTransport = (reply?: unknown): NodeTransport => ({
   submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
   query: vi.fn().mockResolvedValue(reply),
+  view: vi.fn(),
   putBlob: vi.fn(),
   getBlob: vi.fn(),
   status: vi.fn(),
   telemetry: vi.fn(),
+  blocks: vi.fn(),
   onBlock: vi.fn(),
   onTelemetry: vi.fn(),
 });
@@ -169,5 +172,29 @@ describe("rendering helpers", () => {
         { Quote: [{ text: "said", marks: [] }] },
       ]),
     ).toBe("one two\n———\nlet x = 1;\n> said");
+  });
+});
+
+describe("materialized view (search)", () => {
+  it("posts the search request to chat's view endpoint and unwraps hits", async () => {
+    const hit = {
+      channelId: "general",
+      seq: 1,
+      messageId: "m1",
+      author: "user:jess",
+      height: 4,
+      time: 1_000,
+      text: "fluent index demo",
+      deleted: false,
+      edited: false,
+    };
+    const transport = stubTransport();
+    (transport.view as ReturnType<typeof vi.fn>).mockResolvedValue({ hits: [hit] });
+
+    const hits = await searchMessages(transport, { text: "fluent", channelId: "general" });
+    expect(transport.view).toHaveBeenCalledWith("chat", {
+      search: { text: "fluent", channelId: "general", limit: undefined },
+    });
+    expect(hits).toEqual([hit]);
   });
 });

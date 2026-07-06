@@ -107,6 +107,7 @@ fn validator_count(host: &Host) -> usize {
         .expect("valset query");
     match valset_interface::decode_reply(&reply).expect("decode valset") {
         ValsetReply::Validators(v) => v.len(),
+        other => panic!("expected Validators, got {other:?}"),
     }
 }
 

@@ -1,0 +1,209 @@
+# Coordinator Deployment Recipe (`p2p.ducktape.industries`)
+
+How to run `bin/coordinator` as `p2p.ducktape.industries`: an **untrusted,
+non-validator reachability helper** that lets two NAT'd validators find each
+other and, when a direct path can't be punched, relays their ciphertext. This is
+the operator-facing companion to the design of record,
+[Private Cutover — Coordinator](superpowers/specs/2026-07-05-private-cutover-coordinator-design.md).
+Read that for the *why* (the trust model, the reachability plane, the epic
+roadmap). This document is the *how*.
+
+> **Scope honesty.** Everything on this page **works today**: `bin/coordinator`
+> runs as-is and its `--listen` invocation is regression-proven by
+> `bin/coordinator/tests/deploy_smoke.rs`. What does **not** work yet is the
+> other end: the live `ducktape-node` does not call the coordinator (reflexive
+> discovery, hole-punch, WireGuard bring-up, and relay are unwired in the node —
+> `nat-traversal` and `wireguard-effect` are not dependencies of `bin/node`).
+> Deploying this coordinator is real and useful, but it does **not** by itself
+> yield a working zero-exposure tunnel. See
+> [the cross-machine runbook](cross-machine-zero-exposure-runbook.md) (every
+> step tagged) and [the integration-gap handoff](private-cutover-integration-gap.md).
+
+## Why this is safe (untrusted by design)
+
+The two planes this coordinator sits beside are both authenticated and
+end-to-end encrypted **without** the coordinator:
+
+- The **control mesh** is commonware `authenticated::discovery`: a dialer dials
+  an address and expects a specific `ed25519` public key; the handshake
+  authenticates that key regardless of what network path delivered the bytes
+  (same property that makes the Phase-1 [sentry](../sentry-deployment.md) safe).
+- The **data tunnel** is validator↔validator **WireGuard**, keyed and encrypted
+  between the two validators' own keys.
+
+So any box on the path — including this coordinator — is at most a transparent
+ciphertext forwarder plus a rendezvous point. It **learns coarse topology and
+reflexive addresses and can observe ciphertext + timing, but it cannot decrypt,
+impersonate, MITM, serve state, or join consensus** (design §"Trust and threat
+model"). Therefore it is safe to run as **throwaway infra with no key on the
+box**. The hardening in `ops/coordinator/ducktape-coordinator.service` makes that
+structural: if a reviewer can find a place a secret *would* live on this host,
+the recipe is wrong.
+
+## What it is
+
+`coordinator --listen <addr>` (default `0.0.0.0:3478`). One **UDP** *control*
+socket. Stateless. It provides three services on that one socket:
+
+- **Rendezvous** — peers `register` their key and `lookup` each other.
+- **STUN reflexive** — answers a `BindRequest` with the peer's observed
+  public `ip:port` so it can learn its own NAT-mapped address.
+- **Ciphertext relay** — a last-resort splice when hole-punch fails; the
+  coordinator forwards opaque bytes between two peers' relay sockets.
+
+**Caveat to the single-socket picture (load-bearing for the firewall).** 3478 is
+the only *fixed* port, but the relay service is **not** served on it. When (and
+only when) a `RelayRequest` arrives, the coordinator binds **two additional
+ephemeral UDP sockets per relay session**
+(`crates/system/nat-traversal/src/client.rs` ~360/364 — `UdpSocket::bind(bind_ip:0)`
+twice) and splices opaque bytes between them, releasing them when the session
+idles out. So a relay-enabled coordinator opens ephemeral UDP sockets on demand
+beyond 3478 — which is exactly why the firewall guidance below has a relay
+branch. If you never enable relay (STUN + rendezvous only), 3478 genuinely is the
+only socket the process holds.
+
+No TCP listener. No config file. No disk. No secret. `--listen` is the only flag
+the binary parses; on bind it prints `coordinator listening on <addr>` to
+stderr, then serves.
+
+## Deploy A — systemd (bare VPS)
+
+```sh
+# 1. Build the binary (repo root).
+cargo build --release -p coordinator-bin
+
+# 2. Install it.
+sudo install -m 0755 target/release/coordinator /usr/local/bin/ducktape-coordinator
+
+# 3. Install the env file and the hardened unit.
+sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/coordinator.env
+#    edit /etc/ducktape/coordinator.env if you need the relay bind (see caveat)
+sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
+
+# 4. Start it.
+sudo systemctl daemon-reload
+sudo systemctl enable --now ducktape-coordinator
+
+# 5. Verify.
+systemctl status ducktape-coordinator
+ss -lunp 'sport = :3478'     # the fixed control socket, owned by the dynamic user
+```
+
+The unit runs under `DynamicUser=yes` (an ephemeral throwaway user — no home,
+no shell, nothing to compromise), with `CapabilityBoundingSet=` and
+`AmbientCapabilities=` **empty** (port 3478 > 1024 needs no privileged-port
+capability), `NoNewPrivileges=yes`, `ProtectSystem=strict` + `ReadOnlyPaths=/`
+(no writable path at all — the coordinator keeps no state), and
+`RestrictAddressFamilies=AF_INET AF_INET6` (UDP only; no unix/raw/packet
+sockets). This posture is deliberate: **there is no secret to steal and no state
+to corrupt**, so the box can be treated as disposable and replaced at will.
+
+## Deploy B — Docker / OCI
+
+```sh
+docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
+
+# STUN + rendezvous coordinator: 3478 is the only socket, so one published UDP
+# port is enough. Harden the container to match the systemd unit — this is
+# untrusted-by-design infra, so drop everything it does not need.
+docker run \
+  --cap-drop=ALL \
+  --security-opt no-new-privileges \
+  --read-only \
+  --restart unless-stopped \
+  -p 3478:3478/udp \
+  ducktape-coordinator
+```
+
+The image is multi-stage: a `rust:1.96-bookworm` build stage compiles exactly
+`-p coordinator-bin`, and the runtime stage is
+`gcr.io/distroless/cc-debian12:nonroot` — glibc + libgcc for the
+dynamically-linked binary, **no shell, no package manager**, running as the
+built-in non-root uid `65532`. The `docker run` flags above are not optional
+decoration — they mirror the systemd unit's posture and are the container-side
+equivalent of its empty capability set and read-only root:
+
+- `--cap-drop=ALL` — the binary needs **no** Linux capabilities (3478 > 1024, so
+  no privileged-port capability), the same as the unit's empty
+  `CapabilityBoundingSet=`/`AmbientCapabilities=`.
+- `--security-opt no-new-privileges` — mirrors `NoNewPrivileges=yes`.
+- `--read-only` — the coordinator keeps **no** state, so its root filesystem can
+  be immutable, mirroring `ProtectSystem=strict` + `ReadOnlyPaths=/`.
+- `--restart unless-stopped` — the production restart policy; the disposable box
+  comes back after a crash or reboot. Drop it (and add `--rm`) only for a
+  throwaway smoke run.
+
+Keep these: the whole premise is that a compromised coordinator has nothing to
+steal and nowhere to write. Publishing **only** `-p 3478:3478/udp` (not
+`--network host`) is what keeps that true — see the relay note next.
+
+### Relay under Docker — do **not** reach for `--network host`
+
+The relay fallback binds ephemeral UDP sockets on the coordinator socket's own IP
+(see the single-socket caveat above and the relay-bind caveat below), and those
+ports are **not** covered by `-p 3478:3478/udp`. The tempting "fix" is
+`--network host` — **don't.** Host networking removes the container's network
+namespace entirely, letting an intentionally-untrusted process bind or listen on
+**any** host TCP/UDP port; that defeats the "exposes only UDP" design goal and is
+the wrong trade for a disposable, untrusted component.
+
+There is also no clean *bridge*-networking relay recipe today, because a
+`RelayGrant` carries the coordinator's **bind** IP: `--listen 0.0.0.0:3478`
+yields an undialable `0.0.0.0` grant, and a container-internal address is not
+routable from off-host either. So if you need relay, run it on the **bare-VPS
+systemd path (Deploy A) with `--listen <public-ip>:3478`**, where the bind IP is
+genuinely dialable — not a host-networked container. The clean containerized
+relay story waits on the coordinator-side reflexive fix (learn the public IP from
+observed peer sources and emit *that* as the relay-grant IP), tracked in
+[the integration-gap doc](private-cutover-integration-gap.md) §4. Until then,
+Docker is the right tool for a **STUN + rendezvous** coordinator; relay belongs on
+the bare-VPS path.
+
+## The relay-bind caveat (load-bearing)
+
+`nat_traversal::run_coordinator` binds its relay-splice sockets on the
+coordinator socket's **own IP** (`bind_ip = sock.local_addr().ip()`). So if you
+launch with `--listen 0.0.0.0:3478`, a `RelayGrant` hands the client
+`0.0.0.0:<ephemeral>` — **not remotely dialable**. STUN reflexive, rendezvous
+`Lookup`, and hole-punch `PunchSync` are all **unaffected** (they echo/return the
+peer's *observed source*, independent of the coordinator's bind IP); **only the
+ciphertext-relay fallback** breaks under a wildcard bind.
+
+**If you need relay fallback, bind the routable public IP** —
+`--listen 203.0.113.10:3478` — so relay grants are dialable. A future
+coordinator-side fix (learn the public reflexive from observed peer sources and
+emit *that* as the relay-grant IP) is described in
+[the integration-gap doc](private-cutover-integration-gap.md) §4.
+
+## DNS + firewall
+
+- Point an `A` record `p2p.ducktape.industries` → the VPS IP.
+- Open **inbound UDP 3478**. No TCP port is needed at all.
+- For **relay**, either bind the public IP (recommended — then grants use 3478's
+  IP) or open the ephemeral UDP range the OS assigns to relay-splice sockets.
+
+## Redundancy — the coordinator is not uniquely load-bearing
+
+Run **multiple** coordinators. A v3 invite carries a `Vec` of reach hints and
+`NatClient::discover_reflexive_failover` walks them (Slice 3), so a single
+coordinator outage is not fatal to entry. And an already-**punched** direct path
+survives a coordinator restart entirely — only *relay* fallback and *new*
+rendezvous depend on a live coordinator. This is the key contrast with an
+in-path [sentry](../sentry-deployment.md), which sits in the data path and is a
+single point of failure for the validator it fronts: an out-of-path coordinator
+is where the "established connections survive; only new ones depend on it"
+framing actually holds.
+
+## What this recipe does NOT do (forward reference)
+
+The coordinator deployed here is live and correct, **but the `ducktape-node`
+does not yet use it.** Reflexive discovery, hole-punch, WireGuard bring-up, and
+relay are all **unwired in the node** — the mechanism is CI-proven in
+`crates/system/nat-traversal` and `crates/system/wireguard-effect`, but neither
+crate is a dependency of `bin/node`, and a v3 `Coordinated` invite hint is
+currently dialed as an ordinary **TCP mesh bootstrapper** at the coordinator's
+**UDP** address (a no-op-at-best). Do **not** read this page as claiming a
+zero-exposure tunnel. For the exact works-today / needs-wiring line, see
+[`cross-machine-zero-exposure-runbook.md`](cross-machine-zero-exposure-runbook.md);
+for the engineering handoff to close the gap, see
+[`private-cutover-integration-gap.md`](private-cutover-integration-gap.md).

@@ -78,6 +78,24 @@ pub struct Cluster {
     /// `None` -> `127.0.0.1:p2p_ports[0]` (identical to today); `Some(addr)`
     /// points bootstrap at a forwarder in front of node 0.
     pub bootstrap_addr_override: Option<String>,
+    /// when true every config gets `wireguard_listen` (the node's own p2p
+    /// port, UDP — distinct per node, never actually bound) plus
+    /// `wireguard_effect = "fake"`, so the reachability plane runs its full
+    /// rendezvous/handshake protocol without needing privilege. several
+    /// same-host nodes with the REAL effect would fight over the one
+    /// `dt-<chainid>` interface name, so the fake is the only correct
+    /// same-host shape.
+    pub wireguard: bool,
+    /// extra `node.toml` lines appended verbatim to EVERY node's generated
+    /// config (`spawn` regenerates the file, so a hand-edit after the fact
+    /// would not survive a respawn). set before the first spawn; empty by
+    /// default so existing tests are byte-for-byte unchanged.
+    pub extra_toml: Vec<String>,
+    /// extra environment variables for node `idx`'s process, index-aligned
+    /// with `peer_ids` (what gives each node its own capability-provider
+    /// surface: `DUCKTAPE_CAPABILITY_DIR`, spec `detect.env` overrides).
+    /// empty per node by default; set before spawn — a respawn re-applies.
+    pub env: Vec<Vec<(String, String)>>,
     /// declared BEFORE `dir` so drop order kills + reaps every child first —
     /// removing the tempdir under live processes races their qmdb/journal
     /// writes and silently leaks the subtree.
@@ -156,6 +174,41 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// the token-less invite: the joiner's pubkey travels out-of-band and no
+    /// lobby announce happens — the pre-token manual flow, kept working.
+    pub fn invite_manual(&self) -> String {
+        let cfg = self.config_file(0);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["invite", "--manual", "--config"])
+            .arg(cfg)
+            .output()
+            .expect("run invite --manual");
+        assert!(
+            out.status.success(),
+            "invite --manual failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// the founder's verified join-request queue, parsed from the
+    /// `join-requests` verb's JSON stdout.
+    pub fn join_requests(&self) -> serde_json::Value {
+        let cfg = self.config_file(0);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["join-requests", "--config"])
+            .arg(cfg)
+            .output()
+            .expect("run join-requests");
+        assert!(
+            out.status.success(),
+            "join-requests failed:\n{}",
+            command_output(&out)
+        );
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("join-requests prints json")
+    }
+
     pub fn join_friend(&self, invite: &str) -> String {
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .args([
@@ -214,14 +267,101 @@ impl NetworkShapeCluster {
         });
     }
 
-    pub fn run_invite_accept(&self, pubkey_hex: &str) -> (bool, String) {
+    /// kill node `idx`'s process (reaped by NodeProc's drop).
+    pub fn kill(&mut self, idx: usize) {
+        self.nodes[idx] = None;
+    }
+
+    /// one json-lines rpc against node `idx` — the NetworkShapeCluster
+    /// mirror of [`Cluster::rpc`] (same wire, same ports array).
+    pub fn rpc(&self, idx: usize, req: serde_json::Value) -> serde_json::Value {
+        let port = self.rpc_ports[idx];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let stream = loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "rpc connect to node idx {idx} (port {port}) failed: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        };
+        let mut stream = stream;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("rpc read timeout");
+        let mut line = serde_json::to_string(&req).expect("rpc request serializes");
+        line.push('\n');
+        stream.write_all(line.as_bytes()).expect("rpc write");
+        let mut reply = String::new();
+        BufReader::new(stream)
+            .read_line(&mut reply)
+            .expect("rpc read");
+        serde_json::from_str(reply.trim()).expect("rpc reply is json")
+    }
+
+    pub fn query(&self, idx: usize, target: &str, req: &[u8]) -> Option<Vec<u8>> {
+        let reply = self.rpc(
+            idx,
+            serde_json::json!({
+                "cmd": "query",
+                "target": target,
+                "req_hex": hex(req),
+            }),
+        );
+        if reply["ok"] != true {
+            return None;
+        }
+        Some(unhex(
+            reply["reply_hex"]
+                .as_str()
+                .expect("query reply carries hex"),
+        ))
+    }
+
+    pub fn submit(&self, idx: usize, target: &str, payload: &[u8]) {
+        let reply = self.rpc(
+            idx,
+            serde_json::json!({
+                "cmd": "submit",
+                "target": target,
+                "payload_hex": hex(payload),
+            }),
+        );
+        assert_eq!(
+            reply["ok"], true,
+            "submit to {target} via node idx {idx} rejected: {reply}"
+        );
+    }
+
+    pub fn status(&self, idx: usize) -> serde_json::Value {
+        let reply = self.rpc(idx, serde_json::json!({ "cmd": "status" }));
+        assert_eq!(
+            reply["ok"], true,
+            "status via node idx {idx} failed: {reply}"
+        );
+        reply["status"].clone()
+    }
+
+    /// drive a membership ceremony verb (`promote`, `invite-accept`,
+    /// `observer-remove`) against node 0's running rpc, from node 0's config.
+    pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args(["invite-accept", pubkey_hex, "--config"])
+            .args([verb, pubkey_hex, "--config"])
             .arg(cfg)
             .output()
-            .expect("run invite-accept");
+            .unwrap_or_else(|e| panic!("run {verb}: {e}"));
         (out.status.success(), command_output(&out))
+    }
+
+    /// drive the DIRECT admission ceremony (`promote` — the pre-staged
+    /// `invite-accept` semantics) from node 0's config.
+    pub fn run_promote(&self, pubkey_hex: &str) -> (bool, String) {
+        self.run_membership_verb("promote", pubkey_hex)
     }
 
     pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
@@ -281,6 +421,9 @@ impl Cluster {
             http_ports: http_ports.to_vec(),
             advertised: peer_ids.iter().map(|_| None).collect(),
             bootstrap_addr_override: None,
+            wireguard: false,
+            extra_toml: Vec::new(),
+            env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
         }
@@ -325,6 +468,17 @@ impl Cluster {
             "http_listen = \"127.0.0.1:{}\"\n",
             self.http_ports[idx]
         ));
+        if self.wireguard {
+            cfg.push_str(&format!(
+                "wireguard_listen = \"127.0.0.1:{}\"\n",
+                self.p2p_ports[idx]
+            ));
+            cfg.push_str("wireguard_effect = \"fake\"\n");
+        }
+        for line in &self.extra_toml {
+            cfg.push_str(line);
+            cfg.push('\n');
+        }
         std::fs::write(&path, cfg).expect("write node config");
         path
     }
@@ -340,6 +494,7 @@ impl Cluster {
         let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .arg("--config")
             .arg(&cfg)
+            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -350,6 +505,14 @@ impl Cluster {
     /// kill the node at `idx` (crash-fault injection) and reap it.
     pub fn kill(&mut self, idx: usize) {
         self.nodes[idx] = None; // NodeProc::drop kills + waits
+    }
+
+    /// remove node `idx`'s storage directory — a killed slot reused as a
+    /// FRESH observer (the sync-only rebuild) must not inherit the previous
+    /// occupant's state or index locks.
+    pub fn wipe_storage(&self, idx: usize) {
+        let id = self.peer_ids[idx];
+        let _ = std::fs::remove_dir_all(self.dir.path().join(format!("storage-{id}")));
     }
 
     /// send SIGTERM to node `idx` WITHOUT reaping it — the graceful-quit fault
@@ -431,9 +594,10 @@ impl Cluster {
         self.p2p_ports.push(ports[0]);
         self.rpc_ports.push(ports[1]);
         self.http_ports.push(ports[2]);
-        // keep `advertised` index-aligned with the extended index space so a
-        // later `config_path(joiner_idx)` (e.g. `run_sync_only`) never panics.
+        // keep `advertised`/`env` index-aligned with the extended index space
+        // so a later `config_path(joiner_idx)` / `spawn` never panics.
         self.advertised.push(None);
+        self.env.push(Vec::new());
         self.nodes.push(Some(NodeProc { id, child, log }));
         self.peer_ids.len() - 1
     }
@@ -630,37 +794,7 @@ impl Cluster {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> (u16, serde_json::Value) {
-        use std::io::Read as _;
-        let port = self.http_ports[idx];
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("app-surface read timeout");
-        let body_bytes = body
-            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
-            .unwrap_or_default();
-        let req = format!(
-            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body_bytes.len()
-        );
-        stream.write_all(req.as_bytes()).expect("app-surface write");
-        stream
-            .write_all(&body_bytes)
-            .expect("app-surface write body");
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("app-surface read");
-        let text = String::from_utf8_lossy(&raw);
-        let status: u16 = text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let payload = text
-            .split("\r\n\r\n")
-            .nth(1)
-            .and_then(|b| serde_json::from_str(b.trim()).ok())
-            .unwrap_or(serde_json::Value::Null);
-        (status, payload)
+        http_request(self.http_ports[idx], method, path, body)
     }
 
     /// every running node's log tail — the panic payload that makes a stalled
@@ -698,6 +832,49 @@ fn command_output(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// one request against an http/ws APP SURFACE port (the noded wire contract)
+/// — raw http/1.1 over std TCP, returning (status, json body). the port-keyed
+/// twin of [`Cluster::http`], for harnesses that hold ports without a
+/// `Cluster` (e.g. [`NetworkShapeCluster`]). the surface trusts localhost
+/// callers, so a hand-rolled client is a full citizen by design.
+pub fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    use std::io::Read as _;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("app-surface read timeout");
+    let body_bytes = body
+        .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    stream.write_all(req.as_bytes()).expect("app-surface write");
+    stream
+        .write_all(&body_bytes)
+        .expect("app-surface write body");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("app-surface read");
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let payload = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .and_then(|b| serde_json::from_str(b.trim()).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, payload)
 }
 
 /// poll `probe` every 300ms until it returns `Some`, or panic with `what`
