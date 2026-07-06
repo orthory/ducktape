@@ -264,6 +264,10 @@ pub enum AgentQuery {
     Agent { agent_id: String },
 }
 
+// a transient decode-use-drop reply, never stored: the inline AgentRecord
+// (grown by PromptRef) outweighing the Vec variant is fine — boxing would
+// only tax every consumer's ergonomics.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentReply {
