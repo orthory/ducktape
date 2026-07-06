@@ -3942,10 +3942,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone());
     let blobs = http_handle.blob_handle();
-    // share the ring the app-surface's GET /v1/telemetry handler reads, so the
-    // pump can push a telemetry frame per applied block (mirrors the noded
-    // daemon lane). the `async move` pump closure below captures this clone.
-    let telemetry = http_handle.telemetry_ring();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
@@ -3991,6 +3987,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
+        // the validator's own `ducktape_*` Prometheus series, registered on the
+        // SAME runtime registry `context.encode()` (GET /metrics) serves — the
+        // drain loop below folds each applied block in (height, count, apply
+        // latency, per-module dispatch counters), so the networked node reports
+        // the series the local daemon does and one Grafana board reads both.
+        let metrics = noded::NodeMetrics::register(&context);
+
         // the authorized MESH set, SORTED — what discovery tracks. the
         // consensus scheme uses the (possibly smaller) validator set derived
         // from committed valset state after the recovery boot below.
@@ -5854,11 +5857,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
         // dev override (`make dev` sets DUCKTAPE_DISABLE_HEARTBEAT): keep an idle
-        // dev chain quiet — no nop blocks — so telemetry shows every block (all
-        // real activity) and idle honestly reads as empty, with no nop churn in
-        // the ring. NEVER set this on a multi-node or upgrade-driving network:
-        // the heartbeat is what ticks an idle chain across a pending cutover and
-        // keeps the console height visibly live.
+        // dev chain quiet — no nop blocks — so every committed block is real
+        // activity and the journal/logs carry no idle churn. NEVER set this on a
+        // multi-node or upgrade-driving network: the heartbeat is what ticks an
+        // idle chain across a pending cutover and keeps the console height
+        // visibly live.
         let heartbeat_disabled = std::env::var_os("DUCKTAPE_DISABLE_HEARTBEAT").is_some();
         // throttle for the saga crank pump below.
         let mut last_crank = std::time::Instant::now();
@@ -6061,36 +6064,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             (node::Disposition::Applied, Some(op)) => &op.dispatches,
                             _ => &[],
                         };
-                        // telemetry: one frame per applied, non-heartbeat block —
-                        // the applied subset of the explorer's rows below (the
-                        // explorer also records rejected rows), decorated with
-                        // this node's apply latency. push-then-fan, both
-                        // best-effort (a full ring evicts oldest; a
-                        // subscriber-less send errs) — mirrors the noded lane. a
-                        // rejected op is a deterministic no-op with no trace, and
-                        // the nop heartbeat is filtered like the explorer's row,
-                        // so an idle chain streams nothing here (the empty-state
-                        // copy covers it) and the ring keeps real activity.
-                        if let (node::Disposition::Applied, Some(op)) = (&d.disposition, &d.op)
-                            && op.target != NOP_TARGET
-                        {
-                            let frame = noded::TelemetryFrame {
-                                height: d.height,
-                                // this lane's agreed clock IS the height (the
-                                // drain stamps BlockContext { consensus_time:
-                                // height }); never this node's wall clock.
-                                consensus_time: d.height,
-                                latency_us: op.latency_us,
-                                dispatches: dispatches
-                                    .iter()
-                                    .map(noded::DispatchInfo::from)
-                                    .collect(),
-                                // DrainedOp drops BlockOutcome.events and no
-                                // module emits events yet — honestly empty.
-                                events: Vec::new(),
-                            };
-                            telemetry.push(frame.clone());
-                            let _ = http_events.send(noded::WsFrame::Telemetry(frame));
+                        // metrics: fold the block into the validator's
+                        // `ducktape_*` Prometheus series (GET /metrics). an
+                        // APPLIED block records fully — count, this node's
+                        // apply latency, per-module dispatch counters; a
+                        // REJECTED frame (a deterministic no-op — the idle
+                        // heartbeat nop lands here) only follows the height
+                        // gauge, so it never pollutes the block series.
+                        match (&d.disposition, &d.op) {
+                            (node::Disposition::Applied, Some(op)) => {
+                                metrics.record_block(d.height, op.latency_us, dispatches);
+                            }
+                            _ => metrics.record_height(d.height),
                         }
                         let record = match &d.op {
                             Some(op) if op.target != NOP_TARGET => {
@@ -6178,10 +6163,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                     // publish each newly-applied boundary to ws subscribers
-                    // (send only errs when nobody is subscribed — fine).
-                    // telemetry frames are emitted per applied block in the drain
-                    // loop above; this tip seam carries the block summary only —
-                    // it fires once per drain and holds no dispatch trace.
+                    // (send only errs when nobody is subscribed — fine). the
+                    // drain loop above already folded each block into the
+                    // metrics series; this tip seam carries the ws block
+                    // summary only — it fires once per drain.
                     if let Some(f) = node.finalized() {
                         if last_published != Some(f.height) {
                             let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
@@ -6981,9 +6966,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             });
                         }
                         noded::NodeCommand::Metrics { reply } => {
-                            // the validator serves commonware's runtime registry;
-                            // the `ducktape_*` block series are the local daemon's
-                            // (noded's) surface, not wired into this consensus path.
+                            // one registry: commonware's runtime series plus the
+                            // `ducktape_*` block series the drain loop records.
                             let _ = reply.send(context.encode());
                         }
                     }

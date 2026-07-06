@@ -43,10 +43,6 @@ import {
 export type { ConsoleActions } from "./actions";
 export type { ConsoleContextValue } from "./context";
 
-/** How many recent telemetry frames the console keeps in memory (the node's
- *  ring holds more; this bounds the live view's buffer). */
-const TELEMETRY_KEEP = 200;
-
 /** How many recent non-empty blocks the explorer pulls per refresh. */
 const BLOCKS_KEEP = 200;
 
@@ -125,8 +121,8 @@ export function DucktapeProvider({
           // reads as "empty", never a failed refresh (same contract as
           // governance above).
           filesClient.list(live, {}).catch(() => []),
-          // the explorer's ring pull — best-effort like telemetry, so a node
-          // without /v1/blocks reads as "no blocks yet".
+          // the explorer's ring pull — best-effort, so a node without
+          // /v1/blocks reads as "no blocks yet".
           live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
         ]),
       )
@@ -262,32 +258,22 @@ export function DucktapeProvider({
     };
   }, [transport, actions, fail]);
 
-  // 2. Hydrate once the node is resolved, then follow the block stream and the
-  //    node-local telemetry stream (backfilled from the ring, then live). The
-  //    telemetry updaters stay pure (StrictMode double-invokes them): they append
-  //    idempotently and dedupe on the strictly-increasing block height.
+  // 2. Hydrate once the node is resolved, then follow the block stream. The
+  //    lastBlock updater stays pure (StrictMode double-invokes it): it only
+  //    moves forward on the strictly-increasing block height.
   useEffect(() => {
     if (!node) return;
     refresh();
 
-    // Backfill recent telemetry, then keep any newer live frames layered on top.
-    node
-      .telemetry(TELEMETRY_KEEP)
-      .then((frames) =>
-        dispatch({
-          type: "update",
-          fn: (prev) => {
-            const cutoff = frames.length ? frames[frames.length - 1].height : -1;
-            const newer = prev.telemetry.filter((f) => f.height > cutoff);
-            return { telemetry: [...frames, ...newer].slice(-TELEMETRY_KEEP) };
-          },
-        }),
-      )
-      .catch(() => {
-        /* telemetry is best-effort observability; a miss just leaves it empty */
+    const offBlock = node.onBlock((block) => {
+      // The live chain tip, UNGATED — recorded before the pending gate below,
+      // so the console always knows the chain moved even while an op of ours
+      // is in flight (a seam duplicate or reconnect replay never moves it back).
+      dispatch({
+        type: "update",
+        fn: (prev) =>
+          block.height > (prev.lastBlock ?? -1) ? { lastBlock: block.height } : {},
       });
-
-    const offBlock = node.onBlock(() => {
       // A block landing while one of OUR ops is still in flight would re-query
       // state that predates the op and clobber its preconfirmed projection —
       // and the op's own completion refresh follows immediately anyway. Stale
@@ -295,21 +281,7 @@ export function DucktapeProvider({
       if (hasFreshPending(stateRef.current.ops, Date.now())) return;
       refresh();
     });
-    const offTelemetry = node.onTelemetry((frame) => {
-      dispatch({
-        type: "update",
-        fn: (prev) => {
-          const last = prev.telemetry[prev.telemetry.length - 1];
-          // Heights strictly increase; drop a seam duplicate or a reconnect replay.
-          if (last && frame.height <= last.height) return {};
-          return { telemetry: [...prev.telemetry, frame].slice(-TELEMETRY_KEEP) };
-        },
-      });
-    });
-    return () => {
-      offBlock();
-      offTelemetry();
-    };
+    return offBlock;
   }, [node, refresh]);
 
   // 2b. Liveness heartbeat — the "no running node" detection AND recovery. The

@@ -349,12 +349,12 @@ export function createActions({
     // Choosing a local workspace supersedes any remembered remote — it becomes
     // what we reconnect to on next launch.
     clearRemoteUrl();
-    // Tear the old node down BEFORE clearing its projections, so its block /
-    // telemetry subscriptions can't fire a straggler frame into the just-cleared
-    // arrays during the async selectWorkspace/waitUntilUp window that follows
+    // Tear the old node down BEFORE clearing its projections, so its block
+    // subscription can't fire a straggler frame into the just-cleared state
+    // during the async selectWorkspace/waitUntilUp window that follows
     // (mirrors connectRemote). Without this teardown-first order, an old-node
-    // frame lands in the cleared telemetry and the backfill's retain-prev keeps
-    // it atop the NEW node's timeline — the exact staleness this clear prevents.
+    // block would re-set lastBlock right after the clear — the exact
+    // staleness this clear prevents.
     setNode(null);
     patch({
       workspace: target,
@@ -365,9 +365,9 @@ export function createActions({
       forgetNeedsForce: false,
       inviteBlob: null,
       // per-node observability belonging to the workspace we're leaving; the
-      // node effect re-hydrates blocks and re-backfills telemetry once the new
-      // node is set below.
-      telemetry: [],
+      // node effect re-hydrates blocks and re-follows the block stream once
+      // the new node is set below.
+      lastBlock: null,
       blocks: [],
     });
     return Promise.resolve()
@@ -1087,11 +1087,10 @@ export function createActions({
         workspace: null,
         connected: false,
         status: null,
-        // per-node observability: the live telemetry stream and the node's own
-        // durable block history. clear them on a node switch so the new node's
-        // timeline/explorer never shows the previous node's rows (the telemetry
-        // backfill retains prior frames when the new node returns none).
-        telemetry: [],
+        // per-node observability: the live chain tip and the node's own
+        // durable block history. clear them on a node switch so the new
+        // node's explorer never shows the previous node's rows.
+        lastBlock: null,
         blocks: [],
         channels: [],
         messages: [],

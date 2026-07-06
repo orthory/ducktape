@@ -28,7 +28,6 @@ use agent::AgentModule;
 use runs::RunsModule;
 use automations::Automations;
 use chat::Chat;
-use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use tagging::TaggingModule;
@@ -45,14 +44,14 @@ use jobs::Jobs;
 use memory::Memory;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeStatus, TelemetryEvent, TelemetryFrame, TelemetryRing, WsFrame,
-    block_row, hex_bytes, hex_root, payload_preview,
+    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, WsFrame, block_row, hex_bytes, hex_root,
+    payload_preview,
 };
 use pages::Pages;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
-use sdk::{Effect, Event, Msg, Origin};
+use sdk::{Effect, Msg, Origin};
 use tasks::Tasks;
 use tokio::sync::broadcast;
 
@@ -77,84 +76,6 @@ const MODULE_IDS: [&str; 16] = [
     "profiles",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
-
-/// histogram buckets for block apply latency, in SECONDS (Prometheus
-/// convention). ~100µs to ~1s — the range one local block apply falls in.
-const LATENCY_BUCKETS: [f64; 13] = [
-    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
-];
-
-/// labels for the per-dispatch counter. kept LOW-CARDINALITY: `module` is the
-/// bounded registered set; `origin` is the trigger KIND only — never the
-/// specific submitter name or emitter id.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct DispatchLabels {
-    module: String,
-    origin: String,
-}
-
-/// the daemon's own Prometheus series, registered INTO commonware's runtime
-/// registry so one `context.encode()` (GET /metrics) serves runtime + app
-/// metrics together. each `Registered` handle is retained for the process life;
-/// updates go through its `Deref` to the underlying metric.
-struct NodeMetrics {
-    block_height: Registered<raw::Gauge>,
-    blocks_total: Registered<raw::Counter>,
-    apply_latency: Registered<raw::Histogram>,
-    dispatch_total: Registered<raw::Family<DispatchLabels, raw::Counter>>,
-}
-
-impl NodeMetrics {
-    /// register the `ducktape_*` series on the runtime context (root context, so
-    /// names carry no child prefix).
-    fn register<C: commonware_runtime::Metrics>(context: &C) -> Self {
-        Self {
-            block_height: context.gauge(
-                "ducktape_block_height",
-                "latest committed local block height",
-            ),
-            blocks_total: context.counter(
-                "ducktape_blocks_total",
-                "committed local blocks since daemon start",
-            ),
-            apply_latency: context.histogram(
-                "ducktape_block_apply_latency_seconds",
-                "node-local wall-clock cost of applying one block",
-                LATENCY_BUCKETS.into_iter(),
-            ),
-            dispatch_total: context.family(
-                "ducktape_dispatch_total",
-                "module dispatches, by module and trigger-origin kind",
-            ),
-        }
-    }
-
-    /// fold one committed block's telemetry into the series.
-    fn record_block(&self, height: u64, latency_us: u64, dispatches: &[DispatchRecord]) {
-        self.block_height.set(height as i64);
-        self.blocks_total.inc();
-        // microseconds → seconds for the Prometheus convention.
-        self.apply_latency.observe(latency_us as f64 / 1_000_000.0);
-        for d in dispatches {
-            self.dispatch_total
-                .get_or_create(&DispatchLabels {
-                    module: d.module.clone(),
-                    origin: origin_kind(&d.origin).to_string(),
-                })
-                .inc();
-        }
-    }
-}
-
-/// the low-cardinality trigger KIND of a dispatch origin — the metrics label
-/// (`origin_tag` below keeps the specific name/id for the telemetry frame).
-fn origin_kind(origin: &Origin) -> &'static str {
-    match origin {
-        Origin::External(_) => "external",
-        Origin::Module(_) => "module",
-        Origin::System => "system",
-    }
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
@@ -189,15 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_index_store(index.clone());
 
     // the node actor gets its own thread: commonware's tokio runner owns that
-    // thread's runtime, and the host must never leave it. the blob handle and
-    // the telemetry ring are the node-local surfaces that cross: the actor
-    // registers the files module over the blobs and pushes per-block telemetry
-    // into the ring, while the http layer reads both through its own clones.
+    // thread's runtime, and the host must never leave it. the blob handle is
+    // the node-local surface that crosses: the actor registers the files module
+    // over the blobs, while the http layer reads through its own clone.
     let actor_storage = storage.clone();
     let actor_forge_repo = forge_repo.clone();
     let actor_index = index.clone();
     let blobs = handle.blob_handle();
-    let telemetry = handle.telemetry_ring();
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {
@@ -206,7 +125,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_forge_repo,
                 actor_index,
                 blobs,
-                telemetry,
                 cmd_rx,
                 event_tx,
             )
@@ -236,7 +154,6 @@ fn run_node(
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
     blobs: files::BlobHandle,
-    telemetry: TelemetryRing,
     mut cmds: mpsc::Receiver<NodeCommand>,
     events: broadcast::Sender<WsFrame>,
 ) {
@@ -371,7 +288,6 @@ fn run_node(
                         &index,
                         &op_blobs,
                         &events,
-                        &telemetry,
                         &metrics,
                         Origin::External(origin),
                         Msg { target, payload },
@@ -454,15 +370,12 @@ async fn submit_and_drain(
     index: &IndexStore,
     blobs: &files::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
-    telemetry: &TelemetryRing,
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
-    let (included, effects) = match submit_one(
-        host, height, index, blobs, events, telemetry, metrics, origin, msg,
-    )
-    .await
+    let (included, effects) =
+        match submit_one(host, height, index, blobs, events, metrics, origin, msg).await
     {
         Ok(out) => out,
         Err(SubmitError::Fatal(err)) => {
@@ -500,7 +413,6 @@ async fn submit_and_drain(
             index,
             blobs,
             events,
-            telemetry,
             metrics,
             Origin::External(ORACLE_ORIGIN.to_vec()),
             follow,
@@ -529,7 +441,6 @@ async fn submit_one(
     index: &IndexStore,
     blobs: &files::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
-    telemetry: &TelemetryRing,
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
@@ -558,9 +469,10 @@ async fn submit_one(
         consensus_time,
         origin,
     };
-    // node-local wall-clock cost of applying this block — the telemetry plane's
-    // one non-deterministic signal. measured HERE in the effectful daemon layer,
-    // never inside the deterministic host, so the kernel stays clock-free.
+    // node-local wall-clock cost of applying this block — the metrics plane's
+    // one non-deterministic signal (the apply-latency histogram). measured HERE
+    // in the effectful daemon layer, never inside the deterministic host, so
+    // the kernel stays clock-free.
     let started = Instant::now();
     let out = host.submit_at(ctx, msg).await?;
     let latency_us = started.elapsed().as_micros() as u64;
@@ -571,21 +483,11 @@ async fn submit_one(
         app_hash: hex_root(&out.app_hash),
     };
     let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
-    let frame = TelemetryFrame {
-        height: *height,
-        consensus_time,
-        latency_us,
-        dispatches: operations.clone(),
-        events: out.events.iter().map(event_preview).collect(),
-    };
     // fold this block into the Prometheus series (before `out` is consumed).
     metrics.record_block(*height, latency_us, &out.dispatches);
 
-    // buffer for GET /v1/telemetry, then fan both frames out live. no subscribers
-    // is fine — send only fails then.
-    telemetry.push(frame.clone());
+    // fan the block out live. no subscribers is fine — send only fails then.
     let _ = events.send(WsFrame::Block(block.clone()));
-    let _ = events.send(WsFrame::Telemetry(frame));
 
     // fold the block into the derived per-module index LAST: canonical state
     // is already committed, so an index failure degrades the read models and
@@ -619,7 +521,8 @@ async fn submit_one(
     Ok((block, out.effects))
 }
 
-/// map a deterministic dispatch record to its telemetry wire twin.
+/// map a deterministic dispatch record to its explorer wire twin (the block
+/// record's `operations`).
 fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
     DispatchInfo {
         module: record.module.clone(),
@@ -636,17 +539,6 @@ fn origin_tag(origin: &Origin) -> String {
         Origin::External(name) => format!("external:{}", String::from_utf8_lossy(name)),
         Origin::Module(id) => format!("module:{id}"),
         Origin::System => "system".to_string(),
-    }
-}
-
-/// best-effort text preview of an emitted event's (module-defined) payload,
-/// capped so a large payload can't bloat a telemetry frame.
-fn event_preview(ev: &Event) -> TelemetryEvent {
-    const PREVIEW_CAP: usize = 512;
-    let end = ev.payload.len().min(PREVIEW_CAP);
-    TelemetryEvent {
-        source: ev.source.clone(),
-        payload: String::from_utf8_lossy(&ev.payload[..end]).into_owned(),
     }
 }
 

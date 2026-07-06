@@ -19,9 +19,8 @@
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -31,6 +30,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
 use sdk::StateRoot;
@@ -64,31 +64,6 @@ pub struct SubmitReceipt {
     pub op_hash: String,
 }
 
-/// how many recent telemetry frames the daemon retains for `GET /v1/telemetry`.
-/// a client connecting mid-stream pulls this backfill, then follows the ws.
-pub const TELEMETRY_RING_CAP: usize = 256;
-
-/// the observability record for one finalized block: the host's DETERMINISTIC
-/// dispatch trace decorated with this node's WALL-CLOCK apply latency. rides the
-/// ws stream (`WsFrame::Telemetry`) and is buffered in the [`TelemetryRing`] for
-/// `GET /v1/telemetry`. keyed by `(height, source)` — the same space the future
-/// on-consensus telemetry module will use, so the two planes correlate.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelemetryFrame {
-    pub height: u64,
-    /// the block's AGREED logical clock (from the block context) — identical on
-    /// every node. NOT this node's wall clock.
-    pub consensus_time: u64,
-    /// node-local cost of applying this block, in microseconds. the ONE
-    /// non-deterministic field: it differs per node and never enters consensus.
-    pub latency_us: u64,
-    /// one entry per module dispatched this block, in drain (causal) order.
-    pub dispatches: Vec<DispatchInfo>,
-    /// observability events modules emitted during the block, in dispatch order.
-    pub events: Vec<TelemetryEvent>,
-}
-
 /// one dispatch in a block's drain — the wire twin of `host::DispatchRecord`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,43 +77,6 @@ pub struct DispatchInfo {
     pub emitted_msgs: usize,
     /// observability `Event`s this dispatch emitted.
     pub emitted_events: usize,
-}
-
-/// one observability event a module emitted (`Ctx::emit_event`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelemetryEvent {
-    /// the module that emitted it.
-    pub source: String,
-    /// best-effort UTF-8 preview of the (module-defined) payload, capped. binary
-    /// payloads render lossily; no module emits events yet, so this is forward
-    /// wiring for when they do.
-    pub payload: String,
-}
-
-/// a bounded, shared ring of the most recent telemetry frames. the node actor
-/// pushes from its own thread; the http layer reads from the server runtime, so
-/// it is an `Arc<Mutex>` — frames are plain data, cheap to clone out under the
-/// lock. drops oldest at [`TELEMETRY_RING_CAP`].
-#[derive(Clone, Default)]
-pub struct TelemetryRing(Arc<Mutex<VecDeque<TelemetryFrame>>>);
-
-impl TelemetryRing {
-    /// append a frame, evicting the oldest once the cap is reached.
-    pub fn push(&self, frame: TelemetryFrame) {
-        let mut ring = self.0.lock().expect("telemetry ring poisoned");
-        if ring.len() == TELEMETRY_RING_CAP {
-            ring.pop_front();
-        }
-        ring.push_back(frame);
-    }
-
-    /// the most recent `limit` frames, oldest-first (`None` → all buffered).
-    pub fn recent(&self, limit: Option<usize>) -> Vec<TelemetryFrame> {
-        let ring = self.0.lock().expect("telemetry ring poisoned");
-        let take = limit.map_or(ring.len(), |n| n.min(ring.len()));
-        ring.iter().skip(ring.len() - take).cloned().collect()
-    }
 }
 
 /// how many recent blocks `GET /v1/blocks` serves when the caller names no
@@ -200,9 +138,8 @@ pub struct BlockRecord {
 
 /// the explorer's wire rendering of one dispatch. `Origin::External` renders
 /// as plain `"external"`: the block-level `proposer` field already carries
-/// the key, and raw ed25519 bytes are not utf-8 (telemetry's
-/// `external:<name>` convention assumes the embedded daemon's readable
-/// names).
+/// the key, and raw ed25519 bytes are not utf-8 (the `external:<name>`
+/// convention assumes the embedded daemon's readable names).
 impl From<&host::DispatchRecord> for DispatchInfo {
     fn from(record: &host::DispatchRecord) -> Self {
         DispatchInfo {
@@ -226,6 +163,104 @@ pub fn payload_preview(payload: &[u8]) -> String {
     match text.char_indices().nth(PAYLOAD_PREVIEW_MAX) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text.into_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// node metrics: the `ducktape_*` Prometheus series behind GET /metrics.
+// shared by every binary serving this surface — the embedded daemon folds a
+// block in at submit, the consensus validator at drain — so one Grafana board
+// reads them all.
+// ---------------------------------------------------------------------------
+
+/// histogram buckets for block apply latency, in SECONDS (Prometheus
+/// convention). ~100µs to ~1s — the range one local block apply falls in.
+const LATENCY_BUCKETS: [f64; 13] = [
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+];
+
+/// labels for the per-dispatch counter. kept LOW-CARDINALITY: `module` is the
+/// bounded registered set; `origin` is the trigger KIND only — never the
+/// specific submitter name or emitter id.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DispatchLabels {
+    module: String,
+    origin: String,
+}
+
+/// the low-cardinality trigger KIND of a dispatch origin — the metrics label.
+fn origin_kind(origin: &sdk::Origin) -> &'static str {
+    match origin {
+        sdk::Origin::External(_) => "external",
+        sdk::Origin::Module(_) => "module",
+        sdk::Origin::System => "system",
+    }
+}
+
+/// the node's own Prometheus series, registered INTO commonware's runtime
+/// registry so one `context.encode()` (GET /metrics) serves runtime + app
+/// metrics together. each `Registered` handle is retained for the process life;
+/// updates go through its `Deref` to the underlying metric.
+pub struct NodeMetrics {
+    block_height: Registered<raw::Gauge>,
+    blocks_total: Registered<raw::Counter>,
+    apply_latency: Registered<raw::Histogram>,
+    dispatch_total: Registered<raw::Family<DispatchLabels, raw::Counter>>,
+}
+
+impl NodeMetrics {
+    /// register the `ducktape_*` series on the runtime context (root context, so
+    /// names carry no child prefix).
+    pub fn register<C: commonware_runtime::Metrics>(context: &C) -> Self {
+        Self {
+            block_height: context.gauge(
+                "ducktape_block_height",
+                "latest committed local block height",
+            ),
+            blocks_total: context.counter(
+                "ducktape_blocks_total",
+                "committed local blocks since daemon start",
+            ),
+            apply_latency: context.histogram(
+                "ducktape_block_apply_latency_seconds",
+                "node-local wall-clock cost of applying one block",
+                LATENCY_BUCKETS.into_iter(),
+            ),
+            dispatch_total: context.family(
+                "ducktape_dispatch_total",
+                "module dispatches, by module and trigger-origin kind",
+            ),
+        }
+    }
+
+    /// fold one applied block into the series: height, count, this node's
+    /// wall-clock apply latency, and the per-module dispatch counters.
+    pub fn record_block(
+        &self,
+        height: u64,
+        latency_us: u64,
+        dispatches: &[host::DispatchRecord],
+    ) {
+        self.block_height.set(height as i64);
+        self.blocks_total.inc();
+        // microseconds → seconds for the Prometheus convention.
+        self.apply_latency.observe(latency_us as f64 / 1_000_000.0);
+        for d in dispatches {
+            self.dispatch_total
+                .get_or_create(&DispatchLabels {
+                    module: d.module.clone(),
+                    origin: origin_kind(&d.origin).to_string(),
+                })
+                .inc();
+        }
+    }
+
+    /// follow the committed height WITHOUT recording a block apply — the
+    /// validator lane calls this for rejected frames (a deterministic no-op
+    /// advances the height but is not a sample worth the block series; the
+    /// idle heartbeat nop lands here, so it never pollutes the histogram).
+    pub fn record_height(&self, height: u64) {
+        self.block_height.set(height as i64);
     }
 }
 
@@ -313,7 +348,6 @@ pub struct QueryRequest {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WsFrame {
     Block(BlockSummary),
-    Telemetry(TelemetryFrame),
 }
 
 /// a request to the actor that owns the host. replies cross the channel as
@@ -355,10 +389,6 @@ pub struct NodeHandle {
     /// node-local by design (never consensus state, never an op), so the http
     /// handlers read/write this store directly.
     blobs: files::BlobHandle,
-    /// recent per-block telemetry. like `blobs`, this is node-local and never
-    /// crosses the actor command lane: the actor pushes into it as blocks
-    /// commit, `GET /v1/telemetry` reads it directly.
-    telemetry: TelemetryRing,
     /// the forge module's on-disk repo base dir (`<storage>/<forge subdir>`);
     /// each named repo lives at `<forge_repo>/<name>` as a real libgit2 repo.
     /// threaded in so the git upload-pack (clone/fetch) handler can open a repo
@@ -368,7 +398,7 @@ pub struct NodeHandle {
     /// makes upload-pack a clean 500 there rather than a panic.
     forge_repo: Option<PathBuf>,
     /// the per-module derived index (fluent31-backed read models). node-local
-    /// like `blobs`/`telemetry`: the actor is the one WRITER as blocks commit;
+    /// like `blobs`: the actor is the one WRITER as blocks commit;
     /// the `/v1/index/*` handlers read it directly through MVCC snapshots, so
     /// an index scan never crosses the actor command lane. `None` on a handle
     /// whose embedder configured no index (the router tests' fake actor) —
@@ -393,7 +423,6 @@ impl NodeHandle {
             events: event_tx.clone(),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             blobs: files::BlobHandle::default(),
-            telemetry: TelemetryRing::default(),
             forge_repo: None,
             index: None,
         };
@@ -422,12 +451,6 @@ impl NodeHandle {
     /// where the module's `serve_sync` reads.
     pub fn blob_handle(&self) -> files::BlobHandle {
         self.blobs.clone()
-    }
-
-    /// the telemetry ring this surface serves. the daemon actor pushes a frame
-    /// into a clone of it as each block commits; `GET /v1/telemetry` reads here.
-    pub fn telemetry_ring(&self) -> TelemetryRing {
-        self.telemetry.clone()
     }
 
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
@@ -472,7 +495,6 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/submit", post(submit))
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
-        .route("/v1/telemetry", get(telemetry))
         .route("/v1/blocks", get(blocks))
         // the derived read-model tier: snapshot reads of the per-module
         // fluent31 indexes the actor materializes as blocks commit.
@@ -591,27 +613,6 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
         Ok(status) => Json(status).into_response(),
         Err(_) => actor_gone(),
     }
-}
-
-/// query params for `GET /v1/telemetry`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelemetryParams {
-    /// cap the response to the most recent N frames (default: all buffered).
-    pub limit: Option<usize>,
-}
-
-/// GET /v1/telemetry — recent per-block telemetry, oldest-first: `{"frames":[…]}`.
-///
-/// reads the node-local ring directly (no actor round-trip — the actor never
-/// blocks on an http read). a client connecting mid-stream backfills here, then
-/// follows `WsFrame::Telemetry` on `/v1/ws` for live frames.
-async fn telemetry(
-    State(handle): State<NodeHandle>,
-    Query(params): Query<TelemetryParams>,
-) -> Response {
-    let frames = handle.telemetry.recent(params.limit);
-    Json(serde_json::json!({ "frames": frames })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +746,7 @@ pub async fn rebuild_stale_modules(
 }
 
 // ---------------------------------------------------------------------------
-// the derived-index read lane. like the blob and telemetry lanes these
+// the derived-index read lane. like the blob lane these
 // handlers never cross the actor: the store is `Send + Sync` and every read
 // runs at its own MVCC snapshot, concurrent with the actor's block writes.
 // ---------------------------------------------------------------------------
@@ -1693,54 +1694,6 @@ async fn stream_frames(mut socket: WebSocket, mut frames: broadcast::Receiver<Ws
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn frame(height: u64) -> TelemetryFrame {
-        TelemetryFrame {
-            height,
-            consensus_time: 0,
-            latency_us: 0,
-            dispatches: Vec::new(),
-            events: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn ring_evicts_oldest_at_cap_and_recent_returns_newest_tail() {
-        let ring = TelemetryRing::default();
-        // fill two past the cap: the oldest two fall out, the newest survive.
-        for h in 0..(TELEMETRY_RING_CAP as u64 + 2) {
-            ring.push(frame(h));
-        }
-        let all = ring.recent(None);
-        assert_eq!(
-            all.len(),
-            TELEMETRY_RING_CAP,
-            "buffer holds exactly the cap"
-        );
-        assert_eq!(all.first().unwrap().height, 2, "oldest two evicted");
-        assert_eq!(
-            all.last().unwrap().height,
-            TELEMETRY_RING_CAP as u64 + 1,
-            "newest retained, oldest-first ordering"
-        );
-
-        // recent(limit) returns the newest `limit`, still oldest-first.
-        let tail: Vec<u64> = ring.recent(Some(3)).iter().map(|f| f.height).collect();
-        assert_eq!(
-            tail,
-            vec![
-                TELEMETRY_RING_CAP as u64 - 1,
-                TELEMETRY_RING_CAP as u64,
-                TELEMETRY_RING_CAP as u64 + 1,
-            ],
-        );
-
-        // a limit past the buffer size just returns everything.
-        assert_eq!(
-            ring.recent(Some(TELEMETRY_RING_CAP + 100)).len(),
-            TELEMETRY_RING_CAP,
-        );
-    }
 
     /// the explorer row round-trips through its stored index encoding — the
     /// one seam both binaries write and `GET /v1/blocks` reads.

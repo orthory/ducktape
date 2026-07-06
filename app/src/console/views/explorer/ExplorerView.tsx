@@ -9,7 +9,7 @@
 import { useEffect, useState } from "react";
 
 import { displayNameForKey } from "../../../domain/names";
-import type { BlockRecord, TelemetryDispatch } from "../../../domain/transport";
+import type { BlockRecord, DispatchInfo } from "../../../domain/transport";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 
@@ -116,7 +116,7 @@ function DigestLine({ label, value }: { label: string; value: string }) {
   );
 }
 
-function OperationRow({ op, index }: { op: TelemetryDispatch; index: number }) {
+function OperationRow({ op, index }: { op: DispatchInfo; index: number }) {
   const fanout = [
     op.emittedMsgs > 0 ? `▸${op.emittedMsgs} msgs` : null,
     op.emittedEvents > 0 ? `◆${op.emittedEvents} events` : null,

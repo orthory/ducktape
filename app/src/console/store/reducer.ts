@@ -12,7 +12,7 @@ export function reducer(state: ConsoleState, action: Action): ConsoleState {
     case "patch":
       return { ...state, ...action.patch };
     case "update": {
-      // An empty result is a deliberate no-op (e.g. a telemetry frame deduped on
+      // An empty result is a deliberate no-op (e.g. a ws block tip deduped on
       // height) — keep the SAME reference so React bails out of the re-render
       // instead of churning on an identical-content copy.
       const next = action.fn(state);

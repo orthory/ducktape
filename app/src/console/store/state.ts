@@ -14,7 +14,7 @@ import type {
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
-import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type { BlockRecord, NodeStatus } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -109,14 +109,15 @@ export interface ConsoleState {
   /** Every file manifest (List, prefix ""), re-queried per block. */
   files: Manifest[];
 
-  /** Recent per-block node telemetry, oldest-first (the view renders newest
-   *  first). Node-local observability — never re-queried from committed state;
-   *  backfilled from the node's ring on connect, then followed live over ws. */
-  telemetry: TelemetryFrame[];
+  /** The newest finalized height seen on the ws block stream — updated
+   *  UNGATED (unlike the refresh the same stream drives, which is held while
+   *  an op is in flight), so the console always knows the chain moved. Null
+   *  until the first frame on this connection. */
+  lastBlock: number | null;
 
   /** Recent NON-EMPTY blocks, oldest-first (the explorer renders newest
-   *  first). Node-local observability like telemetry — re-pulled from the
-   *  node's ring on every refresh; empty on a node without the surface. */
+   *  first). Node-local observability — re-pulled from the node's ring on
+   *  every refresh; empty on a node without the surface. */
   blocks: BlockRecord[];
 
   /** Height the explorer should open on next render — the finalization-mark
@@ -244,7 +245,7 @@ export const createInitialState = (): ConsoleState => {
     searchPending: false,
     searchOpen: false,
     files: [],
-    telemetry: [],
+    lastBlock: null,
     blocks: [],
     explorerFocus: null,
     ops: {},

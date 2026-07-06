@@ -4,12 +4,7 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type {
-  BlockEvent,
-  NodeTransport,
-  SubmitReceipt,
-  TelemetryFrame,
-} from "../../domain/transport";
+import type { BlockEvent, NodeTransport, SubmitReceipt } from "../../domain/transport";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
@@ -17,7 +12,7 @@ import type { ConsoleActions } from "./DucktapeProvider";
 // Switching nodes dials a new one via node-bootstrap. Mock only connectRemote
 // so the switch lands on a benign, empty node (its status rejects → the "no
 // running node" surface) with no real network — enough to prove the previous
-// node's telemetry/blocks are dropped, not carried across.
+// node's chain tip/blocks are dropped, not carried across.
 vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../domain/node-bootstrap")>();
   const emptyNode: NodeTransport = {
@@ -27,10 +22,8 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
     putBlob: vi.fn().mockResolvedValue("00".repeat(32)),
     getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
     status: vi.fn().mockRejectedValue(new Error("empty test node")),
-    telemetry: vi.fn().mockResolvedValue([]),
     blocks: vi.fn().mockResolvedValue([]),
     onBlock: vi.fn(() => () => {}),
-    onTelemetry: vi.fn(() => () => {}),
   };
   return {
     ...actual,
@@ -146,9 +139,7 @@ const makeFakeNode = () => {
       blockListeners.add(listener);
       return () => blockListeners.delete(listener);
     }),
-    telemetry: vi.fn().mockResolvedValue([]),
     blocks: vi.fn().mockResolvedValue([]),
-    onTelemetry: vi.fn(() => () => {}),
   };
   const finalize = (block: BlockEvent) =>
     blockListeners.forEach((notify) => notify(block));
@@ -343,14 +334,13 @@ describe("DucktapeProvider", () => {
     }
   });
 
-  // Regression: telemetry is a live per-node stream and blocks are the node's
-  // own durable history — both must be dropped on a node switch. Without the
-  // reset, the telemetry backfill RETAINS the prior node's frames when the new
-  // node returns none, so the switch shows stale rows as if current.
-  it("drops the previous node's telemetry and blocks when switching nodes", async () => {
-    const { transport } = makeFakeNode();
-    // node 1 has durable block history AND streams live telemetry, so the switch
-    // must zero BOTH (blocks 1→0, telemetry 1→0).
+  // Regression: the live chain tip and the node's own durable block history
+  // are per-node — both must be dropped on a node switch, or the new node's
+  // explorer shows the previous node's rows (and its tip) as if current.
+  it("drops the previous node's chain tip and blocks when switching nodes", async () => {
+    const { transport, finalize } = makeFakeNode();
+    // node 1 has durable block history AND a live block stream, so the switch
+    // must zero BOTH (blocks 1→0, lastBlock 7→null).
     vi.mocked(transport.blocks).mockResolvedValue([
       {
         height: 7,
@@ -364,36 +354,23 @@ describe("DucktapeProvider", () => {
         opHash: "dd".repeat(32),
       },
     ]);
-    let emit: ((frame: TelemetryFrame) => void) | null = null;
-    vi.mocked(transport.onTelemetry).mockImplementation((listener) => {
-      emit = listener;
-      return () => {};
-    });
     renderConsole(transport);
     await waitFor(() => {
       expect(screen.getByTestId("connected").textContent).toBe("true");
       expect(capturedState!.blocks.length).toBe(1);
     });
 
-    // node 1 streams one telemetry frame.
+    // node 1's ws stream lands a block → the ungated tip follows it.
     await act(async () => {
-      emit!({
-        height: 7,
-        consensusTime: 7,
-        latencyUs: 512,
-        dispatches: [
-          { module: "chat", origin: "external", emittedMsgs: 1, emittedEvents: 0 },
-        ],
-        events: [],
-      });
+      finalize({ height: 7, appHash: "bb".repeat(32) });
     });
-    expect(capturedState!.telemetry.length).toBe(1);
+    expect(capturedState!.lastBlock).toBe(7);
 
-    // switch to another node → the previous node's frames must not linger.
+    // switch to another node → the previous node's rows/tip must not linger.
     await act(async () => {
       capturedActions!.connectRemote("http://127.0.0.1:9999");
     });
-    expect(capturedState!.telemetry.length).toBe(0);
+    expect(capturedState!.lastBlock).toBeNull();
     expect(capturedState!.blocks.length).toBe(0);
   });
 

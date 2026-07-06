@@ -24,10 +24,8 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   putBlob: vi.fn(),
   getBlob: vi.fn(),
   status: vi.fn(),
-  telemetry: vi.fn(),
   blocks: vi.fn(),
   onBlock: vi.fn(),
-  onTelemetry: vi.fn(),
 });
 
 const wireMessage = (over: Partial<MessageView["head"]> = {}): MessageView => ({
