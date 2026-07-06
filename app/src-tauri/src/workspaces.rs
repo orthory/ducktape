@@ -890,9 +890,55 @@ fn commit_active(app: &tauri::AppHandle, reg: &mut Registry, id: &str) -> Result
 pub fn workspace_phase(app: tauri::AppHandle, id: String) -> Result<PhaseReport, String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+    let tail = read_tail(&dir.join("daemon.log"), 64 * 1024)?;
+    let report = classify(&tail);
+    // classify only knows the node's stdout markers, so a node that crashed on
+    // boot for a reason it printed no known marker for — a bind conflict, a
+    // config parse error, an abort — reads as "starting"/"parked" FOREVER: a
+    // cheerful spinner over a corpse. cross-check the process. if the pid WE
+    // recorded is gone and neither port is held, the node is dead, not slow;
+    // report fatal with the last log line as the best reason we have. (once the
+    // node answers /v1/status the webview stops polling this, so a live node
+    // never reaches here; a healthy parked joiner keeps its pid + listen port.)
+    if report.phase != "fatal"
+        && recorded_pid_alive(&dir) == Some(false)
+        && !port_listening(ws.ports.listen)
+        && !port_listening(ws.ports.http)
+    {
+        let detail = tail
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| "the node exited before it came up".to_string());
+        return Ok(PhaseReport {
+            phase: "fatal".into(),
+            detail: Some(detail),
+        });
+    }
+    Ok(report)
+}
+
+/// the path + tail of a workspace's `daemon.log`, so the ui can show the real
+/// startup reason and offer an "open log" affordance instead of stranding the
+/// developer with a generic timeout. reuses [`read_tail`].
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogTail {
+    pub path: String,
+    pub tail: String,
+}
+
+#[tauri::command]
+pub fn workspace_log_tail(app: tauri::AppHandle, id: String) -> Result<LogTail, String> {
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
     let log_path = workspaces_dir(&app)?.join(&ws.id).join("daemon.log");
-    let tail = read_tail(&log_path, 64 * 1024)?;
-    Ok(classify(&tail))
+    Ok(LogTail {
+        path: log_path.display().to_string(),
+        tail: read_tail(&log_path, 64 * 1024)?,
+    })
 }
 
 // ── Phase classification ────────────────────────────────
@@ -913,6 +959,9 @@ fn classify(log: &str) -> PhaseReport {
         ("promoted", "promoted:"),
         ("fatal", "FATAL"),
         ("fatal", "not admitted after"),
+        // a raw Rust panic on boot ("thread 'main' panicked at …") prints no
+        // node marker — catch it so a crashed node stops reading as "starting".
+        ("fatal", "panicked at"),
     ];
     let mut latest: Option<(&str, String)> = None;
     for line in log.lines() {
@@ -962,6 +1011,38 @@ pub(crate) fn port_listening(port: u16) -> bool {
     use std::time::Duration;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+/// is the node WE spawned for this workspace still alive? reads the pidfile
+/// [`workspace_select`] wrote and signal-0s it. `None` when there is no pidfile
+/// (never spawned by us, or an adopted node whose pid we don't own) — the
+/// caller must not infer death from an absent pidfile.
+fn recorded_pid_alive(dir: &Path) -> Option<bool> {
+    let raw = fs::read_to_string(pidfile(dir)).ok()?;
+    let pid = raw.trim();
+    if pid.is_empty() {
+        return None;
+    }
+    Some(pid_alive(pid))
+}
+
+/// unix `kill -0 <pid>`: succeeds iff the process exists. shells out to match
+/// the rest of this module's teardown path (no libc dep in this crate).
+#[cfg(unix)]
+fn pid_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: &str) -> bool {
+    true // best-effort on non-unix; the dev box is linux.
 }
 
 // ── Stopping a workspace's node for real ────────────────
@@ -1205,6 +1286,30 @@ mod tests {
                    [node ab] parked: awaiting admission (epoch 0 has 1 validators)\n\
                    [node ab] promoted: validator at epoch 1 boundary 4 — rebooting\n";
         assert_eq!(classify(log).phase, "promoted");
+    }
+
+    #[test]
+    fn classify_flags_a_raw_panic_as_fatal() {
+        // a boot panic prints no node marker; the "panicked at" catch-all must
+        // still classify it fatal so the join room stops spinning over a corpse.
+        let log = "[node ab] joiner mode: parking on the mesh\n\
+                   thread 'main' panicked at bin/node/src/main.rs:42:9:\n\
+                   called `Result::unwrap()` on an `Err` value: AddrInUse\n";
+        let report = classify(log);
+        assert_eq!(report.phase, "fatal");
+        assert!(
+            report.detail.as_deref().unwrap_or("").contains("panicked"),
+            "detail: {:?}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn classify_ignores_ordinary_log_lines() {
+        // an ordinary info line must not trip any phase — only real markers do.
+        let log = "[node ab] listening on 127.0.0.1:8844\n\
+                   [node ab] indexed 12 blocks\n";
+        assert_eq!(classify(log).phase, "starting");
     }
 
     #[test]

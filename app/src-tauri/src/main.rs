@@ -35,6 +35,7 @@ fn main() {
             workspaces::workspace_forget,
             workspaces::workspace_select,
             workspaces::workspace_phase,
+            workspaces::workspace_log_tail,
             forge_git::forge_head,
             forge_git::forge_log,
             forge_git::forge_tree,
