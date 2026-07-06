@@ -9,4 +9,3 @@ wireguard-upgrade = { workspace = true }
 
 [dev-dependencies]
 commonware-cryptography = { workspace = true }
-nat-traversal = { workspace = true, features = ["simnat"] }

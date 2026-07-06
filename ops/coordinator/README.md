@@ -2,8 +2,9 @@
 
 Three ready-to-use artifacts for running `bin/coordinator` as
 `p2p.ducktape.industries`. The coordinator is the private-cutover reachability
-helper: STUN reflexive + rendezvous + ciphertext relay over a single UDP
-socket. It **holds no keys, serves no state, and is untrusted by design** — see
+helper: STUN reflexive + rendezvous over a single UDP socket — rendezvous
+only, it never carries peer traffic. It **holds no keys, serves no state, and
+is untrusted by design** — see
 `docs/deploy/coordinator.md` for the full recipe and the design of record at
 `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`.
 
@@ -30,7 +31,6 @@ docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
 docker run --rm -p 3478:3478/udp ducktape-coordinator
 ```
 
-**Relay caveat:** a `--listen 0.0.0.0:3478` bind makes ciphertext-relay grants
-undialable (`0.0.0.0:<port>`). Bind the routable public IP if you need relay
-fallback. STUN, rendezvous, and hole-punch are unaffected. Full detail in
-`docs/deploy/coordinator.md`.
+A `--listen 0.0.0.0:3478` wildcard bind is fully functional: every answer
+derives from the datagram's observed source, so there is no bind-IP caveat.
+Full detail in `docs/deploy/coordinator.md`.

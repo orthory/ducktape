@@ -16,7 +16,7 @@ wiring.
 > **This runbook does not yet yield a working zero-exposure tunnel.** It stands
 > up the real coordinator and shows the invite/entry path that works today, then
 > marks precisely where the node must learn to discover its reflexive,
-> hole-punch, bring up WireGuard, and relay. The CI simulated-NAT suite (Slice 3,
+> hole-punch, and bring up WireGuard. The CI simulated-NAT suite (Slice 3,
 > `crates/system/nat-traversal/tests/simnat_ci.rs`) proves the *logic*; this
 > runbook is what turns it into a *deployment* once the node is wired.
 
@@ -58,8 +58,8 @@ gotcha, the 2-validator-quorum teardown caveat).
 5. **A `Coordinated` hint is consumed as a reachability path.** `[NEEDS NODE WIRING]` — verified stub: `reach_entries()` (config.rs ~337-354) feeds `coord_addr` into the commonware **TCP** `bootstrappers`, so today the node would try to open a *mesh* connection to the coordinator's **UDP** port and fail. The hint must instead be routed to a `NatClient`. (This is why step 2 is only *partial*.)
 6. **A and B publish their reflexive endpoints and rendezvous.** `[NEEDS NODE WIRING]` — no reflexive is discovered or published into `EndpointAdvertisementV1.wireguard_endpoint`; no `lookup`/`recv_punch_sync`. Mechanism exists (`nat-traversal` rendezvous + the `wireguard-upgrade` advertisement + Slice 3's `AdvertBook`), unwired.
 7. **A and B hole-punch a direct WireGuard tunnel (coordinator-timed simultaneous open).** `[NEEDS NODE WIRING]` — `send_punch_to`/`recv_punch_from` exist and are CI-proven (`drive_simulated`), but the node never drives them, and no WireGuard interface is created (`wireguard_effect::apply_tunnel_plan` / `DefguardWireGuardEffect` is never called — the crate's own module doc says nothing in the workspace calls `WGApi::configure_interface` today).
-8. **On hole-punch failure, fall back to the coordinator ciphertext relay.** `[NEEDS NODE WIRING]` — `request_relay` + `peer_endpoint_override` exist and are CI-proven (`drive_with_relay_fallback`), unwired; **and** the relay-bind caveat applies (the coordinator must bind its routable public IP, not `0.0.0.0`, or relay grants are undialable — see [`coordinator.md`](coordinator.md)).
-9. **Real state-sync / app-hash flows over the tunnel.** `[NEEDS NODE WIRING]` — depends on steps 6-8; there is nothing to run today.
+8. **On hole-punch failure, resolution fails honestly.** `[BY DESIGN]` — there is no relay fallback (the DERP-style relay was removed 2026-07-06; the coordinator is rendezvous-only). A pair that cannot punch surfaces a `PeerFailed` and rides its advertised endpoint; a symmetric↔symmetric pair needs a routable endpoint on one side.
+9. **Real state-sync / app-hash flows over the tunnel.** `[NEEDS NODE WIRING]` — depends on steps 6-7; there is nothing to run today.
 
 ## What you CAN demo today vs. what proves the tunnel
 
@@ -70,14 +70,14 @@ gotcha, the 2-validator-quorum teardown caveat).
 - Mint and parse a v3 `Coordinated` invite (step 2, encoding).
 - Admit A and B (step 3).
 
-**You cannot yet** do any step tagged `[NEEDS NODE WIRING]` (steps 4-9): the node
-constructs no `NatClient`, discovers no reflexive, punches nothing, brings up no
-WireGuard interface, and relays nothing. The logic behind those steps is already
+**You cannot yet** do any step tagged `[NEEDS NODE WIRING]` (steps 4-7 and 9):
+the node constructs no `NatClient`, discovers no reflexive, punches nothing, and
+brings up no WireGuard interface. The logic behind those steps is already
 proven at the library level by the CI simulated-NAT suite
 (`crates/system/nat-traversal/tests/simnat_ci.rs`, Slice 3) with a fake NAT and a
 `FakeWireGuardEffect`. The moment the node wiring lands (the
 [integration-gap handoff](private-cutover-integration-gap.md) §3 checklist, the
 "Slice 5" follow-on), this runbook becomes the Acceptance §2 procedure verbatim —
 the `[NEEDS NODE WIRING]` tags flip to `[WORKS TODAY]` step by step, and the real
-cross-machine run additionally needs the user's infra (two real NATs, a VPS with
-the relay-bind caveat handled, real WireGuard on A and B).
+cross-machine run additionally needs the user's infra (two real, punchable NATs,
+a VPS, real WireGuard on A and B).

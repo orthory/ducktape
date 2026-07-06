@@ -7,10 +7,14 @@
 //! |------------------------------------------|---------------------------------------------|
 //! | reflexive discovery                      | `reflexive_discovery`                       |
 //! | hole-punch success                       | `hole_punch_success`                        |
-//! | hole-punch failure -> relay splice       | `hole_punch_failure_relays_bidirectionally` |
+//! | hole-punch failure is terminal           | `hole_punch_failure_is_terminal`            |
 //! | endpoint-churn re-advertisement          | `endpoint_churn_readvertise_reconnect`      |
 //! | (multiple coordinators — Slice 3)        | `multi_coordinator_failover`                |
-//! | (keepalive survival — Slice 3)           | `punched_survives_relayed_needs_coordinator`|
+//! | (keepalive survival — Slice 3)           | `punched_path_survives_coordinator_death`   |
+//!
+//! The coordinator is rendezvous ONLY: there is no relay fallback, so a pair
+//! that cannot hole-punch (e.g. symmetric NAT on both sides) terminally fails
+//! resolution instead of degrading onto a coordinator-carried path.
 //!
 //! Out of THIS gate (node-bin's clippy is pre-existingly red from toolchain
 //! drift): v3 invite signature verify/reject and v2 parse-compatibility live in
@@ -20,8 +24,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use nat_traversal::{
-    Coordinator, FallbackOutcome, NatClient, NodeKey, SimNat, drive_rebind_reconnect,
-    drive_simulated, drive_with_relay_fallback, run_coordinator,
+    Coordinator, NatClient, NodeKey, PunchError, SimNat, drive_rebind_reconnect, drive_simulated,
+    run_coordinator,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -56,23 +60,18 @@ fn hole_punch_success() {
 }
 
 #[test]
-fn hole_punch_failure_relays_bidirectionally() {
+fn hole_punch_failure_is_terminal() {
+    // A symmetric-NAT pair defeats simultaneous open, and with no relay
+    // fallback that is the END of resolution: `NotReachable`, honestly
+    // surfaced, never a coordinator-carried data path.
     let a = NodeKey([0xaa; 32]);
     let b = NodeKey([0xbb; 32]);
     let mut a_nat = SimNat::symmetric(ip(1));
     let mut b_nat = SimNat::symmetric(ip(2));
     let mut coord = Coordinator::new();
-    let outcome =
-        drive_with_relay_fallback(a, b, &mut a_nat, &mut b_nat, &mut coord, b"ping", b"pong")
-            .expect("relay");
-    match outcome {
-        FallbackOutcome::Relayed(p) => {
-            assert_eq!(p.delivered_to_b, b"ping");
-            assert_eq!(p.delivered_to_a, b"pong");
-            assert_ne!(p.a_relay_endpoint, p.b_relay_endpoint);
-        }
-        FallbackOutcome::Punched { .. } => panic!("symmetric pair must relay"),
-    }
+    let err = drive_simulated(a, b, &mut a_nat, &mut b_nat, &mut coord)
+        .expect_err("symmetric pair must not connect");
+    assert_eq!(err, PunchError::NotReachable);
 }
 
 #[test]
@@ -109,10 +108,10 @@ async fn multi_coordinator_failover() {
 }
 
 #[tokio::test]
-async fn punched_survives_relayed_needs_coordinator() {
-    // A punched path survives coordinator downtime; an ESTABLISHED relayed path
-    // does not (it flows through the coordinator, so its death kills it); and no
-    // fresh relay can even be allocated once the coordinator is gone.
+async fn punched_path_survives_coordinator_death() {
+    // A punched path lives entirely in the two NATs' filter state: once
+    // established, the coordinator's death cannot touch it. (With rendezvous
+    // only, no data path ever traverses the coordinator in the first place.)
     let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
     let coord = tokio::spawn(run_coordinator(coord_sock));
@@ -135,31 +134,6 @@ async fn punched_survives_relayed_needs_coordinator() {
         a.local_addr().await.unwrap().port(),
     );
 
-    // Establish a RELAYED data path too, and PROVE it forwards while the
-    // coordinator is alive — so the post-abort stall below is a genuine death,
-    // not a path that never carried data.
-    let (_s_a, a_relay) = timeout(Duration::from_secs(2), a.request_relay(b_key))
-        .await
-        .expect("no timeout")
-        .expect("grant a");
-    let (_s_b, b_relay) = timeout(Duration::from_secs(2), b.request_relay(a_key))
-        .await
-        .expect("no timeout")
-        .expect("grant b");
-    const RELAY_A: &[u8] = b"relayed-A";
-    a.relay_send(a_relay, RELAY_A).await.unwrap();
-    b.relay_send(b_relay, b"relayed-B").await.unwrap();
-    let mut relay_forwarded = false;
-    for _ in 0..50 {
-        a.relay_send(a_relay, RELAY_A).await.unwrap();
-        if let Ok(v) = timeout(Duration::from_millis(100), b.relay_recv()).await {
-            assert_eq!(v.expect("recv").as_slice(), RELAY_A);
-            relay_forwarded = true;
-            break;
-        }
-    }
-    assert!(relay_forwarded, "the relay must forward while the coordinator is alive");
-
     coord.abort();
 
     // A sends straight to B with no coordinator. Retransmit-until-received so the
@@ -178,22 +152,4 @@ async fn punched_survives_relayed_needs_coordinator() {
         got.expect("direct path survives"),
         nat_traversal::Msg::Punch { from: a_key }
     );
-
-    // The ESTABLISHED relayed path is now dead: the splice was owned by the
-    // coordinator task, so aborting it tore the relay down. Drain anything the
-    // pre-abort proof left buffered, then prove no new datagram is forwarded.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    while timeout(Duration::from_millis(50), b.relay_recv()).await.is_ok() {}
-    for _ in 0..5 {
-        let _ = a.relay_send(a_relay, RELAY_A).await;
-    }
-    assert!(
-        timeout(Duration::from_millis(500), b.relay_recv()).await.is_err(),
-        "an established relayed path must NOT survive coordinator downtime"
-    );
-
-    // And a fresh relay cannot even be allocated once the coordinator is down.
-    let c2 = NatClient::bind(NodeKey([0xcc; 32]), coord_addr).await.unwrap();
-    let res = timeout(Duration::from_millis(400), c2.request_relay(NodeKey([0xdd; 32]))).await;
-    assert!(res.is_err(), "relay setup requires a live coordinator");
 }

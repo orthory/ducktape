@@ -3865,7 +3865,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
     // there was a silent no-op). reaching them is the reachability plane's
     // job: gossip relays through whatever mesh links exist, the nat client
-    // hole-punches/relays the WireGuard path through the coordinator, and
+    // rendezvouses via the coordinator and hole-punches the WireGuard path, and
     // once tunnels apply the mesh dials the target's advertised overlay
     // address over the tunnel (the target sets `advertised = "overlay"`).
     // what still needs a TCP foothold is the gossip itself: with ZERO

@@ -1,23 +1,22 @@
 # ducktape-coordinator — the UNTRUSTED private-cutover entry helper.
 #
-# Runs bin/coordinator (STUN reflexive + rendezvous + ciphertext relay). It is
-# NOT a validator, holds NO key material, serves NO state, and NEVER decrypts —
+# Runs bin/coordinator (STUN reflexive + rendezvous; never carries peer
+# traffic). It is NOT a validator, holds NO key material, serves NO state, and
+# NEVER decrypts —
 # see docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md.
 # The hardening below makes those invariants structural: a dynamic throwaway
 # user, an empty capability set, a read-only filesystem, and no secrets on disk.
 [Unit]
-Description=Ducktape private-cutover coordinator (untrusted STUN/rendezvous/relay)
+Description=Ducktape private-cutover coordinator (untrusted STUN/rendezvous)
 Documentation=https://github.com/orthory/ducktape/blob/dev/docs/deploy/coordinator.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-# The ONE operator-set value: which address to bind. Ship 0.0.0.0:3478 by
-# default; set it to the box's ROUTABLE PUBLIC IP (e.g. 203.0.113.10:3478) if
-# you need the ciphertext-relay fallback — relay-grant addresses are bound on
-# the coordinator's socket IP, so a 0.0.0.0 bind hands peers an undialable
-# 0.0.0.0:<port> relay endpoint. STUN + rendezvous + hole-punch work fine on
-# 0.0.0.0. This file holds NO secret; the coordinator has none.
+# The ONE operator-set value: which address to bind. 0.0.0.0:3478 is fully
+# functional — every answer derives from the datagram's observed source, so a
+# wildcard bind has no caveat. This file holds NO secret; the coordinator has
+# none.
 EnvironmentFile=/etc/ducktape/coordinator.env
 ExecStart=/usr/local/bin/ducktape-coordinator --listen ${COORDINATOR_LISTEN}
 Restart=always
