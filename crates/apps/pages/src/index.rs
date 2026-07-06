@@ -166,9 +166,10 @@ impl ModuleIndexer for PagesIndex {
         out: &mut Derived,
     ) -> Result<()> {
         match decode_msg(payload).map_err(Error::Mapper)? {
-            PageMsg::CreatePage { page_id, title } => {
+            PageMsg::CreatePage { page_id, title, parent: _ } => {
                 // idempotence mirror: re-creating an existing page is a no-op
-                // that does NOT overwrite the title.
+                // that does NOT overwrite the title. the folder parent is not
+                // searchable, so the index ignores it.
                 if read_row(ctx, &page_id)?.is_some() {
                     return Ok(());
                 }
@@ -270,6 +271,36 @@ impl ModuleIndexer for PagesIndex {
             }
             // checked state carries no searchable text.
             PageMsg::SetChecked { .. } => Ok(()),
+            // comments live in a reserved keyspace, not the block tree — no
+            // searchable block row changes (a future pass could index them).
+            PageMsg::AddComment { .. }
+            | PageMsg::EditComment { .. }
+            | PageMsg::DeleteComment { .. }
+            | PageMsg::ResolveThread { .. } => Ok(()),
+            // folder nesting carries no searchable text — the block tree (and
+            // thus every row) is unchanged.
+            PageMsg::SetPageParent { .. } => Ok(()),
+            PageMsg::DeletePage { page_id } => {
+                // drop the page root and its whole block subtree (rows +
+                // postings), exactly like RemoveBlock but starting from a root.
+                // child PAGES are separate roots (the folder relation is not
+                // mirrored in this index's membership set), so they survive —
+                // matching the module's promote-children semantics.
+                let Some(row) = read_row(ctx, &page_id)? else {
+                    return Ok(());
+                };
+                let mut stack = vec![row];
+                while let Some(row) = stack.pop() {
+                    delete_toks(out, &row);
+                    out.delete(blk_key(&row.block_id));
+                    for child in &row.children {
+                        if let Some(child_row) = read_row(ctx, child)? {
+                            stack.push(child_row);
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -416,6 +447,7 @@ mod tests {
                 op(&PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "roadmap draft".into(),
+                    parent: None,
                 }),
                 insert("p1", "b1", "quarter goals"),
                 insert("b1", "b2", "nested milestone detail"),
@@ -436,6 +468,7 @@ mod tests {
             vec![op(&PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "usurper".into(),
+                parent: None,
             })],
         );
         assert!(search(&store, serde_json::json!({"search": {"text": "usurper"}})).is_empty());
@@ -456,6 +489,7 @@ mod tests {
                 op(&PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
+                    parent: None,
                 }),
                 insert("p1", "b1", "toggle section"),
                 insert("b1", "b2", "hidden inner text"),
@@ -489,10 +523,12 @@ mod tests {
                 op(&PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "alpha".into(),
+                    parent: None,
                 }),
                 op(&PageMsg::CreatePage {
                     page_id: "p2".into(),
                     title: "beta".into(),
+                    parent: None,
                 }),
                 insert("p1", "b1", "shared term"),
                 insert("p2", "b2", "shared term"),
@@ -577,6 +613,7 @@ mod tests {
             vec![op(&PageMsg::CreatePage {
                 page_id: "stale".into(),
                 title: "vanishing title".into(),
+                parent: None,
             })],
         );
 
@@ -585,6 +622,7 @@ mod tests {
             crate::PageMeta {
                 id: "p1".into(),
                 title: "roadmap".into(),
+                parent: None,
             },
             vec![
                 canonical_block("p1", None, "p1", BlockKind::Page, "roadmap", &["b1", "b3"]),
