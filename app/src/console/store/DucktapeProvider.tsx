@@ -389,15 +389,46 @@ export function DucktapeProvider({
     if (state.needsOnboarding || state.onboardingPhase) return;
     const beat = () =>
       node.status().then(
-        () => {
-          // up: only pay for a full refresh on the down→up edge; while already
-          //     connected the block stream keeps projections fresh.
-          if (!stateRef.current.connected) refresh();
+        (s) => {
+          // Recovery identity re-check: a foreign / different-build node could
+          // have grabbed the reused port while ours was down (only the INITIAL
+          // adopt used to verify this). Adopting it would silently show another
+          // node's state. Guarded to when we know both keys (managed workspace).
+          const expected = stateRef.current.workspace?.pubkey;
+          const got = s.publicKey;
+          if (expected && got && got.toLowerCase() !== expected.toLowerCase()) {
+            if (stateRef.current.connected || !stateRef.current.connectionDown?.impostor) {
+              dispatch({
+                type: "patch",
+                patch: {
+                  connected: false,
+                  connectionDown: {
+                    reason:
+                      "a different node is now answering this workspace's port — not reconnecting",
+                    impostor: true,
+                  },
+                },
+              });
+            }
+            return;
+          }
+          // Healthy: on the down→up edge clear the banner and re-hydrate; while
+          // already connected the block stream keeps projections fresh.
+          if (!stateRef.current.connected || stateRef.current.connectionDown) {
+            dispatch({ type: "patch", patch: { connectionDown: null } });
+            refresh();
+          }
         },
-        () => {
-          // unreachable: surface it once; the next beats keep trying to recover.
-          if (stateRef.current.connected) {
-            dispatch({ type: "patch", patch: { connected: false } });
+        (err: unknown) => {
+          // Unreachable: surface the REAL reason in a persistent reconnecting
+          // banner and keep this loop trying to recover. Patch only on the
+          // down-edge to avoid a re-render every beat.
+          if (stateRef.current.connected || !stateRef.current.connectionDown) {
+            const reason = err instanceof Error ? err.message : String(err);
+            dispatch({
+              type: "patch",
+              patch: { connected: false, connectionDown: { reason } },
+            });
           }
         },
       );

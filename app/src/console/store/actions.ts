@@ -623,8 +623,10 @@ export function createActions({
       deleteNeedsForce: null,
       inviteBlob: null,
       // a fresh connect/retry starts from a clean slate — clear any prior boot
-      // failure and error so a stale reason can't linger over the new attempt.
+      // failure, mid-session-down banner, and error so a stale reason can't
+      // linger over the new attempt.
       bootError: null,
+      connectionDown: null,
       error: null,
       // per-node observability belonging to the workspace we're leaving; the
       // node effect re-hydrates blocks and re-follows the block stream once

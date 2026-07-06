@@ -11,6 +11,7 @@ import { accentVar, color, font, radius } from "../theme/tokens";
 import { useDucktape } from "../store/use-ducktape";
 import { isMacDesktop } from "../../domain/node-bootstrap";
 import { ErrorBoundary } from "./ErrorBoundary";
+import { ConnectionBanner } from "./ConnectionBanner";
 
 // Left inset that clears the macOS traffic lights. Only the macOS desktop build
 // overlays them on the content (see isMacDesktop); on Linux/Windows desktop and
@@ -228,6 +229,9 @@ export function WindowFrame({ children }: { children: ReactNode }) {
       }}
     >
       <TitleBar />
+      {/* A mid-session node drop shows a loud reconnecting banner here, not just
+          a lone red dot beside a frozen height. */}
+      <ConnectionBanner />
       {/* Keep the title bar if a body view throws — the boundary replaces only
           the content below, never the whole window (which had no boundary and
           went blank white on any render throw). */}

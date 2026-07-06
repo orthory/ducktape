@@ -75,6 +75,20 @@ export interface BootError {
   logTail: string;
 }
 
+/** The node was reachable and then went away MID-SESSION (crash, stop, remote
+ *  unplugged, a dev.sh restart, a wrong node grabbing the port) — drives a
+ *  persistent reconnecting banner with the reason and (for a managed node) a
+ *  Restart action, instead of a lone red dot beside a frozen-but-live-looking
+ *  height. Null while connected or before the first connect. Distinct from
+ *  `bootError` (never connected) and `error` (transient op failures). */
+export interface ConnectionDown {
+  reason: string;
+  /** True when a DIFFERENT node answered the reused port (identity mismatch on
+   *  recovery) rather than our node merely being unreachable — a stronger
+   *  warning, and Restart won't help. */
+  impostor?: boolean;
+}
+
 // ── State shape ─────────────────────────────────────────
 
 export interface ConsoleState {
@@ -200,6 +214,10 @@ export interface ConsoleState {
   /** A managed node failed to start/connect — routes the console to the
    *  dedicated "Node failed to start" body (see BootError). Null on success. */
   bootError: BootError | null;
+
+  /** The node went away mid-session — drives a persistent reconnecting banner
+   *  (see ConnectionDown). Null while connected. */
+  connectionDown: ConnectionDown | null;
 
   // ── Workspace / onboarding ──
   /** Every registered workspace, for the switcher. Empty on web. */
@@ -380,6 +398,7 @@ export const createInitialState = (): ConsoleState => {
     ops: {},
     error: null,
     bootError: null,
+    connectionDown: null,
     workspaces: [],
     workspace: null,
     needsOnboarding: false,
