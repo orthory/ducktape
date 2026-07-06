@@ -1,22 +1,9 @@
-// The browser audio half of a huddle — everything below the consensus roster.
-//
-// A session owns one microphone capture graph and one playback graph over a
-// single 48 kHz AudioContext, bridged to the node's voice websocket:
-//   capture:  getUserMedia → MediaStreamSource → capture worklet (accumulates
-//             128-sample render quanta into 960-sample / 20 ms frames) → main
-//             thread → Float32→Int16 LE → binary ws frame.
-//   playback: binary ws frame → Int16→Float32 → playback worklet (small ring
-//             buffer, underrun = silence) → destination.
-// A text `recipients` frame (the fan-out set, our own node key excluded) is
-// pushed on open and on every roster change. Mute stops FORWARDING captured
-// frames but keeps the track live, so unmute is instant. Socket close = session
-// end (the server replaces a prior session or refuses with a 503 + one text
-// frame). The pure conversion + recipient helpers are exported for tests; the
-// audio graph itself needs a real browser and is only touched at runtime.
-//
-// The worklet processor code lives in `public/voice-worklets.js` (served
-// same-origin, so it satisfies the app's `default-src 'self'` CSP — a blob: url
-// would need the CSP widened) and registers `voice-capture` / `voice-playback`.
+// The pure, browser-free helpers of a huddle — everything below the consensus
+// roster that a test can exercise without a real AudioContext: PCM ⇄ Float
+// conversion, the fan-out set derivation (self excluded), and the shared audio
+// constants. The live audio + camera graph moved to `call-session.ts`, which
+// bridges these helpers to the node's typed `/v1/call/ws` socket; this module
+// is deliberately runtime-free so it is unit-tested directly.
 
 import { keyHex } from "./chat-client";
 import type { HuddleMember } from "./chat-client";
@@ -26,9 +13,7 @@ export const SAMPLE_RATE = 48_000;
 /** 20 ms at 48 kHz = 960 samples per frame (1920 bytes Int16). */
 export const FRAME_SAMPLES = 960;
 
-/** Same-origin worklet module (see public/voice-worklets.js). */
-const WORKLET_URL = "/voice-worklets.js";
-
+/** A huddle session's lifecycle, mirrored into the ui's voice slice. */
 export type VoiceStatus = "connecting" | "live" | "error" | "closed";
 
 // ── Pure helpers (tested) ───────────────────────────────
@@ -66,176 +51,4 @@ export const huddleRecipients = (
   return Array.from(
     new Set(huddle.map((m) => keyHex(m.node)).filter((hex) => hex !== self)),
   );
-};
-
-// ── The session ─────────────────────────────────────────
-
-export interface VoiceSession {
-  /** Open the mic graph and dial the voice ws. Idempotent — a second call while
-   *  running is ignored (leave then rejoin for a new channel). */
-  start(wsUrl: string): void;
-  /** Set the fan-out set (peer node hex keys, self excluded). Queued until the
-   *  socket is open, then re-sent on every call. */
-  setRecipients(hexKeys: string[]): void;
-  /** Stop forwarding captured frames (true) without dropping the track. */
-  setMuted(muted: boolean): void;
-  /** Tear the whole session down: ws, graph, context, mic track. Idempotent. */
-  stop(): void;
-}
-
-/** Create a voice session. `onStatus` receives lifecycle transitions; the caller
- *  maps them into the ephemeral voice slice (and treats 'closed' as session
- *  end). Nothing here touches the DOM until `start`. */
-export const createVoiceSession = (
-  onStatus: (status: VoiceStatus) => void,
-): VoiceSession => {
-  let ctx: AudioContext | null = null;
-  let stream: MediaStream | null = null;
-  let socket: WebSocket | null = null;
-  let source: MediaStreamAudioSourceNode | null = null;
-  let capture: AudioWorkletNode | null = null;
-  let playback: AudioWorkletNode | null = null;
-  let muted = false;
-  let started = false;
-  let stopped = false;
-  // recipients requested before the socket was open — flushed on open.
-  let pendingRecipients: string[] | null = null;
-
-  const sendRecipients = (peers: string[]) => {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "recipients", peers }));
-    } else {
-      pendingRecipients = peers;
-    }
-  };
-
-  const openSocket = (wsUrl: string) => {
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
-    socket = ws;
-    // a refusal text frame or a socket error is a FAILURE end: report 'error'
-    // once and suppress the browser's follow-up close event, so the caller can
-    // keep a visible error state instead of having it wiped by 'closed'.
-    let failed = false;
-    ws.onopen = () => {
-      if (stopped) return;
-      onStatus("live");
-      if (pendingRecipients) {
-        sendRecipients(pendingRecipients);
-        pendingRecipients = null;
-      }
-    };
-    ws.onmessage = (event) => {
-      if (typeof event.data === "string") {
-        // the server's refusal note (hub unavailable, flow busy) — the socket
-        // closes right after; surface it as a failure, not a clean end.
-        failed = true;
-        onStatus("error");
-        return;
-      }
-      if (stopped || !playback) return;
-      const frame = pcm16ToFloat(new Int16Array(event.data as ArrayBuffer));
-      playback.port.postMessage(frame, [frame.buffer]);
-    };
-    ws.onclose = () => {
-      if (stopped || failed) return;
-      onStatus("closed");
-    };
-    ws.onerror = () => {
-      if (stopped) return;
-      failed = true;
-      onStatus("error");
-    };
-  };
-
-  const start = (wsUrl: string) => {
-    if (started) return;
-    started = true;
-    onStatus("connecting");
-    Promise.resolve()
-      .then(() =>
-        navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-        }),
-      )
-      .then(async (media) => {
-        if (stopped) {
-          media.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        stream = media;
-        const context = new AudioContext({ sampleRate: SAMPLE_RATE });
-        ctx = context;
-        await context.audioWorklet.addModule(WORKLET_URL);
-        if (stopped) return;
-
-        // capture: mic → 20 ms Float32 frames on the main thread → binary ws.
-        source = context.createMediaStreamSource(media);
-        const cap = new AudioWorkletNode(context, "voice-capture", {
-          numberOfInputs: 1,
-          numberOfOutputs: 0,
-        });
-        cap.port.onmessage = (event) => {
-          if (muted || !socket || socket.readyState !== WebSocket.OPEN) return;
-          const pcm = floatToPcm16(event.data as Float32Array);
-          socket.send(pcm.buffer);
-        };
-        source.connect(cap);
-        capture = cap;
-
-        // playback: mixed frames from the ws → ring buffer → speakers.
-        const play = new AudioWorkletNode(context, "voice-playback", {
-          numberOfInputs: 0,
-          numberOfOutputs: 1,
-          outputChannelCount: [1],
-        });
-        play.connect(context.destination);
-        playback = play;
-
-        openSocket(wsUrl);
-      })
-      .catch(() => {
-        if (!stopped) onStatus("error");
-      });
-  };
-
-  const setRecipients = (hexKeys: string[]) => {
-    sendRecipients(hexKeys);
-  };
-
-  const setMuted = (next: boolean) => {
-    muted = next;
-  };
-
-  const stop = () => {
-    if (stopped) return;
-    stopped = true;
-    if (socket) {
-      // drop handlers first so our own close doesn't fire onStatus('closed').
-      socket.onopen = null;
-      socket.onmessage = null;
-      socket.onclose = null;
-      socket.onerror = null;
-      try {
-        socket.close();
-      } catch {
-        // already closing/closed — nothing to do.
-      }
-      socket = null;
-    }
-    try {
-      source?.disconnect();
-      capture?.disconnect();
-      playback?.disconnect();
-    } catch {
-      // graph already torn down.
-    }
-    source = capture = playback = null;
-    stream?.getTracks().forEach((t) => t.stop());
-    stream = null;
-    void ctx?.close().catch(() => undefined);
-    ctx = null;
-  };
-
-  return { start, setRecipients, setMuted, stop };
 };

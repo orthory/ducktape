@@ -15,9 +15,13 @@ import type { TurnPolicy } from "../../domain/runs-client";
 import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
-import { voiceSocketUrl } from "../../domain/transport";
-import { createVoiceSession, huddleRecipients } from "../../domain/voice-session";
-import type { VoiceSession, VoiceStatus } from "../../domain/voice-session";
+import { callSocketUrl } from "../../domain/transport";
+// Task 7 moved the huddle session to call-session (typed /v1/call/ws + video);
+// createVoiceSession is its status-only compat shim, replaced in Task 8.
+import { createVoiceSession } from "../../domain/call-session";
+import type { VoiceSession } from "../../domain/call-session";
+import { huddleRecipients } from "../../domain/voice-session";
+import type { VoiceStatus } from "../../domain/voice-session";
 import { keyBytes } from "../../domain/chat-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
@@ -883,7 +887,7 @@ export function createActions({
       voice = createVoiceSession(onVoiceStatus);
       voice.setMuted(true);
       patch({ voice: { channelId, muted: true, status: "connecting" } });
-      voice.start(voiceSocketUrl(nodeUrl, channelId));
+      voice.start(callSocketUrl(nodeUrl, channelId));
       pushRecipients(channelId);
     },
 
