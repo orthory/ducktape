@@ -17,10 +17,11 @@ use crate::store::ObjectStore;
 use crate::tree::{Store, TreeEdit, entry_at, snapshot_root_tree};
 use crate::wire::{
     CHUNK_SIZE, Change, Content, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp,
-    HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_INLINE_COMMIT_BYTES,
-    MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES, MAX_META_VALUE_BYTES,
-    MAX_PIN_NAME_BYTES, MAX_PINS, MAX_SYMLINK_TARGET_BYTES, MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES,
-    STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, from_hex_32, to_hex,
+    HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_GREP_SCAN_BYTES,
+    MAX_INLINE_COMMIT_BYTES, MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
+    MAX_META_VALUE_BYTES, MAX_PIN_NAME_BYTES, MAX_PINS, MAX_SYMLINK_TARGET_BYTES,
+    MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, from_hex_32,
+    to_hex,
 };
 
 pub struct Fs<S: ObjectStore> {
@@ -31,6 +32,10 @@ pub struct Fs<S: ObjectStore> {
     /// lowered only by the `#[doc(hidden)]` test override so the quota-boundary
     /// logic can be exercised without staging a full gibibyte per owner.
     pub(crate) quota: u64,
+    /// per-call grep scan budget — [`MAX_GREP_SCAN_BYTES`] in production, lowered
+    /// only by the `#[doc(hidden)]` test override so the budget-boundary + resume
+    /// logic can be exercised without a multi-megabyte fixture per call.
+    pub(crate) grep_budget: u64,
 }
 
 /// a block's staged objects — `(kind, body)` pairs the glue flushes into the
@@ -98,6 +103,7 @@ impl<S: ObjectStore> Fs<S> {
             refs,
             pending: None,
             quota: STAGING_QUOTA_BYTES,
+            grep_budget: MAX_GREP_SCAN_BYTES,
         }
     }
 
@@ -107,6 +113,22 @@ impl<S: ObjectStore> Fs<S> {
     #[doc(hidden)]
     pub fn set_staging_quota_for_tests(&mut self, quota: u64) {
         self.quota = quota;
+    }
+
+    /// `#[doc(hidden)]` test seam: shrink the per-call grep scan budget so the
+    /// budget-boundary + resume-cursor logic is exercised without a multi-MiB
+    /// fixture. production never calls this — the budget stays
+    /// [`MAX_GREP_SCAN_BYTES`]. the read side ([`crate::queries`]) reads it via
+    /// [`Fs::grep_budget`].
+    #[doc(hidden)]
+    pub fn set_grep_budget_for_tests(&mut self, budget: u64) {
+        self.grep_budget = budget;
+    }
+
+    /// the per-call grep scan budget the read side charges each scanned file
+    /// against (pre-scan, by declared size).
+    pub(crate) fn grep_budget(&self) -> u64 {
+        self.grep_budget
     }
 
     /// fork committed refs into this block's pending overlay on first touch, so a

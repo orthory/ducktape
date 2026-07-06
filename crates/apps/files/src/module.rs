@@ -107,6 +107,14 @@ impl Files {
         self.fs.set_staging_quota_for_tests(quota);
     }
 
+    /// `#[doc(hidden)]` test seam: shrink the per-call grep scan budget so the
+    /// budget-boundary + resume-cursor logic is exercised without a multi-MiB
+    /// fixture per call.
+    #[doc(hidden)]
+    pub fn set_grep_budget_for_tests(&mut self, budget: u64) {
+        self.fs.set_grep_budget_for_tests(budget);
+    }
+
     /// `#[doc(hidden)]` test seam: register a watch directly in committed refs so
     /// commit-time watch fan-out can be exercised before the watch op (task 10).
     #[doc(hidden)]

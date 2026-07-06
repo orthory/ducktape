@@ -1,25 +1,32 @@
 //! the read side (tasks 11/12): stat/ls/read/find/grep/history/diff/refs over
 //! committed state, paged and byte-capped. task 9 lands `Stat`; task 11 adds
-//! `Ls`/`Read`/`Refs`; the rest stay unimplemented until task 12. every read is
-//! over COMMITTED state — the pending overlay never leaks into a query.
+//! `Ls`/`Read`/`Refs`; task 12 completes the surface with
+//! `Find`/`Grep`/`History`/`Diff`. every read is over COMMITTED state — the
+//! pending overlay never leaks into a query.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
 use crate::fs::{Fs, refs_contains_snapshot};
-use crate::objects::{EntryKind, FileObj, Kind, ObjectId, TreeObj};
+use crate::objects::{EntryKind, FileObj, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj};
 use crate::paths::canonical;
 use crate::store::ObjectStore;
 use crate::tree::{Store, entry_at, snapshot_root_tree};
 use crate::wire::{
-    CHUNK_SIZE, EntryInfo, EntryKindWire, FilesQuery, FilesReply, MAX_PAGE, MAX_READ_BYTES,
-    RefsInfo, from_hex_32, to_hex,
+    CHUNK_SIZE, DiffEntry, DiffKind, EntryInfo, EntryKindWire, FilesQuery, FilesReply, GrepHit,
+    MAX_GREP_LINE_BYTES, MAX_PAGE, MAX_READ_BYTES, RefsInfo, SnapshotInfo, evidence_uri,
+    from_hex_32, to_hex,
 };
 
+/// a diff reply is capped at MAX_PAGE * 16 entries: a bounded reply, no cursor —
+/// callers that trip the cap narrow the prefix.
+const MAX_DIFF_ENTRIES: usize = MAX_PAGE as usize * 16;
+
 /// dispatch a committed-state query. task 9 serves `Stat`; task 11 serves
-/// `Ls`/`Read`/`Refs`; the search/history reads land in task 12.
+/// `Ls`/`Read`/`Refs`; task 12 serves `Find`/`Grep`/`History`/`Diff`.
 pub(crate) fn query<S: ObjectStore>(fs: &Fs<S>, q: FilesQuery) -> Result<FilesReply, String> {
     match q {
         FilesQuery::Stat { path, snapshot } => stat(fs, &path, snapshot.as_deref()),
@@ -35,8 +42,29 @@ pub(crate) fn query<S: ObjectStore>(fs: &Fs<S>, q: FilesQuery) -> Result<FilesRe
             offset,
             len,
         } => read(fs, &path, snapshot.as_deref(), offset, len),
+        FilesQuery::Find {
+            prefix,
+            snapshot,
+            after,
+            limit,
+        } => find(fs, &prefix, snapshot.as_deref(), after.as_deref(), limit),
+        FilesQuery::Grep {
+            pattern,
+            prefix,
+            snapshot,
+            cursor,
+            limit,
+        } => grep(
+            fs,
+            &pattern,
+            &prefix,
+            snapshot.as_deref(),
+            cursor.as_deref(),
+            limit,
+        ),
+        FilesQuery::History { limit } => history(fs, limit),
+        FilesQuery::Diff { from, to, prefix } => diff(fs, &from, &to, &prefix),
         FilesQuery::Refs {} => refs(fs),
-        _ => Err("files: query unimplemented".into()),
     }
 }
 
@@ -213,7 +241,479 @@ fn refs<S: ObjectStore>(fs: &Fs<S>) -> Result<FilesReply, String> {
     }))
 }
 
+// ---- find -------------------------------------------------------------------
+
+/// find: prefix-guided DFS over the committed tree, hits in full-path order,
+/// paged by a strictly-after cursor. all kinds are hits (files, dirs, symlinks).
+///
+/// the prefix is a raw STRING prefix over the full joined path — NOT a
+/// segment-boundary match. so prefix "/a/fo" matches BOTH "/a/foo" and
+/// "/a/food": find is a path-string search. (contrast watch, which is a subtree
+/// subscription and fires on "/a/fo" only for "/a/fo" itself or "/a/fo/**".)
+///
+/// the walk is bounded — a full-namespace scan per page would be O(everything).
+/// a subtree rooted at path P is descended only when it can still hold a match:
+/// P starts_with prefix (the whole subtree matches) OR prefix starts_with P (the
+/// prefix reaches into this subtree). every other subtree is pruned unread, so a
+/// narrow prefix never walks the whole tree.
+fn find<S: ObjectStore>(
+    fs: &Fs<S>,
+    prefix: &str,
+    snapshot: Option<&str>,
+    after: Option<&str>,
+    limit: u64,
+) -> Result<FilesReply, String> {
+    let (store, root_tree) = committed_view(fs, snapshot)?;
+    // 0 is a useless page; the honest clamp is 1..=MAX_PAGE (as Ls).
+    let mut acc = FindAcc {
+        prefix,
+        after,
+        limit: limit.min(MAX_PAGE).max(1) as usize,
+        out: Vec::new(),
+        next: None,
+        done: false,
+    };
+    find_walk(&store, root_tree, "", &mut acc)?;
+    Ok(FilesReply::Find {
+        entries: acc.out,
+        next: acc.next,
+    })
+}
+
+/// the running state of a find DFS: the page under construction plus the
+/// stop-early flag set the moment a genuine (limit+1)th hit is seen.
+struct FindAcc<'a> {
+    prefix: &'a str,
+    after: Option<&'a str>,
+    limit: usize,
+    out: Vec<EntryInfo>,
+    next: Option<String>,
+    done: bool,
+}
+
+/// pre-order DFS: emit a directory's own hit before descending into it, and
+/// visit children in name order — which IS full-path order, so the emitted
+/// sequence is sorted and the cursor resumes cleanly.
+fn find_walk(
+    store: &Store,
+    dir_tree: Option<ObjectId>,
+    base: &str,
+    acc: &mut FindAcc,
+) -> Result<(), String> {
+    if acc.done {
+        return Ok(());
+    }
+    let entries = dir_entries(store, dir_tree)?;
+    for (name, entry) in &entries {
+        if acc.done {
+            return Ok(());
+        }
+        let child = format!("{base}/{name}");
+        // is this entry itself a hit? (string prefix over the full path)
+        if child.starts_with(acc.prefix) && path_after(&child, acc.after) {
+            if acc.out.len() == acc.limit {
+                // a genuine (limit+1)th hit exists → the resume cursor is the last
+                // emitted path, and `next` is Some only because more remain (no
+                // phantom cursor when the page ends exactly at the last hit).
+                acc.next = acc.out.last().map(|e| e.path.clone());
+                acc.done = true;
+                return Ok(());
+            }
+            acc.out.push(entry_info(store, &child, entry)?);
+        }
+        // descend only into subtrees that can still hold a prefix match.
+        if entry.kind == EntryKind::Dir
+            && (child.starts_with(acc.prefix) || acc.prefix.starts_with(child.as_str()))
+        {
+            find_walk(store, Some(entry.id), &child, acc)?;
+        }
+    }
+    Ok(())
+}
+
+// ---- grep -------------------------------------------------------------------
+
+/// grep: literal-substring scan of FILES under `prefix`, in full-path order,
+/// resuming strictly after `cursor` (the last fully-scanned file path). no regex
+/// — determinism and cost. binary-safe: lines split on raw `\n`, each line
+/// lossy-UTF8'd for both matching and reporting.
+///
+/// per-call scan budget [`Fs::grep_budget`], charged pre-scan by file SIZE
+/// (deterministic — the boundary is a pure function of sizes, not scan
+/// internals). a file that would exceed the REMAINING budget ends the call with
+/// `next` = the previous fully-scanned path, so the resume re-enters AT the big
+/// file with a fresh budget. a single file larger than the WHOLE budget can
+/// never be scanned in one call — resuming at it would wall forever, so it is
+/// skipped deterministically (no hits, documented limitation) and the scan
+/// continues past it.
+fn grep<S: ObjectStore>(
+    fs: &Fs<S>,
+    pattern: &str,
+    prefix: &str,
+    snapshot: Option<&str>,
+    cursor: Option<&str>,
+    limit: u64,
+) -> Result<FilesReply, String> {
+    if pattern.is_empty() {
+        return Err("files: grep pattern must not be empty".into());
+    }
+    if pattern.len() > MAX_GREP_LINE_BYTES {
+        return Err("files: grep pattern exceeds the line byte cap".into());
+    }
+    // resolve the snapshot HERE (not via committed_view) because a hit's evidence
+    // uri needs the resolved snapshot hex, not just its root tree.
+    let snapshot_id = resolve_head(fs, snapshot)?;
+    let store = Store {
+        store: fs.store_ref(),
+        pending: &[],
+    };
+    let Some(snap) = snapshot_id else {
+        // empty filesystem: no head, nothing to scan.
+        return Ok(FilesReply::Grep {
+            hits: Vec::new(),
+            next: None,
+        });
+    };
+    let snapshot_hex = to_hex(&snap);
+    let root_tree = snapshot_root_tree(&store, &snap)?;
+    let budget = fs.grep_budget();
+    let mut acc = GrepAcc {
+        pattern,
+        prefix,
+        cursor,
+        snapshot_hex: &snapshot_hex,
+        limit: limit.min(MAX_PAGE).max(1) as usize,
+        remaining: budget,
+        whole_budget: budget,
+        hits: Vec::new(),
+        last_scanned: None,
+        next: None,
+        done: false,
+    };
+    grep_walk(&store, Some(root_tree), "", &mut acc)?;
+    Ok(FilesReply::Grep {
+        hits: acc.hits,
+        next: acc.next,
+    })
+}
+
+/// the running state of a grep scan: the accumulated hits, the shrinking budget,
+/// the last fully-scanned (or deterministically skipped) file path (the resume
+/// cursor), and the stop-early flag.
+struct GrepAcc<'a> {
+    pattern: &'a str,
+    prefix: &'a str,
+    cursor: Option<&'a str>,
+    snapshot_hex: &'a str,
+    limit: usize,
+    remaining: u64,
+    whole_budget: u64,
+    hits: Vec<GrepHit>,
+    last_scanned: Option<String>,
+    next: Option<String>,
+    done: bool,
+}
+
+/// DFS in full-path order. files under the prefix and strictly after the cursor
+/// are scan candidates; symlinks are never scanned; directories are never
+/// scanned but are descended when they can still hold a matching path (a dir may
+/// sit before the cursor yet hold files after it, so the cursor gates FILES, not
+/// descent).
+fn grep_walk(
+    store: &Store,
+    dir_tree: Option<ObjectId>,
+    base: &str,
+    acc: &mut GrepAcc,
+) -> Result<(), String> {
+    if acc.done {
+        return Ok(());
+    }
+    let entries = dir_entries(store, dir_tree)?;
+    for (name, entry) in &entries {
+        if acc.done {
+            return Ok(());
+        }
+        let child = format!("{base}/{name}");
+        match entry.kind {
+            EntryKind::File => {
+                if child.starts_with(acc.prefix) && path_after(&child, acc.cursor) {
+                    grep_file(store, &child, entry, acc)?;
+                }
+            }
+            // a needle in a symlink TARGET is not a file hit — files only.
+            EntryKind::Symlink => {}
+            EntryKind::Dir => {
+                if child.starts_with(acc.prefix) || acc.prefix.starts_with(child.as_str()) {
+                    grep_walk(store, Some(entry.id), &child, acc)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// scan one candidate file against the budget, appending its hits. the three
+/// gates (hit-limit, oversized-single-file, budget-boundary) all end at a file
+/// boundary because the cursor is a whole-file path — never mid-file.
+fn grep_file(
+    store: &Store,
+    path: &str,
+    entry: &TreeEntry,
+    acc: &mut GrepAcc,
+) -> Result<(), String> {
+    if acc.hits.len() >= acc.limit {
+        // page full → resume strictly after the last file we fully scanned.
+        acc.next = acc.last_scanned.clone();
+        acc.done = true;
+        return Ok(());
+    }
+    let size = entry.size;
+    if size > acc.whole_budget {
+        // never scannable in one call: skip it (no hits) so a resume cannot wall
+        // here forever, and continue past it. `last_scanned` advances so the
+        // resume cursor never re-enters this file.
+        acc.last_scanned = Some(path.to_string());
+        return Ok(());
+    }
+    if size > acc.remaining {
+        // fits a fresh budget but not the remainder → end the call now; `next` is
+        // the previous fully-scanned path, so the resume re-enters AT this file.
+        acc.next = acc.last_scanned.clone();
+        acc.done = true;
+        return Ok(());
+    }
+    // charge by declared SIZE before scanning (pre-scan accounting).
+    acc.remaining -= size;
+    let file = load_fileobj(store, &entry.id)?;
+    let bytes = read_range(store, &file, 0, file.size)?;
+    for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
+        let text = String::from_utf8_lossy(line);
+        if text.contains(acc.pattern) {
+            let line_no = i as u64 + 1; // 1-based
+            acc.hits.push(GrepHit {
+                path: path.to_string(),
+                line: line_no,
+                text: truncate_str(&text, MAX_GREP_LINE_BYTES),
+                uri: evidence_uri(path, acc.snapshot_hex, line_no),
+            });
+        }
+    }
+    acc.last_scanned = Some(path.to_string());
+    Ok(())
+}
+
+// ---- history ----------------------------------------------------------------
+
+/// history: the bounded commit window newest-first (head first), clamped to
+/// [`MAX_PAGE`]. the window is stored newest-LAST (commit push_back), so
+/// newest-first is a reverse walk; each id decodes its snapshot object.
+fn history<S: ObjectStore>(fs: &Fs<S>, limit: u64) -> Result<FilesReply, String> {
+    let refs = fs.refs_view();
+    let store = Store {
+        store: fs.store_ref(),
+        pending: &[],
+    };
+    let limit = limit.min(MAX_PAGE).max(1) as usize;
+    let mut out = Vec::new();
+    for id in refs.window.iter().rev().take(limit) {
+        let (kind, body) = store
+            .get(id)?
+            .ok_or_else(|| "files: snapshot object missing from store".to_string())?;
+        if kind != Kind::Snapshot {
+            return Err("files: expected a snapshot object".into());
+        }
+        let snap = SnapshotObj::decode(&body)?;
+        out.push(SnapshotInfo {
+            id: to_hex(id),
+            parent: snap.parent.as_ref().map(|p| to_hex(p)),
+            root_tree: to_hex(&snap.root),
+            author: snap.author,
+            height: snap.height,
+            consensus_time: snap.consensus_time,
+            message: snap.message,
+        });
+    }
+    Ok(FilesReply::History(out))
+}
+
+// ---- diff -------------------------------------------------------------------
+
+/// diff two committed trees, emitting Added/Removed/Modified leaf changes in
+/// full-path order, filtered by the same string-prefix rule as find. both
+/// endpoints resolve by the shared committed-snapshot rule (head/window/pin).
+///
+/// CoW makes this cheap: an identical subtree id on both sides is pruned outright
+/// — its every byte is shared, so nothing under it changed — making the walk
+/// cost O(changed spine), not O(tree). intermediate directories that differ only
+/// because a descendant changed are NOT emitted; only the leaf entries (and whole
+/// added/removed subtrees) are. the reply is bounded: past [`MAX_DIFF_ENTRIES`]
+/// the call errors rather than stream an unbounded diff (no cursor for diff).
+fn diff<S: ObjectStore>(
+    fs: &Fs<S>,
+    from: &str,
+    to: &str,
+    prefix: &str,
+) -> Result<FilesReply, String> {
+    let store = Store {
+        store: fs.store_ref(),
+        pending: &[],
+    };
+    // Some(hex) resolves to Some(id) on success (the None branch is the no-head
+    // read only), so the ok_or is defensive — an unresolvable id already errored.
+    let from_id = resolve_head(fs, Some(from))?
+        .ok_or_else(|| "files: snapshot not resolvable".to_string())?;
+    let to_id =
+        resolve_head(fs, Some(to))?.ok_or_else(|| "files: snapshot not resolvable".to_string())?;
+    let from_root = snapshot_root_tree(&store, &from_id)?;
+    let to_root = snapshot_root_tree(&store, &to_id)?;
+    let mut out = Vec::new();
+    diff_walk(&store, from_root, to_root, "", prefix, &mut out)?;
+    Ok(FilesReply::Diff(out))
+}
+
+/// walk both trees in the merged name order at each level (== full-path order,
+/// since the parent is shared), pruning identical subtree ids.
+fn diff_walk(
+    store: &Store,
+    from_id: ObjectId,
+    to_id: ObjectId,
+    base: &str,
+    prefix: &str,
+    out: &mut Vec<DiffEntry>,
+) -> Result<(), String> {
+    // CoW prune: identical subtree ids share every byte — skip without decoding.
+    if from_id == to_id {
+        return Ok(());
+    }
+    let from = dir_entries(store, Some(from_id))?;
+    let to = dir_entries(store, Some(to_id))?;
+    let mut names: Vec<&String> = from.keys().chain(to.keys()).collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let child = format!("{base}/{name}");
+        // prefix prune (mirrors find's descent rule): skip a subtree that cannot
+        // hold a prefix-matching path.
+        if !(child.starts_with(prefix) || prefix.starts_with(child.as_str())) {
+            continue;
+        }
+        match (from.get(name), to.get(name)) {
+            (Some(f), None) => emit_side(store, &child, f, DiffKind::Removed, prefix, out)?,
+            (None, Some(t)) => emit_side(store, &child, t, DiffKind::Added, prefix, out)?,
+            // identical entry (same id + exec) → unchanged, prune. for dirs this
+            // is the CoW subtree prune; for files it is a no-change.
+            (Some(f), Some(t)) if f == t => {}
+            (Some(f), Some(t)) => {
+                if f.kind == EntryKind::Dir && t.kind == EntryKind::Dir {
+                    // both dirs, different id → recurse for the leaves that differ;
+                    // the directory path itself is not "modified".
+                    diff_walk(store, f.id, t.id, &child, prefix, out)?;
+                } else {
+                    // a leaf changed (content/exec) or the kind flipped → Modified
+                    // at this path; a dir side of a kind flip also adds/removes its
+                    // former/new descendants.
+                    push_diff(out, &child, DiffKind::Modified, prefix)?;
+                    if f.kind == EntryKind::Dir {
+                        emit_children(store, &child, f.id, DiffKind::Removed, prefix, out)?;
+                    }
+                    if t.kind == EntryKind::Dir {
+                        emit_children(store, &child, t.id, DiffKind::Added, prefix, out)?;
+                    }
+                }
+            }
+            (None, None) => unreachable!("a name comes from one of the two maps"),
+        }
+    }
+    Ok(())
+}
+
+/// emit a whole entry present on one side only: the entry path itself, then — if
+/// it is a directory — every descendant, all under the same `kind`.
+fn emit_side(
+    store: &Store,
+    path: &str,
+    entry: &TreeEntry,
+    kind: DiffKind,
+    prefix: &str,
+    out: &mut Vec<DiffEntry>,
+) -> Result<(), String> {
+    push_diff(out, path, kind.clone(), prefix)?;
+    if entry.kind == EntryKind::Dir {
+        emit_children(store, path, entry.id, kind, prefix, out)?;
+    }
+    Ok(())
+}
+
+/// recurse a whole added/removed directory, emitting each child (and its subtree)
+/// under `kind`, honoring the prefix prune.
+fn emit_children(
+    store: &Store,
+    base: &str,
+    dir_id: ObjectId,
+    kind: DiffKind,
+    prefix: &str,
+    out: &mut Vec<DiffEntry>,
+) -> Result<(), String> {
+    for (name, entry) in dir_entries(store, Some(dir_id))? {
+        let child = format!("{base}/{name}");
+        if !(child.starts_with(prefix) || prefix.starts_with(child.as_str())) {
+            continue;
+        }
+        emit_side(store, &child, &entry, kind.clone(), prefix, out)?;
+    }
+    Ok(())
+}
+
+/// record a diff entry iff its path is under the prefix, enforcing the bounded-
+/// reply cap — the (MAX_DIFF_ENTRIES + 1)th entry rejects with a narrow-the-
+/// prefix error instead of building an unbounded reply.
+fn push_diff(
+    out: &mut Vec<DiffEntry>,
+    path: &str,
+    kind: DiffKind,
+    prefix: &str,
+) -> Result<(), String> {
+    if !path.starts_with(prefix) {
+        return Ok(());
+    }
+    out.push(DiffEntry {
+        path: path.to_string(),
+        kind,
+    });
+    if out.len() > MAX_DIFF_ENTRIES {
+        return Err("files: diff too large, narrow the prefix".into());
+    }
+    Ok(())
+}
+
 // ---- helpers ----------------------------------------------------------------
+
+/// strictly-after test in full-path order — the SAME order find/grep emit in, so
+/// paging never skips or repeats across the "/"-boundary. this is segment-wise
+/// (split on "/", compare component sequences), NOT raw byte order: the
+/// separator "/" (0x2f) outranks name bytes below it, so a descendant "/a/x"
+/// sorts AFTER a sibling "/a!" bytewise but BEFORE it in path order. comparing
+/// the split-segment sequences is exactly the DFS visitation order.
+fn path_after(path: &str, cursor: Option<&str>) -> bool {
+    match cursor {
+        None => true,
+        Some(c) => path.split('/').cmp(c.split('/')) == Ordering::Greater,
+    }
+}
+
+/// truncate a string to at most `max_bytes` bytes on a char boundary — grep hit
+/// text is capped at [`MAX_GREP_LINE_BYTES`] so a pathological long line cannot
+/// bloat a reply.
+fn truncate_str(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
 
 /// build the wire [`EntryInfo`] for a tree entry at `path`: kind mapped, size and
 /// exec verbatim, id as hex, and — for a file/symlink — the meta decoded from its
