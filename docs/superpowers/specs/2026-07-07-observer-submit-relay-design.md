@@ -1,0 +1,226 @@
+# Observer Submit Relay — Design
+
+Date: 2026-07-07
+Status: approved direction (user), spec for implementation
+Branch: `feat/observer-submit-relay` (base `origin/dev`)
+
+## Problem
+
+An observer-standing node (the staged-admission tier) is a real member of the
+product: it follows boundaries, serves reads locally, and its node key is the
+user's chat identity. But both of its local surfaces hard-refuse writes:
+
+- rpc: `RpcRequest::Submit` → "observer standing serves reads only" (`bin/node/src/main.rs` park-loop serve window)
+- app surface: `noded::NodeCommand::Submit` → same refusal
+
+So a user whose node holds observer standing can read chat but never post.
+Product-wise that is wrong: the observer tier is exactly the "member on a
+laptop" seat — flaky machines must not sit in the validator set (quorum(n)=n
+for n≤3, so one sleeping laptop halts writes for everyone), yet the human
+behind one still needs to talk.
+
+## Insight the design leans on
+
+Authorship is already decoupled from consensus injection:
+
+1. A frame is `(origin, seq, msg, sig)`; the signature binds
+   `(origin, seq, target, payload)` to the origin key
+   (`crates/kernel/node/src/lib.rs`, `encode_frame`/`decode_frame`). The kernel
+   never requires `origin ∈ valset`; `decode_frame` yields
+   `Origin::External(pubkey)` for any valid ed25519 signer.
+2. The consensus lane cares only about **custody** — which node pinned and
+   proposed the frame ("custody, not origin, gates it", cutover carry doc).
+   Byte-identical duplicates collapse in the exactly-once digest gate.
+3. Modules derive authorship from `ctx.env().origin` and enforce their own
+   policy deterministically: chat gates on channel membership (not valset);
+   governance/valset ops are member-gated and deterministically reject a
+   non-member origin. Relaying therefore grants an observer no authority
+   beyond what modules already grant its key.
+
+So the only missing piece is transport: carry an observer-signed frame to a
+validator that will take custody.
+
+## Approaches considered
+
+**A. Mesh relay lane (chosen).** New static discovery channel; the observer
+signs the frame with its own identity key and ships the bytes to a current
+validator; the validator verifies, gates on committed observer standing, and
+injects via a new kernel `submit_frame` (pin + propose + custody). Reply rides
+the same channel when the frame drains.
+— Pros: authenticated end-to-end transport already exists (the observer is on
+the mesh); authorship stays cryptographically the observer's; custody/carry
+and the digest dedup gate come for free; no consensus or module changes.
+— Cons: one new wire surface to maintain.
+
+**B. Extend the json-lines RPC with a `SubmitSigned`.** Observer POSTs a
+pre-signed frame to a validator's rpc listener.
+— Rejected: `rpc_listen` is typically loopback/private (sentry deployments
+explicitly keep validator surfaces unreachable); the mesh path is the only
+transport guaranteed to exist, and it authenticates peers.
+
+**C. Seat observers in consensus (zero-weight or full).**
+— Rejected: exactly what the observer tier exists to avoid — quorum(n)=n for
+n≤3 means flaky members cost liveness; a "zero-weight member" is a large
+consensus change for no transport gain.
+
+## Design (approach A)
+
+### Wire
+
+- `const CHANNEL_SUBMIT_RELAY: u64 = 3;` — the last free static slot below
+  `CHANNEL_STATE_SYNC = 4` (engine banks start at 8; 0–2 stay free). Like
+  every static lane it must be **registered in every mode** (unregistered
+  channels kill the sender's connection) and black-holed where unserved.
+- `bin/node/src/relay.rs`, modeled on `lobby.rs` (json on the wire; this lane
+  is low-volume — a human posting chat messages):
+
+```rust
+pub enum RelayMsg {
+    /// an observer-signed frame, bytes exactly as `encode_frame` produced.
+    Submit { frame: Vec<u8> },
+    /// the validator's answer, keyed by the frame's content address.
+    Reply { frame_id: [u8; 32], outcome: RelayOutcome },
+}
+pub enum RelayOutcome {
+    /// drained Applied at `height` with the block's `app_hash`.
+    Applied { height: u64, app_hash: String },
+    /// finalized but deterministically rejected.
+    Rejected { detail: String },
+    /// refused at the door (bad frame / no standing / origin mismatch) or
+    /// the hold expired before finalization.
+    Refused { detail: String },
+}
+```
+
+### Kernel: `OrderedNode::submit_frame`
+
+`submit` today signs locally then pins/proposes/tracks. Split it:
+
+```rust
+pub async fn submit(&mut self, signer, seq, msg) -> Result<FrameId, Error> {
+    let frame = encode_frame(signer, seq, &msg);
+    self.submit_frame(frame).await
+}
+/// take custody of an ALREADY-SIGNED frame: verify it decodes (signature
+/// binds origin/seq/target/payload), pin, propose, track outstanding.
+pub async fn submit_frame(&mut self, frame: Vec<u8>) -> Result<FrameId, Error>
+```
+
+`submit_frame` calls `decode_frame` first — junk or a bad signature errors
+before anything is pinned. Custody semantics (outstanding map, cutover carry,
+digest dedup) are unchanged — a relayed frame is carried across epochs exactly
+like a local one.
+
+### Validator side (pump loop)
+
+Register `CHANNEL_SUBMIT_RELAY`; add a select arm:
+
+1. decode `RelayMsg::Submit` — junk drops silently (lobby idiom);
+2. `decode_frame` the bytes — refusal on error;
+3. **origin == the authenticated channel peer** — a node may only relay its
+   own ops (no laundering); refusal on mismatch;
+4. **origin ∈ committed observer standing** (`read_valset_observers` on this
+   node's host) — validators submit locally and parked joiners have no
+   standing; refusal otherwise;
+5. `node.submit_frame(frame)` → `FrameId`; record in a new
+   `pending_relays: HashMap<FrameId, (peer, deadline)>` with the same
+   `SUBMIT_HOLD` budget as local submits.
+
+The drain arm that resolves `pending_submits` also resolves `pending_relays`:
+Applied → `Reply{Applied{height, app_hash}}` (the per-block boundary hash, as
+for local holds), Rejected → `Reply{Rejected}`, expiry → `Reply{Refused}`.
+Discards stay held — the cutover carry keeps the FrameId alive.
+
+### Observer side (park-loop serve window)
+
+Register the channel in the joiner path (and black-hole it in sync-only mode;
+the validator path serves it). Replace both write refusals:
+
+- Gate: writes require `observer_standing && serving.is_some()`; a parked
+  joiner without standing keeps today's refusal, a pre-first-sync observer
+  answers "no boundary yet — retry".
+- On submit: build `Msg`, `seq = persisted counter++`,
+  `frame = node::encode_frame(&signer, seq, &msg)` (the node identity key —
+  the same key that is the user's chat identity, `status.publicKey`),
+  `frame_id = node::frame_id(&frame)`; send `RelayMsg::Submit` to ONE current
+  validator (round-robin over the manifest's participants, the announce
+  idiom); hold the caller's reply in
+  `pending_relayed: HashMap<FrameId, (ReplySlot, Instant)>` where `ReplySlot`
+  is the rpc reply sender or the app-surface oneshot.
+- On `RelayMsg::Reply`: resolve the slot — `Applied` maps to `RpcReply::ok()`
+  / `Ok(BlockSummary{height, app_hash})`; `Rejected`/`Refused` map to the
+  error path verbatim.
+- Expiry: swept on the serve-window tick with a `SUBMIT_HOLD + 5s` budget
+  (relay adds a hop); the message mirrors the validator's truthful timeout —
+  the op may still land, clients re-query on block events.
+- v1 keeps ONE target per submit (no auto-retry): a byte-identical re-send is
+  safe (digest gate) but the client's re-submit already provides it. The
+  round-robin spreads load across validators between submits.
+
+### Observer submit sequence
+
+Per-origin `seq` is persisted at `<storage>/relay-submit-seq` (a plain u64,
+bumped before use). The kernel does not require per-origin monotonicity —
+a lost counter file restarts at 0 and same-`(origin, seq)` frames with
+different payloads are distinct digests that both apply — so this is hygiene,
+not safety. The pre-existing accepted edge ("a REJOINING key resubmitting a
+byte-identical (seq, msg)") is unchanged and stays documented at the validator
+submit site; per-origin replay nonces remain a roadmap item.
+
+### Mixed versions / upgrade gating
+
+None needed. The relay is node-binary capability, not consensus semantics: an
+observer-origin frame applies identically on every binary that can apply
+frames at all (authorship-from-origin is original kernel behavior). An old
+binary would kill a connection that speaks channel 3 at it — a mesh-level
+flag-day, in line with the no-backwards-compat policy; nothing can fork.
+`MAX_PROTOCOL_VERSION` stays 3.
+
+### What does NOT change
+
+- Parked joiners without standing: still read-and-write-refused.
+- Sync-only mode: channel black-holed.
+- Sentry: still pure path.
+- Validator local submits, chat policy, governance member-gates: untouched.
+- No proxying of arbitrary claimed origins: the app-surface `origin` field
+  stays ignored; the signed frame origin is the only authorship.
+
+## Error handling summary
+
+| failure | behavior |
+|---|---|
+| junk on the relay channel | dropped (validator), like the lobby doorbell |
+| bad signature / undecodable frame | `Refused` reply, nothing pinned |
+| origin ≠ sending peer | `Refused` (anti-laundering) |
+| origin lacks committed observer standing | `Refused` |
+| validator dies after accepting | frame is pinned + carried by that validator's custody; if it never finalizes, the observer's hold expires honestly; client re-submit produces a byte-identical or fresh frame — both safe |
+| relay reply lost | observer hold expires honestly; the op may still have landed — the app re-queries on block events (same contract as a validator timeout) |
+| observer restarts mid-hold | in-memory holds die like a validator's; the frame remains under the validator's custody |
+
+## Testing
+
+1. **Kernel unit** (`crates/kernel/node`): `submit_frame` takes custody of a
+   pre-signed frame (pin + outstanding + carried across `cutover`); a
+   tampered/bad-signature frame errors without pinning; `submit` still equals
+   sign + `submit_frame`.
+2. **Relay codec unit** (`bin/node`, in-module tests like `lobby.rs`):
+   round-trip encode/decode; outcome mapping.
+3. **E2E** (`bin/node/tests/observer_submit_e2e.rs`, on the
+   `live_admission_e2e` harness which already grants observer standing):
+   - observer with standing submits a chat post through its app surface →
+     reply carries `Applied{height}`; a validator's query shows the message
+     with `author == observer key`; the observer's own read surface shows it
+     after the next boundary follow.
+   - a parked joiner WITHOUT standing gets the not-a-validator refusal.
+   - a relay whose origin ≠ sender is `Refused` (crafted frame, direct wire).
+   - member-gated module op (e.g. a governance proposal) from an observer
+     finalizes Rejected — proving relay grants no authority.
+
+## Open items deliberately out of scope
+
+- Multi-validator retry/fan-out for a single submit (client re-submit covers).
+- Per-origin replay nonces in app state (existing roadmap item).
+- User-level keys distinct from node identity (the console custodian model is
+  unchanged).
+- Desktop app UX: no change needed — the app already talks the same surface
+  and reads `status.publicKey`.
