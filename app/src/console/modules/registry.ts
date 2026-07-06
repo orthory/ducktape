@@ -10,7 +10,6 @@ import { GovernanceView } from "../views/governance/GovernanceView";
 import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { PagesView } from "../views/pages/PagesView";
-import { SearchView } from "../views/search/SearchView";
 import { StatusView } from "../views/status/StatusView";
 import { TelemetryView } from "../views/telemetry/TelemetryView";
 import type { AppModule, NavSection } from "./module-def";
@@ -20,22 +19,22 @@ import type { AppModule, NavSection } from "./module-def";
 //   NODE OPERATOR — the node/network surfaces (members, governance, modules,
 //                   node, telemetry, explorer)
 // `order` is a sort key WITHIN a section, so the two rails number from 0
-// independently.
+// independently. Cross-module search is NOT a module — it is the ⌘K overlay
+// the shell owns (see SearchModal), reachable from either rail.
 export const MODULES: AppModule[] = [
   // ── User apps ──
-  { id: "search", nav: { icon: "search", label: "Search", order: -1, section: "user" }, Screen: SearchView },
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
-  { id: "pages", nav: { icon: "document", label: "Docs", order: 3, section: "user" }, Screen: PagesView },
-  { id: "files", nav: { icon: "files", label: "Files", order: 5, section: "user" }, Screen: FilesView },
-  { id: "forge", nav: { icon: "forge", label: "Forge", order: 7, section: "user" }, Screen: ForgeView },
-  { id: "agent", nav: { icon: "agent", label: "Agents", order: 8, section: "user" }, Screen: AgentView },
+  { id: "pages", nav: { icon: "document", label: "Docs", order: 1, section: "user" }, Screen: PagesView },
+  { id: "files", nav: { icon: "files", label: "Files", order: 2, section: "user" }, Screen: FilesView },
+  { id: "forge", nav: { icon: "forge", label: "Forge", order: 3, section: "user" }, Screen: ForgeView },
+  { id: "agent", nav: { icon: "agent", label: "Agents", order: 4, section: "user" }, Screen: AgentView },
   // ── Node operator surfaces ──
   { id: "members", nav: { icon: "members", label: "Members", order: 0, section: "operator" }, Screen: MembersView },
   { id: "governance", nav: { icon: "governance", label: "Governance", order: 1, section: "operator" }, Screen: GovernanceView },
-  { id: "modules", nav: { icon: "modules", label: "Modules", order: 4, section: "operator" }, Screen: ModulesView },
-  { id: "status", nav: { icon: "node", label: "Node", order: 5, section: "operator" }, Screen: StatusView },
-  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 6, section: "operator" }, Screen: TelemetryView },
-  { id: "explorer", nav: { icon: "hash", label: "Explorer", order: 7, section: "operator" }, Screen: ExplorerView },
+  { id: "modules", nav: { icon: "modules", label: "Modules", order: 2, section: "operator" }, Screen: ModulesView },
+  { id: "status", nav: { icon: "node", label: "Node", order: 3, section: "operator" }, Screen: StatusView },
+  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 4, section: "operator" }, Screen: TelemetryView },
+  { id: "explorer", nav: { icon: "hash", label: "Explorer", order: 5, section: "operator" }, Screen: ExplorerView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

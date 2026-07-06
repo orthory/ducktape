@@ -154,13 +154,15 @@ export interface ConsoleActions {
   executeProposal(proposalId: string): void;
 
   // ── Search (cross-module, over the node's derived-index views) ──
-  /** Search chat, docs, and pages with one text: the three modules'
-   *  materialized views fan out concurrently and land grouped in
-   *  `state.search`. A node without the index tier contributes empty groups
-   *  rather than failing the search. */
+  /** Search chat + docs with one text: the two modules' materialized views
+   *  fan out concurrently and land grouped in `state.search`. A node without
+   *  the index tier contributes empty groups rather than failing the search. */
   runSearch(text: string): void;
   /** Drop the last search's results. */
   clearSearch(): void;
+  /** Open / close the ⌘K command-palette search overlay. */
+  openSearch(): void;
+  closeSearch(): void;
 
   // ── Files (content-addressed manifests over the `files` module) ──
   /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
@@ -919,6 +921,10 @@ export function createActions({
     },
 
     clearSearch: () => patch({ search: null, searchPending: false }),
+
+    openSearch: () => patch({ searchOpen: true }),
+
+    closeSearch: () => patch({ searchOpen: false }),
 
     // ── Files ──
     uploadFile: ({ name, mime, bytes }) => {

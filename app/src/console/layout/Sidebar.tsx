@@ -123,6 +123,27 @@ export function Sidebar() {
         D
       </div>
 
+      <button
+        onClick={actions.openSearch}
+        title="Search (⌘K)"
+        aria-label="Search"
+        style={{
+          all: "unset",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 34,
+          height: 34,
+          borderRadius: 9,
+          marginBottom: 8,
+          background: color.sunken,
+          border: `1px solid ${color.borderSoft}`,
+        }}
+      >
+        <Icon name="search" size={17} color={color.iconIdle} />
+      </button>
+
       <ModeToggle mode={state.viewMode} onSelect={actions.setViewMode} />
 
       {rail.map((mod) => {

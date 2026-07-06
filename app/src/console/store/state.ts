@@ -102,6 +102,8 @@ export interface ConsoleState {
   search: SearchResults | null;
   /** A search round-trip is in flight (the module views fan out). */
   searchPending: boolean;
+  /** The ⌘K command-palette search overlay is open. Global UI, not per-block. */
+  searchOpen: boolean;
 
   // ── Files (content-addressed manifests) ──
   /** Every file manifest (List, prefix ""), re-queried per block. */
@@ -240,6 +242,7 @@ export const createInitialState = (): ConsoleState => {
     pendingRuns: [],
     search: null,
     searchPending: false,
+    searchOpen: false,
     files: [],
     telemetry: [],
     blocks: [],
