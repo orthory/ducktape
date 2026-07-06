@@ -25,12 +25,16 @@ use crate::transport::{DataPlaneTransport, PeerId, TransportError};
 /// One direction of a link. `bytes_per_sec` models the bottleneck rate,
 /// `latency` the propagation delay on top, `drop_every` deterministic
 /// datagram loss (every Nth datagram vanishes; streams never lose — they
-/// stand in for a reliable transport).
+/// stand in for a reliable transport), `delay_every` deterministic jitter
+/// (every Nth datagram arrives with the extra delay — sized past one send
+/// interval it also produces reordering). Loss and jitter share the same
+/// per-link datagram counter.
 #[derive(Clone, Copy, Debug)]
 pub struct LinkModel {
     pub latency: Duration,
     pub bytes_per_sec: u64,
     pub drop_every: Option<u32>,
+    pub delay_every: Option<(u32, Duration)>,
 }
 
 /// Bytes a stream hands to the link per scheduling step — a stand-in for an
@@ -161,16 +165,23 @@ impl DataPlaneTransport for SimEndpoint {
     async fn send_datagram(&self, to: PeerId, frame: Vec<u8>) -> Result<(), TransportError> {
         let link = self.link_to(to)?;
         let deliver_at = {
-            let dropped = {
+            let (dropped, jitter) = {
                 let mut l = link.lock().expect("link lock");
                 l.datagrams += 1;
-                matches!(l.model.drop_every, Some(n) if n > 0 && l.datagrams % n as u64 == 0)
+                let hits = |n: u32| n > 0 && l.datagrams % n as u64 == 0;
+                (
+                    matches!(l.model.drop_every, Some(n) if hits(n)),
+                    match l.model.delay_every {
+                        Some((n, extra)) if hits(n) => extra,
+                        _ => Duration::ZERO,
+                    },
+                )
             };
             if dropped {
                 // Lost in transit — fire-and-forget contract, sender sees Ok.
                 return Ok(());
             }
-            schedule(&link, frame.len())
+            schedule(&link, frame.len()) + jitter
         };
         let tx = self
             .net

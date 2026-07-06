@@ -4,10 +4,43 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { BlockEvent, NodeTransport, SubmitReceipt } from "../../domain/transport";
+import type {
+  BlockEvent,
+  NodeTransport,
+  SubmitReceipt,
+  TelemetryFrame,
+} from "../../domain/transport";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
+
+// Switching nodes dials a new one via node-bootstrap. Mock only connectRemote
+// so the switch lands on a benign, empty node (its status rejects → the "no
+// running node" surface) with no real network — enough to prove the previous
+// node's telemetry/blocks are dropped, not carried across.
+vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../domain/node-bootstrap")>();
+  const emptyNode: NodeTransport = {
+    submit: vi.fn().mockResolvedValue({ height: 0, appHash: "00".repeat(32) }),
+    query: vi.fn().mockResolvedValue({}),
+    view: vi.fn().mockResolvedValue({ hits: [] }),
+    putBlob: vi.fn().mockResolvedValue("00".repeat(32)),
+    getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
+    status: vi.fn().mockRejectedValue(new Error("empty test node")),
+    telemetry: vi.fn().mockResolvedValue([]),
+    blocks: vi.fn().mockResolvedValue([]),
+    onBlock: vi.fn(() => () => {}),
+    onTelemetry: vi.fn(() => () => {}),
+  };
+  return {
+    ...actual,
+    connectRemote: vi.fn((httpUrl: string) => ({
+      transport: emptyNode,
+      url: httpUrl,
+      managed: false,
+    })),
+  };
+});
 
 // ── Fake node ───────────────────────────────────────────
 
@@ -314,6 +347,60 @@ describe("DucktapeProvider", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Regression: telemetry is a live per-node stream and blocks are the node's
+  // own durable history — both must be dropped on a node switch. Without the
+  // reset, the telemetry backfill RETAINS the prior node's frames when the new
+  // node returns none, so the switch shows stale rows as if current.
+  it("drops the previous node's telemetry and blocks when switching nodes", async () => {
+    const { transport } = makeFakeNode();
+    // node 1 has durable block history AND streams live telemetry, so the switch
+    // must zero BOTH (blocks 1→0, telemetry 1→0).
+    vi.mocked(transport.blocks).mockResolvedValue([
+      {
+        height: 7,
+        hash: "aa".repeat(32),
+        commitHash: "bb".repeat(32),
+        proposer: "cc".repeat(32),
+        disposition: "applied",
+        target: "chat",
+        operations: [],
+        payload: "{}",
+        opHash: "dd".repeat(32),
+      },
+    ]);
+    let emit: ((frame: TelemetryFrame) => void) | null = null;
+    vi.mocked(transport.onTelemetry).mockImplementation((listener) => {
+      emit = listener;
+      return () => {};
+    });
+    renderConsole(transport);
+    await waitFor(() => {
+      expect(screen.getByTestId("connected").textContent).toBe("true");
+      expect(capturedState!.blocks.length).toBe(1);
+    });
+
+    // node 1 streams one telemetry frame.
+    await act(async () => {
+      emit!({
+        height: 7,
+        consensusTime: 7,
+        latencyUs: 512,
+        dispatches: [
+          { module: "chat", origin: "external", emittedMsgs: 1, emittedEvents: 0 },
+        ],
+        events: [],
+      });
+    });
+    expect(capturedState!.telemetry.length).toBe(1);
+
+    // switch to another node → the previous node's frames must not linger.
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    expect(capturedState!.telemetry.length).toBe(0);
+    expect(capturedState!.blocks.length).toBe(0);
   });
 
   it("commitForge submits a Commit msg and hydrates the new HEAD", async () => {
