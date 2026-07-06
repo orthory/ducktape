@@ -80,7 +80,11 @@ so the ADR stays honest without rewriting its history.
 - **Admission** matches #178's posture: locally-live flows (the operator's
   own sessions), not the ADR's consensus-roster-derived policy. The mesh
   already authenticates every peer as a workspace member; flow-level roster
-  admission remains the hardening seam noted in the huddle spec.
+  admission remains the hardening seam noted in the huddle spec. Concretely,
+  the cost is that any workspace member — not just the channel's huddle roster —
+  can inject media into a live session's flows, and the receiving app will spin
+  up a decoder pipe for that un-rostered sender (bounded to workspace members;
+  the flow-level roster-admission seam is what closes it).
 
 ## Consensus-adjacent note
 

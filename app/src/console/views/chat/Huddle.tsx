@@ -378,7 +378,11 @@ function TileGrid({
   names: Record<string, string>;
   sessionStartMs: number;
 }) {
-  const peers = roster.filter((m) => keyHex(m.node) !== selfHex);
+  // Cap the peer tiles at MAX_VIDEO_PARTICIPANTS (roster order); a larger huddle
+  // still works, only its overflow tiles aren't drawn.
+  const peers = roster
+    .filter((m) => keyHex(m.node) !== selfHex)
+    .slice(0, MAX_VIDEO_PARTICIPANTS);
   return (
     <div style={tileGrid}>
       {cameraOn && <SelfTile />}

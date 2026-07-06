@@ -540,7 +540,18 @@ async fn run_session<T: DataPlaneTransport>(
                         });
                     }
                     chat::video::CallControl::RateHint { max_kbps } => {
-                        inbound_hints.insert(peer.0, max_kbps);
+                        // hints outside the ladder are hostile-or-broken; clamping
+                        // preserves min semantics without letting a peer push the
+                        // encoder outside its envelope (a 1 kbps hint would freeze
+                        // our video for every recipient via the min; a huge one
+                        // would fail the encoder's configure and drop our camera).
+                        let clamped = max_kbps.clamp(
+                            *chat::video::RATE_LADDER_KBPS
+                                .last()
+                                .expect("non-empty ladder"),
+                            chat::video::RATE_LADDER_KBPS[0],
+                        );
+                        inbound_hints.insert(peer.0, clamped);
                         push_effective_rate(
                             &recipients, &inbound_hints, &mut effective_kbps, &control_out,
                         );
@@ -568,6 +579,13 @@ async fn run_session<T: DataPlaneTransport>(
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
                 inbound_hints.retain(|peer, _| live.contains(peer));
+                // a peer who left frees their receive lane too: a rejoiner's new
+                // session restarts frame_no at 0, which a retained reassembler
+                // (high last_emitted) would reject as Stale forever — and Stale
+                // doesn't advance dropped_frames, so no keyframe request self-heals
+                // it. Evicting the lane means the rejoiner's next frame builds a
+                // fresh reassembler and their tile lights up.
+                peer_lanes.retain(|peer, _| live.contains(peer));
                 push_effective_rate(&recipients, &inbound_hints, &mut effective_kbps, &control_out);
                 window += 1;
                 if window >= 5 {
@@ -815,6 +833,13 @@ mod tests {
             .recipients
             .send(vec![key_b])
             .expect("session a alive");
+        // B lists A too: a real huddle roster is symmetric, and B's 1 Hz ctl
+        // tick evicts receive lanes for peers NOT in its recipients — without
+        // this, a tick landing mid-keyframe would drop A's in-progress frame.
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
 
         // position-dependent fills (not uniform bytes) so a fragment-ordering
         // or reassembly regression in the hub path shows up — a reordered or
@@ -891,6 +916,12 @@ mod tests {
             .recipients
             .send(vec![key_b])
             .expect("session a alive");
+        // symmetric roster (see video_frames_fragment_and_cross_hubs): keeps
+        // B's 1 Hz peer-lane eviction from dropping A's in-progress frame 0.
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
         let mut control_a = session_a.control_out;
 
         // frame 0 loses a fragment (incomplete); frame 1 completes.
@@ -922,12 +953,20 @@ mod tests {
         assert_eq!(got.data, vec![0xB1; 5000]);
 
         // B's hub asked A's encoder to sync — the keyframe request crossed the
-        // control flow and A surfaced it to its webview.
-        let kick = tokio::time::timeout(Duration::from_secs(10), control_a.recv())
+        // control flow and A surfaced it to its webview. B also beacons A at
+        // 1 Hz (symmetric roster), so skip any interleaved peer state.
+        let saw_keyframe_req = async {
+            loop {
+                match control_a.recv().await {
+                    Some(noded::CallControlOut::KeyframeRequest) => break,
+                    Some(_) => continue,
+                    None => panic!("session a ended before a keyframe request"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), saw_keyframe_req)
             .await
-            .expect("keyframe request must reach A")
-            .expect("session a alive");
-        assert!(matches!(kick, noded::CallControlOut::KeyframeRequest));
+            .expect("keyframe request must reach A");
 
         drop((req_a_tx, req_b_tx));
     }
@@ -976,5 +1015,135 @@ mod tests {
         assert_eq!(state, (key_a, false, true));
 
         drop((req_a_tx, req_b_tx));
+    }
+
+    /// A peer who leaves the roster and rejoins (a fresh session, `frame_no`
+    /// reset to 0) must light back up. Without lane eviction, B's retained
+    /// reassembler keeps a high `last_emitted` and rejects every post-rejoin
+    /// frame as Stale — forever, with no keyframe-request self-heal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_lane_evicts_on_departure_so_rejoin_is_not_stale() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, |_| true);
+
+        let session_a = open(req_a_tx.clone()).await;
+        let mut session_b = open(req_b_tx.clone()).await;
+        session_a.recipients.send(vec![key_b]).expect("session a alive");
+        session_b.recipients.send(vec![key_a]).expect("session b alive");
+
+        // A's first stream: one keyframe crosses and B emits it, so B's
+        // peer_lane for A now carries last_emitted = 0.
+        let first: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        session_a
+            .video_in
+            .send(noded::CapturedVideo {
+                keyframe: true,
+                ts_ms: 1,
+                data: first.clone(),
+            })
+            .await
+            .expect("session a alive");
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("first frame must cross")
+            .expect("session b alive");
+        assert_eq!(got.data, first);
+
+        // A leaves B's roster. B's 1 Hz ctl tick derives `live` from its
+        // recipients watch, so with A gone for >1 tick B must evict A's stale
+        // lane. Wait out two ticks (generous), then restore the roster.
+        session_b.recipients.send(vec![]).expect("session b alive");
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        session_b.recipients.send(vec![key_a]).expect("session b alive");
+
+        // A rejoins with a FRESH session on the same hub: teardown + reopen
+        // resets frame_no to 0.
+        let session_a2 = open(req_a_tx.clone()).await;
+        session_a2
+            .recipients
+            .send(vec![key_b])
+            .expect("session a2 alive");
+
+        let rejoined: Vec<u8> = (0..5000).map(|i| ((i * 3 + 1) % 251) as u8).collect();
+        session_a2
+            .video_in
+            .send(noded::CapturedVideo {
+                keyframe: true,
+                ts_ms: 2,
+                data: rejoined.clone(),
+            })
+            .await
+            .expect("session a2 alive");
+        // Without the eviction fix, B rejects frame_no 0 as Stale and never
+        // emits — this recv times out. With it, a fresh reassembler completes.
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("rejoined frame must cross — B must evict A's lane on departure")
+            .expect("session b alive");
+        assert_eq!(
+            got.data, rejoined,
+            "B must emit A's post-rejoin frame, not reject it as stale"
+        );
+
+        drop((req_a_tx, req_b_tx));
+    }
+
+    /// pull the next RateHint the hub forwards to its local encoder, skipping
+    /// any interleaved beacons/keyframe requests.
+    async fn next_rate_hint(control_out: &mut mpsc::Receiver<noded::CallControlOut>) -> u32 {
+        loop {
+            match control_out.recv().await {
+                Some(noded::CallControlOut::RateHint { max_kbps }) => return max_kbps,
+                Some(_) => continue,
+                None => panic!("session ended before a rate hint"),
+            }
+        }
+    }
+
+    /// A hostile peer's out-of-ladder RateHint must be clamped into the ladder
+    /// envelope before it reaches our encoder: a floor of 1 kbps (would freeze
+    /// our video via min semantics) clamps up to 300, a ceiling of 4e9 (would
+    /// blow the encoder configure) clamps down to 1200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rate_hint_is_clamped_to_the_ladder() {
+        let peer = [0xcc_u8; 32];
+        let (req_tx, req) = mpsc::channel(4);
+        let (_voice_out, _video_out, inbound) = spawn_hub(req);
+        let session = open(req_tx.clone()).await;
+        session.recipients.send(vec![peer]).expect("session alive");
+        let mut control_out = session.control_out;
+
+        // hand-craft a control datagram on the session's ctl flow, exactly as a
+        // hostile peer could inject over the mesh.
+        let flow = ctl_flow("general");
+        let inject = |max_kbps: u32| {
+            data_plane::wire::encode_datagram(
+                Service::Voice,
+                flow,
+                &chat::video::CallControl::RateHint { max_kbps }.encode(),
+            )
+            .expect("datagram encodes")
+        };
+
+        inbound
+            .send((peer, inject(1)))
+            .await
+            .expect("inbound alive");
+        let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
+            .await
+            .expect("a rate hint must reach the encoder");
+        assert_eq!(hint, 300, "a 1 kbps hint must clamp up to the ladder bottom");
+
+        inbound
+            .send((peer, inject(4_000_000_000)))
+            .await
+            .expect("inbound alive");
+        let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
+            .await
+            .expect("a rate hint must reach the encoder");
+        assert_eq!(hint, 1200, "a 4e9 kbps hint must clamp down to the ladder top");
+
+        drop(req_tx);
     }
 }

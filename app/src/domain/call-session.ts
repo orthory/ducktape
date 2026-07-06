@@ -40,8 +40,10 @@ import type { VoiceStatus } from "./voice-session";
 
 export type { VoiceStatus };
 
-/** Tiles beyond this are not rendered — the roster can exceed it, the grid
- *  can't. The node caps concurrent video the same way; this bounds the ui. */
+/** The tile grid renders at most this many peers (roster order, plus our own
+ *  self preview); a larger huddle still works, its extra tiles just aren't
+ *  drawn. This is a UI bound ONLY — the node caps nothing, so any workspace
+ *  member whose media reaches us is still decoded regardless of this number. */
 export const MAX_VIDEO_PARTICIPANTS = 8;
 
 /** Same-origin worklet module (see public/voice-worklets.js). */
@@ -52,6 +54,12 @@ const WORKLET_URL = "/voice-worklets.js";
 const KEYFRAME_INTERVAL = 300;
 /** Starting encoder bitrate (kbps); server `rateHint` moves it. */
 const START_BITRATE_KBPS = 800;
+/** Encoder bitrate envelope (kbps) — the ends of the node's RATE_LADDER_KBPS
+ *  [1200, 800, 500, 300]. A `rateHint` outside this is hostile-or-broken, so we
+ *  clamp before reconfiguring: a tiny hint would freeze our video, a huge one
+ *  would fail the encoder's configure and silently kill the camera. */
+const MIN_BITRATE_KBPS = 300;
+const MAX_BITRATE_KBPS = 1200;
 
 export type CallEvent =
   | { kind: "status"; status: VoiceStatus }
@@ -291,8 +299,17 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
           frame.close();
         },
         error: () => {
-          created.awaitingKey = true;
-          requestPeerKeyframe(peerHex, created);
+          // A fatal decoder error closes the decoder; decoding into it again
+          // would throw uncaught in ws.onmessage on every subsequent frame.
+          // Drop the pipe so pipeFor rebuilds a fresh decoder on the next frame
+          // (which then hits the awaitingKey gate and requests a keyframe).
+          try {
+            if (created.decoder.state !== "closed") created.decoder.close();
+          } catch {
+            // already closed — nothing to do.
+          }
+          pipes.delete(peerHex);
+          requestPeerKeyframe(peerHex, created); // ask the sender for a sync point now
         },
       }),
     };
@@ -341,7 +358,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
         break;
       case "rateHint":
         if (typeof msg.maxKbps === "number" && msg.maxKbps > 0) {
-          bitrateKbps = msg.maxKbps;
+          bitrateKbps = Math.min(MAX_BITRATE_KBPS, Math.max(MIN_BITRATE_KBPS, msg.maxKbps));
           if (encoder && encoder.state === "configured") configureEncoder();
         }
         break;
