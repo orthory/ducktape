@@ -16,13 +16,16 @@ import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import { callSocketUrl } from "../../domain/transport";
-// Task 7 moved the huddle session to call-session (typed /v1/call/ws + video);
-// createVoiceSession is its status-only compat shim, replaced in Task 8.
-import { createVoiceSession } from "../../domain/call-session";
-import type { VoiceSession } from "../../domain/call-session";
+// Task 7 moved the huddle session to call-session (typed /v1/call/ws + audio +
+// camera video + control on one socket); this store drives it via CallEvent.
+import {
+  createCallSession,
+  supportsVideoCalls,
+  MAX_VIDEO_PARTICIPANTS,
+} from "../../domain/call-session";
+import type { CallSession, CallEvent } from "../../domain/call-session";
 import { huddleRecipients } from "../../domain/voice-session";
-import type { VoiceStatus } from "../../domain/voice-session";
-import { keyBytes } from "../../domain/chat-client";
+import { keyBytes, keyHex } from "../../domain/chat-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
@@ -107,6 +110,22 @@ export interface ConsoleActions {
    *  and push it. Called by the provider whenever a refresh lands a new
    *  snapshot while a huddle is active; a no-op when not huddling. */
   syncHuddleRecipients(): void;
+  /** Turn the local camera on / off in the active huddle — acquires + encodes
+   *  (or tears down) camera video on the live session and beacons the change to
+   *  peers. Guarded: no-op with no session, on a runtime that can't do video,
+   *  or when the roster already EXCEEDS the video cap (audio-only past it). */
+  setCamera(on: boolean): void;
+  /** Whether this runtime can do video calls — WebKitGTK can't (no WebCodecs),
+   *  its Chromium companion window can. Drives the camera control's enablement. */
+  videoSupported(): boolean;
+  /** Evict a stale huddle member (one whose beacons went silent) from the
+   *  channel roster on consensus — the cleanup for a client that died without
+   *  leaving. Keyed by the target's submitter identity bytes, not its node. */
+  sweepHuddle(channelId: string, user: number[]): void;
+  /** The live call session (audio graph + camera + ws), or null when not
+   *  huddling — so video tiles can bind their canvas / preview element to it.
+   *  Ephemeral and per-client, exactly like the session itself. */
+  getCallSession(): CallSession | null;
 
   commitForge(params: { path: string; content: string; message: string }): void;
 
@@ -318,10 +337,10 @@ export function createActions({
   // query's results (or repopulate a cleared palette).
   let searchToken = 0;
 
-  // The live voice session (the browser audio graph + ws), or null when not in
-  // a huddle. Ephemeral and per-client — it lives here, not in state; the
-  // `voice` slice mirrors only its status for the ui.
-  let voice: VoiceSession | null = null;
+  // The live call session (the browser audio graph + camera + ws), or null when
+  // not in a huddle. Ephemeral and per-client — it lives here, not in state;
+  // the `voice` slice mirrors only its status + camera/peer beacons for the ui.
+  let voice: CallSession | null = null;
 
   /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
    *  that can't do voice. */
@@ -351,20 +370,40 @@ export function createActions({
     lastRecipients = null;
   };
 
-  // Session lifecycle → the voice slice. Any terminal end reconciles the
+  // Session events → the voice slice. A `peerBeacon` merges that peer's latest
+  // ephemeral call state (keyed by its already-lowercase node hex) into the
+  // slice. A `status` event drives lifecycle: any terminal end reconciles the
   // consensus roster (submit leave) so peers never keep showing a dead
-  // participant: 'closed' (the session was replaced) clears the slice
-  // entirely; 'error' (hub refusal, socket failure, mic denial) keeps the dock
-  // up in its error state so the failure is visible — Leave dismisses it.
-  const onVoiceStatus = (status: VoiceStatus): void => {
+  // participant, and clears local camera/peer state (the session is gone) —
+  // 'closed' (the session was replaced) clears the slice entirely; 'error' (hub
+  // refusal, socket failure, mic denial) keeps the dock up in its error state so
+  // the failure is visible — Leave dismisses it.
+  const onCallEvent = (event: CallEvent): void => {
+    if (event.kind === "peerBeacon") {
+      update((prev) => ({
+        voice: {
+          ...prev.voice,
+          peers: {
+            ...prev.voice.peers,
+            [event.peer]: { muted: event.muted, cameraOn: event.cameraOn, atMs: event.atMs },
+          },
+        },
+      }));
+      return;
+    }
+    const status = event.status;
     if (status === "closed" || status === "error") {
       const channelId = getState().voice.channelId;
       stopVoice();
       if (channelId) submitLeaveHuddle(channelId);
       if (status === "closed") {
-        patch({ voice: { channelId: null, muted: false, status: "idle" } });
+        patch({
+          voice: { channelId: null, muted: false, status: "idle", cameraOn: false, peers: {} },
+        });
       } else {
-        update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+        update((prev) => ({
+          voice: { ...prev.voice, status: "error", cameraOn: false, peers: {} },
+        }));
       }
       return;
     }
@@ -884,9 +923,11 @@ export function createActions({
       // we already know (others may be huddling), self excluded. joins start
       // MUTED — joining a room must never be a hot-mic moment; unmuting is the
       // deliberate act.
-      voice = createVoiceSession(onVoiceStatus);
+      voice = createCallSession(onCallEvent);
       voice.setMuted(true);
-      patch({ voice: { channelId, muted: true, status: "connecting" } });
+      patch({
+        voice: { channelId, muted: true, status: "connecting", cameraOn: false, peers: {} },
+      });
       voice.start(callSocketUrl(nodeUrl, channelId));
       pushRecipients(channelId);
     },
@@ -894,7 +935,9 @@ export function createActions({
     leaveHuddle: () => {
       const channelId = getState().voice.channelId;
       stopVoice();
-      patch({ voice: { channelId: null, muted: false, status: "idle" } });
+      patch({
+        voice: { channelId: null, muted: false, status: "idle", cameraOn: false, peers: {} },
+      });
       if (channelId) submitLeaveHuddle(channelId);
     },
 
@@ -904,6 +947,29 @@ export function createActions({
     },
 
     syncHuddleRecipients: () => pushRecipients(),
+
+    setCamera: (on) => {
+      if (!voice) return;
+      if (on && !supportsVideoCalls()) return; // capability-gated UI should prevent this
+      const channel = getState().channels.find((c) => c.id === getState().voice.channelId);
+      // block turning the camera on once the roster EXCEEDS the video cap — the
+      // grid can't render more tiles, so those huddles stay audio-only.
+      if (on && (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS) return;
+      voice.setCamera(on);
+      update((prev) => ({ voice: { ...prev.voice, cameraOn: on } }));
+    },
+
+    videoSupported: () => supportsVideoCalls(),
+
+    sweepHuddle: (channelId, user) => {
+      submitTracked(
+        opKey.huddle(channelId),
+        (live) => chatClient.sweepHuddle(live, { channelId, user, origin: getState().author }),
+        (prev) => optimistic.huddleSwept(prev, channelId, keyHex(user)),
+      );
+    },
+
+    getCallSession: () => voice,
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;

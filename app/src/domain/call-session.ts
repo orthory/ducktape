@@ -543,18 +543,3 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
 
   return { start, setRecipients, setMuted, setCamera, bindTile, bindPreview, stop };
 };
-
-// ── compatibility shim ──────────────────────────────────
-//
-// Keeps the store (console/store/actions.ts) compiling until Task 8 rewrites it
-// to consume CallEvent + video directly. It maps status events onto the old
-// status-only callback and drops peer beacons. DO NOT grow new callers.
-export type VoiceSession = Pick<CallSession, "start" | "setRecipients" | "setMuted" | "stop">;
-
-/** @deprecated use {@link createCallSession}. Status-only adapter for the store. */
-export const createVoiceSession = (
-  onStatus: (status: VoiceStatus) => void,
-): VoiceSession =>
-  createCallSession((event) => {
-    if (event.kind === "status") onStatus(event.status);
-  });

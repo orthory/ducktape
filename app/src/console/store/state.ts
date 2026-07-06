@@ -37,6 +37,11 @@ export interface VoiceSlice {
   channelId: string | null;
   muted: boolean;
   status: "idle" | "connecting" | "live" | "error";
+  /** Local camera state (ephemeral, beaconed to peers — never consensus). */
+  cameraOn: boolean;
+  /** Per-peer ephemeral call state from 1 Hz beacons, keyed by NODE hex.
+   *  Staleness (no beacon for >10 s) drives the sweep affordance. */
+  peers: Record<string, { muted: boolean; cameraOn: boolean; atMs: number }>;
 }
 
 /** One search round-trip across the modules that ship materialized views —
@@ -304,7 +309,7 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
-    voice: { channelId: null, muted: false, status: "idle" },
+    voice: { channelId: null, muted: false, status: "idle", cameraOn: false, peers: {} },
     members: [],
     observers: [],
     proposals: [],
