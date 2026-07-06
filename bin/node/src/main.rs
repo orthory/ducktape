@@ -3418,6 +3418,10 @@ fn wire_reachability_plane<S, R>(
     wireguard_effect: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    // the genesis-issued admission capability presented on every coordinator
+    // request (private coordination); `None` for a genesis validator, a public
+    // coordinator, or the dev shape.
+    coord_cap: Option<nat_traversal::CoordCap>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
@@ -3430,6 +3434,7 @@ where
 
     let thread_label = label.to_string();
     let reach_signer = signer.clone();
+    let reach_coord_cap = coord_cap;
     let plane_chain_id = chain_id.to_string();
     let key_file = wireguard_key_file.to_path_buf();
     let state_file = mesh_state_file.to_path_buf();
@@ -3451,6 +3456,7 @@ where
                     wireguard_effect,
                     advertised,
                     coordinators,
+                    reach_coord_cap,
                     cmd_rx,
                     nudge_tx,
                     ev_tx,
@@ -3546,6 +3552,7 @@ where
     cmd_tx
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reachability_plane(
     label: String,
     chain_id: String,
@@ -3558,6 +3565,10 @@ async fn reachability_plane(
     effect_kind: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    // the genesis-issued admission capability presented on every coordinator
+    // request (private coordination); `None` for a genesis validator, a public
+    // coordinator, or the dev shape.
+    coord_cap: Option<nat_traversal::CoordCap>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
     // a clone of the `commands` sender, for the plane's own nudge ticker.
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
@@ -3622,7 +3633,13 @@ async fn reachability_plane(
         }
     }
     let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
-    let resolver = match reachability::NatResolver::bind(me, coords.clone()).await {
+    // authenticate every coordinator request: the node signs a
+    // proof-of-possession with its identity key and, in private coordination,
+    // carries the genesis-issued cap. A fully-open coordinator ignores the
+    // authenticator; a public/private one requires it. With no coordinators
+    // configured `bind` short-circuits to pass-through and never touches this.
+    let auth = Some((signer.clone(), coord_cap));
+    let resolver = match reachability::NatResolver::bind(me, coords.clone(), auth).await {
         Ok(resolver) => resolver,
         Err(err) => {
             eprintln!(
@@ -3764,6 +3781,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         invite_token,
         sync_index,
         announce_capabilities,
+        coordination,
+        coord_cap,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -3816,6 +3835,23 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // the plane's to surface at its restore; here they just mean no seeds.
     let chain_id = String::from_utf8_lossy(&namespace).to_string();
     let mesh_state_file = storage.join("mesh-state.json");
+    // fail-closed check for private coordination: a node that is neither a
+    // genesis validator (admitted by membership) nor holding a `coord.cap`
+    // will have every rendezvous request silently dropped by a private
+    // coordinator. Surface that loudly instead of pretending the plane is
+    // healthy — the tunnels never come up, and the operator needs to know it
+    // is a missing credential, not a network fault.
+    if wireguard_listen.is_some()
+        && coordination == config::Coordination::Private
+        && coord_cap.is_none()
+        && !validators.contains(&signer.public_key())
+    {
+        eprintln!(
+            "[node {label}] reachability: private coordination but no coord.cap and not a \
+             genesis validator — rendezvous will be denied; provide coord.cap or use a \
+             fronted/direct reach hint"
+        );
+    }
     let mesh_dial_seeds: Vec<(ed25519::PublicKey, Ingress)> =
         match reachability::store::load(&mesh_state_file, &chain_id) {
             Ok(Some(mesh)) => {
@@ -4264,6 +4300,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             wireguard_effect,
                             advertised_reach,
                             coordinators,
+                            coord_cap.clone(),
                             reach_tx,
                             reach_rx,
                         ))
@@ -5213,6 +5250,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         wireguard_effect,
                         advertised_reach,
                         coordinators,
+                        coord_cap.clone(),
                         reach_p2p_tx,
                         reach_p2p_rx,
                     ))

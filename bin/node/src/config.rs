@@ -1293,6 +1293,17 @@ pub struct Resolved {
     /// publish the discovered provider set into the capability registry; see
     /// `NodeToml::announce_capabilities`.
     pub announce_capabilities: bool,
+    /// the reachability plane's coordination privacy (per-network operational
+    /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
+    /// for a node outside the genesis validator set; `Public` accepts any
+    /// proof-of-possession. The dev shape is always `Private` (it never uses a
+    /// real coordinator).
+    pub coordination: Coordination,
+    /// the genesis-issued admission capability this node presents on every
+    /// coordinator request (loaded from `coord.cap` beside the identity).
+    /// `None` for a genesis validator (admitted by membership), the dev shape,
+    /// or a node that has not been issued one.
+    pub coord_cap: Option<nat_traversal::CoordCap>,
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -1402,6 +1413,11 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_token: load_invite_token(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
+        coordination: descriptor.coordination(),
+        // the reachability plane presents this on every coordinator request; a
+        // genesis validator needs none (admitted by membership), a joiner is
+        // issued one beside its identity.
+        coord_cap: load_coord_cap(base),
     })
 }
 
@@ -1563,6 +1579,10 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         invite_token: None,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
+        // the dev shape wires direct sockets only — no real coordinator, so
+        // the coordination mode defaults to Private and no cap is presented.
+        coordination: Coordination::Private,
+        coord_cap: None,
     })
 }
 

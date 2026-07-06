@@ -505,10 +505,10 @@ async fn nat_resolver_punches_over_loopback() {
 
     let key_a = NodeKey([0xaa; 32]);
     let key_b = NodeKey([0xbb; 32]);
-    let mut a = reachability::NatResolver::bind(key_a, vec![coord_addr])
+    let mut a = reachability::NatResolver::bind(key_a, vec![coord_addr], None)
         .await
         .unwrap();
-    let mut b = reachability::NatResolver::bind(key_b, vec![coord_addr])
+    let mut b = reachability::NatResolver::bind(key_b, vec![coord_addr], None)
         .await
         .unwrap();
     assert!(a.reflexive().is_some(), "bind discovered the reflexive");
@@ -527,10 +527,128 @@ async fn nat_resolver_punches_over_loopback() {
     }
 }
 
+/// A `NodeKey` whose bytes ARE the ed25519 public key — the subject a signed
+/// coordinator request proves possession of.
+fn node_key_of(pk: &commonware_cryptography::ed25519::PublicKey) -> NodeKey {
+    let mut b = [0u8; 32];
+    b.copy_from_slice(pk.as_ref());
+    NodeKey(b)
+}
+
+/// A REAL private (genesis-gated) coordinator ADMITS an authenticated node
+/// whose every coordinator request satisfies the `AuthPolicy::Private` gate:
+/// a genesis member (admitted by membership) and a non-genesis joiner carrying
+/// a genesis-minted cap (admitted by capability) both bind successfully —
+/// `NatResolver::bind` runs an authenticated `BindRequest` + `Register`, both
+/// self-subject (PoP proves possession of the requesting key), so the gate
+/// passes and the reflexive is discovered.
+///
+/// NOTE on scope: this asserts admission at the bind boundary rather than a
+/// full end-to-end punch. Under ANY authenticating policy the committed
+/// coordinator authenticates a `Lookup` against the LOOKED-UP peer's key
+/// (`Msg::subject_key()` returns the target of a `Lookup`), but the requester
+/// signs the PoP with its OWN key — so a cross-peer lookup can never satisfy
+/// PoP and the rendezvous/punch cannot complete. Only self-subject requests
+/// (`BindRequest`/`Register`/`Readvertise`) authenticate. See the task report's
+/// concern: hole-punch rendezvous under a private/public-PoP coordinator needs
+/// a Tasks-1..6 follow-up (authenticate the Lookup under the CALLER's key).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_coordinator_admits_authenticated_bind() {
+    let g = PrivateKey::from_seed(500);
+    let member = PrivateKey::from_seed(501);
+    let joiner = PrivateKey::from_seed(502); // NOT genesis; admitted by a cap
+    let policy = nat_traversal::AuthPolicy::Private {
+        genesis_set: vec![g.public_key(), member.public_key()],
+    };
+
+    let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = coord_sock.local_addr().unwrap();
+    tokio::spawn(nat_traversal::run_coordinator(coord_sock, policy));
+
+    // a genesis member: admitted by membership, no cap needed.
+    let member_key = node_key_of(&member.public_key());
+    let m = reachability::NatResolver::bind(
+        member_key,
+        vec![coord_addr],
+        Some((member.clone(), None)),
+    )
+    .await
+    .expect("a genesis member's authenticated bind is admitted");
+    assert!(
+        m.reflexive().is_some(),
+        "the member discovered its reflexive through the private coordinator"
+    );
+
+    // a non-genesis joiner carrying a genesis-minted cap: admitted by the cap.
+    let joiner_key = node_key_of(&joiner.public_key());
+    let cap = nat_traversal::mint_coord_cap(&g, joiner_key, nat_traversal::now_secs() + 3600);
+    let j = reachability::NatResolver::bind(
+        joiner_key,
+        vec![coord_addr],
+        Some((joiner.clone(), Some(cap))),
+    )
+    .await
+    .expect("a capped joiner's authenticated bind is admitted");
+    assert!(
+        j.reflexive().is_some(),
+        "the capped joiner discovered its reflexive through the private coordinator"
+    );
+}
+
+/// A resolver with NO cap and a NON-genesis key is REFUSED by a private
+/// coordinator at the very first authenticated request: its `BindRequest`
+/// (valid PoP, but neither a genesis member nor cap-bearing) is silently
+/// dropped by the admission gate, so `NatResolver::bind` never discovers a
+/// reflexive and fails. A member with a cap, against the same coordinator,
+/// binds fine — proving it is the missing credential, not the transport,
+/// that denies the outsider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_coordinator_denies_uncredentialed_bind() {
+    let g = PrivateKey::from_seed(600);
+    let member = PrivateKey::from_seed(601);
+    let outsider = PrivateKey::from_seed(602); // NOT in the genesis set, no cap
+    let policy = nat_traversal::AuthPolicy::Private {
+        genesis_set: vec![g.public_key(), member.public_key()],
+    };
+
+    let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = coord_sock.local_addr().unwrap();
+    tokio::spawn(nat_traversal::run_coordinator(coord_sock, policy));
+
+    // the outsider authenticates (valid PoP) but carries no cap and is not a
+    // genesis member: every request, BindRequest included, is dropped by the
+    // admission gate, so bind cannot discover a reflexive.
+    let outsider_key = node_key_of(&outsider.public_key());
+    let denied = reachability::NatResolver::bind(
+        outsider_key,
+        vec![coord_addr],
+        Some((outsider.clone(), None)),
+    )
+    .await;
+    assert!(
+        denied.is_err(),
+        "an uncredentialed (non-genesis, uncapped) node's bind is refused, got Ok"
+    );
+
+    // control: a credentialed member binds against the same coordinator.
+    let member_key = node_key_of(&member.public_key());
+    let ok = reachability::NatResolver::bind(
+        member_key,
+        vec![coord_addr],
+        Some((member.clone(), None)),
+    )
+    .await;
+    assert!(
+        ok.is_ok(),
+        "a genesis member binds against the same coordinator: {:?}",
+        ok.err()
+    );
+}
+
 /// An empty coordinator set degrades to pass-through resolution.
 #[tokio::test]
 async fn nat_resolver_without_coordinators_is_pass_through() {
-    let mut r = reachability::NatResolver::bind(NodeKey([1; 32]), vec![])
+    let mut r = reachability::NatResolver::bind(NodeKey([1; 32]), vec![], None)
         .await
         .unwrap();
     assert_eq!(r.reflexive(), None);
