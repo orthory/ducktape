@@ -236,10 +236,27 @@ worktree forked from `origin/dev` per the branching rule. The plan should still 
 work so it is reviewable in stages: (1) pages backend nesting, (2) comments module, (3) frontend
 clutter/placeholder/new-page/tabs, (4) frontend tree + comments UI — but it merges as one branch.
 
+## Wiring anchors (located during design)
+
+- **Comments module registration** mirrors `pages` exactly. Host binaries construct the module
+  and add it to `Host::genesis(vec![…])`:
+  - `bin/node/src/main.rs` — `genesis_host` (~L609/L624) **and** `restore_host` (~L715). Add
+    `let comments = Comments::init(context.child("comments"), "comments").await;` and
+    `Box::new(comments)` to the registry vec.
+  - `bin/noded/src/main.rs` (~L281), `bin/simnode/src/main.rs` (~L402), and `bin/demo/src/main.rs`
+    if it registers pages — same two-line change each.
+  - Being a qmdb (disk-substrate) module, `comments` reopens itself at its committed position on
+    restore like `pages`/`document`/`kv` — it needs **no** checkpoint-snapshot install in
+    `restore_host`. Confirm against how `restore_host` treats the qmdb cohort.
+- **`activePage` → tab refactor touchpoints** (bounded): `console/store/state.ts` (type +
+  defaults + snapshot), `console/store/actions.ts` (`enterPage` ~L334, `getState().activePage`
+  ~L698, the three reset sites ~L1066/1105/1210), `console/store/DucktapeProvider.tsx` (refresh
+  fetch ~L90/112–114/178, reset ~L361), `console/store/optimistic.ts` (operates on
+  `activePageBlocks`), `console/views/pages/PagesView.tsx`. `activePageBlocks` stays as the
+  active-tab's blocks; `activePage` becomes derived from `activeTab`.
+
 ## Open risks
 
-- **Module registration** for `comments` at genesis must be traced (where `pages`/`chat` are
-  wired into the host and the console transport) — planning task, not yet located.
 - **Index growth** for pages (folder map) and comments (per-anchor) is bounded by
   `MAX_BLOCK_LEN`; fine for expected scale, revisit if pages/threads reach thousands.
 - **Optimistic comments** are optional; if skipped, comment ops feel one-round-trip slow but
