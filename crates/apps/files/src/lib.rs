@@ -10,8 +10,8 @@
 //!   ordered list of per-chunk sha256 digests plus a whole-file digest-of-
 //!   digests. this is the ONLY files state folded into `root()`, and the only
 //!   thing state sync transfers.
-//! - the **body store** is a node-local, in-memory [`BlobStore`] of chunk bytes
-//!   keyed by their own sha256. it is NOT part of `root()`, NOT consensus state,
+//! - the **body store** is a node-local, in-memory [`blobstore::BlobStore`] of
+//!   chunk bytes keyed by their own sha256. it is NOT part of `root()`, NOT consensus state,
 //!   and NOT part of state sync. possession of bytes is per-node; the manifest
 //!   is the shared truth about what those bytes must hash to.
 //!
@@ -34,69 +34,12 @@
 mod interface;
 pub use interface::*;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
 
+use blobstore::BlobHandle;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
-
-
-/// node-local chunk bytes, keyed by their sha256 digest. explicitly NOT part of
-/// `root()` or state sync — durability of bytes is a per-node concern.
-#[derive(Default)]
-pub struct BlobStore {
-    chunks: HashMap<[u8; 32], Vec<u8>>,
-}
-
-impl BlobStore {
-    pub fn put_chunk(&mut self, bytes: Vec<u8>) -> [u8; 32] {
-        let digest = sha256(&bytes);
-        self.chunks.insert(digest, bytes);
-        digest
-    }
-
-    pub fn get_chunk(&self, digest: &[u8; 32]) -> Option<&[u8]> {
-        self.chunks.get(digest).map(Vec::as_slice)
-    }
-
-    pub fn has_chunk(&self, digest: &[u8; 32]) -> bool {
-        self.chunks.contains_key(digest)
-    }
-}
-
-/// a cloneable, thread-safe handle to one node's [`BlobStore`]. the embedding
-/// daemon keeps one clone for its upload/download lane (http handlers on
-/// whatever runtime it likes) and registers the [`Files`] module over another,
-/// so uploaded bytes are visible to `serve_sync` without a chunk byte ever
-/// entering the op stream. this shares only the NODE-LOCAL body store — the
-/// consensus surface (`root()`, execute, state sync) is untouched by it.
-#[derive(Clone, Default)]
-pub struct BlobHandle(Arc<Mutex<BlobStore>>);
-
-impl BlobHandle {
-    /// store one chunk and return its sha256 digest.
-    pub fn put_chunk(&self, bytes: Vec<u8>) -> [u8; 32] {
-        self.0.lock().expect("blob store poisoned").put_chunk(bytes)
-    }
-
-    /// read one chunk's bytes back out (cloned — no borrow may outlive the lock).
-    pub fn get_chunk(&self, digest: &[u8; 32]) -> Option<Vec<u8>> {
-        self.0
-            .lock()
-            .expect("blob store poisoned")
-            .get_chunk(digest)
-            .map(<[u8]>::to_vec)
-    }
-
-    /// whether this node currently holds a chunk's bytes.
-    pub fn has_chunk(&self, digest: &[u8; 32]) -> bool {
-        self.0
-            .lock()
-            .expect("blob store poisoned")
-            .has_chunk(digest)
-    }
-}
 
 pub struct Files {
     id: ModuleId,

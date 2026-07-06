@@ -445,7 +445,7 @@ impl RepoState {
         &mut self,
         base: &Path,
         name: &str,
-        blobs: &files::BlobHandle,
+        blobs: &blobstore::BlobHandle,
     ) -> Result<(), Error> {
         let Some((head, digest)) = self.pending_pack else {
             return Ok(()); // nothing pending — the common Commit / caught-up case
@@ -531,7 +531,7 @@ pub struct Forge {
     /// Push head can be materialized onto the on-disk repo (`materialize`); it is
     /// NEVER read by `root()`/`execute`/`commit_block` and so cannot affect
     /// consensus. a Commit-only deployment can pass a default (unused) handle.
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     /// the repo namespace, keyed by normalized slug and kept SORTED (`BTreeMap`)
     /// so `root()` composes order-independently. seeded at construction from the
     /// on-disk dirs (restart re-adopt) and grown lazily on first write.
@@ -551,11 +551,11 @@ impl Forge {
     /// to reuse the files body plane must build forge over that shared handle
     /// with [`Forge::with_blobs`].
     pub fn init(id: impl Into<ModuleId>, base_dir: impl Into<PathBuf>) -> Result<Self, Error> {
-        Self::with_blobs(id, base_dir, files::BlobHandle::default())
+        Self::with_blobs(id, base_dir, blobstore::BlobHandle::default())
     }
 
-    /// genesis wiring over an EXISTING node-local blob store — mirrors
-    /// [`files::Files::with_blobs`]. the embedding daemon creates one handle,
+    /// genesis wiring over an EXISTING node-local blob store — mirrors the
+    /// files module's own `with_blobs`. the embedding daemon creates one handle,
     /// registers the files module over it (uploads land there), and builds forge
     /// over a clone so a `Push`'s packfile — uploaded before the op is submitted
     /// — is visible to `materialize` without a byte crossing consensus.
@@ -569,7 +569,7 @@ impl Forge {
     pub fn with_blobs(
         id: impl Into<ModuleId>,
         base_dir: impl Into<PathBuf>,
-        blobs: files::BlobHandle,
+        blobs: blobstore::BlobHandle,
     ) -> Result<Self, Error> {
         let base = base_dir.into();
         std::fs::create_dir_all(&base)

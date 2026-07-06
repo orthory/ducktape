@@ -12,12 +12,14 @@
 //! with ONE deliberate exception: the files blob lane. chunk bytes must never
 //! transit consensus (no op carries them), so POST `/v1/files/blob` and GET
 //! `/v1/files/blob/{digest}` bypass the actor entirely and talk straight to
-//! the node-local [`files::BlobHandle`] the registered files module shares.
+//! the node-local [`crate::blobs::BlobHandle`] the registered files module shares.
 //!
 //! lifecycle is part of the surface: `/v1/status` carries the daemon's build
 //! version (so a newer app can spot a stale orphan), and POST `/v1/shutdown`
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
+
+pub mod blobs;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -354,7 +356,7 @@ pub struct NodeHandle {
     /// the files blob lane. NOT a command into the actor: chunk bytes stay
     /// node-local by design (never consensus state, never an op), so the http
     /// handlers read/write this store directly.
-    blobs: files::BlobHandle,
+    blobs: crate::blobs::BlobHandle,
     /// recent per-block telemetry. like `blobs`, this is node-local and never
     /// crosses the actor command lane: the actor pushes into it as blocks
     /// commit, `GET /v1/telemetry` reads it directly.
@@ -392,7 +394,7 @@ impl NodeHandle {
             cmds: cmd_tx,
             events: event_tx.clone(),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
-            blobs: files::BlobHandle::default(),
+            blobs: crate::blobs::BlobHandle::default(),
             telemetry: TelemetryRing::default(),
             forge_repo: None,
             index: None,
@@ -420,7 +422,7 @@ impl NodeHandle {
     /// the blob store this surface serves. the daemon constructs its files
     /// module over a clone (`Files::with_blobs`) so http uploads land exactly
     /// where the module's `serve_sync` reads.
-    pub fn blob_handle(&self) -> files::BlobHandle {
+    pub fn blob_handle(&self) -> crate::blobs::BlobHandle {
         self.blobs.clone()
     }
 

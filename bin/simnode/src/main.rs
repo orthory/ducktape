@@ -350,7 +350,7 @@ struct Sim {
     /// touching the next command, and step order mirrors that.
     oracle_queue: VecDeque<Msg>,
     workers: Vec<Box<dyn reactor::Worker>>,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     telemetry: TelemetryRing,
     index: Arc<IndexStore>,
     events: broadcast::Sender<WsFrame>,
@@ -361,7 +361,7 @@ fn run_sim(
     storage: PathBuf,
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     telemetry: TelemetryRing,
     persona: Arc<Mutex<Persona>>,
     auto: bool,

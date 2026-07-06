@@ -563,6 +563,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blobstore"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2329,6 +2336,7 @@ name = "files"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blobstore",
  "futures",
  "host",
  "sdk",
@@ -2431,7 +2439,7 @@ name = "forge"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "files",
+ "blobstore",
  "futures",
  "git2",
  "sdk",
@@ -4038,6 +4046,7 @@ dependencies = [
  "async-trait",
  "automations",
  "base64 0.22.1",
+ "blobstore",
  "capability",
  "capability-host",
  "chat",
@@ -4098,6 +4107,7 @@ dependencies = [
  "async-trait",
  "automations",
  "axum",
+ "blobstore",
  "capability-host",
  "chat",
  "commonware-runtime",
@@ -5896,6 +5906,7 @@ dependencies = [
  "async-trait",
  "automations",
  "axum",
+ "blobstore",
  "chat",
  "commonware-runtime",
  "dispatch",

@@ -11,6 +11,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
+# the node-local body store (chunk bytes off consensus): the daemon's op-receipt
+# lane, owned by the `blobstore` crate and shared with noded + forge.
+blobstore = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"

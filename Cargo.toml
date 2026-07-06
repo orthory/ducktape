@@ -31,8 +31,9 @@ members = [
     "crates/system/reachability",
     "crates/system/data-plane",
     "crates/system/saga",
-    "crates/system/capability", 
-    "crates/system/dispatch", 
+    "crates/system/capability",
+    "crates/system/blobstore",
+    "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging", 
     # apps — product feature modules
@@ -120,6 +121,7 @@ governance = { path = "crates/system/governance" }
 upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 capability = { path = "crates/system/capability" }
+blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }

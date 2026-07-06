@@ -602,7 +602,7 @@ async fn genesis_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
@@ -708,7 +708,7 @@ async fn restore_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
     manifest: &Manifest,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let document = Document::init(context.child("document"), "document").await;
@@ -1344,7 +1344,7 @@ fn recovery_frame_to_sync(
 /// what makes `GET /v1/files/blob/{op_hash}` answer again after a restart.
 #[allow(clippy::too_many_arguments)]
 fn explorer_block_row(
-    blobs: &files::BlobHandle,
+    blobs: &blobstore::BlobHandle,
     height: u64,
     frame_hash: &node::FrameId,
     app_hash: &StateRoot,
@@ -1380,7 +1380,7 @@ fn explorer_block_row(
 /// heartbeat nop is the deliberately-empty block the explorer hides, and a
 /// discarded frame is never journaled (the arm keeps this total anyway).
 fn sealed_frame_block_row(
-    blobs: &files::BlobHandle,
+    blobs: &blobstore::BlobHandle,
     block: &recovery::FoldedBlock<'_>,
 ) -> Option<Vec<u8>> {
     let (origin, msg) = node::decode_frame(block.frame).ok()?;
@@ -1438,12 +1438,12 @@ fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
 /// `GET /v1/blocks` loses those heights for good.
 struct IndexFold<'a> {
     index: &'a indexer::IndexStore,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     stopped: bool,
 }
 
 impl<'a> IndexFold<'a> {
-    fn new(index: &'a indexer::IndexStore, blobs: files::BlobHandle) -> Self {
+    fn new(index: &'a indexer::IndexStore, blobs: blobstore::BlobHandle) -> Self {
         Self {
             index,
             blobs,
@@ -7880,7 +7880,7 @@ mod tests {
         let app_hash = test_root(9);
 
         // the drain's construction: decoded parts straight from its DrainedOp.
-        let drain_blobs = files::BlobHandle::default();
+        let drain_blobs = blobstore::BlobHandle::default();
         let drain_row = explorer_block_row(
             &drain_blobs,
             7,
@@ -7894,7 +7894,7 @@ mod tests {
         );
 
         // the boot fold's construction: nothing but what the journal seals.
-        let fold_blobs = files::BlobHandle::default();
+        let fold_blobs = blobstore::BlobHandle::default();
         let fold_row = sealed_frame_block_row(
             &fold_blobs,
             &recovery::FoldedBlock {
@@ -7931,7 +7931,7 @@ mod tests {
     /// nop-filtered for exactly these).
     #[test]
     fn boot_fold_skips_nop_and_undecodable_frames() {
-        let blobs = files::BlobHandle::default();
+        let blobs = blobstore::BlobHandle::default();
         let signer = ed25519::PrivateKey::from_seed(43);
         let nop = node::encode_frame(
             &signer,
@@ -7962,7 +7962,7 @@ mod tests {
     /// decoded non-nop reject), with an empty dispatch trace.
     #[test]
     fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
-        let blobs = files::BlobHandle::default();
+        let blobs = blobstore::BlobHandle::default();
         let signer = ed25519::PrivateKey::from_seed(44);
         let frame = node::encode_frame(
             &signer,
