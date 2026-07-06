@@ -1,6 +1,7 @@
 schema = 1
 package = "org.example.dummy"
 version = "0.1.0"
+harness = "dummy-harness"
 
 [requires]
 protocol_min = 1

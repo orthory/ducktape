@@ -31,6 +31,12 @@ pub struct PackageManifest {
     pub schema: u32,
     pub package: String,
     pub version: String,
+    /// The harness module's logical id — which `[[modules]]` entry owns the
+    /// package's lifecycle (the `HarnessMsg` receiver). Optional in the
+    /// schema: install tooling that gets no explicit harness falls back to
+    /// this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     pub requires: Requires,
     #[serde(default)]
     pub modules: Vec<ModuleEntry>,
@@ -168,6 +174,8 @@ pub enum ManifestError {
     UndeclaredAction { agent: String, tag: String },
     #[error("engagement source {module:?} is not a declared module")]
     DanglingSource { module: String },
+    #[error("harness {module:?} is not a declared module")]
+    DanglingHarness { module: String },
     #[error("engagement references undeclared agent {agent:?}")]
     DanglingEngagementAgent { agent: String },
 }
@@ -205,6 +213,16 @@ pub fn validate(m: &PackageManifest) -> Result<(), ManifestError> {
         validate_tag(&me.default_id)?;
         if !module_ids.insert(me.logical.as_str()) {
             return Err(ManifestError::DuplicateLogical(me.logical.clone()));
+        }
+    }
+
+    // the harness key, when present, must name a declared module.
+    if let Some(harness) = &m.harness {
+        validate_tag(harness)?;
+        if !module_ids.contains(harness.as_str()) {
+            return Err(ManifestError::DanglingHarness {
+                module: harness.clone(),
+            });
         }
     }
 
@@ -399,6 +417,35 @@ package_state = "tombstone"
     }
 
     #[test]
+    fn harness_key_parses_and_defaults_to_none() {
+        // the base fixture carries no harness key.
+        assert_eq!(good().harness, None);
+        // an explicit key parses and validates when it names a declared module.
+        let with = GOOD.replace(
+            "version = \"0.1.0\"",
+            "version = \"0.1.0\"\nharness = \"docs-harness\"",
+        );
+        let m = parse_manifest(with.as_bytes()).expect("harness key parses");
+        assert_eq!(m.harness.as_deref(), Some("docs-harness"));
+        validate(&m).expect("a declared harness validates");
+    }
+
+    #[test]
+    fn rejects_dangling_harness() {
+        let mut m = good();
+        m.harness = Some("ghost".into());
+        assert_eq!(
+            validate(&m),
+            Err(ManifestError::DanglingHarness {
+                module: "ghost".into(),
+            })
+        );
+        // the tag shape rule applies to the harness key too.
+        m.harness = Some("NOT A TAG".into());
+        assert!(matches!(validate(&m), Err(ManifestError::BadTag { .. })));
+    }
+
+    #[test]
     fn rejects_wasm_kind() {
         let mut m = good();
         m.modules[0].kind = ModuleKind::Wasm;
@@ -535,6 +582,7 @@ package_state = "tombstone"
         let m = parse_manifest(&bytes).expect("fixture parses");
         validate(&m).expect("fixture validates");
         assert_eq!(m.package, "org.ducktape.docs");
+        assert_eq!(m.harness.as_deref(), Some("docs-harness"));
         assert_eq!(m.actions.len(), 3);
         assert_eq!(
             m.modules

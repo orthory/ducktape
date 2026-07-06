@@ -1,6 +1,7 @@
 schema = 1
 package = "org.ducktape.docs"
 version = "0.1.0"
+harness = "docs-harness"
 
 [requires]
 protocol_min = 1
