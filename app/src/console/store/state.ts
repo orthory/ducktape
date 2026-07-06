@@ -125,6 +125,13 @@ export interface ConsoleState {
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
    *  history lives in the dispatch module, not here. */
   pendingRuns: PendingRun[];
+  /** hex node key -> the executor tags that node announced (the `capability`
+   *  registry, kept per-node instead of flattened). Members view shows what
+   *  each member runs; empty when nothing is announced. */
+  capabilitiesByNode: Map<string, string[]>;
+  /** run_id -> hex node key currently executing it (the saga assignee, via the
+   *  dispatch read facade). Only in-flight runs appear; empty otherwise. */
+  runAssignee: Map<string, string>;
 
   // ── Search (cross-module reads over the node's derived index) ──
   /** The last search's results, or null before any search ran. Query-driven —
@@ -318,6 +325,8 @@ export const createInitialState = (): ConsoleState => {
     capabilities: [],
     watches: [],
     pendingRuns: [],
+    capabilitiesByNode: new Map(),
+    runAssignee: new Map(),
     search: null,
     searchPending: false,
     searchOpen: false,
@@ -354,6 +363,8 @@ export interface ConsoleSnapshot {
   capabilities: string[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
+  capabilitiesByNode: Map<string, string[]>;
+  runAssignee: Map<string, string>;
   files: Manifest[];
   blocks: BlockRecord[];
 }
@@ -377,6 +388,8 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   capabilities: snapshot.capabilities,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
+  capabilitiesByNode: snapshot.capabilitiesByNode,
+  runAssignee: snapshot.runAssignee,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });
