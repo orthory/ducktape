@@ -154,7 +154,7 @@ impl BlockSink for PinRecorder {
         _epoch: u64,
         _view_base: u64,
         _participants: &[Vec<u8>],
-        _observers: &[Vec<u8>],
+        _residents: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
         async { Ok(()) }
     }

@@ -161,7 +161,7 @@ The first shipped mappers and why they exist:
   frame catch-up. Whatever the fold could not reproduce is healed by a
   from-state rebuild at the verified boundary: after checkpoint restore
   (pre-replay) and again at the boot tip once every path converged.
-- A serving OBSERVER never folds — it observes state boundaries, not sealed
+- A serving RESIDENT never folds — it observes state boundaries, not sealed
   frames — so its entire feed is the heal: on every followed boundary whose
   verified app-hash moved, every module re-derives (or re-stamps) at that
   boundary, and the blocks database gains one honest boundary row
@@ -207,8 +207,8 @@ index comes together with the sync. Two lanes, in preference order:
    watermark advances on every applied block): noded startup against the
    resume floor, the validator after checkpoint restore and at the boot tip
    (state-sync install, replay gaps, wiped directories all converge there),
-   and the observer on every state-changing boundary it follows (§6 — the
-   observer's only feed).
+   and the resident on every state-changing boundary it follows (§6 — the
+   resident's only feed).
 
 2. **Index checkpoint shipping (the optimization — SHIPPED).** fluent31
    checkpoints are complete database directories; a source node ships them

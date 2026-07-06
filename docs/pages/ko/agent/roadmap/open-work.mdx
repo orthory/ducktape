@@ -16,14 +16,14 @@ reactor worker, finalized admission commitment가 생기기 전에는 fail-close
 
 ## Demotion And Promotion Edges
 
-epoch cutover에서 validator set에서 빠진 validator는 아직 sync/observer로 남지 않고
+epoch cutover에서 validator set에서 빠진 validator는 아직 sync/resident로 남지 않고
 halt한다. joiner promotion 자체는 shipped 상태다. parked joiner는 admission boundary를
 sync하고 promotion checkpoint를 쓰고 reboot한 뒤 vote할 수 있다. 이것을 missing으로
 기록하면 안 된다.
 
 남은 promotion-adjacent operator work는 stale local-state story다. pre-recovery 또는
 damaged recovery directory는 migrate되지 않고 loud failure로 끝나며, demoted node도
-아직 자동으로 observer role로 degrade하지 않는다.
+아직 자동으로 resident role로 degrade하지 않는다.
 
 ## Replay Nonces
 

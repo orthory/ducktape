@@ -1,12 +1,12 @@
-//! observer submit relay, end to end on the network-shape cluster: a parked
-//! joiner cannot write; once granted OBSERVER standing it posts to chat
+//! resident submit relay, end to end on the network-shape cluster: a parked
+//! joiner cannot write; once granted RESIDENT standing it posts to chat
 //! through its OWN surface — the frame relays to the founder, finalizes, and
-//! the recorded author is the OBSERVER's key (authorship rides the frame
+//! the recorded author is the RESIDENT's key (authorship rides the frame
 //! signature, not the injecting validator). a member-gated module op from the
-//! same observer finalizes Rejected — the relay grants no authority.
+//! same resident finalizes Rejected — the relay grants no authority.
 //!
 //! run alone (cluster e2es flake under parallel load):
-//!   cargo test -p node-bin --test observer_submit_e2e -- --nocapture --test-threads=1
+//!   cargo test -p node-bin --test resident_submit_e2e -- --nocapture --test-threads=1
 
 mod common;
 
@@ -23,11 +23,11 @@ use common::{NetworkShapeCluster, poll_until, serial};
 const CONVERGE: Duration = Duration::from_secs(180);
 
 #[test]
-fn observer_posts_to_chat_with_its_own_authorship() {
+fn resident_posts_to_chat_with_its_own_authorship() {
     let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
-    let chain_id = cluster.init_founder("observer-submit");
+    let chain_id = cluster.init_founder("resident-submit");
     assert!(!chain_id.is_empty(), "init should print the founded chain id");
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
@@ -86,15 +86,15 @@ fn observer_posts_to_chat_with_its_own_authorship() {
         "the refusal names the parked/no-standing contract: {refused}"
     );
 
-    // grant OBSERVER standing (invite-accept = AddObserver), then wait for the
+    // grant RESIDENT standing (invite-accept = AddResident), then wait for the
     // follow arm to grant standing AND pre-sync a boundary — the write gate
     // needs both (serving is Some only after the first boundary).
     let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
     assert!(ok, "invite-accept failed:\n{out}");
-    cluster.wait_marker(1, "observer: standing granted", CONVERGE);
-    cluster.wait_marker(1, "observer: pre-synced boundary", CONVERGE);
+    cluster.wait_marker(1, "resident: standing granted", CONVERGE);
+    cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
-    // (2) THE POINT: the observer posts through its OWN surface and the reply is
+    // (2) THE POINT: the resident posts through its OWN surface and the reply is
     //     the relayed op's consensus fate (ok == Applied — relay → validator →
     //     finalize).
     let posted = cluster.rpc(
@@ -102,15 +102,15 @@ fn observer_posts_to_chat_with_its_own_authorship() {
         serde_json::json!({
             "cmd": "submit",
             "target": "chat",
-            "payload_hex": common::hex(&encode_msg(&post("m-observer", "hi from the cheap seats"))),
+            "payload_hex": common::hex(&encode_msg(&post("m-resident", "hi from the cheap seats"))),
         }),
     );
     assert_eq!(
         posted["ok"], true,
-        "the observer submit should relay + finalize (ok == Applied): {posted}"
+        "the resident submit should relay + finalize (ok == Applied): {posted}"
     );
 
-    // (3) the founder's view of the message carries the OBSERVER's authorship —
+    // (3) the founder's view of the message carries the RESIDENT's authorship —
     //     authorship rides the frame signature, not the injecting validator.
     let author = poll_until(
         "the relayed post to finalize into the founder's channel",
@@ -129,18 +129,18 @@ fn observer_posts_to_chat_with_its_own_authorship() {
             };
             views
                 .into_iter()
-                .find(|v| v.head.message_id == "m-observer")
+                .find(|v| v.head.message_id == "m-resident")
                 .map(|v| v.head.author)
         },
     );
     assert_eq!(
         author,
         AuthorRef::User(common::unhex(&friend_key)),
-        "authorship is the observer's key, not the injecting validator's"
+        "authorship is the resident's key, not the injecting validator's"
     );
 
     // (4) NO AUTHORITY ESCALATION: a member-gated governance op from the
-    //     observer finalizes Rejected (deterministic no-op), and the relay
+    //     resident finalizes Rejected (deterministic no-op), and the relay
     //     reply says so — the relay grants no membership authority.
     let gov = cluster.rpc(
         1,
@@ -155,7 +155,7 @@ fn observer_posts_to_chat_with_its_own_authorship() {
     );
     assert_eq!(
         gov["ok"], false,
-        "a member-gated op from a non-member observer must not apply: {gov}"
+        "a member-gated op from a non-member resident must not apply: {gov}"
     );
     assert!(
         gov["error"]
@@ -180,15 +180,15 @@ fn post(id: &str, text: &str) -> ChatMsg {
     }
 }
 
-/// a well-formed but member-gated governance op: `Propose { AddObserver }`.
+/// a well-formed but member-gated governance op: `Propose { AddResident }`.
 /// the key is a valid 32-byte length (so it clears the door), and the proposer
-/// (the observer's origin) is not a validator-set member — so it finalizes
+/// (the resident's origin) is not a validator-set member — so it finalizes
 /// Rejected.
 fn governance_probe() -> Vec<u8> {
     use governance::{GovAction, GovMsg, encode_msg};
     encode_msg(&GovMsg::Propose {
-        proposal_id: "observer-escalation-probe:0".into(),
-        action: GovAction::AddObserver {
+        proposal_id: "resident-escalation-probe:0".into(),
+        action: GovAction::AddResident {
             key: vec![0xAA; 32],
         },
         voting_period: 1_000,

@@ -429,7 +429,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
 
         let mut src_valset = Valset::new("valset");
         // an established source network: two seated validators plus one
-        // OBSERVER (the staged-admission tier, protocol v3), so the
+        // RESIDENT (the staged-admission tier, protocol v3), so the
         // two-class snapshot round-trips both sections.
         src_valset.insert(validator_key(7));
         commit_op(

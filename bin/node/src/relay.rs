@@ -1,16 +1,16 @@
-//! the submit-relay channel wire format — how an observer-standing node
+//! the submit-relay channel wire format — how a resident-standing node
 //! delivers a frame it signed, and how a validator answers with the frame's
 //! consensus fate.
 //!
-//! transport: the observer ships the frame bytes on `CHANNEL_SUBMIT_RELAY`
+//! transport: the resident ships the frame bytes on `CHANNEL_SUBMIT_RELAY`
 //! to ONE current validator, exactly as `node::encode_frame` produced them.
 //! the SENDING peer's transport identity is deliberately NOT consulted:
-//! observers speak from the network's DERIVED LOBBY identity (the lobby key
+//! residents speak from the network's DERIVED LOBBY identity (the lobby key
 //! folded into every mesh), which ANY invite holder can derive — so origin
-//! could never equal a real observer's transport peer, and a peer-vs-origin
+//! could never equal a real resident's transport peer, and a peer-vs-origin
 //! gate adds nothing anyway. the frame's OWN signature is the authorization:
 //! it binds (origin, seq, target, payload) to the origin key, so forgery is
-//! impossible; committed observer standing on the ORIGIN is the policy gate;
+//! impossible; committed resident standing on the ORIGIN is the policy gate;
 //! and a byte-identical replay collapses in the consensus lane's exactly-once
 //! digest gate. the validator takes consensus custody via `submit_frame` and
 //! replies when the frame drains — Applied with the sealed block's
@@ -30,7 +30,7 @@ pub enum RelayOutcome {
     Applied { height: u64, app_hash: String },
     /// finalized but deterministically rejected by its module.
     Rejected { detail: String },
-    /// refused at the door (bad frame / origin lacks observer standing) or
+    /// refused at the door (bad frame / origin lacks resident standing) or
     /// the validator's hold expired before finalization — the op may still
     /// land later; clients re-query on block events.
     Refused { detail: String },
@@ -39,7 +39,7 @@ pub enum RelayOutcome {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayMsg {
-    /// an observer-signed frame, bytes exactly as `encode_frame` produced.
+    /// a resident-signed frame, bytes exactly as `encode_frame` produced.
     Submit { frame: Vec<u8> },
     /// the validator's answer, keyed by the frame's content address.
     Reply {
@@ -59,26 +59,26 @@ pub fn decode_msg(b: &[u8]) -> Result<RelayMsg, String> {
 /// the validator's door check, pure so it is testable without a mesh: the
 /// frame must decode AND verify (the kernel checks the signature binds
 /// origin/seq/target/payload), its origin must be `Origin::External`, and
-/// that ORIGIN must hold committed observer standing (validators submit
+/// that ORIGIN must hold committed resident standing (validators submit
 /// locally; parked joiners have no standing). the sending peer is
-/// DELIBERATELY not an argument: observers ride the network's derived lobby
+/// DELIBERATELY not an argument: residents ride the network's derived lobby
 /// transport identity — derivable by any invite holder — so a peer-vs-origin
-/// check could never pass for a real observer and would gate nothing. the
+/// check could never pass for a real resident and would gate nothing. the
 /// frame's signature is the authorization (forgery impossible) and the
 /// exactly-once digest gate collapses byte-identical replays; committed
 /// standing is the only policy the door adds. membership-current state is the
 /// CALLER's to fetch — this needs only bytes.
 pub fn verify_relay_submit(
     frame: &[u8],
-    observers: &[Vec<u8>],
+    residents: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
     let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(origin_bytes) = origin else {
         return Err("relayed frames carry an external origin".into());
     };
-    if !observers.iter().any(|o| o.as_slice() == origin_bytes.as_slice()) {
+    if !residents.iter().any(|o| o.as_slice() == origin_bytes.as_slice()) {
         return Err(
-            "origin holds no committed observer standing — submit ops via a validator".into(),
+            "origin holds no committed resident standing — submit ops via a validator".into(),
         );
     }
     Ok(node::frame_id(frame))
@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn door_refuses_without_observer_standing() {
+    fn door_refuses_without_resident_standing() {
         let author = sk(7);
         let frame = node::encode_frame(&author, 0, &msg());
         let err = verify_relay_submit(&frame, &[]).unwrap_err();

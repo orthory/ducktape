@@ -1,21 +1,21 @@
-# Observer Submit Relay Implementation Plan
+# Resident Submit Relay Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Observer-standing nodes can author ops (chat, kv, …) signed with their own identity key, relayed over a new mesh channel to a validator that takes consensus custody.
+**Goal:** Resident-standing nodes can author ops (chat, kv, …) signed with their own identity key, relayed over a new mesh channel to a validator that takes consensus custody.
 
-**Architecture:** A new static discovery channel (`CHANNEL_SUBMIT_RELAY = 3`) carries observer-signed frame bytes to a current validator. The kernel gains `OrderedNode::submit_frame` (custody of an already-signed frame). The validator gates relays on committed observer standing + origin==peer, injects, and answers with the frame's consensus fate when it drains. The observer's park-loop serve window accepts writes when standing, holds the caller's reply until the relay answer.
+**Architecture:** A new static discovery channel (`CHANNEL_SUBMIT_RELAY = 3`) carries resident-signed frame bytes to a current validator. The kernel gains `OrderedNode::submit_frame` (custody of an already-signed frame). The validator gates relays on committed resident standing + origin==peer, injects, and answers with the frame's consensus fate when it drains. The resident's park-loop serve window accepts writes when standing, holds the caller's reply until the relay answer.
 
 **Tech Stack:** Rust; commonware p2p authenticated discovery; serde_json wire (lobby idiom); existing e2e harness `NetworkShapeCluster`.
 
-**Spec:** `docs/superpowers/specs/2026-07-07-observer-submit-relay-design.md`
+**Spec:** `docs/superpowers/specs/2026-07-07-resident-submit-relay-design.md`
 
 ## Global Constraints
 
 - Branch `feat/observer-submit-relay`, base `origin/dev`; PR targets `dev` (never `main`).
 - Commit with `git -c commit.gpgsign=false commit …` (SSH signing hangs in this env).
 - `MAX_PROTOCOL_VERSION` stays 3 — the relay is node-binary capability, not consensus semantics.
-- An unregistered channel is a protocol violation that kills the sender's connection: `CHANNEL_SUBMIT_RELAY` must be registered in EVERY mode (validator serves; joiner/observer client; sync-only black-holes).
+- An unregistered channel is a protocol violation that kills the sender's connection: `CHANNEL_SUBMIT_RELAY` must be registered in EVERY mode (validator serves; joiner/resident client; sync-only black-holes).
 - Comment style: match main.rs — dense, WHY-focused, lowercase-leading.
 - Line numbers below are from `origin/dev` @ cc831cc — re-anchor with the quoted context if drifted.
 
@@ -166,7 +166,7 @@ In `crates/kernel/node/src/lib.rs`, replace the body of `submit` and add `submit
     }
 
     /// take custody of an ALREADY-SIGNED frame (the relay entry point: an
-    /// observer signs with its own identity key, a validator injects). the
+    /// resident signs with its own identity key, a validator injects). the
     /// signature is verified BEFORE anything is pinned — junk from the wire
     /// must never enter the durable store or the orderer. custody semantics
     /// are identical to [`OrderedNode::submit`]: pin, propose, track
@@ -229,22 +229,22 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
   - `pub enum RelayMsg { Submit { frame: Vec<u8> }, Reply { frame_id: [u8; 32], outcome: RelayOutcome } }`
   - `pub enum RelayOutcome { Applied { height: u64, app_hash: String }, Rejected { detail: String }, Refused { detail: String } }`
   - `pub fn encode_msg(&RelayMsg) -> Vec<u8>`, `pub fn decode_msg(&[u8]) -> Result<RelayMsg, String>`
-  - `pub fn verify_relay_submit(frame: &[u8], sender: &[u8], observers: &[Vec<u8>]) -> Result<node::FrameId, String>`
+  - `pub fn verify_relay_submit(frame: &[u8], sender: &[u8], residents: &[Vec<u8>]) -> Result<node::FrameId, String>`
 
 - [ ] **Step 1: Write the module with failing tests inline**
 
 ```rust
-//! the submit-relay channel wire format — how an observer-standing node
+//! the submit-relay channel wire format — how a resident-standing node
 //! delivers a frame it signed, and how a validator answers with the frame's
 //! consensus fate.
 //!
-//! transport: the observer is already an authenticated mesh peer; it speaks
+//! transport: the resident is already an authenticated mesh peer; it speaks
 //! on `CHANNEL_SUBMIT_RELAY` to ONE current validator. the message carries
 //! the frame bytes exactly as `node::encode_frame` produced them — the
 //! frame's own signature (origin, seq, target, payload) is the authorship;
 //! the channel peer identity only GATES (origin must equal the sender, so a
 //! node relays nothing but its own ops, and the origin must hold committed
-//! observer standing). the validator takes consensus custody via
+//! resident standing). the validator takes consensus custody via
 //! `submit_frame` and replies when the frame drains — Applied with the
 //! sealed block's coordinates, Rejected for a deterministic no-op, Refused
 //! for door failures and expired holds.
@@ -271,7 +271,7 @@ pub enum RelayOutcome {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayMsg {
-    /// an observer-signed frame, bytes exactly as `encode_frame` produced.
+    /// a resident-signed frame, bytes exactly as `encode_frame` produced.
     Submit { frame: Vec<u8> },
     /// the validator's answer, keyed by the frame's content address.
     Reply {
@@ -292,13 +292,13 @@ pub fn decode_msg(b: &[u8]) -> Result<RelayMsg, String> {
 /// the frame must decode AND verify (the kernel checks the signature binds
 /// origin/seq/target/payload), its origin must BE the sending peer (a node
 /// relays only its own ops — no laundering), and that origin must hold
-/// committed observer standing (validators submit locally; parked joiners
+/// committed resident standing (validators submit locally; parked joiners
 /// have no standing). membership-current state is the CALLER's to fetch —
 /// this needs only bytes.
 pub fn verify_relay_submit(
     frame: &[u8],
     sender: &[u8],
-    observers: &[Vec<u8>],
+    residents: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
     let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(origin_bytes) = origin else {
@@ -307,8 +307,8 @@ pub fn verify_relay_submit(
     if origin_bytes.as_slice() != sender {
         return Err("frame origin is not the relaying peer — a node relays only its own ops".into());
     }
-    if !observers.iter().any(|o| o.as_slice() == sender) {
-        return Err("origin holds no committed observer standing — submit via a validator".into());
+    if !residents.iter().any(|o| o.as_slice() == sender) {
+        return Err("origin holds no committed resident standing — submit via a validator".into());
     }
     Ok(node::frame_id(frame))
 }
@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn door_accepts_a_standing_observers_own_frame() {
+    fn door_accepts_a_standing_residents_own_frame() {
         let author = sk(7);
         let me = author.public_key().as_ref().to_vec();
         let frame = node::encode_frame(&author, 3, &msg());
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn door_refuses_without_observer_standing() {
+    fn door_refuses_without_resident_standing() {
         let author = sk(7);
         let me = author.public_key().as_ref().to_vec();
         let frame = node::encode_frame(&author, 0, &msg());
@@ -423,18 +423,18 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
   - new select arm (next to the lobby arm at ~6960)
 
 **Interfaces:**
-- Consumes: `relay::{RelayMsg, RelayOutcome, encode_msg, decode_msg, verify_relay_submit}`, `node.submit_frame`, `read_valset_observers`.
-- Produces: a validator that answers `RelayMsg::Submit` with `RelayMsg::Reply` on drain/expiry — what Task 4's observer client consumes.
+- Consumes: `relay::{RelayMsg, RelayOutcome, encode_msg, decode_msg, verify_relay_submit}`, `node.submit_frame`, `read_valset_residents`.
+- Produces: a validator that answers `RelayMsg::Submit` with `RelayMsg::Reply` on drain/expiry — what Task 4's resident client consumes.
 
 - [ ] **Step 1: Add the channel constant** (after `CHANNEL_LOBBY`, renumber nothing):
 
 ```rust
-/// the submit-relay channel: an observer-standing node ships a frame it
+/// the submit-relay channel: a resident-standing node ships a frame it
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and
 /// answers with the frame's fate when it drains. the last free static slot
 /// below CHANNEL_STATE_SYNC; engine banks start at 8. registered in EVERY
-/// mode like the lanes above — validators serve, observers speak, sync-only
+/// mode like the lanes above — validators serve, residents speak, sync-only
 /// black-holes.
 const CHANNEL_SUBMIT_RELAY: u64 = 3;
 ```
@@ -502,11 +502,11 @@ relayed = relay_ingress.next() => {
     let relay::RelayMsg::Submit { frame } = msg else {
         continue; // a Reply at a validator is a protocol confusion — drop.
     };
-    // the door check needs committed state: the observer projection at
+    // the door check needs committed state: the resident projection at
     // this node's latest boundary. origin==peer and signature checks ride
     // inside.
-    let observers_now = read_valset_observers(node.host()).await;
-    let frame_id = match relay::verify_relay_submit(&frame, peer.as_ref(), &observers_now) {
+    let residents_now = read_valset_residents(node.host()).await;
+    let frame_id = match relay::verify_relay_submit(&frame, peer.as_ref(), &residents_now) {
         Ok(id) => id,
         Err(detail) => {
             send_reply(node::frame_id(&frame), relay::RelayOutcome::Refused { detail });
@@ -589,7 +589,7 @@ Expected: clean. (Behavioral verification is Task 5's e2e.)
 git add bin/node/src/main.rs
 git -c commit.gpgsign=false commit -m "feat(node): validators serve the submit-relay lane
 
-door check (signature, origin==peer, committed observer standing),
+door check (signature, origin==peer, committed resident standing),
 consensus custody via submit_frame, wire reply on drain or expiry —
 the same SUBMIT_HOLD contract as local app-surface holds.
 
@@ -598,7 +598,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: Observer side — accept writes, relay, hold the reply
+### Task 4: Resident side — accept writes, relay, hold the reply
 
 **Files:**
 - Modify: `bin/node/src/main.rs`:
@@ -606,11 +606,11 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
   - joiner path registrations (~4254–4314): register the client lane
   - serve window (~4437–4560): replace both write refusals; add relay-reply arm + holds
   - park-loop tail (after the tick, before the manifest poll): expiry sweep
-- Modify: `docs/superpowers/specs/2026-07-07-observer-submit-relay-design.md`: the observer sweep budget is `SUBMIT_HOLD` (not `+5s`) — the rpc bridge caps at 10s anyway; note it.
+- Modify: `docs/superpowers/specs/2026-07-07-resident-submit-relay-design.md`: the resident sweep budget is `SUBMIT_HOLD` (not `+5s`) — the rpc bridge caps at 10s anyway; note it.
 
 **Interfaces:**
 - Consumes: Task 3's validator behavior; `relay::*`; `node::{encode_frame, frame_id}`; `announce_targets` (current participants, refreshed by the manifest poll); `storage_for_sync` (the joiner path's storage root, ~line 4205).
-- Produces: observer surfaces that accept `RpcRequest::Submit` / `NodeCommand::Submit` when `observer_standing && serving.is_some()`.
+- Produces: resident surfaces that accept `RpcRequest::Submit` / `NodeCommand::Submit` when `resident_standing && serving.is_some()`.
 
 - [ ] **Step 1: sync-only black-hole** (next to the voice black-hole at ~4126):
 
@@ -626,7 +626,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - [ ] **Step 2: joiner-path registration** (next to the lobby registration at ~4314):
 
 ```rust
-// the submit-relay lane: once observer standing lands, writes leave here —
+// the submit-relay lane: once resident standing lands, writes leave here —
 // this node signs its own frames and a validator takes custody. replies
 // (the frame's consensus fate) come back on the same lane.
 let (mut relay_tx, mut relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
@@ -704,8 +704,8 @@ rpc (~4450) — the refusal stays for the un-standing / not-yet-serving cases:
 
 ```rust
 RpcRequest::Submit { target, payload_hex } => {
-    if !observer_standing || serving.is_none() {
-        RpcReply::err(not_serving(observer_standing))
+    if !resident_standing || serving.is_none() {
+        RpcReply::err(not_serving(resident_standing))
     } else {
         match unhex(&payload_hex) {
             Ok(payload) => match relay_submit(
@@ -734,8 +734,8 @@ http (~4509):
 
 ```rust
 noded::NodeCommand::Submit { target, payload, origin: _, reply } => {
-    if !observer_standing || serving.is_none() {
-        let _ = reply.send(Err(not_serving(observer_standing)));
+    if !resident_standing || serving.is_none() {
+        let _ = reply.send(Err(not_serving(resident_standing)));
     } else {
         match relay_submit(
             target, payload, &mut relay_seq, &mut relay_round,
@@ -819,8 +819,8 @@ Expected: clean, 5 relay tests pass.
 - [ ] **Step 8: Amend the spec** (sweep budget = `SUBMIT_HOLD`; rpc-bridge note), then commit:
 
 ```bash
-git add bin/node/src/main.rs docs/superpowers/specs/2026-07-07-observer-submit-relay-design.md
-git -c commit.gpgsign=false commit -m "feat(node): observer surfaces accept writes via the submit relay
+git add bin/node/src/main.rs docs/superpowers/specs/2026-07-07-resident-submit-relay-design.md
+git -c commit.gpgsign=false commit -m "feat(node): resident surfaces accept writes via the submit relay
 
 standing + first-boundary gated; frames signed with this node's own
 identity key (authorship = status.publicKey); reply held until the
@@ -831,11 +831,11 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 5: E2E — an observer posts to chat
+### Task 5: E2E — a resident posts to chat
 
 **Files:**
-- Create: `bin/node/tests/observer_submit_e2e.rs`
-- Modify: `docs/validator-onboarding.md` — one paragraph: observer standing now includes writes (relayed, authorship = the observer's key); reads were already local.
+- Create: `bin/node/tests/resident_submit_e2e.rs`
+- Modify: `docs/validator-onboarding.md` — one paragraph: resident standing now includes writes (relayed, authorship = the resident's key); reads were already local.
 
 **Interfaces:**
 - Consumes: everything above; `NetworkShapeCluster` (`bin/node/tests/common/mod.rs`); `chat::interface` (dependency of the `ducktape-node` bin — reuse via `chat::…` path used by main.rs; if the test needs it in dev-dependencies, add `chat = { path = "../../crates/apps/chat" }` to `bin/node/Cargo.toml` `[dev-dependencies]`).
@@ -843,12 +843,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - [ ] **Step 1: Write the failing e2e**
 
 ```rust
-//! observer submit relay, end to end on the network-shape cluster: a parked
-//! joiner cannot write; once granted OBSERVER standing it posts to chat
+//! resident submit relay, end to end on the network-shape cluster: a parked
+//! joiner cannot write; once granted RESIDENT standing it posts to chat
 //! through its OWN surface — the frame relays to the founder, finalizes, and
-//! the recorded author is the OBSERVER's key (authorship rides the frame
+//! the recorded author is the RESIDENT's key (authorship rides the frame
 //! signature, not the injecting validator). a member-gated module op from
-//! the same observer finalizes Rejected — the relay grants no authority.
+//! the same resident finalizes Rejected — the relay grants no authority.
 
 mod common;
 
@@ -861,11 +861,11 @@ use chat::interface::{
 use common::{NetworkShapeCluster, serial};
 
 #[test]
-fn observer_posts_to_chat_with_its_own_authorship() {
+fn resident_posts_to_chat_with_its_own_authorship() {
     let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
-    let chain_id = cluster.init_founder("observer-submit");
+    let chain_id = cluster.init_founder("resident-submit");
     assert!(!chain_id.is_empty());
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
@@ -898,26 +898,26 @@ fn observer_posts_to_chat_with_its_own_authorship() {
     );
     assert_eq!(refused["ok"], false, "parked node must refuse writes: {refused}");
 
-    // grant OBSERVER standing (invite-accept = AddObserver), wait for the
+    // grant RESIDENT standing (invite-accept = AddResident), wait for the
     // follow arm to pre-sync a boundary — the write gate needs both.
     let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
     assert!(ok, "invite-accept failed:\n{out}");
-    cluster.wait_marker(1, "observer: standing granted", Duration::from_secs(120));
-    cluster.wait_marker(1, "observer: pre-synced boundary", Duration::from_secs(120));
+    cluster.wait_marker(1, "resident: standing granted", Duration::from_secs(120));
+    cluster.wait_marker(1, "resident: pre-synced boundary", Duration::from_secs(120));
 
-    // THE POINT: the observer posts through its OWN surface and the reply is
+    // THE POINT: the resident posts through its OWN surface and the reply is
     // the relayed op's consensus fate (ok == Applied).
     let posted = cluster.rpc(
         1,
         serde_json::json!({
             "cmd": "submit",
             "target": "chat",
-            "payload_hex": common_hex(&encode_msg(&post("m-observer", "hi from the cheap seats"))),
+            "payload_hex": common_hex(&encode_msg(&post("m-resident", "hi from the cheap seats"))),
         }),
     );
-    assert_eq!(posted["ok"], true, "observer submit should relay + apply: {posted}");
+    assert_eq!(posted["ok"], true, "resident submit should relay + apply: {posted}");
 
-    // the founder's view of the message carries the OBSERVER's authorship.
+    // the founder's view of the message carries the RESIDENT's authorship.
     let raw = cluster
         .query(
             0,
@@ -933,16 +933,16 @@ fn observer_posts_to_chat_with_its_own_authorship() {
     };
     let ours = views
         .iter()
-        .find(|v| v.head.message_id == "m-observer")
+        .find(|v| v.head.message_id == "m-resident")
         .expect("the relayed post finalized into the channel");
     let friend_bytes = unhex_pub(&friend_key);
     assert_eq!(
         ours.head.author,
         AuthorRef::User(friend_bytes),
-        "authorship is the observer's key, not the injecting validator's"
+        "authorship is the resident's key, not the injecting validator's"
     );
 
-    // NO AUTHORITY ESCALATION: a member-gated governance op from the observer
+    // NO AUTHORITY ESCALATION: a member-gated governance op from the resident
     // finalizes Rejected, and the relay reply says so.
     let gov = cluster.rpc(
         1,
@@ -973,8 +973,8 @@ fn post(id: &str, text: &str) -> ChatMsg {
 fn governance_probe() -> Vec<u8> {
     use governance::{GovAction, GovMsg, encode_msg};
     encode_msg(&GovMsg::Propose {
-        proposal_id: "observer-escalation-probe:0".into(),
-        action: GovAction::AddObserver { key: vec![0xAA; 32] },
+        proposal_id: "resident-escalation-probe:0".into(),
+        action: GovAction::AddResident { key: vec![0xAA; 32] },
         voting_period: 1_000,
     })
 }
@@ -995,21 +995,21 @@ Adjust to the harness's actual exports: `common/mod.rs` may already export `hex`
 
 - [ ] **Step 2: Run to verify it fails only where expected**
 
-Run: `cargo test -p ducktape-node --test observer_submit_e2e -- --nocapture`
-Expected before Tasks 3–4 land: the parked refusal passes, the observer submit FAILS (refused). After Tasks 3–4: full pass. (If executing tasks in order, this test is written last — expect a full pass; flip to red by reverting if independent verification of the red state is wanted. The unit tests in Tasks 1–2 carried the TDD red phase for the mechanics.)
+Run: `cargo test -p ducktape-node --test resident_submit_e2e -- --nocapture`
+Expected before Tasks 3–4 land: the parked refusal passes, the resident submit FAILS (refused). After Tasks 3–4: full pass. (If executing tasks in order, this test is written last — expect a full pass; flip to red by reverting if independent verification of the red state is wanted. The unit tests in Tasks 1–2 carried the TDD red phase for the mechanics.)
 
 - [ ] **Step 3: Run the sibling e2es that share the harness**
 
 Run: `cargo test -p ducktape-node --test live_admission_e2e --test join_request_e2e -- --nocapture`
 Expected: pass (serial-gated; run on an otherwise idle machine — parallel cluster e2es flake, dedicated runs are authoritative).
 
-- [ ] **Step 4: Docs touch** — `docs/validator-onboarding.md`: in the observer-standing section, state: observers now WRITE through their own surface (the node signs with its identity key and relays to a validator; authorship is the observer's key; member-gated modules still reject non-member origins deterministically).
+- [ ] **Step 4: Docs touch** — `docs/validator-onboarding.md`: in the resident-standing section, state: residents now WRITE through their own surface (the node signs with its identity key and relays to a validator; authorship is the resident's key; member-gated modules still reject non-member origins deterministically).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add bin/node/tests/observer_submit_e2e.rs bin/node/Cargo.toml docs/validator-onboarding.md
-git -c commit.gpgsign=false commit -m "test(node): observer submit relay e2e — chat authorship + no escalation
+git add bin/node/tests/resident_submit_e2e.rs bin/node/Cargo.toml docs/validator-onboarding.md
+git -c commit.gpgsign=false commit -m "test(node): resident submit relay e2e — chat authorship + no escalation
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
@@ -1025,7 +1025,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ```bash
 git push -u origin feat/observer-submit-relay
-gh pr create --base dev --title "feat: observer submit relay — writes for observer-standing nodes" --body "..."
+gh pr create --base dev --title "feat: resident submit relay — writes for resident-standing nodes" --body "..."
 ```
 
 PR body covers: spec + plan paths, the authorship-rides-the-signature argument, the no-escalation e2e, flag-day note (new static channel 3).
@@ -1034,6 +1034,6 @@ PR body covers: spec + plan paths, the authorship-rides-the-signature argument, 
 
 ## Self-Review Notes
 
-- Spec coverage: wire (T2/T3), kernel custody (T1), validator gate+reply (T3), observer surfaces+seq+holds (T4), e2e incl. negative authority (T5), docs+mixed-version note (T5/T6, spec §Mixed versions needs no code). Spec's "+5s sweep" superseded — amended in T4 Step 8.
+- Spec coverage: wire (T2/T3), kernel custody (T1), validator gate+reply (T3), resident surfaces+seq+holds (T4), e2e incl. negative authority (T5), docs+mixed-version note (T5/T6, spec §Mixed versions needs no code). Spec's "+5s sweep" superseded — amended in T4 Step 8.
 - Type consistency: `RelayHold` enum local to the serve window; `relay::RelayMsg/RelayOutcome` shared; `node::FrameId = [u8;32]` used as the wire `frame_id` directly.
 - The borrow-shape CAUTIONs in T4 are real risks flagged for the implementer, not placeholders — the behavior on each path is fully specified.

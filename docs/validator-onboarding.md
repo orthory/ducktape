@@ -72,12 +72,12 @@ The lobby identity authenticates nothing and is meant to be public to the
 network's invitees. Anyone holding a descriptor can connect with it; without a
 valid token their messages are dropped on receipt.
 
-A key granted **observer standing** (a member's `invite-accept`) climbs one
+A key granted **resident standing** (a member's `invite-accept`) climbs one
 rung further: its node follows finalized boundaries, serves reads locally, and
-**writes through its own surface**. A submit against the observer's surface is
+**writes through its own surface**. A submit against the resident's surface is
 signed with the node's identity key and relayed over the mesh to a current
 validator, which takes consensus custody and answers with the op's finalized
-fate — authorship is the observer's key, never the relaying validator's.
+fate — authorship is the resident's key, never the relaying validator's.
 Standing to write is not membership: member-gated modules (governance among
 them) still reject a non-member origin deterministically.
 

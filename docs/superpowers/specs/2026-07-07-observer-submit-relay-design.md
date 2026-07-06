@@ -1,20 +1,21 @@
-# Observer Submit Relay — Design
+# Resident Submit Relay — Design
 
 Date: 2026-07-07
 Status: approved direction (user), spec for implementation
+Naming: the tier shipped as "resident" (renamed from "observer", user decision 2026-07-07).
 Branch: `feat/observer-submit-relay` (base `origin/dev`)
 
 ## Problem
 
-An observer-standing node (the staged-admission tier) is a real member of the
+An resident-standing node (the staged-admission tier) is a real member of the
 product: it follows boundaries, serves reads locally, and its node key is the
 user's chat identity. But both of its local surfaces hard-refuse writes:
 
-- rpc: `RpcRequest::Submit` → "observer standing serves reads only" (`bin/node/src/main.rs` park-loop serve window)
+- rpc: `RpcRequest::Submit` → "resident standing serves reads only" (`bin/node/src/main.rs` park-loop serve window)
 - app surface: `noded::NodeCommand::Submit` → same refusal
 
-So a user whose node holds observer standing can read chat but never post.
-Product-wise that is wrong: the observer tier is exactly the "member on a
+So a user whose node holds resident standing can read chat but never post.
+Product-wise that is wrong: the resident tier is exactly the "member on a
 laptop" seat — flaky machines must not sit in the validator set (quorum(n)=n
 for n≤3, so one sleeping laptop halts writes for everyone), yet the human
 behind one still needs to talk.
@@ -34,32 +35,32 @@ Authorship is already decoupled from consensus injection:
 3. Modules derive authorship from `ctx.env().origin` and enforce their own
    policy deterministically: chat gates on channel membership (not valset);
    governance/valset ops are member-gated and deterministically reject a
-   non-member origin. Relaying therefore grants an observer no authority
+   non-member origin. Relaying therefore grants a resident no authority
    beyond what modules already grant its key.
 
-So the only missing piece is transport: carry an observer-signed frame to a
+So the only missing piece is transport: carry a resident-signed frame to a
 validator that will take custody.
 
 ## Approaches considered
 
-**A. Mesh relay lane (chosen).** New static discovery channel; the observer
+**A. Mesh relay lane (chosen).** New static discovery channel; the resident
 signs the frame with its own identity key and ships the bytes to a current
-validator; the validator verifies, gates on committed observer standing, and
+validator; the validator verifies, gates on committed resident standing, and
 injects via a new kernel `submit_frame` (pin + propose + custody). Reply rides
 the same channel when the frame drains.
-— Pros: authenticated end-to-end transport already exists (the observer is on
-the mesh); authorship stays cryptographically the observer's; custody/carry
+— Pros: authenticated end-to-end transport already exists (the resident is on
+the mesh); authorship stays cryptographically the resident's; custody/carry
 and the digest dedup gate come for free; no consensus or module changes.
 — Cons: one new wire surface to maintain.
 
-**B. Extend the json-lines RPC with a `SubmitSigned`.** Observer POSTs a
+**B. Extend the json-lines RPC with a `SubmitSigned`.** Resident POSTs a
 pre-signed frame to a validator's rpc listener.
 — Rejected: `rpc_listen` is typically loopback/private (sentry deployments
 explicitly keep validator surfaces unreachable); the mesh path is the only
 transport guaranteed to exist, and it authenticates peers.
 
-**C. Seat observers in consensus (zero-weight or full).**
-— Rejected: exactly what the observer tier exists to avoid — quorum(n)=n for
+**C. Seat residents in consensus (zero-weight or full).**
+— Rejected: exactly what the resident tier exists to avoid — quorum(n)=n for
 n≤3 means flaky members cost liveness; a "zero-weight member" is a large
 consensus change for no transport gain.
 
@@ -76,7 +77,7 @@ consensus change for no transport gain.
 
 ```rust
 pub enum RelayMsg {
-    /// an observer-signed frame, bytes exactly as `encode_frame` produced.
+    /// a resident-signed frame, bytes exactly as `encode_frame` produced.
     Submit { frame: Vec<u8> },
     /// the validator's answer, keyed by the frame's content address.
     Reply { frame_id: [u8; 32], outcome: RelayOutcome },
@@ -86,7 +87,7 @@ pub enum RelayOutcome {
     Applied { height: u64, app_hash: String },
     /// finalized but deterministically rejected.
     Rejected { detail: String },
-    /// refused at the door (bad frame / origin lacks observer standing) or
+    /// refused at the door (bad frame / origin lacks resident standing) or
     /// the hold expired before finalization.
     Refused { detail: String },
 }
@@ -118,12 +119,12 @@ Register `CHANNEL_SUBMIT_RELAY`; add a select arm:
 1. decode `RelayMsg::Submit` — junk drops silently (lobby idiom);
 2. `decode_frame` the bytes — refusal on error (the signature must bind
    `(origin, seq, target, payload)` to the origin key; forgery is impossible);
-3. **origin ∈ committed observer standing** (`read_valset_observers` on this
+3. **origin ∈ committed resident standing** (`read_valset_residents` on this
    node's host) — validators submit locally and parked joiners have no
    standing; refusal otherwise. the sending PEER is deliberately not consulted:
-   observers ride the network's derived lobby transport identity (derivable by
+   residents ride the network's derived lobby transport identity (derivable by
    any invite holder), so an `origin == peer` check could never pass for a real
-   observer and would gate nothing — the frame signature is the authorization
+   resident and would gate nothing — the frame signature is the authorization
    and the exactly-once digest gate collapses byte-identical replays;
 4. `node.submit_frame(frame)` → `FrameId`; record in a new
    `pending_relays: HashMap<FrameId, (peer, deadline)>` with the same
@@ -134,13 +135,13 @@ Applied → `Reply{Applied{height, app_hash}}` (the per-block boundary hash, as
 for local holds), Rejected → `Reply{Rejected}`, expiry → `Reply{Refused}`.
 Discards stay held — the cutover carry keeps the FrameId alive.
 
-### Observer side (park-loop serve window)
+### Resident side (park-loop serve window)
 
 Register the channel in the joiner path (and black-hole it in sync-only mode;
 the validator path serves it). Replace both write refusals:
 
-- Gate: writes require `observer_standing && serving.is_some()`; a parked
-  joiner without standing keeps today's refusal, a pre-first-sync observer
+- Gate: writes require `resident_standing && serving.is_some()`; a parked
+  joiner without standing keeps today's refusal, a pre-first-sync resident
   answers "no boundary yet — retry".
 - On submit: build `Msg`, `seq = persisted counter++`,
   `frame = node::encode_frame(&signer, seq, &msg)` (the node identity key —
@@ -165,7 +166,7 @@ the validator path serves it). Replace both write refusals:
   safe (digest gate) but the client's re-submit already provides it. The
   round-robin spreads load across validators between submits.
 
-### Observer submit sequence
+### Resident submit sequence
 
 Per-origin `seq` is persisted at `<storage>/relay-submit-seq` (a plain u64,
 bumped before use). The kernel does not require per-origin monotonicity —
@@ -178,7 +179,7 @@ submit site; per-origin replay nonces remain a roadmap item.
 ### Mixed versions / upgrade gating
 
 None needed. The relay is node-binary capability, not consensus semantics: an
-observer-origin frame applies identically on every binary that can apply
+resident-origin frame applies identically on every binary that can apply
 frames at all (authorship-from-origin is original kernel behavior). An old
 binary would kill a connection that speaks channel 3 at it — a mesh-level
 flag-day, in line with the no-backwards-compat policy; nothing can fork.
@@ -199,11 +200,11 @@ flag-day, in line with the no-backwards-compat policy; nothing can fork.
 |---|---|
 | junk on the relay channel | dropped (validator), like the lobby doorbell |
 | bad signature / undecodable frame | `Refused` reply, nothing pinned |
-| sending peer ≠ origin | not a failure — observers ride the shared, invite-derivable lobby transport identity, so the peer is never consulted; the frame signature + committed observer standing are the whole gate |
-| origin lacks committed observer standing | `Refused` |
-| validator dies after accepting | frame is pinned + carried by that validator's custody; if it never finalizes, the observer's hold expires honestly; client re-submit produces a byte-identical or fresh frame — both safe |
-| relay reply lost | observer hold expires honestly; the op may still have landed — the app re-queries on block events (same contract as a validator timeout) |
-| observer restarts mid-hold | in-memory holds die like a validator's; the frame remains under the validator's custody |
+| sending peer ≠ origin | not a failure — residents ride the shared, invite-derivable lobby transport identity, so the peer is never consulted; the frame signature + committed resident standing are the whole gate |
+| origin lacks committed resident standing | `Refused` |
+| validator dies after accepting | frame is pinned + carried by that validator's custody; if it never finalizes, the resident's hold expires honestly; client re-submit produces a byte-identical or fresh frame — both safe |
+| relay reply lost | resident hold expires honestly; the op may still have landed — the app re-queries on block events (same contract as a validator timeout) |
+| resident restarts mid-hold | in-memory holds die like a validator's; the frame remains under the validator's custody |
 
 ## Testing
 
@@ -214,20 +215,20 @@ flag-day, in line with the no-backwards-compat policy; nothing can fork.
 2. **Relay codec + door unit** (`bin/node`, in-module tests like `lobby.rs`):
    round-trip encode/decode; outcome mapping; and the pure door check
    `verify_relay_submit` — a standing origin's frame is accepted, a frame whose
-   origin holds no committed observer standing is refused, and a
+   origin holds no committed resident standing is refused, and a
    signature-tampered frame that still parses as json is refused at the
    signature (not the json parser).
-3. **E2E** (`bin/node/tests/observer_submit_e2e.rs`, on the
-   `live_admission_e2e` harness which already grants observer standing):
-   - observer with standing submits a chat post through its app surface →
+3. **E2E** (`bin/node/tests/resident_submit_e2e.rs`, on the
+   `live_admission_e2e` harness which already grants resident standing):
+   - resident with standing submits a chat post through its app surface →
      reply carries `Applied{height}`; a validator's query shows the message
-     with `author == observer key`; the observer's own read surface shows it
+     with `author == resident key`; the resident's own read surface shows it
      after the next boundary follow.
    - a parked joiner WITHOUT standing gets the not-a-validator refusal.
-   - (a frame whose origin holds no committed observer standing is refused at
+   - (a frame whose origin holds no committed resident standing is refused at
      the door — now covered by the `verify_relay_submit` unit test in §2, not a
      separate e2e; there is no origin≠peer gate to exercise.)
-   - member-gated module op (e.g. a governance proposal) from an observer
+   - member-gated module op (e.g. a governance proposal) from a resident
      finalizes Rejected — proving relay grants no authority.
 
 ## Open items deliberately out of scope

@@ -81,9 +81,9 @@ const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 /// `ReadinessSignaller` truthfully signals readiness for a pending upgrade iff
 /// `MAX_PROTOCOL_VERSION >= to_version`, and the boot preflight refuses a boundary
 /// whose `required_min_version` exceeds it. Phase 9 raised this to 2 when the
-/// forge v2 dual path landed; the staged-admission observer tier raised it to
+/// forge v2 dual path landed; the staged-admission resident tier raised it to
 /// 3 — this binary can execute a scheduled `to_version=3` (valset/governance
-/// observer ops, gated below 3) and truthfully `SignalReady`.
+/// resident ops, gated below 3) and truthfully `SignalReady`.
 const MAX_PROTOCOL_VERSION: u32 = 3;
 use automations::Automations;
 use capability::CapabilityRegistry;
@@ -114,7 +114,7 @@ use valset::Valset;
 use vaults::Vaults;
 
 /// the peer-set index a node WITHOUT consensus coordinates tracks (a parked
-/// joiner, a sync-only observer): the genesis mesh at index 0. a VALIDATOR
+/// joiner, a sync-only resident): the genesis mesh at index 0. a VALIDATOR
 /// tracks its epoch's mesh at index = epoch instead — discovery requires
 /// strictly increasing indexes per `track`, ignores indexes a peer does not
 /// know, but KILLS a peer whose set at a SHARED index has a different
@@ -159,13 +159,13 @@ const MAX_BACKLOG: usize = 128;
 /// deadline in the pump loop: ingress load can delay one drain by one
 /// request's service time, but can never starve the arm.
 const DRAIN_TICK: Duration = Duration::from_millis(100);
-/// the submit-relay channel: an observer-standing node ships a frame it
+/// the submit-relay channel: a resident-standing node ships a frame it
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and
 /// answers with the frame's fate when it drains. the last free static slot
 /// below CHANNEL_STATE_SYNC; engine banks start at 9 (statics run 3–8).
 /// registered in EVERY
-/// mode like the lanes above — validators serve, observers speak, sync-only
+/// mode like the lanes above — validators serve, residents speak, sync-only
 /// black-holes.
 const CHANNEL_SUBMIT_RELAY: u64 = 3;
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
@@ -279,11 +279,11 @@ fn participant_bytes(
         .collect()
 }
 
-fn observer_bytes(
+fn resident_bytes(
     orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
 ) -> Vec<Vec<u8>> {
     orchestrator
-        .current_observers()
+        .current_residents()
         .iter()
         .map(|k| k.as_ref().to_vec())
         .collect()
@@ -305,19 +305,19 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-/// read the valset module's current OBSERVER projection (committed state —
+/// read the valset module's current RESIDENT projection (committed state —
 /// called between drains, outside any block; same read point as
 /// [`read_valset_members`], so a boundary read sees one frozen state).
-async fn read_valset_observers(host: &Host) -> Vec<Vec<u8>> {
+async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
     use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
-        .query("valset", &encode_query(&ValsetQuery::Observers))
+        .query("valset", &encode_query(&ValsetQuery::Residents))
         .await
     else {
         return Vec::new();
     };
     match decode_reply(&reply) {
-        Ok(ValsetReply::Observers(v)) => v,
+        Ok(ValsetReply::Residents(v)) => v,
         Ok(_) | Err(_) => Vec::new(),
     }
 }
@@ -1427,10 +1427,10 @@ fn sealed_frame_block_row(
     ))
 }
 
-/// the observer's explorer row: a followed BOUNDARY, not a sealed frame. the
+/// the resident's explorer row: a followed BOUNDARY, not a sealed frame. the
 /// populated fields are verified truth — the boundary height and the
 /// app-hash the manifest check passed — and every frame-derived field stays
-/// honestly empty, because an observer never sees the frames between
+/// honestly empty, because a resident never sees the frames between
 /// boundaries (the same degradation rule that keeps the frameless daemon
 /// lane's `hash` empty rather than fabricated).
 fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
@@ -1832,7 +1832,7 @@ where
         target.epoch,
         target.view_base,
         target.participants.clone(),
-        target.observers.clone(),
+        target.residents.clone(),
         pending_cutover_view,
         target.current_version,
         target.pending_upgrade.clone(),
@@ -2103,20 +2103,20 @@ fn resume_member_keys(
     Ok(keys)
 }
 
-/// the recovered epoch's OBSERVER keys — empty on a fresh boot (genesis has
-/// no observers) and on checkpoints written before the staged-admission tier.
-fn resume_observer_keys(
+/// the recovered epoch's RESIDENT keys — empty on a fresh boot (genesis has
+/// no residents) and on checkpoints written before the staged-admission tier.
+fn resume_resident_keys(
     resumed: Option<&recovery::Recovered>,
 ) -> Result<Vec<ed25519::PublicKey>, String> {
     let raw: Vec<Vec<u8>> = match resumed {
-        Some(rec) => rec.observers.clone(),
+        Some(rec) => rec.residents.clone(),
         None => Vec::new(),
     };
     let mut keys = Vec::with_capacity(raw.len());
     for k in &raw {
         keys.push(
             ed25519::PublicKey::decode(k.as_slice())
-                .map_err(|e| format!("recovered observer set holds a non-ed25519 key: {e}"))?,
+                .map_err(|e| format!("recovered resident set holds a non-ed25519 key: {e}"))?,
         );
     }
     Ok(keys)
@@ -2325,7 +2325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
         Some("promote") => return cmd_promote(&args[1..]),
-        Some("observer-remove") => return cmd_observer_remove(&args[1..]),
+        Some("resident-remove") => return cmd_resident_remove(&args[1..]),
         Some("join-requests") => return cmd_join_requests(&args[1..]),
         Some("member-remove") => return cmd_member_remove(&args[1..]),
         Some("member-leave") => return cmd_member_leave(&args[1..]),
@@ -2348,7 +2348,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|promote|observer-remove|\
+                     keygen|init|invite|admit|invite-accept|promote|resident-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
                      upgrade-status — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
@@ -2665,12 +2665,12 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     }
 }
 
-fn read_observers(addr: &str) -> Result<Vec<Vec<u8>>, String> {
+fn read_residents(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
-    let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Observers))?;
+    let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Residents))?;
     match decode_reply(&raw)? {
-        ValsetReply::Observers(v) => Ok(v),
-        other => Err(format!("expected Observers, got {other:?}")),
+        ValsetReply::Residents(v) => Ok(v),
+        other => Err(format!("expected Residents, got {other:?}")),
     }
 }
 
@@ -2808,8 +2808,8 @@ enum CeremonyOutcome {
 /// for exactly this action (else mint an unused `<id_prefix><key>:<n>` id and
 /// propose), cast a yes ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
-/// executes. shared by `invite-accept` (AddObserver), `promote`
-/// (AddValidator), and `observer-remove` (RemoveObserver).
+/// executes. shared by `invite-accept` (AddResident), `promote`
+/// (AddValidator), and `resident-remove` (RemoveResident).
 fn drive_membership_ceremony(
     rpc_addr: &str,
     me_bytes: &[u8],
@@ -2919,12 +2919,12 @@ fn drive_membership_ceremony(
 }
 
 /// `invite-accept <hex pubkey> [--config node.toml]` — approve a join request
-/// as OBSERVER standing (the staged-admission tier): drive a governance
-/// AddObserver proposal for `pubkey` through this member's own RUNNING node.
+/// as RESIDENT standing (the staged-admission tier): drive a governance
+/// AddResident proposal for `pubkey` through this member's own RUNNING node.
 /// the passing proposal's valset Grant schedules the epoch cutover that
 /// admits the key to the mesh, at which point its parked node PRE-SYNCS
 /// state on a stride cadence. promotion into the quorum is the separate,
-/// deliberate `promote` verb — run it once the observer is warm.
+/// deliberate `promote` verb — run it once the resident is warm.
 fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
@@ -2951,9 +2951,9 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
     }
-    if read_observers(&rpc_addr)?.contains(&key_bytes) {
+    if read_residents(&rpc_addr)?.contains(&key_bytes) {
         eprintln!(
-            "{pubkey_hex} already holds observer standing — promote with \
+            "{pubkey_hex} already holds resident standing — promote with \
              `ducktape-node promote {pubkey_hex}` once it is synced"
         );
         return Ok(());
@@ -2961,7 +2961,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     if !members.contains(&me_bytes) {
         return Err(
             "this node's identity is not a current member — only members admit \
-                    observers"
+                    residents"
                 .into(),
         );
     }
@@ -2972,11 +2972,11 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         pubkey_hex,
         "invite-accept",
         "observe:",
-        GovAction::AddObserver { key: key_bytes },
+        GovAction::AddResident { key: key_bytes },
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
-                "granted observer standing to {pubkey_hex}: the mesh admits it at the next \
+                "granted resident standing to {pubkey_hex}: the mesh admits it at the next \
                  epoch cutover and its parked node pre-syncs state. promote it into the \
                  quorum once warm:\n    ducktape-node promote {pubkey_hex}"
             );
@@ -2988,11 +2988,11 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 
 /// `promote <hex pubkey> [--config node.toml]` — seat a key in the consensus
 /// quorum: drive a governance AddValidator proposal through this member's own
-/// RUNNING node. the passing proposal's valset Join clears any observer
+/// RUNNING node. the passing proposal's valset Join clears any resident
 /// standing in the same block and schedules the epoch cutover; a pre-synced
-/// observer then catches up a small delta and reboots as a validator, so the
+/// resident then catches up a small delta and reboots as a validator, so the
 /// quorum only ever gains a warm member. also serves DIRECT (un-staged)
-/// admission — exactly the pre-observer `invite-accept` semantics.
+/// admission — exactly the pre-resident `invite-accept` semantics.
 fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
@@ -3043,20 +3043,20 @@ fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// `observer-remove <hex pubkey> [--config node.toml]` — revoke observer
-/// standing: drive a governance RemoveObserver proposal through this member's
+/// `resident-remove <hex pubkey> [--config node.toml]` — revoke resident
+/// standing: drive a governance RemoveResident proposal through this member's
 /// own RUNNING node. the mirror of `invite-accept` with inverted guards — a
-/// no-op when the key holds no observer standing, and only members may drive
+/// no-op when the key holds no resident standing, and only members may drive
 /// it. the passing proposal's valset Revoke schedules the epoch cutover that
 /// drops the key from the mesh; its node falls back to a parked joiner, and
 /// `invite-accept` re-grants. a seated validator is `member-remove`'s job —
 /// standing never overlaps (Grant refuses validators, Join clears standing).
-fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
-        return Err("observer-remove needs exactly one <hex pubkey>".into());
+        return Err("resident-remove needs exactly one <hex pubkey>".into());
     };
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
@@ -3068,25 +3068,25 @@ fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let rpc_addr = resolved
         .rpc_listen
         .clone()
-        .ok_or("observer-remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
+        .ok_or("resident-remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
     let me_bytes = resolved.signer.public_key().as_ref().to_vec();
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
         eprintln!(
-            "{pubkey_hex} is a seated validator, not an observer — remove it with \
+            "{pubkey_hex} is a seated validator, not a resident — remove it with \
              `ducktape-node member-remove {pubkey_hex}`"
         );
         return Ok(());
     }
-    if !read_observers(&rpc_addr)?.contains(&key_bytes) {
-        eprintln!("{pubkey_hex} holds no observer standing — nothing to do");
+    if !read_residents(&rpc_addr)?.contains(&key_bytes) {
+        eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
         return Ok(());
     }
     if !members.contains(&me_bytes) {
         return Err(
             "this node's identity is not a current member — only members remove \
-                    observers"
+                    residents"
                 .into(),
         );
     }
@@ -3095,13 +3095,13 @@ fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         &rpc_addr,
         &me_bytes,
         pubkey_hex,
-        "observer-remove",
+        "resident-remove",
         "revoke:",
-        GovAction::RemoveObserver { key: key_bytes },
+        GovAction::RemoveResident { key: key_bytes },
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
-                "revoked observer standing from {pubkey_hex}: the mesh drops it at the next \
+                "revoked resident standing from {pubkey_hex}: the mesh drops it at the next \
                  epoch cutover and its node parks again. a member re-grants with:\n    \
                  ducktape-node invite-accept {pubkey_hex}"
             );
@@ -3935,7 +3935,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
-    // JOINER binds too: the park loop pumps the same surface — an observer
+    // JOINER binds too: the park loop pumps the same surface — a resident
     // serves local reads from its pre-synced boundary, a still-parked joiner
     // answers with a clear not-admitted error instead of a dead port.
     let rpc_listener = match rpc_listen.as_deref() {
@@ -3951,7 +3951,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // the derived per-module index (noded's exact store, <storage>/index),
     // plus the blocks database the explorer reads: the pump folds sealed
     // blocks into it, boot heals it from verified state at sync/recovery
-    // boundaries, an observer's follow arm heals it at every state-changing
+    // boundaries, a resident's follow arm heals it at every state-changing
     // boundary it serves, and the already-routed GET /v1/blocks +
     // /v1/index/* lanes light up through the handle below. an open failure
     // is fatal-with-remedy rather than a silent no-index run: the tier is
@@ -4111,7 +4111,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
-            // the submit-relay lane: a sync-only observer holds no standing,
+            // the submit-relay lane: a sync-only resident holds no standing,
             // relays no writes, and answers nothing — but an unregistered
             // channel kills the sender, so black-hole.
             {
@@ -4120,7 +4120,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     .child("blackhole_submit_relay")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
-            // the lobby lane: a sync-only observer never announces or answers,
+            // the lobby lane: a sync-only resident never announces or answers,
             // but an unregistered channel is a protocol violation — black-hole.
             {
                 let (_tx, mut rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
@@ -4128,7 +4128,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     while rx.recv().await.is_ok() {}
                 });
             }
-            // the reachability lane: a sync-only observer runs no WireGuard
+            // the reachability lane: a sync-only resident runs no WireGuard
             // plane, but the channel must exist — black-hole.
             {
                 let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
@@ -4136,7 +4136,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     .child("blackhole_reachability")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
-            // the voice lane: a sync-only observer serves no huddle audio,
+            // the voice lane: a sync-only resident serves no huddle audio,
             // but the channel must exist — black-hole. dropping the session
             // lane makes /v1/call/ws refuse instead of hang (this branch
             // never reaches the validator hub below).
@@ -4147,7 +4147,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     .child("blackhole_voice")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
-            // the video lane: a sync-only observer serves no huddle video, but
+            // the video lane: a sync-only resident serves no huddle video, but
             // the channel must exist — black-hole.
             {
                 let (_tx, mut rx) = network.register(CHANNEL_VIDEO, quota, MAX_BACKLOG);
@@ -4255,7 +4255,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
             // the parked mesh identity: genesis set at the base index (no
             // consensus coordinates yet), engine lanes black-holed exactly
-            // like the sync-only observer — an unregistered channel is a
+            // like the sync-only resident — an unregistered channel is a
             // protocol violation that kills the very connection the sync
             // client needs.
             oracle.track(PEER_SET, mesh_participants.clone());
@@ -4272,7 +4272,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
             // the reachability lane: a parked joiner with a WireGuard config
-            // runs the plane in its STANDBY role — once observer standing
+            // runs the plane in its STANDBY role — once resident standing
             // lands (the park loop below drives Retargets off the manifest),
             // it pre-warms tunnels with every member so activation, and the
             // promotion reboot via the persisted mesh, start connected
@@ -4328,7 +4328,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     .child("blackhole_video")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
-            // the submit-relay lane: once observer standing lands, writes leave
+            // the submit-relay lane: once resident standing lands, writes leave
             // here — this node signs its own frames and a validator takes
             // custody. replies (the frame's consensus fate) come back on the
             // same lane. bound `mut` because the serve window's relay helper
@@ -4383,10 +4383,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut last_plane_epoch: Option<u64> = None;
             let mut attempt = 0usize;
             let mut announce_round = 0usize;
-            // once observer standing is seen, parking is the STEADY state
+            // once resident standing is seen, parking is the STEADY state
             // (awaiting a deliberate promote) — the not-admitted bail below
             // must never fire.
-            let mut observer_standing = false;
+            let mut resident_standing = false;
             let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
                 let Some(frame) = &announce_frame else { return };
                 if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
@@ -4403,10 +4403,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             };
 
-            // ---- the OBSERVER's serving lanes ------------------------------
+            // ---- the RESIDENT's serving lanes ------------------------------
             //
             // the same two local surfaces a validator exposes, pumped by the
-            // park loop's serve window below: an observer answers reads from
+            // park loop's serve window below: a resident answers reads from
             // its last pre-synced boundary; a still-parked joiner answers
             // with a clear not-admitted error instead of a dead port. writes
             // are refused — ops enter the chain through validators only.
@@ -4424,7 +4424,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 drop(rpc_tx); // rpc off: the ingress arm stays terminated.
             }
             let mut http_ingress = http_cmds;
-            // the last pre-synced boundary this observer serves reads from:
+            // the last pre-synced boundary this resident serves reads from:
             // (boundary height, the composed host). exactly ONE live host may
             // exist — the sync path reopens the same on-disk partitions, so
             // this is dropped before every re-sync.
@@ -4439,7 +4439,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut last_indexed_root: Option<StateRoot> = None;
             let not_serving = |standing: bool| -> String {
                 if standing {
-                    "observer: no boundary pre-synced yet — retry shortly".into()
+                    "resident: no boundary pre-synced yet — retry shortly".into()
                 } else {
                     "parked: not admitted yet — no state to serve (a member must run \
                      `invite-accept` for this key)"
@@ -4532,9 +4532,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             });
             let (boundary, host, floor) = loop {
                 attempt += 1;
-                if attempt > 900 && !observer_standing {
+                if attempt > 900 && !resident_standing {
                     // ~30 minutes of 2s retries: parking forever is operator
-                    // guidance territory, not a silent spin. (an OBSERVER
+                    // guidance territory, not a silent spin. (a RESIDENT
                     // parks indefinitely by design — that bail is gated off.)
                     eprintln!(
                         "[node {label}] FATAL: still not admitted after {attempt} attempts — \
@@ -4564,8 +4564,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     // or the sweep). the refusal stays for the
                                     // un-standing / not-yet-serving cases.
                                     RpcRequest::Submit { target, payload_hex } => {
-                                        if !observer_standing || serving.is_none() {
-                                            RpcReply::err(not_serving(observer_standing))
+                                        if !resident_standing || serving.is_none() {
+                                            RpcReply::err(not_serving(resident_standing))
                                         } else {
                                             match unhex(&payload_hex) {
                                                 Ok(payload) => match relay_submit_frame(
@@ -4615,7 +4615,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             }
                                             Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
                                         },
-                                        None => RpcReply::err(not_serving(observer_standing)),
+                                        None => RpcReply::err(not_serving(resident_standing)),
                                     },
                                     RpcRequest::Status => match &serving {
                                         Some((height, host)) => {
@@ -4634,14 +4634,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                                 ..RpcReply::ok()
                                             }
                                         }
-                                        None => RpcReply::err(not_serving(observer_standing)),
+                                        None => RpcReply::err(not_serving(resident_standing)),
                                     },
                                     RpcRequest::JoinRequests => RpcReply::err(
                                         "this node is not a member — join requests queue on \
                                          validators",
                                     ),
                                     RpcRequest::Shutdown => {
-                                        // an observer writes no checkpoint — nothing to
+                                        // a resident writes no checkpoint — nothing to
                                         // flush; a restart parks straight back here.
                                         let _ = reply.send(RpcReply::ok());
                                         println!(
@@ -4666,9 +4666,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         origin: _,
                                         reply,
                                     } => {
-                                        if !observer_standing || serving.is_none() {
+                                        if !resident_standing || serving.is_none() {
                                             let _ =
-                                                reply.send(Err(not_serving(observer_standing)));
+                                                reply.send(Err(not_serving(resident_standing)));
                                         } else {
                                             match relay_submit_frame(
                                                 &signer,
@@ -4706,7 +4706,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                                 .query(&target, &req)
                                                 .await
                                                 .map_err(|e| e.to_string()),
-                                            None => Err(not_serving(observer_standing)),
+                                            None => Err(not_serving(resident_standing)),
                                         };
                                         let _ = reply.send(result);
                                     }
@@ -4753,7 +4753,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 let Ok(relay::RelayMsg::Reply { frame_id, outcome }) =
                                     relay::decode_msg(&bytes)
                                 else {
-                                    continue; // junk or a stray Submit at an observer — drop.
+                                    continue; // junk or a stray Submit at a resident — drop.
                                 };
                                 let Some((hold, _)) = pending_relayed.remove(&frame_id) else {
                                     continue;
@@ -4868,14 +4868,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     last_tracked = m.epoch;
                 }
                 // drive the reachability plane's standby role off the
-                // manifest: membership and observer standing come from the
+                // manifest: membership and resident standing come from the
                 // synced boundary, whose height doubles as the plane's
                 // freshness clock (the same app-height regime the members'
                 // ViewTicks run — within the advert TTL's generous window).
                 // Nothing is sent before standing: no member would admit the
                 // gossip yet.
                 if let Some(cmd) = &reach_cmd {
-                    if m.observers.iter().any(|k| k == &me_bytes) {
+                    if m.residents.iter().any(|k| k == &me_bytes) {
                         let clock = m.view_base.max(m.height);
                         let _ = cmd
                             .send(reachability::ReachabilityCommand::ViewTick(clock))
@@ -4887,7 +4887,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                                 .collect();
                             let standbys: Vec<ed25519::PublicKey> = m
-                                .observers
+                                .residents
                                 .iter()
                                 .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                                 .collect();
@@ -4916,15 +4916,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     if !current.is_empty() {
                         announce_targets = current;
                     }
-                    if m.observers.iter().any(|k| k == &me_bytes) {
-                        if !observer_standing {
-                            observer_standing = true;
+                    if m.residents.iter().any(|k| k == &me_bytes) {
+                        if !resident_standing {
+                            resident_standing = true;
                             println!(
-                                "[node {label}] observer: standing granted — following \
+                                "[node {label}] resident: standing granted — following \
                                  boundaries and serving local reads"
                             );
                         }
-                        // OBSERVER standing (staged admission): granted, so
+                        // RESIDENT standing (staged admission): granted, so
                         // stop knocking — and FOLLOW: every boundary advance
                         // re-syncs the warm substrates (the qmdb lanes fetch
                         // deltas; snapshots re-install), then serves reads
@@ -4940,7 +4940,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 std::process::exit(1);
                             }
                             println!(
-                                "[node {label}] observer: pre-syncing boundary {} ({} modules)",
+                                "[node {label}] resident: pre-syncing boundary {} ({} modules)",
                                 m.height,
                                 m.entries.len()
                             );
@@ -4955,16 +4955,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 Ok(host) => {
                                     let root = host.app_hash();
                                     println!(
-                                        "[node {label}] observer: pre-synced boundary {} app_hash={}",
+                                        "[node {label}] resident: pre-synced boundary {} app_hash={}",
                                         m.height,
                                         hex(&root)
                                     );
                                     // the DERIVED tier follows the boundary
                                     // too: read models re-derive from the
-                                    // verified state (an observer folds no
+                                    // verified state (a resident folds no
                                     // blocks, so every module's watermark
                                     // trails), the explorer records the one
-                                    // thing an observer observes — the
+                                    // thing a resident observes — the
                                     // boundary — and ws subscribers learn
                                     // the advance. index failures poison and
                                     // log; canonical reads keep serving.
@@ -4975,7 +4975,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             boundary_block_row(m.height, &root),
                                         ) {
                                             eprintln!(
-                                                "[node {label}] observer: explorer row at \
+                                                "[node {label}] resident: explorer row at \
                                                  boundary {} refused: {err}",
                                                 m.height
                                             );
@@ -4987,7 +4987,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             },
                                         ));
                                         println!(
-                                            "[node {label}] observer: derived index follows \
+                                            "[node {label}] resident: derived index follows \
                                              boundary {}",
                                             m.height
                                         );
@@ -4996,7 +4996,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     serving = Some((m.height, host));
                                 }
                                 Err(e) => println!(
-                                    "[node {label}] observer pre-sync at boundary {} failed: {e}",
+                                    "[node {label}] resident pre-sync at boundary {} failed: {e}",
                                     m.height
                                 ),
                             }
@@ -5037,7 +5037,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     eprintln!("[node {label}] FATAL: cannot promote — {e}");
                     std::process::exit(1);
                 }
-                // a promoted observer stops serving: drop the served host
+                // a promoted resident stops serving: drop the served host
                 // before the promotion sync reopens the same partitions.
                 serving = None;
                 match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
@@ -5156,7 +5156,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 boundary.epoch,
                 boundary.view_base,
                 boundary.participants.clone(),
-                boundary.observers.clone(),
+                boundary.residents.clone(),
                 None,
                 cv,
                 pu,
@@ -5351,14 +5351,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         }
         let initial_resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
 
-        // the TRANSPORT baseline adds the committed OBSERVER set (granted,
+        // the TRANSPORT baseline adds the committed RESIDENT set (granted,
         // quorum-exempt keys the mesh must admit so they can sync). read
         // LIVE from the recovered host, unlike the frozen participant set
-        // above: an observer grant arms its own cutover, so within any epoch
-        // the observer set is constant — except a reboot inside that cutover
+        // above: a resident grant arms its own cutover, so within any epoch
+        // the resident set is constant — except a reboot inside that cutover
         // window, where this node briefly tracks the wider set alone; the
         // boundary re-tracks identically a few views later.
-        let initial_observer_keys: Vec<ed25519::PublicKey> = read_valset_observers(&host)
+        let initial_resident_keys: Vec<ed25519::PublicKey> = read_valset_residents(&host)
             .await
             .iter()
             .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
@@ -5388,7 +5388,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             mesh_at(
                 &initial_member_keys
                     .iter()
-                    .chain(initial_observer_keys.iter())
+                    .chain(initial_resident_keys.iter())
                     .cloned()
                     .collect(),
             ),
@@ -5435,7 +5435,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // as the derived lobby identity); this member verifies each announce
         // against the invite token it carries and RECORDS it for approval.
         let (mut lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
-        // the submit-relay lane: an observer-standing node ships its own
+        // the submit-relay lane: a resident-standing node ships its own
         // signed frame here; this validator takes custody and answers on
         // drain/expiry. bound `mut` because the pump uses `relay_tx` from BOTH
         // the ingress select arm and the drain-resolution/expiry code.
@@ -5538,7 +5538,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             };
         // boot: target the resume epoch's member set immediately (with the
-        // committed observer set as the pre-warm standbys); cutovers
+        // committed resident set as the pre-warm standbys); cutovers
         // retarget from the orchestrator loop below. the recovered view base
         // keeps advert expiries in the same view regime as live peers.
         if let Some(cmd) = &reach_cmd {
@@ -5547,7 +5547,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     reachability::MeshEpochEvent {
                         epoch: initial_resume_epoch,
                         members: initial_member_keys.clone(),
-                        standbys: initial_observer_keys.clone(),
+                        standbys: initial_resident_keys.clone(),
                         current_view: resumed.as_ref().map(|r| r.view_base).unwrap_or(0),
                     },
                 ))
@@ -5620,7 +5620,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
-                                &target.observers,
+                                &target.residents,
                             )
                             .await
                             {
@@ -5741,7 +5741,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
-                                &target.observers,
+                                &target.residents,
                             )
                             .await
                             {
@@ -5758,7 +5758,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             target.epoch,
                             target.view_base,
                             target.participants.clone(),
-                            target.observers.clone(),
+                            target.residents.clone(),
                             None,
                             target.current_version,
                             target.pending_upgrade.clone(),
@@ -5969,7 +5969,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
         });
         // the submit-relay lane rides the same bounded drop-on-full bridge: a
-        // dropped relay degrades to the observer client's honest timeout +
+        // dropped relay degrades to the resident client's honest timeout +
         // re-submit, so flood pressure never blocks the pump.
         let (relay_bridge_tx, mut relay_ingress) =
             futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
@@ -6148,7 +6148,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // schedules deterministic epoch cutovers. it resumes at the recovered
         // epoch coordinates over the epoch's ENGINE PARTICIPANT SET, and
         // re-arms a cutover the pre-crash process had scheduled.
-        let observer_keys = match resume_observer_keys(resumed.as_ref()) {
+        let resident_keys = match resume_resident_keys(resumed.as_ref()) {
             Ok(keys) => keys,
             Err(e) => {
                 eprintln!("[node {label}] FATAL: {e}");
@@ -6158,7 +6158,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut orchestrator = consensus::ValsetOrchestrator::resume(
             CUTOVER_DELAY,
             member_keys.clone(),
-            observer_keys.clone(),
+            resident_keys.clone(),
             resume_epoch,
             view_base,
             pending_boot,
@@ -6370,7 +6370,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         orchestrator.epoch(),
                         orchestrator.epoch_base(),
                         participant_bytes(&orchestrator),
-                        observer_bytes(&orchestrator),
+                        resident_bytes(&orchestrator),
                         orchestrator.pending_cutover().map(|c| c.cutover_view()),
                         cv,
                         pu,
@@ -6595,7 +6595,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                     // the same expiry contract for relayed holds: the mesh never
-                    // finalized in time, so answer the observer truthfully — the
+                    // finalized in time, so answer the resident truthfully — the
                     // op may still land, it re-queries on the next block.
                     if !pending_relays.is_empty() {
                         let now = std::time::Instant::now();
@@ -6677,7 +6677,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
-                                observer_bytes(&orchestrator),
+                                resident_bytes(&orchestrator),
                                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                                 cv,
                                 pu,
@@ -6747,21 +6747,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 observed.push(pk);
                             }
                         }
-                        // the OBSERVER projection, read at the same frozen
+                        // the RESIDENT projection, read at the same frozen
                         // point: a grant/revoke arms the same single cutover
                         // slot (mesh admission is epoch-scoped).
-                        let observers_raw = read_valset_observers(node.host()).await;
-                        let mut observed_observers: Vec<ed25519::PublicKey> = Vec::new();
-                        for key in &observers_raw {
+                        let residents_raw = read_valset_residents(node.host()).await;
+                        let mut observed_residents: Vec<ed25519::PublicKey> = Vec::new();
+                        for key in &residents_raw {
                             if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
-                                observed_observers.push(pk);
+                                observed_residents.push(pk);
                             }
                         }
                         if let consensus::ObservationOutcome::Scheduled(cutover) =
                             orchestrator.observe_members(
                                 engine_view,
                                 observed.iter().cloned(),
-                                observed_observers.iter().cloned(),
+                                observed_residents.iter().cloned(),
                             )
                         {
                             println!(
@@ -6797,25 +6797,25 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if let Some(plan) = orchestrator.respawn_if_due(
                             engine_view,
                             observed,
-                            observed_observers,
+                            observed_residents,
                             boundary_upgrade,
                         ) {
                             let members = plan.valset().consensus_members();
                             let member_bytes: Vec<Vec<u8>> =
                                 members.iter().map(|k| k.as_ref().to_vec()).collect();
-                            let plan_observers: Vec<ed25519::PublicKey> = plan
+                            let plan_residents: Vec<ed25519::PublicKey> = plan
                                 .valset()
                                 .transport_members()
                                 .difference(members)
                                 .cloned()
                                 .collect();
-                            let plan_observer_bytes: Vec<Vec<u8>> = plan_observers
+                            let plan_resident_bytes: Vec<Vec<u8>> = plan_residents
                                 .iter()
                                 .map(|k| k.as_ref().to_vec())
                                 .collect();
                             // transport FIRST: the new epoch's mesh must admit
                             // its members (a fresh joiner — or a granted
-                            // observer — above all) before anything is
+                            // resident — above all) before anything is
                             // expected of them. the mesh tracks the TRANSPORT
                             // union; the engine below gets validators only.
                             // index = epoch, strictly increasing across
@@ -6823,7 +6823,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             mesh_oracle.track(plan.epoch(), mesh_at(plan.valset().transport_members()));
                             // the reachability plane retunnels for the new
                             // member set the moment transport admits it —
-                            // with the epoch's observer tier as the pre-warm
+                            // with the epoch's resident tier as the pre-warm
                             // standbys, so a registered joiner's tunnels
                             // assemble ahead of its activation cutover.
                             // cutover_app_height IS the new epoch's absolute
@@ -6837,7 +6837,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         reachability::MeshEpochEvent {
                                             epoch: plan.epoch(),
                                             members: members.iter().cloned().collect(),
-                                            standbys: plan_observers.clone(),
+                                            standbys: plan_residents.clone(),
                                             current_view: plan.cutover_app_height(),
                                         },
                                     ))
@@ -6845,7 +6845,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                             if !members.contains(&signer.public_key()) {
                                 println!(
-                                    "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
+                                    "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/resident)",
                                     plan.epoch()
                                 );
                                 std::process::exit(0);
@@ -6869,7 +6869,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     plan.epoch(),
                                     plan.cutover_app_height(),
                                     &member_bytes,
-                                    &plan_observer_bytes,
+                                    &plan_resident_bytes,
                                 )
                                 .await
                             {
@@ -6926,7 +6926,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
-                                observer_bytes(&orchestrator),
+                                resident_bytes(&orchestrator),
                                 None,
                                 cv,
                                 pu,
@@ -7261,12 +7261,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                         RpcRequest::JoinRequests => {
                             // read-time hygiene: an approved joiner holds
-                            // STANDING now (observer or already validator) —
+                            // STANDING now (resident or already validator) —
                             // its request is settled, drop it.
                             let members = read_members_from_host(node.host()).await;
-                            let observers_now = read_valset_observers(node.host()).await;
+                            let residents_now = read_valset_residents(node.host()).await;
                             join_requests.retain(|joiner, _| {
-                                !members.contains(joiner) && !observers_now.contains(joiner)
+                                !members.contains(joiner) && !residents_now.contains(joiner)
                             });
                             let views = join_requests
                                 .iter()
@@ -7321,18 +7321,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // then membership: the issuer must still be a member (a
                     // removed member's outstanding invites die with it), and a
                     // joiner that already holds standing — VALIDATOR or
-                    // OBSERVER — has nothing pending.
+                    // RESIDENT — has nothing pending.
                     let members = read_members_from_host(node.host()).await;
-                    let observers_now = read_valset_observers(node.host()).await;
+                    let residents_now = read_valset_residents(node.host()).await;
                     let joiner_bytes = verified.joiner.as_ref().to_vec();
                     if members.contains(&joiner_bytes) {
                         send_reply(false, "already a validator".into());
                         continue;
                     }
-                    if observers_now.contains(&joiner_bytes) {
+                    if residents_now.contains(&joiner_bytes) {
                         send_reply(
                             false,
-                            "already an observer — a member promotes it into the quorum".into(),
+                            "already a resident — a member promotes it into the quorum".into(),
                         );
                         continue;
                     }
@@ -7384,12 +7384,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let relay::RelayMsg::Submit { frame } = msg else {
                         continue; // a Reply at a validator is a protocol confusion — drop.
                     };
-                    // the door check needs committed state: the observer projection at
+                    // the door check needs committed state: the resident projection at
                     // this node's latest boundary. the frame signature and the ORIGIN's
-                    // standing ride inside — the sending peer is not consulted (observers
+                    // standing ride inside — the sending peer is not consulted (residents
                     // speak from the shared, invite-derivable lobby transport identity).
-                    let observers_now = read_valset_observers(node.host()).await;
-                    let frame_id = match relay::verify_relay_submit(&frame, &observers_now) {
+                    let residents_now = read_valset_residents(node.host()).await;
+                    let frame_id = match relay::verify_relay_submit(&frame, &residents_now) {
                         Ok(id) => id,
                         Err(detail) => {
                             send_reply(node::frame_id(&frame), relay::RelayOutcome::Refused { detail });
@@ -7554,7 +7554,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 epoch: orchestrator.epoch(),
                                 view_base: orchestrator.epoch_base(),
                                 participants: participant_bytes(&orchestrator),
-                                observers: observer_bytes(&orchestrator),
+                                residents: resident_bytes(&orchestrator),
                                 current_version: bc_current,
                                 pending_upgrade: bc_pending,
                                 floor_cert: latest_floor
@@ -7615,7 +7615,7 @@ mod tests {
             epoch: 0,
             view_base: 0,
             participants: vec![test_me()],
-            observers: vec![],
+            residents: vec![],
             floor_cert,
             current_version: host::BASELINE_VERSION,
             pending_upgrade: None,
@@ -8099,7 +8099,7 @@ mod tests {
                 epoch: 0,
                 view_base: 0,
                 participants: vec![test_me()],
-                observers: vec![],
+                residents: vec![],
                 floor_cert: Some(vec![1, 2, 3]),
                 current_version: host::BASELINE_VERSION,
                 pending_upgrade: None,

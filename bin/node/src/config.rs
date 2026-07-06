@@ -2063,13 +2063,13 @@ mod tests {
     #[test]
     fn sync_source_prefers_validator_hints_and_never_self() {
         let me = ed25519::PrivateKey::from_seed(31).public_key();
-        let observer = ed25519::PrivateKey::from_seed(32).public_key();
+        let resident = ed25519::PrivateKey::from_seed(32).public_key();
         let validator = ed25519::PrivateKey::from_seed(33).public_key();
         let addr: SocketAddr = "127.0.0.1:52200".parse().unwrap();
         let validators = vec![me.clone(), validator.clone()];
 
         // a non-validator hint sorts first but can never serve — skipped.
-        let hints = vec![(observer.clone(), addr), (validator.clone(), addr)];
+        let hints = vec![(resident.clone(), addr), (validator.clone(), addr)];
         assert_eq!(
             choose_sync_source(&hints, &validators, &me),
             Some(validator.clone())
