@@ -3843,6 +3843,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // healthy — the tunnels never come up, and the operator needs to know it
     // is a missing credential, not a network fault.
     if wireguard_listen.is_some()
+        && !coordinated.is_empty()
         && coordination == config::Coordination::Private
         && coord_cap.is_none()
         && !validators.contains(&signer.public_key())
