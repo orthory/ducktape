@@ -58,6 +58,7 @@ const LINK: LinkModel = LinkModel {
     latency: Duration::from_millis(5),
     bytes_per_sec: 1_000_000,
     drop_every: None,
+    delay_every: None,
 };
 
 fn config(bulk_bytes_per_sec: u64) -> PlaneConfig {
@@ -414,6 +415,7 @@ async fn bulk_holds_its_ceiling() {
             latency: Duration::from_millis(5),
             bytes_per_sec: 10_000_000,
             drop_every: None,
+            delay_every: None,
         },
     );
 
