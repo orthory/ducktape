@@ -8,6 +8,15 @@
 
 **Tech Stack:** Rust (Tauri v2 shell: `app/src-tauri`), Bash (`ops/dev.sh`), React 19 + TypeScript + Vite + Vitest (`app/src`), `cargo test`.
 
+## Delivery status (2026-07-07)
+
+**Shipped** (all with tests green — 21 Rust unit, ~308 frontend vitest, dev.sh honesty tests):
+- **P0 (complete):** M1 `spawn_verified` + env-path guard · M2 `workspace_log_tail` + reason surfacing · M3a broadened `classify()` + process-death fatality · M4 honest `ops/dev.sh` restart + worktree isolation · M6-min `NodeFailed` body (reason + idempotent Retry + log) + boot-failure→gate · M7 `ErrorBoundary` + global handlers.
+- **P1 (core):** registry corrupt-recovery + atomic write (T9) · `run_verb` 30s timeout (T10) · node-side `FATAL:` marker on run-path boot failure (M3b) · transport classification + bounded fetches + ws backoff (M5). *Both critical non-startup cases (corrupt-registry brick, run_verb hang) fixed.*
+- **P2 (high-value UX):** mid-session reconnecting banner + heartbeat identity re-check.
+
+**Deferred as polish** (non-load-bearing; the single `error` string + the surfaces above cover the critical/high cases): P1 QoL — solo/inactive `workspace_forget` short-circuit, batched teardown grace, time-bounded `public_ip`. P2 — full `ConnectionPhase` machine (kept the boolean + `connectionDown`), error *queue* vs single string, hoisted copyable presenter, in-app confirm modal, JoinProgress copy fixes, daemon.log rotation, retire the dead `daemon_spawn`. The honest headless GUI e2e (§7) is the recommended manual verification.
+
 ## Global Constraints
 
 - Rust commands return `Result<T, String>` (the `Err` string is human-readable, shown in the UI). Keep that contract.
