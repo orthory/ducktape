@@ -7,6 +7,30 @@ coordinator-auth" open item tracked in
 rendezvous coordinator) and reuses the invite-token signing machinery in
 `bin/node/src/config.rs`.
 
+## As-built amendments (2026-07-07)
+
+Two corrections landed during implementation; where this document and the code
+disagree, the code (and the operator guide `docs/pages/en/human/network/coordination.mdx`)
+are authoritative.
+
+- **The authenticator binds an explicit `caller`, not the inner request's key.**
+  The sections below describe verifying proof-of-possession against the inner
+  message's key. That is wrong for `Lookup`, whose key is the *looked-up peer*,
+  not the caller — it would make every cross-peer lookup fail closed and break
+  rendezvous. As built, `AuthRequest { caller: NodeKey, inner: Msg, auth }`
+  carries the caller identity explicitly; the coordinator verifies PoP and
+  admission against `caller`, and cross-checks `caller == inner.key` for the
+  self-ops (`Register`/`Readvertise`/`BindRequest`) as anti-poisoning. A member
+  may look up any peer but may only register its own key.
+
+- **Joiner capabilities are minted at join, not "alongside the invite".** A cap
+  binds a subject key that does not exist at invite-mint time, so it cannot ride
+  the invite. As built: a genesis-validator member mints a `CoordCap` for the
+  joiner at the lobby `JoinRequest` handler (gated on `Private` mode) and
+  delivers it on the `JoinReply`; the joiner saves it as `coord.cap`. The invite
+  gains a `v4` mode byte so a joiner learns the coordination mode. Cap TTL is
+  long-lived (1 year); rotation/revocation remains future work.
+
 ## Goal
 
 Give a network a **choice of coordination privacy**, and make that choice
