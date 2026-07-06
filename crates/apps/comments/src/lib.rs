@@ -110,7 +110,6 @@ enum CommentError {
     TooManyTargets,
     ReservedId,
     Corrupt,
-    Unsupported,
 }
 
 impl core::fmt::Display for CommentError {
@@ -128,7 +127,6 @@ impl core::fmt::Display for CommentError {
             CommentError::TooManyTargets => "too many query targets",
             CommentError::ReservedId => "reserved id",
             CommentError::Corrupt => "stored comment state is corrupt",
-            CommentError::Unsupported => "unsupported",
         };
         f.write_str(s)
     }
@@ -397,8 +395,15 @@ where
                 }
                 Ok(())
             }
-            // Resolve added in Task 9.
-            CommentMsg::ResolveThread { .. } => Err(CommentError::Unsupported),
+            CommentMsg::ResolveThread { thread_id, resolved } => {
+                let mut thread = self
+                    .load_thread(&thread_id)
+                    .await?
+                    .ok_or(CommentError::ThreadNotFound)?;
+                thread.resolved = resolved;
+                thread.resolved_by = if resolved { Some(author) } else { None };
+                self.store_thread(&thread)
+            }
         }
     }
 
@@ -728,6 +733,25 @@ mod tests {
             assert!(thread_of(&c, "t1").await.is_none());
             let groups = anchored(&c, "pages", &["b1"]).await;
             assert!(groups[0].threads.is_empty());
+        });
+    }
+
+    #[test]
+    fn resolve_toggles_and_records_resolver() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut c = Comments::init(context, "comments").await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m1".into(), anchor: anchor("b1"), text: "a".into(),
+            }, user("alice")).await;
+            apply_commit(&mut c, &CommentMsg::ResolveThread { thread_id: "t1".into(), resolved: true }, user("bob")).await;
+            let v = thread_of(&c, "t1").await.unwrap();
+            assert!(v.thread.resolved);
+            assert_eq!(v.thread.resolved_by, Some(AuthorRef::User(b"bob".to_vec())));
+            apply_commit(&mut c, &CommentMsg::ResolveThread { thread_id: "t1".into(), resolved: false }, user("alice")).await;
+            let v = thread_of(&c, "t1").await.unwrap();
+            assert!(!v.thread.resolved);
+            assert_eq!(v.thread.resolved_by, None);
+            apply_err(&mut c, &CommentMsg::ResolveThread { thread_id: "ghost".into(), resolved: true }, user("alice"), "thread not found").await;
         });
     }
 }
