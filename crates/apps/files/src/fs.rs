@@ -645,6 +645,12 @@ impl<S: ObjectStore> Fs<S> {
                 }
                 Ok(FilesSyncResp::Objects(out))
             }
+            // the refs image is the `root()` preimage — served over the same
+            // resolver lane so a duckfs-odb joiner installs refs then walks
+            // `missing_objects` without ever touching the snapshot/chunk lane.
+            FilesSyncReq::GetRefs => Ok(FilesSyncResp::Refs {
+                b64: STANDARD.encode(self.snapshot_refs()),
+            }),
         }
     }
 

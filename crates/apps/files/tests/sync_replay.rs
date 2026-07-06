@@ -232,7 +232,9 @@ fn two_nodes_sync_to_full_possession() {
         let ids: Vec<String> = missing.iter().map(|id| to_hex(id)).collect();
         let resp = block_on(source.serve_sync(&encode_sync_req(&FilesSyncReq::GetObjects { ids })))
             .expect("serve_sync");
-        let FilesSyncResp::Objects(objs) = decode_sync_resp(&resp).expect("decode resp");
+        let FilesSyncResp::Objects(objs) = decode_sync_resp(&resp).expect("decode resp") else {
+            panic!("GetObjects must answer with Objects");
+        };
         let batch: Vec<(ObjectId, u8, Vec<u8>)> = objs
             .iter()
             .filter(|o| o.present)

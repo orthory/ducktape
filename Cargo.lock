@@ -6044,6 +6044,7 @@ name = "statesync"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-p2p",
@@ -6052,6 +6053,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "data-plane",
+ "files",
  "futures",
  "host",
  "indexer",

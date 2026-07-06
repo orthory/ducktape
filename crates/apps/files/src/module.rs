@@ -265,10 +265,20 @@ impl Module for Files {
         StateRoot(self.fs.root_bytes())
     }
 
-    /// phase-1 bridge: refs are small, so the snapshot lane ships them whole;
-    /// the resolver-backed handle lands with the node integration (task 14).
+    /// duckfs syncs object-by-object, not as one self-contained blob: the
+    /// snapshot lane would ship the refs image alone (the `root()` preimage) and
+    /// leave the joiner with an EMPTY odb — it would know every file exists but
+    /// could not read a byte. so this is a real resolver: the joiner fetches the
+    /// refs image and then loops `missing_objects` -> `GetObjects` -> `ingest`
+    /// (both refs and objects over the `serve_sync` lane) until it holds every
+    /// object its refs reach. the `duckfs-odb` backend tells the statesync
+    /// capture to record this WITHOUT a qmdb op-range target (duckfs has none)
+    /// and to route the fetch to `serve_sync`.
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+        Ok(StateSyncHandle::ResolverBacked {
+            backend: "duckfs-odb".into(),
+            detail: "refs image + GetObjects fetch to full object possession".into(),
+        })
     }
 
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {

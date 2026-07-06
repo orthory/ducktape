@@ -791,16 +791,14 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("inbox install: {e}"))?;
 
-    let mut files =
+    // files is a duckfs-odb resolver module — NOT in the checkpoint's snapshot
+    // set (like the qmdb modules above, which `init` from their own on-disk
+    // stores). `Files::open` already recovers its committed refs, durable height,
+    // and objects from the on-disk odb/refs envelope, and recovery replays
+    // forward from that height — so a reboot needs no checkpoint bytes and no
+    // object fetch here.
+    let files =
         Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
-    let (bytes, root) = snapshot_of("files")?;
-    // duckfs persists its refs envelope at the checkpoint height so a crash right
-    // after restore resumes replay from the boundary, not genesis (an already-
-    // pruned op stream). `manifest.height` is None only at genesis (nothing
-    // applied) → height 0.
-    files
-        .install(bytes, root, manifest.height.unwrap_or(0))
-        .map_err(|e| format!("files install: {e}"))?;
 
     let mut jobs = Jobs::new("jobs");
     let (bytes, root) = snapshot_of("jobs")?;
@@ -865,6 +863,45 @@ async fn restore_host(
         Box::new(automations),
     ])
     .map_err(|e| format!("restore host: {e}"))
+}
+
+/// the object-store ([`statesync::ObjectFetch`]) adapter over the live `files`
+/// module: the statesync possession driver owns the loop + the full-possession
+/// gate, this owns the duckfs `serve_sync` wire (refs image + `GetObjects`).
+struct FilesOdb<'a>(&'a mut Files);
+
+impl statesync::ObjectFetch for FilesOdb<'_> {
+    fn refs_request(&self) -> Vec<u8> {
+        files::encode_get_refs()
+    }
+
+    fn install_refs(&mut self, reply: &[u8], root: StateRoot, height: u64) -> Result<(), String> {
+        let bytes = files::decode_refs_reply(reply)?;
+        // persist the refs envelope at the SYNCED boundary height so a restart
+        // right after the join resumes replay from the boundary, not genesis.
+        self.0
+            .install(&bytes, root, height)
+            .map_err(|e| e.to_string())
+    }
+
+    fn missing_request(&self, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        let ids = self.0.missing_objects(limit).map_err(|e| e.to_string())?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(files::encode_get_objects(&ids)))
+    }
+
+    fn ingest(&mut self, reply: &[u8]) -> Result<usize, String> {
+        let batch = files::decode_objects_reply(reply)?;
+        let landed = batch.len();
+        self.0.ingest_objects(&batch).map_err(|e| e.to_string())?;
+        Ok(landed)
+    }
+
+    fn possession_complete(&self) -> Result<bool, String> {
+        self.0.possession_complete().map_err(|e| e.to_string())
+    }
 }
 
 /// rebuild EVERY production module from a peer's statesync service at
@@ -1045,14 +1082,26 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("inbox install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("files").await?;
+    // files is a duckfs-odb resolver module: its refs image AND its
+    // content-addressed objects both ride the Module/`serve_sync` lane. a fresh
+    // joiner's odb is EMPTY, so install the boundary refs (root-verified) at the
+    // sync-target height and then loop GetObjects to full object possession —
+    // the snapshot lane would leave this node refs-only (every file listed, not
+    // one byte readable).
     let mut files =
         Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
-    // persist the refs envelope at the synced boundary height (see restore_host):
-    // a restart right after a state-sync join resumes replay from the boundary.
-    files
-        .install(&bytes, root, manifest.height)
-        .map_err(|e| format!("files install: {e}"))?;
+    let files_root = entry_root("files")?;
+    let files_lane = statesync::ClientModuleLane::new(client.clone(), manifest.boundary_id());
+    statesync::sync_object_possession(
+        &files_lane,
+        "files",
+        files_root,
+        manifest.height,
+        &mut FilesOdb(&mut files),
+        files::MAX_SYNC_IDS,
+    )
+    .await
+    .map_err(|e| format!("files sync: {e}"))?;
 
     let (bytes, root) = snapshot_of("jobs").await?;
     let mut jobs = Jobs::new("jobs");

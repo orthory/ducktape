@@ -4,7 +4,11 @@
 
 use std::collections::BTreeMap;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
+
+use crate::objects::ObjectId;
 
 /// a sha256-derived object id rendered as 64-char lowercase hex on the wire.
 pub type DigestHex = String;
@@ -277,6 +281,10 @@ pub enum FilesReply {
 pub enum FilesSyncReq {
     /// batched fetch; response order matches request order.
     GetObjects { ids: Vec<DigestHex> },
+    /// the boundary refs image — the `root()` preimage a joiner installs BEFORE
+    /// it can walk `missing_objects`. rides the same resolver (`serve_sync`) lane
+    /// so a duckfs-odb joiner never needs the snapshot/chunk lane.
+    GetRefs,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -293,6 +301,12 @@ pub struct SyncObject {
 #[serde(rename_all = "snake_case")]
 pub enum FilesSyncResp {
     Objects(Vec<SyncObject>),
+    /// the refs image, standard-base64 (raw bytes as a json number array would
+    /// inflate ~4x). the joiner root-verifies it against the manifest boundary
+    /// root inside [`Files::install`](crate::Files::install) before adopting.
+    Refs {
+        b64: String,
+    },
 }
 
 // ---- codecs (same shape as every module in this repo) ----
@@ -326,6 +340,57 @@ pub fn encode_sync_resp(r: &FilesSyncResp) -> Vec<u8> {
 }
 pub fn decode_sync_resp(b: &[u8]) -> Result<FilesSyncResp, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+
+// ---- resolver-lane helpers (the duckfs-odb state-sync driver's wire seam) ----
+// pure encode/decode over the `serve_sync` lane, shared by the node join glue
+// and the statesync driver test so neither re-derives the base64/hex framing.
+
+/// encode the resolver-lane request for the boundary refs image.
+pub fn encode_get_refs() -> Vec<u8> {
+    encode_sync_req(&FilesSyncReq::GetRefs)
+}
+
+/// decode a served `Refs` reply into the raw refs image bytes (the `install`
+/// input). rejects any other reply shape — a caller that asked for refs must
+/// not silently accept an object batch.
+pub fn decode_refs_reply(resp: &[u8]) -> Result<Vec<u8>, String> {
+    match decode_sync_resp(resp)? {
+        FilesSyncResp::Refs { b64 } => STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|_| "files: refs reply is not valid base64".to_string()),
+        FilesSyncResp::Objects(_) => Err("files: expected a refs reply, got objects".into()),
+    }
+}
+
+/// encode a resolver-lane `GetObjects` request from raw ids.
+pub fn encode_get_objects(ids: &[ObjectId]) -> Vec<u8> {
+    encode_sync_req(&FilesSyncReq::GetObjects {
+        ids: ids.iter().map(|id| to_hex(id)).collect(),
+    })
+}
+
+/// decode a served `Objects` reply into the PRESENT `(id, kind, body)` batch
+/// [`Files::ingest_objects`](crate::Files::ingest_objects) accepts; absent
+/// entries are dropped (the caller re-queues them by re-walking
+/// `missing_objects`). every id is re-hashed again at ingest, so a hex/b64 that
+/// decodes here is still verified before it lands.
+pub fn decode_objects_reply(resp: &[u8]) -> Result<Vec<(ObjectId, u8, Vec<u8>)>, String> {
+    match decode_sync_resp(resp)? {
+        FilesSyncResp::Objects(objs) => objs
+            .iter()
+            .filter(|o| o.present)
+            .map(|o| {
+                let id =
+                    from_hex_32(&o.id).ok_or_else(|| "files: reply id is not hex".to_string())?;
+                let body = STANDARD
+                    .decode(o.b64.as_bytes())
+                    .map_err(|_| "files: reply body is not base64".to_string())?;
+                Ok((id, o.kind, body))
+            })
+            .collect(),
+        FilesSyncResp::Refs { .. } => Err("files: expected an objects reply, got refs".into()),
+    }
 }
 
 /// build a putblob op: `[PUTBLOB_FRAME_TAG] ++ raw chunk bytes`.
