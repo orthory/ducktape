@@ -510,7 +510,7 @@ fn resident_grant_arms_a_cutover_without_touching_the_quorum() {
 /// quorum in ONE respawn (valset's Join clears the resident standing, so the
 /// boundary projections arrive already-moved).
 #[test]
-fn promotion_moves_an_resident_into_the_quorum_in_one_boundary() {
+fn promotion_moves_a_resident_into_the_quorum_in_one_boundary() {
     let mut orchestrator = ValsetOrchestrator::new(3, members(&["a", "b", "c"]));
     orchestrator.observe_members(5, members(&["a", "b", "c"]), members(&["o"]));
     orchestrator

@@ -963,7 +963,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.submit_frame(frame).await
     }
 
-    /// take custody of an ALREADY-SIGNED frame (the relay entry point: an
+    /// take custody of an ALREADY-SIGNED frame (the relay entry point: a
     /// resident signs with its own identity key, a validator injects). the
     /// signature is verified BEFORE anything is pinned — junk from the wire
     /// must never enter the durable store or the orderer. custody semantics

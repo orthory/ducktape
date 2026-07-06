@@ -7,7 +7,7 @@ Branch: `feat/observer-submit-relay` (base `origin/dev`)
 
 ## Problem
 
-An resident-standing node (the staged-admission tier) is a real member of the
+A resident-standing node (the staged-admission tier) is a real member of the
 product: it follows boundaries, serves reads locally, and its node key is the
 user's chat identity. But both of its local surfaces hard-refuse writes:
 
@@ -178,7 +178,7 @@ submit site; per-origin replay nonces remain a roadmap item.
 
 ### Mixed versions / upgrade gating
 
-None needed. The relay is node-binary capability, not consensus semantics: an
+None needed. The relay is node-binary capability, not consensus semantics: a
 resident-origin frame applies identically on every binary that can apply
 frames at all (authorship-from-origin is original kernel behavior). An old
 binary would kill a connection that speaks channel 3 at it — a mesh-level

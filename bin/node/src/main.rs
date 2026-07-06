@@ -2971,7 +2971,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         &me_bytes,
         pubkey_hex,
         "invite-accept",
-        "observe:",
+        "resident:",
         GovAction::AddResident { key: key_bytes },
     )? {
         CeremonyOutcome::Passed => {

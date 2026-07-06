@@ -22,7 +22,7 @@ pub enum ValsetMsg {
     Leave { key: Vec<u8> },
     /// grant RESIDENT standing: mesh + statesync access, no quorum seat.
     Grant { key: Vec<u8> },
-    /// revoke resident standing by key. a no-op if the key is not an
+    /// revoke resident standing by key. a no-op if the key is not a
     /// resident.
     Revoke { key: Vec<u8> },
 }

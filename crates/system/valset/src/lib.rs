@@ -882,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn join_promotes_an_resident_out_of_the_tier() {
+    fn join_promotes_a_resident_out_of_the_tier() {
         let mut v = Valset::new("valset");
         let mut ctx = TestCtx::at_version(3);
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
