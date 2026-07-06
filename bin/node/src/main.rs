@@ -2317,6 +2317,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("keygen") => return cmd_keygen(&args[1..]),
+        Some("user-key") => return cmd_user_key(&args[1..]),
+        Some("user-sign-bind") => return cmd_user_sign_bind(&args[1..]),
+        Some("user-sign-unbind") => return cmd_user_sign_unbind(&args[1..]),
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
@@ -2345,7 +2348,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|promote|observer-remove|\
+                     keygen|user-key|user-sign-bind|user-sign-unbind|init|invite|admit|\
+                     invite-accept|promote|observer-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
                      upgrade-status — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
@@ -2439,6 +2443,114 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "{} identity at {}",
         if generated { "generated" } else { "reusing" },
         out.display()
+    );
+    Ok(())
+}
+
+/// `user-key [--out <path>]` — generate (or reuse) a persisted ed25519 USER
+/// identity: the human's app-side keypair (distinct from `keygen`'s per-node
+/// identity), a bare hex ed25519 seed file under the same load-or-generate
+/// discipline. pubkey on stdout (scriptable — the desktop shell's `run_verb`
+/// takes the LAST stdout line as the value), provenance on stderr.
+fn cmd_user_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
+    let (key, generated) = config::load_or_generate_identity(&out)?;
+    println!("{}", hex_bytes(key.public_key().as_ref()));
+    eprintln!(
+        "{} user identity at {}",
+        if generated { "generated" } else { "reusing" },
+        out.display()
+    );
+    Ok(())
+}
+
+/// `user-sign-bind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint a bind certificate binding `node-pub` to the user identity at
+/// `--key` (generated there if absent), at `chain-id`/`nonce`, and print the
+/// ready-to-submit `IdentityMsg::BindNode` JSON as the last (only) stdout
+/// line. `user_key` rides the payload — the node being bound is the verified
+/// submit ORIGIN, never a payload field; the module resolves it from the rpc
+/// transport, not from this CLI.
+fn cmd_user_sign_bind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-bind needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-bind needs --chain-id <id>")?;
+    let node_pub_hex = flags
+        .get("node-pub")
+        .ok_or("user-sign-bind needs --node-pub <hex>")?;
+    let node_pub = config::decode_key(node_pub_hex)?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-bind needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let (user, generated) = config::load_or_generate_identity(&key_path)?;
+    if generated {
+        eprintln!("generated user identity at {}", key_path.display());
+    }
+    let user_sig = config::mint_bind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let msg = IdentityMsg::BindNode {
+        user_key: user.public_key().as_ref().to_vec(),
+        user_sig,
+    };
+    println!(
+        "{}",
+        String::from_utf8(encode_msg(&msg)).expect("json is utf-8")
+    );
+    Ok(())
+}
+
+/// `user-sign-unbind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint an unbind certificate evicting `node-pub` from the user identity at
+/// `--key`, and print the ready-to-submit `IdentityMsg::UnbindNode` JSON as
+/// the last stdout line. `node_key` (not `user_key`) rides the payload:
+/// unbind carries no origin restriction — a surviving device evicts a lost
+/// one by naming it directly, identified via the existing binding.
+fn cmd_user_sign_unbind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-unbind needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-unbind needs --chain-id <id>")?;
+    let node_pub_hex = flags
+        .get("node-pub")
+        .ok_or("user-sign-unbind needs --node-pub <hex>")?;
+    let node_pub = config::decode_key(node_pub_hex)?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-unbind needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let (user, generated) = config::load_or_generate_identity(&key_path)?;
+    if generated {
+        eprintln!("generated user identity at {}", key_path.display());
+    }
+    let user_sig = config::mint_unbind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let msg = IdentityMsg::UnbindNode {
+        node_key: node_pub.as_ref().to_vec(),
+        user_sig,
+    };
+    println!(
+        "{}",
+        String::from_utf8(encode_msg(&msg)).expect("json is utf-8")
     );
     Ok(())
 }
