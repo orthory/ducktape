@@ -701,6 +701,9 @@ impl Sim {
             app_hash: hex_root(&self.host.app_hash()),
             height: self.height,
             modules,
+            // the sim node has no mesh identity — clients treat an empty key
+            // as "no peer-routed features here" (no huddle voice).
+            public_key: String::new(),
         }
     }
 

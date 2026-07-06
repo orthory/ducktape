@@ -319,6 +319,9 @@ fn run_node(
                         app_hash: hex_root(&host.app_hash()),
                         height,
                         modules,
+                        // the embedded daemon has no mesh identity — clients
+                        // treat an empty key as "no peer-routed features here".
+                        public_key: String::new(),
                     });
                 }
                 NodeCommand::Metrics { reply } => {

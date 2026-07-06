@@ -23,6 +23,17 @@ import type { PhaseReport, Workspace } from "../../domain/workspace-client";
  *  side confers authority — it is purely which surfaces the rail shows. */
 export type ViewMode = "user" | "operator";
 
+/** The ephemeral voice-huddle slice. Lives OUTSIDE ConsoleSnapshot (like
+ *  telemetry): the roster is committed consensus state on the channel, but
+ *  whether THIS client is in a live audio session — and its mic/connection
+ *  state — is per-client and never re-projected from the node. `channelId` is
+ *  the channel we're huddling in (null = not in a huddle). */
+export interface VoiceSlice {
+  channelId: string | null;
+  muted: boolean;
+  status: "idle" | "connecting" | "live" | "error";
+}
+
 /** One search round-trip across the modules that ship materialized views —
  *  chat and docs (the `pages` module) searched with the same text, grouped.
  *  `docs` holds the page-block hits — pages is the console's docs surface. */
@@ -59,6 +70,9 @@ export interface ConsoleState {
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
    *  into author rendering so messages show chosen names, not hex handles. */
   authorNames: Record<string, string>;
+  /** This client's live voice-huddle session — ephemeral, never in the
+   *  committed snapshot (see VoiceSlice). */
+  voice: VoiceSlice;
 
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
@@ -235,6 +249,7 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
+    voice: { channelId: null, muted: false, status: "idle" },
     members: [],
     observers: [],
     proposals: [],

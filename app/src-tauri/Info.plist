@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Shown by macOS the first time Ducktape asks for the mic (huddle voice).
+       Tauri v2 merges this file, adjacent to tauri.conf.json, into the bundled
+       app's Info.plist during the macOS build. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Ducktape uses your microphone for huddle voice chat.</string>
+</dict>
+</plist>

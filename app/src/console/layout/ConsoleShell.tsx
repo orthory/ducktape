@@ -7,6 +7,7 @@ import { useEffect } from "react";
 import { moduleById } from "../modules/registry";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font } from "../theme/tokens";
+import { HuddleDock } from "../views/chat/Huddle";
 import { SearchModal } from "../views/search/SearchModal";
 import { SettingsView } from "../views/settings/SettingsView";
 import { Sidebar } from "./Sidebar";
@@ -85,6 +86,11 @@ export function ConsoleShell() {
       <Sidebar />
       <div style={{ flex: 1, minWidth: 0, display: "flex" }}>
         <Screen />
+      </div>
+      {/* the live-huddle session card floats above EVERY screen — a hot mic
+          must never lose its mute/leave controls to navigation. */}
+      <div style={{ position: "absolute", left: 82, bottom: 8, width: 232, zIndex: 25 }}>
+        <HuddleDock />
       </div>
       <ErrorStrip />
       {state.searchOpen && <SearchModal />}

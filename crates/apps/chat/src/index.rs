@@ -296,14 +296,16 @@ impl ModuleIndexer for ChatIndex {
                 row.text = String::new();
                 put_row_and_toks(out, &row)
             }
-            // channel records, reactions, hooks, and membership don't change
-            // any searchable text — no view impact.
+            // channel records, reactions, hooks, membership, and huddle
+            // rosters don't change any searchable text — no view impact.
             ChatMsg::CreateChannel { .. }
             | ChatMsg::AddReaction { .. }
             | ChatMsg::RemoveReaction { .. }
             | ChatMsg::RegisterHook { .. }
             | ChatMsg::UnregisterHook { .. }
-            | ChatMsg::SetMembership { .. } => Ok(()),
+            | ChatMsg::SetMembership { .. }
+            | ChatMsg::JoinHuddle { .. }
+            | ChatMsg::LeaveHuddle { .. } => Ok(()),
         }
     }
 
@@ -631,6 +633,7 @@ mod tests {
             post_policy: crate::PostPolicy::Open,
             hooks: Vec::new(),
             pinned: Vec::new(),
+            huddle: Vec::new(),
         }
     }
 
