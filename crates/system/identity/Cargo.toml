@@ -13,6 +13,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 valset = { workspace = true }
 commonware-cryptography = { workspace = true }
+# required for the PublicKey/Signature-from-bytes api (DecodeExt) -- same
+# reason valset depends on it.
+commonware-codec = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 
