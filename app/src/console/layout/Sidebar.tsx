@@ -87,6 +87,10 @@ function ModeToggle({
   );
 }
 
+/** The icon rail's fixed width — ConsoleShell offsets the floating huddle
+ *  dock by exactly this, so the two must agree. */
+export const SIDEBAR_ICON_RAIL_WIDTH = 74;
+
 export function Sidebar() {
   const { state, actions } = useDucktape();
   const rail = modulesInSection(state.viewMode);
@@ -94,7 +98,7 @@ export function Sidebar() {
   return (
     <div
       style={{
-        width: 74,
+        width: SIDEBAR_ICON_RAIL_WIDTH,
         flexShrink: 0,
         borderRight: `1px solid ${color.borderSoft}`,
         background: color.sidebar,

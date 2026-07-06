@@ -31,6 +31,11 @@ const WORKLET_URL = "/voice-worklets.js";
 
 export type VoiceStatus = "connecting" | "live" | "error" | "closed";
 
+/** Why a session failed — which message the dock shows. `mic-*` come from the
+ *  capture graph (getUserMedia/worklet), `connection` from the voice ws, and
+ *  `refused` from a consensus join rejection (assigned by the caller). */
+export type VoiceError = "mic-denied" | "mic-missing" | "mic-failed" | "connection" | "refused";
+
 // ── Pure helpers (tested) ───────────────────────────────
 
 /** Float32 [-1,1] samples → Int16 little-endian PCM, clamped. A fresh exact-fit
@@ -68,6 +73,25 @@ export const huddleRecipients = (
   );
 };
 
+/** Classify a capture-graph failure by DOMException name. macOS never
+ *  re-prompts once mic access is denied, so `mic-denied` must send the user to
+ *  System Settings — a generic "failed" would leave them retrying into a wall. */
+export const voiceErrorOf = (name: string): VoiceError => {
+  switch (name) {
+    case "NotAllowedError":
+    case "SecurityError":
+    case "PermissionDeniedError":
+      return "mic-denied";
+    case "NotFoundError":
+    case "DevicesNotFoundError":
+    case "OverconstrainedError":
+    case "NotReadableError":
+      return "mic-missing";
+    default:
+      return "mic-failed";
+  }
+};
+
 // ── The session ─────────────────────────────────────────
 
 export interface VoiceSession {
@@ -83,11 +107,12 @@ export interface VoiceSession {
   stop(): void;
 }
 
-/** Create a voice session. `onStatus` receives lifecycle transitions; the caller
+/** Create a voice session. `onStatus` receives lifecycle transitions — an
+ *  'error' carries why, so the dock can say something actionable; the caller
  *  maps them into the ephemeral voice slice (and treats 'closed' as session
  *  end). Nothing here touches the DOM until `start`. */
 export const createVoiceSession = (
-  onStatus: (status: VoiceStatus) => void,
+  onStatus: (status: VoiceStatus, error?: VoiceError) => void,
 ): VoiceSession => {
   let ctx: AudioContext | null = null;
   let stream: MediaStream | null = null;
@@ -130,7 +155,8 @@ export const createVoiceSession = (
         // the server's refusal note (hub unavailable, flow busy) — the socket
         // closes right after; surface it as a failure, not a clean end.
         failed = true;
-        onStatus("error");
+        console.error("voice ws refused:", event.data);
+        onStatus("error", "connection");
         return;
       }
       if (stopped || !playback) return;
@@ -144,7 +170,7 @@ export const createVoiceSession = (
     ws.onerror = () => {
       if (stopped) return;
       failed = true;
-      onStatus("error");
+      onStatus("error", "connection");
     };
   };
 
@@ -194,8 +220,10 @@ export const createVoiceSession = (
 
         openSocket(wsUrl);
       })
-      .catch(() => {
-        if (!stopped) onStatus("error");
+      .catch((err: unknown) => {
+        if (stopped) return;
+        console.error("voice capture failed:", err);
+        onStatus("error", voiceErrorOf(err instanceof DOMException ? err.name : ""));
       });
   };
 

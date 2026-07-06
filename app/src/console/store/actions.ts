@@ -17,7 +17,7 @@ import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import { voiceSocketUrl } from "../../domain/transport";
 import { createVoiceSession, huddleRecipients } from "../../domain/voice-session";
-import type { VoiceSession, VoiceStatus } from "../../domain/voice-session";
+import type { VoiceError, VoiceSession, VoiceStatus } from "../../domain/voice-session";
 import { keyBytes } from "../../domain/chat-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
@@ -29,6 +29,7 @@ import {
 import type { Action } from "./reducer";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
+import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
 import {
   addTab,
   channelIdOf,
@@ -91,7 +92,7 @@ export interface ConsoleActions {
    *  stop the old session), submit join_huddle carrying this node's key, start
    *  the audio session, and push the current roster as the fan-out set. No-op
    *  when the daemon can't do voice (no status.publicKey) or we're already in
-   *  this channel's huddle. */
+   *  this channel's huddle — except an errored session, where re-join retries. */
   joinHuddle(channelId: string): void;
   /** Leave the active huddle: stop the audio session, clear the voice slice,
    *  and submit leave_huddle for the channel. */
@@ -103,6 +104,12 @@ export interface ConsoleActions {
    *  and push it. Called by the provider whenever a refresh lands a new
    *  snapshot while a huddle is active; a no-op when not huddling. */
   syncHuddleRecipients(): void;
+  /** Pop the huddle out into its own desktop window (Tauri only) — the in-app
+   *  card yields while the window is open. No-op when not in a huddle. */
+  popOutHuddle(): void;
+  /** Return the huddle to the in-app card, closing the window. Also invoked
+   *  when Rust reports the window destroyed (any way it dies). */
+  popInHuddle(): void;
 
   commitForge(params: { path: string; content: string; message: string }): void;
 
@@ -352,19 +359,22 @@ export function createActions({
   // participant: 'closed' (the session was replaced) clears the slice
   // entirely; 'error' (hub refusal, socket failure, mic denial) keeps the dock
   // up in its error state so the failure is visible — Leave dismisses it.
-  const onVoiceStatus = (status: VoiceStatus): void => {
+  const onVoiceStatus = (status: VoiceStatus, error?: VoiceError): void => {
     if (status === "closed" || status === "error") {
       const channelId = getState().voice.channelId;
       stopVoice();
       if (channelId) submitLeaveHuddle(channelId);
       if (status === "closed") {
-        patch({ voice: { channelId: null, muted: false, status: "idle" } });
+        closeHuddleWindow();
+        patch({ voice: { channelId: null, muted: false, status: "idle", error: null, popped: false } });
       } else {
-        update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+        update((prev) => ({
+          voice: { ...prev.voice, status: "error", error: error ?? "connection" },
+        }));
       }
       return;
     }
-    update((prev) => ({ voice: { ...prev.voice, status } }));
+    update((prev) => ({ voice: { ...prev.voice, status, error: null } }));
   };
 
   /** Submit a leave_huddle for `channelId` with the optimistic roster prune. */
@@ -846,10 +856,12 @@ export function createActions({
       // no voice identity (legacy daemon) or no resolved node → nothing to do.
       if (!publicKey || !nodeUrl || !channelId) return;
       const active = state.voice.channelId;
-      if (active === channelId) return; // already in this huddle
+      // already in this huddle — unless it errored, where re-join is the retry.
+      if (active === channelId && state.voice.status !== "error") return;
       // switching huddles: the server replaces the session, so leave the old on
-      // consensus and stop its audio before starting the new one.
-      if (active) submitLeaveHuddle(active);
+      // consensus and stop its audio before starting the new one. An errored
+      // session already left (onVoiceStatus reconciled the roster) — skip it.
+      if (active && active !== channelId) submitLeaveHuddle(active);
       stopVoice();
       // submit the join carrying our node key bytes; optimistically add us to
       // the roster so the pill/dock react instantly.
@@ -873,7 +885,7 @@ export function createActions({
           settled.voice.channelId === channelId
         ) {
           stopVoice();
-          update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+          update((prev) => ({ voice: { ...prev.voice, status: "error", error: "refused" } }));
         }
       });
       // start the audio session and reflect "connecting"; push whatever roster
@@ -882,7 +894,10 @@ export function createActions({
       // deliberate act.
       voice = createVoiceSession(onVoiceStatus);
       voice.setMuted(true);
-      patch({ voice: { channelId, muted: true, status: "connecting" } });
+      // a retry from the popped window must keep it popped — spread, don't reset.
+      update((prev) => ({
+        voice: { ...prev.voice, channelId, muted: true, status: "connecting", error: null },
+      }));
       voice.start(voiceSocketUrl(nodeUrl, channelId));
       pushRecipients(channelId);
     },
@@ -890,7 +905,8 @@ export function createActions({
     leaveHuddle: () => {
       const channelId = getState().voice.channelId;
       stopVoice();
-      patch({ voice: { channelId: null, muted: false, status: "idle" } });
+      closeHuddleWindow();
+      patch({ voice: { channelId: null, muted: false, status: "idle", error: null, popped: false } });
       if (channelId) submitLeaveHuddle(channelId);
     },
 
@@ -900,6 +916,17 @@ export function createActions({
     },
 
     syncHuddleRecipients: () => pushRecipients(),
+
+    popOutHuddle: () => {
+      if (!getState().voice.channelId) return;
+      openHuddleWindow();
+      update((prev) => ({ voice: { ...prev.voice, popped: true } }));
+    },
+
+    popInHuddle: () => {
+      closeHuddleWindow();
+      update((prev) => ({ voice: { ...prev.voice, popped: false } }));
+    },
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
