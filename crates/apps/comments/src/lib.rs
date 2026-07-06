@@ -340,10 +340,65 @@ where
                     }
                 }
             }
-            // Edit/Delete/Resolve added in Tasks 8–9.
-            CommentMsg::EditComment { .. }
-            | CommentMsg::DeleteComment { .. }
-            | CommentMsg::ResolveThread { .. } => Err(CommentError::Unsupported),
+            CommentMsg::EditComment { comment_id, text } => {
+                if text.len() > MAX_COMMENT_TEXT_BYTES {
+                    return Err(CommentError::TextTooLarge);
+                }
+                let mut c = self
+                    .load_comment(&comment_id)
+                    .await?
+                    .ok_or(CommentError::CommentNotFound)?;
+                if c.deleted {
+                    return Err(CommentError::CommentNotFound);
+                }
+                if c.author != author {
+                    return Err(CommentError::NotAuthor);
+                }
+                c.text = text;
+                c.edited_at = Some(now);
+                self.store_comment(&c)
+            }
+            CommentMsg::DeleteComment { comment_id } => {
+                let mut c = self
+                    .load_comment(&comment_id)
+                    .await?
+                    .ok_or(CommentError::CommentNotFound)?;
+                if c.deleted {
+                    return Ok(()); // idempotent
+                }
+                if c.author != author {
+                    return Err(CommentError::NotAuthor);
+                }
+                c.deleted = true;
+                c.text = String::new();
+                let thread_id = c.thread_id.clone();
+                self.store_comment(&c)?;
+                // if no live comments remain, remove the whole thread.
+                let thread = self
+                    .load_thread(&thread_id)
+                    .await?
+                    .ok_or(CommentError::Corrupt)?;
+                let mut any_live = false;
+                for cid in &thread.comment_ids {
+                    let cc = self.load_comment(cid).await?.ok_or(CommentError::Corrupt)?;
+                    if !cc.deleted {
+                        any_live = true;
+                        break;
+                    }
+                }
+                if !any_live {
+                    for cid in &thread.comment_ids {
+                        self.delete_key(&comment_key(cid));
+                    }
+                    self.delete_key(&thread_key(&thread.id));
+                    let mut ids = self.load_anchor_index(&thread.anchor).await?;
+                    ids.retain(|t| t != &thread.id);
+                    self.stage_anchor_index(&thread.anchor, &ids)?;
+                }
+                Ok(())
+            }
+            // Resolve added in Task 9.
+            CommentMsg::ResolveThread { .. } => Err(CommentError::Unsupported),
         }
     }
 
@@ -637,6 +692,42 @@ mod tests {
             apply_err(&mut c, &CommentMsg::AddComment {
                 thread_id: "t9".into(), comment_id: "m9".into(), anchor: anchor("b1"), text: "z".into(),
             }, Origin::External(vec![]), "empty origin").await;
+        });
+    }
+
+    #[test]
+    fn edit_and_delete_are_author_only() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut c = Comments::init(context, "comments").await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m1".into(), anchor: anchor("b1"), text: "orig".into(),
+            }, user("alice")).await;
+            apply_err(&mut c, &CommentMsg::EditComment { comment_id: "m1".into(), text: "hacked".into() }, user("bob"), "not the comment author").await;
+            apply_err(&mut c, &CommentMsg::DeleteComment { comment_id: "m1".into() }, user("bob"), "not the comment author").await;
+            apply_commit(&mut c, &CommentMsg::EditComment { comment_id: "m1".into(), text: "edited".into() }, user("alice")).await;
+            let v = thread_of(&c, "t1").await.unwrap();
+            assert_eq!(v.comments[0].text, "edited");
+            assert_eq!(v.comments[0].edited_at, Some(7));
+        });
+    }
+
+    #[test]
+    fn deleting_last_live_comment_removes_the_thread() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut c = Comments::init(context, "comments").await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m1".into(), anchor: anchor("b1"), text: "a".into(),
+            }, user("alice")).await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m2".into(), anchor: anchor("b1"), text: "b".into(),
+            }, user("alice")).await;
+            apply_commit(&mut c, &CommentMsg::DeleteComment { comment_id: "m1".into() }, user("alice")).await;
+            let v = thread_of(&c, "t1").await.unwrap();
+            assert_eq!(v.comments.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["b"]);
+            apply_commit(&mut c, &CommentMsg::DeleteComment { comment_id: "m2".into() }, user("alice")).await;
+            assert!(thread_of(&c, "t1").await.is_none());
+            let groups = anchored(&c, "pages", &["b1"]).await;
+            assert!(groups[0].threads.is_empty());
         });
     }
 }
