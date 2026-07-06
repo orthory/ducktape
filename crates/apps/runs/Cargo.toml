@@ -16,6 +16,7 @@ tagging = { workspace = true }
 dispatch = { workspace = true }
 tasks = { workspace = true }
 jobs = { workspace = true }
+memory = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

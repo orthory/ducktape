@@ -24,10 +24,10 @@ use dispatch::{
 };
 use futures::executor::block_on;
 use jobs::{JobsEvent, encode_event as jobs_encode_event};
-use runs::{RunsModule, job_run_id_for, job_spec_hash, run_id_for};
 use runs::{
     PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply, encode_msg, encode_query,
 };
+use runs::{RunsModule, job_run_id_for, job_spec_hash, run_id_for};
 use saga::SagaOrigin;
 use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
 
@@ -61,7 +61,7 @@ impl TestCtx {
                 owner: SagaOrigin::External(b"alice".to_vec()),
                 display_name: agent_id.to_uppercase(),
                 capability: "model-1".into(),
-                prompt_hash: vec![7u8; 32],
+                prompt: None,
                 allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
                 status: AgentStatus::Active,
                 created_at: 0,
@@ -291,7 +291,11 @@ fn installed_snapshot_reconstructs_root_and_reads_across_both_keyspaces() {
     };
     assert_eq!(watches.len(), 4);
     let threaded = pending(&src, &run_id_for("general", 3, "ext-bot")).expect("threaded entry");
-    assert_eq!(threaded.thread_root, Some(1), "the option field is populated");
+    assert_eq!(
+        threaded.thread_root,
+        Some(1),
+        "the option field is populated"
+    );
     assert!(pending(&src, &run_id_for("dev", 1, "mod-bot")).is_some());
     let job = pending(&src, &job_run_id_for("job-1", "mod-bot", 2)).expect("job entry");
     assert_eq!(job.job_id, Some("job-1".into()));
