@@ -28,4 +28,4 @@ pub use coordinator::Coordinator;
 pub use punch::{PunchError, PunchPlan, RebindProof, drive_rebind_reconnect, drive_simulated};
 #[cfg(any(test, feature = "simnat"))]
 pub use simnat::SimNat;
-pub use wire::{Msg, NodeKey, WireError};
+pub use wire::{AuthRequest, Msg, NodeKey, WireError};
