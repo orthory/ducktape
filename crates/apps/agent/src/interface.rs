@@ -41,10 +41,36 @@ pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 /// module must be able to prove the post will fit BEFORE emitting.
 pub const MAX_REPLY_BLOCKS_BYTES: usize = 32 * 1024;
 
-/// required byte length of an agent's prompt hash (a sha256 digest). prompt
-/// CONTENT lives off-registry (e.g. in `document`); consensus commits to the
-/// hash, so which prompt an agent runs is part of the app-hash.
+/// required byte length of a [`PromptRef`]'s sha256 pin. prompt CONTENT lives
+/// in the source module the ref names (e.g. `memory`); consensus commits to
+/// the pin, so which prompt an agent runs is part of the app-hash.
 pub const PROMPT_HASH_LEN: usize = 32;
+
+/// the v1 prompt renderer: the ref's `target` is `"<path>@<generation>"`,
+/// resolved at compose time via the source module's
+/// `MemoryQuery::Read { path, generation }`; the content must be inline and
+/// must sha256 to the registered pin.
+pub const RENDERER_MEMORY_GENERATION: &str = "memory.generation";
+
+/// every prompt renderer the platform knows. registration rejects a
+/// [`PromptRef`] whose `renderer` is outside this set, so a registered prompt
+/// is always resolvable by the module that composes payloads.
+pub const KNOWN_PROMPT_RENDERERS: [&str; 1] = [RENDERER_MEMORY_GENERATION];
+
+/// a consensus-resident reference to an agent's prompt content: which module
+/// holds it (`module`), where inside that module (`target`, a
+/// renderer-specific coordinate), how to resolve it (`renderer`, from
+/// [`KNOWN_PROMPT_RENDERERS`]), and the sha256 pin the resolved content must
+/// hash to (exactly [`PROMPT_HASH_LEN`] bytes). registration validates all
+/// four; resolution happens at payload-compose time in the module that runs
+/// agents, and content that no longer hashes to the pin fails the run.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PromptRef {
+    pub module: String,
+    pub target: String,
+    pub renderer: String,
+    pub sha256: Vec<u8>,
+}
 
 /// the reserved unit separator agent ids must never contain: the runs module
 /// keys its run records with `\x1f`-delimited fields, and an agent id
@@ -73,12 +99,15 @@ pub const KNOWN_ACTIONS: [&str; 3] = [
 // ---- registry ----------------------------------------------------------------
 
 /// whether an agent may engage new runs. a paused agent never engages — but
-/// pausing does not cancel work already dispatched.
+/// pausing does not cancel work already dispatched. a tombstoned agent is
+/// TERMINAL: it never engages, never claims jobs, and cannot be resumed or
+/// otherwise mutated — the record stays for audit, the id stays reserved.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Active,
     Paused,
+    Tombstoned,
 }
 
 /// one registered agent — an ordered-op registration, so which capability and
@@ -96,11 +125,10 @@ pub struct AgentRecord {
     pub display_name: String,
     /// the capability registry tag this agent's runs are dispatched on.
     pub capability: String,
-    /// sha256 of the agent's prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
-    /// the content itself is content-addressed in the blob store under this
-    /// digest; consensus pins only the hash, and the host resolves the prompt.
-    pub prompt_hash: Vec<u8>,
-    /// granted action names, each from [`KNOWN_ACTIONS`], sorted and deduped.
+    /// where the agent's prompt content lives and what it must hash to.
+    /// `None` means the composing module's generic default prompt.
+    pub prompt: Option<PromptRef>,
+    /// granted action names (shape-validated open-set tags), sorted and deduped.
     pub allowed_actions: Vec<String>,
     pub status: AgentStatus,
     pub created_at: u64,
@@ -174,23 +202,31 @@ pub enum AgentMsg {
         agent_id: String,
         display_name: String,
         capability: String,
-        prompt_hash: Vec<u8>,
+        /// `None` keeps the composing module's generic default prompt.
+        prompt: Option<PromptRef>,
         allowed_actions: Vec<String>,
     },
-    /// owner-gated partial update; `None` fields keep their current value. a
-    /// capability change also notifies the hook target
+    /// owner-gated partial update; `None` fields keep their current value
+    /// (clearing a registered prompt means re-registering). a capability
+    /// change also notifies the hook target
     /// ([`AgentEvent::CapabilityChanged`]) in the same block.
     UpdateAgent {
         agent_id: String,
         display_name: Option<String>,
         capability: Option<String>,
-        prompt_hash: Option<Vec<u8>>,
+        prompt: Option<PromptRef>,
         allowed_actions: Option<Vec<String>>,
     },
     /// owner-gated: stop the agent from engaging new runs.
     PauseAgent { agent_id: String },
     /// owner-gated: resume engagement.
     ResumeAgent { agent_id: String },
+    /// owner-gated and TERMINAL: retire the agent for good. the record stays
+    /// for audit (the id stays reserved), but every later mutation — resume
+    /// included — is rejected. the hook target is notified
+    /// ([`AgentEvent::Tombstoned`]) in the same block so the agent's
+    /// dispatch-plane recipe is removed atomically with the retirement.
+    TombstoneAgent { agent_id: String },
 }
 
 // ---- the registry hook ----------------------------------------------------------
@@ -209,6 +245,8 @@ pub enum AgentEvent {
     Registered { agent_id: String, capability: String },
     /// an existing agent's capability changed; the hook retunes its recipe.
     CapabilityChanged { agent_id: String, capability: String },
+    /// an agent was retired for good; the hook removes its recipe.
+    Tombstoned { agent_id: String },
 }
 
 // ---- queries ------------------------------------------------------------------
