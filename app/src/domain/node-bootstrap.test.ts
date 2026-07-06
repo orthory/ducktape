@@ -9,7 +9,7 @@ import {
   shutdownNode,
   waitUntilUp,
 } from "./node-bootstrap";
-import type { NodeTransport } from "./transport";
+import { NodeError, type NodeTransport } from "./transport";
 
 const status = {
   version: "0.1.0",
@@ -68,6 +68,25 @@ describe("waitUntilUp", () => {
     } as unknown as NodeTransport;
 
     await expect(waitUntilUp(transport, 2)).rejects.toThrow(/did not come up/);
+  });
+
+  it("fails fast when the node is up but erroring (httpError) — no 40× poll", async () => {
+    const statusFn = vi.fn().mockRejectedValue(new NodeError("httpError", "node replied 500", 500));
+    const transport = { status: statusFn } as unknown as NodeTransport;
+
+    await expect(waitUntilUp(transport, 40)).rejects.toThrow(/node replied 500/);
+    expect(statusFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps polling while the node is merely not answering yet (refused)", async () => {
+    const statusFn = vi
+      .fn()
+      .mockRejectedValueOnce(new NodeError("refused", "could not reach the node"))
+      .mockResolvedValueOnce(status);
+    const transport = { status: statusFn } as unknown as NodeTransport;
+
+    await expect(waitUntilUp(transport, 3)).resolves.toBeUndefined();
+    expect(statusFn).toHaveBeenCalledTimes(2);
   });
 });
 
