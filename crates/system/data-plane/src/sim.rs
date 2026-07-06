@@ -67,8 +67,11 @@ struct PeerHandles {
     accepts: mpsc::UnboundedSender<(PeerId, SimStream)>,
 }
 
+/// Directed links, keyed `(from, to)`.
+type LinkTable = HashMap<(PeerId, PeerId), Arc<Mutex<DirectedLink>>>;
+
 struct NetInner {
-    links: Mutex<HashMap<(PeerId, PeerId), Arc<Mutex<DirectedLink>>>>,
+    links: Mutex<LinkTable>,
     peers: Mutex<HashMap<PeerId, PeerHandles>>,
 }
 

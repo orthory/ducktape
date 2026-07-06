@@ -507,7 +507,7 @@ impl TokenBucket {
     }
 
     fn grant(&self, want: usize) -> Grant {
-        let want = want.min(MAX_GRANT).max(1);
+        let want = want.clamp(1, MAX_GRANT);
         let mut s = self.state.lock().expect("bucket lock");
         let now = Instant::now();
         s.tokens = (s.tokens + now.duration_since(s.refilled_at).as_secs_f64() * self.rate)
