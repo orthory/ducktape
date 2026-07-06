@@ -39,6 +39,7 @@ fn main() {
             user_identity::user_identity_status,
             user_identity::user_sign_bind,
             user_identity::user_sign_unbind,
+            forge_git::forge_list_repos,
             forge_git::forge_head,
             forge_git::forge_log,
             forge_git::forge_tree,

@@ -78,7 +78,7 @@ describe("ForgeView", () => {
     ]);
     forgeGit.forgeHead.mockResolvedValue(HEAD);
     forgeGit.forgeLog.mockResolvedValue(COMMITS);
-    forgeGit.forgeTree.mockImplementation((path = "") =>
+    forgeGit.forgeTree.mockImplementation((_repo, path = "") =>
       Promise.resolve(
         path === ""
           ? [

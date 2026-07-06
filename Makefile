@@ -8,7 +8,7 @@ CARGO ?= cargo
 BUN ?= bun
 APP_DEST ?= /Applications
 
-.PHONY: all dev node web app sidecar install install-node install-app test clean
+.PHONY: all dev dogfood-forge node web app sidecar install install-node install-app test clean
 
 all: node web
 
@@ -18,6 +18,12 @@ all: node web
 ## see ops/dev.sh. (stop any already-running `tauri dev` first — it owns :1430.)
 dev:
 	@bash ops/dev.sh
+
+## dogfood: host ducktape's own source in the local dev node's forge module.
+## registers a static `ducktape-dev` git remote at the node's forge endpoint and
+## pushes `main` (needs a running dev node — `make dev`). see ops/dogfood-forge.sh.
+dogfood-forge:
+	@bash ops/dogfood-forge.sh
 
 ## release build of the networked node (serves the app surface)
 node:
