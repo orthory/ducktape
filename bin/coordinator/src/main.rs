@@ -29,6 +29,9 @@ async fn main() -> std::io::Result<()> {
     let sock = UdpSocket::bind(listen).await?;
     // the address line stays parseable (tooling/tests read its tail).
     eprintln!("coordinator listening on {}", sock.local_addr()?);
-    run_coordinator(sock).await;
+    // Task 6 owns wiring the real per-network policy (public/private) from
+    // config. Until then the deployed binary stays fully-open — backwards
+    // compatible with every existing client and the deploy smoke test.
+    run_coordinator(sock, nat_traversal::AuthPolicy::Open { require_pop: false }).await;
     Ok(())
 }

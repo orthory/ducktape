@@ -498,7 +498,10 @@ async fn single_member_mesh_and_stranger_traffic_are_inert() {
 async fn nat_resolver_punches_over_loopback() {
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
-    tokio::spawn(nat_traversal::client::run_coordinator(coord_sock));
+    tokio::spawn(nat_traversal::client::run_coordinator(
+        coord_sock,
+        nat_traversal::AuthPolicy::Open { require_pop: false },
+    ));
 
     let key_a = NodeKey([0xaa; 32]);
     let key_b = NodeKey([0xbb; 32]);

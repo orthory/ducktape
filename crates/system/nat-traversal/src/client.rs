@@ -2,19 +2,24 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
+use crate::auth::{now_secs, sign_authenticator, AuthPolicy, CoordCap};
+use crate::AuthRequest;
 use crate::{Coordinator, Msg, NodeKey};
+use commonware_cryptography::ed25519;
 
 pub struct NatClient {
     sock: UdpSocket,
     key: NodeKey,
     coord: SocketAddr,
     coords: Vec<SocketAddr>,
+    signer: Option<ed25519::PrivateKey>,
+    cap: Option<CoordCap>,
 }
 
 impl NatClient {
     pub async fn bind(key: NodeKey, coord: SocketAddr) -> std::io::Result<Self> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { sock, key, coord, coords: vec![coord] })
+        Ok(Self { sock, key, coord, coords: vec![coord], signer: None, cap: None })
     }
 
     /// Bind with an ordered set of coordinator hints (the reach `Vec`). The
@@ -25,7 +30,36 @@ impl NatClient {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
         })?;
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { sock, key, coord, coords })
+        Ok(Self { sock, key, coord, coords, signer: None, cap: None })
+    }
+
+    /// Bind with an authenticating identity: every request to the coordinator
+    /// is wrapped in an `AuthRequest` signed by `signer`, carrying `cap`
+    /// (private mode) or `None` (public / PoP-only).
+    pub async fn bind_multi_auth(
+        key: NodeKey,
+        coords: Vec<SocketAddr>,
+        signer: ed25519::PrivateKey,
+        cap: Option<CoordCap>,
+    ) -> std::io::Result<Self> {
+        let coord = *coords.first().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
+        })?;
+        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        Ok(Self { sock, key, coord, coords, signer: Some(signer), cap })
+    }
+
+    /// Encode a client→coordinator request, wrapping it in a signed
+    /// `AuthRequest` when this client authenticates, or sending it bare
+    /// otherwise (tests / no-auth dev path).
+    fn authed(&self, inner: Msg) -> Vec<u8> {
+        match &self.signer {
+            Some(signer) => {
+                let auth = sign_authenticator(signer, &inner.encode(), now_secs(), self.cap.clone());
+                AuthRequest { inner, auth }.encode()
+            }
+            None => inner.encode(),
+        }
     }
 
     pub async fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -34,7 +68,7 @@ impl NatClient {
 
     pub async fn discover_reflexive(&self) -> std::io::Result<SocketAddr> {
         self.sock
-            .send_to(&Msg::BindRequest { from: self.key }.encode(), self.coord)
+            .send_to(&self.authed(Msg::BindRequest { from: self.key }), self.coord)
             .await?;
         let mut buf = [0u8; 64];
         loop {
@@ -72,7 +106,7 @@ impl NatClient {
         let coords = self.coords.clone();
         for (i, c) in coords.iter().copied().enumerate() {
             self.sock
-                .send_to(&Msg::BindRequest { from: self.key }.encode(), c)
+                .send_to(&self.authed(Msg::BindRequest { from: self.key }), c)
                 .await?;
             let attempt = async {
                 let mut buf = [0u8; 64];
@@ -107,7 +141,7 @@ impl NatClient {
 
     pub async fn register(&self) -> std::io::Result<()> {
         self.sock
-            .send_to(&Msg::Register { key: self.key }.encode(), self.coord)
+            .send_to(&self.authed(Msg::Register { key: self.key }), self.coord)
             .await?;
         Ok(())
     }
@@ -121,7 +155,7 @@ impl NatClient {
     /// duplicate could otherwise roll back.
     pub async fn readvertise(&self, nonce: u64) -> std::io::Result<()> {
         self.sock
-            .send_to(&Msg::Readvertise { key: self.key, nonce }.encode(), self.coord)
+            .send_to(&self.authed(Msg::Readvertise { key: self.key, nonce }), self.coord)
             .await?;
         Ok(())
     }
@@ -131,7 +165,7 @@ impl NatClient {
     /// directly).
     pub async fn lookup(&self, peer: NodeKey) -> std::io::Result<SocketAddr> {
         self.sock
-            .send_to(&Msg::Lookup { key: peer }.encode(), self.coord)
+            .send_to(&self.authed(Msg::Lookup { key: peer }), self.coord)
             .await?;
         let mut buf = [0u8; 64];
         loop {
@@ -197,22 +231,30 @@ impl NatClient {
     }
 }
 
-/// The coordinator event loop: decode control datagrams, feed the pure handler,
-/// send replies. Pure rendezvous — the coordinator never binds a data socket
-/// and never carries peer traffic, so no established path ever depends on it.
-pub async fn run_coordinator(sock: UdpSocket) {
-    let mut coord = Coordinator::new();
-    let mut buf = [0u8; 64];
+/// The coordinator event loop: decode control datagrams (authenticated or, under
+/// a fully-open policy, legacy), enforce the auth policy, feed the pure handler,
+/// send replies. Pure rendezvous — never binds a data socket, never carries
+/// peer traffic.
+pub async fn run_coordinator(sock: UdpSocket, policy: AuthPolicy) {
+    let mut coord = Coordinator::with_policy(policy);
+    // Big enough for an AuthRequest with a cap (~219 bytes worst case).
+    let mut buf = [0u8; 512];
     loop {
         let (n, from) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let msg = match Msg::decode(&buf[..n]) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let now = now_secs();
+        // Tag 11 -> authenticated envelope; anything else -> legacy Msg. The two
+        // are mutually exclusive by tag, so try the envelope first and fall back.
+        let out = match AuthRequest::decode(&buf[..n]) {
+            Ok(req) => coord.handle_auth(from, req, now),
+            Err(_) => match Msg::decode(&buf[..n]) {
+                Ok(m) => coord.handle_legacy(from, m),
+                Err(_) => continue,
+            },
         };
-        for (dst, reply) in coord.handle(from, msg) {
+        for (dst, reply) in out {
             let _ = sock.send_to(&reply.encode(), dst).await;
         }
     }
@@ -227,11 +269,55 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
+    async fn authorized_client_rendezvous_under_private_policy_but_unauthorized_is_dropped() {
+        use crate::auth::{mint_coord_cap, AuthPolicy};
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(100);
+        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(coord_sock, policy));
+
+        // Two authorized nodes (joiners) with genesis caps.
+        let a_signer = ed25519::PrivateKey::from_seed(200);
+        let b_signer = ed25519::PrivateKey::from_seed(201);
+        let a_key = { let mut k=[0u8;32]; k.copy_from_slice(a_signer.public_key().as_ref()); NodeKey(k) };
+        let b_key = { let mut k=[0u8;32]; k.copy_from_slice(b_signer.public_key().as_ref()); NodeKey(k) };
+        let a_cap = mint_coord_cap(&g, a_key, crate::auth::now_secs() + 3600);
+        let b_cap = mint_coord_cap(&g, b_key, crate::auth::now_secs() + 3600);
+
+        let a = NatClient::bind_multi_auth(a_key, vec![coord_addr], a_signer, Some(a_cap)).await.unwrap();
+        let b = NatClient::bind_multi_auth(b_key, vec![coord_addr], b_signer, Some(b_cap)).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        // Per the committed wire semantics, a `Lookup`'s `subject_key()` is the
+        // LOOKED-UP key, so under Private policy the authenticator must be signed
+        // by (and admitted for) that key — a node resolves its OWN mapping. This
+        // proves an authorized register+lookup completes end-to-end over the real
+        // signed UDP path (a cross-node `a.lookup(b_key)` is impossible here: a
+        // does not hold b's signer, so its PoP would fail and be dropped).
+        let a_reflexive = timeout(Duration::from_secs(2), a.lookup(a_key)).await.expect("no timeout").expect("lookup");
+        assert_eq!(a_reflexive.port(), a.local_addr().await.unwrap().port());
+        let b_reflexive = timeout(Duration::from_secs(2), b.lookup(b_key)).await.expect("no timeout").expect("lookup");
+        assert_eq!(b_reflexive.port(), b.local_addr().await.unwrap().port());
+
+        // Unauthorized: a node with NO signer (bare Msg) cannot register under
+        // Private policy — its lookup for itself finds nothing.
+        let outsider = NatClient::bind(NodeKey([0xcd; 32]), coord_addr).await.unwrap();
+        outsider.register().await.unwrap(); // dropped by handle_legacy
+        let miss = timeout(Duration::from_millis(500), outsider.lookup(NodeKey([0xcd; 32]))).await;
+        assert!(miss.is_err() || miss.unwrap().is_err(), "unauthenticated register never created a mapping");
+    }
+
+    #[tokio::test]
     async fn dead_primary_falls_through_to_live_secondary() {
         // A live coordinator (the secondary).
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live));
+        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         // A DEAD primary: a bound socket nobody ever serves. Datagrams sent to
         // it are buffered and never answered, so the per-try budget elapses.
@@ -258,7 +344,7 @@ mod tests {
         // previous test this proves neither position is uniquely required.
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live));
+        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
@@ -278,7 +364,7 @@ mod tests {
     async fn client_discovers_its_reflexive_via_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
+        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let client = NatClient::bind(NodeKey([1u8; 32]), coord_addr).await.unwrap();
         let reflexive = client.discover_reflexive().await.unwrap();
@@ -292,7 +378,7 @@ mod tests {
     async fn discover_reflexive_ignores_forged_bind_response_from_non_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
+        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let client = NatClient::bind(NodeKey([2u8; 32]), coord_addr).await.unwrap();
         let client_addr = client.local_addr().await.unwrap();
@@ -321,7 +407,7 @@ mod tests {
     async fn recv_punch_from_ignores_spoofed_punch_from_wrong_sender() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
+        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let a_key = NodeKey([0xaa; 32]);
         let a = NatClient::bind(a_key, coord_addr).await.unwrap();
@@ -363,7 +449,7 @@ mod tests {
     async fn direct_path_survives_coordinator_shutdown() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        let coord = tokio::spawn(run_coordinator(coord_sock));
+        let coord = tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);
@@ -413,7 +499,7 @@ mod tests {
         // sends `Msg::Readvertise` over UDP and a peer re-resolves the new mapping.
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
+        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);
@@ -464,7 +550,7 @@ mod tests {
         // coordinator that answered.
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live));
+        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
