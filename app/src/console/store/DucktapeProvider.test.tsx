@@ -91,6 +91,9 @@ const makeFakeNode = () => {
         return Promise.resolve({ Profiles: [] });
       }
       if (target === "valset") {
+        if (query === "Observers") {
+          return Promise.resolve({ Observers: [[0xfe, 0xed]] });
+        }
         return Promise.resolve({ Validators: [[0xde, 0xad, 0xbe, 0xef]] });
       }
       if (target === "document") {
@@ -139,6 +142,7 @@ function Probe() {
       <span data-testid="forge">{state.forgeHead ?? "unborn"}</span>
       <span data-testid="members">{state.members.length}</span>
       <span data-testid="member-keys">{state.members.join(",")}</span>
+      <span data-testid="observer-keys">{state.observers.join(",")}</span>
       <span data-testid="connected">{String(state.connected)}</span>
     </div>
   );
@@ -174,6 +178,16 @@ describe("DucktapeProvider", () => {
       expect(screen.getByTestId("member-keys").textContent).toBe("deadbeef");
     });
     expect(transport.query).toHaveBeenCalledWith("valset", "Validators");
+  });
+
+  it("hydrates observer standing from valset", async () => {
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observer-keys").textContent).toBe("feed");
+    });
+    expect(transport.query).toHaveBeenCalledWith("valset", "Observers");
   });
 
   it("sendMessage posts a paragraph block with the author as submit origin", async () => {

@@ -112,6 +112,9 @@ export function DucktapeProvider({
           // validator set) — best-effort like governance below, so a local
           // node reads as "no members" instead of never connecting.
           valsetClient.validators(live).catch((): number[][] => []),
+          // the observer tier (staged admission) — same best-effort contract:
+          // a pre-observer node (protocol < 3) reads as "no observers".
+          valsetClient.observers(live).catch((): number[][] => []),
           // governance is a first-class operator surface but best-effort in the
           // snapshot: a node/build without it just reads as "no proposals"
           // rather than failing the whole refresh.
@@ -156,6 +159,7 @@ export function DucktapeProvider({
         channels,
         tasks,
         validators,
+        observerKeys,
         proposals,
         forgeHead,
         docIds,
@@ -181,6 +185,7 @@ export function DucktapeProvider({
           profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
         );
         const members = validators.map(valsetClient.validatorHex);
+        const observers = observerKeys.map(valsetClient.validatorHex);
         const current = stateRef.current.activeChannel;
         const active =
           current && channels.some((c) => c.id === current)
@@ -197,6 +202,7 @@ export function DucktapeProvider({
                 channels,
                 tasks,
                 members,
+                observers,
                 proposals,
                 forgeHead,
                 activeChannel: active,

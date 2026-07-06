@@ -76,6 +76,10 @@ export interface ConsoleState {
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
   members: string[];
+  /** Hex-encoded observer public keys from the `valset` module — the
+   *  staged-admission tier (mesh + statesync, no quorum seat). Disjoint from
+   *  `members`: valset's Grant refuses validators, Join clears standing. */
+  observers: string[];
 
   // ── Governance ──
   /** Every proposal from the `governance` module, sorted by id. Re-queried per
@@ -277,6 +281,7 @@ export const createInitialState = (): ConsoleState => {
     authorNames: {},
     tasks: [],
     members: [],
+    observers: [],
     proposals: [],
     forgeHead: null,
     docIds: [],
@@ -321,6 +326,7 @@ export interface ConsoleSnapshot {
   channels: Channel[];
   tasks: Task[];
   members: string[];
+  observers: string[];
   proposals: ProposalView[];
   forgeHead: string | null;
   activeChannel: string | null;
@@ -352,6 +358,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   channels: snapshot.channels,
   tasks: snapshot.tasks,
   members: snapshot.members,
+  observers: snapshot.observers,
   proposals: snapshot.proposals,
   forgeHead: snapshot.forgeHead,
   activeChannel: snapshot.activeChannel,
