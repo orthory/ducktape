@@ -41,10 +41,30 @@ const PATHS: Record<string, ReactNode> = {
   close: <path d="M6 6l12 12M18 6L6 18" />,
   plus: <path d="M12 5v14M5 12h14" />,
   check: <path d="M5 12.5l4 4 10-10" />,
+  code: (
+    <>
+      <path d="M9 18l-6-6 6-6" />
+      <path d="M15 6l6 6-6 6" />
+    </>
+  ),
   edit: (
     <>
       <path d="M4.5 19.5l.8-3.6L15.2 6l2.8 2.8-9.9 9.9z" />
       <path d="M13.7 7.5l2.8 2.8" />
+    </>
+  ),
+  divider: <path d="M5 12h14" />,
+  link: (
+    <>
+      <path d="M9.5 14.5l5-5" />
+      <path d="M11 7.4l1.4-1.4a4 4 0 0 1 5.7 5.7l-1.4 1.4" />
+      <path d="M13 16.6l-1.4 1.4a4 4 0 0 1-5.7-5.7l1.4-1.4" />
+    </>
+  ),
+  quote: (
+    <>
+      <path d="M8 9h4v7H6v-5.2A5 5 0 0 1 10.8 6" />
+      <path d="M17 9h4v7h-6v-5.2A5 5 0 0 1 19.8 6" />
     </>
   ),
   chevronRight: <path d="M9 6l6 6-6 6" />,
