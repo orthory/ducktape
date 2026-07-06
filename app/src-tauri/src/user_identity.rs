@@ -67,6 +67,9 @@ pub fn user_sign_bind(
 
 /// sign an `unbind_node` `IdentityMsg` for `node_pub` at `nonce` — the undo of
 /// [`user_sign_bind`], same one-line ready-to-submit JSON shape.
+///
+/// no TS caller exists yet: this is the deliberate seam for a future "unlink
+/// device" affordance — unbind is CLI-only in v1.
 #[tauri::command]
 pub fn user_sign_unbind(
     app: tauri::AppHandle,

@@ -215,6 +215,11 @@ user는 여전히 세 자리를 차지하고 세 표를 던진다 — identity�
 authorship resolution을 위해 key를 사람에게 매핑할 뿐, consensus weight를
 합치지 않는다.
 
+identity가 없던 network에 이를 추가하는 것은 다른 module-set 변경과
+마찬가지다: genesis app-hash가 옮겨가므로, 이미 돌고 있는 network가 이를
+적용하려면 coordinated rebuild — rolling이 아닌, 모든 validator에 걸친
+lockstep upgrade — 가 필요하다.
+
 ## Interface Shape
 
 interface crate는 module-specific payload를 encode/decode하고, host는 opaque byte만

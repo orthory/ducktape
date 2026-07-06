@@ -142,7 +142,13 @@ export function DucktapeProvider({
             .pendingRuns(live)
             .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
-          identityClient.allUsers(live, { from: 0, limit: 256 }),
+          // identity is newer than some reachable nodes (any pre-identity
+          // network, e.g. the web build's node) — best-effort like pages
+          // above, so the overlay just degrades to profiles' names instead
+          // of failing the whole refresh.
+          identityClient
+            .allUsers(live, { from: 0, limit: 256 })
+            .catch((): identityClient.UserView[] => []),
           // files is best-effort so a node that does not register the module
           // reads as "empty", never a failed refresh (same contract as
           // governance above).

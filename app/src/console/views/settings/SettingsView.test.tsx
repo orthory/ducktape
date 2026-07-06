@@ -1,6 +1,9 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
-import { describe, expect, it, vi, type Mock } from "vitest";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
+
+const invokeMock = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import { shortKey } from "../../../domain/names";
 import type { ConsoleActions } from "../../store/actions";
@@ -8,6 +11,10 @@ import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import type { Workspace } from "../../../domain/workspace-client";
 import { SettingsView } from "./SettingsView";
+
+const markTauri = () => {
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+};
 
 const workspace: Workspace = {
   id: "acme-research",
@@ -65,6 +72,11 @@ const renderSettings = (patch: Partial<ConsoleState> = {}) => {
 
   return { spies };
 };
+
+afterEach(() => {
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  vi.clearAllMocks();
+});
 
 describe("SettingsView", () => {
   it("renders the workspace settings and preserves the existing actions", () => {
@@ -235,6 +247,46 @@ describe("SettingsView", () => {
     renderSettings({ workspace: null });
 
     expect(screen.queryByText("DEVICES")).not.toBeInTheDocument();
+  });
+
+  it("renders the machine user key once user_identity_status resolves (desktop)", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status")
+        return Promise.resolve({ pubkey: "cd34".repeat(16) });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    expect(await screen.findByText("User key")).toBeInTheDocument();
+    expect(
+      screen.getByText(shortKey("cd34".repeat(16))),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces the user_identity_status error string on failure (corrupt user.key)", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status")
+        return Promise.reject("user.key exists but is corrupt (bad hex)");
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    expect(
+      await screen.findByText("user.key exists but is corrupt (bad hex)"),
+    ).toBeInTheDocument();
+  });
+
+  it("never calls user_identity_status on the web build (no tauri shell)", async () => {
+    renderSettings();
+
+    // Give any stray microtask a chance to run before asserting the negative.
+    await Promise.resolve();
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(screen.queryByText("User key")).not.toBeInTheDocument();
   });
 
   it("disables Request leave for a solo validator (can't remove the last one)", () => {

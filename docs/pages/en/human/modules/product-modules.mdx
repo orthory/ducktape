@@ -222,6 +222,11 @@ validators still holds three seats and casts three votes — identity maps keys
 to a person for display and authorship resolution, it does not collapse
 consensus weight.
 
+Adding identity to a network that predates it is a module-set change like any
+other: the genesis app-hash moves, so an already-running network needs a
+coordinated rebuild — a lockstep upgrade across every validator, not a rolling
+one — to adopt it.
+
 ## Interface Shape
 
 Interface crates encode and decode module-specific payloads while the host

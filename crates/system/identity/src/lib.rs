@@ -470,7 +470,9 @@ impl Module for Identity {
                 // 3. resolve the origin node's current binding via the merged view.
                 if let Some(bound_to) = self.merged_index().get(&origin) {
                     if *bound_to == user_key {
-                        // idempotent re-bind: no-op, nonce NOT bumped.
+                        // idempotent re-bind: no-op, nonce NOT bumped. user_sig is
+                        // deliberately left unverified on this path — no state
+                        // changes, and origin is already consensus-authenticated.
                         return Ok(());
                     }
                     return Err(Error::Module(
