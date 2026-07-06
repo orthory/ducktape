@@ -176,17 +176,17 @@ const postJson = <T>(url: string, body: unknown): Promise<T> =>
     });
 
 /** A node base url in its websocket form: trailing slash stripped, http→ws
- *  scheme swap — the ONE derivation both the block stream and the voice
+ *  scheme swap — the ONE derivation both the block stream and the call
  *  socket dial through. */
 const wsBase = (baseUrl: string): string =>
   baseUrl.replace(/\/$/, "").replace(/^http/, "ws");
 
-/** The voice websocket url for a channel on the node at `baseUrl` — same
- *  host/port as the daemon's http/ws surface. The audio session
- *  (voice-session.ts) dials this; kept here because this is where the base
- *  url and its ws form live. */
-export const voiceSocketUrl = (baseUrl: string, channel: string): string =>
-  `${wsBase(baseUrl)}/v1/voice/ws?channel=${encodeURIComponent(channel)}`;
+/** The call websocket url for a channel on the node at `baseUrl` — same
+ *  host/port as the daemon's http/ws surface. The huddle session
+ *  (call-session.ts) dials this typed socket (audio + camera video + control);
+ *  kept here because this is where the base url and its ws form live. */
+export const callSocketUrl = (baseUrl: string, channel: string): string =>
+  `${wsBase(baseUrl)}/v1/call/ws?channel=${encodeURIComponent(channel)}`;
 
 export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");

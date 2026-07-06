@@ -59,6 +59,9 @@ pub enum Service {
     StateSync = 1,
     /// Real-time voice channels (chat module).
     Voice = 2,
+    /// Real-time camera video (chat module): encoded frames fragmented
+    /// across datagrams — see `chat::video` for the frame layer.
+    Video = 3,
 }
 
 impl TryFrom<u8> for Service {
@@ -68,6 +71,7 @@ impl TryFrom<u8> for Service {
         match value {
             1 => Ok(Service::StateSync),
             2 => Ok(Service::Voice),
+            3 => Ok(Service::Video),
             other => Err(other),
         }
     }

@@ -26,6 +26,10 @@ pub mod index;
 // module's consensus state (channels, membership) is what will drive its
 // admission and channel→flow derivation. Kept as a self-contained submodule.
 pub mod voice;
+// the video call media wire (frame fragmentation/reassembly + call control)
+// over the data plane's Service::Video / Service::Voice flows. Off-consensus
+// like `voice`, for the same reason: consensus never carries media.
+pub mod video;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
@@ -895,6 +899,35 @@ where
         )
     }
 
+    /// evict `user` from the channel's huddle (staleness cleanup — see
+    /// `ChatMsg::SweepHuddle`). gated like posting; absent target = no-op.
+    async fn stage_sweep_huddle(
+        &mut self,
+        author: AuthorRef,
+        channel_id: &str,
+        user: &[u8],
+    ) -> Result<(), Error> {
+        Self::validate_non_empty("channel_id", channel_id)?;
+        let AuthorRef::User(_) = &author else {
+            return Err(Error::Module(
+                "only external users may sweep a huddle".into(),
+            ));
+        };
+        let mut channel = self.require_channel(channel_id).await?;
+        self.check_post_policy(&channel, &author).await?;
+        let before = channel.huddle.len();
+        channel.huddle.retain(|m| m.user != user);
+        if channel.huddle.len() == before {
+            return Ok(());
+        }
+        self.store_bounded(
+            channel_key(channel_id),
+            &channel,
+            MAX_CHANNEL_RECORD_BYTES,
+            "channel",
+        )
+    }
+
     // ---- query assembly ------------------------------------------------------
 
     async fn reactions(&self, channel_id: &str, seq: u64) -> Result<Vec<ReactionSummary>, Error> {
@@ -1271,6 +1304,9 @@ where
             }
             ChatMsg::LeaveHuddle { channel_id } => {
                 self.stage_leave_huddle(author, &channel_id).await
+            }
+            ChatMsg::SweepHuddle { channel_id, user } => {
+                self.stage_sweep_huddle(author, &channel_id, &user).await
             }
         }
     }

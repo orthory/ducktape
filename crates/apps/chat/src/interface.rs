@@ -259,6 +259,12 @@ pub enum ChatMsg {
     /// leave the channel's huddle. leaving a huddle one is not in is a
     /// deterministic no-op; an empty roster means no huddle.
     LeaveHuddle { channel_id: String },
+    /// evict a huddle member — call liveness is not consensus-observable
+    /// (a crashed client cannot leave), so cleanup is social: any author the
+    /// channel's post policy admits may sweep a stale entry, mirroring
+    /// `SetMembership`'s trust posture. sweeping an absent user is a
+    /// deterministic no-op.
+    SweepHuddle { channel_id: String, user: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

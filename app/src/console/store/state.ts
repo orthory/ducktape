@@ -43,6 +43,11 @@ export interface VoiceSlice {
   /** The huddle lives in its own desktop window right now — the in-app card
    *  yields to it (desktop only; see store/huddle-window.ts). */
   popped: boolean;
+  /** Local camera state (ephemeral, beaconed to peers — never consensus). */
+  cameraOn: boolean;
+  /** Per-peer ephemeral call state from 1 Hz beacons, keyed by NODE hex.
+   *  Staleness (no beacon for >10 s) drives the sweep affordance. */
+  peers: Record<string, { muted: boolean; cameraOn: boolean; atMs: number }>;
 }
 
 /** One search round-trip across the modules that ship materialized views —
@@ -321,7 +326,15 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
-    voice: { channelId: null, muted: false, status: "idle", error: null, popped: false },
+    voice: {
+      channelId: null,
+      muted: false,
+      status: "idle",
+      error: null,
+      popped: false,
+      cameraOn: false,
+      peers: {},
+    },
     members: [],
     observers: [],
     proposals: [],

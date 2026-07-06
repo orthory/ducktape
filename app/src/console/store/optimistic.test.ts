@@ -190,6 +190,23 @@ describe("huddle projections", () => {
     const out = optimistic.huddleLeft(prev, "general", keyHex(selfNode));
     expect(out.channels![0].huddle).toEqual([{ user: [], node: other, joined_at: 2 }]);
   });
+
+  it("prunes exactly the swept user from the roster, keeping others", () => {
+    const staleUser = Array.from(new TextEncoder().encode("stale"));
+    const liveUser = Array.from(new TextEncoder().encode("live"));
+    const prev = base({
+      channels: [
+        channel([
+          { user: staleUser, node: [1, 1, 1], joined_at: 1 },
+          { user: liveUser, node: [2, 2, 2], joined_at: 2 },
+        ]),
+      ],
+    });
+    const out = optimistic.huddleSwept(prev, "general", keyHex(staleUser));
+    expect(out.channels![0].huddle).toEqual([
+      { user: liveUser, node: [2, 2, 2], joined_at: 2 },
+    ]);
+  });
 });
 
 describe("reaction projections", () => {

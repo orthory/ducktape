@@ -207,6 +207,22 @@ export const huddleLeft = (
   ),
 });
 
+/** Drop a swept (stale) member from a channel's huddle roster the instant the
+ *  sweep is submitted — keyed by the target's submitter identity (user) hex,
+ *  the same key the sweep op carries (unlike leave, which keys on the mesh
+ *  node). The refresh replaces the roster with committed truth after. */
+export const huddleSwept = (
+  prev: ConsoleState,
+  channelId: string,
+  userKeyHex: string,
+): Partial<ConsoleState> => ({
+  channels: prev.channels.map((c) =>
+    c.id === channelId
+      ? { ...c, huddle: (c.huddle ?? []).filter((m) => keyHex(m.user) !== userKeyHex) }
+      : c,
+  ),
+});
+
 // ── Pages ───────────────────────────────────────────────
 
 export const pageCreated = (

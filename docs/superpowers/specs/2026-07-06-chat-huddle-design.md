@@ -59,6 +59,11 @@ existing native voice engine (`chat::voice` — Opus, jitter, mixer, PR #172).
 
 ### 3. Webview-to-node audio — `GET /v1/voice/ws?channel=<id>`
 
+> **Superseded:** `/v1/voice/ws` was replaced by the typed `/v1/call/ws`
+> socket (tag-dispatched binary frames carrying audio + camera video, json
+> control both ways — see `docs/superpowers/plans/2026-07-06-video-calls.md`,
+> Task 6). The raw-PCM framing below is the historical audio-only design.
+
 - New WS route in `bin/noded` (axum, alongside `/v1/ws`): binary frames of
   exactly 1920 bytes = one 20 ms mono 48 kHz PCM frame (960 × i16 LE).
   Client→server = captured mic frames; server→client = the engine's mixed

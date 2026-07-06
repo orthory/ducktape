@@ -262,6 +262,35 @@ impl Daemon {
         reader.read_exact(&mut payload).expect("ws frame payload");
         String::from_utf8(payload).expect("ws text frame is utf-8")
     }
+
+    /// a websocket-upgrade GET that expects an http REFUSAL, not a 101: sends
+    /// the full rfc6455 handshake so the request reaches the handler body
+    /// (axum's extractor stops a plain GET before the handler can say why),
+    /// then returns whatever status + raw response text the daemon answers.
+    /// a refusal leaves the connection open (keep-alive), so the read is
+    /// timeout-bounded instead of read-to-close.
+    fn ws_upgrade_refusal(&self, path: &str) -> (u16, String) {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-key: ZHVja3RhcGUtZTJlLXdzLWtleQ==\r\nsec-websocket-version: 13\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).expect("write request");
+        let mut raw = Vec::new();
+        // read_to_end keeps what arrived before the timeout error — exactly
+        // the refusal head + body on a connection the server holds open.
+        let _ = stream.read_to_end(&mut raw);
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, text)
+    }
 }
 
 fn parse_http_body(body: &str) -> serde_json::Value {
@@ -313,6 +342,27 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
             "as_agent": null,
         }
     })
+}
+
+/// the embedded daemon runs no mesh, so it never wires a call hub — which
+/// makes the real binary exactly the no-hub case /v1/call/ws must refuse
+/// LOUDLY: 503 at upgrade with a body that says why (the #178 posture — every
+/// refusal path explains itself), never a silent hang. the replaced
+/// /v1/voice/ws route is gone outright (app and node ship lockstep): 404.
+#[test]
+fn call_ws_without_a_hub_refuses_with_a_reason() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    let (status, raw) = daemon.ws_upgrade_refusal("/v1/call/ws?channel=general");
+    assert_eq!(status, 503, "no call hub → refused at upgrade: {raw}");
+    assert!(
+        raw.contains("no mesh call hub"),
+        "refusal says WHY: {raw}"
+    );
+
+    let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
+    assert_eq!(status, 404, "the old voice route is unrouted, not refused");
 }
 
 #[test]
