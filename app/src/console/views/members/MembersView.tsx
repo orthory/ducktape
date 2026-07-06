@@ -174,7 +174,11 @@ type MemberItem =
 /** Fold rows onto one header per (tier, bound user) — keyed on tier so a user
  *  with nodes in BOTH the validator and observer tiers gets a separate header
  *  in each (the tiers are disjoint valset standings, never merged). An
- *  unbound key passes through untouched, in place, with no group wrapper. */
+ *  unbound key passes through untouched, in place, with no group wrapper.
+ *  A bound group with exactly ONE node also collapses flat: post auto-bind
+ *  most users are single-device, and the row's authorNames-resolved label
+ *  already carries the user name (the provider overlays it), so a header
+ *  would only repeat the name directly above its own row. */
 function groupMembersByUser(
   members: MemberVM[],
   nodeUsers: Record<string, { userKey: string; name: string | null }>,
@@ -201,8 +205,21 @@ function groupMembersByUser(
     }
     group.members.push(member);
   }
-  return items;
+  return items.map((item) =>
+    item.kind === "group" && item.group.members.length === 1
+      ? { kind: "member", member: item.group.members[0] }
+      : item,
+  );
 }
+
+/** A grouped node row labels by its DEVICE key: the header above it already
+ *  carries the who (the user), so the row carries the which-device. Copy,
+ *  never mutate — the detail pane and search both read the original VM. */
+const asDeviceRow = (member: MemberVM): MemberVM => ({
+  ...member,
+  displayName: member.shortKey,
+  initials: initialsOf(member.shortKey),
+});
 
 function MemberGroupHeader({ group }: { group: MemberGroup }) {
   return (
@@ -1322,7 +1339,9 @@ export function MembersView() {
                   <div key={item.group.key}>
                     <MemberGroupHeader group={item.group} />
                     <div style={{ paddingLeft: 14 }}>
-                      {item.group.members.map((member) => renderMemberRow(member))}
+                      {item.group.members.map((member) =>
+                        renderMemberRow(asDeviceRow(member)),
+                      )}
                     </div>
                   </div>
                 ),
