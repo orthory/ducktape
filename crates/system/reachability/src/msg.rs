@@ -27,6 +27,7 @@ pub struct MsgError(#[from] serde_json::Error);
 /// its signed advertisement commits to. So each epoch runs record gossip
 /// first, then signed advertisements over the agreed set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReachabilityMsg {
     /// Pre-version gossip: a member's OWNER-SIGNED record for the current
     /// epoch — self-signed so a relaying member can neither forge nor alter

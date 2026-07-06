@@ -31,7 +31,7 @@ export const setName = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { SetName: { display_name: params.displayName } },
+    { set_name: { display_name: params.displayName } },
     params.origin,
   );
 
@@ -43,5 +43,5 @@ export const allProfiles = (
   { from = 0, limit = MAX_QUERY_LIMIT }: { from?: number; limit?: number } = {},
 ): Promise<Profile[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { All: { from, limit } }))
-    .then((reply) => replyVariant<Profile[]>(reply, "Profiles"));
+    .then(() => transport.query(TARGET, { all: { from, limit } }))
+    .then((reply) => replyVariant<Profile[]>(reply, "profiles"));

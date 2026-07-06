@@ -98,17 +98,17 @@ const SCRIPT: { target: string; payload: unknown; origin: string }[] = [
   {
     target: "chat",
     payload: {
-      CreateChannel: { channel_id: "general", name: "General", post_policy: "Open" },
+      create_channel: { channel_id: "general", name: "General", post_policy: "open" },
     },
     origin: "parity-owner",
   },
   {
     target: "chat",
     payload: {
-      PostMessage: {
+      post_message: {
         channel_id: "general",
         message_id: "m-1",
-        blocks: [{ Paragraph: [{ text: "hello parity", marks: [] }] }],
+        blocks: [{ paragraph: [{ text: "hello parity", marks: [] }] }],
         thread: null,
         as_agent: null,
       },
@@ -117,15 +117,15 @@ const SCRIPT: { target: string; payload: unknown; origin: string }[] = [
   },
   {
     target: "tasks",
-    payload: { CreateTask: { task_id: "t-1", title: "parity" } },
+    payload: { create_task: { task_id: "t-1", title: "parity" } },
     origin: "parity-owner",
   },
 ];
 
 const QUERIES: { target: string; query: unknown }[] = [
-  { target: "chat", query: "Channels" },
-  { target: "chat", query: { MessagesLatest: { channel_id: "general", limit: 16 } } },
-  { target: "tasks", query: "List" },
+  { target: "chat", query: "channels" },
+  { target: "chat", query: { messages_latest: { channel_id: "general", limit: 16 } } },
+  { target: "tasks", query: "list" },
 ];
 
 describe.skipIf(!nodedBin || !simBin)("noded ↔ simnode wire conformance", () => {

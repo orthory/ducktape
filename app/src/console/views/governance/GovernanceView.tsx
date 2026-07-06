@@ -35,9 +35,9 @@ const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
 ];
 
 const STATUS_PILLS: Record<ProposalStatus, { text: string; bg: string; border: string }> = {
-  Open: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
-  Passed: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
-  Rejected: { text: color.danger, bg: color.dangerSoft, border: color.dangerBorder },
+  open: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
+  passed: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
+  rejected: { text: color.danger, bg: color.dangerSoft, border: color.dangerBorder },
 };
 
 const buttonBase: CSSProperties = {
@@ -111,9 +111,9 @@ function inFilter(proposal: ProposalVM, filter: FilterId): boolean {
     case "all":
       return true;
     case "open":
-      return proposal.status === "Open";
+      return proposal.status === "open";
     case "settled":
-      return proposal.status !== "Open";
+      return proposal.status !== "open";
   }
 }
 
@@ -226,7 +226,7 @@ function HeaderRole({
   return (
     <Pill
       label={canVote ? "Voting member" : "Read only"}
-      pill={canVote ? STATUS_PILLS.Passed : STATUS_PILLS.Open}
+      pill={canVote ? STATUS_PILLS.passed : STATUS_PILLS.open}
       title={
         canVote
           ? "This node is a current validator: it may propose, vote, and settle."
@@ -289,7 +289,7 @@ function ProposalCard({
   onVote: (approve: boolean) => void;
   onExecute: () => void;
 }) {
-  const open = proposal.status === "Open";
+  const open = proposal.status === "open";
   return (
     <div
       style={{
@@ -470,10 +470,10 @@ function ProposeForm({
         <div
           style={{
             marginTop: 9,
-            border: `1px dashed ${STATUS_PILLS.Open.border}`,
+            border: `1px dashed ${STATUS_PILLS.open.border}`,
             borderRadius: radius.lg,
-            background: STATUS_PILLS.Open.bg,
-            color: STATUS_PILLS.Open.text,
+            background: STATUS_PILLS.open.bg,
+            color: STATUS_PILLS.open.text,
             padding: "11px 13px",
             display: "flex",
             alignItems: "center",
@@ -517,7 +517,7 @@ export function GovernanceView() {
         .sort((a, b) => {
           // Open first, then by id so the ordering is stable across refreshes.
           if (a.status === b.status) return a.id.localeCompare(b.id);
-          return a.status === "Open" ? -1 : b.status === "Open" ? 1 : 0;
+          return a.status === "open" ? -1 : b.status === "open" ? 1 : 0;
         }),
     [state.proposals, localKey, memberCount],
   );
@@ -526,7 +526,7 @@ export function GovernanceView() {
     [rows, filter],
   );
   const canVote = Boolean(state.workspace?.founder || state.workspace?.member);
-  const openCount = rows.filter((proposal) => proposal.status === "Open").length;
+  const openCount = rows.filter((proposal) => proposal.status === "open").length;
 
   return (
     <div

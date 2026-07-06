@@ -15,12 +15,12 @@ const TARGET = "valset";
 
 export const validators = (transport: NodeTransport): Promise<number[][]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "Validators"))
-    .then((reply) => replyVariant<number[][]>(reply, "Validators"));
+    .then(() => transport.query(TARGET, "validators"))
+    .then((reply) => replyVariant<number[][]>(reply, "validators"));
 
 export const observers = (transport: NodeTransport): Promise<number[][]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "Observers"))
-    .then((reply) => replyVariant<number[][]>(reply, "Observers"));
+    .then(() => transport.query(TARGET, "observers"))
+    .then((reply) => replyVariant<number[][]>(reply, "observers"));
 
 export const validatorHex = (key: number[]): string => keyHex(key);

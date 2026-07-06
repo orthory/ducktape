@@ -25,6 +25,7 @@ pub struct Upgrade {
 /// not the variant: schedule/cancel are governance/system-authored, `SignalReady`
 /// is validator-authored, `Advance` is the system-injected boundary tick.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum UpgradeMsg {
     /// authorize a pending upgrade. `Origin::Module("governance") | System` only.
     Schedule {
@@ -47,6 +48,7 @@ pub enum UpgradeMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum UpgradeQuery {
     /// the current version, the pending upgrade, and the readiness verdict.
     Status,
@@ -70,6 +72,7 @@ pub struct UpgradeStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum UpgradeReply {
     Status(UpgradeStatus),
 }

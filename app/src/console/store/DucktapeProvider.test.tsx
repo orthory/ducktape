@@ -16,8 +16,8 @@ const GENERAL_MESSAGE = {
   seq: 1,
   head: {
     message_id: "m1",
-    author: { User: Array.from(new TextEncoder().encode("jess")) },
-    blocks: [{ Paragraph: [{ text: "hello", marks: [] }] }],
+    author: { user: Array.from(new TextEncoder().encode("jess")) },
+    blocks: [{ paragraph: [{ text: "hello", marks: [] }] }],
     created_at: 10,
     rev: 0,
     edited_at: null,
@@ -36,7 +36,7 @@ const wireChannel = (id: string, name: string, created_at: number) => ({
   name,
   created_at,
   head_seq: 0,
-  post_policy: "Open",
+  post_policy: "open",
   hooks: [],
   pinned: [],
 });
@@ -52,59 +52,59 @@ const makeFakeNode = () => {
   let forgeHead: string | null = null;
   const transport: NodeTransport = {
     submit: vi.fn((target: string, payload: unknown) => {
-      const create = (payload as { CreateChannel?: { channel_id: string; name: string } })
-        .CreateChannel;
+      const create = (payload as { create_channel?: { channel_id: string; name: string } })
+        .create_channel;
       if (target === "chat" && create) {
         channels.push(wireChannel(create.channel_id, create.name, 2));
         messagesByChannel[create.channel_id] = [];
       }
-      if (target === "forge" && (payload as { Commit?: unknown }).Commit) {
+      if (target === "forge" && (payload as { commit?: unknown }).commit) {
         forgeHead = "a".repeat(40);
       }
       return Promise.resolve({ height: 2, appHash: "bb".repeat(32) });
     }),
     query: vi.fn((target: string, query: unknown) => {
-      if (target === "chat" && query === "Channels") {
-        return Promise.resolve({ Channels: [...channels] });
+      if (target === "chat" && query === "channels") {
+        return Promise.resolve({ channels: [...channels] });
       }
-      const latest = (query as { MessagesLatest?: { channel_id: string } })
-        .MessagesLatest;
+      const latest = (query as { messages_latest?: { channel_id: string } })
+        .messages_latest;
       if (target === "chat" && latest) {
         return Promise.resolve({
-          Messages: messagesByChannel[latest.channel_id] ?? [],
+          messages: messagesByChannel[latest.channel_id] ?? [],
         });
       }
       if (target === "chat") {
         return Promise.resolve({
-          Thread: { root: GENERAL_MESSAGE, replies: [] },
+          thread: { root: GENERAL_MESSAGE, replies: [] },
         });
       }
       if (target === "forge") {
-        return Promise.resolve({ Head: forgeHead });
+        return Promise.resolve({ head: forgeHead });
       }
       if (target === "agent") {
-        return Promise.resolve({ Agents: [] });
+        return Promise.resolve({ agents: [] });
       }
       if (target === "runs") {
-        if (query === "Watches") return Promise.resolve({ Watches: [] });
-        return Promise.resolve({ PendingRuns: [] });
+        if (query === "watches") return Promise.resolve({ watches: [] });
+        return Promise.resolve({ pending_runs: [] });
       }
       if (target === "profiles") {
-        return Promise.resolve({ Profiles: [] });
+        return Promise.resolve({ profiles: [] });
       }
       if (target === "valset") {
-        if (query === "Observers") {
-          return Promise.resolve({ Observers: [[0xfe, 0xed]] });
+        if (query === "observers") {
+          return Promise.resolve({ observers: [[0xfe, 0xed]] });
         }
-        return Promise.resolve({ Validators: [[0xde, 0xad, 0xbe, 0xef]] });
+        return Promise.resolve({ validators: [[0xde, 0xad, 0xbe, 0xef]] });
       }
       if (target === "document") {
         // refresh now enumerates the doc index (ListDocs) and, when a doc is
         // open, re-reads its blocks (GetDoc) — answer both so refresh resolves.
-        if (query === "ListDocs") return Promise.resolve({ DocList: [] });
-        return Promise.resolve({ Doc: null });
+        if (query === "list_docs") return Promise.resolve({ doc_list: [] });
+        return Promise.resolve({ doc: null });
       }
-      return Promise.resolve({ Tasks: [] });
+      return Promise.resolve({ tasks: [] });
     }),
     view: vi.fn().mockResolvedValue({ hits: [] }),
     putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
@@ -179,7 +179,7 @@ describe("DucktapeProvider", () => {
       expect(screen.getByTestId("members").textContent).toBe("1");
       expect(screen.getByTestId("member-keys").textContent).toBe("deadbeef");
     });
-    expect(transport.query).toHaveBeenCalledWith("valset", "Validators");
+    expect(transport.query).toHaveBeenCalledWith("valset", "validators");
   });
 
   it("hydrates observer standing from valset", async () => {
@@ -189,7 +189,7 @@ describe("DucktapeProvider", () => {
     await waitFor(() => {
       expect(screen.getByTestId("observer-keys").textContent).toBe("feed");
     });
-    expect(transport.query).toHaveBeenCalledWith("valset", "Observers");
+    expect(transport.query).toHaveBeenCalledWith("valset", "observers");
   });
 
   it("sendMessage posts a paragraph block with the author as submit origin", async () => {
@@ -208,19 +208,19 @@ describe("DucktapeProvider", () => {
     expect(target).toBe("chat");
     expect(origin).toBe("operator"); // authorship travels as origin, not payload
     const msg = payload as {
-      PostMessage: {
+      post_message: {
         channel_id: string;
         message_id: string;
         blocks: unknown[];
         thread: number | null;
       };
     };
-    expect(msg.PostMessage.channel_id).toBe("general");
-    expect(msg.PostMessage.blocks).toEqual([
-      { Paragraph: [{ text: "hi node", marks: [] }] },
+    expect(msg.post_message.channel_id).toBe("general");
+    expect(msg.post_message.blocks).toEqual([
+      { paragraph: [{ text: "hi node", marks: [] }] },
     ]);
-    expect(msg.PostMessage.thread).toBeNull();
-    expect(msg.PostMessage.message_id).toBeTruthy();
+    expect(msg.post_message.thread).toBeNull();
+    expect(msg.post_message.message_id).toBeTruthy();
   });
 
   it("re-queries committed state when a block finalizes", async () => {
@@ -258,7 +258,7 @@ describe("DucktapeProvider", () => {
     );
 
     await act(async () => {
-      capturedActions!.createChannel("Release Party", "Open");
+      capturedActions!.createChannel("Release Party", "open");
     });
 
     await waitFor(() => {
@@ -339,7 +339,7 @@ describe("DucktapeProvider", () => {
       .mock.calls.find((call) => call[0] === "forge");
     expect(forgeCall).toBeTruthy();
     expect(forgeCall![1]).toEqual({
-      Commit: { path: "README.md", content: "hello forge", message: "init" },
+      commit: { path: "README.md", content: "hello forge", message: "init" },
     });
   });
 });

@@ -1,5 +1,5 @@
 // The tasks client mirrors tasks-interface: TaskMsg encoding + TaskReply
-// decoding, including the unit-variant "List" query.
+// decoding, including the unit-variant "list" query.
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -24,15 +24,15 @@ describe("task msgs", () => {
     const transport = stubTransport();
     await createTask(transport, { taskId: "t1", title: "port the app" });
     expect(transport.submit).toHaveBeenCalledWith("tasks", {
-      CreateTask: { task_id: "t1", title: "port the app" },
+      create_task: { task_id: "t1", title: "port the app" },
     });
   });
 
   it("encodes UpdateStatus with the enum status verbatim", async () => {
     const transport = stubTransport();
-    await updateStatus(transport, { taskId: "t1", status: "InProgress" });
+    await updateStatus(transport, { taskId: "t1", status: "in_progress" });
     expect(transport.submit).toHaveBeenCalledWith("tasks", {
-      UpdateStatus: { task_id: "t1", status: "InProgress" },
+      update_status: { task_id: "t1", status: "in_progress" },
     });
   });
 });
@@ -40,10 +40,10 @@ describe("task msgs", () => {
 describe("task queries", () => {
   it("sends the unit variant List and decodes Tasks", async () => {
     const wire = [
-      { id: "t1", title: "port the app", status: "Open", created_at: 1, updated_at: 1 },
+      { id: "t1", title: "port the app", status: "open", created_at: 1, updated_at: 1 },
     ];
-    const transport = stubTransport({ Tasks: wire });
+    const transport = stubTransport({ tasks: wire });
     await expect(listTasks(transport)).resolves.toEqual(wire);
-    expect(transport.query).toHaveBeenCalledWith("tasks", "List");
+    expect(transport.query).toHaveBeenCalledWith("tasks", "list");
   });
 });

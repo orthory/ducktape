@@ -36,14 +36,14 @@ const inputBase: CSSProperties = {
 };
 
 const TRIGGER_KINDS: { value: TriggerKind; label: string }[] = [
-  { value: "MessagePosted", label: "Message posted" },
-  { value: "MemoryPublished", label: "Memory published" },
+  { value: "message_posted", label: "Message posted" },
+  { value: "memory_published", label: "Memory published" },
 ];
 
 const ACTION_KINDS: { value: ActionKind; label: string }[] = [
-  { value: "PostMessage", label: "Post message" },
-  { value: "CreateTask", label: "Create task" },
-  { value: "DeliverInbox", label: "Deliver inbox" },
+  { value: "post_message", label: "Post message" },
+  { value: "create_task", label: "Create task" },
+  { value: "deliver_inbox", label: "Deliver inbox" },
 ];
 
 // ── Pure helpers ────────────────────────────────────────
@@ -54,8 +54,8 @@ const shortId = (id: string): string =>
 const chan = (id: string): string => (id.startsWith("#") ? id : `#${id}`);
 
 function summarizeTrigger(trigger: Trigger): string {
-  if ("MessagePosted" in trigger) {
-    const t = trigger.MessagePosted;
+  if ("message_posted" in trigger) {
+    const t = trigger.message_posted;
     const parts: string[] = [];
     if (t.channel_id) parts.push(`in ${chan(t.channel_id)}`);
     if (t.mention) parts.push(`mentioning ${t.mention}`);
@@ -64,7 +64,7 @@ function summarizeTrigger(trigger: Trigger): string {
       ? `When a message ${parts.join(" ")}`
       : "When any message is posted";
   }
-  const m = trigger.MemoryPublished;
+  const m = trigger.memory_published;
   const parts: string[] = [];
   if (m.prefix) parts.push(`under ${m.prefix}`);
   if (m.meta_kind) parts.push(`of kind ${m.meta_kind}`);
@@ -75,9 +75,9 @@ function summarizeTrigger(trigger: Trigger): string {
 }
 
 function summarizeAction(action: Action): string {
-  if ("PostMessage" in action) return `post to ${chan(action.PostMessage.channel_id)}`;
-  if ("CreateTask" in action) return "create task";
-  return `deliver inbox note (${action.DeliverInbox.kind})`;
+  if ("post_message" in action) return `post to ${chan(action.post_message.channel_id)}`;
+  if ("create_task" in action) return "create task";
+  return `deliver inbox note (${action.deliver_inbox.kind})`;
 }
 
 /** A human, field-aware one-liner for a committed rule. */
@@ -203,7 +203,7 @@ function BuilderLabel({ children }: { children: string }) {
 function RuleBuilder({ backed }: { backed: boolean }) {
   const { actions } = useDucktape();
 
-  const [triggerKind, setTriggerKind] = useState<TriggerKind>("MessagePosted");
+  const [triggerKind, setTriggerKind] = useState<TriggerKind>("message_posted");
   // MessagePosted fields
   const [mpChannel, setMpChannel] = useState("");
   const [mpMention, setMpMention] = useState("");
@@ -213,7 +213,7 @@ function RuleBuilder({ backed }: { backed: boolean }) {
   const [meKind, setMeKind] = useState("");
   const [meAuthor, setMeAuthor] = useState("");
 
-  const [actionKind, setActionKind] = useState<ActionKind>("PostMessage");
+  const [actionKind, setActionKind] = useState<ActionKind>("post_message");
   // PostMessage fields
   const [pmChannel, setPmChannel] = useState("");
   const [pmTemplate, setPmTemplate] = useState("");
@@ -229,9 +229,9 @@ function RuleBuilder({ backed }: { backed: boolean }) {
   const [submitHover, setSubmitHover] = useState(false);
 
   const actionValid =
-    actionKind === "PostMessage"
+    actionKind === "post_message"
       ? Boolean(pmChannel.trim() && pmTemplate.trim())
-      : actionKind === "CreateTask"
+      : actionKind === "create_task"
         ? Boolean(ctPrefix.trim() && ctTitle.trim())
         : Boolean(diMember.trim() && diKind.trim() && diBody.trim());
 
@@ -257,33 +257,33 @@ function RuleBuilder({ backed }: { backed: boolean }) {
   const create = () => {
     if (!canCreate) return;
     const trigger: Trigger =
-      triggerKind === "MessagePosted"
+      triggerKind === "message_posted"
         ? {
-            MessagePosted: {
+            message_posted: {
               channel_id: mpChannel.trim() || null,
               mention: mpMention.trim() || null,
               text_contains: mpText.trim() || null,
             },
           }
         : {
-            MemoryPublished: {
+            memory_published: {
               prefix: mePrefix.trim() || null,
               meta_kind: meKind.trim() || null,
               author_contains: meAuthor.trim() || null,
             },
           };
     const action: Action =
-      actionKind === "PostMessage"
-        ? { PostMessage: { channel_id: pmChannel.trim(), template: pmTemplate.trim() } }
-        : actionKind === "CreateTask"
+      actionKind === "post_message"
+        ? { post_message: { channel_id: pmChannel.trim(), template: pmTemplate.trim() } }
+        : actionKind === "create_task"
           ? {
-              CreateTask: {
+              create_task: {
                 task_id_prefix: ctPrefix.trim(),
                 title_template: ctTitle.trim(),
               },
             }
           : {
-              DeliverInbox: {
+              deliver_inbox: {
                 member_template: diMember.trim(),
                 kind: diKind.trim(),
                 body_template: diBody.trim(),
@@ -318,7 +318,7 @@ function RuleBuilder({ backed }: { backed: boolean }) {
           />
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-          {triggerKind === "MessagePosted" ? (
+          {triggerKind === "message_posted" ? (
             <>
               <Field
                 label="CHANNEL ID"
@@ -391,11 +391,11 @@ function RuleBuilder({ backed }: { backed: boolean }) {
           style={{
             display: "grid",
             gridTemplateColumns:
-              actionKind === "DeliverInbox" ? "1fr 1fr 1fr" : "1fr 1fr",
+              actionKind === "deliver_inbox" ? "1fr 1fr 1fr" : "1fr 1fr",
             gap: 10,
           }}
         >
-          {actionKind === "PostMessage" ? (
+          {actionKind === "post_message" ? (
             <>
               <Field
                 label="CHANNEL ID"
@@ -412,7 +412,7 @@ function RuleBuilder({ backed }: { backed: boolean }) {
                 disabled={!backed}
               />
             </>
-          ) : actionKind === "CreateTask" ? (
+          ) : actionKind === "create_task" ? (
             <>
               <Field
                 label="TASK ID PREFIX"

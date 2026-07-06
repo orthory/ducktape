@@ -23,8 +23,8 @@ import { replyVariant } from "./wire";
 
 /** How a watched channel selects which agents a user post engages. `Assigned`
  *  names exactly one agent; the other three are structural (serde newtype: the
- *  Assigned variant is `{ "Assigned": "<agent_id>" }` on the wire). */
-export type TurnPolicy = "Mention" | "All" | { Assigned: string } | "RoundRobin";
+ *  Assigned variant is `{ "assigned": "<agent_id>" }` on the wire). */
+export type TurnPolicy = "mention" | "all" | { assigned: string } | "round_robin";
 
 export interface WatchView {
   channel_id: string;
@@ -64,7 +64,7 @@ export const watchChannel = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { WatchChannel: { channel_id: params.channelId, policy: params.policy } },
+    { watch_channel: { channel_id: params.channelId, policy: params.policy } },
     params.origin,
   );
 
@@ -74,7 +74,7 @@ export const unwatchChannel = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { UnwatchChannel: { channel_id: params.channelId } },
+    { unwatch_channel: { channel_id: params.channelId } },
     params.origin,
   );
 
@@ -84,7 +84,7 @@ export const enableJobWorker = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { EnableJobWorker: { enabled: params.enabled } },
+    { enable_job_worker: { enabled: params.enabled } },
     params.origin,
   );
 
@@ -95,7 +95,7 @@ export const requestRun = (
   transport.submit(
     TARGET,
     {
-      RequestRun: {
+      request_run: {
         agent_id: params.agentId,
         channel_id: params.channelId,
         anchor_seq: params.anchorSeq,
@@ -108,7 +108,7 @@ export const cancelRun = (
   transport: NodeTransport,
   params: { runId: string; origin: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { CancelRun: { run_id: params.runId } }, params.origin);
+  transport.submit(TARGET, { cancel_run: { run_id: params.runId } }, params.origin);
 
 // ── Queries (reads over committed state) ────────────────
 
@@ -117,11 +117,11 @@ export const cancelRun = (
  *  `PendingRuns` is a unit-variant query — the bare string. */
 export const pendingRuns = (transport: NodeTransport): Promise<PendingRun[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "PendingRuns"))
-    .then((reply) => replyVariant<PendingRun[]>(reply, "PendingRuns"));
+    .then(() => transport.query(TARGET, "pending_runs"))
+    .then((reply) => replyVariant<PendingRun[]>(reply, "pending_runs"));
 
 /** Every channel watch. `Watches` is a unit-variant query — the bare string. */
 export const watches = (transport: NodeTransport): Promise<WatchView[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "Watches"))
-    .then((reply) => replyVariant<WatchView[]>(reply, "Watches"));
+    .then(() => transport.query(TARGET, "watches"))
+    .then((reply) => replyVariant<WatchView[]>(reply, "watches"));

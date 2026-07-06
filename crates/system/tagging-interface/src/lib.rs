@@ -55,6 +55,7 @@ pub struct EntityRef {
 /// engagement (an engaged entity's reply is itself content, and entity-,
 /// module-, and system-authored content must never re-fire).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Author {
     /// an external submitter's (non-empty) public key bytes.
     User(Vec<u8>),
@@ -84,6 +85,7 @@ pub struct TagEvent {
 // ---- ops -----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaggingMsg {
     /// MODULE-ORIGIN ONLY: register the emitting module as a subscriber of
     /// `(source, container)`. idempotent — re-subscribing an existing
@@ -114,6 +116,7 @@ pub struct EngagementEvent {
 // ---- queries --------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaggingQuery {
     /// every subscription scope with its subscriber set.
     Subscriptions,
@@ -130,6 +133,7 @@ pub struct SubscriptionView {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaggingReply {
     Subscriptions(Vec<SubscriptionView>),
     Subscribers(Vec<String>),

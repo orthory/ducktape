@@ -34,6 +34,7 @@ pub const MAX_QUERY_LIMIT: u64 = 256;
 
 /// who authored a message — derived from `Env.origin`, never from a payload.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthorRef {
     /// an external submitter's (non-empty) public key bytes.
     User(Vec<u8>),
@@ -53,6 +54,7 @@ pub enum AuthorRef {
 /// inline formatting applied to a [`Span`]. mentions are structured so
 /// agent-trigger parsing stays deterministic.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Mark {
     Bold,
     Italic,
@@ -79,6 +81,7 @@ impl Span {
 
 /// one block of a message body.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Block {
     Paragraph(Vec<Span>),
     Code { lang: Option<String>, text: String },
@@ -95,6 +98,7 @@ impl Block {
 
 /// who may post (and react) in a channel.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PostPolicy {
     /// any authenticated author.
     Open,
@@ -167,6 +171,7 @@ pub struct Thread {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatMsg {
     CreateChannel {
         channel_id: String,
@@ -229,6 +234,7 @@ pub enum ChatMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatQuery {
     Channels,
     Channel {
@@ -273,6 +279,7 @@ pub enum ChatQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatReply {
     Channels(Vec<Channel>),
     Channel(Option<Channel>),
@@ -287,6 +294,7 @@ pub enum ChatReply {
 /// the hook notification payload: one follow-up [`sdk::Msg`]-shaped dispatch
 /// per registered hook module, emitted in the same block as the post (P2).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatEvent {
     MessagePosted {
         channel_id: String,

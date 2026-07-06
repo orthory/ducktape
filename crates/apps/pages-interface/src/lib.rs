@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 /// but only [`PageMsg::CreatePage`] may mint one — block ops that try to
 /// insert or convert to `Page` are rejected.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockKind {
     Page,
     Paragraph,
@@ -85,6 +86,7 @@ pub struct BlockRef {
 /// "first child of `parent`"; `Some(id)` == "immediately after that sibling"
 /// (the anchor must be a child of `parent`, else the op errors).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PageMsg {
     /// create a top-level page: a root block of kind `Page` whose text is
     /// `title`. idempotent: re-creating an existing page is a benign no-op
@@ -128,6 +130,7 @@ pub fn decode_msg(b: &[u8]) -> Result<PageMsg, String> {
 
 /// read requests the pages module serves via `Module::query`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PageQuery {
     /// the whole page as its blocks in PREORDER (root first, each block's
     /// subtree before its next sibling). `None` == no page at that id.
@@ -151,6 +154,7 @@ pub struct PageMeta {
 
 /// replies to a [`PageQuery`]. `Option` mirrors absence.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PageReply {
     Page(Option<Vec<Block>>),
     Block(Option<Block>),

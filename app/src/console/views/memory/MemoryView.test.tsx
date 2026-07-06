@@ -9,9 +9,9 @@ import { createInitialState, type ConsoleState } from "../../store/state";
 import { MemoryView } from "./MemoryView";
 
 const entries: LsEntry[] = [
-  { Dir: { path: "/projects" } },
+  { dir: { path: "/projects" } },
   {
-    File: {
+    file: {
       path: "/notes.md",
       latest_generation: 3,
       generations: 3,

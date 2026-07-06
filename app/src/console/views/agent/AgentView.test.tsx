@@ -16,7 +16,7 @@ const channels: Channel[] = [
     name: "General",
     created_at: 1,
     head_seq: 42,
-    post_policy: "Open",
+    post_policy: "open",
     hooks: [],
     pinned: [],
   },
@@ -25,7 +25,7 @@ const channels: Channel[] = [
     name: "Project",
     created_at: 2,
     head_seq: 7,
-    post_policy: "Open",
+    post_policy: "open",
     hooks: [],
     pinned: [],
   },
@@ -40,30 +40,30 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
     agents: [
       {
         agent_id: "summarizer",
-        owner: "System" as const,
+        owner: "system" as const,
         display_name: "Summary Agent",
         capability: "alpha",
         prompt_hash: bytes(0xab),
         prompt_doc: null,
         allowed_actions: ["chat.post", "tasks.create"],
-        status: "Active" as const,
+        status: "active" as const,
         created_at: 10,
         updated_at: 20,
       },
       {
         agent_id: "qa-agent",
-        owner: "System" as const,
+        owner: "system" as const,
         display_name: "QA Agent",
         capability: "beta",
         prompt_hash: bytes(0xcd),
         prompt_doc: null,
         allowed_actions: ["chat.post"],
-        status: "Paused" as const,
+        status: "paused" as const,
         created_at: 11,
         updated_at: 21,
       },
     ],
-    watches: [{ channel_id: "general", policy: { Assigned: "summarizer" } }],
+    watches: [{ channel_id: "general", policy: { assigned: "summarizer" } }],
     pendingRuns: [
       {
         run_id: "general/42/summarizer",
@@ -74,7 +74,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         thread_root: null,
         job_id: null,
         job_claim_height: 0,
-        requester: "System" as const,
+        requester: "system" as const,
         created_at: 30,
       },
     ],
@@ -131,12 +131,12 @@ describe("AgentView", () => {
       target: { value: "project" },
     });
     fireEvent.change(screen.getByLabelText("Turn policy"), {
-      target: { value: "Mention" },
+      target: { value: "mention" },
     });
     fireEvent.click(screen.getByRole("button", { name: /watch channel/i }));
     expect(spies.watchChannel).toHaveBeenCalledWith({
       channelId: "project",
-      policy: "Mention",
+      policy: "mention",
     });
 
     fireEvent.click(screen.getByRole("button", { name: /stop watching general/i }));

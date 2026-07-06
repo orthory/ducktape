@@ -24,7 +24,7 @@ const makeActions = () => {
 const blockOf = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
   parent: "p1",
   page: "p1",
-  kind: "Paragraph",
+  kind: "paragraph",
   text: "",
   checked: false,
   children: [],
@@ -32,9 +32,9 @@ const blockOf = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
 });
 
 const PAGE: PageBlock[] = [
-  blockOf({ id: "p1", parent: null, kind: "Page", text: "Launch plan", children: ["a", "b"] }),
+  blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["a", "b"] }),
   blockOf({ id: "a", text: "First draft" }),
-  blockOf({ id: "b", kind: "Todo", text: "Ship it" }),
+  blockOf({ id: "b", kind: "todo", text: "Ship it" }),
 ];
 
 const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
@@ -82,28 +82,28 @@ describe("PagesView", () => {
   it("renders the tree as labelled editors with the title on the root", () => {
     renderPagesView();
     expect(screen.getByLabelText("Page title")).toHaveValue("Launch plan");
-    expect(screen.getByLabelText("Edit Paragraph block 1")).toHaveValue("First draft");
-    expect(screen.getByLabelText("Edit Todo block 2")).toHaveValue("Ship it");
+    expect(screen.getByLabelText("Edit paragraph block 1")).toHaveValue("First draft");
+    expect(screen.getByLabelText("Edit todo block 2")).toHaveValue("Ship it");
   });
 
   it("splits on Enter: a fresh sibling after the current block", () => {
     const { spies } = renderPagesView();
-    fireEvent.keyDown(screen.getByLabelText("Edit Paragraph block 1"), {
+    fireEvent.keyDown(screen.getByLabelText("Edit paragraph block 1"), {
       key: "Enter",
     });
     expect(spies.insertPageBlock).toHaveBeenCalledWith(
-      expect.objectContaining({ parent: "p1", after: "a", kind: "Paragraph" }),
+      expect.objectContaining({ parent: "p1", after: "a", kind: "paragraph" }),
     );
   });
 
   it("converts a paragraph via a typed markdown prefix", () => {
     const { spies } = renderPagesView();
-    fireEvent.change(screen.getByLabelText("Edit Paragraph block 1"), {
+    fireEvent.change(screen.getByLabelText("Edit paragraph block 1"), {
       target: { value: "# First draft" },
     });
     expect(spies.setPageBlockKind).toHaveBeenCalledWith({
       blockId: "a",
-      kind: "Heading1",
+      kind: "heading1",
     });
   });
 
@@ -118,7 +118,7 @@ describe("PagesView", () => {
 
   it("indents with Tab using the previous sibling as the new parent", () => {
     const { spies } = renderPagesView();
-    fireEvent.keyDown(screen.getByLabelText("Edit Todo block 2"), {
+    fireEvent.keyDown(screen.getByLabelText("Edit todo block 2"), {
       key: "Tab",
     });
     expect(spies.movePageBlock).toHaveBeenCalledWith({
@@ -131,12 +131,12 @@ describe("PagesView", () => {
   it("removes an empty block on Backspace", () => {
     const { spies } = renderPagesView({
       activePageBlocks: [
-        blockOf({ id: "p1", parent: null, kind: "Page", text: "T", children: ["a", "empty"] }),
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a", "empty"] }),
         blockOf({ id: "a", text: "keep" }),
         blockOf({ id: "empty", text: "" }),
       ],
     });
-    fireEvent.keyDown(screen.getByLabelText("Edit Paragraph block 2"), {
+    fireEvent.keyDown(screen.getByLabelText("Edit paragraph block 2"), {
       key: "Backspace",
     });
     expect(spies.removePageBlock).toHaveBeenCalledWith("empty");

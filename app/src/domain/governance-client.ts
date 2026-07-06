@@ -20,13 +20,13 @@ const TARGET = "governance";
 
 // ── Wire types (GovReply / ProposalView payloads, verbatim) ─────────────────
 
-export type ProposalStatus = "Open" | "Passed" | "Rejected";
+export type ProposalStatus = "open" | "passed" | "rejected";
 
 /** What a passing proposal DOES. Serializes as a single-variant object. */
 export type GovAction =
-  | { AddValidator: { key: number[] } }
-  | { RemoveValidator: { key: number[] } }
-  | { Signal: { text: string } };
+  | { add_validator: { key: number[] } }
+  | { remove_validator: { key: number[] } }
+  | { signal: { text: string } };
 
 export interface ProposalView {
   proposal_id: string;
@@ -47,8 +47,8 @@ export const DEFAULT_VOTING_PERIOD = 1_000_000;
 
 export const proposals = (transport: NodeTransport): Promise<ProposalView[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "Proposals"))
-    .then((reply) => replyVariant<ProposalView[]>(reply, "Proposals"));
+    .then(() => transport.query(TARGET, "proposals"))
+    .then((reply) => replyVariant<ProposalView[]>(reply, "proposals"));
 
 // ── Msgs (writes) ───────────────────────────────────────
 
@@ -57,7 +57,7 @@ export const propose = (
   params: { proposalId: string; action: GovAction; votingPeriod?: number },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    Propose: {
+    propose: {
       proposal_id: params.proposalId,
       action: params.action,
       voting_period: params.votingPeriod ?? DEFAULT_VOTING_PERIOD,
@@ -69,14 +69,14 @@ export const vote = (
   params: { proposalId: string; approve: boolean },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    Vote: { proposal_id: params.proposalId, approve: params.approve },
+    vote: { proposal_id: params.proposalId, approve: params.approve },
   });
 
 export const execute = (
   transport: NodeTransport,
   params: { proposalId: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { Execute: { proposal_id: params.proposalId } });
+  transport.submit(TARGET, { execute: { proposal_id: params.proposalId } });
 
 // ── Pure helpers ────────────────────────────────────────
 
@@ -84,21 +84,21 @@ export const proposerHex = (key: number[]): string => keyHex(key);
 
 /** A human summary of what a proposal would do. */
 export const actionLabel = (action: GovAction): string => {
-  if ("AddValidator" in action) return "Add validator";
-  if ("RemoveValidator" in action) return "Remove validator";
-  return "Signal";
+  if ("add_validator" in action) return "Add validator";
+  if ("remove_validator" in action) return "Remove validator";
+  return "signal";
 };
 
 /** The subject key of a membership action, hex — null for a signal. */
 export const actionKeyHex = (action: GovAction): string | null => {
-  if ("AddValidator" in action) return keyHex(action.AddValidator.key);
-  if ("RemoveValidator" in action) return keyHex(action.RemoveValidator.key);
+  if ("add_validator" in action) return keyHex(action.add_validator.key);
+  if ("remove_validator" in action) return keyHex(action.remove_validator.key);
   return null;
 };
 
 /** The free text of a signal action — null for a membership action. */
 export const actionText = (action: GovAction): string | null =>
-  "Signal" in action ? action.Signal.text : null;
+  "signal" in action ? action.signal.text : null;
 
 export interface Tally {
   yes: number;

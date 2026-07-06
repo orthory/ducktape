@@ -14,17 +14,17 @@ import { replyVariant } from "./wire";
 // ── Wire types (verbatim serde shapes) ──────────────────
 
 export type JobStatus =
-  | "Pending"
-  | "Processing"
-  | "Done"
-  | "Failed"
-  | "Cancelled";
+  | "pending"
+  | "processing"
+  | "done"
+  | "failed"
+  | "cancelled";
 
 /** Terminal states never transition again (only Prune removes them). */
 export const TERMINAL_STATUSES: readonly JobStatus[] = [
-  "Done",
-  "Failed",
-  "Cancelled",
+  "done",
+  "failed",
+  "cancelled",
 ];
 
 export const isTerminal = (status: JobStatus): boolean =>
@@ -78,7 +78,7 @@ export const submitJob = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { Submit: { job_id: params.jobId, kind: params.kind, spec: params.spec } },
+    { submit: { job_id: params.jobId, kind: params.kind, spec: params.spec } },
     params.origin,
   );
 
@@ -89,7 +89,7 @@ export const claimJob = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { Claim: { job_id: params.jobId, lease_views: params.leaseViews } },
+    { claim: { job_id: params.jobId, lease_views: params.leaseViews } },
     params.origin,
   );
 
@@ -100,7 +100,7 @@ export const finalizeJob = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { Finalize: { job_id: params.jobId, ok: params.ok, payload: params.payload } },
+    { finalize: { job_id: params.jobId, ok: params.ok, payload: params.payload } },
     params.origin,
   );
 
@@ -109,28 +109,28 @@ export const releaseJob = (
   transport: NodeTransport,
   params: { jobId: string; origin?: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { Release: { job_id: params.jobId } }, params.origin);
+  transport.submit(TARGET, { release: { job_id: params.jobId } }, params.origin);
 
 /** Permissionless requeue of a Processing job whose lease has expired. */
 export const reclaimJob = (
   transport: NodeTransport,
   params: { jobId: string; origin?: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { Reclaim: { job_id: params.jobId } }, params.origin);
+  transport.submit(TARGET, { reclaim: { job_id: params.jobId } }, params.origin);
 
 /** The submitter cancels a still-Pending job. */
 export const cancelJob = (
   transport: NodeTransport,
   params: { jobId: string; origin?: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { Cancel: { job_id: params.jobId } }, params.origin);
+  transport.submit(TARGET, { cancel: { job_id: params.jobId } }, params.origin);
 
 /** The submitter removes a terminal job's record entirely. */
 export const pruneJob = (
   transport: NodeTransport,
   params: { jobId: string; origin?: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { Prune: { job_id: params.jobId } }, params.origin);
+  transport.submit(TARGET, { prune: { job_id: params.jobId } }, params.origin);
 
 // ── Queries (reads over committed state) ────────────────
 
@@ -139,8 +139,8 @@ export const getJob = (
   jobId: string,
 ): Promise<Job | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { Get: { job_id: jobId } }))
-    .then((reply) => replyVariant<Job | null>(reply, "Job"));
+    .then(() => transport.query(TARGET, { get: { job_id: jobId } }))
+    .then((reply) => replyVariant<Job | null>(reply, "job"));
 
 /** Jobs filtered by optional status and a kind prefix, at most `limit`. */
 export const listJobs = (
@@ -150,16 +150,16 @@ export const listJobs = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        List: {
+        list: {
           status: params.status ?? null,
           kind_prefix: params.kindPrefix ?? "",
           limit: params.limit ?? 256,
         },
       }),
     )
-    .then((reply) => replyVariant<Job[]>(reply, "Jobs"));
+    .then((reply) => replyVariant<Job[]>(reply, "jobs"));
 
 export const counts = (transport: NodeTransport): Promise<BoardCounts> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { Counts: {} }))
-    .then((reply) => replyVariant<BoardCounts>(reply, "Counts"));
+    .then(() => transport.query(TARGET, { counts: {} }))
+    .then((reply) => replyVariant<BoardCounts>(reply, "counts"));

@@ -6,15 +6,15 @@
 //! head. writes go via [`ForgeMsg`] (a file put + commit, or a git push); reads
 //! via [`ForgeQuery`] -> [`ForgeReply`], returning HEAD oids as hex.
 //!
-//! ## back-compat: the default repo
+//! ## the default repo
 //!
 //! the `repo` field on [`ForgeMsg::Commit`]/[`ForgeMsg::Push`] carries
 //! `#[serde(default)]`, so a wire message that omits it deserializes with
 //! `repo == ""`; the module normalizes an empty repo to the well-known
-//! `"default"` repo. an old client that sends `{"Commit":{path,content,message}}`
-//! and queries `"Head"` therefore keeps targeting one canonical repo with no
-//! change — the multi-repo surface ([`ForgeQuery::HeadOf`]/[`ForgeQuery::
-//! ListRepos`]) is purely additive.
+//! `"default"` repo. a single-repo client that sends
+//! `{"commit":{path,content,message}}` and queries `"head"` therefore keeps
+//! targeting one canonical repo with no change — the multi-repo surface
+//! ([`ForgeQuery::HeadOf`]/[`ForgeQuery::ListRepos`]) is purely additive.
 
 use serde::{Deserialize, Serialize};
 
@@ -26,8 +26,9 @@ use serde::{Deserialize, Serialize};
 /// both variants name their target repo via `repo`. the field is
 /// `#[serde(default)]`, so an omitted/empty `repo` deserializes to `""` and the
 /// module maps it to the `"default"` repo (see the module docstring) — the
-/// legacy single-repo wire is preserved byte-for-byte.
+/// single-repo wire needs no `repo` key at all.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ForgeMsg {
     Commit {
         /// the target repo slug; empty/absent -> the `"default"` repo.
@@ -62,9 +63,10 @@ pub enum ForgeMsg {
 
 /// reads over the repo namespace.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ForgeQuery {
-    /// the canonical head of the `"default"` repo — the legacy single-repo query
-    /// (kept as a unit variant so an old `"Head"` message still works).
+    /// the canonical head of the `"default"` repo — the single-repo query
+    /// (a unit variant: the bare `"head"` string on the wire).
     Head,
     /// the canonical head of a named repo (empty -> `"default"`).
     HeadOf { repo: String },
@@ -77,6 +79,7 @@ pub enum ForgeQuery {
 /// holds while the app-hash keeps sha256-strength (the head oid is the root's
 /// preimage material).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ForgeReply {
     /// a single repo's head hex (the reply to [`ForgeQuery::Head`]/[`ForgeQuery::
     /// HeadOf`]).
@@ -119,12 +122,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_commit_without_repo_decodes_with_empty_repo() {
-        // the exact bytes an old client (and the app's forge-client) sends: no
-        // `repo` key. `#[serde(default)]` must fill it with "" so the module can
-        // map it to the default repo — this is the whole back-compat contract.
-        let legacy = br#"{"Commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
-        let msg = decode_msg(legacy).expect("legacy Commit must still decode");
+    fn commit_without_repo_decodes_with_empty_repo() {
+        // the exact bytes a single-repo client (and the app's forge-client)
+        // sends: no `repo` key. `#[serde(default)]` must fill it with "" so the
+        // module can map it to the default repo — this is the defaulting contract.
+        let legacy = br#"{"commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
+        let msg = decode_msg(legacy).expect("repo-less commit must decode");
         assert_eq!(
             msg,
             ForgeMsg::Commit {
@@ -137,9 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_push_without_repo_decodes_with_empty_repo() {
-        let legacy = br#"{"Push":{"prev_oid":null,"new_oid":[1,2,3],"pack_digest":[4,5]}}"#;
-        let msg = decode_msg(legacy).expect("legacy Push must still decode");
+    fn push_without_repo_decodes_with_empty_repo() {
+        let legacy = br#"{"push":{"prev_oid":null,"new_oid":[1,2,3],"pack_digest":[4,5]}}"#;
+        let msg = decode_msg(legacy).expect("repo-less push must decode");
         assert_eq!(
             msg,
             ForgeMsg::Push {
@@ -152,8 +155,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_head_query_still_decodes_as_the_unit_variant() {
-        assert_eq!(decode_query(br#""Head""#).unwrap(), ForgeQuery::Head);
+    fn bare_head_query_decodes_as_the_unit_variant() {
+        assert_eq!(decode_query(br#""head""#).unwrap(), ForgeQuery::Head);
     }
 
     #[test]

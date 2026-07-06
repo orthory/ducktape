@@ -44,7 +44,7 @@ export const deliver = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { Deliver: { member: params.member, kind: params.kind, body: params.body } },
+    { deliver: { member: params.member, kind: params.kind, body: params.body } },
     params.origin,
   );
 
@@ -54,7 +54,7 @@ export const markRead = (
   params: { member: string; upToSeq: number },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    MarkRead: { member: params.member, up_to_seq: params.upToSeq },
+    mark_read: { member: params.member, up_to_seq: params.upToSeq },
   });
 
 /** Delete every item with `seq <= upToSeq`. `next_seq` never rewinds. */
@@ -63,7 +63,7 @@ export const clear = (
   params: { member: string; upToSeq: number },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    Clear: { member: params.member, up_to_seq: params.upToSeq },
+    clear: { member: params.member, up_to_seq: params.upToSeq },
   });
 
 // ── Queries (reads over committed state) ────────────────
@@ -77,14 +77,14 @@ export const list = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        List: {
+        list: {
           member: params.member,
           from_seq: params.fromSeq ?? 0,
           limit: params.limit ?? MAX_QUERY_LIMIT,
         },
       }),
     )
-    .then((reply) => replyVariant<Notification[]>(reply, "Items"));
+    .then((reply) => replyVariant<Notification[]>(reply, "items"));
 
 /** Count of unread items for `member`. */
 export const unread = (
@@ -92,5 +92,5 @@ export const unread = (
   member: string,
 ): Promise<number> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { Unread: { member } }))
-    .then((reply) => replyVariant<number>(reply, "UnreadCount"));
+    .then(() => transport.query(TARGET, { unread: { member } }))
+    .then((reply) => replyVariant<number>(reply, "unread_count"));

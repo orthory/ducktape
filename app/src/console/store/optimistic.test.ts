@@ -16,7 +16,7 @@ describe("postedMessage", () => {
     const out = optimistic.postedMessage(prev, {
       channelId: "general",
       messageId: "m-1",
-      blocks: [{ Paragraph: [{ text: "hi", marks: [] }] }],
+      blocks: [{ paragraph: [{ text: "hi", marks: [] }] }],
       author: "jess",
       at: 123,
       thread: null,
@@ -26,7 +26,7 @@ describe("postedMessage", () => {
     expect(view.seq).toBe(1);
     expect(view.head.message_id).toBe("m-1");
     expect(view.head.author).toEqual({
-      User: Array.from(new TextEncoder().encode("jess")),
+      user: Array.from(new TextEncoder().encode("jess")),
     });
   });
 
@@ -77,7 +77,7 @@ describe("page block projections", () => {
     id,
     parent,
     page: "root",
-    kind: id === "root" ? "Page" : "Paragraph",
+    kind: id === "root" ? "page" : "paragraph",
     text: id,
     checked: false,
     children,
@@ -142,15 +142,15 @@ describe("page block projections", () => {
 
 describe("doc block projections", () => {
   const doc = [
-    { id: "x", kind: "Paragraph" as const, text: "x" },
-    { id: "y", kind: "Paragraph" as const, text: "y" },
+    { id: "x", kind: "paragraph" as const, text: "x" },
+    { id: "y", kind: "paragraph" as const, text: "y" },
   ];
 
   it("inserts at the front on a null anchor (the module's `after` rule)", () => {
     const prev = base({ activeDocBlocks: doc });
     const out = optimistic.docBlockInserted(prev, {
       after: null,
-      block: { id: "n", kind: "Paragraph", text: "n" },
+      block: { id: "n", kind: "paragraph", text: "n" },
     });
     expect(out.activeDocBlocks!.map((b) => b.id)).toEqual(["n", "x", "y"]);
   });
@@ -199,7 +199,7 @@ describe("reaction projections", () => {
 
     const added = optimistic.reactionToggled(prev, "general", seeded.seq, "🦆", self, false);
     expect(added.messages![0].reactions).toEqual([
-      { emoji: "🦆", reactors: [{ User: self }] },
+      { emoji: "🦆", reactors: [{ user: self }] },
     ]);
 
     const removed = optimistic.reactionToggled(

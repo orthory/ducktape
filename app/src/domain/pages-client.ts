@@ -1,6 +1,6 @@
 // Typed client for the node's `pages` module — the TS mirror of
 // `crates/apps/pages-interface`. A page is a TREE of blocks: the page itself
-// is the root block (kind "Page", text == title), each block carries an
+// is the root block (kind "page", text == title), each block carries an
 // ordered `children` list, and block ids are GLOBALLY UNIQUE within the
 // module — getBlock resolves a bare id with no page context, which is what
 // makes a block referenceable from elsewhere (see BlockRef). Same contract as
@@ -13,23 +13,23 @@ import { replyVariant } from "./wire";
 // ── Wire types (block records + PageReply payloads, verbatim) ─
 
 export type BlockKind =
-  | "Page"
-  | "Paragraph"
-  | "Heading1"
-  | "Heading2"
-  | "Heading3"
-  | "Bulleted"
-  | "Numbered"
-  | "Todo"
-  | "Toggle"
-  | "Quote"
-  | "Code"
-  | "Callout"
-  | "Divider";
+  | "page"
+  | "paragraph"
+  | "heading1"
+  | "heading2"
+  | "heading3"
+  | "bulleted"
+  | "numbered"
+  | "todo"
+  | "toggle"
+  | "quote"
+  | "code"
+  | "callout"
+  | "divider";
 
 /** One stored block. `parent` is null only for a page root; `page` names the
  *  root block of the page this block belongs to (a root names itself);
- *  `checked` is only meaningful for kind "Todo". */
+ *  `checked` is only meaningful for kind "todo". */
 export interface PageBlock {
   id: string;
   parent: string | null;
@@ -66,7 +66,7 @@ export const createPage = (
   params: { pageId: string; title: string },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    CreatePage: { page_id: params.pageId, title: params.title },
+    create_page: { page_id: params.pageId, title: params.title },
   });
 
 export const insertBlock = (
@@ -78,7 +78,7 @@ export const insertBlock = (
   },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    InsertBlock: {
+    insert_block: {
       parent: params.parent,
       after: params.after,
       block: params.block,
@@ -90,7 +90,7 @@ export const updateText = (
   params: { blockId: string; text: string },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    UpdateText: { block_id: params.blockId, text: params.text },
+    update_text: { block_id: params.blockId, text: params.text },
   });
 
 export const setKind = (
@@ -98,7 +98,7 @@ export const setKind = (
   params: { blockId: string; kind: BlockKind },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    SetKind: { block_id: params.blockId, kind: params.kind },
+    set_kind: { block_id: params.blockId, kind: params.kind },
   });
 
 export const setChecked = (
@@ -106,7 +106,7 @@ export const setChecked = (
   params: { blockId: string; checked: boolean },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    SetChecked: { block_id: params.blockId, checked: params.checked },
+    set_checked: { block_id: params.blockId, checked: params.checked },
   });
 
 export const moveBlock = (
@@ -114,7 +114,7 @@ export const moveBlock = (
   params: { blockId: string; parent: string; after: string | null },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    MoveBlock: {
+    move_block: {
       block_id: params.blockId,
       parent: params.parent,
       after: params.after,
@@ -125,7 +125,7 @@ export const removeBlock = (
   transport: NodeTransport,
   blockId: string,
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { RemoveBlock: { block_id: blockId } });
+  transport.submit(TARGET, { remove_block: { block_id: blockId } });
 
 // ── Queries (reads over committed state) ────────────────
 
@@ -136,8 +136,8 @@ export const getPage = (
   pageId: string,
 ): Promise<PageBlock[] | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { GetPage: { page_id: pageId } }))
-    .then((reply) => replyVariant<PageBlock[] | null>(reply, "Page"));
+    .then(() => transport.query(TARGET, { get_page: { page_id: pageId } }))
+    .then((reply) => replyVariant<PageBlock[] | null>(reply, "page"));
 
 /** A single block by id ALONE — the BlockRef resolution surface. The reply
  *  carries the block's `page` and `parent`, so a resolver learns where the
@@ -147,15 +147,15 @@ export const getBlock = (
   blockId: string,
 ): Promise<PageBlock | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { GetBlock: { block_id: blockId } }))
-    .then((reply) => replyVariant<PageBlock | null>(reply, "Block"));
+    .then(() => transport.query(TARGET, { get_block: { block_id: blockId } }))
+    .then((reply) => replyVariant<PageBlock | null>(reply, "block"));
 
 /** Every page, sorted by id, with live titles — the module's enumeration
  *  index joined against the root blocks. */
 export const listPages = (transport: NodeTransport): Promise<PageMeta[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "ListPages"))
-    .then((reply) => replyVariant<PageMeta[]>(reply, "PageList"));
+    .then(() => transport.query(TARGET, "list_pages"))
+    .then((reply) => replyVariant<PageMeta[]>(reply, "page_list"));
 
 // ── Materialized view (the module's derived-index endpoint) ──
 

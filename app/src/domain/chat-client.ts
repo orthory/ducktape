@@ -21,12 +21,12 @@ import { replyVariant } from "./wire";
 // ── Wire types (verbatim serde shapes) ──────────────────
 
 export type AuthorRef =
-  | { User: number[] }
-  | { Agent: { module: string; agent_id: string } }
-  | { Module: string }
-  | "System";
+  | { user: number[] }
+  | { agent: { module: string; agent_id: string } }
+  | { module: string }
+  | "system";
 
-export type Mark = "Bold" | "Italic" | { Link: string } | { Mention: AuthorRef };
+export type Mark = "bold" | "italic" | { link: string } | { mention: AuthorRef };
 
 export interface Span {
   text: string;
@@ -34,12 +34,12 @@ export interface Span {
 }
 
 export type ChatBlock =
-  | { Paragraph: Span[] }
-  | { Code: { lang: string | null; text: string } }
-  | { Quote: Span[] }
-  | "Divider";
+  | { paragraph: Span[] }
+  | { code: { lang: string | null; text: string } }
+  | { quote: Span[] }
+  | "divider";
 
-export type PostPolicy = "Open" | "MembersOnly";
+export type PostPolicy = "open" | "members_only";
 
 export interface Channel {
   id: string;
@@ -103,11 +103,11 @@ export const keyHex = (bytes: number[]): string =>
  *  identity the daemon stamped; when the `profiles` registry (`names`) resolves
  *  those bytes it wins, else we fall back to the utf-8/hex handle. */
 export const authorName = (author: AuthorRef, names?: AuthorNames): string => {
-  if (author === "System") return "system";
-  if ("User" in author)
-    return names?.[keyHex(author.User)] ?? displayUserBytes(author.User);
-  if ("Agent" in author) return `${author.Agent.module}/${author.Agent.agent_id}`;
-  return author.Module;
+  if (author === "system") return "system";
+  if ("user" in author)
+    return names?.[keyHex(author.user)] ?? displayUserBytes(author.user);
+  if ("agent" in author) return `${author.agent.module}/${author.agent.agent_id}`;
+  return author.module;
 };
 
 /** User author bytes are a claimed display name on the embedded daemon but a
@@ -131,10 +131,10 @@ const spanText = (spans: Span[]): string => spans.map((span) => span.text).join(
 export const blocksText = (blocks: ChatBlock[]): string =>
   blocks
     .map((block) => {
-      if (block === "Divider") return "———";
-      if ("Paragraph" in block) return spanText(block.Paragraph);
-      if ("Quote" in block) return `> ${spanText(block.Quote)}`;
-      return block.Code.text;
+      if (block === "divider") return "———";
+      if ("paragraph" in block) return spanText(block.paragraph);
+      if ("quote" in block) return `> ${spanText(block.quote)}`;
+      return block.code.text;
     })
     .join("\n");
 
@@ -147,7 +147,7 @@ export const createChannel = (
   transport.submit(
     TARGET,
     {
-      CreateChannel: {
+      create_channel: {
         channel_id: params.channelId,
         name: params.name,
         post_policy: params.postPolicy,
@@ -170,7 +170,7 @@ export const postMessage = (
   transport.submit(
     TARGET,
     {
-      PostMessage: {
+      post_message: {
         channel_id: params.channelId,
         message_id: params.messageId,
         blocks: params.blocks,
@@ -190,7 +190,7 @@ export const addReaction = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { AddReaction: { channel_id: params.channelId, seq: params.seq, emoji: params.emoji } },
+    { add_reaction: { channel_id: params.channelId, seq: params.seq, emoji: params.emoji } },
     params.origin,
   );
 
@@ -200,7 +200,7 @@ export const removeReaction = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { RemoveReaction: { channel_id: params.channelId, seq: params.seq, emoji: params.emoji } },
+    { remove_reaction: { channel_id: params.channelId, seq: params.seq, emoji: params.emoji } },
     params.origin,
   );
 
@@ -216,7 +216,7 @@ export const editMessage = (
   transport.submit(
     TARGET,
     {
-      EditMessage: {
+      edit_message: {
         channel_id: params.channelId,
         seq: params.seq,
         blocks: params.blocks,
@@ -234,7 +234,7 @@ export const deleteMessage = (
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
-    { DeleteMessage: { channel_id: params.channelId, seq: params.seq } },
+    { delete_message: { channel_id: params.channelId, seq: params.seq } },
     params.origin,
   );
 
@@ -242,8 +242,8 @@ export const deleteMessage = (
 
 export const channels = (transport: NodeTransport): Promise<Channel[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "Channels"))
-    .then((reply) => replyVariant<Channel[]>(reply, "Channels"));
+    .then(() => transport.query(TARGET, "channels"))
+    .then((reply) => replyVariant<Channel[]>(reply, "channels"));
 
 export const latestMessages = (
   transport: NodeTransport,
@@ -253,10 +253,10 @@ export const latestMessages = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        MessagesLatest: { channel_id: channelId, limit },
+        messages_latest: { channel_id: channelId, limit },
       }),
     )
-    .then((reply) => replyVariant<MessageView[]>(reply, "Messages"));
+    .then((reply) => replyVariant<MessageView[]>(reply, "messages"));
 
 export const thread = (
   transport: NodeTransport,
@@ -265,7 +265,7 @@ export const thread = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        Thread: {
+        thread: {
           channel_id: params.channelId,
           root_seq: params.rootSeq,
           from: 0,
@@ -273,7 +273,7 @@ export const thread = (
         },
       }),
     )
-    .then((reply) => replyVariant<ChatThread | null>(reply, "Thread"));
+    .then((reply) => replyVariant<ChatThread | null>(reply, "thread"));
 
 // ── Materialized view (the module's derived-index endpoint) ──
 

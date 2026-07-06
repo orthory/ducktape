@@ -16,49 +16,49 @@ import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
-const STATUS_ORDER: JobStatus[] = ["Pending", "Processing", "Done", "Failed", "Cancelled"];
+const STATUS_ORDER: JobStatus[] = ["pending", "processing", "done", "failed", "cancelled"];
 
 const COUNTS_KEY: Record<JobStatus, keyof BoardCounts> = {
-  Pending: "pending",
-  Processing: "processing",
-  Done: "done",
-  Failed: "failed",
-  Cancelled: "cancelled",
+  pending: "pending",
+  processing: "processing",
+  done: "done",
+  failed: "failed",
+  cancelled: "cancelled",
 };
 
 const STATUS_TONE: Record<
   JobStatus,
   { label: string; countLabel: string; text: string; bg: string; border: string }
 > = {
-  Pending: {
+  pending: {
     label: "Pending",
     countLabel: "pending",
     text: color.amber,
     bg: "#fbf4e6",
     border: "#ecdcae",
   },
-  Processing: {
+  processing: {
     label: "Processing",
     countLabel: "processing",
     text: color.blue,
     bg: "#eef1f6",
     border: "#d1dbe9",
   },
-  Done: {
+  done: {
     label: "Done",
     countLabel: "done",
     text: color.green,
     bg: "#eef5f0",
     border: "#cfe3d7",
   },
-  Failed: {
+  failed: {
     label: "Failed",
     countLabel: "failed",
     text: color.red,
     bg: color.dangerSoft,
     border: color.dangerBorder,
   },
-  Cancelled: {
+  cancelled: {
     label: "Cancelled",
     countLabel: "cancelled",
     text: color.muted2,
@@ -318,7 +318,7 @@ function JobCard({
       ) : null}
 
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 2 }}>
-        {job.status === "Pending" ? (
+        {job.status === "pending" ? (
           <>
             <input
               type="number"
@@ -337,7 +337,7 @@ function JobCard({
           </>
         ) : null}
 
-        {job.status === "Processing" ? (
+        {job.status === "processing" ? (
           <>
             <input
               type="text"

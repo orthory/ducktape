@@ -7,8 +7,8 @@ import { MessageItem } from "./MessageItem";
 
 const SELF = "operator";
 const selfKey = selfAuthorKeyOf(SELF);
-const ownAuthor: AuthorRef = { User: Array.from(new TextEncoder().encode(SELF)) };
-const otherAuthor: AuthorRef = { User: Array.from(new TextEncoder().encode("someone-else")) };
+const ownAuthor: AuthorRef = { user: Array.from(new TextEncoder().encode(SELF)) };
+const otherAuthor: AuthorRef = { user: Array.from(new TextEncoder().encode("someone-else")) };
 
 const msg = (author: AuthorRef, text: string, overrides: Partial<MessageView["head"]> = {}): MessageView => ({
   channel_id: "general",
@@ -16,7 +16,7 @@ const msg = (author: AuthorRef, text: string, overrides: Partial<MessageView["he
   head: {
     message_id: "m-7",
     author,
-    blocks: [{ Paragraph: [{ text, marks: [] }] }],
+    blocks: [{ paragraph: [{ text, marks: [] }] }],
     created_at: 1_735_689_600,
     rev: 1,
     edited_at: null,
@@ -80,7 +80,7 @@ describe("MessageItem edit/delete", () => {
   });
 
   it("seeds the inline editor with re-editable source for a code-block message", () => {
-    const codeMessage = msg(ownAuthor, "", { blocks: [{ Code: { lang: "ts", text: "const a = 1;" } }] });
+    const codeMessage = msg(ownAuthor, "", { blocks: [{ code: { lang: "ts", text: "const a = 1;" } }] });
     render(<MessageItem {...baseProps} message={codeMessage} />);
 
     fireEvent.click(screen.getByText("Edit message"));

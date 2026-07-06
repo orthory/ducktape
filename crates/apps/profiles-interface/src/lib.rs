@@ -29,6 +29,7 @@ pub struct Profile {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ProfileMsg {
     /// set the SUBMITTER'S OWN display name -- the key is the verified origin,
     /// never carried in the payload, so a submitter can only name itself. a
@@ -38,6 +39,7 @@ pub enum ProfileMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ProfileQuery {
     /// every profile, ascending by key, offset+limit paginated (`limit`
     /// clamped to [`MAX_QUERY_LIMIT`]).
@@ -47,6 +49,7 @@ pub enum ProfileQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ProfileReply {
     Profiles(Vec<Profile>),
     Profile(Option<Profile>),

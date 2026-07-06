@@ -286,10 +286,10 @@ fn free_port() -> u16 {
 
 fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Value {
     serde_json::json!({
-        "PostMessage": {
+        "post_message": {
             "channel_id": channel,
             "message_id": message_id,
-            "blocks": [{ "Paragraph": [{ "text": text, "marks": [] }] }],
+            "blocks": [{ "paragraph": [{ "text": text, "marks": [] }] }],
             "thread": null,
             "as_agent": null,
         }
@@ -298,17 +298,17 @@ fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Valu
 
 fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::Value {
     serde_json::json!({
-        "PostMessage": {
+        "post_message": {
             "channel_id": channel,
             "message_id": message_id,
             "blocks": [{
-                "Paragraph": [
+                "paragraph": [
                     { "text": "hey ", "marks": [] },
                     {
                         "text": format!("@{agent_id}"),
                         "marks": [{
-                            "Mention": {
-                                "Agent": { "module": "runs", "agent_id": agent_id }
+                            "mention": {
+                                "agent": { "module": "runs", "agent_id": agent_id }
                             }
                         }]
                     },
@@ -366,7 +366,7 @@ fn full_surface_blocks_authorship_and_ws() {
     let (code, block) = daemon.submit(
         "chat",
         serde_json::json!({
-            "CreateChannel": { "channel_id": "general", "name": "General", "post_policy": "Open" }
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
         }),
         None,
     );
@@ -422,14 +422,14 @@ fn full_surface_blocks_authorship_and_ws() {
     // committed state reads back; authorship derived from the submit origin.
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "MessagesLatest": { "channel_id": "general", "limit": 16 } }),
+        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
     );
-    let messages = reply["Messages"].as_array().expect("Messages reply");
+    let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 1);
     let head = &messages[0]["head"];
     assert_eq!(head["message_id"], "m1");
-    assert_eq!(head["blocks"][0]["Paragraph"][0]["text"], "hello from e2e");
-    let author_bytes: Vec<u8> = head["author"]["User"]
+    assert_eq!(head["blocks"][0]["paragraph"][0]["text"], "hello from e2e");
+    let author_bytes: Vec<u8> = head["author"]["user"]
         .as_array()
         .expect("User author")
         .iter()
@@ -454,7 +454,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     let (code, block) = daemon.submit(
         "chat",
         serde_json::json!({
-            "CreateChannel": { "channel_id": "general", "name": "General", "post_policy": "Open" }
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
         }),
         Some("owner"),
     );
@@ -464,7 +464,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
-            "RegisterAgent": {
+            "register_agent": {
                 "agent_id": "quackbot",
                 "display_name": "Quackbot",
                 "capability": "echo-model",
@@ -479,9 +479,9 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     let (code, block) = daemon.submit(
         "runs",
         serde_json::json!({
-            "WatchChannel": {
+            "watch_channel": {
                 "channel_id": "general",
-                "policy": "Mention"
+                "policy": "mention"
             }
         }),
         Some("owner"),
@@ -512,39 +512,39 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
     // the run's lifecycle lives in the dispatch module; the runs module's
     // pending entry pruned when the delivery landed.
-    let pending = daemon.query("runs", serde_json::json!("PendingRuns"));
+    let pending = daemon.query("runs", serde_json::json!("pending_runs"));
     assert_eq!(
-        pending["PendingRuns"].as_array().map(Vec::len),
+        pending["pending_runs"].as_array().map(Vec::len),
         Some(0),
         "the delivered run must leave no pending entry: {pending}"
     );
     let dispatch = daemon.query(
         "dispatch",
         serde_json::json!({
-            "Dispatch": {
+            "dispatch": {
                 "receiver": "runs",
                 "dispatch_id": runs::dispatch_id_for(run_id),
             }
         }),
     );
     assert_eq!(
-        dispatch["Dispatch"]["status"], "Delivered",
+        dispatch["dispatch"]["status"], "delivered",
         "the dispatch record is the run's history: {dispatch}"
     );
 
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "MessagesLatest": { "channel_id": "general", "limit": 16 } }),
+        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
     );
-    let messages = reply["Messages"].as_array().expect("Messages reply");
+    let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 2, "user post plus agent reply should exist");
     let agent_reply = &messages[1]["head"];
     assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
     assert_eq!(
         agent_reply["author"],
-        serde_json::json!({ "Agent": { "module": "runs", "agent_id": "quackbot" } })
+        serde_json::json!({ "agent": { "module": "runs", "agent_id": "quackbot" } })
     );
-    let text = agent_reply["blocks"][0]["Paragraph"][0]["text"]
+    let text = agent_reply["blocks"][0]["paragraph"][0]["text"]
         .as_str()
         .expect("reply text");
     assert!(
@@ -658,7 +658,7 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
         fixtures.path(),
         &spec_dir,
         "duck-job-model",
-        r#"{"reply_blocks":[],"actions":[{"CreateTask":{"task_id":"t-from-job","title":"filed by the job run"}}]}"#,
+        r#"{"reply_blocks":[],"actions":[{"create_task":{"task_id":"t-from-job","title":"filed by the job run"}}]}"#,
     );
 
     // hermetic: hide any host claude/codex CLIs behind a missing path so this
@@ -687,20 +687,20 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     let prompt_hash = Sha256::digest(prompt_text.as_bytes()).to_vec();
     let (code, block) = daemon.submit(
         "document",
-        serde_json::json!({ "CreateDoc": { "doc_id": "prompts/duck" } }),
+        serde_json::json!({ "create_doc": { "doc_id": "prompts/duck" } }),
         Some("owner"),
     );
     assert_eq!(code, 200, "create doc failed: {block}");
     let inserts = [
-        serde_json::json!({ "InsertBlock": {
+        serde_json::json!({ "insert_block": {
             "doc_id": "prompts/duck",
             "after": null,
-            "block": { "id": "b1", "kind": "Heading", "text": heading },
+            "block": { "id": "b1", "kind": "heading", "text": heading },
         } }),
-        serde_json::json!({ "InsertBlock": {
+        serde_json::json!({ "insert_block": {
             "doc_id": "prompts/duck",
             "after": "b1",
-            "block": { "id": "b2", "kind": "Paragraph", "text": body },
+            "block": { "id": "b2", "kind": "paragraph", "text": body },
         } }),
     ];
     for op in inserts {
@@ -713,7 +713,7 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     let (code, block) = daemon.submit(
         "chat",
         serde_json::json!({
-            "CreateChannel": { "channel_id": "general", "name": "General", "post_policy": "Open" }
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
         }),
         Some("owner"),
     );
@@ -721,7 +721,7 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
-            "RegisterAgent": {
+            "register_agent": {
                 "agent_id": "duck-live",
                 "display_name": "Duck Live",
                 "capability": "duck-chat-model",
@@ -735,7 +735,7 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     assert_eq!(code, 200, "register chat agent failed: {block}");
     let (code, block) = daemon.submit(
         "runs",
-        serde_json::json!({ "WatchChannel": { "channel_id": "general", "policy": "Mention" } }),
+        serde_json::json!({ "watch_channel": { "channel_id": "general", "policy": "mention" } }),
         Some("owner"),
     );
     assert_eq!(code, 200, "watch channel failed: {block}");
@@ -766,13 +766,13 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     let run_id = runs::run_id_for("general", 1, "duck-live");
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "MessagesLatest": { "channel_id": "general", "limit": 16 } }),
+        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
     );
-    let messages = reply["Messages"].as_array().expect("Messages reply");
+    let messages = reply["messages"].as_array().expect("Messages reply");
     let agent_reply = &messages.last().expect("mention plus reply")["head"];
     assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
     assert_eq!(
-        agent_reply["blocks"][0]["Paragraph"][0]["text"],
+        agent_reply["blocks"][0]["paragraph"][0]["text"],
         "the doc led my payload"
     );
 
@@ -781,7 +781,7 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
-            "RegisterAgent": {
+            "register_agent": {
                 "agent_id": "duck-jobs",
                 "display_name": "Duck Jobs",
                 "capability": "duck-job-model",
@@ -795,13 +795,13 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     assert_eq!(code, 200, "register job agent failed: {block}");
     let (code, block) = daemon.submit(
         "runs",
-        serde_json::json!({ "EnableJobWorker": { "enabled": true } }),
+        serde_json::json!({ "enable_job_worker": { "enabled": true } }),
         Some("owner"),
     );
     assert_eq!(code, 200, "enable job worker failed: {block}");
     let (code, block) = daemon.submit(
         "jobs",
-        serde_json::json!({ "Submit": {
+        serde_json::json!({ "submit": {
             "job_id": "job-1",
             "kind": "agent/duck-jobs",
             "spec": "summarize the duck ledger",
@@ -827,17 +827,17 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     );
 
     // the run finalized the job off the actions-only response...
-    let reply = daemon.query("jobs", serde_json::json!({ "Get": { "job_id": "job-1" } }));
-    let job = &reply["Job"];
+    let reply = daemon.query("jobs", serde_json::json!({ "get": { "job_id": "job-1" } }));
+    let job = &reply["job"];
     assert_eq!(
-        job["status"], "Done",
+        job["status"], "done",
         "the job run must finalize ok: {reply}"
     );
     assert_eq!(job["result"]["ok"], true, "the run succeeded: {reply}");
 
     // ...and the response's action actually executed.
-    let reply = daemon.query("tasks", serde_json::json!("List"));
-    let tasks = reply["Tasks"].as_array().expect("Tasks reply");
+    let reply = daemon.query("tasks", serde_json::json!("list"));
+    let tasks = reply["tasks"].as_array().expect("Tasks reply");
     assert!(
         tasks.iter().any(|t| t["id"] == "t-from-job"),
         "the CreateTask action landed: {reply}"
@@ -853,7 +853,7 @@ fn state_persists_across_restart() {
         let (code, _) = daemon.submit(
             "chat",
             serde_json::json!({
-                "CreateChannel": { "channel_id": "durable", "name": "Durable", "post_policy": "Open" }
+                "create_channel": { "channel_id": "durable", "name": "Durable", "post_policy": "open" }
             }),
             None,
         );
@@ -893,12 +893,12 @@ fn state_persists_across_restart() {
     assert_eq!(daemon.status()["height"], 2);
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "MessagesLatest": { "channel_id": "durable", "limit": 16 } }),
+        serde_json::json!({ "messages_latest": { "channel_id": "durable", "limit": 16 } }),
     );
-    let messages = reply["Messages"].as_array().expect("Messages reply");
+    let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 1, "chat state must survive a restart");
     assert_eq!(
-        messages[0]["head"]["blocks"][0]["Paragraph"][0]["text"],
+        messages[0]["head"]["blocks"][0]["paragraph"][0]["text"],
         "written before restart"
     );
 
@@ -936,7 +936,7 @@ fn per_module_index_serves_ops_and_views() {
         let (code, _) = daemon.submit(
             "chat",
             serde_json::json!({
-                "CreateChannel": { "channel_id": "eng", "name": "Eng", "post_policy": "Open" }
+                "create_channel": { "channel_id": "eng", "name": "Eng", "post_policy": "open" }
             }),
             None,
         );
@@ -945,7 +945,7 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(code, 200);
         let (code, _) = daemon.submit(
             "tasks",
-            serde_json::json!({ "CreateTask": { "task_id": "t1", "title": "wire the indexer" } }),
+            serde_json::json!({ "create_task": { "task_id": "t1", "title": "wire the indexer" } }),
             None,
         );
         assert_eq!(code, 200);
@@ -957,7 +957,7 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(rows.len(), 2, "create-channel and post: {ops}");
         // the payload is the module op VERBATIM (chat's wire is snake_case);
         // the envelope itself (origin/height/seq) is the indexer's camelCase.
-        assert_eq!(rows[1]["payload"]["PostMessage"]["message_id"], "m1");
+        assert_eq!(rows[1]["payload"]["post_message"]["message_id"], "m1");
         assert_eq!(rows[1]["origin"]["kind"], "external");
         assert_eq!(rows[1]["height"], 2);
 
@@ -977,7 +977,7 @@ fn per_module_index_serves_ops_and_views() {
         let (code, reply) = daemon.request(
             "POST",
             "/v1/index/tasks/view",
-            Some(&serde_json::json!({ "byStatus": { "status": "Open" } })),
+            Some(&serde_json::json!({ "byStatus": { "status": "open" } })),
         );
         assert_eq!(code, 200, "tasks view failed: {reply}");
         let tasks = reply["tasks"]["tasks"].as_array().expect("tasks array");
@@ -1117,7 +1117,7 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
     let (code, block) = daemon.submit(
         "files",
         serde_json::json!({
-            "AddManifest": {
+            "add_manifest": {
                 "file_id": "f1",
                 "name": "blob.bin",
                 "mime": "application/octet-stream",
@@ -1131,9 +1131,9 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
     assert_eq!(code, 200, "AddManifest failed: {block}");
     assert_eq!(block["height"], 1, "the manifest IS a block");
 
-    let reply = daemon.query("files", serde_json::json!({ "Stat": { "file_id": "f1" } }));
+    let reply = daemon.query("files", serde_json::json!({ "stat": { "file_id": "f1" } }));
     let manifest: files_interface::Manifest =
-        serde_json::from_value(reply["Stat"].clone()).expect("Stat carries the manifest");
+        serde_json::from_value(reply["stat"].clone()).expect("Stat carries the manifest");
     files_interface::verify_chunk(&manifest, 0, &fetched)
         .expect("fetched bytes verify against the committed manifest");
 }
@@ -1148,7 +1148,7 @@ fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
     let (code, block) = daemon.submit(
         "chat",
         serde_json::json!({
-            "CreateChannel": { "channel_id": "general", "name": "General", "post_policy": "Open" }
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
         }),
         None,
     );
@@ -1272,8 +1272,8 @@ fn rev_parse_head(dir: &Path) -> String {
 
 /// forge's committed HEAD oid hex for `repo` over /v1/query (`None` == unborn).
 fn forge_head(daemon: &Daemon, repo: &str) -> Option<String> {
-    let reply = daemon.query("forge", serde_json::json!({ "HeadOf": { "repo": repo } }));
-    reply["Head"].as_str().map(str::to_string)
+    let reply = daemon.query("forge", serde_json::json!({ "head_of": { "repo": repo } }));
+    reply["head"].as_str().map(str::to_string)
 }
 
 #[test]

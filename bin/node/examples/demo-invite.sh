@@ -94,8 +94,8 @@ echo "genesis agreed: $ga"
 
 # an op submitted on the founder finalizes across the 2-validator quorum and
 # is readable on the friend.
-set_op=$(hexenc '{"Set":{"key":"ceremony","value":"two members, zero seeds"}}')
-get_q=$(hexenc '{"Get":{"key":"ceremony"}}')
+set_op=$(hexenc '{"set":{"key":"ceremony","value":"two members, zero seeds"}}')
+get_q=$(hexenc '{"get":{"key":"ceremony"}}')
 rpc 53300 "{\"cmd\":\"submit\",\"target\":\"directory\",\"payload_hex\":\"$set_op\"}" >/dev/null
 converge_ok=""
 for _ in $(seq 1 60); do
