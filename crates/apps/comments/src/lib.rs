@@ -259,15 +259,92 @@ where
         Ok(Some(ThreadView { thread, comments }))
     }
 
-    /// apply one decoded msg with the derived author/time. every arm is a stub
-    /// until Tasks 7–10.
+    /// apply one decoded msg with the derived author/time.
     async fn apply(
         &mut self,
-        _msg: CommentMsg,
-        _author: AuthorRef,
-        _now: u64,
+        msg: CommentMsg,
+        author: AuthorRef,
+        now: u64,
     ) -> Result<(), CommentError> {
-        Err(CommentError::Unsupported)
+        match msg {
+            CommentMsg::AddComment {
+                thread_id,
+                comment_id,
+                anchor,
+                text,
+            } => {
+                if thread_id.is_empty()
+                    || comment_id.is_empty()
+                    || thread_id.starts_with('\u{0}')
+                    || comment_id.starts_with('\u{0}')
+                {
+                    return Err(CommentError::ReservedId);
+                }
+                if text.len() > MAX_COMMENT_TEXT_BYTES {
+                    return Err(CommentError::TextTooLarge);
+                }
+                if self.load_comment(&comment_id).await?.is_some() {
+                    return Err(CommentError::DuplicateComment);
+                }
+                match self.load_thread(&thread_id).await? {
+                    Some(mut thread) => {
+                        if thread.anchor != anchor {
+                            return Err(CommentError::AnchorMismatch);
+                        }
+                        if thread.comment_ids.len() >= MAX_COMMENTS_PER_THREAD {
+                            return Err(CommentError::TooManyComments);
+                        }
+                        let comment = Comment {
+                            id: comment_id.clone(),
+                            thread_id: thread_id.clone(),
+                            author,
+                            text,
+                            created_at: now,
+                            edited_at: None,
+                            deleted: false,
+                        };
+                        thread.comment_ids.push(comment_id);
+                        self.store_comment(&comment)?;
+                        self.store_thread(&thread)
+                    }
+                    None => {
+                        let mut ids = self.load_anchor_index(&anchor).await?;
+                        if ids.len() >= MAX_THREADS_PER_ANCHOR {
+                            return Err(CommentError::TooManyThreads);
+                        }
+                        let comment = Comment {
+                            id: comment_id.clone(),
+                            thread_id: thread_id.clone(),
+                            author: author.clone(),
+                            text,
+                            created_at: now,
+                            edited_at: None,
+                            deleted: false,
+                        };
+                        let thread = Thread {
+                            id: thread_id.clone(),
+                            anchor: anchor.clone(),
+                            opener: author,
+                            created_at: now,
+                            resolved: false,
+                            resolved_by: None,
+                            comment_ids: vec![comment_id],
+                        };
+                        if !ids.contains(&thread_id) {
+                            ids.push(thread_id);
+                            ids.sort();
+                            self.stage_anchor_index(&anchor, &ids)?;
+                        }
+                        self.store_comment(&comment)?;
+                        self.store_thread(&thread)
+                    }
+                }
+            }
+            // Edit/Delete/Resolve added in Tasks 8–9.
+            CommentMsg::EditComment { .. }
+            | CommentMsg::DeleteComment { .. }
+            | CommentMsg::ResolveThread { .. } => Err(CommentError::Unsupported),
+        }
     }
 
     // ---- state-sync (verbatim from pages) ----
@@ -353,11 +430,33 @@ where
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let err = |e: CommentError| Error::Module(e.to_string());
         match decode_query(req).map_err(Error::Module)? {
-            CommentQuery::ThreadsForAnchors { .. } => {
-                Ok(encode_reply(&CommentReply::Anchored(Vec::new())))
+            CommentQuery::ThreadsForAnchors { module, targets } => {
+                if targets.len() > MAX_QUERY_TARGETS {
+                    return Err(err(CommentError::TooManyTargets));
+                }
+                let mut out = Vec::with_capacity(targets.len());
+                for target in targets {
+                    let anchor = Anchor {
+                        module: module.clone(),
+                        target: target.clone(),
+                    };
+                    let ids = self.load_anchor_index(&anchor).await.map_err(err)?;
+                    let mut threads = Vec::new();
+                    for tid in ids {
+                        if let Some(view) = self.thread_view(&tid).await.map_err(err)? {
+                            threads.push(view);
+                        }
+                    }
+                    out.push(AnchorThreads { target, threads });
+                }
+                Ok(encode_reply(&CommentReply::Anchored(out)))
             }
-            CommentQuery::Thread { .. } => Ok(encode_reply(&CommentReply::Thread(None))),
+            CommentQuery::Thread { thread_id } => {
+                let view = self.thread_view(&thread_id).await.map_err(err)?;
+                Ok(encode_reply(&CommentReply::Thread(view)))
+            }
         }
     }
 
@@ -389,16 +488,155 @@ where
 mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, deterministic};
+    use sdk::{Env, Origin};
+
+    struct TestCtx {
+        env: Env,
+    }
+    impl TestCtx {
+        fn new(origin: Origin) -> Self {
+            Self {
+                env: Env {
+                    protocol_version: 0,
+                    height: 0,
+                    consensus_time: 7,
+                    origin,
+                    me: "comments".into(),
+                },
+            }
+        }
+    }
+    #[async_trait::async_trait(?Send)]
+    impl Ctx for TestCtx {
+        fn env(&self) -> &Env {
+            &self.env
+        }
+        fn module_root(&self, _t: &str) -> Option<StateRoot> {
+            None
+        }
+        async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
+            Err(Error::QueryUnsupported)
+        }
+        fn emit_msg(&mut self, _m: Msg) {}
+        fn emit_event(&mut self, _e: sdk::Event) {}
+        fn request_effect(&mut self, _e: sdk::Effect) {}
+    }
+    fn user(name: &str) -> Origin {
+        Origin::External(name.as_bytes().to_vec())
+    }
+    fn wire(m: &CommentMsg) -> Msg {
+        Msg {
+            target: "comments".into(),
+            payload: encode_msg(m),
+        }
+    }
+
+    async fn apply_commit<E: Context + BufferPooler>(c: &mut Comments<E>, m: &CommentMsg, origin: Origin) {
+        c.execute(&mut TestCtx::new(origin), &wire(m)).await.unwrap();
+        c.commit_block().await.unwrap();
+    }
+    async fn apply_err<E: Context + BufferPooler>(
+        c: &mut Comments<E>,
+        m: &CommentMsg,
+        origin: Origin,
+        needle: &str,
+    ) {
+        let e = c
+            .execute(&mut TestCtx::new(origin), &wire(m))
+            .await
+            .expect_err("must reject");
+        assert!(
+            matches!(e, Error::Module(ref s) if s.contains(needle)),
+            "unexpected: {e:?}"
+        );
+        c.abort_block().await.unwrap();
+    }
+    async fn anchored<E: Context + BufferPooler>(
+        c: &Comments<E>,
+        module: &str,
+        targets: &[&str],
+    ) -> Vec<AnchorThreads> {
+        let q = CommentQuery::ThreadsForAnchors {
+            module: module.into(),
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+        };
+        match decode_reply(&c.query(&encode_query(&q)).await.unwrap()).unwrap() {
+            CommentReply::Anchored(v) => v,
+            _ => panic!("expected Anchored"),
+        }
+    }
+    async fn thread_of<E: Context + BufferPooler>(c: &Comments<E>, thread_id: &str) -> Option<ThreadView> {
+        match decode_reply(
+            &c.query(&encode_query(&CommentQuery::Thread { thread_id: thread_id.into() }))
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+        {
+            CommentReply::Thread(v) => v,
+            _ => panic!("expected Thread"),
+        }
+    }
+    fn anchor(target: &str) -> Anchor {
+        Anchor { module: "pages".into(), target: target.into() }
+    }
 
     #[test]
     fn a_staged_write_moves_the_root() {
         deterministic::Runner::default().start(|context| async move {
             let mut c = Comments::init(context, "comments").await;
             let r0 = c.root();
-            // stage a raw thread record directly (apply arms are stubs in Task 6).
             c.pending.insert(b"t:probe".to_vec(), Some(b"{}".to_vec()));
             c.commit_block().await.unwrap();
-            assert_ne!(c.root(), r0, "a committed write must move the root");
+            assert_ne!(c.root(), r0);
+        });
+    }
+
+    #[test]
+    fn add_opens_then_appends_and_batches_by_anchor() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut c = Comments::init(context, "comments").await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m1".into(), anchor: anchor("b1"), text: "first".into(),
+            }, user("alice")).await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m2".into(), anchor: anchor("b1"), text: "second".into(),
+            }, user("bob")).await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t2".into(), comment_id: "m3".into(), anchor: anchor("b1"), text: "other".into(),
+            }, user("alice")).await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t3".into(), comment_id: "m4".into(), anchor: anchor("b2"), text: "elsewhere".into(),
+            }, user("alice")).await;
+
+            let groups = anchored(&c, "pages", &["b1", "b2"]).await;
+            let b1 = groups.iter().find(|g| g.target == "b1").unwrap();
+            assert_eq!(b1.threads.len(), 2);
+            let t1 = b1.threads.iter().find(|v| v.thread.id == "t1").unwrap();
+            assert_eq!(t1.comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+            assert_eq!(t1.thread.opener, AuthorRef::User(b"alice".to_vec()));
+            assert_eq!(t1.comments[1].author, AuthorRef::User(b"bob".to_vec()));
+            let b2 = groups.iter().find(|g| g.target == "b2").unwrap();
+            assert_eq!(b2.threads.len(), 1);
+        });
+    }
+
+    #[test]
+    fn append_rejects_anchor_mismatch_and_duplicate_comment() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut c = Comments::init(context, "comments").await;
+            apply_commit(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m1".into(), anchor: anchor("b1"), text: "x".into(),
+            }, user("alice")).await;
+            apply_err(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m2".into(), anchor: anchor("b2"), text: "y".into(),
+            }, user("alice"), "anchor mismatch").await;
+            apply_err(&mut c, &CommentMsg::AddComment {
+                thread_id: "t1".into(), comment_id: "m1".into(), anchor: anchor("b1"), text: "z".into(),
+            }, user("alice"), "duplicate comment id").await;
+            apply_err(&mut c, &CommentMsg::AddComment {
+                thread_id: "t9".into(), comment_id: "m9".into(), anchor: anchor("b1"), text: "z".into(),
+            }, Origin::External(vec![]), "empty origin").await;
         });
     }
 }
