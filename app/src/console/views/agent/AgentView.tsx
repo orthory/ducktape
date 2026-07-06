@@ -7,7 +7,7 @@
 //
 // No optimistic state: every write goes through the store's submit-then-refresh.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type { AgentRecord, SagaOrigin } from "../../../domain/agent-client";
@@ -29,20 +29,23 @@ const ACTION_LABEL: Record<string, string> = {
   "tasks.update_status": "Update task status",
 };
 
+// Permission checkboxes read as plain abilities ("what this agent can do"),
+// not as the wire action ids they map to.
 const ACTION_HINT: Record<string, string> = {
-  "chat.post": "Allow chat replies",
-  "tasks.create": "Allow creating tasks",
-  "tasks.update_status": "Allow task status updates",
+  "chat.post": "Reply in chat",
+  "tasks.create": "Create tasks",
+  "tasks.update_status": "Update task status",
 };
 
 const POLICY_KINDS = ["mention", "all", "round_robin", "assigned"] as const;
 type PolicyKind = (typeof POLICY_KINDS)[number];
 
+// "When to reply" options — plain language for the dispatch turn policy.
 const POLICY_LABEL: Record<PolicyKind, string> = {
-  mention: "Mention",
-  all: "All",
-  round_robin: "Round-robin",
-  assigned: "Assigned",
+  mention: "When mentioned",
+  all: "Every message",
+  round_robin: "Take turns",
+  assigned: "Only a chosen agent",
 };
 
 type Tone = { text: string; bg: string; border: string };
@@ -107,6 +110,11 @@ const slug = (raw: string): string =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
 
+/** Present a lowercase executor tag ("codex") as a friendly label ("Codex").
+ *  The raw tag stays the stored value — this is display only. */
+const titleCase = (tag: string): string =>
+  tag ? tag.charAt(0).toUpperCase() + tag.slice(1) : tag;
+
 const initialsOf = (name: string): string => {
   const parts = name
     .trim()
@@ -125,9 +133,6 @@ const shortHex = (bytes: number[]): string => {
   return hex.length > 18 ? `${hex.slice(0, 10)}…${hex.slice(-6)}` : hex || "—";
 };
 
-const shortText = (value: string): string =>
-  value.length > 32 ? `${value.slice(0, 18)}…${value.slice(-8)}` : value;
-
 const ownerText = (origin: SagaOrigin): string => {
   if (origin === "system") return "system";
   if ("module" in origin) return `module:${origin.module}`;
@@ -141,10 +146,10 @@ const agentLabel = (agents: AgentRecord[], agentId: string): string =>
   agents.find((agent) => agent.agent_id === agentId)?.display_name ?? agentId;
 
 const policyText = (policy: TurnPolicy, agents: AgentRecord[]): string => {
-  if (policy === "mention") return "mention";
-  if (policy === "all") return "All agents";
-  if (policy === "round_robin") return "Round-robin";
-  return `Assigned · ${agentLabel(agents, policy.assigned)}`;
+  if (policy === "mention") return "When mentioned";
+  if (policy === "all") return "Every message";
+  if (policy === "round_robin") return "Take turns";
+  return `Only ${agentLabel(agents, policy.assigned)}`;
 };
 
 /** Every listed entry is by definition awaiting its dispatch delivery — the
@@ -355,6 +360,93 @@ function Chip({ text, tone = statusTone.neutral }: { text: string; tone?: Tone }
   );
 }
 
+/** "Runs on" — which executor backs this agent. Reads the network's announced
+ *  executor registry (`state.capabilities`) so the user picks a real one
+ *  instead of typing a routing tag blind. Degrades by registry size:
+ *   - none announced & nothing chosen → a labelled text field (never blocks
+ *     setup before a host has announced);
+ *   - one or more announced → a select; when the current value is empty it
+ *     defaults to the first, so a single-executor node needs no choice at all.
+ *  An already-stored tag absent from the registry (its host went offline) is
+ *  pinned so an edit never silently rewrites which executor the agent runs on. */
+function RunsOnField({
+  id,
+  value,
+  capabilities,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  capabilities: string[];
+  onChange: (next: string) => void;
+}) {
+  const known = capabilities;
+
+  // Adopt a sane default once the registry loads: an empty value with executors
+  // available picks the first, so the common single-executor case is one fewer
+  // decision. Never overrides a value the user (or the record) already set.
+  useEffect(() => {
+    if (value === "" && known.length > 0) onChange(known[0]);
+  }, [value, known, onChange]);
+
+  // Nothing announced and nothing chosen yet: fall back to free text so a
+  // first-time operator can still register before any host announces.
+  if (known.length === 0 && value === "") {
+    return (
+      <>
+        <input
+          id={id}
+          name={id}
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder="e.g. codex"
+          style={monoInputStyle}
+        />
+        <div
+          style={{
+            marginTop: 5,
+            font: `400 10.5px ${font.sans}`,
+            color: color.muted2,
+            lineHeight: 1.4,
+          }}
+        >
+          Name of an executor your node can run (for example codex or claude).
+        </div>
+      </>
+    );
+  }
+
+  const offline = (tag: string) => known.length > 0 && !known.includes(tag);
+  const optionLabel = (tag: string) =>
+    offline(tag) ? `${titleCase(tag)} (offline)` : titleCase(tag);
+  // Pin an off-registry stored value at the front so it stays selectable.
+  const options = value !== "" && !known.includes(value) ? [value, ...known] : known;
+
+  return (
+    <select
+      id={id}
+      name={id}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      style={{ ...inputStyle, cursor: "pointer" }}
+    >
+      {value === "" && (
+        <option value="" disabled>
+          Choose an executor…
+        </option>
+      )}
+      {options.map((tag) => (
+        <option key={tag} value={tag}>
+          {optionLabel(tag)}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 // ── Agents roster + detail ──────────────────────────────
 
 function AgentListButton({
@@ -451,6 +543,7 @@ function AgentListButton({
 function AgentDetail({
   agent,
   channels,
+  capabilities,
   onPause,
   onResume,
   onUpdate,
@@ -458,6 +551,7 @@ function AgentDetail({
 }: {
   agent: AgentRecord | null;
   channels: Channel[];
+  capabilities: string[];
   onPause: (agentId: string) => void;
   onResume: (agentId: string) => void;
   onUpdate: (params: {
@@ -479,7 +573,7 @@ function AgentDetail({
           <EmptyState
             icon="agent"
             title="No agent selected"
-            body="Register an agent or select one from the roster to inspect its backing data."
+            body="Add an agent, or pick one from the list to see its settings."
           />
         </GroupCard>
       </section>
@@ -557,18 +651,18 @@ function AgentDetail({
               gap: 8,
             }}
           >
-            <InfoRow label="capability" value={agent.capability} />
+            <InfoRow label="runs on" value={titleCase(agent.capability)} />
             <InfoRow label="owner" value={ownerText(agent.owner)} />
             <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
             <InfoRow label="updated" value={String(agent.updated_at)} />
           </div>
 
           <div style={{ marginTop: 15 }}>
-            <SectionLabel>CAPABILITIES</SectionLabel>
+            <SectionLabel>PERMISSIONS</SectionLabel>
             <div style={{ marginTop: 8, display: "flex", gap: 7, flexWrap: "wrap" }}>
               {agent.allowed_actions.length === 0 ? (
                 <span style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
-                  No write actions granted.
+                  Can't take any actions yet.
                 </span>
               ) : (
                 agent.allowed_actions.map((action) => (
@@ -586,6 +680,7 @@ function AgentDetail({
             <AgentEditForm
               key={agent.agent_id}
               agent={agent}
+              capabilities={capabilities}
               onUpdate={onUpdate}
               onClose={() => setEditing(false)}
             />
@@ -599,10 +694,12 @@ function AgentDetail({
 
 function AgentEditForm({
   agent,
+  capabilities,
   onUpdate,
   onClose,
 }: {
   agent: AgentRecord;
+  capabilities: string[];
   onUpdate: (params: {
     agentId: string;
     displayName?: string;
@@ -668,16 +765,12 @@ function AgentEditForm({
           />
         </div>
         <div>
-          <FieldLabel htmlFor="agent-edit-capability">Edit capability</FieldLabel>
-          <input
+          <FieldLabel htmlFor="agent-edit-capability">Runs on</FieldLabel>
+          <RunsOnField
             id="agent-edit-capability"
-            name="agent-edit-capability"
-            type="text"
-            autoComplete="off"
-            spellCheck={false}
             value={capability}
-            onChange={(event) => setCapability(event.target.value)}
-            style={monoInputStyle}
+            capabilities={capabilities}
+            onChange={setCapability}
           />
         </div>
       </div>
@@ -785,7 +878,10 @@ function RunRequestForm({
 }) {
   const defaultChannelId = channels[0]?.id ?? "";
   const [channelId, setChannelId] = useState(defaultChannelId);
+  // Anchor defaults to the channel's latest message; only the "Options"
+  // disclosure lets you reply from an earlier point.
   const [anchorInput, setAnchorInput] = useState("");
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const selectedChannel = channels.find((channel) => channel.id === channelId) ?? null;
   const defaultAnchor = selectedChannel?.head_seq ?? 0;
   const anchorSeq = anchorInput.trim() === "" ? defaultAnchor : Number(anchorInput);
@@ -808,24 +904,42 @@ function RunRequestForm({
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <SectionLabel>REQUEST RUN</SectionLabel>
+        <SectionLabel>ASK TO RESPOND</SectionLabel>
         {!hasMessages && (
           <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>
-            no channel messages yet
+            no messages here yet
           </span>
         )}
+        <button
+          type="button"
+          onClick={() => setShowAdvanced((open) => !open)}
+          aria-expanded={showAdvanced}
+          style={{
+            marginLeft: "auto",
+            appearance: "none",
+            border: 0,
+            background: "transparent",
+            cursor: "pointer",
+            padding: 0,
+            font: `600 10px ${font.mono}`,
+            letterSpacing: ".05em",
+            color: color.muted2,
+          }}
+        >
+          {showAdvanced ? "Hide options" : "Options"}
+        </button>
       </div>
       <div
         style={{
           marginTop: 9,
           display: "grid",
-          gridTemplateColumns: "minmax(0, 1.3fr) minmax(110px, .7fr) auto",
+          gridTemplateColumns: "minmax(0, 1fr) auto",
           gap: 8,
           alignItems: "end",
         }}
       >
         <div style={{ minWidth: 0 }}>
-          <FieldLabel htmlFor="agent-run-channel">Run channel</FieldLabel>
+          <FieldLabel htmlFor="agent-run-channel">Channel</FieldLabel>
           <select
             id="agent-run-channel"
             name="agent-run-channel"
@@ -848,8 +962,13 @@ function RunRequestForm({
             )}
           </select>
         </div>
-        <div style={{ minWidth: 0 }}>
-          <FieldLabel htmlFor="agent-run-anchor">Anchor sequence</FieldLabel>
+        <button type="submit" disabled={!ready} style={primaryButton(ready)}>
+          Ask to respond
+        </button>
+      </div>
+      {showAdvanced && (
+        <div style={{ marginTop: 10 }}>
+          <FieldLabel htmlFor="agent-run-anchor">Reply from message #</FieldLabel>
           <input
             id="agent-run-anchor"
             name="agent-run-anchor"
@@ -862,11 +981,17 @@ function RunRequestForm({
             disabled={!hasMessages}
             style={monoInputStyle}
           />
+          <div
+            style={{
+              marginTop: 5,
+              font: `400 10.5px ${font.sans}`,
+              color: color.muted2,
+            }}
+          >
+            Defaults to the latest message.
+          </div>
         </div>
-        <button type="submit" disabled={!ready} style={primaryButton(ready)}>
-          Request run
-        </button>
-      </div>
+      )}
     </form>
   );
 }
@@ -874,8 +999,10 @@ function RunRequestForm({
 // ── Register flow ───────────────────────────────────────
 
 function RegisterAgentForm({
+  capabilities,
   onRegister,
 }: {
+  capabilities: string[];
   onRegister: (params: {
     displayName: string;
     agentId: string;
@@ -889,6 +1016,8 @@ function RegisterAgentForm({
   const [capability, setCapability] = useState("");
   const [prompt, setPrompt] = useState("");
   const [allowedActions, setAllowedActions] = useState<string[]>(["chat.post"]);
+  // The id is derived from the name by default; this reveals the override.
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const agentId = slug(agentIdInput || displayName);
   const ready =
@@ -918,6 +1047,7 @@ function RegisterAgentForm({
     setCapability("");
     setPrompt("");
     setAllowedActions(["chat.post"]);
+    setShowAdvanced(false);
   };
 
   return (
@@ -929,7 +1059,7 @@ function RegisterAgentForm({
             <AgentAvatar name={displayName || "AI"} size={40} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>
-                New collaboration worker
+                Add an agent
               </div>
               <div
                 style={{
@@ -939,7 +1069,7 @@ function RegisterAgentForm({
                   lineHeight: 1.45,
                 }}
               >
-                Prompt text is stored by the node, then the registry records its hash.
+                Give it a name, pick what it runs on, and describe its job.
               </div>
             </div>
             <StatusPill label="AGENT" tone={statusTone.agent} />
@@ -967,31 +1097,12 @@ function RegisterAgentForm({
               />
             </div>
             <div>
-              <FieldLabel htmlFor="agent-id">Agent ID</FieldLabel>
-              <input
-                id="agent-id"
-                name="agent-id"
-                type="text"
-                autoComplete="off"
-                spellCheck={false}
-                value={agentIdInput}
-                onChange={(event) => setAgentIdInput(event.target.value)}
-                placeholder={agentId || "triage-agent…"}
-                style={monoInputStyle}
-              />
-            </div>
-            <div>
-              <FieldLabel htmlFor="agent-capability">Capability</FieldLabel>
-              <input
+              <FieldLabel htmlFor="agent-capability">Runs on</FieldLabel>
+              <RunsOnField
                 id="agent-capability"
-                name="agent-capability"
-                type="text"
-                autoComplete="off"
-                spellCheck={false}
                 value={capability}
-                onChange={(event) => setCapability(event.target.value)}
-                placeholder="capability tag…"
-                style={monoInputStyle}
+                capabilities={capabilities}
+                onChange={setCapability}
               />
             </div>
           </div>
@@ -1033,7 +1144,7 @@ function RegisterAgentForm({
                 color: color.muted2,
               }}
             >
-              CAPABILITIES
+              PERMISSIONS
             </legend>
             <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
               {KNOWN_ACTIONS.map((name) => {
@@ -1068,6 +1179,32 @@ function RegisterAgentForm({
             </div>
           </fieldset>
 
+          {showAdvanced && (
+            <div style={{ marginTop: 12 }}>
+              <FieldLabel htmlFor="agent-id">Agent ID</FieldLabel>
+              <input
+                id="agent-id"
+                name="agent-id"
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={agentIdInput}
+                onChange={(event) => setAgentIdInput(event.target.value)}
+                placeholder={agentId || "triage-agent…"}
+                style={monoInputStyle}
+              />
+              <div
+                style={{
+                  marginTop: 5,
+                  font: `400 10.5px ${font.sans}`,
+                  color: color.muted2,
+                }}
+              >
+                Used in @mentions and the API. Defaults to the name.
+              </div>
+            </div>
+          )}
+
           <div
             style={{
               marginTop: 14,
@@ -1077,6 +1214,24 @@ function RegisterAgentForm({
               minWidth: 0,
             }}
           >
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((open) => !open)}
+              aria-expanded={showAdvanced}
+              style={{
+                appearance: "none",
+                border: 0,
+                background: "transparent",
+                cursor: "pointer",
+                padding: 0,
+                font: `600 10px ${font.mono}`,
+                letterSpacing: ".05em",
+                color: color.muted2,
+                flexShrink: 0,
+              }}
+            >
+              {showAdvanced ? "Hide advanced" : "Advanced"}
+            </button>
             <span
               translate="no"
               style={{
@@ -1085,11 +1240,12 @@ function RegisterAgentForm({
                 overflow: "hidden",
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
+                textAlign: "right",
                 font: `400 11px ${font.mono}`,
                 color: color.muted2,
               }}
             >
-              id {agentId || "—"}
+              saved as {agentId || "—"}
             </span>
             <button type="submit" disabled={!ready} style={primaryButton(ready)}>
               Register agent
@@ -1178,7 +1334,7 @@ function WatchRow({
         aria-label={`Stop watching ${label}`}
         style={{ ...secondaryButton, minHeight: 30, color: color.red }}
       >
-        Unwatch
+        Turn off
       </button>
     </div>
   );
@@ -1249,7 +1405,7 @@ function WatchForm({
           </select>
         </div>
         <div style={{ minWidth: 0 }}>
-          <FieldLabel htmlFor="agent-watch-policy">Turn policy</FieldLabel>
+          <FieldLabel htmlFor="agent-watch-policy">When to reply</FieldLabel>
           <select
             id="agent-watch-policy"
             name="agent-watch-policy"
@@ -1266,7 +1422,7 @@ function WatchForm({
         </div>
         {kind === "assigned" && (
           <div style={{ minWidth: 0 }}>
-            <FieldLabel htmlFor="agent-watch-assigned">Assigned agent</FieldLabel>
+            <FieldLabel htmlFor="agent-watch-assigned">Which agent</FieldLabel>
             <select
               id="agent-watch-assigned"
               name="agent-watch-assigned"
@@ -1285,7 +1441,7 @@ function WatchForm({
           </div>
         )}
         <button type="submit" disabled={!ready} style={primaryButton(ready)}>
-          Watch channel
+          Add auto-reply
         </button>
       </div>
     </form>
@@ -1311,7 +1467,7 @@ function WatchesPanel({
   return (
     <section aria-label="Watches" style={{ minWidth: 0 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <SectionLabel>WATCHES</SectionLabel>
+        <SectionLabel>AUTO-REPLY</SectionLabel>
         <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
           {watches.length}
         </span>
@@ -1320,8 +1476,8 @@ function WatchesPanel({
         {watches.length === 0 ? (
           <EmptyState
             icon="hash"
-            title="No watched channels"
-            body="Add a real channel watch to let registered agents engage posts by policy."
+            title="No auto-reply set up"
+            body="Pick a channel and your agents will answer there on the rule you choose."
           />
         ) : (
           watches.map((watch) => (
@@ -1410,7 +1566,7 @@ function RunRow({
           >
             {agentName}
           </span>
-          <StatusPill label="AWAITING RESULT" tone={statusTone.warning} />
+          <StatusPill label="WORKING…" tone={statusTone.warning} />
           <StatusPill label={run.job_id ? "JOB" : "CHAT"} tone={run.job_id ? statusTone.agent : statusTone.blue} />
           <button
             type="button"
@@ -1423,13 +1579,12 @@ function RunRow({
         </div>
         <div style={{ padding: "11px 12px" }}>
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
-            <Chip text={shortText(run.run_id)} />
             <FinalizationMark op={op} />
             <Chip text={label} tone={statusTone.blue} />
             {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
           </div>
           <div
-            title={runDetail(run)}
+            title={`run ${run.run_id} · ${runDetail(run)}`}
             style={{
               marginTop: 7,
               font: `400 11px ${font.mono}`,
@@ -1439,7 +1594,7 @@ function RunRow({
               whiteSpace: "nowrap",
             }}
           >
-            {runDetail(run)} · created {run.created_at}
+            started {run.created_at}
           </div>
         </div>
       </GroupCard>
@@ -1464,7 +1619,7 @@ function RunsTimeline({
   return (
     <section aria-label="Pending runs" style={{ minWidth: 0 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <SectionLabel>PENDING RUNS</SectionLabel>
+        <SectionLabel>IN PROGRESS</SectionLabel>
         <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
           {runs.length}
         </span>
@@ -1473,8 +1628,8 @@ function RunsTimeline({
         <GroupCard style={{ marginTop: 9 }}>
           <EmptyState
             icon="agent"
-            title="No runs in flight"
-            body="Engagements and explicit requests appear here until their result delivers; history lives on the dispatch plane."
+            title="Nothing running"
+            body="When an agent is working on a reply, it shows here until it finishes."
           />
         </GroupCard>
       ) : (
@@ -1582,7 +1737,7 @@ export function AgentView() {
                 Jobs worker
               </span>
               <span style={{ font: `400 9px ${font.sans}`, color: color.muted2 }}>
-                opts the agent module into job-board work
+                let agents pick up background jobs
               </span>
             </div>
             <FinalizationMark op={state.ops[opKey.jobWorker()]} />
@@ -1622,8 +1777,8 @@ export function AgentView() {
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <StatusPill label={`${activeCount} ACTIVE`} tone={statusTone.success} />
-            <StatusPill label={`${state.watches.length} WATCHES`} tone={statusTone.neutral} />
-            <StatusPill label={`${state.pendingRuns.length} PENDING`} tone={statusTone.warning} />
+            <StatusPill label={`${state.watches.length} AUTO-REPLY`} tone={statusTone.neutral} />
+            <StatusPill label={`${state.pendingRuns.length} IN PROGRESS`} tone={statusTone.warning} />
           </div>
         </div>
       </div>
@@ -1658,8 +1813,8 @@ export function AgentView() {
             {state.agents.length === 0 ? (
               <EmptyState
                 icon="agent"
-                title="No agents registered"
-                body="Register an agent before configuring runs or assigned watches."
+                title="No agents yet"
+                body="Add an agent to get started."
               />
             ) : (
               state.agents.map((agent) => (
@@ -1695,12 +1850,16 @@ export function AgentView() {
             <AgentDetail
               agent={selectedAgent}
               channels={state.channels}
+              capabilities={state.capabilities}
               onPause={actions.pauseAgent}
               onResume={actions.resumeAgent}
               onUpdate={actions.updateAgent}
               onRequestRun={actions.requestRun}
             />
-            <RegisterAgentForm onRegister={actions.registerAgent} />
+            <RegisterAgentForm
+              capabilities={state.capabilities}
+              onRegister={actions.registerAgent}
+            />
           </div>
 
           <div

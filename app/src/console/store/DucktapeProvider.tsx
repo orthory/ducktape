@@ -14,6 +14,7 @@ import {
 import type { ReactNode } from "react";
 
 import * as agentClient from "../../domain/agent-client";
+import * as capabilityClient from "../../domain/capability-client";
 import * as chatClient from "../../domain/chat-client";
 import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
@@ -115,6 +116,11 @@ export function DucktapeProvider({
                 .catch((): PageBlock[] | null => null)
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
+          // the executor registry — best-effort like governance/files above, so
+          // a node without the capability module reads as "no executors" (the
+          // "Runs on" picker degrades to a text field) rather than a failed
+          // refresh.
+          capabilityClient.capabilities(live).catch((): string[] => []),
           runsClient.watches(live),
           // newest-first for the timeline; the wire orders by dispatch id.
           runsClient
@@ -140,6 +146,7 @@ export function DucktapeProvider({
         pages,
         pageBlocks,
         agents,
+        capabilities,
         watches,
         pendingRuns,
         profiles,
@@ -177,6 +184,7 @@ export function DucktapeProvider({
                 pages,
                 activePageBlocks: pageBlocks ?? [],
                 agents,
+                capabilities,
                 watches,
                 pendingRuns,
                 files,
