@@ -40,10 +40,12 @@ export interface PageBlock {
   children: string[];
 }
 
-/** One entry of the page enumeration: id + live title. */
+/** One entry of the page enumeration: id + live title + folder parent. */
 export interface PageMeta {
   id: string;
   title: string;
+  /** Folder parent page id, or null for a top-level page. */
+  parent: string | null;
 }
 
 /** A stable pointer to one block in one pages module — the shape a future
@@ -63,11 +65,32 @@ const TARGET = "pages";
 
 export const createPage = (
   transport: NodeTransport,
-  params: { pageId: string; title: string },
+  params: { pageId: string; title: string; parent?: string | null },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    create_page: { page_id: params.pageId, title: params.title },
+    create_page: {
+      page_id: params.pageId,
+      title: params.title,
+      parent: params.parent ?? null,
+    },
   });
+
+/** Re-nest a page under a (possibly new) parent page, or to top level with
+ *  null. */
+export const setPageParent = (
+  transport: NodeTransport,
+  params: { pageId: string; parent: string | null },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    set_page_parent: { page_id: params.pageId, parent: params.parent },
+  });
+
+/** Delete a page: its root + block subtree; child pages are promoted up. */
+export const deletePage = (
+  transport: NodeTransport,
+  pageId: string,
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, { delete_page: { page_id: pageId } });
 
 export const insertBlock = (
   transport: NodeTransport,
