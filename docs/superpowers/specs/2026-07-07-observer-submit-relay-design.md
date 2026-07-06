@@ -86,7 +86,7 @@ pub enum RelayOutcome {
     Applied { height: u64, app_hash: String },
     /// finalized but deterministically rejected.
     Rejected { detail: String },
-    /// refused at the door (bad frame / no standing / origin mismatch) or
+    /// refused at the door (bad frame / origin lacks observer standing) or
     /// the hold expired before finalization.
     Refused { detail: String },
 }
@@ -116,13 +116,16 @@ like a local one.
 Register `CHANNEL_SUBMIT_RELAY`; add a select arm:
 
 1. decode `RelayMsg::Submit` — junk drops silently (lobby idiom);
-2. `decode_frame` the bytes — refusal on error;
-3. **origin == the authenticated channel peer** — a node may only relay its
-   own ops (no laundering); refusal on mismatch;
-4. **origin ∈ committed observer standing** (`read_valset_observers` on this
+2. `decode_frame` the bytes — refusal on error (the signature must bind
+   `(origin, seq, target, payload)` to the origin key; forgery is impossible);
+3. **origin ∈ committed observer standing** (`read_valset_observers` on this
    node's host) — validators submit locally and parked joiners have no
-   standing; refusal otherwise;
-5. `node.submit_frame(frame)` → `FrameId`; record in a new
+   standing; refusal otherwise. the sending PEER is deliberately not consulted:
+   observers ride the network's derived lobby transport identity (derivable by
+   any invite holder), so an `origin == peer` check could never pass for a real
+   observer and would gate nothing — the frame signature is the authorization
+   and the exactly-once digest gate collapses byte-identical replays;
+4. `node.submit_frame(frame)` → `FrameId`; record in a new
    `pending_relays: HashMap<FrameId, (peer, deadline)>` with the same
    `SUBMIT_HOLD` budget as local submits.
 
@@ -196,7 +199,7 @@ flag-day, in line with the no-backwards-compat policy; nothing can fork.
 |---|---|
 | junk on the relay channel | dropped (validator), like the lobby doorbell |
 | bad signature / undecodable frame | `Refused` reply, nothing pinned |
-| origin ≠ sending peer | `Refused` (anti-laundering) |
+| sending peer ≠ origin | not a failure — observers ride the shared, invite-derivable lobby transport identity, so the peer is never consulted; the frame signature + committed observer standing are the whole gate |
 | origin lacks committed observer standing | `Refused` |
 | validator dies after accepting | frame is pinned + carried by that validator's custody; if it never finalizes, the observer's hold expires honestly; client re-submit produces a byte-identical or fresh frame — both safe |
 | relay reply lost | observer hold expires honestly; the op may still have landed — the app re-queries on block events (same contract as a validator timeout) |
@@ -208,8 +211,12 @@ flag-day, in line with the no-backwards-compat policy; nothing can fork.
    pre-signed frame (pin + outstanding + carried across `cutover`); a
    tampered/bad-signature frame errors without pinning; `submit` still equals
    sign + `submit_frame`.
-2. **Relay codec unit** (`bin/node`, in-module tests like `lobby.rs`):
-   round-trip encode/decode; outcome mapping.
+2. **Relay codec + door unit** (`bin/node`, in-module tests like `lobby.rs`):
+   round-trip encode/decode; outcome mapping; and the pure door check
+   `verify_relay_submit` — a standing origin's frame is accepted, a frame whose
+   origin holds no committed observer standing is refused, and a
+   signature-tampered frame that still parses as json is refused at the
+   signature (not the json parser).
 3. **E2E** (`bin/node/tests/observer_submit_e2e.rs`, on the
    `live_admission_e2e` harness which already grants observer standing):
    - observer with standing submits a chat post through its app surface →
@@ -217,7 +224,9 @@ flag-day, in line with the no-backwards-compat policy; nothing can fork.
      with `author == observer key`; the observer's own read surface shows it
      after the next boundary follow.
    - a parked joiner WITHOUT standing gets the not-a-validator refusal.
-   - a relay whose origin ≠ sender is `Refused` (crafted frame, direct wire).
+   - (a frame whose origin holds no committed observer standing is refused at
+     the door — now covered by the `verify_relay_submit` unit test in §2, not a
+     separate e2e; there is no origin≠peer gate to exercise.)
    - member-gated module op (e.g. a governance proposal) from an observer
      finalizes Rejected — proving relay grants no authority.
 

@@ -7385,10 +7385,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         continue; // a Reply at a validator is a protocol confusion — drop.
                     };
                     // the door check needs committed state: the observer projection at
-                    // this node's latest boundary. origin==peer and signature checks ride
-                    // inside.
+                    // this node's latest boundary. the frame signature and the ORIGIN's
+                    // standing ride inside — the sending peer is not consulted (observers
+                    // speak from the shared, invite-derivable lobby transport identity).
                     let observers_now = read_valset_observers(node.host()).await;
-                    let frame_id = match relay::verify_relay_submit(&frame, peer.as_ref(), &observers_now) {
+                    let frame_id = match relay::verify_relay_submit(&frame, &observers_now) {
                         Ok(id) => id,
                         Err(detail) => {
                             send_reply(node::frame_id(&frame), relay::RelayOutcome::Refused { detail });
