@@ -162,3 +162,60 @@ describe("PagesView", () => {
     expect(spies.removePageBlock).toHaveBeenCalledWith("empty");
   });
 });
+
+describe("Docs keyboard shortcuts & tab strip", () => {
+  const withTabs = (patch: Partial<ConsoleState> = {}) =>
+    renderPagesView({ openTabs: ["p1", "p2", "p3"], activePage: "p1", ...patch });
+
+  it("cycles to the next tab on ⌘⇧]", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "BracketRight", metaKey: true, shiftKey: true });
+    expect(spies.openPage).toHaveBeenLastCalledWith("p2");
+  });
+
+  it("wraps from the last tab back to the first on ⌘⇧]", () => {
+    const { spies } = withTabs({ activePage: "p3" });
+    fireEvent.keyDown(document, { code: "BracketRight", metaKey: true, shiftKey: true });
+    expect(spies.openPage).toHaveBeenLastCalledWith("p1");
+  });
+
+  it("cycles to the previous tab on ⌘⇧[ (wrapping past the first to the last)", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, shiftKey: true });
+    expect(spies.openPage).toHaveBeenLastCalledWith("p3");
+  });
+
+  it("accepts Ctrl as well as ⌘ for tab cycling", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, shiftKey: true });
+    expect(spies.openPage).toHaveBeenLastCalledWith("p2");
+  });
+
+  it("creates a new top-level page on ⌘T and ⌘N", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "KeyT", metaKey: true });
+    fireEvent.keyDown(document, { code: "KeyN", metaKey: true });
+    expect(spies.createChildPage).toHaveBeenCalledTimes(2);
+    expect(spies.createChildPage).toHaveBeenNthCalledWith(1, null);
+    expect(spies.createChildPage).toHaveBeenNthCalledWith(2, null);
+  });
+
+  it("leaves ⌘W to the window — it never closes a doc tab or creates a page", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "KeyW", metaKey: true });
+    expect(spies.closeTab).not.toHaveBeenCalled();
+    expect(spies.openPage).not.toHaveBeenCalled();
+    // createChildPage is spied lazily on first access; ⌘W must never reach it,
+    // so the spy stays undefined (and if present, uncalled).
+    if (spies.createChildPage) expect(spies.createChildPage).not.toHaveBeenCalled();
+  });
+
+  it("keeps the tab strip scrollable but hides the scrollbar chrome", () => {
+    withTabs();
+    const strip = screen.getByRole("tablist", { name: "Open documents" });
+    // scroll is retained (overflow-x auto) …
+    expect(strip).toHaveStyle({ overflowX: "auto" });
+    // … while the .no-scrollbar utility suppresses the global 10px bar.
+    expect(strip.className).toContain("no-scrollbar");
+  });
+});
