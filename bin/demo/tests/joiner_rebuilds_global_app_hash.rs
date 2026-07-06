@@ -460,7 +460,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 agent_id: "quackbot".into(),
                 display_name: "Quackbot".into(),
                 capability: "mock-llm-1".into(),
-                prompt_hash: vec![7u8; 32],
+                prompt: None,
                 allowed_actions: vec![ACTION_CHAT_POST.into()],
             }),
         )
@@ -473,7 +473,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 agent_id: "sleepy".into(),
                 display_name: "Sleepy".into(),
                 capability: "mock-llm-1".into(),
-                prompt_hash: vec![8u8; 32],
+                prompt: None,
                 allowed_actions: Vec::new(),
             }),
         )

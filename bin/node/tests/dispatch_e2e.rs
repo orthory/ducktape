@@ -218,7 +218,7 @@ fn register_and_mention(
             agent_id: agent_id.into(),
             display_name: agent_id.into(),
             capability: tag.into(),
-            prompt_hash: vec![7u8; 32],
+            prompt: None,
             allowed_actions: vec![ACTION_CHAT_POST.into()],
         }),
     );

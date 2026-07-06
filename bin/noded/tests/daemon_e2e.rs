@@ -470,7 +470,8 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     );
     assert_eq!(code, 200, "create channel failed: {block}");
 
-    let prompt_hash = vec![7u8; 32];
+    // no prompt ref: a missing/null `prompt` keeps the runs module's generic
+    // default prompt — the exact wire shape a minimal client submits.
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
@@ -478,7 +479,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
                 "agent_id": "quackbot",
                 "display_name": "Quackbot",
                 "capability": "echo-model",
-                "prompt_hash": prompt_hash,
+                "prompt": null,
                 "allowed_actions": ["chat.post"]
             }
         }),

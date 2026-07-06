@@ -403,7 +403,7 @@ fn main() {
                     agent_id: "quackbot".into(),
                     display_name: "Quackbot".into(),
                     capability: "mock-llm-1".into(),
-                    prompt_hash: vec![7u8; 32],
+                    prompt: None,
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                 }),
             },
