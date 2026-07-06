@@ -2459,6 +2459,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
         reach: Vec::new(),
+        coordination: None,
     };
     if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -3404,6 +3405,10 @@ fn wire_reachability_plane<S, R>(
     wireguard_effect: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    // the genesis-issued admission capability presented on every coordinator
+    // request (private coordination); `None` for a genesis validator, a public
+    // coordinator, or the dev shape.
+    coord_cap: Option<nat_traversal::CoordCap>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
@@ -3416,6 +3421,7 @@ where
 
     let thread_label = label.to_string();
     let reach_signer = signer.clone();
+    let reach_coord_cap = coord_cap;
     let plane_chain_id = chain_id.to_string();
     let key_file = wireguard_key_file.to_path_buf();
     let state_file = mesh_state_file.to_path_buf();
@@ -3437,6 +3443,7 @@ where
                     wireguard_effect,
                     advertised,
                     coordinators,
+                    reach_coord_cap,
                     cmd_rx,
                     nudge_tx,
                     ev_tx,
@@ -3532,6 +3539,7 @@ where
     cmd_tx
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reachability_plane(
     label: String,
     chain_id: String,
@@ -3544,6 +3552,10 @@ async fn reachability_plane(
     effect_kind: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    // the genesis-issued admission capability presented on every coordinator
+    // request (private coordination); `None` for a genesis validator, a public
+    // coordinator, or the dev shape.
+    coord_cap: Option<nat_traversal::CoordCap>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
     // a clone of the `commands` sender, for the plane's own nudge ticker.
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
@@ -3608,7 +3620,13 @@ async fn reachability_plane(
         }
     }
     let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
-    let resolver = match reachability::NatResolver::bind(me, coords.clone()).await {
+    // authenticate every coordinator request: the node signs a
+    // proof-of-possession with its identity key and, in private coordination,
+    // carries the genesis-issued cap. A fully-open coordinator ignores the
+    // authenticator; a public/private one requires it. With no coordinators
+    // configured `bind` short-circuits to pass-through and never touches this.
+    let auth = Some((signer.clone(), coord_cap));
+    let resolver = match reachability::NatResolver::bind(me, coords.clone(), auth).await {
         Ok(resolver) => resolver,
         Err(err) => {
             eprintln!(
@@ -3750,6 +3768,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         invite_token,
         sync_index,
         announce_capabilities,
+        coordination,
+        coord_cap,
+        workspace,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -3802,6 +3823,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // the plane's to surface at its restore; here they just mean no seeds.
     let chain_id = String::from_utf8_lossy(&namespace).to_string();
     let mesh_state_file = storage.join("mesh-state.json");
+    // fail-closed check for private coordination: a node that is neither a
+    // genesis validator (admitted by membership) nor holding a `coord.cap`
+    // will have every rendezvous request silently dropped by a private
+    // coordinator. Surface that loudly instead of pretending the plane is
+    // healthy — the tunnels never come up, and the operator needs to know it
+    // is a missing credential, not a network fault.
+    if wireguard_listen.is_some()
+        && !coordinated.is_empty()
+        && coordination == config::Coordination::Private
+        && coord_cap.is_none()
+        && !validators.contains(&signer.public_key())
+    {
+        eprintln!(
+            "[node {label}] reachability: private coordination but no coord.cap and not a \
+             genesis validator — rendezvous will be denied; provide coord.cap or use a \
+             fronted/direct reach hint"
+        );
+    }
     let mesh_dial_seeds: Vec<(ed25519::PublicKey, Ingress)> =
         match reachability::store::load(&mesh_state_file, &chain_id) {
             Ok(Some(mesh)) => {
@@ -4258,6 +4297,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             wireguard_effect,
                             advertised_reach,
                             coordinators,
+                            coord_cap.clone(),
                             reach_tx,
                             reach_rx,
                         ))
@@ -4295,15 +4335,45 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
             {
                 let label = label.clone();
+                // the parked joiner persists a coord.cap delivered over a
+                // JoinReply into its workspace, so a later boot presents it to
+                // the private coordinator (loaded via `load_coord_cap`).
+                let cap_dir = workspace.clone();
                 context.child("lobby_replies").spawn(move |_ctx| async move {
                     while let Ok((peer, msg)) = lobby_rx.recv().await {
                         let bytes: Vec<u8> = msg.into();
                         match lobby::decode_msg(&bytes) {
-                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail }) => println!(
-                                "[node {label}] member {}: {}{detail}",
-                                hex_bytes(&peer.as_ref()[..4]),
-                                if recorded { "" } else { "join request refused — " },
-                            ),
+                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail, cap }) => {
+                                println!(
+                                    "[node {label}] member {}: {}{detail}",
+                                    hex_bytes(&peer.as_ref()[..4]),
+                                    if recorded { "" } else { "join request refused — " },
+                                );
+                                // a delivered cap (private coordination): unpack
+                                // the opaque bytes and persist beside identity.
+                                if let Some(cap_bytes) = cap {
+                                    match config::unpack_coord_cap(&cap_bytes) {
+                                        Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
+                                            Ok(()) => println!(
+                                                "[node {label}] coordinator cap delivered by \
+                                                 member {} — saved (issuer {}, expires {})",
+                                                hex_bytes(&peer.as_ref()[..4]),
+                                                hex_bytes(&cap.issuer.as_ref()[..4]),
+                                                cap.not_after,
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "[node {label}] coordinator cap delivered but \
+                                                 could not be saved: {e}"
+                                            ),
+                                        },
+                                        Err(e) => eprintln!(
+                                            "[node {label}] member {} sent a malformed \
+                                             coordinator cap: {e}",
+                                            hex_bytes(&peer.as_ref()[..4]),
+                                        ),
+                                    }
+                                }
+                            }
                             Ok(_) | Err(_) => {}
                         }
                     }
@@ -5243,6 +5313,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         wireguard_effect,
                         advertised_reach,
                         coordinators,
+                        coord_cap.clone(),
                         reach_p2p_tx,
                         reach_p2p_rx,
                     ))
@@ -6940,8 +7011,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
                 announce = lobby_ingress.next() => {
                     let Some((peer, bytes)) = announce else { continue };
-                    let mut send_reply = |recorded: bool, detail: String| {
-                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
+                    let mut send_reply = |recorded: bool, detail: String, cap: Option<Vec<u8>>| {
+                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail, cap };
                         let _ = lobby_tx.send(
                             Recipients::One(peer.clone()),
                             IoBuf::from(lobby::encode_msg(&msg)),
@@ -6957,7 +7028,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let verified = match lobby::verify_join_request(&msg, &namespace) {
                         Ok(v) => v,
                         Err(e) => {
-                            send_reply(false, e);
+                            send_reply(false, e, None);
                             continue;
                         }
                     };
@@ -6969,13 +7040,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let observers_now = read_valset_observers(node.host()).await;
                     let joiner_bytes = verified.joiner.as_ref().to_vec();
                     if members.contains(&joiner_bytes) {
-                        send_reply(false, "already a validator".into());
+                        send_reply(false, "already a validator".into(), None);
                         continue;
                     }
                     if observers_now.contains(&joiner_bytes) {
                         send_reply(
                             false,
                             "already an observer — a member promotes it into the quorum".into(),
+                            None,
                         );
                         continue;
                     }
@@ -6983,6 +7055,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         send_reply(
                             false,
                             "the inviting member is no longer part of this network".into(),
+                            None,
                         );
                         continue;
                     }
@@ -7005,9 +7078,35 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             hex_bytes(verified.joiner.as_ref())
                         );
                     }
+                    // MINT the coordinator capability for the joiner, additive
+                    // and side-effect-free (a pure ed25519 sign — no consensus,
+                    // no valset change). Gated: only a GENESIS validator on a
+                    // PRIVATE network issues one — its key is in the
+                    // coordinator's pinned genesis set, so the cap it signs
+                    // actually admits. A public network needs no cap; a
+                    // non-genesis member cannot mint one the coordinator trusts.
+                    // The cap cannot ride the invite (the joiner's key did not
+                    // exist at invite-mint time), so this JoinReply is its only
+                    // delivery channel. Rotation is DEFERRED — the cap is
+                    // long-lived (COORD_CAP_TTL_SECS).
+                    let minted_cap = if coordination == config::Coordination::Private
+                        && validators.contains(&signer.public_key())
+                    {
+                        let mut subj = [0u8; 32];
+                        subj.copy_from_slice(verified.joiner.as_ref());
+                        let cap = nat_traversal::mint_coord_cap(
+                            &signer,
+                            nat_traversal::NodeKey(subj),
+                            nat_traversal::now_secs() + nat_traversal::COORD_CAP_TTL_SECS,
+                        );
+                        Some(config::pack_coord_cap(&cap))
+                    } else {
+                        None
+                    };
                     send_reply(
                         true,
                         "join request recorded — awaiting member approval".into(),
+                        minted_cap,
                     );
                 }
                 cmd = http_ingress.next() => {

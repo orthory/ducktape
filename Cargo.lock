@@ -1403,8 +1403,13 @@ dependencies = [
 name = "coordinator-bin"
 version = "0.1.0"
 dependencies = [
+ "commonware-codec",
+ "commonware-cryptography",
  "nat-traversal",
+ "serde",
+ "tempfile",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -3876,6 +3881,7 @@ dependencies = [
 name = "nat-traversal"
 version = "0.1.0"
 dependencies = [
+ "commonware-codec",
  "commonware-cryptography",
  "thiserror 2.0.18",
  "tokio",
@@ -4041,6 +4047,7 @@ dependencies = [
  "jobs",
  "kv",
  "memory",
+ "nat-traversal",
  "node",
  "noded",
  "pages",
