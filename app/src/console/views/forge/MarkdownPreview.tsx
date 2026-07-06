@@ -67,7 +67,9 @@ const COMPONENTS: Components = {
   strong: ({ children }) => <strong style={{ fontWeight: 650, color: color.ink }}>{children}</strong>,
   em: ({ children }) => <em style={{ fontStyle: "italic" }}>{children}</em>,
   code: ({ className, children }) => {
-    const isBlock = /language-/.test(className ?? "");
+    // block code carries a language- class (fenced with a lang) or spans lines
+    // (fenced without a lang); everything else is inline code.
+    const isBlock = /language-/.test(className ?? "") || String(children ?? "").includes("\n");
     if (isBlock) {
       return (
         <code style={{ font: codeFont, color: color.inkSoft, whiteSpace: "pre", display: "block" }}>{children}</code>
