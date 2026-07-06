@@ -59,6 +59,7 @@ use commonware_codec::DecodeExt as _;
 use host::{FinalizedBlock, Host};
 use sdk::{ModuleId, ROOT_LEN, StateRoot, StateSyncHandle, UpgradeCoords};
 
+pub mod dataplane;
 pub mod p2p;
 pub mod qmdb;
 pub mod wire;

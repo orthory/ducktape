@@ -26,6 +26,11 @@ commonware-parallel = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-utils = { workspace = true }
 commonware-p2p = { workspace = true }
+# the off-consensus stream class the data-plane binding (`dataplane.rs`) opens
+# statesync streams on. `io-util` brings the AsyncRead/Write ext traits the
+# binding frames requests/responses with; PacedStream is tokio io.
+data-plane = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 futures = "0.3"
 
 [dev-dependencies]
@@ -36,3 +41,7 @@ async-trait = { workspace = true }
 # framed, fetched, staged, and adopted through this crate's wire.
 indexer = { workspace = true }
 tempfile = "3"
+# the sim transport arm: the dataplane binding's round-trip proof runs two
+# planes over one in-memory SimNet under tokio's paused clock.
+data-plane = { workspace = true, features = ["sim"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "test-util"] }

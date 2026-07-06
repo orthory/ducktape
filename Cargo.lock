@@ -6068,6 +6068,7 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "data-plane",
  "futures",
  "host",
  "indexer",
@@ -6075,6 +6076,7 @@ dependencies = [
  "sdk",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
