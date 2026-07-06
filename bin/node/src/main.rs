@@ -2480,31 +2480,27 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `invite [--config node.toml] [--manual]` — emit the one-line paste blob:
-/// the network descriptor with THIS member's dial hint folded in (and
-/// persisted, so every future invite carries it), plus an INVITE TOKEN. the
-/// token lets the joiner's parked node deliver its pubkey over the lobby
-/// channel automatically — the join request then awaits member approval
-/// (`invite-accept`, or the app's approve button); a token never admits by
-/// itself. `--manual` omits the token: the joiner's pubkey travels out-of-band
-/// exactly as before. any current member may invite (the blob is a low-trust
-/// doorbell, gated by the descriptor's genesis fingerprint and the admission
-/// ballot — not a signed genesis-only credential).
+/// `invite [--config node.toml] [--ttl-days N]` — emit the one-line paste
+/// blob: the whole join credential. minting IS the admission decision — the
+/// blob carries the descriptor with THIS member's dial hint folded in (and
+/// persisted, so every future invite carries it), the inviter's WireGuard
+/// bootstrap when the reachability plane is configured (`wireguard_listen`),
+/// an expiry, and a single-use INVITE TOKEN, the whole envelope signed by
+/// this member's identity. the joiner's node redeems the token automatically
+/// (governance `Redeem`) — no member approval step follows.
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    // `--manual` is a bare boolean; strip it before the `--flag value` parser.
-    let mut manual = false;
-    let args: Vec<String> = args
-        .iter()
-        .filter(|a| {
-            let is_manual = a.as_str() == "--manual";
-            manual |= is_manual;
-            !is_manual
-        })
-        .cloned()
-        .collect();
-    let (pos, flags) = parse_flags(&args)?;
+    let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let ttl_days: u64 = match flags.get("ttl-days") {
+        Some(v) => v
+            .parse()
+            .map_err(|e| format!("--ttl-days {v:?}: {e}"))?,
+        None => config::DEFAULT_INVITE_TTL_DAYS,
+    };
+    if ttl_days == 0 {
+        return Err("--ttl-days must be at least 1".into());
     }
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
@@ -2515,16 +2511,19 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor_path = base.join(network_rel);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
     let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
-    match config::dialable(raw.advertised.as_deref(), &raw.listen)? {
-        Some(addr) => descriptor.add_bootstrap(&key.public_key(), &addr),
-        // an invite must carry SOME dialable member. a member that joined via a
-        // v3 invite holds its dial hints as `reach` (bootstrap is empty), so
+    let dial_hint = config::dialable(raw.advertised.as_deref(), &raw.listen)?;
+    match &dial_hint {
+        Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
+        // an invite must carry SOME dialable member. a member that joined via
+        // an invite holds its dial hints as `reach` (bootstrap is empty), so
         // check the union, not just bootstrap — else a reachable NAT'd member
-        // is wrongly refused.
-        None if descriptor
-            .reach_hints()
-            .map(|h| h.is_empty())
-            .unwrap_or(true) =>
+        // is wrongly refused. a WireGuard-planed inviter is exempt: its blob
+        // carries the tunnel bootstrap, which IS the dial path.
+        None if raw.wireguard_listen.is_none()
+            && descriptor
+                .reach_hints()
+                .map(|h| h.is_empty())
+                .unwrap_or(true) =>
         {
             return Err(
                 "no dialable address: give node.toml a concrete `listen` port or an \
@@ -2535,9 +2534,44 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     descriptor.save(&descriptor_path)?;
-    let token = (!manual)
-        .then(|| config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes()));
-    println!("{}", config::encode_invite(&descriptor, token.as_ref())?);
+
+    // the WireGuard bootstrap: present iff this member runs the reachability
+    // plane. endpoints are minted from the advertised host (the listen IP is
+    // usually unspecified) + the plane's UDP ports; the mesh port is where
+    // the joiner dials this member's overlay ULA once the tunnel routes.
+    let wireguard = match config::resolved_wireguard_listen(raw.wireguard_listen.as_deref())? {
+        Some(wg_listen) => {
+            let (wg_keypair, _) =
+                reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
+                    .map_err(|e| format!("wireguard key: {e}"))?;
+            let host = config::endpoint_host(raw.advertised.as_deref(), &raw.listen, wg_listen)?;
+            let intro_port = config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?
+                .port();
+            let mesh_port: u16 = raw
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .map(|a| a.port())
+                .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
+            Some(config::InviteWireGuard {
+                public_key: wg_keypair.public_key().0,
+                endpoint: format!("{host}:{}", wg_listen.port()),
+                intro: format!("{host}:{intro_port}"),
+                mesh_port,
+            })
+        }
+        None => None,
+    };
+
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is past the epoch")
+        .as_secs()
+        + ttl_days * 24 * 60 * 60;
+    let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes());
+    println!(
+        "{}",
+        config::encode_invite(&descriptor, &token, wireguard.as_ref(), expires, &key)?
+    );
     Ok(())
 }
 
@@ -3312,10 +3346,11 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let [blob] = pos.as_slice() else {
         return Err("join needs exactly one <invite blob>".into());
     };
-    let (descriptor, token) = config::decode_invite(blob)?;
+    let invite = config::decode_invite(blob)?;
+    let descriptor = &invite.descriptor;
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
-    config::guard_join_descriptor(&dir, &descriptor)?;
+    config::guard_join_descriptor(&dir, descriptor)?;
     // plumbing merges: explicit flags win, an existing node.toml's values
     // (network- or dev-shape) survive, defaults fill the rest. computed
     // BEFORE anything lands on disk so a corrupt existing node.toml aborts
@@ -3333,10 +3368,13 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
     config::write_node_toml(&dir, &plumbing)?;
-    if let Some(token) = &token {
-        // the bearer credential the parked node announces with; a re-join
-        // with a fresh invite replaces a stale one.
-        config::save_invite_token(&dir, token)?;
+    // the capability the joining node redeems automatically; a re-join with a
+    // fresh invite replaces a stale/spent one.
+    config::save_invite_token(&dir, &invite.token)?;
+    if let Some(wg) = &invite.wireguard {
+        // the tunnel bootstrap the joining node dials BEFORE any p2p; kept
+        // beside the token so `run_node` can bring the interface up first.
+        config::save_invite_wireguard(&dir, &invite.token.issuer, wg)?;
     }
     eprintln!(
         "{} identity {me_hex}",
@@ -3352,25 +3390,14 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "this identity is a member — start: ducktape-node --config {}/node.toml",
             dir.display()
         );
-    } else if token.is_some() {
-        eprintln!(
-            "NOT yet a member. start now — `ducktape-node --config {}/node.toml` parks on \
-             the mesh and DELIVERS this identity to the members automatically (the invite \
-             carries a token); a member then approves the join request (the app's approve \
-             button, or `ducktape-node invite-accept {me_hex}`), and this node promotes \
-             itself.",
-            dir.display()
-        );
     } else {
-        eprintln!("NOT yet a member. send this identity to a member, then:");
-        eprintln!("  running network: the member runs `ducktape-node invite-accept {me_hex}`,");
         eprintln!(
-            "    and you start now — `ducktape-node --config {}/node.toml` parks on the \
-             mesh and promotes itself once admitted;",
+            "NOT yet a member. start now — `ducktape-node --config {}/node.toml` redeems \
+             this invite automatically: the node joins the network's VPN, syncs state, and \
+             comes up as a full node. no approval step follows (minting the invite WAS the \
+             approval); a member can later promote it into the quorum with `promote {me_hex}`.",
             dir.display()
         );
-        eprintln!("  before genesis: the member runs `ducktape-node admit {me_hex}` and you");
-        eprintln!("    join again with the refreshed invite (the identity here is kept).");
     }
     println!("{me_hex}");
     Ok(())
@@ -3745,9 +3772,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         wireguard_listen,
         wireguard_effect,
         wireguard_key_file,
+        invite_listen,
         dev_demo,
         checkpoint_blocks,
         invite_token,
+        invite_wireguard,
         sync_index,
         announce_capabilities,
     } = resolved;
