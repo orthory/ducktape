@@ -251,29 +251,30 @@ the root.
 
 ## Modularization and wasm readiness
 
-duckfs is built as three crates plus one sdk surface, so the consensus state
-machine can later compile to wasm unchanged:
+duckfs ships as ONE crate — `files` — whose pure core is enforced by a cargo
+feature rather than a crate boundary, plus the small `fscap` capability crate:
 
-- **`crates/apps/duckfs`** — the pure state machine: objects, canonical
-  paths, refs/root, CoW tree engine, verb execution, queries, GC marking.
-  No `std::fs`, no tokio, no sdk dependency (its inputs are plain types:
-  actor string, height, consensus time). All I/O goes through two traits it
-  defines: `ObjectStore` (put/get/has/remove/list of objects) and `RefsStore`
-  (load/save of the refs envelope). Ships `MemStore`/`MemRefs` in-memory
-  implementations (tests today, the wasm default tomorrow). This crate is the
-  wasm migration unit.
-- **`crates/apps/files`** also owns the native disk backend (`src/store.rs`):
-  `DiskStore` (loose-object odb, tmp→fsync→rename, verified reads, tmp sweep)
-  and `DiskRefs` (atomic refs file with height/gc-watermark envelope) — native
-  code lives with the native glue, no separate store crate.
-- **`crates/apps/files`** — the thin sdk glue: implements `sdk::Module` by
-  mapping `Ctx`/`Env`/`Origin` onto `duckfs` calls over `DiskStore`, and
-  emits the watch notifications core returns. Module id stays `files`.
+- **`crates/apps/files`, always-compiled core** (the wasm migration unit):
+  wire types, objects, canonical paths, refs/root, CoW tree engine, the
+  `Fs<S>` state machine, queries, GC marking, and the two I/O traits it is
+  generic over — `ObjectStore` (put/get/has/remove/list) and `RefsStore`
+  (load/save of the refs envelope) — with `MemStore`/`MemRefs` in-memory
+  implementations (tests today, the wasm default tomorrow). This half
+  depends only on sha2/serde/serde_json/base64/unicode-normalization: no
+  `std::fs`, no sdk, no async.
+- **`crates/apps/files`, `native` feature (default-on)**: `DiskStore`
+  (loose-object odb, tmp→fsync→rename, verified reads, tmp sweep),
+  `DiskRefs` (atomic refs file with height/gc-watermark envelope), and the
+  sdk glue — the `Files` type implementing `sdk::Module`, origin→owner
+  mapping, watch-notification emission. The sdk/async-trait dependencies are
+  optional and enabled only by this feature.
 - **`crates/apps/fscap`** — the fs capability over the module-injected
   interface (below).
 
-The determinism boundary gets a second enforcement layer from this split:
-the `duckfs` crate cannot even name the OS filesystem.
+The wasm-readiness proof is a standing build gate, not a promise:
+`cargo check -p files --no-default-features` must stay green — it compiles
+exactly the future wasm surface and fails on any accidental `std::fs`/sdk
+leak into the core.
 
 ## The fs capability (module-injected interface)
 
@@ -297,8 +298,8 @@ receive, with no new host machinery. It ships as `fscap` (the kernel
   path.
 
 Because `FsCap` is pure sugar over `Ctx`, it compiles anywhere `Ctx` exists —
-including a future wasm module ABI. Its wire types come from the `duckfs` crate's
-`wire` module, so no consumer ever depends on the files module crate itself.
+including a future wasm module ABI. Its wire types come from the files crate compiled
+with `default-features = false` — exactly the pure core, nothing native.
 
 ## Client stack
 
@@ -395,9 +396,8 @@ Rust crate shared by CLI, daemon, and sandbox runner; TS mirror for the app.
 
 ## Implementation shape (for the planning step)
 
-New/changed surfaces: `crates/apps/duckfs` + `crates/apps/files` glue
-+ `crates/apps/fscap` (per the modularization
-section), `crates/apps/memory` (deleted), a new `duckfs-client` crate, noded (blob-receipt store internalized; duckfs HTTP
+New/changed surfaces: `crates/apps/files` (single crate: pure core +
+`native` feature) + `crates/apps/fscap` (per the modularization section), `crates/apps/memory` (deleted), a new `duckfs-client` crate, noded (blob-receipt store internalized; duckfs HTTP
 endpoints; sandbox workspace RPC), bin/node + bin/demo registration sites,
 kernel statesync resolver wiring for `duckfs-odb`, app TS client + FilesView,
 docs (en+ko module pages). Branching per `.project/work.md`: worktree from
