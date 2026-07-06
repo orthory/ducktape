@@ -16,7 +16,7 @@ import type { OpLedger } from "../../store/finalization";
 import { Icon } from "../../components/Icon";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
-import { color, font } from "../../theme/tokens";
+import { color, font, radius } from "../../theme/tokens";
 
 const THREAD_COMPOSER_MAX_HEIGHT = 120;
 
@@ -69,7 +69,8 @@ export function ThreadPanel({
   };
 
   const handleComposerKeyDown = (event: KeyboardEvent) => {
-    if (event.key === "Escape") onClose();
+    // Don't close the thread when Escape is only dismissing an IME candidate.
+    if (event.key === "Escape" && !event.nativeEvent.isComposing) onClose();
   };
 
   const linkRefOf = (messageId: string) => `ducktape://${workspaceId ?? "local"}/${thread.root.channel_id}/${messageId}`;
@@ -197,8 +198,33 @@ export function ThreadPanel({
           ))}
         </div>
         {thread.replies.length === 0 && (
-          <div style={{ margin: "7px 0 0", font: `400 12px ${font.sans}`, color: color.muted2 }}>
-            No replies yet. Start the thread below.
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 8,
+              padding: "20px 12px 6px",
+              textAlign: "center",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 38,
+                height: 38,
+                borderRadius: radius.md,
+                background: color.sunken,
+              }}
+            >
+              <Icon name="chat" size={17} color={color.muted2} />
+            </div>
+            <div style={{ font: `500 12.5px ${font.sans}`, color: color.muted3 }}>No replies yet</div>
+            <div style={{ font: `400 11.5px ${font.sans}`, color: color.muted2, lineHeight: 1.5 }}>
+              Be the first to reply in this thread.
+            </div>
           </div>
         )}
       </div>

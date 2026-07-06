@@ -11,7 +11,8 @@ import { opForMessage } from "../../store/finalization";
 import type { OpLedger } from "../../store/finalization";
 import { buildStreamRows } from "./chat-helpers";
 import { MessageItem } from "./MessageItem";
-import { color, font } from "../../theme/tokens";
+import { Icon } from "../../components/Icon";
+import { color, font, radius } from "../../theme/tokens";
 
 function DayDivider({ label }: { label: string }) {
   return (
@@ -19,6 +20,43 @@ function DayDivider({ label }: { label: string }) {
       <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
       <span style={{ font: `500 10.5px ${font.mono}`, color: color.muted2, whiteSpace: "nowrap" }}>{label}</span>
       <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
+    </div>
+  );
+}
+
+// The Slack-style "start of channel" marker. It anchors the top of the stream
+// (giving an otherwise-sparse pane real substance) and, when the channel is
+// still empty, carries the invite to post the first message — so there's no
+// separate thin "no messages" caption floating alone in a blank pane.
+function ChannelIntro({ channelName, empty }: { channelName: string; empty: boolean }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 9,
+        padding: empty ? "18px 2px 8px" : "6px 2px 14px",
+        minWidth: 0,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 46,
+          height: 46,
+          borderRadius: radius.lg,
+          background: color.sunken,
+        }}
+      >
+        <Icon name="hash" size={21} color={color.muted2} />
+      </div>
+      <div style={{ font: `600 18px ${font.sans}`, color: color.ink, minWidth: 0 }}>#{channelName}</div>
+      <div style={{ font: `400 13px ${font.sans}`, color: color.muted2, lineHeight: 1.5, maxWidth: 560 }}>
+        This is the very beginning of the #{channelName} channel.
+        {empty ? " Send the first message to start the conversation." : ""}
+      </div>
     </div>
   );
 }
@@ -92,6 +130,7 @@ export function MessageList({
           gap: 1,
         }}
       >
+        <ChannelIntro channelName={channelName} empty={roots.length === 0} />
         {rows.map(({ message, groupStart, dayDivider }) => {
           const lastReply = message.head.last_reply_seq !== null ? bySeq.get(message.head.last_reply_seq) : undefined;
           const replyHint = lastReply ? authorName(lastReply.head.author, names) : null;
@@ -121,11 +160,6 @@ export function MessageList({
             </div>
           );
         })}
-        {roots.length === 0 && (
-          <div style={{ padding: "22px 0", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
-            No messages in #{channelName} yet. Send the first one.
-          </div>
-        )}
       </div>
     </div>
   );

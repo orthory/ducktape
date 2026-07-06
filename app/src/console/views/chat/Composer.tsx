@@ -91,7 +91,9 @@ export function Composer({
   const canSend = value.trim().length > 0;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey) {
+    // Ignore Enter while an IME composition is active — pressing Enter to commit
+    // a Korean / Japanese / Chinese candidate must NOT also send the message.
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       if (canSend) onSend();
     }

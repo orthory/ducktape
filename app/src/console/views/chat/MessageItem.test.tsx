@@ -66,6 +66,17 @@ describe("MessageItem edit/delete", () => {
     expect(screen.queryByText("Delete message")).toBeNull();
   });
 
+  it("badges an agent author with the AGENT pill (wire casing is lowercase `agent`)", () => {
+    const agentAuthor: AuthorRef = { agent: { module: "automations", agent_id: "helper" } };
+    const { unmount } = render(<MessageItem {...baseProps} message={msg(agentAuthor, "on it")} />);
+    expect(screen.getByText("AGENT")).toBeTruthy();
+    unmount();
+
+    // a plain user author must NOT be badged
+    render(<MessageItem {...baseProps} message={msg(otherAuthor, "hi")} />);
+    expect(screen.queryByText("AGENT")).toBeNull();
+  });
+
   it("opens an inline editor seeded with the message text and saves the new text", () => {
     const onEdit = vi.fn();
     render(<MessageItem {...baseProps} onEdit={onEdit} message={msg(ownAuthor, "original")} />);

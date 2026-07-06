@@ -1,0 +1,14 @@
+[package]
+name = "voice"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+data-plane.workspace = true
+opus.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+data-plane = { workspace = true, features = ["sim"] }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "test-util"] }

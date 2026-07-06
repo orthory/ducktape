@@ -12,7 +12,8 @@
 // renders on every operation surface, and a bare render (tests, previews)
 // must stay a passive indicator, not throw for a missing provider.
 
-import { useContext, useState } from "react";
+import { useContext, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import { ConsoleContext } from "../store/context";
 import type { OpRecord } from "../store/finalization";
@@ -28,9 +29,29 @@ export function FinalizationMark({
   op: OpRecord | undefined;
   size?: number;
 }) {
-  const [hover, setHover] = useState(false);
+  const [tip, setTip] = useState<{ left: number; top?: number; bottom?: number } | null>(null);
+  const ref = useRef<HTMLSpanElement>(null);
   const store = useContext(ConsoleContext);
   if (!op) return null;
+
+  // The tooltip renders to the document body (not in-flow) so it escapes the
+  // chat/list panes' `overflow:hidden` — the old absolute box was cropped at
+  // the left pane edge, mangling the text. Coords come from the mark's viewport
+  // rect, clamped horizontally and flipped above→below near the window top, so
+  // it can never clip regardless of where in the layout the mark sits.
+  const TIP_MAX = 280;
+  const showTip = () => {
+    const el = ref.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const left = Math.max(8, Math.min(r.left, window.innerWidth - TIP_MAX - 8));
+    setTip(
+      r.top < 96
+        ? { left, top: r.bottom + 6 }
+        : { left, bottom: window.innerHeight - r.top + 6 },
+    );
+  };
+  const hideTip = () => setTip(null);
 
   const label =
     op.phase === "pending"
@@ -56,6 +77,7 @@ export function FinalizationMark({
 
   return (
     <span
+      ref={ref}
       aria-label={label}
       role={openInExplorer ? "button" : undefined}
       tabIndex={openInExplorer ? 0 : undefined}
@@ -69,8 +91,10 @@ export function FinalizationMark({
               openInExplorer(event);
             }
       }
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
+      onMouseEnter={showTip}
+      onMouseLeave={hideTip}
+      onFocus={showTip}
+      onBlur={hideTip}
       style={{
         position: "relative",
         display: "inline-flex",
@@ -99,63 +123,63 @@ export function FinalizationMark({
         <Icon name="close" size={size} color={color.danger} strokeWidth={2.2} />
       )}
 
-      {hover && (
-        <span
-          role="tooltip"
-          style={{
-            position: "absolute",
-            bottom: "calc(100% + 6px)",
-            left: "50%",
-            transform: "translateX(-50%)",
-            zIndex: 60,
-            minWidth: 120,
-            maxWidth: 260,
-            padding: "6px 8px",
-            background: color.paper,
-            border: `1px solid ${color.borderStrong}`,
-            borderRadius: radius.sm,
-            boxShadow: shadow.pop,
-            font: `400 10px/1.5 ${font.mono}`,
-            color: color.inkSoft,
-            textAlign: "left",
-            pointerEvents: "none",
-            whiteSpace: "nowrap",
-          }}
-        >
-          <span style={{ display: "block" }}>{label}</span>
-          {op.phase === "finalized" && op.opHash && (
-            <span
-              style={{
-                display: "block",
-                marginTop: 3,
-                color: color.muted3,
-                whiteSpace: "normal",
-                wordBreak: "break-all",
-              }}
-            >
-              op {op.opHash}
-            </span>
-          )}
-          {openInExplorer && (
-            <span style={{ display: "block", marginTop: 3, color: color.muted3 }}>
-              click to view in explorer
-            </span>
-          )}
-          {op.phase === "failed" && op.error && (
-            <span
-              style={{
-                display: "block",
-                marginTop: 3,
-                color: color.danger,
-                whiteSpace: "normal",
-                wordBreak: "break-word",
-              }}
-            >
-              {op.error}
-            </span>
-          )}
-        </span>
-      )}
+      {tip &&
+        createPortal(
+          <span
+            role="tooltip"
+            style={{
+              position: "fixed",
+              left: tip.left,
+              top: tip.top,
+              bottom: tip.bottom,
+              zIndex: 90,
+              maxWidth: TIP_MAX,
+              padding: "6px 9px",
+              background: color.paper,
+              border: `1px solid ${color.borderStrong}`,
+              borderRadius: radius.sm,
+              boxShadow: shadow.pop,
+              font: `400 10px/1.55 ${font.mono}`,
+              color: color.inkSoft,
+              textAlign: "left",
+              pointerEvents: "none",
+            }}
+          >
+            <span style={{ display: "block", whiteSpace: "nowrap" }}>{label}</span>
+            {op.phase === "finalized" && op.opHash && (
+              <span
+                style={{
+                  display: "block",
+                  marginTop: 3,
+                  color: color.muted3,
+                  whiteSpace: "normal",
+                  wordBreak: "break-all",
+                }}
+              >
+                op {op.opHash}
+              </span>
+            )}
+            {openInExplorer && (
+              <span style={{ display: "block", marginTop: 3, color: color.muted3 }}>
+                click to view in explorer
+              </span>
+            )}
+            {op.phase === "failed" && op.error && (
+              <span
+                style={{
+                  display: "block",
+                  marginTop: 3,
+                  color: color.danger,
+                  whiteSpace: "normal",
+                  wordBreak: "break-word",
+                }}
+              >
+                {op.error}
+              </span>
+            )}
+          </span>,
+          document.body,
+        )}
     </span>
   );
 }

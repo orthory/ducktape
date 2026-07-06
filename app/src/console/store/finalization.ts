@@ -52,8 +52,14 @@ export const opKey = {
    *  carries it in `head.message_id`, so the row matches after refresh too). */
   message: (channelId: string, messageId: string) =>
     `chat/${channelId}/id/${messageId}`,
-  /** An op on an EXISTING message (edit/delete/reaction) — keyed by seq. */
+  /** An op on an EXISTING message (edit/delete) — keyed by seq. Reactions are
+   *  deliberately NOT keyed here: they use `reaction()` so a reaction submit
+   *  never paints a finalization mark on the message body it targets. */
   messageSeq: (channelId: string, seq: number) => `chat/${channelId}/seq/${seq}`,
+  /** A reaction toggle — its own key so `opForMessage` never picks it up (the
+   *  reaction chip is its own optimistic feedback). */
+  reaction: (channelId: string, seq: number, emoji: string) =>
+    `chat/${channelId}/seq/${seq}/react/${emoji}`,
   forgeHead: () => "forge/head",
   page: (pageId: string) => `page/${pageId}`,
   /** Page block ids are module-global — no page qualifier needed. */
