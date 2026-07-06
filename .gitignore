@@ -2,10 +2,9 @@
 **/*.rs.bk
 .DS_Store
 .claude/worktrees/
-docs/node_modules/
+node_modules/
 docs/dist/
 docs/pages.gen.ts
-app/node_modules/
 app/dist/
 app/src-tauri/gen/
 app/src-tauri/binaries/
