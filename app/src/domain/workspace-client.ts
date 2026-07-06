@@ -110,9 +110,21 @@ export const createWorkspace = (name: string): Promise<Workspace> =>
 export const joinWorkspace = (name: string, blob: string): Promise<Workspace> =>
   invoke<Workspace>("workspace_join", { name, blob });
 
-/** Admit a joiner by pubkey through this running member node's governance. */
+/** Admit a joiner by pubkey through this running member node's governance.
+ *  Grants OBSERVER standing (mesh + statesync, no quorum seat) — the first
+ *  step of staged admission; [`promoteMember`] seats it once warm. */
 export const admitMember = (id: string, pubkey: string): Promise<void> =>
   invoke<void>("workspace_admit", { id, pubkey });
+
+/** Promote an observer into the consensus quorum by pubkey through this
+ *  running member node's governance — staged admission's second step. */
+export const promoteMember = (id: string, pubkey: string): Promise<void> =>
+  invoke<void>("workspace_promote", { id, pubkey });
+
+/** Revoke observer standing by pubkey through this running member node's
+ *  governance — the undo of [`admitMember`]; the key's node parks again. */
+export const removeObserver = (id: string, pubkey: string): Promise<void> =>
+  invoke<void>("workspace_observer_remove", { id, pubkey });
 
 /** Remove a validator by pubkey through this running member node's governance.
  *  Opens a RemoveValidator proposal and casts this node's yes-ballot; the

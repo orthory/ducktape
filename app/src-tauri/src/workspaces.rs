@@ -542,6 +542,54 @@ pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Re
     .map(|_| ())
 }
 
+/// promote an observer into the consensus quorum by pubkey: drive the
+/// governance AddValidator through THIS running member node's local rpc. the
+/// second, deliberate step of staged admission — [`workspace_admit`] grants
+/// observer standing; this seats the (pre-synced, warm) key as a validator at
+/// the next epoch cutover. same majority ceremony as every membership change.
+#[tauri::command]
+pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
+    let pubkey = pubkey.trim().to_string();
+    if pubkey.is_empty() {
+        return Err("provide the observer's public key to promote".into());
+    }
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
+    run_verb(
+        &node_bin,
+        &["promote", &pubkey, "--config", &cfg.to_string_lossy()],
+    )
+    .map(|_| ())
+}
+
+/// revoke observer standing by pubkey: drive the governance RemoveObserver
+/// through THIS running member node's local rpc. the undo of
+/// [`workspace_admit`] — the key drops off the mesh at the next epoch cutover
+/// and its node parks again; re-granting is another admit. a seated validator
+/// is [`workspace_demote`]'s job (the tiers never overlap).
+#[tauri::command]
+pub fn workspace_observer_remove(
+    app: tauri::AppHandle,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
+    let pubkey = pubkey.trim().to_string();
+    if pubkey.is_empty() {
+        return Err("provide the observer's public key to revoke".into());
+    }
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
+    run_verb(
+        &node_bin,
+        &["observer-remove", &pubkey, "--config", &cfg.to_string_lossy()],
+    )
+    .map(|_| ())
+}
+
 /// REQUEST to leave a network: drive this node's on-chain SELF-removal, and
 /// KEEP THE NODE RUNNING. the honest first half of departure — the node must
 /// stay up through its own pending removal, because it is a current validator
