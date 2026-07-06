@@ -278,13 +278,35 @@ pub fn forge_diff(
     Ok(files.into_inner())
 }
 
+/// Validate a caller-supplied forge repo NAME: a single normal path segment (no
+/// `/` or `\`, not `.`/`..`, no absolute root), so `base.join(name)` can never
+/// escape the forge base. This is the `repo` arg's boundary — the analogue of
+/// [`clean_repo_path`] for the `path` arg — because `repo` arrives straight from
+/// a renderer `invoke` and `PathBuf::join` would otherwise let an absolute or
+/// `..`-laden value open an arbitrary on-disk git repo. forge only ever creates
+/// `[a-z0-9._-]` slugs (its `norm_repo`), so every real repo name passes.
+fn clean_repo_name(name: &str) -> Result<&str, String> {
+    if name.is_empty() {
+        return Err("forge repo name is required".into());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("forge repo name must be a single path segment".into());
+    }
+    match Path::new(name).components().next() {
+        Some(Component::Normal(_)) if name != "." && name != ".." => Ok(name),
+        _ => Err(format!("invalid forge repo name {name:?}")),
+    }
+}
+
 /// Open a forge repo BY NAME from the first base that has materialized it.
 ///
 /// forge namespaces repos at `<base>/<name>` (a `Push`/`Commit` creates the dir
 /// lazily), so the on-disk repo lives ONE LEVEL DOWN. The caller passes the repo
 /// name it wants to read (from [`list_forge_repos`]/the UI's selection), so
-/// nothing here hardcodes or guesses a repo name.
+/// nothing here hardcodes or guesses a repo name; the name is validated as a
+/// single path segment first so it cannot escape the base.
 fn open_named_repo(app: &tauri::AppHandle, repo: &str) -> Result<Option<Repository>, String> {
+    let repo = clean_repo_name(repo)?;
     for base in forge_base_dirs(app)? {
         let dir = base.join(repo);
         if dir.join(".git").exists() {
@@ -533,4 +555,37 @@ fn text_lossy(bytes: &[u8]) -> String {
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_repo_name;
+
+    #[test]
+    fn accepts_real_forge_repo_slugs() {
+        for name in ["ducktape", "default", "my-repo", "a.b_c-1", "x"] {
+            assert_eq!(clean_repo_name(name).unwrap(), name, "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_and_separators() {
+        // these must NOT be joined onto the forge base — they would escape it.
+        for name in [
+            "",
+            ".",
+            "..",
+            "../secret",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "/Users/eddy/dev/private/ducktape/ducktape",
+            "../../../etc",
+        ] {
+            assert!(
+                clean_repo_name(name).is_err(),
+                "{name:?} must be rejected as a repo name"
+            );
+        }
+    }
 }
