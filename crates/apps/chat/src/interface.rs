@@ -234,18 +234,23 @@ pub enum ChatMsg {
         seq: u64,
         emoji: String,
     },
-    /// subscribe a module to this channel's post notifications. any non-empty
-    /// origin may register for now — admin gating is future work.
+    /// subscribe a module to this channel's post notifications. an external
+    /// (operator) origin may wire any registered module; a MODULE origin may
+    /// only register ITSELF (`module_id` == emitter) — admin gating beyond
+    /// that is future work.
     RegisterHook {
         channel_id: String,
         module_id: String,
     },
+    /// remove a module's subscription. same origin rule as `RegisterHook`:
+    /// a module origin may only unregister itself.
     UnregisterHook {
         channel_id: String,
         module_id: String,
     },
     /// add/remove an external user from the channel member set. any non-empty
-    /// origin may modify for now — admin gating is future work.
+    /// origin may modify for now — admin gating is future work (the
+    /// private-team-messaging ADR owns this surface).
     SetMembership {
         channel_id: String,
         user: Vec<u8>,

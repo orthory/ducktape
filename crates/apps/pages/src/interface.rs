@@ -157,6 +157,18 @@ pub enum PageMsg {
     DeleteComment { comment_id: String },
     /// toggle a thread's resolved flag; records the resolver as origin.
     ResolveThread { thread_id: String, resolved: bool },
+
+    // ── hooks ──
+    // subscribe/unsubscribe a module to this module's [`PageEvent`] fan-out.
+    // the payloads are EMPTY on purpose: the subscriber derives from the
+    // EMITTING module's origin (spoof-proof, the tagging idiom), so only a
+    // module can subscribe — and only ITSELF.
+    /// subscribe the emitting module. module-origin only; idempotent; capped
+    /// at [`MAX_PAGE_HOOKS`]; the pages module itself is rejected.
+    RegisterHook {},
+    /// unsubscribe the emitting module. module-origin only; absent is a
+    /// deterministic no-op.
+    UnregisterHook {},
 }
 
 // write-time caps for comments (consensus constants) — enforced before staging.
@@ -164,6 +176,10 @@ pub const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
 pub const MAX_QUERY_TARGETS: usize = 512;
+
+/// cap on the module-wide [`PageMsg::RegisterHook`] subscriber set (consensus
+/// constant) — every extra hook is one more same-block follow-up per write.
+pub const MAX_PAGE_HOOKS: usize = 8;
 
 /// who authored a comment — derived from `Env.origin`, never a payload. own
 /// copy of chat's shape (each module's interface is self-contained).
@@ -221,6 +237,45 @@ pub fn encode_msg(m: &PageMsg) -> Vec<u8> {
     serde_json::to_vec(m).expect("serializable")
 }
 pub fn decode_msg(b: &[u8]) -> Result<PageMsg, String> {
+    serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+
+/// what the pages module tells its registered hooks: one follow-up `Msg` per
+/// subscriber, emitted in the SAME block as (and only after) the triggering
+/// write, so the write and every notification commit or abort as one atomic
+/// unit. receivers own no-fail handling — a hook that errors on decode poisons
+/// the writer's block.
+///
+/// `page_id` is the page containing the touched target, derived by the module
+/// (a page-anchored comment names the page itself); it is EMPTY when a comment
+/// anchors to a target that does not resolve to a live block (a dangling
+/// anchor, exactly like a hyperlink).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PageEvent {
+    /// a comment was added — a new thread's opener or an append.
+    CommentAdded {
+        page_id: String,
+        target: String,
+        thread_id: String,
+        comment_id: String,
+        author: AuthorRef,
+        text: String,
+    },
+    /// a thread's resolved flag was toggled.
+    ThreadResolved {
+        page_id: String,
+        thread_id: String,
+        resolved: bool,
+    },
+    /// a block's text was replaced (a page root's text is its title).
+    BlockUpdated { page_id: String, block_id: String },
+}
+
+pub fn encode_page_event(e: &PageEvent) -> Vec<u8> {
+    serde_json::to_vec(e).expect("serializable")
+}
+pub fn decode_page_event(b: &[u8]) -> Result<PageEvent, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }
 
@@ -299,14 +354,23 @@ mod interface_tests {
             title: "root".into(),
             parent: None,
         };
-        assert!(String::from_utf8(encode_msg(&top)).unwrap().contains("\"parent\":null"));
+        assert!(
+            String::from_utf8(encode_msg(&top))
+                .unwrap()
+                .contains("\"parent\":null")
+        );
     }
 
     #[test]
     fn set_parent_and_delete_round_trip() {
         for m in [
-            PageMsg::SetPageParent { page_id: "p2".into(), parent: None },
-            PageMsg::DeletePage { page_id: "p2".into() },
+            PageMsg::SetPageParent {
+                page_id: "p2".into(),
+                parent: None,
+            },
+            PageMsg::DeletePage {
+                page_id: "p2".into(),
+            },
         ] {
             assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
         }
@@ -314,9 +378,42 @@ mod interface_tests {
 
     #[test]
     fn page_meta_carries_parent() {
-        let meta = PageMeta { id: "p2".into(), title: "t".into(), parent: Some("p1".into()) };
+        let meta = PageMeta {
+            id: "p2".into(),
+            title: "t".into(),
+            parent: Some("p1".into()),
+        };
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn hook_msgs_and_page_events_round_trip() {
+        // the registration payloads are EMPTY — the subscriber is the origin.
+        for m in [PageMsg::RegisterHook {}, PageMsg::UnregisterHook {}] {
+            assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
+        }
+        for e in [
+            PageEvent::CommentAdded {
+                page_id: "p1".into(),
+                target: "b1".into(),
+                thread_id: "t1".into(),
+                comment_id: "c1".into(),
+                author: AuthorRef::User(vec![7; 32]),
+                text: "hi".into(),
+            },
+            PageEvent::ThreadResolved {
+                page_id: "p1".into(),
+                thread_id: "t1".into(),
+                resolved: true,
+            },
+            PageEvent::BlockUpdated {
+                page_id: "p1".into(),
+                block_id: "b1".into(),
+            },
+        ] {
+            assert_eq!(decode_page_event(&encode_page_event(&e)).unwrap(), e);
+        }
     }
 }

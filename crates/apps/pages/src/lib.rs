@@ -50,7 +50,7 @@ pub use interface::*;
 // the derived-tier materialized view; registered only by serving binaries.
 pub mod index;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
@@ -116,6 +116,12 @@ pub const MAX_BLOCK_LEN: usize = 768 * 1024;
 /// (clients mint uuids), and every op that names it is rejected
 /// ([`PageError::ReservedId`]) before it can reach storage.
 const PAGE_INDEX_KEY: &str = "\u{0}page-index";
+
+/// the reserved logical key under which the module-wide HOOK subscriber set
+/// rides in the same qmdb — a serialized `BTreeSet<ModuleId>` (canonically
+/// sorted), so it folds into the root and state-syncs like any block. same
+/// NUL-prefix uncollidability rule as [`PAGE_INDEX_KEY`].
+const HOOKS_KEY: &str = "\u{0}hooks";
 
 /// how many parent hops a MoveBlock ancestry walk will follow before declaring
 /// the stored tree corrupt. committed state is acyclic by construction (every
@@ -250,6 +256,14 @@ enum PageError {
     TooManyThreads,
     /// a ThreadsForTargets query named more than [`MAX_QUERY_TARGETS`] targets.
     TooManyTargets,
+    // ── hooks ──
+    /// a hook op arrived from a non-module origin — the subscriber derives
+    /// from the EMITTING module, so externals/system have no hook surface.
+    HookOriginNotModule,
+    /// the pages module tried to hook itself.
+    HookSelf,
+    /// the subscriber set already holds [`MAX_PAGE_HOOKS`] modules.
+    TooManyHooks,
 }
 
 impl core::fmt::Display for PageError {
@@ -280,6 +294,11 @@ impl core::fmt::Display for PageError {
             PageError::TooManyComments => "too many comments in thread",
             PageError::TooManyThreads => "too many threads on target",
             PageError::TooManyTargets => "too many query targets",
+            PageError::HookOriginNotModule => {
+                "hook ops are module-origin only (the subscriber derives from the emitting module)"
+            }
+            PageError::HookSelf => "pages cannot hook itself",
+            PageError::TooManyHooks => "hook cap reached",
         };
         f.write_str(s)
     }
@@ -435,11 +454,17 @@ where
     }
 
     fn store_thread(&mut self, t: &Thread) -> Result<(), PageError> {
-        self.stage(&thread_key(&t.id), serde_json::to_vec(t).expect("thread serializable"))
+        self.stage(
+            &thread_key(&t.id),
+            serde_json::to_vec(t).expect("thread serializable"),
+        )
     }
 
     fn store_comment(&mut self, c: &Comment) -> Result<(), PageError> {
-        self.stage(&comment_key(&c.id), serde_json::to_vec(c).expect("comment serializable"))
+        self.stage(
+            &comment_key(&c.id),
+            serde_json::to_vec(c).expect("comment serializable"),
+        )
     }
 
     async fn load_target_index(&self, target: &str) -> Result<Vec<String>, PageError> {
@@ -454,7 +479,37 @@ where
             self.delete_block(&target_index_key(target));
             Ok(())
         } else {
-            self.stage(&target_index_key(target), serde_json::to_vec(ids).expect("ids serializable"))
+            self.stage(
+                &target_index_key(target),
+                serde_json::to_vec(ids).expect("ids serializable"),
+            )
+        }
+    }
+
+    // ── hook storage (the reserved `\0hooks` key) ──
+
+    /// the module-wide hook subscriber set, through the staged-over-committed
+    /// overlay. absent reads as empty; a decode failure is corruption.
+    /// `BTreeSet` serializes canonically sorted, so every validator commits
+    /// identical bytes.
+    async fn load_hooks(&self) -> Result<BTreeSet<ModuleId>, PageError> {
+        match self.get(HOOKS_KEY.as_bytes()).await {
+            Some(b) => serde_json::from_slice(&b).map_err(|_| PageError::Corrupt),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
+    /// re-stage the whole hook set; an EMPTY set deletes the key, so the root
+    /// returns to the no-hooks shape instead of committing an empty record.
+    fn stage_hooks(&mut self, hooks: &BTreeSet<ModuleId>) -> Result<(), PageError> {
+        if hooks.is_empty() {
+            self.delete_block(HOOKS_KEY);
+            Ok(())
+        } else {
+            self.stage(
+                HOOKS_KEY,
+                serde_json::to_vec(hooks).expect("hooks serializable"),
+            )
         }
     }
 
@@ -528,7 +583,11 @@ where
     /// [`PageError::PageCycle`] if `forbidden` is met — that would nest a page
     /// inside its own folder subtree. [`MAX_DEPTH`] turns a corrupt (looping)
     /// folder chain into a loud error instead of a hang.
-    async fn folder_ancestry_excludes(&self, start: &str, forbidden: &str) -> Result<(), PageError> {
+    async fn folder_ancestry_excludes(
+        &self,
+        start: &str,
+        forbidden: &str,
+    ) -> Result<(), PageError> {
         let index = self.load_index().await.map_err(to_page_err)?;
         let mut cur = Some(start.to_string());
         for _ in 0..MAX_DEPTH {
@@ -555,7 +614,9 @@ where
         // key lead with NUL, so rejecting NUL-prefixed ids here — BEFORE any
         // storage touch — keeps a block/comment write from ever clobbering them.
         let named: Vec<&str> = match &msg {
-            PageMsg::CreatePage { page_id, parent, .. } => {
+            PageMsg::CreatePage {
+                page_id, parent, ..
+            } => {
                 let mut v = vec![page_id.as_str()];
                 if let Some(p) = parent {
                     v.push(p.as_str());
@@ -567,7 +628,9 @@ where
             | PageMsg::SetKind { block_id, .. }
             | PageMsg::SetChecked { block_id, .. }
             | PageMsg::RemoveBlock { block_id } => vec![block_id.as_str()],
-            PageMsg::MoveBlock { block_id, parent, .. } => vec![block_id.as_str(), parent.as_str()],
+            PageMsg::MoveBlock {
+                block_id, parent, ..
+            } => vec![block_id.as_str(), parent.as_str()],
             PageMsg::SetPageParent { page_id, parent } => {
                 let mut v = vec![page_id.as_str()];
                 if let Some(p) = parent {
@@ -576,19 +639,30 @@ where
                 v
             }
             PageMsg::DeletePage { page_id } => vec![page_id.as_str()],
-            PageMsg::AddComment { thread_id, comment_id, target, .. } => {
+            PageMsg::AddComment {
+                thread_id,
+                comment_id,
+                target,
+                ..
+            } => {
                 vec![thread_id.as_str(), comment_id.as_str(), target.as_str()]
             }
             PageMsg::EditComment { comment_id, .. } => vec![comment_id.as_str()],
             PageMsg::DeleteComment { comment_id } => vec![comment_id.as_str()],
             PageMsg::ResolveThread { thread_id, .. } => vec![thread_id.as_str()],
+            // hook payloads are empty — the subscriber derives from the origin.
+            PageMsg::RegisterHook {} | PageMsg::UnregisterHook {} => Vec::new(),
         };
         if named.iter().any(|id| id.starts_with('\u{0}')) {
             return Err(PageError::ReservedId);
         }
 
         match msg {
-            PageMsg::CreatePage { page_id, title, parent } => {
+            PageMsg::CreatePage {
+                page_id,
+                title,
+                parent,
+            } => {
                 match self.load_block(&page_id).await.map_err(to_page_err)? {
                     // idempotent: re-creating an existing page is a benign
                     // no-op that does NOT clobber the live title OR re-nest it.
@@ -834,7 +908,12 @@ where
             }
 
             // ── comments ──
-            PageMsg::AddComment { thread_id, comment_id, target, text } => {
+            PageMsg::AddComment {
+                thread_id,
+                comment_id,
+                target,
+                text,
+            } => {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
@@ -955,7 +1034,10 @@ where
                 }
                 Ok(())
             }
-            PageMsg::ResolveThread { thread_id, resolved } => {
+            PageMsg::ResolveThread {
+                thread_id,
+                resolved,
+            } => {
                 let author = author_from_origin(origin)?;
                 let mut thread = self
                     .load_thread(&thread_id)
@@ -965,7 +1047,120 @@ where
                 thread.resolved_by = if resolved { Some(author) } else { None };
                 self.store_thread(&thread)
             }
+
+            // ── hooks (the tagging registration idiom: subscriber = origin) ──
+            PageMsg::RegisterHook {} => {
+                let subscriber = self.hook_subscriber(origin)?;
+                let mut hooks = self.load_hooks().await?;
+                if hooks.contains(&subscriber) {
+                    // idempotent: re-registering stages nothing.
+                    return Ok(());
+                }
+                if hooks.len() >= MAX_PAGE_HOOKS {
+                    return Err(PageError::TooManyHooks);
+                }
+                hooks.insert(subscriber);
+                self.stage_hooks(&hooks)
+            }
+            PageMsg::UnregisterHook {} => {
+                let subscriber = self.hook_subscriber(origin)?;
+                let mut hooks = self.load_hooks().await?;
+                if !hooks.remove(&subscriber) {
+                    // idempotent: unregistering an absent hook stages nothing.
+                    return Ok(());
+                }
+                self.stage_hooks(&hooks)
+            }
         }
+    }
+
+    /// the hook subscriber behind a registration op: the EMITTING module,
+    /// derived from the origin (spoof-proof — a module can only subscribe
+    /// ITSELF). external/system origins have no hook surface, and the pages
+    /// module hooking itself would fan its own events back in.
+    fn hook_subscriber(&self, origin: &Origin) -> Result<ModuleId, PageError> {
+        let subscriber = match origin {
+            Origin::Module(m) => m.clone(),
+            _ => return Err(PageError::HookOriginNotModule),
+        };
+        if subscriber == self.id {
+            return Err(PageError::HookSelf);
+        }
+        Ok(subscriber)
+    }
+
+    /// the [`PageEvent`] a JUST-APPLIED op fans out to the registered hooks,
+    /// `None` for the ops that carry none. reads page context through the
+    /// staged overlay — post-apply, so a comment's new thread is visible.
+    async fn event_after(
+        &self,
+        msg: &PageMsg,
+        origin: &Origin,
+    ) -> Result<Option<PageEvent>, PageError> {
+        Ok(match msg {
+            PageMsg::AddComment {
+                thread_id,
+                comment_id,
+                target,
+                text,
+            } => {
+                // apply derived the author from this same origin and
+                // succeeded, so this cannot fail here.
+                let author = author_from_origin(origin)?;
+                Some(PageEvent::CommentAdded {
+                    page_id: self.page_of(target).await?,
+                    target: target.clone(),
+                    thread_id: thread_id.clone(),
+                    comment_id: comment_id.clone(),
+                    author,
+                    text: text.clone(),
+                })
+            }
+            PageMsg::ResolveThread {
+                thread_id,
+                resolved,
+            } => {
+                // apply loaded (and re-staged) this thread, so absence here
+                // is corruption, not a race.
+                let target = self
+                    .load_thread(thread_id)
+                    .await?
+                    .ok_or(PageError::Corrupt)?
+                    .target;
+                Some(PageEvent::ThreadResolved {
+                    page_id: self.page_of(&target).await?,
+                    thread_id: thread_id.clone(),
+                    resolved: *resolved,
+                })
+            }
+            PageMsg::UpdateText { block_id, .. } => {
+                // apply required this block, so absence here is corruption.
+                let page_id = self
+                    .load_block(block_id)
+                    .await
+                    .map_err(to_page_err)?
+                    .ok_or(PageError::Corrupt)?
+                    .page;
+                Some(PageEvent::BlockUpdated {
+                    page_id,
+                    block_id: block_id.clone(),
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// the page a comment target lives on, through the staged overlay. EMPTY
+    /// when the target does not resolve to a live block — a comment may
+    /// anchor to a target that never existed (a dangling anchor, exactly like
+    /// a hyperlink), and the event still names what the writer named.
+    async fn page_of(&self, target: &str) -> Result<String, PageError> {
+        Ok(self
+            .load_block(target)
+            .await
+            .map_err(to_page_err)?
+            .map(|b| b.page)
+            .unwrap_or_default())
     }
 
     /// assemble a whole page in PREORDER (root first, each block's subtree
@@ -1088,17 +1283,35 @@ where
         statesync::qmdb::resolver_sync_target(&self.db).await
     }
 
-    /// decode a [`PageMsg`] and apply it to the staged overlay. the only
-    /// `.await` is on own qmdb state — deterministic, so replay-safe.
+    /// decode a [`PageMsg`] and apply it to the staged overlay, then fan the
+    /// op's [`PageEvent`] (if it carries one) out to every registered hook —
+    /// one follow-up `Msg` per subscriber, in the SAME block, only AFTER a
+    /// successful apply, so the write and every notification commit (or
+    /// abort) as one atomic unit. the only `.await`s are on own qmdb state —
+    /// deterministic, so replay-safe.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let m = decode_msg(&msg.payload).map_err(Error::Module)?;
         // origin + consensus time feed the comment ops (author + timestamp);
         // block ops ignore them. clone off `ctx` so `self` can borrow mutably.
         let origin = ctx.env().origin.clone();
         let now = ctx.env().consensus_time;
-        self.apply(m, &origin, now)
+        let module_err = |e: PageError| Error::Module(e.to_string());
+        self.apply(m.clone(), &origin, now)
             .await
-            .map_err(|e| Error::Module(e.to_string()))
+            .map_err(module_err)?;
+        let hooks = self.load_hooks().await.map_err(module_err)?;
+        if hooks.is_empty() {
+            return Ok(());
+        }
+        if let Some(event) = self.event_after(&m, &origin).await.map_err(module_err)? {
+            for hook in hooks {
+                ctx.emit_msg(Msg {
+                    target: hook,
+                    payload: encode_page_event(&event),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// real async read of own qmdb state, serving STAGED-over-committed via
@@ -1205,8 +1418,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_runtime::{Runner as _, deterministic};
     use crate::{NewBlock, decode_reply, encode_msg, encode_query};
+    use commonware_runtime::{Runner as _, deterministic};
     use state::global_root;
 
     fn nb(id: &str, kind: BlockKind, text: &str) -> NewBlock {
@@ -1231,6 +1444,8 @@ mod tests {
     // a minimal Ctx so execute can be driven without a full host.
     struct TestCtx {
         env: sdk::Env,
+        /// follow-up msgs emitted during execute, in order (hook fan-out).
+        emitted: Vec<Msg>,
     }
     impl TestCtx {
         fn new() -> Self {
@@ -1242,6 +1457,7 @@ mod tests {
                     origin: sdk::Origin::System,
                     me: "pages".into(),
                 },
+                emitted: Vec::new(),
             }
         }
     }
@@ -1256,7 +1472,9 @@ mod tests {
         async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
             Err(Error::QueryUnsupported)
         }
-        fn emit_msg(&mut self, _m: Msg) {}
+        fn emit_msg(&mut self, m: Msg) {
+            self.emitted.push(m);
+        }
         fn emit_event(&mut self, _e: sdk::Event) {}
         fn request_effect(&mut self, _e: sdk::Effect) {}
     }
@@ -1339,6 +1557,7 @@ mod tests {
                 origin,
                 me: "pages".into(),
             },
+            emitted: Vec::new(),
         }
     }
     async fn apply_commit_as<E: Context + BufferPooler>(
@@ -1381,7 +1600,9 @@ mod tests {
         p: &Pages<E>,
         thread_id: &str,
     ) -> Option<ThreadView> {
-        let q = PageQuery::CommentThread { thread_id: thread_id.into() };
+        let q = PageQuery::CommentThread {
+            thread_id: thread_id.into(),
+        };
         match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
             PageReply::CommentThread(v) => v,
             _ => panic!("expected CommentThread"),
@@ -1814,7 +2035,13 @@ mod tests {
                 },
             )
             .await;
-            apply_commit(&mut p, &PageMsg::RemoveBlock { block_id: "b1".into() }).await;
+            apply_commit(
+                &mut p,
+                &PageMsg::RemoveBlock {
+                    block_id: "b1".into(),
+                },
+            )
+            .await;
 
             // b1, c1, d1 all gone — by id and from the page.
             for gone in ["b1", "c1", "d1"] {
@@ -1826,7 +2053,9 @@ mod tests {
             // roots are not removable.
             apply_expect_err(
                 &mut p,
-                &PageMsg::RemoveBlock { block_id: "p1".into() },
+                &PageMsg::RemoveBlock {
+                    block_id: "p1".into(),
+                },
                 "page roots",
             )
             .await;
@@ -1877,7 +2106,9 @@ mod tests {
             // stage a removal (a delete) AND an insert, then abort.
             p.execute(
                 &mut TestCtx::new(),
-                &msg(&PageMsg::RemoveBlock { block_id: "b2".into() }),
+                &msg(&PageMsg::RemoveBlock {
+                    block_id: "b2".into(),
+                }),
             )
             .await
             .unwrap();
@@ -1940,7 +2171,9 @@ mod tests {
             // the SAME block-height succeeds (absence through the overlay).
             p.execute(
                 &mut TestCtx::new(),
-                &msg(&PageMsg::RemoveBlock { block_id: "c1".into() }),
+                &msg(&PageMsg::RemoveBlock {
+                    block_id: "c1".into(),
+                }),
             )
             .await
             .unwrap();
@@ -1991,7 +2224,11 @@ mod tests {
             )
             .await;
             assert!(p.pending.is_empty(), "a rejected write must not be staged");
-            assert_eq!(p.root(), r_before, "a rejected write must not move the root");
+            assert_eq!(
+                p.root(),
+                r_before,
+                "a rejected write must not move the root"
+            );
             assert_eq!(get_page(&p, "p1").await.unwrap().len(), 1);
         });
     }
@@ -2073,7 +2310,10 @@ mod tests {
     fn list_pages_enumerates_sorted_with_live_titles() {
         deterministic::Runner::default().start(|context| async move {
             let mut p = Pages::init(context, "pages").await;
-            assert!(list_pages(&p).await.is_empty(), "a fresh store lists nothing");
+            assert!(
+                list_pages(&p).await.is_empty(),
+                "a fresh store lists nothing"
+            );
             // create out of order; the index comes back sorted by id.
             for (id, title) in [("zebra", "Z"), ("alpha", "A"), ("mid", "M")] {
                 apply_commit(
@@ -2139,12 +2379,24 @@ mod tests {
     fn create_with_parent_records_folder_edge() {
         deterministic::Runner::default().start(|context| async move {
             let mut p = Pages::init(context, "pages").await;
-            apply_commit(&mut p, &PageMsg::CreatePage {
-                page_id: "root".into(), title: "Root".into(), parent: None,
-            }).await;
-            apply_commit(&mut p, &PageMsg::CreatePage {
-                page_id: "child".into(), title: "Child".into(), parent: Some("root".into()),
-            }).await;
+            apply_commit(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: "root".into(),
+                    title: "Root".into(),
+                    parent: None,
+                },
+            )
+            .await;
+            apply_commit(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: "child".into(),
+                    title: "Child".into(),
+                    parent: Some("root".into()),
+                },
+            )
+            .await;
             let pages = list_pages(&p).await;
             let child = pages.iter().find(|m| m.id == "child").unwrap();
             assert_eq!(child.parent.as_deref(), Some("root"));
@@ -2159,13 +2411,27 @@ mod tests {
             let mut p = Pages::init(context, "pages").await;
             seed_page(&mut p, "p1").await; // p1 + blocks b1,b2,b3
             // parent does not exist
-            apply_expect_err(&mut p, &PageMsg::CreatePage {
-                page_id: "x".into(), title: "x".into(), parent: Some("ghost".into()),
-            }, "parent page not found").await;
+            apply_expect_err(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: "x".into(),
+                    title: "x".into(),
+                    parent: Some("ghost".into()),
+                },
+                "parent page not found",
+            )
+            .await;
             // parent exists but is a non-page block
-            apply_expect_err(&mut p, &PageMsg::CreatePage {
-                page_id: "y".into(), title: "y".into(), parent: Some("b1".into()),
-            }, "parent page not found").await;
+            apply_expect_err(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: "y".into(),
+                    title: "y".into(),
+                    parent: Some("b1".into()),
+                },
+                "parent page not found",
+            )
+            .await;
         });
     }
 
@@ -2174,29 +2440,90 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut p = Pages::init(context, "pages").await;
             for id in ["a", "b", "c"] {
-                apply_commit(&mut p, &PageMsg::CreatePage {
-                    page_id: id.into(), title: id.into(), parent: None,
-                }).await;
+                apply_commit(
+                    &mut p,
+                    &PageMsg::CreatePage {
+                        page_id: id.into(),
+                        title: id.into(),
+                        parent: None,
+                    },
+                )
+                .await;
             }
             // b under a, c under b.
-            apply_commit(&mut p, &PageMsg::SetPageParent { page_id: "b".into(), parent: Some("a".into()) }).await;
-            apply_commit(&mut p, &PageMsg::SetPageParent { page_id: "c".into(), parent: Some("b".into()) }).await;
-            let parent_of = |pages: &[PageMeta], id: &str| pages.iter().find(|m| m.id == id).unwrap().parent.clone();
+            apply_commit(
+                &mut p,
+                &PageMsg::SetPageParent {
+                    page_id: "b".into(),
+                    parent: Some("a".into()),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut p,
+                &PageMsg::SetPageParent {
+                    page_id: "c".into(),
+                    parent: Some("b".into()),
+                },
+            )
+            .await;
+            let parent_of = |pages: &[PageMeta], id: &str| {
+                pages.iter().find(|m| m.id == id).unwrap().parent.clone()
+            };
             let pages = list_pages(&p).await;
             assert_eq!(parent_of(&pages, "b"), Some("a".into()));
             assert_eq!(parent_of(&pages, "c"), Some("b".into()));
             // a under c would cycle (a -> c -> b -> a).
-            apply_expect_err(&mut p, &PageMsg::SetPageParent { page_id: "a".into(), parent: Some("c".into()) }, "page cycle").await;
+            apply_expect_err(
+                &mut p,
+                &PageMsg::SetPageParent {
+                    page_id: "a".into(),
+                    parent: Some("c".into()),
+                },
+                "page cycle",
+            )
+            .await;
             // self-parent cycles too.
-            apply_expect_err(&mut p, &PageMsg::SetPageParent { page_id: "a".into(), parent: Some("a".into()) }, "page cycle").await;
+            apply_expect_err(
+                &mut p,
+                &PageMsg::SetPageParent {
+                    page_id: "a".into(),
+                    parent: Some("a".into()),
+                },
+                "page cycle",
+            )
+            .await;
             // detach to top level.
-            apply_commit(&mut p, &PageMsg::SetPageParent { page_id: "b".into(), parent: None }).await;
+            apply_commit(
+                &mut p,
+                &PageMsg::SetPageParent {
+                    page_id: "b".into(),
+                    parent: None,
+                },
+            )
+            .await;
             assert_eq!(parent_of(&list_pages(&p).await, "b"), None);
             // target must be a page root.
             seed_page(&mut p, "pg").await;
-            apply_expect_err(&mut p, &PageMsg::SetPageParent { page_id: "b1".into(), parent: None }, "not a page").await;
+            apply_expect_err(
+                &mut p,
+                &PageMsg::SetPageParent {
+                    page_id: "b1".into(),
+                    parent: None,
+                },
+                "not a page",
+            )
+            .await;
             // parent must be a page.
-            apply_expect_err(&mut p, &PageMsg::SetPageParent { page_id: "a".into(), parent: Some("b1".into()) }, "parent page not found").await;
+            apply_expect_err(
+                &mut p,
+                &PageMsg::SetPageParent {
+                    page_id: "a".into(),
+                    parent: Some("b1".into()),
+                },
+                "parent page not found",
+            )
+            .await;
         });
     }
 
@@ -2205,12 +2532,50 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut p = Pages::init(context, "pages").await;
             // grand -> parent -> child ; parent also has a content block pb1.
-            apply_commit(&mut p, &PageMsg::CreatePage { page_id: "grand".into(), title: "G".into(), parent: None }).await;
-            apply_commit(&mut p, &PageMsg::CreatePage { page_id: "parent".into(), title: "P".into(), parent: Some("grand".into()) }).await;
-            apply_commit(&mut p, &PageMsg::CreatePage { page_id: "child".into(), title: "C".into(), parent: Some("parent".into()) }).await;
-            apply_commit(&mut p, &PageMsg::InsertBlock { parent: "parent".into(), after: None, block: para("pb1", "body") }).await;
+            apply_commit(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: "grand".into(),
+                    title: "G".into(),
+                    parent: None,
+                },
+            )
+            .await;
+            apply_commit(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: "parent".into(),
+                    title: "P".into(),
+                    parent: Some("grand".into()),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: "child".into(),
+                    title: "C".into(),
+                    parent: Some("parent".into()),
+                },
+            )
+            .await;
+            apply_commit(
+                &mut p,
+                &PageMsg::InsertBlock {
+                    parent: "parent".into(),
+                    after: None,
+                    block: para("pb1", "body"),
+                },
+            )
+            .await;
 
-            apply_commit(&mut p, &PageMsg::DeletePage { page_id: "parent".into() }).await;
+            apply_commit(
+                &mut p,
+                &PageMsg::DeletePage {
+                    page_id: "parent".into(),
+                },
+            )
+            .await;
 
             // parent's root + content block are gone …
             assert!(get_block(&p, "parent").await.is_none());
@@ -2224,7 +2589,14 @@ mod tests {
 
             // deleting a non-page id is rejected.
             seed_page(&mut p, "pg").await;
-            apply_expect_err(&mut p, &PageMsg::DeletePage { page_id: "b1".into() }, "not a page").await;
+            apply_expect_err(
+                &mut p,
+                &PageMsg::DeletePage {
+                    page_id: "b1".into(),
+                },
+                "not a page",
+            )
+            .await;
         });
     }
 
@@ -2252,10 +2624,24 @@ mod tests {
             let b1 = groups.iter().find(|g| g.target == "b1").unwrap();
             assert_eq!(b1.threads.len(), 2);
             let t1 = b1.threads.iter().find(|v| v.thread.id == "t1").unwrap();
-            assert_eq!(t1.comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+            assert_eq!(
+                t1.comments
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["first", "second"]
+            );
             assert_eq!(t1.thread.opener, AuthorRef::User(b"alice".to_vec()));
             assert_eq!(t1.comments[1].author, AuthorRef::User(b"bob".to_vec()));
-            assert_eq!(groups.iter().find(|g| g.target == "b2").unwrap().threads.len(), 1);
+            assert_eq!(
+                groups
+                    .iter()
+                    .find(|g| g.target == "b2")
+                    .unwrap()
+                    .threads
+                    .len(),
+                1
+            );
         });
     }
 
@@ -2264,9 +2650,27 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut p = Pages::init(context, "pages").await;
             apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
-            apply_err_as(&mut p, &add("t1", "m2", "b2", "y"), user("alice"), "target mismatch").await;
-            apply_err_as(&mut p, &add("t1", "m1", "b1", "z"), user("alice"), "duplicate comment id").await;
-            apply_err_as(&mut p, &add("t9", "m9", "b1", "z"), sdk::Origin::External(vec![]), "empty origin").await;
+            apply_err_as(
+                &mut p,
+                &add("t1", "m2", "b2", "y"),
+                user("alice"),
+                "target mismatch",
+            )
+            .await;
+            apply_err_as(
+                &mut p,
+                &add("t1", "m1", "b1", "z"),
+                user("alice"),
+                "duplicate comment id",
+            )
+            .await;
+            apply_err_as(
+                &mut p,
+                &add("t9", "m9", "b1", "z"),
+                sdk::Origin::External(vec![]),
+                "empty origin",
+            )
+            .await;
         });
     }
 
@@ -2275,9 +2679,34 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut p = Pages::init(context, "pages").await;
             apply_commit_as(&mut p, &add("t1", "m1", "b1", "orig"), user("alice")).await;
-            apply_err_as(&mut p, &PageMsg::EditComment { comment_id: "m1".into(), text: "hax".into() }, user("bob"), "not the comment author").await;
-            apply_err_as(&mut p, &PageMsg::DeleteComment { comment_id: "m1".into() }, user("bob"), "not the comment author").await;
-            apply_commit_as(&mut p, &PageMsg::EditComment { comment_id: "m1".into(), text: "edited".into() }, user("alice")).await;
+            apply_err_as(
+                &mut p,
+                &PageMsg::EditComment {
+                    comment_id: "m1".into(),
+                    text: "hax".into(),
+                },
+                user("bob"),
+                "not the comment author",
+            )
+            .await;
+            apply_err_as(
+                &mut p,
+                &PageMsg::DeleteComment {
+                    comment_id: "m1".into(),
+                },
+                user("bob"),
+                "not the comment author",
+            )
+            .await;
+            apply_commit_as(
+                &mut p,
+                &PageMsg::EditComment {
+                    comment_id: "m1".into(),
+                    text: "edited".into(),
+                },
+                user("alice"),
+            )
+            .await;
             let v = query_thread(&p, "t1").await.unwrap();
             assert_eq!(v.comments[0].text, "edited");
             assert_eq!(v.comments[0].edited_at, Some(7));
@@ -2290,10 +2719,30 @@ mod tests {
             let mut p = Pages::init(context, "pages").await;
             apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
             apply_commit_as(&mut p, &add("t1", "m2", "b1", "b"), user("alice")).await;
-            apply_commit_as(&mut p, &PageMsg::DeleteComment { comment_id: "m1".into() }, user("alice")).await;
+            apply_commit_as(
+                &mut p,
+                &PageMsg::DeleteComment {
+                    comment_id: "m1".into(),
+                },
+                user("alice"),
+            )
+            .await;
             let v = query_thread(&p, "t1").await.unwrap();
-            assert_eq!(v.comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["b"]);
-            apply_commit_as(&mut p, &PageMsg::DeleteComment { comment_id: "m2".into() }, user("alice")).await;
+            assert_eq!(
+                v.comments
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["b"]
+            );
+            apply_commit_as(
+                &mut p,
+                &PageMsg::DeleteComment {
+                    comment_id: "m2".into(),
+                },
+                user("alice"),
+            )
+            .await;
             assert!(query_thread(&p, "t1").await.is_none());
             assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
         });
@@ -2304,13 +2753,41 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut p = Pages::init(context, "pages").await;
             apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
-            apply_commit_as(&mut p, &PageMsg::ResolveThread { thread_id: "t1".into(), resolved: true }, user("bob")).await;
+            apply_commit_as(
+                &mut p,
+                &PageMsg::ResolveThread {
+                    thread_id: "t1".into(),
+                    resolved: true,
+                },
+                user("bob"),
+            )
+            .await;
             let v = query_thread(&p, "t1").await.unwrap();
             assert!(v.thread.resolved);
             assert_eq!(v.thread.resolved_by, Some(AuthorRef::User(b"bob".to_vec())));
-            apply_commit_as(&mut p, &PageMsg::ResolveThread { thread_id: "t1".into(), resolved: false }, user("alice")).await;
-            assert_eq!(query_thread(&p, "t1").await.unwrap().thread.resolved_by, None);
-            apply_err_as(&mut p, &PageMsg::ResolveThread { thread_id: "ghost".into(), resolved: true }, user("alice"), "thread not found").await;
+            apply_commit_as(
+                &mut p,
+                &PageMsg::ResolveThread {
+                    thread_id: "t1".into(),
+                    resolved: false,
+                },
+                user("alice"),
+            )
+            .await;
+            assert_eq!(
+                query_thread(&p, "t1").await.unwrap().thread.resolved_by,
+                None
+            );
+            apply_err_as(
+                &mut p,
+                &PageMsg::ResolveThread {
+                    thread_id: "ghost".into(),
+                    resolved: true,
+                },
+                user("alice"),
+                "thread not found",
+            )
+            .await;
         });
     }
 
@@ -2319,13 +2796,29 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut p = Pages::init(context, "pages").await;
             let huge = "x".repeat(MAX_COMMENT_TEXT_BYTES + 1);
-            apply_err_as(&mut p, &add("t1", "m1", "b1", &huge), user("alice"), "comment text too large").await;
+            apply_err_as(
+                &mut p,
+                &add("t1", "m1", "b1", &huge),
+                user("alice"),
+                "comment text too large",
+            )
+            .await;
             assert!(p.pending.is_empty(), "a rejected comment op stages nothing");
             // a NUL-prefixed id lands in the reserved keyspace — rejected.
-            apply_err_as(&mut p, &add("\u{0}evil", "m1", "b1", "x"), user("alice"), "reserved block id").await;
+            apply_err_as(
+                &mut p,
+                &add("\u{0}evil", "m1", "b1", "x"),
+                user("alice"),
+                "reserved block id",
+            )
+            .await;
             // over-cap query rejected.
             let targets: Vec<String> = (0..=MAX_QUERY_TARGETS).map(|i| format!("t{i}")).collect();
-            assert!(p.query(&encode_query(&PageQuery::ThreadsForTargets { targets })).await.is_err());
+            assert!(
+                p.query(&encode_query(&PageQuery::ThreadsForTargets { targets }))
+                    .await
+                    .is_err()
+            );
         });
     }
 
@@ -2340,7 +2833,10 @@ mod tests {
             apply_commit_as(&mut p, &add("t1", "m1", "b1", "note on b1"), user("alice")).await;
             assert_ne!(p.root(), before, "a comment write moves the root");
             // the block tree is untouched by the comment.
-            assert_eq!(ids(&get_page(&p, "p1").await.unwrap()), ["p1", "b1", "b2", "b3"]);
+            assert_eq!(
+                ids(&get_page(&p, "p1").await.unwrap()),
+                ["p1", "b1", "b2", "b3"]
+            );
             assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
         });
     }
@@ -2357,15 +2853,308 @@ mod tests {
             assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
 
             // remove b1 → its thread t1 (+ comment m1 + target index) is gone.
-            apply_commit(&mut p, &PageMsg::RemoveBlock { block_id: "b1".into() }).await;
+            apply_commit(
+                &mut p,
+                &PageMsg::RemoveBlock {
+                    block_id: "b1".into(),
+                },
+            )
+            .await;
             assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
             assert!(query_thread(&p, "t1").await.is_none());
 
             // delete the page → the page-anchored thread t2 is purged too.
-            apply_commit(&mut p, &PageMsg::CreatePage { page_id: "p2".into(), title: "keep".into(), parent: None }).await;
-            apply_commit(&mut p, &PageMsg::DeletePage { page_id: "p1".into() }).await;
+            apply_commit(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: "p2".into(),
+                    title: "keep".into(),
+                    parent: None,
+                },
+            )
+            .await;
+            apply_commit(
+                &mut p,
+                &PageMsg::DeletePage {
+                    page_id: "p1".into(),
+                },
+            )
+            .await;
             assert!(query_thread(&p, "t2").await.is_none());
             assert!(query_threads(&p, &["p1"]).await[0].threads.is_empty());
+        });
+    }
+
+    // ── hooks + event fan-out (the tagging registration idiom) ──
+
+    fn module_origin(name: &str) -> sdk::Origin {
+        sdk::Origin::Module(name.into())
+    }
+
+    #[test]
+    fn hooks_register_module_origin_only_idempotent_capped() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+
+            // externals (empty or not) and the system have no hook surface —
+            // the subscriber derives from the EMITTING module, spoof-proof.
+            for origin in [
+                user("alice"),
+                sdk::Origin::External(vec![]),
+                sdk::Origin::System,
+            ] {
+                apply_err_as(
+                    &mut p,
+                    &PageMsg::RegisterHook {},
+                    origin,
+                    "module-origin only",
+                )
+                .await;
+            }
+            // pages itself is rejected: a self-hook would fan events back in.
+            apply_err_as(
+                &mut p,
+                &PageMsg::RegisterHook {},
+                module_origin("pages"),
+                "itself",
+            )
+            .await;
+
+            // a module origin registers, and the committed set moves the root.
+            let before = p.root();
+            apply_commit_as(
+                &mut p,
+                &PageMsg::RegisterHook {},
+                module_origin("docs-harness"),
+            )
+            .await;
+            let registered = p.root();
+            assert_ne!(registered, before, "the hook set must fold into the root");
+
+            // idempotent: re-registering stages nothing, the root stands.
+            p.execute(
+                &mut ctx_as(module_origin("docs-harness")),
+                &msg(&PageMsg::RegisterHook {}),
+            )
+            .await
+            .unwrap();
+            assert!(p.pending.is_empty(), "re-register must stage nothing");
+            p.commit_block().await.unwrap();
+            assert_eq!(p.root(), registered);
+
+            // the cap holds at MAX_PAGE_HOOKS distinct subscribers.
+            for i in 1..MAX_PAGE_HOOKS {
+                apply_commit_as(
+                    &mut p,
+                    &PageMsg::RegisterHook {},
+                    module_origin(&format!("hook{i}")),
+                )
+                .await;
+            }
+            apply_err_as(
+                &mut p,
+                &PageMsg::RegisterHook {},
+                module_origin("overflow"),
+                "hook cap",
+            )
+            .await;
+
+            // unregister derives the subscriber the same way; absent = no-op.
+            apply_commit_as(
+                &mut p,
+                &PageMsg::UnregisterHook {},
+                module_origin("docs-harness"),
+            )
+            .await;
+            p.execute(
+                &mut ctx_as(module_origin("docs-harness")),
+                &msg(&PageMsg::UnregisterHook {}),
+            )
+            .await
+            .unwrap();
+            assert!(p.pending.is_empty(), "absent unregister must stage nothing");
+            p.commit_block().await.unwrap();
+            apply_err_as(
+                &mut p,
+                &PageMsg::UnregisterHook {},
+                user("alice"),
+                "module-origin only",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn comment_and_block_ops_fan_out_page_events_to_hooks() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            seed_page(&mut p, "p1").await;
+            apply_commit_as(&mut p, &PageMsg::RegisterHook {}, module_origin("mod-a")).await;
+            apply_commit_as(&mut p, &PageMsg::RegisterHook {}, module_origin("mod-b")).await;
+
+            // AddComment: ONE follow-up per hook, each a decodable
+            // CommentAdded carrying page context, author, and text.
+            let mut ctx = ctx_as(user("alice"));
+            p.execute(&mut ctx, &msg(&add("t1", "m1", "b1", "review this")))
+                .await
+                .unwrap();
+            p.commit_block().await.unwrap();
+            assert_eq!(ctx.emitted.len(), 2, "one follow-up per registered hook");
+            let targets: Vec<&str> = ctx.emitted.iter().map(|m| m.target.as_str()).collect();
+            assert_eq!(targets, ["mod-a", "mod-b"]);
+            for m in &ctx.emitted {
+                assert_eq!(
+                    decode_page_event(&m.payload).unwrap(),
+                    PageEvent::CommentAdded {
+                        page_id: "p1".into(),
+                        target: "b1".into(),
+                        thread_id: "t1".into(),
+                        comment_id: "m1".into(),
+                        author: AuthorRef::User(b"alice".to_vec()),
+                        text: "review this".into(),
+                    }
+                );
+            }
+
+            // ResolveThread: the event names the page of the thread's target.
+            let mut ctx = ctx_as(user("bob"));
+            p.execute(
+                &mut ctx,
+                &msg(&PageMsg::ResolveThread {
+                    thread_id: "t1".into(),
+                    resolved: true,
+                }),
+            )
+            .await
+            .unwrap();
+            p.commit_block().await.unwrap();
+            assert_eq!(ctx.emitted.len(), 2);
+            assert_eq!(
+                decode_page_event(&ctx.emitted[0].payload).unwrap(),
+                PageEvent::ThreadResolved {
+                    page_id: "p1".into(),
+                    thread_id: "t1".into(),
+                    resolved: true,
+                }
+            );
+
+            // UpdateText: BlockUpdated names the block and its page.
+            let mut ctx = ctx_as(user("alice"));
+            p.execute(
+                &mut ctx,
+                &msg(&PageMsg::UpdateText {
+                    block_id: "b1".into(),
+                    text: "new".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            p.commit_block().await.unwrap();
+            assert_eq!(ctx.emitted.len(), 2);
+            assert_eq!(
+                decode_page_event(&ctx.emitted[0].payload).unwrap(),
+                PageEvent::BlockUpdated {
+                    page_id: "p1".into(),
+                    block_id: "b1".into(),
+                }
+            );
+
+            // a page-anchored comment names the page as its own page context.
+            let mut ctx = ctx_as(user("alice"));
+            p.execute(&mut ctx, &msg(&add("t2", "m2", "p1", "on the page")))
+                .await
+                .unwrap();
+            p.commit_block().await.unwrap();
+            match decode_page_event(&ctx.emitted[0].payload).unwrap() {
+                PageEvent::CommentAdded {
+                    page_id, target, ..
+                } => {
+                    assert_eq!(page_id, "p1");
+                    assert_eq!(target, "p1");
+                }
+                other => panic!("expected CommentAdded, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn events_skip_failed_ops_unhooked_stores_and_other_ops() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            seed_page(&mut p, "p1").await;
+
+            // no hooks: a triggering op emits nothing.
+            let mut ctx = ctx_as(user("alice"));
+            p.execute(&mut ctx, &msg(&add("t1", "m1", "b1", "quiet")))
+                .await
+                .unwrap();
+            p.commit_block().await.unwrap();
+            assert!(ctx.emitted.is_empty());
+
+            apply_commit_as(&mut p, &PageMsg::RegisterHook {}, module_origin("mod-a")).await;
+
+            // a FAILED triggering op emits nothing — the event rides the write.
+            let mut ctx = ctx_as(user("alice"));
+            p.execute(
+                &mut ctx,
+                &msg(&PageMsg::UpdateText {
+                    block_id: "ghost".into(),
+                    text: "x".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            p.abort_block().await.unwrap();
+            assert!(ctx.emitted.is_empty());
+
+            // non-triggering ops stay silent.
+            let mut ctx = ctx_as(user("alice"));
+            p.execute(
+                &mut ctx,
+                &msg(&PageMsg::InsertBlock {
+                    parent: "p1".into(),
+                    after: None,
+                    block: para("b9", "nine"),
+                }),
+            )
+            .await
+            .unwrap();
+            p.commit_block().await.unwrap();
+            assert!(ctx.emitted.is_empty());
+
+            // unregistering stops the fan-out.
+            apply_commit_as(&mut p, &PageMsg::UnregisterHook {}, module_origin("mod-a")).await;
+            let mut ctx = ctx_as(user("alice"));
+            p.execute(&mut ctx, &msg(&add("t2", "m2", "b1", "still quiet")))
+                .await
+                .unwrap();
+            p.commit_block().await.unwrap();
+            assert!(ctx.emitted.is_empty());
+        });
+    }
+
+    // a comment may anchor to a target that never existed (dangling, like a
+    // hyperlink) — the event still fires, with an EMPTY page_id.
+    #[test]
+    fn dangling_target_comment_event_carries_empty_page() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            apply_commit_as(&mut p, &PageMsg::RegisterHook {}, module_origin("mod-a")).await;
+            let mut ctx = ctx_as(user("alice"));
+            p.execute(&mut ctx, &msg(&add("t1", "m1", "ghost", "dangling")))
+                .await
+                .unwrap();
+            p.commit_block().await.unwrap();
+            assert_eq!(ctx.emitted.len(), 1);
+            match decode_page_event(&ctx.emitted[0].payload).unwrap() {
+                PageEvent::CommentAdded {
+                    page_id, target, ..
+                } => {
+                    assert_eq!(page_id, "");
+                    assert_eq!(target, "ghost");
+                }
+                other => panic!("expected CommentAdded, got {other:?}"),
+            }
         });
     }
 }

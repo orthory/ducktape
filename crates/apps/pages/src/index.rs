@@ -277,6 +277,8 @@ impl ModuleIndexer for PagesIndex {
             | PageMsg::EditComment { .. }
             | PageMsg::DeleteComment { .. }
             | PageMsg::ResolveThread { .. } => Ok(()),
+            // the hook subscriber set carries no searchable text either.
+            PageMsg::RegisterHook {} | PageMsg::UnregisterHook {} => Ok(()),
             // folder nesting carries no searchable text — the block tree (and
             // thus every row) is unchanged.
             PageMsg::SetPageParent { .. } => Ok(()),

@@ -12,25 +12,28 @@
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use pages::Pages;
 use pages::{
-    Block, BlockKind, NewBlock, PageMeta, PageMsg, PageQuery, PageReply, ThreadView, decode_reply,
-    encode_msg, encode_query,
+    Block, BlockKind, NewBlock, PageEvent, PageMeta, PageMsg, PageQuery, PageReply, ThreadView,
+    decode_page_event, decode_reply, encode_msg, encode_query,
 };
-use sdk::{Ctx, Error, Module, Msg, StateRoot};
+use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
 
 // a minimal Ctx so execute can be driven without a full host.
 struct TestCtx {
     env: sdk::Env,
+    /// follow-up msgs emitted during execute, in order (hook fan-out).
+    emitted: Vec<Msg>,
 }
 impl TestCtx {
-    fn new() -> Self {
+    fn with_origin(origin: Origin) -> Self {
         Self {
             env: sdk::Env {
                 protocol_version: 0,
                 height: 0,
                 consensus_time: 0,
-                origin: sdk::Origin::System,
+                origin,
                 me: "pages".into(),
             },
+            emitted: Vec::new(),
         }
     }
 }
@@ -45,7 +48,9 @@ impl Ctx for TestCtx {
     async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::QueryUnsupported)
     }
-    fn emit_msg(&mut self, _m: Msg) {}
+    fn emit_msg(&mut self, m: Msg) {
+        self.emitted.push(m);
+    }
     fn emit_event(&mut self, _e: sdk::Event) {}
     fn request_effect(&mut self, _e: sdk::Effect) {}
 }
@@ -64,11 +69,21 @@ async fn apply_commit<E>(p: &mut Pages<E>, m: &PageMsg)
 where
     E: commonware_storage::Context + commonware_runtime::BufferPooler,
 {
+    apply_commit_as(p, m, Origin::System).await;
+}
+
+// same, from an explicit origin (hook registration is module-origin only).
+async fn apply_commit_as<E>(p: &mut Pages<E>, m: &PageMsg, origin: Origin)
+where
+    E: commonware_storage::Context + commonware_runtime::BufferPooler,
+{
     let msg = Msg {
         target: "pages".into(),
         payload: encode_msg(m),
     };
-    p.execute(&mut TestCtx::new(), &msg).await.unwrap();
+    p.execute(&mut TestCtx::with_origin(origin), &msg)
+        .await
+        .unwrap();
     p.commit_block().await.unwrap();
 }
 
@@ -140,7 +155,13 @@ fn synced_store_reconstructs_source_root() {
             },
         )
         .await; // overwrite: op-log order matters
-        apply_commit(&mut src, &PageMsg::RemoveBlock { block_id: "c1".into() }).await; // delete rides the log too
+        apply_commit(
+            &mut src,
+            &PageMsg::RemoveBlock {
+                block_id: "c1".into(),
+            },
+        )
+        .await; // delete rides the log too
         // a comment rides the SAME qmdb (reserved keys) — it must sync too.
         apply_commit(
             &mut src,
@@ -152,6 +173,16 @@ fn synced_store_reconstructs_source_root() {
             },
         )
         .await;
+        // a registered hook rides the reserved `\0hooks` key: it must FOLD
+        // INTO the root (assert movement) and survive the sync below.
+        let unhooked = src.root();
+        apply_commit_as(
+            &mut src,
+            &PageMsg::RegisterHook {},
+            Origin::Module("docs-harness".into()),
+        )
+        .await;
+        assert_ne!(src.root(), unhooked, "the hook set must fold into the root");
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
 
@@ -162,7 +193,9 @@ fn synced_store_reconstructs_source_root() {
 
         // JOINER: reconstruct on a FRESH context + namespace by pulling from
         // the resolver. no ops are applied in application order on this side.
-        let synced = Pages::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
+        let synced = Pages::sync_from(context.child("dst"), "dst", target, resolver)
+            .await
+            .expect("sync_from");
 
         // THE PROPERTY: identical qmdb root — the app-hash linkage a joiner
         // needs at the boundary height.
@@ -181,7 +214,9 @@ fn synced_store_reconstructs_source_root() {
         // the comment survived the sync too.
         let view = match decode_reply(
             &synced
-                .query(&encode_query(&PageQuery::CommentThread { thread_id: "th1".into() }))
+                .query(&encode_query(&PageQuery::CommentThread {
+                    thread_id: "th1".into(),
+                }))
                 .await
                 .unwrap(),
         )
@@ -193,6 +228,40 @@ fn synced_store_reconstructs_source_root() {
         let view: ThreadView = view.expect("thread present after sync");
         assert_eq!(view.comments.len(), 1);
         assert_eq!(view.comments[0].text, "review this");
+
+        // the hook set survived the sync: a comment on the SYNCED store fans
+        // out to the subscriber registered on the source.
+        let mut synced = synced;
+        let mut ctx = TestCtx::with_origin(Origin::External(b"alice".to_vec()));
+        synced
+            .execute(
+                &mut ctx,
+                &Msg {
+                    target: "pages".into(),
+                    payload: encode_msg(&PageMsg::AddComment {
+                        thread_id: "th2".into(),
+                        comment_id: "cm2".into(),
+                        target: "b1".into(),
+                        text: "post-sync".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        synced.commit_block().await.unwrap();
+        assert_eq!(ctx.emitted.len(), 1, "synced hook set must fan out");
+        assert_eq!(ctx.emitted[0].target, "docs-harness");
+        assert_eq!(
+            decode_page_event(&ctx.emitted[0].payload).unwrap(),
+            PageEvent::CommentAdded {
+                page_id: "p1".into(),
+                target: "b1".into(),
+                thread_id: "th2".into(),
+                comment_id: "cm2".into(),
+                author: pages::AuthorRef::User(b"alice".to_vec()),
+                text: "post-sync".into(),
+            }
+        );
     });
 }
 
@@ -230,7 +299,9 @@ fn synced_store_reproduces_the_page_index() {
 
         let target = src.sync_target().await;
         let resolver = src.into_resolver();
-        let synced = Pages::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
+        let synced = Pages::sync_from(context.child("dst"), "dst", target, resolver)
+            .await
+            .expect("sync_from");
 
         assert_eq!(
             list_pages(&synced).await,

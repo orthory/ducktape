@@ -198,12 +198,10 @@ fn collect_mentions(blocks: &[Block]) -> Vec<AuthorRef> {
 fn tag_author(author: &AuthorRef) -> tagging::Author {
     match author {
         AuthorRef::User(key) => tagging::Author::User(key.clone()),
-        AuthorRef::Agent { module, agent_id } => {
-            tagging::Author::Entity(tagging::EntityRef {
-                module: module.clone(),
-                entity: agent_id.clone(),
-            })
-        }
+        AuthorRef::Agent { module, agent_id } => tagging::Author::Entity(tagging::EntityRef {
+            module: module.clone(),
+            entity: agent_id.clone(),
+        }),
         AuthorRef::Module(module) => tagging::Author::Module(module.clone()),
         AuthorRef::System => tagging::Author::System,
     }
@@ -744,6 +742,20 @@ where
         )
     }
 
+    /// hook-origin hygiene: when the emitter is a MODULE, it may only
+    /// (un)register ITSELF — `module_id` must equal the origin, so no module
+    /// can wire or unwire another module behind the operator's back. external
+    /// and system origins pass through (operator wiring).
+    fn require_module_self(origin: &Origin, module_id: &str) -> Result<(), Error> {
+        match origin {
+            Origin::Module(emitter) if emitter != module_id => Err(Error::Module(format!(
+                "a module origin may only (un)register itself as a hook \
+                 (emitter {emitter:?}, target {module_id:?})"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     async fn stage_register_hook(
         &mut self,
         channel_id: &str,
@@ -1279,9 +1291,12 @@ where
                 channel_id,
                 module_id,
             } => {
-                // any non-empty origin may (un)register for now — admin gating
-                // is future work. the target must be a registered module other
-                // than chat itself, or every later post would poison the block.
+                // hook hygiene: a MODULE origin may only register ITSELF
+                // (spoof-proof self-subscription); external (operator) origins
+                // may wire any registered module — automations depends on it.
+                Self::require_module_self(&ctx.env().origin, &module_id)?;
+                // the target must be a registered module other than chat
+                // itself, or every later post would poison the block.
                 if module_id == self.id {
                     return Err(Error::Module("chat cannot hook itself".into()));
                 }
@@ -1293,7 +1308,12 @@ where
             ChatMsg::UnregisterHook {
                 channel_id,
                 module_id,
-            } => self.stage_unregister_hook(&channel_id, &module_id).await,
+            } => {
+                // same origin rule as RegisterHook: a module may not unwire
+                // ANOTHER module's subscription.
+                Self::require_module_self(&ctx.env().origin, &module_id)?;
+                self.stage_unregister_hook(&channel_id, &module_id).await
+            }
             ChatMsg::SetMembership {
                 channel_id,
                 user,
