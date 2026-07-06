@@ -389,9 +389,11 @@ function RunsOnField({
     if (value === "" && known.length > 0) onChange(known[0]);
   }, [value, known, onChange]);
 
-  // Nothing announced and nothing chosen yet: fall back to free text so a
-  // first-time operator can still register before any host announces.
-  if (known.length === 0 && value === "") {
+  // No executors announced: free text so a first-time operator can register
+  // before any host announces. Keyed on `known` alone, never on `value` — a
+  // value-gated guard would flip to the select branch on the first keystroke
+  // (unmounting the input mid-word).
+  if (known.length === 0) {
     return (
       <>
         <input

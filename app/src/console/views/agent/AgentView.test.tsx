@@ -238,6 +238,29 @@ describe("AgentView", () => {
     );
   });
 
+  it("keeps Runs on a free-text field across keystrokes when no executors are announced", () => {
+    const { spies } = renderAgents(); // capabilities: [] by default
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    expect(screen.getByLabelText("Runs on").tagName).toBe("INPUT");
+
+    // A partial value must NOT morph the input into a single-option <select>:
+    // typing one character mid-word previously trapped the field.
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "c" } });
+    expect(screen.getByLabelText("Runs on").tagName).toBe("INPUT");
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "codex" } });
+    expect(screen.getByLabelText("Runs on")).toHaveValue("codex");
+
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage" },
+    });
+    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ capability: "codex" }),
+    );
+  });
+
   it("edits an agent through the inline Edit form", () => {
     const { spies } = renderAgents();
 
