@@ -812,6 +812,13 @@ impl ReachHint {
 /// whose integrity is the genesis fingerprint, and admission stays a ballot.
 const INVITE_VERSION_V2: u8 = 2;
 const INVITE_VERSION_V3: u8 = 3;
+/// v4 = a token-carrying invite (like v3) that ALSO echoes the network's
+/// coordination mode as one trailing byte (0 = public, 1 = private). the mode
+/// lets a fresh joiner learn, off the invite alone, whether the reachability
+/// plane's coordinator is private — so it knows to expect (and present) a
+/// `CoordCap`. v2/v3 stay parseable and decode with `coordination = None`
+/// (which resolves to the safe `Private` default).
+const INVITE_VERSION_V4: u8 = 4;
 
 const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -848,8 +855,12 @@ pub fn decode_invite(blob: &str) -> Result<(NetworkDescriptor, Option<InviteToke
 /// that only ever ran `add_bootstrap` still ships a well-formed invite. a v3
 /// payload appends the lobby [`InviteToken`]; nothing is signed.
 fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec<u8>, String> {
+    // a token-carrying invite is now v4 (token + coordination-mode byte); a
+    // token-less (manual-flow) blob stays v2 (descriptor only). the mode echo
+    // only rides the token flow — the live-join path that actually reaches a
+    // coordinator — so the manual flow is untouched.
     let mut out = vec![if token.is_some() {
-        INVITE_VERSION_V3
+        INVITE_VERSION_V4
     } else {
         INVITE_VERSION_V2
     }];
@@ -886,6 +897,12 @@ fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec
     }
     if let Some(t) = token {
         out.extend_from_slice(&pack_invite_token(t));
+        // v4 trailer: one coordination-mode byte after the token. sourced from
+        // the descriptor (None resolves to Private, the safe default).
+        out.push(match d.coordination() {
+            Coordination::Public => 0,
+            Coordination::Private => 1,
+        });
     }
     Ok(out)
 }
@@ -906,10 +923,13 @@ fn put_str_u8(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
 fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>), String> {
     let mut r = InviteReader::new(bytes);
     let version = r.u8()?;
-    if version != INVITE_VERSION_V2 && version != INVITE_VERSION_V3 {
+    if version != INVITE_VERSION_V2
+        && version != INVITE_VERSION_V3
+        && version != INVITE_VERSION_V4
+    {
         return Err(format!(
-            "unsupported invite version {version} (this build reads v{INVITE_VERSION_V2} and \
-             v{INVITE_VERSION_V3})"
+            "unsupported invite version {version} (this build reads v{INVITE_VERSION_V2}, \
+             v{INVITE_VERSION_V3} and v{INVITE_VERSION_V4})"
         ));
     }
     let cid_len = r.u8()? as usize;
@@ -939,9 +959,20 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
         reach.push(ReachHint { expected_key, reach: reach_val }.to_canonical());
     }
     reach.sort();
-    // a v3 payload carries the lobby token; v2 stops after the descriptor.
-    let token = if version == INVITE_VERSION_V3 {
+    // a v3/v4 payload carries the lobby token; v2 stops after the descriptor.
+    let token = if version == INVITE_VERSION_V3 || version == INVITE_VERSION_V4 {
         Some(unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?)
+    } else {
+        None
+    };
+    // v4 appends one coordination-mode byte after the token; v2/v3 carry no
+    // mode and decode with `coordination = None` (resolving to Private).
+    let coordination = if version == INVITE_VERSION_V4 {
+        match r.u8()? {
+            0 => Some("public".to_string()),
+            1 => Some("private".to_string()),
+            other => return Err(format!("unknown coordination mode {other} in v4 invite")),
+        }
     } else {
         None
     };
@@ -957,7 +988,7 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
             // stays empty and both feed one dial source via `reach_hints`.
             bootstrap: Vec::new(),
             reach,
-            coordination: None,
+            coordination,
         },
         token,
     ))
@@ -1304,6 +1335,12 @@ pub struct Resolved {
     /// `None` for a genesis validator (admitted by membership), the dev shape,
     /// or a node that has not been issued one.
     pub coord_cap: Option<nat_traversal::CoordCap>,
+    /// the workspace base directory — where `identity.key`, `network.toml`,
+    /// `wireguard.key` and `coord.cap` live (the network shape's config
+    /// directory; the dev shape's `storage_dir`). Threaded so a parked
+    /// joiner's lobby-reply task can persist a `coord.cap` delivered over its
+    /// `JoinReply` via `save_coord_cap`.
+    pub workspace: PathBuf,
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -1418,6 +1455,9 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // genesis validator needs none (admitted by membership), a joiner is
         // issued one beside its identity.
         coord_cap: load_coord_cap(base),
+        // the config directory: identity.key / network.toml / coord.cap live
+        // here, so a joiner persists a delivered cap into it.
+        workspace: base.to_path_buf(),
     })
 }
 
@@ -1569,6 +1609,9 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         // the dev shape has no identity.key directory; the wireguard key
         // lives with the node's other per-process state.
         wireguard_key_file: storage_dir.join("wireguard.key"),
+        // the dev shape has no config directory; its per-process state dir
+        // stands in as the workspace base (it never delivers a real cap).
+        workspace: storage_dir.clone(),
         storage_dir,
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
@@ -1696,14 +1739,17 @@ mod tests {
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
-            coordination: None,
+            // a token invite now packs v4, which echoes the coordination mode;
+            // a `None` source resolves to Private, so it decodes as an EXPLICIT
+            // "private" (semantically identical — see `coordination()`).
+            coordination: Some("private".into()),
         };
         let binding = d.genesis_namespace();
         let token = mint_invite_token(&issuer, binding.as_bytes());
         let (decoded, carried) =
             decode_invite(&encode_invite(&d, Some(&token)).expect("encode")).expect("roundtrip");
         assert_eq!(decoded, d);
-        let carried = carried.expect("v3 carries the token");
+        let carried = carried.expect("v4 carries the token");
         assert_eq!(carried, token);
         assert!(verify_invite_token(&carried, binding.as_bytes()));
         assert!(
@@ -1724,6 +1770,156 @@ mod tests {
         assert!(
             !verify_join_proof(&thief, binding.as_bytes(), &carried, &proof),
             "a substituted key fails the proof"
+        );
+    }
+
+    #[test]
+    fn invite_v4_echoes_coordination_public_and_private() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let base = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        let token = mint_invite_token(&issuer, base.genesis_namespace().as_bytes());
+
+        for (mode, expect) in [("public", Coordination::Public), ("private", Coordination::Private)]
+        {
+            let mut d = base.clone();
+            d.coordination = Some(mode.to_string());
+            let packed = pack_invite(&d, Some(&token)).expect("pack v4");
+            assert_eq!(packed[0], INVITE_VERSION_V4, "a token invite packs v4");
+            let (decoded, carried) = unpack_invite(&packed).expect("unpack v4");
+            assert_eq!(carried.expect("v4 carries the token"), token);
+            assert_eq!(
+                decoded.coordination(),
+                expect,
+                "the {mode} mode byte roundtrips"
+            );
+            assert_eq!(decoded.coordination.as_deref(), Some(mode));
+        }
+    }
+
+    #[test]
+    fn invite_v2_and_v3_decode_with_coordination_none() {
+        // v2: a token-less blob still packs v2 and carries no mode.
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(
+                ed25519::PrivateKey::from_seed(7).public_key().as_ref(),
+            )],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: Some("public".into()),
+        };
+        let packed_v2 = pack_invite(&d, None).expect("pack v2");
+        assert_eq!(packed_v2[0], INVITE_VERSION_V2);
+        let (decoded_v2, token_v2) = unpack_invite(&packed_v2).expect("unpack v2");
+        assert_eq!(token_v2, None);
+        assert_eq!(
+            decoded_v2.coordination, None,
+            "v2 carries no mode byte — coordination stays None"
+        );
+
+        // v3: an OLD token invite (no trailing mode byte). synthesize one by
+        // packing v4 and stripping the trailer + relabeling the version.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let mut packed_v3 = pack_invite(&d, Some(&token)).expect("pack v4");
+        assert_eq!(*packed_v3.last().unwrap(), 0, "v4 trailer is the public byte");
+        packed_v3.pop(); // drop the v4 coordination-mode byte
+        packed_v3[0] = INVITE_VERSION_V3; // relabel as a legacy v3 blob
+        let (decoded_v3, token_v3) = unpack_invite(&packed_v3).expect("unpack v3");
+        assert_eq!(token_v3.expect("v3 carries the token"), token);
+        assert_eq!(
+            decoded_v3.coordination, None,
+            "v3 carries no mode byte — coordination stays None"
+        );
+    }
+
+    #[test]
+    fn invite_v4_rejects_an_unknown_mode_byte() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let mut packed = pack_invite(&d, Some(&token)).expect("pack v4");
+        *packed.last_mut().unwrap() = 9; // neither 0 nor 1
+        let err = unpack_invite(&packed).expect_err("unknown mode rejected");
+        assert!(err.contains("coordination mode"), "{err}");
+    }
+
+    /// the FULL delivery chain at the crypto level: a genesis validator mints a
+    /// cap for a joiner, it is packed for the wire (`pack_coord_cap`), the
+    /// joiner unpacks it (`unpack_coord_cap`) and presents it on an
+    /// authenticated request — and the coordinator's private `verify_request`
+    /// admits the joiner off that delivered cap. Proves the cap the member
+    /// hands over its `JoinReply` actually authorizes the holder.
+    #[test]
+    fn delivered_cap_admits_the_joiner_under_private_policy() {
+        use commonware_cryptography::Signer as _;
+        use nat_traversal::{
+            mint_coord_cap, now_secs, sign_authenticator, verify_request, AuthPolicy, NodeKey,
+            COORD_CAP_TTL_SECS, DEFAULT_FRESHNESS_WINDOW_SECS,
+        };
+
+        let genesis = ed25519::PrivateKey::from_seed(1);
+        let joiner = ed25519::PrivateKey::from_seed(2);
+        let mut subj = [0u8; 32];
+        subj.copy_from_slice(joiner.public_key().as_ref());
+        let subject = NodeKey(subj);
+
+        let now = now_secs();
+        // MINT (member side) -> PACK (wire) -> UNPACK (joiner side).
+        let minted = mint_coord_cap(&genesis, subject, now + COORD_CAP_TTL_SECS);
+        let wire = pack_coord_cap(&minted);
+        let delivered = unpack_coord_cap(&wire).expect("joiner unpacks the delivered cap");
+        assert_eq!(delivered, minted, "the cap survives the wire byte-for-byte");
+
+        // the joiner builds an authenticated request carrying the delivered cap.
+        let inner = b"\x03register-request-bytes";
+        let auth = sign_authenticator(&joiner, inner, now, Some(delivered));
+
+        // the coordinator, pinned to this genesis key, admits the joiner.
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![genesis.public_key()],
+        };
+        assert_eq!(
+            verify_request(
+                &policy,
+                now,
+                DEFAULT_FRESHNESS_WINDOW_SECS,
+                subject,
+                inner,
+                &auth
+            ),
+            Ok(()),
+            "the delivered cap admits the joiner"
+        );
+
+        // control: WITHOUT the cap the same private policy rejects the joiner.
+        let bare = sign_authenticator(&joiner, inner, now, None);
+        assert!(
+            verify_request(
+                &policy,
+                now,
+                DEFAULT_FRESHNESS_WINDOW_SECS,
+                subject,
+                inner,
+                &bare
+            )
+            .is_err(),
+            "a joiner with no cap is not admitted to a private network"
         );
     }
 
@@ -1912,6 +2108,9 @@ mod tests {
         assert!(!r.dev_demo);
         assert_eq!(r.signer.public_key(), me.public_key());
         assert_eq!(r.storage_dir, dir.join("storage"));
+        // the workspace base is the config directory — where a joiner would
+        // persist a `coord.cap` delivered over its JoinReply.
+        assert_eq!(r.workspace, dir);
     }
 
     #[test]

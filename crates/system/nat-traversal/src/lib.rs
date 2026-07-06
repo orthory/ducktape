@@ -20,7 +20,8 @@ pub mod wire;
 pub use advert::{AdvertBook, AdvertOutcome, ReflexiveAdvert};
 pub use auth::{
     mint_coord_cap, now_secs, sign_authenticator, verify_request, AuthError, AuthPolicy,
-    Authenticator, CoordCap, COORD_CAP_NS, COORD_REQ_NS, DEFAULT_FRESHNESS_WINDOW_SECS,
+    Authenticator, CoordCap, COORD_CAP_NS, COORD_CAP_TTL_SECS, COORD_REQ_NS,
+    DEFAULT_FRESHNESS_WINDOW_SECS,
 };
 pub use client::{NatClient, run_coordinator};
 pub use coordinator::Coordinator;

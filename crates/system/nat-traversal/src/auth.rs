@@ -16,6 +16,13 @@ pub const COORD_REQ_NS: &[u8] = b"ducktape-coord-req-v1";
 pub const COORD_CAP_NS: &[u8] = b"ducktape-coord-cap-v1";
 /// Max clock skew (seconds) between a request timestamp and the coordinator.
 pub const DEFAULT_FRESHNESS_WINDOW_SECS: u64 = 30;
+/// Lifetime of a minted admission capability (`mint_coord_cap`), in seconds:
+/// one year. Deliberately long-lived — there is NO cap-rotation flow yet (a
+/// joiner receives exactly one cap over its `JoinReply` and never refreshes
+/// it), so a short TTL would strand admitted nodes. Rotation (re-minting +
+/// re-delivering a fresh cap before expiry) is DEFERRED; when it lands this
+/// TTL should shrink to match the rotation cadence.
+pub const COORD_CAP_TTL_SECS: u64 = 365 * 24 * 3600;
 
 /// A signed admission capability. A genesis validator (`issuer`) vouches that
 /// `subject` (implied — the request's key) is authorized until `not_after`.
