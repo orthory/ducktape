@@ -121,6 +121,20 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M3.7 12.2A1.2 1.2 0 0 1 4.9 11h14.2a1.2 1.2 0 0 1 1.18 1.46l-1.1 6A1.5 1.5 0 0 1 17.7 20H6.3a1.5 1.5 0 0 1-1.48-1.24z" />
     </>
   ),
+  // file-type glyphs for the forge tree (see views/forge/file-icons.ts)
+  braces: (
+    <>
+      <path d="M9 4.5c-1.8 0-1.8 2.6-1.8 3.75 0 1.5-1.7 1.75-1.7 1.75s1.7.25 1.7 1.75c0 1.15 0 3.75 1.8 3.75" transform="translate(0 2)" />
+      <path d="M15 4.5c1.8 0 1.8 2.6 1.8 3.75 0 1.5 1.7 1.75 1.7 1.75s-1.7.25-1.7 1.75c0 1.15 0 3.75-1.8 3.75" transform="translate(0 2)" />
+    </>
+  ),
+  image: (
+    <>
+      <rect x="4" y="5" width="16" height="14" rx="2" />
+      <circle cx="9" cy="10" r="1.5" />
+      <path d="M4.5 17.5l4.5-4 3 2.5 3.2-3.2L19.5 16" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof PATHS;
