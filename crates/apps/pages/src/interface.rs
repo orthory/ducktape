@@ -88,11 +88,17 @@ pub struct BlockRef {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageMsg {
-    /// create a top-level page: a root block of kind `Page` whose text is
-    /// `title`. idempotent: re-creating an existing page is a benign no-op
-    /// that does NOT overwrite the title. `page_id` is a block id and shares
-    /// the global-uniqueness rule.
-    CreatePage { page_id: String, title: String },
+    /// create a page: a root block of kind `Page` whose text is `title`.
+    /// `parent`, when `Some`, nests this page under another page (a folder
+    /// relation stored only in the enumeration index — content blocks are
+    /// untouched). idempotent: re-creating an existing page is a benign no-op
+    /// that changes neither the title NOR the parent. `page_id` is a block id
+    /// and shares the global-uniqueness rule.
+    CreatePage {
+        page_id: String,
+        title: String,
+        parent: Option<String>,
+    },
     /// insert `block` under `parent` after the given sibling anchor (see the
     /// `after` rule). the parent may be the page root or any block — nesting
     /// is what makes toggles/indent work. rejected when `block.kind` is
@@ -119,6 +125,17 @@ pub enum PageMsg {
     },
     /// remove a block AND its whole subtree. rejected on page roots.
     RemoveBlock { block_id: String },
+    /// re-nest a page under a (possibly new) parent page, or to top level with
+    /// `None`. rejected when the target is not a page root, the parent is not a
+    /// page, or the move would form a cycle in the folder forest.
+    SetPageParent {
+        page_id: String,
+        parent: Option<String>,
+    },
+    /// delete a page: remove its root and whole block subtree, and PROMOTE its
+    /// direct child pages to the deleted page's parent (no cascade). rejected
+    /// when the id is not a page root.
+    DeletePage { page_id: String },
 }
 
 pub fn encode_msg(m: &PageMsg) -> Vec<u8> {
@@ -150,6 +167,8 @@ pub enum PageQuery {
 pub struct PageMeta {
     pub id: String,
     pub title: String,
+    /// the containing page id (folder parent), or `None` for a top-level page.
+    pub parent: Option<String>,
 }
 
 /// replies to a [`PageQuery`]. `Option` mirrors absence.
@@ -172,4 +191,45 @@ pub fn encode_reply(r: &PageReply) -> Vec<u8> {
 }
 pub fn decode_reply(b: &[u8]) -> Result<PageReply, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+
+    #[test]
+    fn create_page_carries_optional_parent() {
+        let m = PageMsg::CreatePage {
+            page_id: "p2".into(),
+            title: "child".into(),
+            parent: Some("p1".into()),
+        };
+        let round: PageMsg = decode_msg(&encode_msg(&m)).unwrap();
+        assert_eq!(round, m);
+        // top-level create serializes parent as null.
+        let top = PageMsg::CreatePage {
+            page_id: "p1".into(),
+            title: "root".into(),
+            parent: None,
+        };
+        assert!(String::from_utf8(encode_msg(&top)).unwrap().contains("\"parent\":null"));
+    }
+
+    #[test]
+    fn set_parent_and_delete_round_trip() {
+        for m in [
+            PageMsg::SetPageParent { page_id: "p2".into(), parent: None },
+            PageMsg::DeletePage { page_id: "p2".into() },
+        ] {
+            assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn page_meta_carries_parent() {
+        let meta = PageMeta { id: "p2".into(), title: "t".into(), parent: Some("p1".into()) };
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, meta);
+    }
 }

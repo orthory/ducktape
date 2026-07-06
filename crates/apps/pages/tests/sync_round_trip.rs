@@ -110,6 +110,7 @@ fn synced_store_reconstructs_source_root() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "one".into(),
+                parent: None,
             },
         )
         .await;
@@ -181,6 +182,7 @@ fn synced_store_reproduces_the_page_index() {
                 &PageMsg::CreatePage {
                     page_id: id.into(),
                     title: title.into(),
+                    parent: None,
                 },
             )
             .await;

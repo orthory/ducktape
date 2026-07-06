@@ -192,6 +192,8 @@ enum PageError {
     Corrupt,
     /// an op named the reserved [`PAGE_INDEX_KEY`] sentinel.
     ReservedId,
+    /// a create/set-parent named a `parent` that is not an existing page root.
+    ParentPageNotFound,
 }
 
 impl core::fmt::Display for PageError {
@@ -209,6 +211,7 @@ impl core::fmt::Display for PageError {
             PageError::BlockTooLarge => "block too large",
             PageError::Corrupt => "stored page state is corrupt",
             PageError::ReservedId => "reserved block id",
+            PageError::ParentPageNotFound => "parent page not found",
         };
         f.write_str(s)
     }
@@ -315,26 +318,30 @@ where
         self.pending.insert(block_id.as_bytes().to_vec(), None);
     }
 
-    /// load the enumeration index — the sorted set of page ids — through the
-    /// staged-over-committed overlay. absent reads as the empty set; a decode
-    /// failure is corruption.
-    async fn load_index(&self) -> Result<Vec<String>, Error> {
+    /// load the enumeration index — page id → folder parent — through the
+    /// staged-over-committed overlay. absent reads as the empty map; a decode
+    /// failure is corruption. `BTreeMap` serializes with SORTED keys, so the
+    /// bytes are canonical and every validator commits the same index root.
+    async fn load_index(&self) -> Result<BTreeMap<String, Option<String>>, Error> {
         match self.get(PAGE_INDEX_KEY.as_bytes()).await {
             Some(b) => serde_json::from_slice(&b).map_err(|e| Error::Module(e.to_string())),
-            None => Ok(Vec::new()),
+            None => Ok(BTreeMap::new()),
         }
     }
 
-    /// add `page_id` to the enumeration index if absent, re-staging it as a
-    /// sorted set. the SORT makes the serialized bytes canonical, so every
-    /// validator commits the same index bytes and lands on the same root.
-    async fn index_add(&mut self, page_id: &str) -> Result<(), PageError> {
-        let mut ids = self.load_index().await.map_err(to_page_err)?;
-        if !ids.iter().any(|id| id == page_id) {
-            ids.push(page_id.to_string());
-            ids.sort();
-            let bytes = serde_json::to_vec(&ids).expect("Vec<String> is always serializable");
-            self.stage(PAGE_INDEX_KEY, bytes)?;
+    /// re-stage the whole index map (canonical serialization).
+    fn stage_index(&mut self, index: &BTreeMap<String, Option<String>>) -> Result<(), PageError> {
+        let bytes = serde_json::to_vec(index).expect("index is always serializable");
+        self.stage(PAGE_INDEX_KEY, bytes)
+    }
+
+    /// add `page_id -> parent` to the index if absent (idempotent create keeps
+    /// the existing entry, so re-create never re-nests).
+    async fn index_add(&mut self, page_id: &str, parent: Option<String>) -> Result<(), PageError> {
+        let mut index = self.load_index().await.map_err(to_page_err)?;
+        if !index.contains_key(page_id) {
+            index.insert(page_id.to_string(), parent);
+            self.stage_index(&index)?;
         }
         Ok(())
     }
@@ -384,24 +391,37 @@ where
             PageMsg::MoveBlock {
                 block_id, parent, ..
             } => [block_id.as_str(), parent.as_str()],
+            PageMsg::SetPageParent { page_id, parent } => {
+                [page_id.as_str(), parent.as_deref().unwrap_or("")]
+            }
+            PageMsg::DeletePage { page_id } => [page_id.as_str(), ""],
         };
         if named.iter().any(|id| *id == PAGE_INDEX_KEY) {
             return Err(PageError::ReservedId);
         }
 
         match msg {
-            PageMsg::CreatePage { page_id, title } => {
+            PageMsg::CreatePage { page_id, title, parent } => {
                 match self.load_block(&page_id).await.map_err(to_page_err)? {
                     // idempotent: re-creating an existing page is a benign
-                    // no-op that does NOT clobber the live title.
+                    // no-op that does NOT clobber the live title OR re-nest it.
                     Some(b) if b.kind == BlockKind::Page => Ok(()),
                     // the id is already a NON-page block somewhere — page ids
                     // are block ids, so this is a global-uniqueness violation.
                     Some(_) => Err(PageError::DuplicateBlock),
                     None => {
-                        self.index_add(&page_id).await?;
+                        // a named folder parent must exist AND be a page root.
+                        if let Some(par) = &parent {
+                            match self.load_block(par).await.map_err(to_page_err)? {
+                                Some(b) if b.kind == BlockKind::Page => {}
+                                _ => return Err(PageError::ParentPageNotFound),
+                            }
+                        }
+                        self.index_add(&page_id, parent).await?;
                         self.store_block(&Block {
                             id: page_id.clone(),
+                            // block-parent stays None; the folder parent lives
+                            // only in the enumeration index.
                             parent: None,
                             page: page_id,
                             kind: BlockKind::Page,
@@ -576,6 +596,9 @@ where
                 }
                 Ok(())
             }
+            PageMsg::SetPageParent { .. } | PageMsg::DeletePage { .. } => {
+                Err(PageError::Corrupt) // stub — real logic in Tasks 3–4
+            }
         }
     }
 
@@ -730,11 +753,12 @@ where
                 Ok(encode_reply(&PageReply::Block(block)))
             }
             PageQuery::ListPages => {
-                // ids straight from the reserved index entry; titles read from
-                // the live roots so a rename shows without touching the index.
-                let ids = self.load_index().await?;
-                let mut pages = Vec::with_capacity(ids.len());
-                for id in ids {
+                // id -> folder parent straight from the reserved index entry;
+                // titles read from the live roots so a rename shows without
+                // touching the index.
+                let index = self.load_index().await?;
+                let mut pages = Vec::with_capacity(index.len());
+                for (id, parent) in index {
                     let root = self
                         .load_block(&id)
                         .await?
@@ -743,6 +767,7 @@ where
                     pages.push(PageMeta {
                         id,
                         title: root.text,
+                        parent,
                     });
                 }
                 Ok(encode_reply(&PageReply::PageList(pages)))
@@ -912,6 +937,7 @@ mod tests {
             &PageMsg::CreatePage {
                 page_id: page.into(),
                 title: format!("{page} title"),
+                parent: None,
             },
         )
         .await;
@@ -1022,6 +1048,7 @@ mod tests {
                 &PageMsg::CreatePage {
                     page_id: "p2".into(),
                     title: "two".into(),
+                    parent: None,
                 },
             )
             .await;
@@ -1053,6 +1080,7 @@ mod tests {
                 &PageMsg::CreatePage {
                     page_id: "b1".into(),
                     title: "steal".into(),
+                    parent: None,
                 },
                 "duplicate block id",
             )
@@ -1245,6 +1273,7 @@ mod tests {
                 &PageMsg::CreatePage {
                     page_id: "p2".into(),
                     title: "two".into(),
+                    parent: None,
                 },
             )
             .await;
@@ -1423,6 +1452,7 @@ mod tests {
                 &PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "one".into(),
+                    parent: None,
                 },
             )
             .await;
@@ -1485,6 +1515,7 @@ mod tests {
                 &PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "one".into(),
+                    parent: None,
                 },
             )
             .await;
@@ -1534,6 +1565,7 @@ mod tests {
                 &PageMsg::CreatePage {
                     page_id: "blk1".into(),
                     title: "steal".into(),
+                    parent: None,
                 },
                 "corrupt",
             )
@@ -1568,6 +1600,7 @@ mod tests {
                 &PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "stale title".into(),
+                    parent: None,
                 },
             )
             .await;
@@ -1590,6 +1623,7 @@ mod tests {
                     &PageMsg::CreatePage {
                         page_id: id.into(),
                         title: title.into(),
+                        parent: None,
                     },
                 )
                 .await;
@@ -1617,6 +1651,7 @@ mod tests {
                 &PageMsg::CreatePage {
                     page_id: PAGE_INDEX_KEY.into(),
                     title: "clobber".into(),
+                    parent: None,
                 },
                 "reserved block id",
             )
@@ -1637,6 +1672,42 @@ mod tests {
             assert!(get_block(&p, PAGE_INDEX_KEY).await.is_none());
             assert!(get_page(&p, PAGE_INDEX_KEY).await.is_none());
             assert_eq!(list_pages(&p).await.len(), 1);
+        });
+    }
+
+    // ── nested pages (folder relation in the index) ──
+
+    #[test]
+    fn create_with_parent_records_folder_edge() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            apply_commit(&mut p, &PageMsg::CreatePage {
+                page_id: "root".into(), title: "Root".into(), parent: None,
+            }).await;
+            apply_commit(&mut p, &PageMsg::CreatePage {
+                page_id: "child".into(), title: "Child".into(), parent: Some("root".into()),
+            }).await;
+            let pages = list_pages(&p).await;
+            let child = pages.iter().find(|m| m.id == "child").unwrap();
+            assert_eq!(child.parent.as_deref(), Some("root"));
+            let root = pages.iter().find(|m| m.id == "root").unwrap();
+            assert_eq!(root.parent, None);
+        });
+    }
+
+    #[test]
+    fn create_under_missing_or_nonpage_parent_is_rejected() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            seed_page(&mut p, "p1").await; // p1 + blocks b1,b2,b3
+            // parent does not exist
+            apply_expect_err(&mut p, &PageMsg::CreatePage {
+                page_id: "x".into(), title: "x".into(), parent: Some("ghost".into()),
+            }, "parent page not found").await;
+            // parent exists but is a non-page block
+            apply_expect_err(&mut p, &PageMsg::CreatePage {
+                page_id: "y".into(), title: "y".into(), parent: Some("b1".into()),
+            }, "parent page not found").await;
         });
     }
 }
