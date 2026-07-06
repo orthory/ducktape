@@ -28,18 +28,27 @@ pub fn select_policy(args: &[String]) -> std::io::Result<nat_traversal::AuthPoli
     if args.iter().any(|a| a == "--allow-anonymous") {
         return Ok(nat_traversal::AuthPolicy::Open { require_pop: false });
     }
-    if let Some(path) = flag_value(args, "--genesis-set") {
-        let genesis_set = load_genesis_pubkeys(&path)?;
+    // `--genesis-set` presence is detected SEPARATELY from its value: a present
+    // but value-less flag (bare `--genesis-set`, `--genesis-set` as the final
+    // token, or immediately followed by another `--flag` — e.g. an unset shell
+    // variable that collapses to nothing) is a HARD error, never a silent
+    // fall-through to the weaker `Open { require_pop: true }`. Downgrading a
+    // Private (genesis/cap-gated) coordinator to public-PoP on a typo'd path
+    // would admit any node with a valid proof-of-possession.
+    if let Some(i) = args.iter().position(|a| a == "--genesis-set") {
+        let path = args
+            .get(i + 1)
+            .filter(|v| !v.starts_with("--"))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--genesis-set requires a <network.toml> path",
+                )
+            })?;
+        let genesis_set = load_genesis_pubkeys(path)?;
         return Ok(nat_traversal::AuthPolicy::Private { genesis_set });
     }
     Ok(nat_traversal::AuthPolicy::Open { require_pop: true })
-}
-
-/// The value following `flag` in `args`, if present (`--flag <value>`).
-fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1).cloned())
 }
 
 /// Parse the PUBLIC genesis validator pubkeys out of a `network.toml`. This is
