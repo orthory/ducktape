@@ -1,20 +1,77 @@
 use std::net::SocketAddr;
 
 use crate::advert::{AdvertBook, AdvertOutcome};
+use crate::auth::{verify_request, AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS};
+use crate::AuthRequest;
 use crate::{Msg, NodeKey};
 
 /// The untrusted entry helper. Maps a node key to the reflexive address the
 /// coordinator observed for it, and brokers a simultaneous-open. Holds no key
 /// material, no plaintext, no mesh authority — and never carries peer traffic:
 /// rendezvous only, no relay.
-#[derive(Default)]
 pub struct Coordinator {
     adverts: AdvertBook,
+    policy: AuthPolicy,
+    window: u64,
+    rejects: u64,
+}
+
+impl Default for Coordinator {
+    fn default() -> Self {
+        Self {
+            adverts: AdvertBook::default(),
+            policy: AuthPolicy::default(), // fully-open
+            window: DEFAULT_FRESHNESS_WINDOW_SECS,
+            rejects: 0,
+        }
+    }
 }
 
 impl Coordinator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct with an explicit authorization policy.
+    pub fn with_policy(policy: AuthPolicy) -> Self {
+        Self { policy, ..Self::default() }
+    }
+
+    /// Count of requests dropped by the auth gate (observability).
+    pub fn rejects(&self) -> u64 {
+        self.rejects
+    }
+
+    /// Authenticate then handle one authenticated request. `now` is wall-clock
+    /// seconds. A failed authenticator produces NO reply and bumps the counter.
+    pub fn handle_auth(
+        &mut self,
+        from: SocketAddr,
+        req: AuthRequest,
+        now: u64,
+    ) -> Vec<(SocketAddr, Msg)> {
+        let Some(subject) = req.inner.subject_key() else {
+            self.rejects += 1;
+            return Vec::new();
+        };
+        match verify_request(&self.policy, now, self.window, subject, &req.inner.encode(), &req.auth) {
+            Ok(()) => self.handle(from, req.inner),
+            Err(_) => {
+                self.rejects += 1;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Handle a legacy (unauthenticated) request. Accepted ONLY under the
+    /// fully-open policy; any auth-requiring policy drops it.
+    pub fn handle_legacy(&mut self, from: SocketAddr, msg: Msg) -> Vec<(SocketAddr, Msg)> {
+        if matches!(self.policy, AuthPolicy::Open { require_pop: false }) {
+            self.handle(from, msg)
+        } else {
+            self.rejects += 1;
+            Vec::new()
+        }
     }
 
     /// Handle one datagram observed from `from`; return datagrams to send.
@@ -178,5 +235,83 @@ mod tests {
         let missing = NodeKey([0xcc; 32]);
         let out = c.handle(a_src, Msg::Lookup { key: missing });
         assert_eq!(out, vec![(a_src, Msg::LookupResponse { key: missing, reflexive: None })]);
+    }
+
+    #[test]
+    fn private_policy_admits_authorized_register_and_lookup_but_drops_unauthorized() {
+        use crate::auth::{sign_authenticator, mint_coord_cap, now_secs, AuthPolicy};
+        use crate::AuthRequest;
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(100);
+        let node = ed25519::PrivateKey::from_seed(200);
+        let mut nb = [0u8; 32];
+        nb.copy_from_slice(node.public_key().as_ref());
+        let subject = NodeKey(nb);
+        let now = now_secs();
+
+        let mut c = Coordinator::with_policy(AuthPolicy::Private { genesis_set: vec![g.public_key()] });
+        let src = addr(1, 1111);
+
+        // Authorized: joiner with a valid genesis cap registers -> mapping created.
+        let reg = Msg::Register { key: subject };
+        let cap = mint_coord_cap(&g, subject, now + 3600);
+        let auth = sign_authenticator(&node, &reg.encode(), now, Some(cap));
+        let out = c.handle_auth(src, AuthRequest { inner: reg, auth }, now);
+        assert!(out.is_empty());
+        // A lookup from the same authorized node resolves it.
+        let lk = Msg::Lookup { key: subject };
+        let lauth = sign_authenticator(&node, &lk.encode(), now, Some(mint_coord_cap(&g, subject, now + 3600)));
+        let out = c.handle_auth(src, AuthRequest { inner: lk, auth: lauth }, now);
+        assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: Some(_), .. })));
+
+        // Unauthorized: outsider (no cap) -> dropped, no mapping, reject counted.
+        let outsider = ed25519::PrivateKey::from_seed(201);
+        let mut ob = [0u8; 32];
+        ob.copy_from_slice(outsider.public_key().as_ref());
+        let osub = NodeKey(ob);
+        let before = c.rejects();
+        let oreg = Msg::Register { key: osub };
+        let oauth = sign_authenticator(&outsider, &oreg.encode(), now, None);
+        let out = c.handle_auth(addr(2, 2222), AuthRequest { inner: oreg, auth: oauth }, now);
+        assert!(out.is_empty());
+        assert_eq!(c.rejects(), before + 1);
+        // The outsider's key never entered the book: an AUTHORIZED lookup for it
+        // resolves to None (the dropped register created no mapping). Because a
+        // Lookup's `subject_key()` is the LOOKED-UP key, its PoP must be signed
+        // by that key and admitted for it — so the outsider self-signs a lookup
+        // of its own key under a genesis cap.
+        let lk = Msg::Lookup { key: osub };
+        let lauth = sign_authenticator(&outsider, &lk.encode(), now, Some(mint_coord_cap(&g, osub, now + 3600)));
+        let out = c.handle_auth(src, AuthRequest { inner: lk, auth: lauth }, now);
+        assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: None, .. })));
+    }
+
+    #[test]
+    fn legacy_unauthenticated_request_rejected_unless_fully_open() {
+        use crate::auth::AuthPolicy;
+        let key = NodeKey([1u8; 32]);
+
+        // Fully-open: a bare Register is accepted (mapping created, nothing rejected).
+        let mut open = Coordinator::new(); // Open { require_pop: false }
+        assert!(open.handle_legacy(addr(1, 1111), Msg::Register { key }).is_empty());
+        assert_eq!(open.rejects(), 0, "fully-open never rejects");
+        let out = open.handle_legacy(addr(2, 2222), Msg::Lookup { key });
+        assert!(
+            out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: Some(_), .. })),
+            "the bare Register created a mapping under fully-open"
+        );
+
+        // require_pop: a bare, unauthenticated Register is dropped and counted.
+        let mut gated = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+        let before = gated.rejects();
+        assert!(gated.handle_legacy(addr(1, 1111), Msg::Register { key }).is_empty());
+        assert_eq!(gated.rejects(), before + 1);
+        // No mapping was created: a lookup for the same key resolves to None.
+        let out = gated.handle_legacy(addr(2, 2222), Msg::Lookup { key });
+        // (The lookup is itself a legacy request, also dropped under require_pop —
+        // so it too returns empty; the reject counter is the load-bearing assertion.)
+        assert!(out.is_empty());
+        assert_eq!(gated.rejects(), before + 2);
     }
 }
