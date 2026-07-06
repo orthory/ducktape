@@ -11,7 +11,6 @@ import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
-import * as inboxClient from "../../domain/inbox-client";
 import * as jobsClient from "../../domain/jobs-client";
 import * as memoryClient from "../../domain/memory-client";
 import type { Meta } from "../../domain/memory-client";
@@ -20,7 +19,6 @@ import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
-import * as tasksClient from "../../domain/tasks-client";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
@@ -37,7 +35,6 @@ import {
   channelIdOf,
   clearRemoteUrl,
   docIdOf,
-  nextTaskStatus,
   saveRemoteUrl,
   saveViewMode,
 } from "./state";
@@ -88,8 +85,6 @@ export interface ConsoleActions {
    *  that emoji yet, removes it if we have. Refreshes the open thread panel
    *  too, since its replies are a separate snapshot from `state.messages`. */
   toggleReaction(seq: number, emoji: string): void;
-  addTask(title: string): void;
-  advanceTask(taskId: string): void;
   commitForge(params: { path: string; content: string; message: string }): void;
 
   // ── Documents (block store over the `document` module) ──
@@ -183,17 +178,6 @@ export interface ConsoleActions {
   voteProposal(proposalId: string, approve: boolean): void;
   /** Tally and settle a decidable proposal (anyone may trigger it). */
   executeProposal(proposalId: string): void;
-
-  // ── Inbox (per-member notification queue over the `inbox` module) ──
-  /** Mark every notification in the local member's queue read (idempotent). */
-  markInboxRead(): void;
-  /** Mark every item up to and including `seq` read. */
-  markInboxReadTo(seq: number): void;
-  /** Delete every notification in the local member's queue (up to the latest). */
-  clearInbox(): void;
-  /** Enqueue a notification (module follow-ups are the primary writers, but the
-   *  console can self-deliver or notify another member). */
-  deliverNotification(params: { member: string; kind: string; body: string }): void;
 
   // ── Jobs (consensus work board over the `jobs` module) ──
   /** Post a new job (id generated here). */
@@ -740,28 +724,6 @@ export function createActions({
       });
     },
 
-    addTask: (title) => {
-      const clean = title.trim();
-      if (!clean) return;
-      const taskId = crypto.randomUUID();
-      submitTracked(
-        opKey.task(taskId),
-        (live) => tasksClient.createTask(live, { taskId, title: clean }),
-        (prev) => optimistic.taskAdded(prev, { taskId, title: clean, at: Date.now() }),
-      );
-    },
-
-    advanceTask: (taskId) => {
-      const task = getState().tasks.find((t) => t.id === taskId);
-      if (!task || task.status === "done") return;
-      const status = nextTaskStatus(task.status);
-      submitTracked(
-        opKey.task(taskId),
-        (live) => tasksClient.updateStatus(live, { taskId, status }),
-        (prev) => optimistic.taskAdvanced(prev, taskId, status),
-      );
-    },
-
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
       submitTracked(opKey.forgeHead(), (live) =>
@@ -1082,46 +1044,6 @@ export function createActions({
       if (!proposalId) return;
       submitTracked(opKey.proposal(proposalId), (live) =>
         governanceClient.execute(live, { proposalId }),
-      );
-    },
-
-    // ── Inbox ──
-    // The local member's queue is keyed by the author identity; mark/clear act on
-    // the highest seq currently loaded, so "mark all read" needs no per-item loop.
-    markInboxRead: () => {
-      const items = getState().inbox;
-      if (items.length === 0) return;
-      const upToSeq = items[items.length - 1].seq;
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.markRead(live, { member: getState().author, upToSeq }),
-        (prev) => optimistic.inboxReadTo(prev, upToSeq),
-      );
-    },
-
-    markInboxReadTo: (seq) => {
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.markRead(live, { member: getState().author, upToSeq: seq }),
-        (prev) => optimistic.inboxReadTo(prev, seq),
-      );
-    },
-
-    clearInbox: () => {
-      const items = getState().inbox;
-      if (items.length === 0) return;
-      const upToSeq = items[items.length - 1].seq;
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.clear(live, { member: getState().author, upToSeq }),
-        (prev) => optimistic.inboxCleared(prev, upToSeq),
-      );
-    },
-
-    deliverNotification: ({ member, kind, body }) => {
-      if (!member.trim() || !kind.trim()) return;
-      submitTracked(opKey.inbox(), (live) =>
-        inboxClient.deliver(live, { member: member.trim(), kind: kind.trim(), body }),
       );
     },
 
@@ -1463,7 +1385,6 @@ export function createActions({
         activeChannel: null,
         activeThread: null,
         authorNames: {},
-        tasks: [],
         docIds: [],
         activeDoc: null,
         activeDocBlocks: [],
@@ -1473,8 +1394,6 @@ export function createActions({
         agents: [],
         watches: [],
         pendingRuns: [],
-        inbox: [],
-        inboxUnread: 0,
         jobs: [],
         jobCounts: null,
         rules: [],
@@ -1506,7 +1425,6 @@ export function createActions({
         activeChannel: null,
         activeThread: null,
         authorNames: {},
-        tasks: [],
         members: [],
         proposals: [],
         forgeHead: null,
@@ -1519,8 +1437,6 @@ export function createActions({
         agents: [],
         watches: [],
         pendingRuns: [],
-        inbox: [],
-        inboxUnread: 0,
         jobs: [],
         jobCounts: null,
         rules: [],
@@ -1627,7 +1543,6 @@ export function createActions({
             activeChannel: null,
             activeThread: null,
             authorNames: {},
-            tasks: [],
             docIds: [],
             activeDoc: null,
             activeDocBlocks: [],

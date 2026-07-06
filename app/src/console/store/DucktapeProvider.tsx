@@ -22,7 +22,6 @@ import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
-import * as inboxClient from "../../domain/inbox-client";
 import * as jobsClient from "../../domain/jobs-client";
 import type { BoardCounts } from "../../domain/jobs-client";
 import * as memoryClient from "../../domain/memory-client";
@@ -34,7 +33,6 @@ import {
 } from "../../domain/node-bootstrap";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
-import * as tasksClient from "../../domain/tasks-client";
 import * as valsetClient from "../../domain/valset-client";
 import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
@@ -99,16 +97,13 @@ export function DucktapeProvider({
     // pages slice refreshes the same way (enumeration + the open page's tree).
     const activeDoc = stateRef.current.activeDoc;
     const activePage = stateRef.current.activePage;
-    // the inbox is per-member; the console keys "my" queue by the local author
-    // identity, and memory browsing re-lists whatever dir is open.
-    const member = stateRef.current.author;
+    // memory browsing re-lists whatever dir is open.
     const memoryPath = stateRef.current.memoryPath;
     return Promise.resolve()
       .then(() =>
         Promise.all([
           live.status(),
           chatClient.channels(live),
-          tasksClient.listTasks(live),
           // valset only exists on the NETWORKED node (the local daemon has no
           // validator set) — best-effort like governance below, so a local
           // node reads as "no members" instead of never connecting.
@@ -143,8 +138,6 @@ export function DucktapeProvider({
           // ── unexposed-until-now modules — every one best-effort so a node
           //    that does not register the module reads as "empty", never a
           //    failed refresh (same contract as governance above). ──
-          inboxClient.list(live, { member }).catch(() => []),
-          inboxClient.unread(live, member).catch(() => 0),
           jobsClient.listJobs(live, {}).catch(() => []),
           jobsClient.counts(live).catch((): BoardCounts | null => null),
           automationsClient.listRules(live).catch(() => []),
@@ -158,7 +151,6 @@ export function DucktapeProvider({
       .then(([
         status,
         channels,
-        tasks,
         validators,
         observerKeys,
         proposals,
@@ -171,8 +163,6 @@ export function DucktapeProvider({
         watches,
         pendingRuns,
         profiles,
-        inbox,
-        inboxUnread,
         jobs,
         jobCounts,
         rules,
@@ -201,7 +191,6 @@ export function DucktapeProvider({
                 connected: true,
                 status,
                 channels,
-                tasks,
                 members,
                 observers,
                 proposals,
@@ -216,8 +205,6 @@ export function DucktapeProvider({
                 agents,
                 watches,
                 pendingRuns,
-                inbox,
-                inboxUnread,
                 jobs,
                 jobCounts,
                 rules,

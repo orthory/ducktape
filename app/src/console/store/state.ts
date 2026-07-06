@@ -15,7 +15,6 @@ import type {
 import type { Block, DocSearchHit } from "../../domain/document-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
-import type { Notification } from "../../domain/inbox-client";
 import type { BoardCounts, Job } from "../../domain/jobs-client";
 import type {
   FileStat,
@@ -24,7 +23,6 @@ import type {
   LsEntry,
 } from "../../domain/memory-client";
 import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
-import type { Task, TaskStatus } from "../../domain/tasks-client";
 import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
@@ -71,9 +69,6 @@ export interface ConsoleState {
    *  into author rendering so messages show chosen names, not hex handles. */
   authorNames: Record<string, string>;
 
-  // ── Tasks ──
-  tasks: Task[];
-
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
   members: string[];
@@ -119,13 +114,6 @@ export interface ConsoleState {
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
    *  history lives in the dispatch module, not here. */
   pendingRuns: PendingRun[];
-
-  // ── Inbox ──
-  /** This member's notification queue (List for the local author identity),
-   *  ascending by seq, re-queried per block. */
-  inbox: Notification[];
-  /** Unread count for the local member — feeds the nav badge. */
-  inboxUnread: number;
 
   // ── Jobs (consensus work board) ──
   /** Every job on the board, re-queried per block. */
@@ -280,7 +268,6 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
-    tasks: [],
     members: [],
     observers: [],
     proposals: [],
@@ -294,8 +281,6 @@ export const createInitialState = (): ConsoleState => {
     agents: [],
     watches: [],
     pendingRuns: [],
-    inbox: [],
-    inboxUnread: 0,
     jobs: [],
     jobCounts: null,
     rules: [],
@@ -325,7 +310,6 @@ export interface ConsoleSnapshot {
   connected: boolean;
   status: NodeStatus | null;
   channels: Channel[];
-  tasks: Task[];
   members: string[];
   observers: string[];
   proposals: ProposalView[];
@@ -340,8 +324,6 @@ export interface ConsoleSnapshot {
   agents: AgentRecord[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
-  inbox: Notification[];
-  inboxUnread: number;
   jobs: Job[];
   jobCounts: BoardCounts | null;
   rules: Rule[];
@@ -357,7 +339,6 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   connected: snapshot.connected,
   status: snapshot.status,
   channels: snapshot.channels,
-  tasks: snapshot.tasks,
   members: snapshot.members,
   observers: snapshot.observers,
   proposals: snapshot.proposals,
@@ -372,8 +353,6 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   agents: snapshot.agents,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
-  inbox: snapshot.inbox,
-  inboxUnread: snapshot.inboxUnread,
   jobs: snapshot.jobs,
   jobCounts: snapshot.jobCounts,
   rules: snapshot.rules,
@@ -409,15 +388,3 @@ export const docIdOf = (raw: string): string =>
     )
     .filter((segment) => segment.length > 0)
     .join("/");
-
-/** The task lifecycle is a one-way lane; Done stays Done. */
-export const nextTaskStatus = (status: TaskStatus): TaskStatus => {
-  switch (status) {
-    case "open":
-      return "in_progress";
-    case "in_progress":
-      return "done";
-    case "done":
-      return "done";
-  }
-};

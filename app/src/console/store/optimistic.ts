@@ -15,7 +15,6 @@ import type { Job } from "../../domain/jobs-client";
 import type { LsEntry, Meta } from "../../domain/memory-client";
 import type { PageBlock } from "../../domain/pages-client";
 import type { Rule } from "../../domain/automations-client";
-import type { TaskStatus } from "../../domain/tasks-client";
 import type { ConsoleState } from "./state";
 
 // ── Chat ────────────────────────────────────────────────
@@ -173,32 +172,6 @@ export const channelCreated = (
           },
         ],
       };
-
-// ── Tasks ───────────────────────────────────────────────
-
-export const taskAdded = (
-  prev: ConsoleState,
-  params: { taskId: string; title: string; at: number },
-): Partial<ConsoleState> => ({
-  tasks: [
-    ...prev.tasks,
-    {
-      id: params.taskId,
-      title: params.title,
-      status: "open",
-      created_at: params.at,
-      updated_at: params.at,
-    },
-  ],
-});
-
-export const taskAdvanced = (
-  prev: ConsoleState,
-  taskId: string,
-  status: TaskStatus,
-): Partial<ConsoleState> => ({
-  tasks: prev.tasks.map((t) => (t.id === taskId ? { ...t, status } : t)),
-});
 
 // ── Documents ───────────────────────────────────────────
 
@@ -387,26 +360,6 @@ export const runCancelled = (
   // which prunes the entry node-side a block later — mirror that prune.
   pendingRuns: prev.pendingRuns.filter((r) => r.run_id !== runId),
 });
-
-// ── Inbox ───────────────────────────────────────────────
-
-export const inboxReadTo = (
-  prev: ConsoleState,
-  upToSeq: number,
-): Partial<ConsoleState> => {
-  const inbox = prev.inbox.map((n) =>
-    n.seq <= upToSeq ? { ...n, read: true } : n,
-  );
-  return { inbox, inboxUnread: inbox.filter((n) => !n.read).length };
-};
-
-export const inboxCleared = (
-  prev: ConsoleState,
-  upToSeq: number,
-): Partial<ConsoleState> => {
-  const inbox = prev.inbox.filter((n) => n.seq > upToSeq);
-  return { inbox, inboxUnread: inbox.filter((n) => !n.read).length };
-};
 
 // ── Jobs ────────────────────────────────────────────────
 

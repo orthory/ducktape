@@ -9,7 +9,6 @@ import { ExplorerView } from "../views/explorer/ExplorerView";
 import { FilesView } from "../views/files/FilesView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { GovernanceView } from "../views/governance/GovernanceView";
-import { InboxView } from "../views/inbox/InboxView";
 import { JobsView } from "../views/jobs/JobsView";
 import { MemoryView } from "../views/memory/MemoryView";
 import { MembersView } from "../views/members/MembersView";
@@ -17,7 +16,6 @@ import { ModulesView } from "../views/modules/ModulesView";
 import { PagesView } from "../views/pages/PagesView";
 import { SearchView } from "../views/search/SearchView";
 import { StatusView } from "../views/status/StatusView";
-import { TasksView } from "../views/tasks/TasksView";
 import { TelemetryView } from "../views/telemetry/TelemetryView";
 import type { AppModule, NavSection } from "./module-def";
 
@@ -31,8 +29,6 @@ export const MODULES: AppModule[] = [
   // ── User apps ──
   { id: "search", nav: { icon: "search", label: "Search", order: -1, section: "user" }, Screen: SearchView },
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
-  { id: "inbox", nav: { icon: "inbox", label: "Inbox", order: 1, section: "user" }, Screen: InboxView },
-  { id: "tasks", nav: { icon: "tasks", label: "Tasks", order: 2, section: "user" }, Screen: TasksView },
   { id: "document", nav: { icon: "document", label: "Docs", order: 3, section: "user" }, Screen: DocumentView },
   { id: "pages", nav: { icon: "pages", label: "Pages", order: 4, section: "user" }, Screen: PagesView },
   { id: "files", nav: { icon: "files", label: "Files", order: 5, section: "user" }, Screen: FilesView },

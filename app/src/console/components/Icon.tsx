@@ -4,12 +4,6 @@ import type { CSSProperties, ReactNode } from "react";
 // source, trimmed to the icons this console uses.
 const PATHS: Record<string, ReactNode> = {
   chat: <path d="M5 7a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-6l-4 3.5V14H7a2 2 0 0 1-2-2z" />,
-  tasks: (
-    <>
-      <path d="M12 3.4l6.6 2.3v5c0 4.2-2.8 7-6.6 8.5-3.8-1.5-6.6-4.3-6.6-8.5v-5z" />
-      <path d="M9.2 11.7l2 2 3.6-3.8" />
-    </>
-  ),
   members: (
     <>
       <circle cx="10" cy="8" r="3" />
@@ -94,12 +88,6 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M19.5 4v4h-4" />
       <path d="M18.5 14.8A7 7 0 0 1 6 17.4l-1.5-1.6" />
       <path d="M4.5 20v-4h4" />
-    </>
-  ),
-  inbox: (
-    <>
-      <path d="M4 13.5l2.6-7A2 2 0 0 1 8.5 5h7a2 2 0 0 1 1.9 1.5l2.6 7" />
-      <path d="M4 13.5V17a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3.5h-5l-1.2 2h-3.6L9 13.5z" />
     </>
   ),
   files: (

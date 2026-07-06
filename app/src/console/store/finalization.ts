@@ -54,7 +54,6 @@ export const opKey = {
     `chat/${channelId}/id/${messageId}`,
   /** An op on an EXISTING message (edit/delete/reaction) — keyed by seq. */
   messageSeq: (channelId: string, seq: number) => `chat/${channelId}/seq/${seq}`,
-  task: (taskId: string) => `task/${taskId}`,
   forgeHead: () => "forge/head",
   doc: (docId: string) => `doc/${docId}`,
   docBlock: (docId: string, blockId: string) => `doc/${docId}/block/${blockId}`,
@@ -69,8 +68,6 @@ export const opKey = {
   runRequest: (agentId: string) => `agent/run-request/${agentId}`,
   jobWorker: () => "agent/job-worker",
   proposal: (proposalId: string) => `governance/${proposalId}`,
-  /** The local member's inbox controls (mark-read / clear / deliver). */
-  inbox: () => "inbox/self",
   job: (jobId: string) => `job/${jobId}`,
   rule: (ruleId: string) => `rule/${ruleId}`,
   memory: (path: string) => `memory/${path}`,
