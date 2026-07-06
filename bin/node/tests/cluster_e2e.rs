@@ -319,6 +319,42 @@ fn cluster_lifecycle() {
             .is_some_and(|ops| !ops.is_empty()),
         "an applied block carries its dispatch trace: {submitted}"
     );
+    // 8c-bis. the telemetry plane: applying that same non-empty block pushes a
+    // per-block frame into node 0's in-memory ring (GET /v1/telemetry) and over
+    // the ws stream — the dispatch trace decorated with this node's apply
+    // latency. it read {"frames":[]} forever until the validator learned to
+    // emit; the heartbeat nops are filtered exactly like the explorer's rows,
+    // so the two planes render the SAME dispatch trace for the block.
+    let telem = poll_until("held submit's telemetry frame on node 0", FINALIZE, || {
+        let (code, body) = cluster.http(0, "GET", "/v1/telemetry", None);
+        if code != 200 {
+            return None;
+        }
+        body["frames"]
+            .as_array()?
+            .iter()
+            .find(|f| f["height"] == block["height"])
+            .cloned()
+    });
+    assert!(
+        telem["dispatches"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty()),
+        "the telemetry frame carries the block's dispatch trace: {telem}"
+    );
+    assert_eq!(
+        telem["dispatches"].as_array().map(Vec::len),
+        submitted["operations"].as_array().map(Vec::len),
+        "telemetry and the explorer render the same dispatch trace for the block"
+    );
+    assert_eq!(
+        telem["consensusTime"], block["height"],
+        "this validator lane stamps consensus_time = height: {telem}"
+    );
+    assert!(
+        telem["latencyUs"].as_u64().is_some(),
+        "the frame carries this node's apply latency as a u64: {telem}"
+    );
     // 8d. the record's op hash is a real content address: staging at the
     // drain keys the committed payload bytes by sha256, so the blob lane
     // must serve the exact submitted payload back under that digest.
