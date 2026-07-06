@@ -183,7 +183,7 @@ async fn hub_loop(
         if let Some(previous) = active.take() {
             previous.teardown().await;
         }
-        let (session, guard) = match open_session(&plane, &flows, &request.channel_id) {
+        let (session, guard) = match open_session(&plane, &flows, &request.channel_id).await {
             Ok(opened) => opened,
             Err(refusal) => {
                 let _ = request.reply.send(Err(refusal));
@@ -204,21 +204,34 @@ async fn hub_loop(
     }
 }
 
-fn open_session<T: DataPlaneTransport>(
+async fn open_session<T: DataPlaneTransport>(
     plane: &DataPlane<T>,
     flows: &Arc<ActiveFlows>,
     channel_id: &str,
 ) -> Result<(noded::VoiceSession, SessionGuard), String> {
     let flow = channel_flow(channel_id);
-    let datagram_flow = plane
-        .datagram_flow(
+    // a torn-down predecessor's engine pump releases its flow registration
+    // asynchronously (task abort), so a same-channel rejoin can transiently
+    // collide — retry briefly instead of refusing the join.
+    let mut attempts = 0;
+    let datagram_flow = loop {
+        match plane.datagram_flow(
             Service::Voice,
             flow,
             DatagramPolicy {
                 max_queued: FLOW_QUEUE,
             },
-        )
-        .map_err(|e| format!("voice flow unavailable for {channel_id}: {e}"))?;
+        ) {
+            Ok(datagram_flow) => break datagram_flow,
+            Err(e) if attempts >= 20 => {
+                return Err(format!("voice flow unavailable for {channel_id}: {e}"));
+            }
+            Err(_) => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
     let engine = VoiceEngine::new(datagram_flow, VoiceConfig::default())
         .map_err(|e| format!("voice codec init failed: {e}"))?;
     flows.insert(flow);
