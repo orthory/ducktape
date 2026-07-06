@@ -69,13 +69,19 @@ export interface AgentRecord {
 
 const TARGET = "agent";
 
-/** Every action name an agent can be granted (KNOWN_ACTIONS). A RegisterAgent /
- *  UpdateAgent rejects an `allowed_actions` entry outside this set. */
+/** The builtin action routes seeded at genesis — the UI's default grant
+ *  suggestions, NOT a closed set. Grants are open shape-valid tags
+ *  (`[a-z0-9._-]`, max 64 bytes): RegisterAgent / UpdateAgent accept any
+ *  well-shaped tag, and whether a granted tag does anything is decided at
+ *  delivery time by the package registry's tag -> owner route table. */
 export const KNOWN_ACTIONS = [
   "chat.post",
   "tasks.create",
   "tasks.update_status",
 ] as const;
+
+/** The registry's tag shape rule — what a custom grant must match. */
+export const ACTION_TAG_PATTERN = /^[a-z0-9._-]{1,64}$/;
 
 // ── Prompt pin helpers ───────────────────────────────
 
