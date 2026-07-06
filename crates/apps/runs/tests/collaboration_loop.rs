@@ -18,18 +18,18 @@
 //! finalizes the board item with the validated response.
 
 use agent::AgentModule;
-use agent_interface::{
+use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentQuery, AgentReply,
     AgentResponse, AgentStatus, ReplyBlock, decode_reply, encode_msg, encode_query,
     encode_response,
 };
 use runs::{RunsModule, dispatch_id_for, job_run_id_for, reply_message_id, run_id_for};
-use runs_interface::{
+use runs::{
     PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
     encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use chat::Chat;
-use chat_interface::{
+use chat::{
     AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
@@ -42,7 +42,7 @@ use dispatch_interface::{
 };
 use host::{BlockContext, Host};
 use jobs::Jobs;
-use jobs_interface::{
+use jobs::{
     Job, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_reply as jobs_decode_reply,
     encode_msg as jobs_encode_msg, encode_query as jobs_encode_query,
 };
@@ -54,7 +54,7 @@ use saga_interface::{
 use sdk::{Effect, Msg, Origin, StateRoot};
 use tagging::TaggingModule;
 use tasks::Tasks;
-use tasks_interface::{
+use tasks::{
     TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
 };
 
@@ -295,7 +295,7 @@ async fn dispatch_saga_id(host: &Host, run_id: &str) -> String {
     }
 }
 
-async fn chat_message(host: &Host, message_id: &str) -> Option<chat_interface::MessageView> {
+async fn chat_message(host: &Host, message_id: &str) -> Option<chat::MessageView> {
     let reply = host
         .query(
             "chat",

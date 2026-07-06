@@ -32,13 +32,12 @@
 //! install re-derives the root from the decoded temporaries before adopting
 //! them — the consensus-agreed root, not the peer, is the trust anchor.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use agent_interface::{
-    AgentEvent, AgentMsg, AgentQuery, AgentRecord, AgentReply, AgentStatus, KNOWN_ACTIONS,
-    MAX_AGENT_RECORD_BYTES, PROMPT_HASH_LEN, RESERVED_ID_SEPARATOR, decode_msg, decode_query,
-    encode_event, encode_reply,
-};
 use capability_interface::validate_tag;
 use saga_interface::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -691,7 +690,7 @@ impl Module for AgentModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_interface::{
+    use crate::{
         ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg,
         encode_query,
     };

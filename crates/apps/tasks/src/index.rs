@@ -24,7 +24,7 @@ use indexer::{
     ViewReader,
 };
 use serde::{Deserialize, Serialize};
-use tasks_interface::{TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_msg, decode_reply, encode_query};
+use crate::{TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_msg, decode_reply, encode_query};
 
 /// default and max page size for by-status listing.
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -250,7 +250,7 @@ impl ModuleIndexer for TasksIndex {
 mod tests {
     use super::*;
     use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
-    use tasks_interface::encode_msg;
+    use crate::encode_msg;
 
     fn store(dir: &std::path::Path) -> IndexStore {
         IndexStore::open(dir, &["tasks"])
@@ -385,16 +385,16 @@ mod tests {
     }
 
     /// canonical tasks state standing in for the module's query surface.
-    struct CanonicalTasks(Vec<tasks_interface::Task>);
+    struct CanonicalTasks(Vec<crate::Task>);
 
     #[async_trait::async_trait(?Send)]
     impl indexer::StateReader for CanonicalTasks {
         async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
             assert!(matches!(
-                tasks_interface::decode_query(req),
+                crate::decode_query(req),
                 Ok(TaskQuery::List)
             ));
-            Ok(tasks_interface::encode_reply(&TaskReply::Tasks(
+            Ok(crate::encode_reply(&TaskReply::Tasks(
                 self.0.clone(),
             )))
         }
@@ -415,14 +415,14 @@ mod tests {
         );
 
         let state = CanonicalTasks(vec![
-            tasks_interface::Task {
+            crate::Task {
                 id: "t1".into(),
                 title: "ship the indexer".into(),
                 status: TaskStatus::Done,
                 created_at: 1_001,
                 updated_at: 1_003,
             },
-            tasks_interface::Task {
+            crate::Task {
                 id: "t2".into(),
                 title: "write the spec".into(),
                 status: TaskStatus::Open,

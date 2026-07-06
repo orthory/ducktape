@@ -144,7 +144,7 @@ pub enum AgentAction {
         task_id: String,
         title: String,
     },
-    /// `status` is the wire name of a `tasks_interface::TaskStatus`:
+    /// `status` is the wire name of a `tasks::TaskStatus`:
     /// `"open"`, `"in_progress"`, or `"done"`.
     UpdateTaskStatus {
         task_id: String,

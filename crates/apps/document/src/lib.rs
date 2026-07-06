@@ -49,6 +49,12 @@
 //! equals the source root, and every fetched batch is merkle-verified against
 //! that root, so the source is untrusted — the root is the trust anchor.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+// the derived-tier materialized view; registered only by serving binaries.
+pub mod index;
+
 use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -67,9 +73,6 @@ use commonware_storage::{
 };
 use commonware_utils::range::NonEmptyRange;
 
-use document_interface::{
-    Block, DocMsg, DocQuery, DocReply, decode_msg, decode_query, encode_reply,
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, ResolverSyncTarget, StateRoot, StateSyncHandle};
 
 /// write-time cap on a SERIALIZED document. [`doc_config`]'s codec [`RangeCfg`]
@@ -628,7 +631,7 @@ where
 mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, deterministic};
-    use document_interface::{BlockKind, decode_reply, encode_msg, encode_query};
+    use crate::{BlockKind, decode_reply, encode_msg, encode_query};
     use state::global_root;
 
     fn blk(id: &str, text: &str) -> Block {

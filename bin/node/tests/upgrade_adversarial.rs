@@ -29,7 +29,7 @@
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 
-use forge_interface::{ForgeMsg, encode_msg as forge_encode};
+use forge::{ForgeMsg, encode_msg as forge_encode};
 use host::{BASELINE_VERSION, BlockContext, Host};
 use sdk::{Msg, Origin, StateRoot};
 use upgrade::Upgrade;

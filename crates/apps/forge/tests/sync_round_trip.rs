@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
-use forge_interface::{ForgeMsg, encode_msg};
+use forge::{ForgeMsg, encode_msg};
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
 
 /// the module's canonical branch — the ref install must (and may only) move.

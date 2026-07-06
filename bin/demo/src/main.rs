@@ -14,17 +14,17 @@
 //! run: `cargo run -p demo`
 
 use agent::AgentModule;
-use agent_interface::{
+use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg,
 };
 use runs::{RunsModule, run_id_for};
-use runs_interface::{
+use runs::{
     RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
     encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use automations::Automations;
 use chat::Chat;
-use chat_interface::{
+use chat::{
     Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, PostPolicy,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
@@ -35,20 +35,20 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory_interface::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
 use document::Document;
-use document_interface::{
+use document::{
     Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
     encode_msg as doc_encode_msg, encode_query as doc_encode_query,
 };
 use files::Files;
 use forge::Forge;
-use forge_interface::{
+use forge::{
     ForgeMsg, ForgeQuery, ForgeReply, decode_reply as forge_decode_reply,
     encode_msg as forge_encode_msg, encode_query as forge_encode_query,
 };
 use greeter::Greeter;
 use host::{BlockContext, Host};
 use inbox::Inbox;
-use inbox_interface::{
+use inbox::{
     InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
@@ -528,17 +528,17 @@ fn main() {
                         channel_id: "general".into(),
                         message_id: "m3".into(),
                         blocks: vec![ChatBlock::Paragraph(vec![
-                            chat_interface::Span::plain("hey "),
-                            chat_interface::Span {
+                            chat::Span::plain("hey "),
+                            chat::Span {
                                 text: "@quackbot".into(),
-                                marks: vec![chat_interface::Mark::Mention(
-                                    chat_interface::AuthorRef::Agent {
+                                marks: vec![chat::Mark::Mention(
+                                    chat::AuthorRef::Agent {
                                         module: "runs".into(),
                                         agent_id: "quackbot".into(),
                                     },
                                 )],
                             },
-                            chat_interface::Span::plain(" can you follow up?"),
+                            chat::Span::plain(" can you follow up?"),
                         ])],
                         thread: None,
                         as_agent: None,

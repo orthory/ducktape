@@ -28,10 +28,10 @@ mod common;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_interface::{ACTION_CHAT_POST, AgentMsg};
-use runs_interface::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
+use agent::{ACTION_CHAT_POST, AgentMsg};
+use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 use capability_interface::{CapabilityQuery, CapabilityReply};
-use chat_interface::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
+use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
 use common::{Cluster, poll_until, serial};
 use dispatch_interface::{DispatchQuery, DispatchReply, DispatchStatus};
 
@@ -214,7 +214,7 @@ fn register_and_mention(
     cluster.submit(
         idx,
         "agent",
-        &agent_interface::encode_msg(&AgentMsg::RegisterAgent {
+        &agent::encode_msg(&AgentMsg::RegisterAgent {
             agent_id: agent_id.into(),
             display_name: agent_id.into(),
             capability: tag.into(),
@@ -226,7 +226,7 @@ fn register_and_mention(
     cluster.submit(
         idx,
         "runs",
-        &runs_interface::encode_msg(&RunsMsg::WatchChannel {
+        &runs::encode_msg(&RunsMsg::WatchChannel {
             channel_id: channel.into(),
             policy: TurnPolicy::Mention,
         }),
@@ -237,9 +237,9 @@ fn register_and_mention(
         let reply = cluster.query(
             idx,
             "runs",
-            &runs_interface::encode_query(&RunsQuery::Watches),
+            &runs::encode_query(&RunsQuery::Watches),
         )?;
-        match runs_interface::decode_reply(&reply) {
+        match runs::decode_reply(&reply) {
             Ok(RunsReply::Watches(w)) => {
                 w.iter().any(|v| v.channel_id == channel).then_some(())
             }
@@ -249,7 +249,7 @@ fn register_and_mention(
     cluster.submit(
         idx,
         "chat",
-        &chat_interface::encode_msg(&ChatMsg::PostMessage {
+        &chat::encode_msg(&ChatMsg::PostMessage {
             channel_id: channel.into(),
             message_id: message_id.into(),
             blocks: vec![Block::Paragraph(vec![
@@ -276,12 +276,12 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) ->
         let reply = cluster.query(
             idx,
             "chat",
-            &chat_interface::encode_query(&ChatQuery::MessagesLatest {
+            &chat::encode_query(&ChatQuery::MessagesLatest {
                 channel_id: channel.into(),
                 limit: 64,
             }),
         )?;
-        let ChatReply::Messages(views) = chat_interface::decode_reply(&reply).ok()? else {
+        let ChatReply::Messages(views) = chat::decode_reply(&reply).ok()? else {
             return None;
         };
         views.into_iter().find_map(|v| {
@@ -387,7 +387,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     cluster.submit(
         0,
         "chat",
-        &chat_interface::encode_msg(&ChatMsg::CreateChannel {
+        &chat::encode_msg(&ChatMsg::CreateChannel {
             channel_id: "dispatch".into(),
             name: "Dispatch".into(),
             post_policy: PostPolicy::Open,
@@ -442,10 +442,10 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
         .query(
             0,
             "runs",
-            &runs_interface::encode_query(&RunsQuery::PendingRuns),
+            &runs::encode_query(&RunsQuery::PendingRuns),
         )
         .expect("pending runs query");
-    match runs_interface::decode_reply(&reply) {
+    match runs::decode_reply(&reply) {
         Ok(RunsReply::PendingRuns(pending)) => {
             assert!(pending.is_empty(), "delivered runs must prune: {pending:?}")
         }
@@ -494,7 +494,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     cluster.submit(
         0,
         "chat",
-        &chat_interface::encode_msg(&ChatMsg::CreateChannel {
+        &chat::encode_msg(&ChatMsg::CreateChannel {
             channel_id: "race".into(),
             name: "Race".into(),
             post_policy: PostPolicy::Open,

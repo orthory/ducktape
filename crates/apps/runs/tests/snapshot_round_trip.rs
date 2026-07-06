@@ -10,11 +10,11 @@
 
 use std::collections::BTreeMap;
 
-use agent_interface::{
+use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentQuery, AgentRecord, AgentReply, AgentStatus,
     decode_query as agent_decode_query, encode_reply as agent_encode_reply,
 };
-use chat_interface::{
+use chat::{
     AuthorRef, Block, ChatQuery, ChatReply, MessageHead, MessageView,
     decode_query as chat_decode_query, encode_reply as chat_encode_reply,
 };
@@ -23,9 +23,9 @@ use dispatch_interface::{
     encode_reply as dispatch_encode_reply,
 };
 use futures::executor::block_on;
-use jobs_interface::{JobsEvent, encode_event as jobs_encode_event};
+use jobs::{JobsEvent, encode_event as jobs_encode_event};
 use runs::{RunsModule, job_run_id_for, job_spec_hash, run_id_for};
-use runs_interface::{
+use runs::{
     PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply, encode_msg, encode_query,
 };
 use saga_interface::SagaOrigin;

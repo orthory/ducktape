@@ -1,8 +1,0 @@
-[package]
-name = "jobs-interface"
-edition.workspace = true
-version.workspace = true
-
-[dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }

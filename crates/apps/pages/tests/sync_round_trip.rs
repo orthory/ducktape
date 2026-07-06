@@ -11,7 +11,7 @@
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use pages::Pages;
-use pages_interface::{
+use pages::{
     Block, BlockKind, NewBlock, PageMeta, PageMsg, PageQuery, PageReply, decode_reply, encode_msg,
     encode_query,
 };

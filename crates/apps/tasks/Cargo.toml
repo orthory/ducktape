@@ -5,10 +5,14 @@ version.workspace = true
 
 [dependencies]
 sdk = { workspace = true }
-tasks-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexer = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"
 host = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }

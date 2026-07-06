@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use chat::Chat;
-use chat_interface::{
+use chat::{
     AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_event,
     decode_reply, encode_msg, encode_query,
 };

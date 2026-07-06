@@ -12,7 +12,7 @@
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use document::Document;
-use document_interface::{
+use document::{
     Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply, encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, Msg, StateRoot};

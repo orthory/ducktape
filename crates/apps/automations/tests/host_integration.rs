@@ -3,22 +3,22 @@
 //! in the real tasks module — all atomically within one block.
 
 use automations::Automations;
-use automations_interface::{
+use automations::{
     Action, AutomationsMsg, AutomationsQuery, AutomationsReply, RunRecord, Trigger, decode_reply,
     encode_msg, encode_query,
 };
-use chat_interface::{AuthorRef, ChatEvent, encode_event};
+use chat::{AuthorRef, ChatEvent, encode_event};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use inbox::Inbox;
-use inbox_interface::{
+use inbox::{
     InboxQuery, InboxReply, decode_reply as inbox_decode_reply, encode_query as inbox_encode_query,
 };
 use memory::Memory;
-use memory_interface::{MemoryMsg, Meta, PublishBody, encode_msg as memory_encode_msg};
+use memory::{MemoryMsg, Meta, PublishBody, encode_msg as memory_encode_msg};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use tasks::Tasks;
-use tasks_interface::{
+use tasks::{
     TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
 };
 
@@ -86,7 +86,7 @@ fn chat_event_msg(channel: &str, seq: u64, author: AuthorRef) -> Msg {
     }
 }
 
-async fn tasks_of(host: &Host) -> Vec<tasks_interface::Task> {
+async fn tasks_of(host: &Host) -> Vec<tasks::Task> {
     let bytes = host
         .query(TASKS, &tasks_encode_query(&TaskQuery::List))
         .await
@@ -113,7 +113,7 @@ async fn run_history(host: &Host, rule_id: &str) -> Vec<RunRecord> {
     }
 }
 
-async fn inbox_items(host: &Host, member: &str) -> Vec<inbox_interface::Notification> {
+async fn inbox_items(host: &Host, member: &str) -> Vec<inbox::Notification> {
     let bytes = host
         .query(
             INBOX,
@@ -395,7 +395,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
             },
             Msg {
                 target: TASKS.into(),
-                payload: tasks_interface::encode_msg(&tasks_interface::TaskMsg::CreateTask {
+                payload: tasks::encode_msg(&tasks::TaskMsg::CreateTask {
                     task_id: "auto-general-5".into(),
                     title: "squatted".into(),
                 }),

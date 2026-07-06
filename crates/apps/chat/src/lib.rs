@@ -16,16 +16,16 @@
 //! block and flushed to qmdb in one batch at `commit_block`; the module root is
 //! the real qmdb root and the joiner path is commonware storage sync.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+// the derived-tier materialized view; registered only by serving binaries.
+pub mod index;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use chat_interface::{
-    AuthorRef, Block, Channel, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_CHANNEL_RECORD_BYTES,
-    MAX_EMOJI_BYTES, MAX_HOOKS_PER_CHANNEL, MAX_MESSAGE_HEAD_BYTES, MAX_QUERY_LIMIT,
-    MAX_REACTION_EMOJIS, MAX_REVISIONS, MAX_THREAD_REPLIES, Mark, MessageHead, MessageView,
-    PostPolicy, ReactionSummary, Thread, decode_msg, decode_query, encode_event, encode_reply,
-};
 use commonware_codec::RangeCfg;
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::Sequential;

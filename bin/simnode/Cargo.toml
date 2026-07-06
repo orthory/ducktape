@@ -35,16 +35,11 @@ pages = { workspace = true }
 forge = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
-chat-interface = { workspace = true }
 reactor = { workspace = true }
 noded = { path = "../noded" }
 # the durable block index — /v1/blocks and /v1/index/* read it, the sim actor
 # feeds it block-by-block exactly like the real daemons.
 indexer = { workspace = true }
-chat-index = { workspace = true }
-tasks-index = { workspace = true }
-document-index = { workspace = true }
-pages-index = { workspace = true }
 
 commonware-runtime = { workspace = true }
 

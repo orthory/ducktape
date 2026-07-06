@@ -109,14 +109,15 @@
 //! `abort_block` drops every repo's staged write and the built objects linger
 //! unreferenced in the odb (node-local, never in `root()`/the app-hash).
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 mod git;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use forge_interface::{
-    ForgeMsg, ForgeQuery, ForgeReply, RepoHead, decode_msg, decode_query, encode_reply,
-};
 use git2::{Oid, Repository};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
@@ -1140,7 +1141,7 @@ impl Module for Forge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_interface::{decode_reply, encode_msg, encode_query};
+    use crate::{decode_reply, encode_msg, encode_query};
 
     // a minimal Ctx so execute can read consensus_time without a full host.
     struct TestCtx {

@@ -15,12 +15,12 @@
 //! byte stream that `root()` hashes so a joiner can verify a peer image before
 //! adopting it.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::BTreeMap;
 
-use profiles_interface::{
-    MAX_NAME_LEN, MAX_QUERY_LIMIT, Profile, ProfileMsg, ProfileQuery, ProfileReply, decode_msg,
-    decode_query, encode_reply,
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 

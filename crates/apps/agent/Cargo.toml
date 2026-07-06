@@ -9,7 +9,6 @@ version.workspace = true
 # everything that ACTS on agents lives in the runs module.
 [dependencies]
 sdk = { workspace = true }
-agent-interface = { workspace = true }
 saga-interface = { workspace = true }
 capability-interface = { workspace = true }
 sha2 = { workspace = true }

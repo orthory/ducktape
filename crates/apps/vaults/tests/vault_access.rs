@@ -8,7 +8,7 @@ use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Module as _, Msg, Origin, StateRoot};
 use vaults::Vaults;
-use vaults_interface::{VaultMsg, VaultQuery, VaultReply, decode_reply, encode_msg, encode_query};
+use vaults::{VaultMsg, VaultQuery, VaultReply, decode_reply, encode_msg, encode_query};
 
 fn key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];

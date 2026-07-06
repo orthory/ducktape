@@ -17,14 +17,14 @@
 //! `snapshot`/`install` ship exactly that preimage (verify-then-adopt, strict
 //! bounds-checked decode of untrusted bytes).
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use vaults_interface::{
-    SecretEntry, VaultMsg, VaultQuery, VaultReply, VaultView, decode_msg, decode_query,
-    encode_reply,
-};
 
 /// per-secret ciphertext ceiling: a vault holds credentials, not blobs. keeps
 /// one hostile put from ballooning every validator's replicated state.
@@ -449,7 +449,7 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use host::{Host, SubmitError};
-    use vaults_interface::{decode_reply, encode_msg, encode_query, VaultQuery, VaultReply};
+    use crate::{decode_reply, encode_msg, encode_query, VaultQuery, VaultReply};
 
     /// the noded surface applies client bytes verbatim as `Origin::External`, so
     /// an empty origin (also `Host::submit`'s pre-consensus default) must not

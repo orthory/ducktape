@@ -25,7 +25,7 @@ mod common;
 
 use std::time::Duration;
 
-use chat_interface::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
+use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
 use common::{Cluster, poll_until, serial};
 use directory_interface::{DirMsg, DirQuery, DirReply};
 use governance_interface::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
@@ -37,7 +37,7 @@ const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
 
 fn chat_post(channel: &str, message_id: &str, text: &str) -> Vec<u8> {
-    chat_interface::encode_msg(&ChatMsg::PostMessage {
+    chat::encode_msg(&ChatMsg::PostMessage {
         channel_id: channel.into(),
         message_id: message_id.into(),
         blocks: vec![Block::paragraph(text)],
@@ -57,12 +57,12 @@ fn read_message(
     let reply = cluster.query(
         idx,
         "chat",
-        &chat_interface::encode_query(&ChatQuery::MessagesLatest {
+        &chat::encode_query(&ChatQuery::MessagesLatest {
             channel_id: channel.into(),
             limit: 64,
         }),
     )?;
-    let ChatReply::Messages(views) = chat_interface::decode_reply(&reply).ok()? else {
+    let ChatReply::Messages(views) = chat::decode_reply(&reply).ok()? else {
         return None;
     };
     views.into_iter().find_map(|v| {
@@ -161,7 +161,7 @@ fn cluster_lifecycle() {
     cluster.submit(
         0,
         "chat",
-        &chat_interface::encode_msg(&ChatMsg::CreateChannel {
+        &chat::encode_msg(&ChatMsg::CreateChannel {
             channel_id: "general".into(),
             name: "General".into(),
             post_policy: PostPolicy::Open,

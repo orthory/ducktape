@@ -8,7 +8,7 @@
 //! before the call.
 
 use agent::AgentModule;
-use agent_interface::{
+use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, AgentStatus,
     decode_reply, encode_msg, encode_query,
 };

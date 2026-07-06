@@ -27,7 +27,7 @@ use indexer::{
     ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, RebuildMeta, Result, StateReader,
     ViewReader,
 };
-use pages_interface::{BlockKind, PageMsg, PageQuery, PageReply, decode_msg, decode_reply, encode_query};
+use crate::{BlockKind, PageMsg, PageQuery, PageReply, decode_msg, decode_reply, encode_query};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -357,7 +357,7 @@ impl ModuleIndexer for PagesIndex {
 mod tests {
     use super::*;
     use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
-    use pages_interface::{NewBlock, encode_msg};
+    use crate::{NewBlock, encode_msg};
 
     fn store(dir: &std::path::Path) -> IndexStore {
         IndexStore::open(dir, &["pages"])
@@ -526,12 +526,12 @@ mod tests {
 
     /// canonical pages state standing in for the module's query surface:
     /// page id → preorder blocks (roots first, complete tree shape).
-    struct CanonicalPages(Vec<(pages_interface::PageMeta, Vec<pages_interface::Block>)>);
+    struct CanonicalPages(Vec<(crate::PageMeta, Vec<crate::Block>)>);
 
     #[async_trait::async_trait(?Send)]
     impl indexer::StateReader for CanonicalPages {
         async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
-            let reply = match pages_interface::decode_query(req).map_err(Error::State)? {
+            let reply = match crate::decode_query(req).map_err(Error::State)? {
                 PageQuery::ListPages => {
                     PageReply::PageList(self.0.iter().map(|(meta, _)| meta.clone()).collect())
                 }
@@ -543,7 +543,7 @@ mod tests {
                 ),
                 other => return Err(Error::State(format!("unexpected query {other:?}"))),
             };
-            Ok(pages_interface::encode_reply(&reply))
+            Ok(crate::encode_reply(&reply))
         }
     }
 
@@ -554,8 +554,8 @@ mod tests {
         kind: BlockKind,
         text: &str,
         children: &[&str],
-    ) -> pages_interface::Block {
-        pages_interface::Block {
+    ) -> crate::Block {
+        crate::Block {
             id: id.into(),
             parent: parent.map(Into::into),
             page: page.into(),
@@ -582,7 +582,7 @@ mod tests {
 
         // one page: root p1 → b1 (toggle section) → b2 (inner), plus b3.
         let state = CanonicalPages(vec![(
-            pages_interface::PageMeta {
+            crate::PageMeta {
                 id: "p1".into(),
                 title: "roadmap".into(),
             },

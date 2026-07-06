@@ -13,11 +13,11 @@ use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};
 
 use chat::Chat;
-use chat_interface::{Block as ChatBlock, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
+use chat::{Block as ChatBlock, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
 use directory::Directory;
 use directory_interface::{DirMsg, encode_msg as dir_encode_msg};
 use document::Document;
-use document_interface::{Block, BlockKind, DocMsg, encode_msg as doc_encode_msg};
+use document::{Block, BlockKind, DocMsg, encode_msg as doc_encode_msg};
 use forge::Forge;
 use greeter::Greeter;
 use host::{FinalizedBlock, Host};
@@ -181,7 +181,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             },
             Msg {
                 target: "forge".into(),
-                payload: forge_interface::encode_msg(&forge_interface::ForgeMsg::Commit {
+                payload: forge::encode_msg(&forge::ForgeMsg::Commit {
                     repo: String::new(),
                     path: "README.md".into(),
                     content: "# ducktape\n".into(),

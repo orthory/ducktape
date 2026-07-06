@@ -491,7 +491,7 @@ pub fn router(handle: NodeHandle) -> Router {
             // one chunk per request, so the body cap IS the chunk cap. the
             // json routes keep axum's (smaller) default limit.
             post(put_blob).layer(DefaultBodyLimit::max(
-                files_interface::MAX_CHUNK_SIZE as usize,
+                files::MAX_CHUNK_SIZE as usize,
             )),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
@@ -633,10 +633,10 @@ pub fn open_index_store<S: AsRef<str>>(
         .map(|store| {
             Arc::new(
                 store
-                    .with_indexer(Box::new(chat_index::ChatIndex::new("chat")))
-                    .with_indexer(Box::new(tasks_index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(document_index::DocumentIndex::new("document")))
-                    .with_indexer(Box::new(pages_index::PagesIndex::new("pages"))),
+                    .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
+                    .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
+                    .with_indexer(Box::new(document::index::DocumentIndex::new("document")))
+                    .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
             )
         })
         .map_err(|err| {
@@ -1205,7 +1205,7 @@ fn norm_repo(repo: &str) -> Option<String> {
 /// query the forge module for a repo's committed HEAD oid hex (`None` == unborn).
 /// errors surface as an http `Response` so callers can early-return them.
 async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, Response> {
-    let req = forge_interface::encode_query(&forge_interface::ForgeQuery::HeadOf {
+    let req = forge::encode_query(&forge::ForgeQuery::HeadOf {
         repo: repo.to_string(),
     });
     let (reply, rx) = oneshot::channel();
@@ -1220,8 +1220,8 @@ async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, R
         .await
         .map_err(|_| actor_gone())?
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err))?;
-    match forge_interface::decode_reply(&bytes) {
-        Ok(forge_interface::ForgeReply::Head(head)) => Ok(head),
+    match forge::decode_reply(&bytes) {
+        Ok(forge::ForgeReply::Head(head)) => Ok(head),
         Ok(_) => Err(error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected forge reply to HeadOf",
@@ -1473,7 +1473,7 @@ async fn git_receive_pack(
     let pack_digest = handle.blobs.put_chunk(pack.to_vec());
 
     // CAS the head through a forge Push op and await the block result.
-    let payload = forge_interface::encode_msg(&forge_interface::ForgeMsg::Push {
+    let payload = forge::encode_msg(&forge::ForgeMsg::Push {
         repo,
         prev_oid,
         new_oid,

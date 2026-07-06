@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use files::Files;
-use files_interface::{
+use files::{
     FilesMsg, FilesQuery, FilesReply, Manifest, decode_reply as files_decode_reply,
     digest_hex as file_digest_hex, encode_msg as files_encode_msg,
     encode_query as files_encode_query, encode_reply as files_encode_reply,
@@ -15,7 +15,7 @@ use files_interface::{
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use memory::Memory;
-use memory_interface::{
+use memory::{
     Body, FileStat, Generation, GrepHit, LsEntry, MAX_BODY_BYTES, MAX_FILES,
     MAX_GENERATIONS_PER_PATH, MAX_GREP_LINE_BYTES, MAX_META_ENTRIES, MAX_SNAPSHOTS, MAX_WATCHES,
     MemoryEvent, MemoryMsg, MemoryQuery, MemoryReply, Meta, PublishBody, decode_event,
@@ -83,7 +83,7 @@ impl Ctx for TestCtx {
         if target != FILES {
             return Err(Error::QueryUnsupported);
         }
-        let reply = match files_interface::decode_query(req).map_err(Error::Module)? {
+        let reply = match files::decode_query(req).map_err(Error::Module)? {
             FilesQuery::Stat { file_id } => {
                 FilesReply::Stat(self.file_manifests.get(&file_id).cloned())
             }
@@ -199,7 +199,7 @@ async fn read(
     path: &str,
     generation: Option<u64>,
     snapshot: Option<&str>,
-) -> Option<memory_interface::Generation> {
+) -> Option<memory::Generation> {
     match query(
         module,
         MemoryQuery::Read {

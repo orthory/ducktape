@@ -105,15 +105,19 @@
 //! install re-derives the root from the decoded temporaries before adopting
 //! them — the consensus-agreed root, not the peer, is the trust anchor.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use agent_interface::{
+use agent::{
     ACTION_CHAT_POST, AgentAction, AgentEvent, AgentQuery, AgentRecord, AgentReply, AgentResponse,
     AgentStatus, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
     decode_event as agent_decode_event, decode_reply as agent_decode_reply,
     encode_query as agent_encode_query, encode_response,
 };
-use chat_interface::{
+use chat::{
     AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
@@ -123,17 +127,13 @@ use dispatch_interface::{
     Routing, decode_reply as dispatch_decode_reply, decode_result_event,
     encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
-use document_interface::{
+use document::{
     DocQuery, DocReply, decode_reply as doc_decode_reply, encode_query as doc_encode_query,
 };
-use jobs_interface::{
+use jobs::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_event as jobs_decode_event,
     decode_reply as jobs_decode_reply, encode_msg as jobs_encode_msg,
     encode_query as jobs_encode_query,
-};
-use runs_interface::{
-    PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, WatchView, decode_msg, decode_query,
-    encode_reply,
 };
 use saga_interface::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -142,7 +142,7 @@ use tagging_interface::{
     EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
     encode_msg as tagging_encode_msg,
 };
-use tasks_interface::{
+use tasks::{
     TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_reply as tasks_decode_reply,
     encode_msg as tasks_encode_msg, encode_query as tasks_encode_query,
 };
@@ -226,7 +226,7 @@ Allowed reply block kinds are Paragraph, Heading, and Code. Heading is rendered 
 /// the canonical rendering of a prompt document: block texts joined by blank
 /// lines, kind-agnostic. `AgentRecord::prompt_hash` pins sha256 of exactly
 /// this string, so registrant and validator agree byte-for-byte.
-pub fn render_prompt_doc(blocks: &[document_interface::Block]) -> String {
+pub fn render_prompt_doc(blocks: &[document::Block]) -> String {
     blocks
         .iter()
         .map(|b| b.text.as_str())
@@ -2145,27 +2145,27 @@ impl Module for RunsModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_interface::{
+    use agent::{
         ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, PROMPT_HASH_LEN,
         encode_event as agent_encode_event, encode_reply as agent_encode_reply,
     };
-    use chat_interface::{MessageHead, decode_msg as chat_decode_msg};
+    use chat::{MessageHead, decode_msg as chat_decode_msg};
     use dispatch_interface::{
         DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
         encode_reply as dispatch_encode_reply, encode_result_event,
     };
-    use document_interface::{
+    use document::{
         BlockKind, decode_query as doc_decode_query, encode_reply as doc_encode_reply,
     };
     use futures::executor::block_on;
-    use jobs_interface::{
+    use jobs::{
         Claim as JobClaim, Job, encode_event as jobs_encode_event,
         encode_reply as jobs_encode_reply,
     };
-    use runs_interface::{decode_reply as runs_decode_reply, encode_msg, encode_query};
+    use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
     use sdk::{Effect, Env};
     use tagging_interface::{Author, encode_event as tagging_encode_event};
-    use tasks_interface::{
+    use tasks::{
         Task, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
     };
 
@@ -2185,7 +2185,7 @@ mod tests {
         transcripts: BTreeMap<String, Vec<MessageView>>,
         tasks: Vec<Task>,
         /// doc_id -> prompt document blocks served by the document arm.
-        docs: BTreeMap<String, Vec<document_interface::Block>>,
+        docs: BTreeMap<String, Vec<document::Block>>,
         /// dispatch ids the dispatch module already has a record for — the
         /// committed turn-claim layer the module probes.
         taken_dispatches: BTreeSet<String>,
@@ -2259,7 +2259,7 @@ mod tests {
         fn with_doc(mut self, doc_id: &str, text: &str) -> Self {
             self.docs.insert(
                 doc_id.into(),
-                vec![document_interface::Block {
+                vec![document::Block {
                     id: "b1".into(),
                     kind: BlockKind::Paragraph,
                     text: text.into(),
@@ -2315,7 +2315,7 @@ mod tests {
             self.msgs
                 .iter()
                 .filter(|m| m.target == "jobs")
-                .map(|m| jobs_interface::decode_msg(&m.payload).expect("jobs msg"))
+                .map(|m| jobs::decode_msg(&m.payload).expect("jobs msg"))
                 .collect()
         }
         /// decoded dispatch-plane msgs emitted this dispatch.
@@ -2345,7 +2345,7 @@ mod tests {
         }
         async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
             match target {
-                "agent" => match agent_interface::decode_query(req).map_err(Error::Module)? {
+                "agent" => match agent::decode_query(req).map_err(Error::Module)? {
                     AgentQuery::Agent { agent_id } => Ok(agent_encode_reply(&AgentReply::Agent(
                         self.agents.get(&agent_id).cloned(),
                     ))),
@@ -2359,7 +2359,7 @@ mod tests {
                     ))),
                     _ => Err(Error::QueryUnsupported),
                 },
-                "chat" => match chat_interface::decode_query(req).map_err(Error::Module)? {
+                "chat" => match chat::decode_query(req).map_err(Error::Module)? {
                     ChatQuery::MessagesRange {
                         channel_id,
                         from_seq,
@@ -2375,10 +2375,10 @@ mod tests {
                             let to = head.min(from + limit - 1);
                             window = transcript[(from - 1) as usize..to as usize].to_vec();
                         }
-                        Ok(chat_interface::encode_reply(&ChatReply::Messages(window)))
+                        Ok(chat::encode_reply(&ChatReply::Messages(window)))
                     }
                     ChatQuery::Message { message_id } => {
-                        Ok(chat_interface::encode_reply(&ChatReply::Message(
+                        Ok(chat::encode_reply(&ChatReply::Message(
                             self.transcripts
                                 .values()
                                 .flatten()
@@ -2389,7 +2389,7 @@ mod tests {
                     _ => Err(Error::QueryUnsupported),
                 },
                 "tasks" => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
-                "jobs" => match jobs_interface::decode_query(req).map_err(Error::Module)? {
+                "jobs" => match jobs::decode_query(req).map_err(Error::Module)? {
                     JobsQuery::Get { job_id } => Ok(jobs_encode_reply(&JobsReply::Job(
                         self.jobs.get(&job_id).cloned(),
                     ))),

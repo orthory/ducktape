@@ -7,7 +7,8 @@ version.workspace = true
 # in a node-local blob store served peer-to-peer (the NoKV metadata/body split).
 [dependencies]
 sdk = { workspace = true }
-files-interface = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 
@@ -15,4 +16,3 @@ async-trait = { workspace = true }
 futures = "0.3"
 host = { workspace = true }
 sha2 = { workspace = true }
-files-interface = { workspace = true }

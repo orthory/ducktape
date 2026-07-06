@@ -11,15 +11,10 @@ directory = { workspace = true }
 greeter = { workspace = true }
 directory-interface = { workspace = true }
 forge = { workspace = true }
-forge-interface = { workspace = true }
 document = { workspace = true }
-document-interface = { workspace = true }
 chat = { workspace = true }
-chat-interface = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
-agent-interface = { workspace = true }
-runs-interface = { workspace = true }
 saga = { workspace = true }
 saga-interface = { workspace = true }
 dispatch = { workspace = true }
@@ -29,11 +24,9 @@ tasks = { workspace = true }
 profiles = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
-inbox-interface = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
-jobs-interface = { workspace = true }
 valset = { workspace = true }
 valset-interface = { workspace = true }
 sdk = { workspace = true }

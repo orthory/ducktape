@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use common::{Cluster, poll_until, serial};
 use directory_interface::{DirMsg, DirQuery, DirReply};
-use forge_interface::{ForgeMsg, ForgeQuery, ForgeReply};
+use forge::{ForgeMsg, ForgeQuery, ForgeReply};
 use governance_interface::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
 use upgrade_interface::{UpgradeQuery, UpgradeReply, UpgradeStatus};
 
@@ -75,9 +75,9 @@ fn forge_head(cluster: &Cluster, idx: usize, repo: &str) -> Option<String> {
     let reply = cluster.query(
         idx,
         "forge",
-        &forge_interface::encode_query(&ForgeQuery::HeadOf { repo: repo.into() }),
+        &forge::encode_query(&ForgeQuery::HeadOf { repo: repo.into() }),
     )?;
-    match forge_interface::decode_reply(&reply).ok()? {
+    match forge::decode_reply(&reply).ok()? {
         ForgeReply::Head(head) => head,
         _ => None,
     }
@@ -401,7 +401,7 @@ fn cluster_upgrade() {
     cluster.submit(
         0,
         "forge",
-        &forge_interface::encode_msg(&ForgeMsg::Commit {
+        &forge::encode_msg(&ForgeMsg::Commit {
             repo: "demo".into(),
             path: "README.md".into(),
             content: "forge v1 committed state".into(),

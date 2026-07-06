@@ -8,7 +8,7 @@ use host::{BlockContext, Host, SubmitError};
 use jobs::{
     Jobs, MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_LIST_LIMIT, MAX_PAYLOAD, MAX_SPEC, MAX_WORKERS,
 };
-use jobs_interface::{
+use jobs::{
     BoardCounts, Job, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
     decode_event as decode_jobs_event, decode_reply, encode_event as encode_jobs_event, encode_msg,
     encode_query,

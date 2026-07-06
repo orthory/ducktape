@@ -4,7 +4,7 @@ use sdk::{
     Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
 };
 use tasks::Tasks;
-use tasks_interface::{
+use tasks::{
     TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_reply, encode_msg, encode_query,
 };
 
@@ -31,7 +31,7 @@ fn update(task_id: &str, status: TaskStatus) -> Msg {
     })
 }
 
-async fn module_tasks(tasks: &Tasks) -> Vec<tasks_interface::Task> {
+async fn module_tasks(tasks: &Tasks) -> Vec<tasks::Task> {
     match decode_reply(
         &tasks
             .query(&encode_query(&TaskQuery::List))
@@ -44,7 +44,7 @@ async fn module_tasks(tasks: &Tasks) -> Vec<tasks_interface::Task> {
     }
 }
 
-async fn host_tasks(host: &Host) -> Vec<tasks_interface::Task> {
+async fn host_tasks(host: &Host) -> Vec<tasks::Task> {
     match decode_reply(
         &host
             .query(TASKS, &encode_query(&TaskQuery::List))
