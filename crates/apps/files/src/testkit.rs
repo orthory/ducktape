@@ -6,3 +6,11 @@
 //! reachable only through this hidden seam.
 
 pub use crate::tree::{Store, TreeEdit, entry_at, snapshot_root_tree};
+
+// `gc_due` is the `pub(crate)` gc trigger predicate in the native glue; expose a
+// thin pub wrapper here (native-gated) so the out-of-crate task-13 trigger test
+// can table-drive the period boundary without widening the real public api.
+#[cfg(feature = "native")]
+pub fn gc_due(height: u64, watermark: u64) -> bool {
+    crate::module::gc_due(height, watermark)
+}

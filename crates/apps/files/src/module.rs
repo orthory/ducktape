@@ -12,9 +12,20 @@ use crate::fs::{Fs, StagedObjects};
 use crate::state::Refs;
 use crate::store::{ObjectStore as _, RefsStore as _};
 use crate::wire::{
-    FilesMsg, PUTBLOB_FRAME_TAG, decode_msg, decode_query, decode_sync_req, encode_reply,
-    encode_sync_resp, to_hex,
+    FilesMsg, GC_PERIOD_BLOCKS, PUTBLOB_FRAME_TAG, decode_msg, decode_query, decode_sync_req,
+    encode_reply, encode_sync_resp, to_hex,
 };
+
+/// gc is due at `height` iff `height` has crossed into a new
+/// [`GC_PERIOD_BLOCKS`]-wide window since the last swept height (`watermark`).
+/// integer-divide both to the window index and fire when the block's window is
+/// strictly ahead — so exactly one gc runs per period, on the first files-active
+/// block past each boundary, identically on every node (the trigger is a pure
+/// function of the op stream, never the wall clock). `pub(crate)` so the task-13
+/// trigger test can table-drive the boundary (re-exported via `testkit`).
+pub(crate) fn gc_due(height: u64, watermark: u64) -> bool {
+    height / GC_PERIOD_BLOCKS > watermark / GC_PERIOD_BLOCKS
+}
 
 /// derive the acting identity from the dispatch origin: a module id verbatim,
 /// `"ext:"` + lowercase hex for an external submitter (the prefix
@@ -132,6 +143,55 @@ impl Files {
     #[doc(hidden)]
     pub fn committed_head_for_test(&self) -> Option<String> {
         self.fs.committed_head_for_test()
+    }
+
+    /// `#[doc(hidden)]` test seam: run mark+sweep NOW over committed state,
+    /// returning the removed-object count. gc is consensus-neutral, so this never
+    /// moves the root; a corrupt store panics (the negative signal a reachability
+    /// test wants). production gc runs only via the [`commit_block`] watermark
+    /// trigger; this forces it for tests.
+    #[doc(hidden)]
+    pub fn force_gc(&mut self) -> u64 {
+        self.fs.gc().expect("gc over a consistent store")
+    }
+
+    /// `#[doc(hidden)]` test seam: shrink the bounded history window so gc's
+    /// window-expiry sweep can be driven with a few commits.
+    #[doc(hidden)]
+    pub fn set_history_window_for_tests(&mut self, n: usize) {
+        self.fs.set_history_window_for_tests(n);
+    }
+
+    /// `#[doc(hidden)]` test seam: force the per-node gc watermark so the NEXT
+    /// `commit_block` past a period boundary triggers gc for real.
+    #[doc(hidden)]
+    pub fn set_gc_watermark_for_tests(&mut self, watermark: u64) {
+        self.gc_watermark = watermark;
+    }
+
+    /// `#[doc(hidden)]` test seam: the current per-node gc watermark — asserted
+    /// after a trigger and after a reopen to prove it persisted.
+    #[doc(hidden)]
+    pub fn gc_watermark_for_test(&self) -> u64 {
+        self.gc_watermark
+    }
+
+    /// `#[doc(hidden)]` test seam: does the committed odb hold `id`?
+    #[doc(hidden)]
+    pub fn odb_has_for_test(&self, id: &crate::ObjectId) -> bool {
+        self.fs.odb_has_for_test(id)
+    }
+
+    /// `#[doc(hidden)]` test seam: the committed odb object count.
+    #[doc(hidden)]
+    pub fn odb_len_for_test(&self) -> usize {
+        self.fs.odb_len_for_test()
+    }
+
+    /// `#[doc(hidden)]` test seam: the gc mark set over committed refs.
+    #[doc(hidden)]
+    pub fn gc_mark_for_test(&self) -> std::collections::BTreeSet<crate::ObjectId> {
+        self.fs.gc_mark_for_test()
     }
 }
 
@@ -272,6 +332,25 @@ impl Module for Files {
         // 5. adopt — root advances only now that the refs file is durable.
         self.fs.adopt_refs(refs);
         self.durable_height = height;
+
+        // 6. gc watermark trigger — per-node bookkeeping, NOT consensus (the root
+        // covers refs only, and unreachable-on-one-node is unreachable on every
+        // node). run AFTER adopt so a gc crash can never lose committed state: the
+        // block is already durable above, so any error here bricks the node loudly
+        // (corruption) without rolling the block back. the deterministic cadence
+        // is op-stream-driven — the first files-active block past each period
+        // boundary — so nodes may lag in wall time but never diverge in state. the
+        // advanced watermark lives ONLY in the refs-file envelope (never the root),
+        // so re-save it here.
+        if gc_due(height, self.gc_watermark) {
+            self.fs
+                .gc()
+                .map_err(|e| Error::Module(format!("files: gc: {e}")))?;
+            self.gc_watermark = height;
+            self.refs_store
+                .save(self.fs.refs(), self.durable_height, self.gc_watermark)
+                .map_err(|e| Error::Module(format!("files: refs save (gc watermark): {e}")))?;
+        }
         Ok(())
     }
 

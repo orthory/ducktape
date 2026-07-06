@@ -36,6 +36,11 @@ pub struct Fs<S: ObjectStore> {
     /// only by the `#[doc(hidden)]` test override so the budget-boundary + resume
     /// logic can be exercised without a multi-megabyte fixture per call.
     pub(crate) grep_budget: u64,
+    /// bounded history-window capacity — [`HISTORY_WINDOW`] in production, shrunk
+    /// only by the `#[doc(hidden)]` test override so gc's window-expiry sweep can
+    /// be exercised with a handful of commits instead of thousands. commit's
+    /// window pop keys on this.
+    pub(crate) window_cap: usize,
 }
 
 /// a block's staged objects — `(kind, body)` pairs the glue flushes into the
@@ -104,6 +109,7 @@ impl<S: ObjectStore> Fs<S> {
             pending: None,
             quota: STAGING_QUOTA_BYTES,
             grep_budget: MAX_GREP_SCAN_BYTES,
+            window_cap: HISTORY_WINDOW,
         }
     }
 
@@ -123,6 +129,35 @@ impl<S: ObjectStore> Fs<S> {
     #[doc(hidden)]
     pub fn set_grep_budget_for_tests(&mut self, budget: u64) {
         self.grep_budget = budget;
+    }
+
+    /// `#[doc(hidden)]` test seam: shrink the bounded history window so gc's
+    /// window-expiry sweep can be driven with a few commits. production never
+    /// calls this — the window stays [`HISTORY_WINDOW`].
+    #[doc(hidden)]
+    pub fn set_history_window_for_tests(&mut self, n: usize) {
+        self.window_cap = n;
+    }
+
+    /// `#[doc(hidden)]` test seam: the gc mark set over COMMITTED refs — the
+    /// reachable-object set a reachability test asserts every member of resolves
+    /// after a sweep. panics on a corrupt store (a reachable object missing),
+    /// which is itself the negative signal the reachability tests want.
+    #[doc(hidden)]
+    pub fn gc_mark_for_test(&self) -> BTreeSet<ObjectId> {
+        crate::gc::mark(&self.refs, &self.store).expect("mark over a consistent store")
+    }
+
+    /// `#[doc(hidden)]` test seam: does the committed odb hold `id`?
+    #[doc(hidden)]
+    pub fn odb_has_for_test(&self, id: &ObjectId) -> bool {
+        self.store.has(id)
+    }
+
+    /// `#[doc(hidden)]` test seam: the committed odb object count.
+    #[doc(hidden)]
+    pub fn odb_len_for_test(&self) -> usize {
+        self.store.list().map(|ids| ids.len()).unwrap_or(0)
     }
 
     /// the per-call grep scan budget the read side charges each scanned file
@@ -277,6 +312,9 @@ impl<S: ObjectStore> Fs<S> {
         changes: Vec<Change>,
     ) -> Result<Vec<Notification>, String> {
         self.require_pending(height);
+        // read the window cap before borrowing pending — commit_apply needs it to
+        // bound the history window, and it is a plain Copy field.
+        let window_cap = self.window_cap;
         // the scratch refs every commit mutation lands in — a clone of the pending
         // view, swept at the top. merged back into pending only on full success.
         let scratch = self
@@ -306,6 +344,7 @@ impl<S: ObjectStore> Fs<S> {
                 base,
                 message,
                 &changes,
+                window_cap,
             )?
         };
 
@@ -547,9 +586,29 @@ impl<S: ObjectStore> Fs<S> {
         Err(unimplemented_err())
     }
 
-    /// mark + sweep now; the CALLER decides when (task 13 wires the trigger).
+    /// mark + sweep over COMMITTED state now; the CALLER (the glue) decides WHEN
+    /// via the watermark trigger. returns the number of objects removed.
+    ///
+    /// consensus-neutral: [`crate::gc::mark`] reads only committed refs and the
+    /// sweep removes only unreachable objects from the store — `self.refs`, hence
+    /// the module root, is NEVER touched, so gc cannot move the root and every
+    /// node converges to the same object set whenever it happens to run.
+    ///
+    /// all-or-nothing on corruption: if any reachable object is missing, mark
+    /// returns Err and this removes NOTHING (a partial mark must never drive a
+    /// sweep — that would delete live-but-unreadable data).
     pub fn gc(&mut self) -> Result<u64, String> {
-        Err(unimplemented_err())
+        let live = crate::gc::mark(&self.refs, &self.store)?;
+        // list() is owned, so its immutable borrow ends before the removes below;
+        // remove every stored id the mark did not reach.
+        let mut removed = 0u64;
+        for id in self.store.list()? {
+            if !live.contains(&id) {
+                self.store.remove(&id)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 }
 
@@ -597,6 +656,7 @@ fn commit_apply(
     base: Option<String>,
     message: String,
     changes: &[Change],
+    window_cap: usize,
 ) -> Result<CommitBuilt, String> {
     // step 0: the deterministic staging sweep, over the scratch. a reject never
     // persists a half-applied sweep — production aborts the whole block, and an
@@ -862,7 +922,9 @@ fn commit_apply(
     // so it reclaims nothing.
     refs.head = Some(snap_id);
     refs.window.push_back(snap_id);
-    while refs.window.len() > HISTORY_WINDOW {
+    // bound the window at the (test-overridable) cap — evicted snapshots fall out
+    // of the gc root set, so their exclusive objects become sweepable.
+    while refs.window.len() > window_cap {
         refs.window.pop_front();
     }
     for id in &chunk_refs {
