@@ -16,12 +16,10 @@
 //! appends generation `latest + 1` (1 for a brand-new file). a `(path,
 //! generation)` pair is a stable, hash-pinned reference.
 //!
-//! large bodies can be published through the files module: memory probes a
-//! committed files manifest, then copies its digest and size into the immutable
-//! generation. that is pin-at-publish semantics — removing the files manifest
-//! later does not rewrite or invalidate the memory generation. the generation's
-//! copied digest/size are its consensus truth; body bytes remain fetched over
-//! the files chunk lane and receiver-verified with `files::verify_chunk`.
+//! bodies are inline-only. the old file-backed body lane (pin-at-publish over
+//! the files module's manifests) was removed in the duckfs flag-day reset —
+//! flag-day rule: fresh genesis, delete instead of deprecate — and this whole
+//! module is scheduled for deletion in the next phase.
 //!
 //! ## snapshots & the retention mechanism (design decision)
 //!
@@ -49,10 +47,6 @@ pub use interface::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use files::{
-    FilesQuery, FilesReply, MAX_FILE_ID_BYTES, decode_reply as decode_files_reply,
-    encode_query as encode_files_query,
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
@@ -82,7 +76,6 @@ struct Store {
 
 pub struct Memory {
     id: ModuleId,
-    files_module_id: ModuleId,
     /// what `root()` / `query` observe.
     committed: Store,
     /// the per-block working copy; `None` until the block's first mutation.
@@ -90,10 +83,9 @@ pub struct Memory {
 }
 
 impl Memory {
-    pub fn new(id: impl Into<ModuleId>, files_module_id: impl Into<ModuleId>) -> Self {
+    pub fn new(id: impl Into<ModuleId>) -> Self {
         Self {
             id: id.into(),
-            files_module_id: files_module_id.into(),
             committed: Store::default(),
             pending: None,
         }
@@ -109,7 +101,7 @@ impl Memory {
 
     // ---- mutations (staged) ------------------------------------------------
 
-    async fn publish(
+    fn publish(
         &mut self,
         ctx: &mut dyn Ctx,
         author: String,
@@ -121,7 +113,11 @@ impl Memory {
         let path = validate_file_path(&path)?;
         // caps enforced BEFORE staging, with rejection: an oversized value must
         // never enter the root preimage (the poison-value lesson).
-        let body = self.resolve_publish_body(ctx, body).await?;
+        let PublishBody::Inline(body) = body;
+        if body.len() > MAX_BODY_BYTES {
+            return Err(Error::Module("body exceeds 64 KiB cap".into()));
+        }
+        let body = Body::Inline(body);
         validate_meta(&meta)?;
 
         let (generation, targets) = {
@@ -190,55 +186,6 @@ impl Memory {
             }
         }
         Ok(())
-    }
-
-    async fn resolve_publish_body(
-        &self,
-        ctx: &mut dyn Ctx,
-        body: PublishBody,
-    ) -> Result<Body, Error> {
-        match body {
-            PublishBody::Inline(body) => {
-                if body.len() > MAX_BODY_BYTES {
-                    return Err(Error::Module("body exceeds 64 KiB cap".into()));
-                }
-                Ok(Body::Inline(body))
-            }
-            PublishBody::File { file_id } => {
-                validate_file_id(&file_id)?;
-                let req = encode_files_query(&FilesQuery::Stat {
-                    file_id: file_id.clone(),
-                });
-                let bytes = ctx
-                    .query(&self.files_module_id, &req)
-                    .await
-                    .map_err(|e| Error::Module(format!("files stat probe failed: {e}")))?;
-                let manifest = match decode_files_reply(&bytes).map_err(Error::Module)? {
-                    FilesReply::Stat(Some(manifest)) => manifest,
-                    FilesReply::Stat(None) => {
-                        return Err(Error::Module(format!(
-                            "files manifest not found: {file_id}"
-                        )));
-                    }
-                    FilesReply::List(_) => {
-                        return Err(Error::Module(
-                            "files stat probe returned an unexpected reply".into(),
-                        ));
-                    }
-                };
-                if manifest.file_id != file_id {
-                    return Err(Error::Module(
-                        "files stat probe returned a mismatched file_id".into(),
-                    ));
-                }
-                validate_digest_hex(&manifest.digest)?;
-                Ok(Body::File {
-                    file_id,
-                    digest: manifest.digest,
-                    size: manifest.size,
-                })
-            }
-        }
     }
 
     fn delete(&mut self, path: String) -> Result<(), Error> {
@@ -530,9 +477,7 @@ impl Store {
             let Some(record) = self.gens.get(&(path.clone(), generation)) else {
                 continue;
             };
-            let Body::Inline(body) = &record.body else {
-                continue;
-            };
+            let Body::Inline(body) = &record.body;
             for (idx, line) in body.split('\n').enumerate() {
                 if hits.len() >= limit {
                     return hits;
@@ -749,7 +694,7 @@ impl Module for Memory {
         let height = ctx.env().height;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             MemoryMsg::Publish { path, body, meta } => {
-                self.publish(ctx, author, height, path, body, meta).await
+                self.publish(ctx, author, height, path, body, meta)
             }
             MemoryMsg::Delete { path } => self.delete(path),
             MemoryMsg::Snapshot { name } => self.create_snapshot(name),
@@ -908,34 +853,9 @@ fn validate_meta(meta: &Meta) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_file_id(file_id: &str) -> Result<(), Error> {
-    if file_id.is_empty() {
-        return Err(Error::Module("file_id must not be empty".into()));
-    }
-    if file_id.len() > MAX_FILE_ID_BYTES {
-        return Err(Error::Module("file_id exceeds byte cap".into()));
-    }
-    Ok(())
-}
-
-fn validate_digest_hex(digest: &str) -> Result<(), Error> {
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err(Error::Module(
-            "file digest must be 64-char lowercase hex".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn body_len(body: &Body) -> u64 {
-    match body {
-        Body::Inline(body) => body.len() as u64,
-        Body::File { size, .. } => *size,
-    }
+    let Body::Inline(body) = body;
+    body.len() as u64
 }
 
 /// a watch prefix is a CANONICAL absolute path — the same segment validation as
@@ -982,22 +902,9 @@ fn push_meta(out: &mut Vec<u8>, meta: &Meta) {
 }
 
 fn push_body(out: &mut Vec<u8>, body: &Body) {
-    match body {
-        Body::Inline(value) => {
-            out.push(0);
-            push_str(out, value);
-        }
-        Body::File {
-            file_id,
-            digest,
-            size,
-        } => {
-            out.push(1);
-            push_str(out, file_id);
-            push_str(out, digest);
-            out.extend_from_slice(&size.to_le_bytes());
-        }
-    }
+    let Body::Inline(value) = body;
+    out.push(0);
+    push_str(out, value);
 }
 
 /// a length-prefixed collection count, guarded so a corrupt count can never make
@@ -1029,18 +936,7 @@ fn read_body(bytes: &[u8], off: &mut usize) -> Result<Body, Error> {
             }
             Ok(Body::Inline(body))
         }
-        1 => {
-            let file_id = read_string(bytes, off)?;
-            validate_file_id(&file_id)?;
-            let digest = read_string(bytes, off)?;
-            validate_digest_hex(&digest)?;
-            let size = read_u64(bytes, off)?;
-            Ok(Body::File {
-                file_id,
-                digest,
-                size,
-            })
-        }
+        // tag 1 was the flag-day-removed file-backed body — invalid now too.
         _ => Err(Error::Module("snapshot body variant is invalid".into())),
     }
 }

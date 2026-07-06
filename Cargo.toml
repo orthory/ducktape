@@ -94,6 +94,11 @@ defguard_wireguard_rs = "0.10.0"
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
+# duckfs path normalization: NFC so visually-identical names collide instead
+# of coexisting (a consensus-determinism requirement, not cosmetics).
+unicode-normalization = "0.1"
+# tests only: isolated on-disk module data dirs.
+tempfile = "3"
 
 # fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
 # per-module indexer tier ONLY: nothing the app-hash commits to may live in it

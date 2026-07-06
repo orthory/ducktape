@@ -1044,7 +1044,7 @@ fn per_module_index_serves_ops_and_views() {
 }
 
 #[test]
-fn files_blob_seam_round_trips_and_ties_into_consensus() {
+fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
     let genesis_hash = daemon.status()["appHash"]
@@ -1052,10 +1052,17 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
         .expect("appHash")
         .to_string();
 
-    // upload: binary, non-utf8, deliberately smaller than the chunk size so
-    // the manifest's tail-length rule is exercised below.
-    let chunk: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
-    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &chunk);
+    // sha256 as 64-char lowercase hex — the digest rendering the lane returns.
+    let digest_hex = |bytes: &[u8]| -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+
+    // upload: binary, non-utf8 receipt bytes.
+    let receipt: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &receipt);
     assert_eq!(
         code,
         200,
@@ -1066,35 +1073,35 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
     let digest = reply["digest"].as_str().expect("digest").to_string();
     assert_eq!(
         digest,
-        files::digest_hex(&chunk),
+        digest_hex(&receipt),
         "the returned digest is sha256 of the exact uploaded bytes"
     );
 
     // fetch round-trips byte-identical.
     let (code, fetched) = daemon.request_bytes("GET", &format!("/v1/files/blob/{digest}"), &[]);
     assert_eq!(code, 200);
-    assert_eq!(fetched, chunk, "fetched bytes must be byte-identical");
+    assert_eq!(fetched, receipt, "fetched bytes must be byte-identical");
 
     // a well-formed digest nobody uploaded is a 404; a malformed digest
     // (uppercase hex included) is a 400, not a miss.
-    let absent = files::digest_hex(b"never uploaded");
+    let absent = digest_hex(b"never uploaded");
     let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{absent}"), &[]);
-    assert_eq!(code, 404, "absent chunk must be a 404");
+    assert_eq!(code, 404, "absent receipt must be a 404");
     let upper = digest.to_uppercase();
     let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{upper}"), &[]);
     assert_eq!(code, 400, "digest must be lowercase hex");
 
-    // the cap is MAX_CHUNK_SIZE inclusive: exactly 4 MiB lands...
-    let max = vec![0xABu8; files::MAX_CHUNK_SIZE as usize];
+    // the receipt-lane body cap is 4 MiB inclusive: exactly 4 MiB lands...
+    let max = vec![0xABu8; 4 * 1024 * 1024];
     let (code, _) = daemon.request_bytes("POST", "/v1/files/blob", &max);
-    assert_eq!(code, 200, "a chunk of exactly MAX_CHUNK_SIZE must land");
+    assert_eq!(code, 200, "a body of exactly the cap must land");
     // ...and one byte more is a 413 in the daemon's error envelope.
-    let over = vec![0xCDu8; files::MAX_CHUNK_SIZE as usize + 1];
+    let over = vec![0xCDu8; 4 * 1024 * 1024 + 1];
     let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &over);
     assert_eq!(
         code,
         413,
-        "oversized chunk must be rejected: {}",
+        "oversized body must be rejected: {}",
         String::from_utf8_lossy(&body)
     );
     let err: serde_json::Value = serde_json::from_slice(&body).expect("413 body is json");
@@ -1111,31 +1118,6 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
         Some(genesis_hash.as_str()),
         "blob puts must not move the app hash"
     );
-
-    // the consensus tie-in: ONLY the digest crosses /v1/submit. the committed
-    // manifest then verifies the fetched bytes end to end.
-    let (code, block) = daemon.submit(
-        "files",
-        serde_json::json!({
-            "add_manifest": {
-                "file_id": "f1",
-                "name": "blob.bin",
-                "mime": "application/octet-stream",
-                "size": 3000,
-                "chunk_size": 4096,
-                "chunks": [digest],
-            }
-        }),
-        Some("eddy"),
-    );
-    assert_eq!(code, 200, "AddManifest failed: {block}");
-    assert_eq!(block["height"], 1, "the manifest IS a block");
-
-    let reply = daemon.query("files", serde_json::json!({ "stat": { "file_id": "f1" } }));
-    let manifest: files::Manifest =
-        serde_json::from_value(reply["stat"].clone()).expect("Stat carries the manifest");
-    files::verify_chunk(&manifest, 0, &fetched)
-        .expect("fetched bytes verify against the committed manifest");
 }
 
 #[test]

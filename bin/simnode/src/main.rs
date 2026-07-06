@@ -370,6 +370,7 @@ fn run_sim(
     mut control: mpsc::Receiver<SimCommand>,
     events: broadcast::Sender<WsFrame>,
 ) {
+    let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -401,8 +402,8 @@ fn run_sim(
         let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
-        let files = Files::with_blobs("files", blobs.clone());
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir).expect("duckfs open");
+        let memory = Memory::new("memory");
         let profiles = Profiles::new("profiles");
         let host = Host::genesis(vec![
             Box::new(chat),

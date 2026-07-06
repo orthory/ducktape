@@ -9,10 +9,10 @@
 //! carries the module's own `*Msg`/`*Query` enum as a json value, encoded to the
 //! exact bytes the modules' crate-root `encode_*` helpers would produce
 //! (`serde_json::to_vec`), so the daemon needs no per-module knowledge —
-//! with ONE deliberate exception: the files blob lane. chunk bytes must never
-//! transit consensus (no op carries them), so POST `/v1/files/blob` and GET
-//! `/v1/files/blob/{digest}` bypass the actor entirely and talk straight to
-//! the node-local [`crate::blobs::BlobHandle`] the registered files module shares.
+//! with ONE deliberate exception: the op-receipt blob lane. receipt bytes
+//! never transit consensus (no op carries them), so POST `/v1/files/blob` and
+//! GET `/v1/files/blob/{digest}` bypass the actor entirely and talk straight
+//! to the node-local [`crate::blobs::BlobHandle`] forge and the block loop share.
 //!
 //! lifecycle is part of the surface: `/v1/status` carries the daemon's build
 //! version (so a newer app can spot a stale orphan), and POST `/v1/shutdown`
@@ -382,7 +382,7 @@ impl NodeHandle {
     /// build the handle plus the actor-side ends: the command receiver the
     /// actor drains and the event sender it publishes finalized blocks on.
     /// the blob store is born here — BEFORE genesis — so the embedding daemon
-    /// can register its files module over [`Self::blob_handle`].
+    /// can hand [`Self::blob_handle`] clones to forge and its block loop.
     pub fn channel() -> (
         Self,
         mpsc::Receiver<NodeCommand>,
@@ -419,9 +419,9 @@ impl NodeHandle {
         self
     }
 
-    /// the blob store this surface serves. the daemon constructs its files
-    /// module over a clone (`Files::with_blobs`) so http uploads land exactly
-    /// where the module's `serve_sync` reads.
+    /// the blob store this surface serves. the daemon hands clones to forge
+    /// (push packfiles) and its block loop (op receipts) so http uploads land
+    /// exactly where those consumers read.
     pub fn blob_handle(&self) -> crate::blobs::BlobHandle {
         self.blobs.clone()
     }
@@ -490,11 +490,9 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/ws", get(ws))
         .route(
             "/v1/files/blob",
-            // one chunk per request, so the body cap IS the chunk cap. the
-            // json routes keep axum's (smaller) default limit.
-            post(put_blob).layer(DefaultBodyLimit::max(
-                files::MAX_CHUNK_SIZE as usize,
-            )),
+            // one receipt per request; the json routes keep axum's (smaller)
+            // default limit.
+            post(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BODY_BYTES)),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
         .route("/forge/{repo}/info/refs", get(git_info_refs))
@@ -1039,13 +1037,15 @@ async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
-/// POST /v1/files/blob — raw chunk bytes in, `{"digest":"<64-hex>"}` out.
+/// body cap for the op-receipt blob lane. a receipt-lane bound only —
+/// unrelated to duckfs chunking, which rides the op stream.
+const MAX_BLOB_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// POST /v1/files/blob — raw receipt bytes in, `{"digest":"<64-hex>"}` out.
 ///
 /// bytes go straight into the node-local blob store; NOTHING reaches the node
-/// actor and no op is submitted — committing a manifest that references the
-/// digest is a separate, explicit `/v1/submit`. the route's body limit is
-/// `MAX_CHUNK_SIZE` (a bigger chunk could never be referenced by a valid
-/// manifest anyway), and an oversized body is a 413 in the daemon's json
+/// actor and no op is submitted. the route's body limit is
+/// `MAX_BLOB_BODY_BYTES`, and an oversized body is a 413 in the daemon's json
 /// error envelope.
 async fn put_blob(
     State(handle): State<NodeHandle>,

@@ -72,6 +72,10 @@ fn main() {
     // genesis starts from an unborn repo (root == ZERO) and output is reproducible.
     let forge_repo = std::env::temp_dir().join("ducktape-forge-demo");
     let _ = std::fs::remove_dir_all(&forge_repo);
+    // duckfs gets the same treatment: a wiped per-run data dir keeps output
+    // reproducible (the skeleton runs in-memory; tasks 5/6 use the dir).
+    let duckfs_dir = std::env::temp_dir().join("ducktape-duckfs-demo");
+    let _ = std::fs::remove_dir_all(&duckfs_dir);
 
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real chain).
@@ -90,8 +94,8 @@ fn main() {
         let tasks = Tasks::new("tasks");
         let profiles = Profiles::new("profiles");
         let inbox = Inbox::new("inbox");
-        let files = Files::new("files");
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
+        let memory = Memory::new("memory");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(

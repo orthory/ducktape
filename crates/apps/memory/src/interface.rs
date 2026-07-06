@@ -68,29 +68,20 @@ pub const SKILLS_PREFIX: &str = "/skills/";
 /// [`MAX_META_ENTRIES`] / [`MAX_META_KEY_BYTES`] / [`MAX_META_VALUE_BYTES`].
 pub type Meta = BTreeMap<String, String>;
 
-/// one immutable generation body. small bodies are kept directly in memory's
-/// consensus state; large bodies are pinned by reference to a files manifest.
+/// one immutable generation body, kept directly in memory's consensus state.
+/// (file-backed bodies pinned to the old files-module manifests were removed
+/// in the duckfs flag-day reset; memory is inline-only until its deletion.)
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Body {
     Inline(String),
-    File {
-        file_id: String,
-        /// the 64-character lowercase-hex digest copied from the files manifest
-        /// at publish time.
-        digest: String,
-        size: u64,
-    },
 }
 
-/// write-time body selector. file publishes probe the files module and copy the
-/// committed manifest digest/size into [`Body::File`], so later manifest removal
-/// does not change the generation's pinned truth.
+/// write-time body selector — inline only (see [`Body`]).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum PublishBody {
     Inline(String),
-    File { file_id: String },
 }
 
 /// one immutable generation of a file: the write-once body plus its metadata and
@@ -139,9 +130,8 @@ pub enum LsEntry {
 #[serde(rename_all = "snake_case")]
 pub enum MemoryMsg {
     /// write-once publish: assigns `generation = latest + 1` (1 for a new file)
-    /// atomically and appends an immutable generation. inline body/meta caps are
-    /// enforced at execute time with rejection. file bodies require a committed
-    /// files manifest; memory copies its digest and size at publish time.
+    /// atomically and appends an immutable generation. body/meta caps are
+    /// enforced at execute time with rejection.
     Publish {
         path: String,
         body: PublishBody,
@@ -203,10 +193,9 @@ pub enum MemoryQuery {
         meta_filter: BTreeMap<String, String>,
         limit: u64,
     },
-    /// case-sensitive substring scan (no regex — determinism) over INLINE
-    /// latest generations of live files under `prefix`, paths in sorted order,
-    /// up to `limit` (clamped to [`MAX_QUERY_LIMIT`]) hits. file-backed bodies
-    /// are skipped silently and deterministically.
+    /// case-sensitive substring scan (no regex — determinism) over the latest
+    /// generations of live files under `prefix`, paths in sorted order, up to
+    /// `limit` (clamped to [`MAX_QUERY_LIMIT`]) hits.
     Grep {
         prefix: String,
         pattern: String,

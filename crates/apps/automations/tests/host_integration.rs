@@ -27,7 +27,6 @@ const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
 const INBOX: &str = "inbox";
 const MEMORY: &str = "memory";
-const FILES: &str = "files";
 
 /// a stand-in for chat that relays its payload to automations as a hook
 /// follow-up. because it is registered under the id "chat", the host stamps the
@@ -136,7 +135,7 @@ fn genesis() -> Host {
         Box::new(Tasks::new(TASKS)),
         Box::new(RelayChat),
         Box::new(Inbox::new(INBOX)),
-        Box::new(Memory::new(MEMORY, FILES)),
+        Box::new(Memory::new(MEMORY)),
         Box::new(Automations::new(AUTO, CHAT, TASKS, INBOX, MEMORY)),
     ])
     .expect("genesis")

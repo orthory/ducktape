@@ -601,6 +601,7 @@ fn hex(root: &StateRoot) -> String {
 async fn genesis_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
     blobs: blobstore::BlobHandle,
 ) -> Host {
@@ -610,10 +611,9 @@ async fn genesis_host(
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
-    // forge shares the files body plane so a Push's packfile (staged on the blob
+    // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
-    let forge =
-        Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone()).expect("forge init");
+    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs).expect("forge init");
     let mut valset = Valset::new("valset");
     // genesis-seed the validator set from config — deterministic and identical
     // on every node, so membership is IN consensus state from block zero (the
@@ -665,10 +665,10 @@ async fn genesis_host(
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
-        Box::new(Files::with_blobs("files", blobs)),
+        Box::new(Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open")),
         // the shared agent workspace: a filesystem-shaped namespace with
         // write-once publish, immutable generations, snapshots, and watches.
-        Box::new(Memory::new("memory", "files")),
+        Box::new(Memory::new("memory")),
         Box::new(Jobs::new("jobs")),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
@@ -707,6 +707,7 @@ async fn genesis_host(
 async fn restore_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
     manifest: &Manifest,
     blobs: blobstore::BlobHandle,
 ) -> Result<Host, String> {
@@ -716,8 +717,8 @@ async fn restore_host(
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
-    // forge shares the files body plane (see genesis_host) for Push materialization.
-    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
+    // forge shares the blob plane (see genesis_host) for Push materialization.
+    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge: {e}"))?;
     // establish the checkpoint boundary's dual-path branch selector so the
     // restored forge `root()` matches at any block the replay SKIPS (disk already
@@ -801,13 +802,14 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("inbox install: {e}"))?;
 
-    let mut files = Files::with_blobs("files", blobs);
+    let mut files =
+        Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
     let (bytes, root) = snapshot_of("files")?;
     files
         .install(bytes, root)
         .map_err(|e| format!("files install: {e}"))?;
 
-    let mut memory = Memory::new("memory", "files");
+    let mut memory = Memory::new("memory");
     let (bytes, root) = snapshot_of("memory")?;
     memory
         .install(bytes, root)
@@ -892,6 +894,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     client: &C,
     manifest: &statesync::Manifest,
     forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
     attempt: usize,
 ) -> Result<Host, String> {
     let entry_root = |module: &str| -> Result<StateRoot, String> {
@@ -1057,13 +1060,14 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("inbox install: {e}"))?;
 
     let (bytes, root) = snapshot_of("files").await?;
-    let mut files = Files::new("files");
+    let mut files =
+        Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
     files
         .install(&bytes, root)
         .map_err(|e| format!("files install: {e}"))?;
 
     let (bytes, root) = snapshot_of("memory").await?;
-    let mut memory = Memory::new("memory", "files");
+    let mut memory = Memory::new("memory");
     memory
         .install(&bytes, root)
         .map_err(|e| format!("memory install: {e}"))?;
@@ -4140,7 +4144,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // disk, so every store opens under its canonical module id) and
             // print the greppable line the demo script asserts on.
             let forge_repo = storage_for_sync.join("forge-repo");
-            match sync_all_modules(&context, &client, &manifest, &forge_repo, 0).await {
+            let duckfs_dir = storage_for_sync.join("duckfs");
+            match sync_all_modules(&context, &client, &manifest, &forge_repo, &duckfs_dir, 0).await
+            {
                 Ok(host) => {
                     println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
                 }
@@ -4172,6 +4178,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
         };
         let forge_repo = storage_for_sync.join("forge-repo");
+        let duckfs_dir = storage_for_sync.join("duckfs");
 
         // ---- the JOINER: park on the mesh, sync a boundary that includes
         // this key, fabricate the equivalent recovery checkpoint, reboot ----
@@ -4626,8 +4633,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // handle may exist. reads queue in the serve window
                             // until the fresh host lands.
                             serving = None;
-                            match sync_all_modules(&context, &client, &m, &forge_repo, attempt)
-                                .await
+                            match sync_all_modules(
+                                &context,
+                                &client,
+                                &m,
+                                &forge_repo,
+                                &duckfs_dir,
+                                attempt,
+                            )
+                            .await
                             {
                                 Ok(host) => {
                                     let root = host.app_hash();
@@ -4717,7 +4731,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // a promoted observer stops serving: drop the served host
                 // before the promotion sync reopens the same partitions.
                 serving = None;
-                match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
+                match sync_all_modules(&context, &client, &m, &forge_repo, &duckfs_dir, attempt)
+                    .await
+                {
                     Ok(host) => {
                         let latest = match fetch_manifest(&client).await {
                             Ok(latest) => latest,
@@ -4907,7 +4923,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let host = genesis_host(&context, &forge_repo, &validators, blobs.clone()).await;
+                let host = genesis_host(
+                    &context,
+                    &forge_repo,
+                    &duckfs_dir,
+                    &validators,
+                    blobs.clone(),
+                )
+                .await;
                 let pos = recovery.oplog_pos().await;
                 let genesis_participants: Vec<Vec<u8>> =
                     validators.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -4954,7 +4977,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let restored = restore_host(&context, &forge_repo, &manifest, blobs.clone()).await;
+                let restored = restore_host(
+                    &context,
+                    &forge_repo,
+                    &duckfs_dir,
+                    &manifest,
+                    blobs.clone(),
+                )
+                .await;
                 let mut host = match restored {
                     Ok(h) => h,
                     Err(e) => {
@@ -5332,6 +5362,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             &client,
                             &target,
                             &forge_repo,
+                            &duckfs_dir,
                             10_000 + attempts,
                         )
                         .await

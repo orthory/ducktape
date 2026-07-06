@@ -4,14 +4,6 @@
 //! snapshot retention across deletes, watch fan-out, commit/abort staging, and
 //! the snapshot/install sync boundary.
 
-use std::collections::BTreeMap;
-
-use files::Files;
-use files::{
-    FilesMsg, FilesQuery, FilesReply, Manifest, decode_reply as files_decode_reply,
-    digest_hex as file_digest_hex, encode_msg as files_encode_msg,
-    encode_query as files_encode_query, encode_reply as files_encode_reply,
-};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use memory::Memory;
@@ -23,14 +15,12 @@ use memory::{
 };
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 
-const FILES: &str = "files";
 const MEMORY: &str = "memory";
 
 struct TestCtx {
     env: sdk::Env,
     /// module ids `module_root` reports as registered (watch targets).
     known_modules: Vec<String>,
-    file_manifests: BTreeMap<String, Manifest>,
     /// follow-up msgs emitted during execute, in order.
     emitted: Vec<Msg>,
 }
@@ -45,7 +35,6 @@ impl TestCtx {
                 me: MEMORY.into(),
             },
             known_modules: Vec::new(),
-            file_manifests: BTreeMap::new(),
             emitted: Vec::new(),
         }
     }
@@ -56,12 +45,6 @@ impl TestCtx {
 
     fn knowing(mut self, module_id: &str) -> Self {
         self.known_modules.push(module_id.to_string());
-        self
-    }
-
-    fn with_file_manifest(mut self, manifest: Manifest) -> Self {
-        self.file_manifests
-            .insert(manifest.file_id.clone(), manifest);
         self
     }
 }
@@ -79,17 +62,8 @@ impl Ctx for TestCtx {
             .then_some(StateRoot::ZERO)
     }
 
-    async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
-        if target != FILES {
-            return Err(Error::QueryUnsupported);
-        }
-        let reply = match files::decode_query(req).map_err(Error::Module)? {
-            FilesQuery::Stat { file_id } => {
-                FilesReply::Stat(self.file_manifests.get(&file_id).cloned())
-            }
-            FilesQuery::List { .. } => FilesReply::List(Vec::new()),
-        };
-        Ok(files_encode_reply(&reply))
+    async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::QueryUnsupported)
     }
 
     fn emit_msg(&mut self, msg: Msg) {
@@ -125,61 +99,9 @@ fn publish_meta(path: &str, body: &str, meta: &[(&str, &str)]) -> MemoryMsg {
     }
 }
 
-fn publish_file(path: &str, file_id: &str) -> MemoryMsg {
-    MemoryMsg::Publish {
-        path: path.into(),
-        body: PublishBody::File {
-            file_id: file_id.into(),
-        },
-        meta: Meta::new(),
-    }
-}
-
 fn inline_body(record: &Generation) -> &str {
-    match &record.body {
-        Body::Inline(body) => body,
-        other => panic!("expected inline body, got {other:?}"),
-    }
-}
-
-fn file_body(record: &Generation) -> (&str, &str, u64) {
-    match &record.body {
-        Body::File {
-            file_id,
-            digest,
-            size,
-        } => (file_id, digest, *size),
-        other => panic!("expected file body, got {other:?}"),
-    }
-}
-
-fn file_manifest(file_id: &str, size: u64) -> Manifest {
-    let chunk_digest = file_digest_hex(&vec![b'x'; size as usize]);
-    let mut raw = Vec::new();
-    raw.extend_from_slice(&hex32(&chunk_digest));
-    Manifest {
-        file_id: file_id.into(),
-        name: format!("{file_id}.bin"),
-        mime: "application/octet-stream".into(),
-        size,
-        chunk_size: size,
-        chunks: vec![chunk_digest],
-        digest: file_digest_hex(&raw),
-        owner: "system".into(),
-        created_at_height: 1,
-    }
-}
-
-fn hex32(s: &str) -> [u8; 32] {
-    let bytes = s.as_bytes();
-    assert_eq!(bytes.len(), 64, "digest fixture length");
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let hi = (bytes[2 * i] as char).to_digit(16).unwrap() as u8;
-        let lo = (bytes[2 * i + 1] as char).to_digit(16).unwrap() as u8;
-        *slot = (hi << 4) | lo;
-    }
-    out
+    let Body::Inline(body) = &record.body;
+    body
 }
 
 async fn query(module: &Memory, req: MemoryQuery) -> MemoryReply {
@@ -255,105 +177,10 @@ async fn find(
     }
 }
 
-fn files_module_msg(payload: FilesMsg) -> Msg {
-    Msg {
-        target: FILES.into(),
-        payload: files_encode_msg(&payload),
-    }
-}
-
-fn add_manifest(file_id: &str, bytes: &[u8]) -> FilesMsg {
-    assert!(bytes.len() >= 4096, "files module chunk_size minimum");
-    FilesMsg::AddManifest {
-        file_id: file_id.into(),
-        name: format!("{file_id}.bin"),
-        mime: "application/octet-stream".into(),
-        size: bytes.len() as u64,
-        chunk_size: bytes.len() as u64,
-        chunks: vec![file_digest_hex(bytes)],
-    }
-}
-
-fn block_ctx(height: u64) -> BlockContext {
-    BlockContext { protocol_version: 0,
-        height,
-        consensus_time: height,
-        origin: Origin::System,
-    }
-}
-
-async fn host_files_stat(host: &Host, file_id: &str) -> Option<Manifest> {
-    let bytes = host
-        .query(
-            FILES,
-            &files_encode_query(&FilesQuery::Stat {
-                file_id: file_id.into(),
-            }),
-        )
-        .await
-        .expect("files stat");
-    match files_decode_reply(&bytes).expect("files reply") {
-        FilesReply::Stat(manifest) => manifest,
-        other => panic!("unexpected files reply: {other:?}"),
-    }
-}
-
-async fn host_memory_query(host: &Host, req: MemoryQuery) -> MemoryReply {
-    let bytes = host
-        .query(MEMORY, &encode_query(&req))
-        .await
-        .expect("memory query");
-    decode_reply(&bytes).expect("memory reply")
-}
-
-async fn host_read(
-    host: &Host,
-    path: &str,
-    generation: Option<u64>,
-    snapshot: Option<&str>,
-) -> Option<Generation> {
-    match host_memory_query(
-        host,
-        MemoryQuery::Read {
-            path: path.into(),
-            generation,
-            snapshot: snapshot.map(str::to_string),
-        },
-    )
-    .await
-    {
-        MemoryReply::Read(record) => record,
-        other => panic!("unexpected memory reply: {other:?}"),
-    }
-}
-
-async fn host_stat(host: &Host, path: &str) -> Option<FileStat> {
-    match host_memory_query(host, MemoryQuery::Stat { path: path.into() }).await {
-        MemoryReply::Stat(stat) => stat,
-        other => panic!("unexpected memory reply: {other:?}"),
-    }
-}
-
-async fn host_grep(host: &Host, prefix: &str, pattern: &str, limit: u64) -> Vec<GrepHit> {
-    match host_memory_query(
-        host,
-        MemoryQuery::Grep {
-            prefix: prefix.into(),
-            pattern: pattern.into(),
-            limit,
-        },
-    )
-    .await
-    {
-        MemoryReply::Grep(hits) => hits,
-        other => panic!("unexpected memory reply: {other:?}"),
-    }
-}
-
 #[test]
 fn path_normalization_accepts_canonical_and_rejects_malformed() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         let root0 = module.root();
 
         let long_segment_ok = format!("/{}", "s".repeat(128));
@@ -441,7 +268,7 @@ fn path_normalization_accepts_canonical_and_rejects_malformed() {
 #[test]
 fn publish_assigns_monotonic_generations_and_keeps_them_immutable() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
 
         for (height, body) in [(1u64, "v1"), (2, "v2"), (5, "v3")] {
             module
@@ -482,7 +309,7 @@ fn publish_assigns_monotonic_generations_and_keeps_them_immutable() {
 #[test]
 fn author_derives_from_origin_and_cannot_be_spoofed() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         let root0 = module.root();
 
         // the demo-default empty external origin never passes.
@@ -535,7 +362,7 @@ fn author_derives_from_origin_and_cannot_be_spoofed() {
 #[test]
 fn caps_reject_oversized_bodies_and_meta_before_staging() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         module
             .execute(&mut TestCtx::at(1), &module_msg(publish("/ok", "small")))
             .await
@@ -596,7 +423,7 @@ fn caps_reject_oversized_bodies_and_meta_before_staging() {
 #[test]
 fn caps_bound_generations_and_file_count() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
 
         // generations: 1024 publishes to one path pass, the 1025th is rejected.
         for _ in 0..MAX_GENERATIONS_PER_PATH {
@@ -662,7 +489,7 @@ fn caps_bound_generations_and_file_count() {
 #[test]
 fn caps_bound_snapshots_and_watches() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         module
             .execute(&mut TestCtx::at(1), &module_msg(publish("/a", "x")))
             .await
@@ -768,7 +595,7 @@ async fn ls(module: &Memory, path: &str, limit: u64) -> Vec<LsEntry> {
 #[test]
 fn ls_lists_implicit_dirs_and_files_sorted() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         for path in ["/a/b/c", "/a/b/d", "/a/x", "/top", "/a"] {
             module
                 .execute(&mut TestCtx::at(1), &module_msg(publish(path, "body")))
@@ -826,7 +653,7 @@ fn ls_lists_implicit_dirs_and_files_sorted() {
 #[test]
 fn ls_clamps_the_limit_and_pages_in_sorted_order() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         // 257 children under one dir: one more than the clamp.
         for i in 0..257 {
             module
@@ -862,7 +689,7 @@ fn ls_clamps_the_limit_and_pages_in_sorted_order() {
 #[test]
 fn read_resolves_latest_generation_and_snapshot_exclusively() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         module
             .execute(&mut TestCtx::at(1), &module_msg(publish("/doc", "v1")))
             .await
@@ -913,7 +740,7 @@ fn read_resolves_latest_generation_and_snapshot_exclusively() {
 #[test]
 fn snapshot_pins_survive_delete_and_drop_releases_retention() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         let empty_root = module.root();
 
         module
@@ -1024,224 +851,9 @@ fn snapshot_pins_survive_delete_and_drop_releases_retention() {
 }
 
 #[test]
-fn file_publish_pins_manifest_digest_and_survives_manifest_removal() {
-    block_on(async {
-        let mut host = Host::genesis(vec![
-            Box::new(Files::new(FILES)),
-            Box::new(Memory::new(MEMORY, FILES)),
-        ])
-        .expect("genesis");
-        let file_id = "large/body";
-        let bytes = vec![0x42; 4096];
-
-        host.submit_at(
-            block_ctx(1),
-            files_module_msg(add_manifest(file_id, &bytes)),
-        )
-        .await
-        .expect("add manifest");
-        let manifest = host_files_stat(&host, file_id).await.expect("manifest");
-
-        host.submit_at(block_ctx(2), module_msg(publish_file("/large", file_id)))
-            .await
-            .expect("publish file body");
-
-        let record = host_read(&host, "/large", None, None)
-            .await
-            .expect("record");
-        assert_eq!(
-            file_body(&record),
-            (
-                manifest.file_id.as_str(),
-                manifest.digest.as_str(),
-                manifest.size
-            ),
-            "memory stores the manifest digest/size at publish time"
-        );
-        assert_eq!(
-            host_stat(&host, "/large").await.unwrap().body_len,
-            manifest.size
-        );
-
-        host.submit_at(
-            block_ctx(3),
-            files_module_msg(FilesMsg::RemoveManifest {
-                file_id: file_id.into(),
-            }),
-        )
-        .await
-        .expect("remove manifest");
-        assert!(
-            host_files_stat(&host, file_id).await.is_none(),
-            "the files manifest is gone"
-        );
-
-        let pinned = host_read(&host, "/large", None, None)
-            .await
-            .expect("pinned generation");
-        assert_eq!(
-            file_body(&pinned),
-            (
-                manifest.file_id.as_str(),
-                manifest.digest.as_str(),
-                manifest.size
-            ),
-            "manifest removal must not rewrite or invalidate the generation"
-        );
-    });
-}
-
-#[test]
-fn file_publish_rejects_missing_manifest_before_staging() {
-    block_on(async {
-        let mut host = Host::genesis(vec![
-            Box::new(Files::new(FILES)),
-            Box::new(Memory::new(MEMORY, FILES)),
-        ])
-        .expect("genesis");
-        let root = host.module_root(MEMORY).expect("memory root");
-
-        host.submit_at(block_ctx(1), module_msg(publish_file("/missing", "ghost")))
-            .await
-            .expect_err("missing manifest rejects the publish");
-
-        assert_eq!(
-            host.module_root(MEMORY).expect("memory root"),
-            root,
-            "the rejected file publish leaves no memory trace"
-        );
-        assert!(host_read(&host, "/missing", None, None).await.is_none());
-    });
-}
-
-#[test]
-fn grep_skips_file_bodies_and_stats_use_their_sizes() {
-    block_on(async {
-        let mut host = Host::genesis(vec![
-            Box::new(Files::new(FILES)),
-            Box::new(Memory::new(MEMORY, FILES)),
-        ])
-        .expect("genesis");
-        let file_id = "notes/blob";
-        let bytes = vec![0x77; 8192];
-
-        host.submit_at(
-            block_ctx(1),
-            files_module_msg(add_manifest(file_id, &bytes)),
-        )
-        .await
-        .expect("add manifest");
-        let manifest = host_files_stat(&host, file_id).await.expect("manifest");
-        host.submit_at(
-            block_ctx(2),
-            module_msg(publish_file("/notes/blob", file_id)),
-        )
-        .await
-        .expect("publish file body");
-        host.submit_at(
-            block_ctx(3),
-            module_msg(publish("/notes/inline", "needle is inline")),
-        )
-        .await
-        .expect("publish inline sibling");
-
-        assert_eq!(
-            host_grep(&host, "/notes", "needle", 100)
-                .await
-                .iter()
-                .map(|hit| hit.path.as_str())
-                .collect::<Vec<_>>(),
-            ["/notes/inline"],
-            "grep scans inline siblings and silently skips file bodies"
-        );
-        assert_eq!(
-            host_stat(&host, "/notes/blob").await.unwrap().body_len,
-            manifest.size
-        );
-        assert_eq!(
-            host_stat(&host, "/notes/inline").await.unwrap().body_len,
-            "needle is inline".len() as u64
-        );
-
-        let MemoryReply::Ls(entries) = host_memory_query(
-            &host,
-            MemoryQuery::Ls {
-                path: "/notes".into(),
-                limit: 10,
-            },
-        )
-        .await
-        else {
-            panic!("expected ls reply");
-        };
-        let lengths: Vec<(&str, u64)> = entries
-            .iter()
-            .map(|entry| match entry {
-                LsEntry::File(stat) => (stat.path.as_str(), stat.body_len),
-                LsEntry::Dir { path } => panic!("unexpected dir {path}"),
-            })
-            .collect();
-        assert_eq!(
-            lengths,
-            vec![
-                ("/notes/blob", manifest.size),
-                ("/notes/inline", "needle is inline".len() as u64),
-            ]
-        );
-    });
-}
-
-#[test]
-fn snapshot_pin_retains_file_body_generation_after_delete() {
-    block_on(async {
-        let manifest = file_manifest("snapshot/blob", 8192);
-        let mut module = Memory::new(MEMORY, FILES);
-
-        module
-            .execute(
-                &mut TestCtx::at(1).with_file_manifest(manifest.clone()),
-                &module_msg(publish_file("/blob", &manifest.file_id)),
-            )
-            .await
-            .expect("publish file body");
-        module.commit_block().await.unwrap();
-        module
-            .execute(
-                &mut TestCtx::at(2),
-                &module_msg(MemoryMsg::Snapshot { name: "pin".into() }),
-            )
-            .await
-            .expect("snapshot");
-        module
-            .execute(
-                &mut TestCtx::at(2),
-                &module_msg(MemoryMsg::Delete {
-                    path: "/blob".into(),
-                }),
-            )
-            .await
-            .expect("delete");
-        module.commit_block().await.unwrap();
-
-        assert!(stat_of(&module, "/blob").await.is_none());
-        let pinned = read(&module, "/blob", None, Some("pin"))
-            .await
-            .expect("snapshot pin");
-        assert_eq!(
-            file_body(&pinned),
-            (
-                manifest.file_id.as_str(),
-                manifest.digest.as_str(),
-                manifest.size
-            )
-        );
-    });
-}
-
-#[test]
 fn find_filters_on_latest_meta_and_discovers_skills() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         for msg in [
             publish_meta(
                 "/skills/deploy",
@@ -1310,7 +922,7 @@ fn find_filters_on_latest_meta_and_discovers_skills() {
 #[test]
 fn grep_returns_cited_hits_deterministically() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         let ops = [
             publish("/notes/b", "no match here\nquack once\nplain\nquack twice"),
             publish("/notes/a", "first line\nsecond quack line"),
@@ -1381,7 +993,7 @@ fn grep_returns_cited_hits_deterministically() {
         assert!(hits[0].text.len() <= MAX_GREP_LINE_BYTES);
 
         // determinism: a second instance replaying the same ops greps the same.
-        let mut twin = Memory::new(MEMORY, FILES);
+        let mut twin = Memory::new(MEMORY);
         for msg in ops {
             twin.execute(&mut TestCtx::at(1), &module_msg(msg))
                 .await
@@ -1404,7 +1016,7 @@ fn grep_returns_cited_hits_deterministically() {
 #[test]
 fn watches_fan_out_one_event_per_module_and_unregister_stops_them() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
 
         // unknown targets and self-watches are rejected at registration time.
         let err = module
@@ -1554,7 +1166,7 @@ fn watches_fan_out_one_event_per_module_and_unregister_stops_them() {
 #[test]
 fn watch_matching_is_segment_aware_not_a_string_prefix() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         module
             .execute(
                 &mut TestCtx::at(1).knowing("agent"),
@@ -1621,7 +1233,7 @@ fn watch_matching_is_segment_aware_not_a_string_prefix() {
 #[test]
 fn root_changes_only_after_commit_and_abort_leaves_no_trace() {
     block_on(async {
-        let mut module = Memory::new(MEMORY, FILES);
+        let mut module = Memory::new(MEMORY);
         let root0 = module.root();
 
         module
@@ -1668,20 +1280,12 @@ fn root_changes_only_after_commit_and_abort_leaves_no_trace() {
 #[test]
 fn snapshot_install_round_trips_and_rejects_tampering() {
     block_on(async {
-        let mut source = Memory::new(MEMORY, FILES);
-        let manifest = file_manifest("snap/blob", 8192);
+        let mut source = Memory::new(MEMORY);
         // a state exercising every encoded section: files with several
-        // generations, a file-backed body, a snapshot that RETAINS a deleted
-        // file's generation, and registered watches.
+        // generations, a snapshot that RETAINS a deleted file's generation,
+        // and registered watches.
         source
             .execute(&mut TestCtx::at(1), &module_msg(publish("/doc", "v1")))
-            .await
-            .unwrap();
-        source
-            .execute(
-                &mut TestCtx::at(1).with_file_manifest(manifest.clone()),
-                &module_msg(publish_file("/blob", &manifest.file_id)),
-            )
             .await
             .unwrap();
         source
@@ -1732,7 +1336,7 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
         assert_eq!(bytes, source.snapshot(), "the handle IS the root preimage");
 
         // ...that install on a joiner only against the matching root.
-        let mut target = Memory::new(MEMORY, FILES);
+        let mut target = Memory::new(MEMORY);
         let mut tampered = bytes.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
@@ -1747,15 +1351,6 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
         assert_eq!(
             inline_body(&read(&target, "/doc", None, None).await.unwrap()),
             "v2"
-        );
-        assert_eq!(
-            file_body(&read(&target, "/blob", None, None).await.unwrap()),
-            (
-                manifest.file_id.as_str(),
-                manifest.digest.as_str(),
-                manifest.size
-            ),
-            "the file-backed generation transferred verbatim"
         );
         assert_eq!(
             inline_body(&read(&target, "/skills/s", None, Some("pin")).await.unwrap()),
@@ -1794,26 +1389,6 @@ fn push_gen(out: &mut Vec<u8>, path: &str, generation: u64, body: &str) {
     push_u64(out, generation);
     out.push(0); // Body::Inline
     push_str(out, body);
-    push_u64(out, 0); // meta entries
-    push_str(out, "system");
-    push_u64(out, 1); // published_at_height
-}
-
-/// one file-backed generation record: empty meta, "system" author, height 1.
-fn push_file_gen(
-    out: &mut Vec<u8>,
-    path: &str,
-    generation: u64,
-    file_id: &str,
-    digest: &str,
-    size: u64,
-) {
-    push_str(out, path);
-    push_u64(out, generation);
-    out.push(1); // Body::File
-    push_str(out, file_id);
-    push_str(out, digest);
-    push_u64(out, size);
     push_u64(out, 0); // meta entries
     push_str(out, "system");
     push_u64(out, 1); // published_at_height
@@ -1890,42 +1465,17 @@ fn install_rejects_non_canonical_bytes_even_with_a_colluding_root() {
     push_str(&mut watch, "/skills/");
     push_str(&mut watch, "agent");
 
-    // a file body with a digest that is not 64-character lowercase hex.
-    let mut bad_file_digest = Vec::new();
-    push_u64(&mut bad_file_digest, 1);
-    push_str(&mut bad_file_digest, "/blob");
-    push_u64(&mut bad_file_digest, 1);
-    push_u64(&mut bad_file_digest, 1);
-    push_u64(&mut bad_file_digest, 1);
-    push_file_gen(
-        &mut bad_file_digest,
-        "/blob",
-        1,
-        "blob-id",
-        &"A".repeat(64),
-        4096,
-    );
-    push_u64(&mut bad_file_digest, 0);
-    push_u64(&mut bad_file_digest, 0);
-
-    // a file body whose canonical bytes are truncated.
-    let mut truncated_file_body = Vec::new();
-    push_u64(&mut truncated_file_body, 1);
-    push_str(&mut truncated_file_body, "/blob");
-    push_u64(&mut truncated_file_body, 1);
-    push_u64(&mut truncated_file_body, 1);
-    push_u64(&mut truncated_file_body, 1);
-    push_file_gen(
-        &mut truncated_file_body,
-        "/blob",
-        1,
-        "blob-id",
-        &"a".repeat(64),
-        4096,
-    );
-    push_u64(&mut truncated_file_body, 0);
-    push_u64(&mut truncated_file_body, 0);
-    truncated_file_body.pop();
+    // body tag 1 was the flag-day-removed file-backed variant — a peer image
+    // still carrying it must reject, not silently decode.
+    let mut removed_body_variant = Vec::new();
+    push_u64(&mut removed_body_variant, 1); // live count
+    push_str(&mut removed_body_variant, "/blob");
+    push_u64(&mut removed_body_variant, 1); // first
+    push_u64(&mut removed_body_variant, 1); // latest
+    push_u64(&mut removed_body_variant, 1); // gens count
+    push_str(&mut removed_body_variant, "/blob");
+    push_u64(&mut removed_body_variant, 1); // generation
+    removed_body_variant.push(1); // the deleted Body::File tag
 
     for (bytes, what) in [
         (dup, "duplicate generation keys"),
@@ -1933,12 +1483,11 @@ fn install_rejects_non_canonical_bytes_even_with_a_colluding_root() {
         (ghost, "live head without records"),
         (pin, "dangling snapshot pin"),
         (watch, "non-canonical watch prefix"),
-        (bad_file_digest, "bad file body digest"),
-        (truncated_file_body, "truncated file body"),
+        (removed_body_variant, "removed file-backed body variant"),
     ] {
         let colluding_root = sha256_root(&bytes);
-        let empty_root = Memory::new(MEMORY, FILES).root();
-        let mut target = Memory::new(MEMORY, FILES);
+        let empty_root = Memory::new(MEMORY).root();
+        let mut target = Memory::new(MEMORY);
         let err = target
             .install(&bytes, colluding_root)
             .expect_err(&format!("{what} must be rejected"));
@@ -1967,7 +1516,7 @@ impl Module for ExplodingWatcher {
 fn failed_watch_follow_up_aborts_the_publish_atomically() {
     block_on(async {
         let mut host = Host::genesis(vec![
-            Box::new(Memory::new(MEMORY, FILES)),
+            Box::new(Memory::new(MEMORY)),
             Box::new(ExplodingWatcher),
         ])
         .expect("genesis");
@@ -2020,8 +1569,8 @@ fn failed_watch_follow_up_aborts_the_publish_atomically() {
 #[test]
 fn two_instances_replaying_the_same_ops_produce_identical_roots() {
     block_on(async {
-        let mut left = Memory::new("left", FILES);
-        let mut right = Memory::new("right", FILES);
+        let mut left = Memory::new("left");
+        let mut right = Memory::new("right");
 
         let blocks: Vec<Vec<(u64, Origin, MemoryMsg)>> = vec![
             vec![

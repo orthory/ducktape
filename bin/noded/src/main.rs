@@ -241,6 +241,7 @@ fn run_node(
     events: broadcast::Sender<WsFrame>,
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
+    let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -249,9 +250,6 @@ fn run_node(
         // automations bridging chat/memory events into chat/tasks/inbox
         // follow-ups, jobs for deferred work, document + forge for the
         // substrate-backed stores, and files + memory for the content planes.
-        // files registers over the
-        // http layer's blob handle so uploads land in the store `serve_sync`
-        // reads — the bytes themselves never touch consensus.
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");
@@ -288,8 +286,8 @@ fn run_node(
         // blob lane (worker follow-ups included — the http submit handler only
         // stages what clients POST).
         let op_blobs = blobs.clone();
-        let files = Files::with_blobs("files", blobs);
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir).expect("duckfs open");
+        let memory = Memory::new("memory");
         // the origin-gated display-name registry: maps each verified submit
         // origin to a chosen name so the ui can resolve authors to names.
         let profiles = Profiles::new("profiles");

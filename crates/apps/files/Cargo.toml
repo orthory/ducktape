@@ -3,19 +3,23 @@ name = "files"
 edition.workspace = true
 version.workspace = true
 
-# the files module: content-addressed manifests in consensus state, chunk bytes
-# in a node-local blob store served peer-to-peer (the NoKV metadata/body split).
+# duckfs: a consensus-replicated, copy-on-write, content-addressed filesystem
+# module. ONE crate with the pure core always compiled (the future wasm unit);
+# the `native` feature (default) adds the disk stores and the sdk module glue.
+# purity gate: `cargo check -p files --no-default-features` must stay green.
+[features]
+default = ["native"]
+native = ["dep:sdk", "dep:async-trait"]
+
 [dependencies]
-sdk = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-async-trait = { workspace = true }
-# the node-local body store (chunk bytes off consensus): the daemon's op-receipt
-# lane, owned by the `blobstore` crate and shared with noded + forge.
-blobstore = { workspace = true }
+base64 = { workspace = true }
+unicode-normalization = { workspace = true }
+sdk = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = "0.3"
-host = { workspace = true }
-sha2 = { workspace = true }
+tempfile = { workspace = true }
