@@ -9,10 +9,10 @@
 //! op-log ordered, so a naive "export current pairs and re-apply" could never
 //! reproduce it — only the real sync path can. the joiner rebuilds kv
 //! and chat through the qmdb sync engine (target + resolver), forge / valset /
-//! directory / saga / agent through snapshot + install gated on the source
-//! root, and greeter fresh (stateless). every reconstructed module is then
-//! read back — content, not just digests — and one tampered snapshot must be
-//! refused without disturbing the already-installed state.
+//! directory / saga / agent / runs / package through snapshot + install gated
+//! on the source root, and greeter fresh (stateless). every reconstructed
+//! module is then read back — content, not just digests — and one tampered
+//! snapshot must be refused without disturbing the already-installed state.
 
 use agent::AgentModule;
 use agent::{
@@ -46,6 +46,12 @@ use forge::{ForgeMsg, encode_msg as forge_encode_msg};
 use greeter::Greeter;
 use kv::Kv;
 use kv::{KvMsg, encode as kv_encode};
+use package::PackageModule;
+use package::{
+    ActionRoute, InstallSpec, ModuleBinding, PackageMsg, PackageQuery, PackageReply, PackageStatus,
+    UninstallPolicy, decode_reply as package_decode_reply, encode_msg as package_encode_msg,
+    encode_query as package_encode_query,
+};
 use saga::SagaModule;
 use saga::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
@@ -61,7 +67,8 @@ use valset::{
 
 // a minimal Ctx so each module's execute can be driven without a full host.
 // forge reads consensus_time from it; saga drops a WorkerRequest effect into it
-// (the worker half is not under test); nothing else touches it.
+// (the worker half is not under test); the package install checks its harness
+// binding through module_root; nothing else touches it.
 struct TestCtx {
     env: sdk::Env,
 }
@@ -82,8 +89,9 @@ impl Ctx for TestCtx {
     fn env(&self) -> &sdk::Env {
         &self.env
     }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
+    fn module_root(&self, t: &str) -> Option<StateRoot> {
+        // the package leg's one binding target; everything else is unknown.
+        (t == "docs-harness").then_some(StateRoot::ZERO)
     }
     async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::QueryUnsupported)
@@ -171,10 +179,11 @@ fn joiner_app_hash(
     saga: &dyn Module,
     agent: &dyn Module,
     runs: &dyn Module,
+    package: &dyn Module,
 ) -> StateRoot {
     let kv_entry = RegistryEntry::of("kv", kv);
     let chat_entry = RegistryEntry::of("chat", chat);
-    let mods: [&dyn Module; 9] = [
+    let mods: [&dyn Module; 10] = [
         &kv_entry,
         directory,
         greeter,
@@ -184,6 +193,7 @@ fn joiner_app_hash(
         saga,
         agent,
         runs,
+        package,
     ];
     global_root(&mods)
 }
@@ -511,6 +521,56 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         )
         .await;
 
+        // the package registry: builtin routes plus one installed-then-
+        // activated package — the lifecycle machinery is exercised by the
+        // package crate's own suites; this leg pins the joiner path. the
+        // MarkActive ack carries the recorded harness's MODULE origin, exactly
+        // as the harness would emit it.
+        let mut src_package = PackageModule::new(
+            "package",
+            "memory",
+            vec![
+                ("tasks.create".into(), "tasks".into()),
+                ("tasks.update_status".into(), "tasks".into()),
+            ],
+        );
+        commit_op_as(
+            &mut src_package,
+            34,
+            owner.clone(),
+            package_encode_msg(&PackageMsg::Install(InstallSpec {
+                package: "org.example.docs".into(),
+                version: "1.0.0".into(),
+                manifest_hash: vec![7u8; 32],
+                modules: vec![ModuleBinding {
+                    logical: "h".into(),
+                    module_id: "docs-harness".into(),
+                }],
+                harness: "h".into(),
+                prompts: Vec::new(),
+                agents: Vec::new(),
+                actions: vec![ActionRoute {
+                    tag: "docs.note.add".into(),
+                    owner: "h".into(),
+                }],
+                engagements: Vec::new(),
+                uninstall: UninstallPolicy {
+                    pending_runs: "drain".into(),
+                    user_data: "preserve".into(),
+                },
+            })),
+        )
+        .await;
+        commit_op_as(
+            &mut src_package,
+            35,
+            sdk::Origin::Module("docs-harness".into()),
+            package_encode_msg(&PackageMsg::MarkActive {
+                package: "org.example.docs".into(),
+            }),
+        )
+        .await;
+
         let src_greeter = Greeter::new("greeter");
 
         // ---- the source app-hash: what consensus commits to ------------------
@@ -522,6 +582,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let src_saga_root = src_saga.root();
         let src_agent_root = src_agent.root();
         let src_runs_root = src_runs.root();
+        let src_package_root = src_package.root();
         for (id, root) in [
             ("kv", src_kv_root),
             ("directory", src_directory_root),
@@ -531,6 +592,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             ("saga", src_saga_root),
             ("agent", src_agent_root),
             ("runs", src_runs_root),
+            ("package", src_package_root),
         ] {
             assert_ne!(
                 root,
@@ -540,7 +602,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         }
 
         let src_global = {
-            let mods: [&dyn Module; 9] = [
+            let mods: [&dyn Module; 10] = [
                 &src_kv,
                 &src_directory,
                 &src_greeter,
@@ -550,6 +612,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &src_saga,
                 &src_agent,
                 &src_runs,
+                &src_package,
             ];
             global_root(&mods)
         };
@@ -565,6 +628,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let saga_bytes = src_saga.snapshot();
         let agent_bytes = src_agent.snapshot();
         let runs_bytes = src_runs.snapshot();
+        let package_bytes = src_package.snapshot();
         let forge_bytes = src_forge.snapshot().expect("forge snapshot");
         let src_validators = validators(&src_valset).await;
         let src_chat_messages = chat_messages(&src_chat, "general").await;
@@ -686,6 +750,17 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         join_runs
             .install(&runs_bytes, src_runs_root)
             .expect("runs install");
+        let mut join_package = PackageModule::new(
+            "package",
+            "memory",
+            vec![
+                ("tasks.create".into(), "tasks".into()),
+                ("tasks.update_status".into(), "tasks".into()),
+            ],
+        );
+        join_package
+            .install(&package_bytes, src_package_root)
+            .expect("package install");
         let mut join_forge = Forge::init("forge", joiner_dir.clone()).expect("joiner forge init");
         join_forge
             .install(&forge_bytes, src_forge_root)
@@ -733,6 +808,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             src_runs_root,
             "runs: installed root != source root"
         );
+        assert_eq!(
+            join_package.root(),
+            src_package_root,
+            "package: installed root != source root"
+        );
 
         // ...and the composed app-hash over the same canonical ids is the exact
         // digest consensus committed on the source — THE joiner property.
@@ -747,6 +827,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &join_saga,
                 &join_agent,
                 &join_runs,
+                &join_package,
             ),
             src_global,
             "the joiner must land on the exact source app-hash"
@@ -826,6 +907,33 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         assert_eq!(watches[0].channel_id, "general");
         assert_eq!(watches[0].policy, TurnPolicy::Mention);
 
+        // package: the activated row survived, and both an installed and a
+        // builtin action tag resolve to their owners.
+        let reply = join_package
+            .query(&package_encode_query(&PackageQuery::Get {
+                package: "org.example.docs".into(),
+            }))
+            .await
+            .unwrap();
+        let PackageReply::Package(Some(row)) = package_decode_reply(&reply).unwrap() else {
+            panic!("the installed package must exist on the joiner");
+        };
+        assert_eq!(row.status, PackageStatus::Active);
+        assert_eq!(row.harness, "docs-harness");
+        for (tag, module) in [("docs.note.add", "docs-harness"), ("tasks.create", "tasks")] {
+            let reply = join_package
+                .query(&package_encode_query(&PackageQuery::ActionOwner {
+                    tag: tag.into(),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(
+                package_decode_reply(&reply).unwrap(),
+                PackageReply::Owner(Some(module.into())),
+                "owner of {tag}"
+            );
+        }
+
         // forge: read the committed FILE back out of the joiner's OWN repo —
         // proof the pack landed real objects (commit, tree, blob), not just a
         // head oid that rehashes to the right root.
@@ -888,6 +996,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &join_saga,
                 &join_agent,
                 &join_runs,
+                &join_package,
             ),
             src_global
         );

@@ -46,6 +46,7 @@ use noded::{
     NodeCommand, NodeHandle, NodeMetrics, NodeStatus, WsFrame, block_row, hex_bytes, hex_root,
     payload_preview,
 };
+use package::PackageModule;
 use pages::Pages;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
@@ -56,7 +57,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 15] = [
+const MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
     "dispatch",
@@ -72,6 +73,7 @@ const MODULE_IDS: [&str; 15] = [
     "files",
     "memory",
     "profiles",
+    "package",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 
@@ -206,6 +208,17 @@ fn run_node(
         // the origin-gated display-name registry: maps each verified submit
         // origin to a chosen name so the ui can resolve authors to names.
         let profiles = Profiles::new("profiles");
+        // the quack package registry: install lifecycle rows plus the
+        // tag -> owner action-route table, with the built-in task actions
+        // seeded as routes; prompt seeds publish into "memory".
+        let package = PackageModule::new(
+            "package",
+            "memory",
+            vec![
+                ("tasks.create".into(), "tasks".into()),
+                ("tasks.update_status".into(), "tasks".into()),
+            ],
+        );
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
@@ -222,6 +235,7 @@ fn run_node(
             Box::new(files),
             Box::new(memory),
             Box::new(profiles),
+            Box::new(package),
         ])
         .expect("genesis");
 

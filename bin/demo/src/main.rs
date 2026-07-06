@@ -1,15 +1,14 @@
-//! a runnable super-app demo: fifteen registered modules — a qmdb-backed kv, a
+//! a runnable super-app demo: nineteen registered modules — a qmdb-backed kv, a
 //! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
 //! qmdb-backed block-based CHAT module, an
 //! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
 //! orchestrator, a TASKS ledger, the origin-gated PROFILES name registry, the
 //! AUTOMATIONS rule engine, the INBOX notification queues, a content-addressed
-//! FILES module, the MEMORY shared agent workspace, and the JOBS work board —
-//! dispatched over ONE host, showing
+//! FILES module, the MEMORY shared agent workspace, the JOBS work board, and
+//! the PACKAGE registry — dispatched over ONE host, showing
 //! the app-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
 //! block.
-//! mention becomes a run and a pending saga in one block.
 //!
 //! run: `cargo run -p demo`
 
@@ -49,6 +48,7 @@ use inbox::{
 };
 use jobs::Jobs;
 use memory::Memory;
+use package::PackageModule;
 use profiles::Profiles;
 use saga::SagaModule;
 use saga::{
@@ -99,6 +99,16 @@ fn main() {
             Some("jobs".into()),
         );
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        // the quack package registry: builtin task actions seeded as routes;
+        // prompt seeds publish into "memory".
+        let package = PackageModule::new(
+            "package",
+            "memory",
+            vec![
+                ("tasks.create".into(), "tasks".into()),
+                ("tasks.update_status".into(), "tasks".into()),
+            ],
+        );
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
@@ -118,10 +128,11 @@ fn main() {
             Box::new(agent),
             Box::new(runs),
             Box::new(automations),
+            Box::new(package),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 18 registered modules over one host ===");
+        println!("=== super-app demo — 19 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

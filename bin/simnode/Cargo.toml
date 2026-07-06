@@ -32,6 +32,7 @@ pages = { workspace = true }
 forge = { workspace = true }
 files = { workspace = true }
 memory = { workspace = true }
+package = { workspace = true }
 reactor = { workspace = true }
 noded = { path = "../noded" }
 # the durable block index — /v1/blocks and /v1/index/* read it, the sim actor
