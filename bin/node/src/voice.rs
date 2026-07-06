@@ -1,5 +1,5 @@
 //! The node's live-call runtime: the bridge between huddle websockets
-//! (`noded`'s `/v1/voice/ws`, and the WebRTC gateway to come), the chat voice
+//! (`noded`'s `/v1/call/ws` typed audio+video+control socket), the chat voice
 //! engine + video wire, and the p2p mesh.
 //!
 //! Runtime shape mirrors the reachability plane's split exactly: the hub runs

@@ -352,20 +352,29 @@ pub struct QueryRequest {
 }
 
 // ---- the call lane ----------------------------------------------------------
-// the webview end of a huddle: GET /v1/voice/ws?channel=<id> upgrades to a
-// binary pcm socket (one 20 ms mono 48 kHz frame per message, i16 LE — see
-// `chat::voice::FRAME_SAMPLES`). the handler asks the node's call hub for a
-// session over the request lane below; a binary client frame is one captured
-// mic frame, a binary server frame is one mixed playout frame, and text frames
-// carry json control (`VoiceControl`). the hub side lives with the mesh (only
-// the p2p validator runs one); a daemon without a hub answers 503.
+// the webview end of a huddle: GET /v1/call/ws?channel=<id> upgrades to a
+// typed socket that carries the huddle's audio, camera video, and call control
+// together. the handler asks the node's call hub for a session over the request
+// lane below; a daemon without a hub answers 503, and every refusal path says
+// WHY as one text frame before closing.
 //
-// a call session carries audio, camera video, and call control together: the
-// audio ends are the huddle's voice, the video ends fragment/reassemble
-// encoded camera frames over `Service::Video`, and the control ends carry
-// keyframe requests, presence beacons, and rate hints (see `chat::video`).
-// video/control are consumed by the WebRTC gateway (Task 6); the voice
-// websocket only wires the audio ends today.
+// binary frames are tagged by their first byte (`WS_TAG_*`):
+//   audio `[0x01][1920 B pcm]` — both directions; one 20 ms mono 48 kHz frame
+//     (960 × i16 LE, exactly `PCM_FRAME_BYTES` after the tag — see
+//     `chat::voice::FRAME_SAMPLES`). client→server is a captured mic frame,
+//     server→client a mixed playout frame.
+//   video — client→server `[0x02][flags u8][ts_ms u32 LE][vp8 chunk]` captured
+//     camera; server→client `[0x03][flags u8][ts_ms u32 LE][peer 32 raw]
+//     [vp8 chunk]` a reassembled peer frame. `flags` bit 0 (`WS_FLAG_KEYFRAME`)
+//     marks a decoder sync point. little-endian on THIS leg (browser
+//     `DataView`-friendly); the mesh leg stays big-endian.
+// text frames are json control: client→server `CallClientControl` (recipients /
+// beacon / keyframeRequest), server→client `CallServerControl` (keyframeRequest
+// / peerBeacon / rateHint).
+//
+// the hub side lives with the mesh (only the p2p validator runs one): it
+// fragments/reassembles the video ends over `Service::Video` and routes control
+// (keyframe kicks, presence beacons, rate hints — see `chat::video`).
 
 /// one captured, encoded camera frame handed webview → hub for fan-out. the
 /// hub fragments `data` across `Service::Video` datagrams; `frame_no` is the
@@ -444,13 +453,37 @@ pub struct CallSessionRequest {
 /// the request lane into the call hub.
 pub type CallLane = tokio::sync::mpsc::Sender<CallSessionRequest>;
 
-/// client → server control messages on the voice socket (text frames).
+/// binary ws frame tags on /v1/call/ws (first byte).
+const WS_TAG_AUDIO: u8 = 0x01;
+const WS_TAG_VIDEO_CAPTURED: u8 = 0x02; // client → server
+const WS_TAG_VIDEO_PEER: u8 = 0x03; // server → client
+const WS_VIDEO_CAPTURED_HEADER: usize = 6; // tag + flags + ts_ms
+const WS_VIDEO_PEER_HEADER: usize = 38; // tag + flags + ts_ms + peer key
+const WS_FLAG_KEYFRAME: u8 = 0b0000_0001;
+
+/// client → server control messages on the call socket (text frames).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum VoiceControl {
-    /// replace the fan-out set with these hex-encoded node keys. the client
-    /// tracks the consensus huddle roster and excludes its own node.
+pub enum CallClientControl {
+    /// replace the fan-out set with these hex node keys (self excluded —
+    /// the client tracks the consensus huddle roster).
     Recipients { peers: Vec<String> },
+    /// this client's ephemeral state; the hub beacons it to peers at 1 Hz.
+    Beacon { muted: bool, camera_on: bool },
+    /// the decoder lost sync with `peer` — ask it for a keyframe.
+    KeyframeRequest { peer: String },
+}
+
+/// server → client control messages on the call socket (text frames).
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CallServerControl {
+    /// a peer lost sync with US: encode the next frame as a keyframe.
+    KeyframeRequest,
+    /// a peer's 1 Hz beacon (ephemeral presence/state — never consensus).
+    PeerBeacon { peer: String, muted: bool, camera_on: bool },
+    /// send at no more than this (min across peers' loss reports).
+    RateHint { max_kbps: u32 },
 }
 
 /// a ws frame. tagged so the stream can grow beyond block events without
@@ -516,7 +549,7 @@ pub struct NodeHandle {
     /// index routes answer 503 there.
     index: Option<Arc<indexer::IndexStore>>,
     /// the call hub's session-request lane. `None` on daemons without a mesh
-    /// (the embedded daemon, router tests) — `/v1/voice/ws` answers 503 there.
+    /// (the embedded daemon, router tests) — `/v1/call/ws` answers 503 there.
     call: Option<CallLane>,
 }
 
@@ -562,7 +595,7 @@ impl NodeHandle {
     }
 
     /// point this handle at a call hub's session-request lane so
-    /// `/v1/voice/ws` can open huddle sessions. only the p2p validator
+    /// `/v1/call/ws` can open huddle sessions. only the p2p validator
     /// wires one — it owns the mesh the audio/video rides.
     pub fn with_call(mut self, call: CallLane) -> Self {
         self.call = Some(call);
@@ -631,7 +664,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
-        .route("/v1/voice/ws", get(voice_ws))
+        .route("/v1/call/ws", get(call_ws))
         .route(
             "/v1/files/blob",
             // one chunk per request, so the body cap IS the chunk cap. the
@@ -1816,36 +1849,38 @@ async fn stream_frames(mut socket: WebSocket, mut frames: broadcast::Receiver<Ws
 }
 
 #[derive(Debug, Deserialize)]
-pub struct VoiceParams {
+pub struct CallParams {
     channel: String,
 }
 
 /// one pcm sample is an i16 — two wire bytes, little endian.
 const PCM_FRAME_BYTES: usize = chat::voice::FRAME_SAMPLES * 2;
 
-async fn voice_ws(
+async fn call_ws(
     State(handle): State<NodeHandle>,
-    Query(params): Query<VoiceParams>,
+    Query(params): Query<CallParams>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let Some(voice) = handle.call.clone() else {
+    let Some(call) = handle.call.clone() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "voice is not available on this node (no mesh voice hub)",
+            "calls are not available on this node (no mesh call hub)",
         );
     };
     if params.channel.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "channel must not be empty");
     }
-    upgrade.on_upgrade(move |socket| voice_session(socket, voice, params.channel))
+    upgrade.on_upgrade(move |socket| call_session(socket, call, params.channel))
 }
 
-/// pump one huddle's audio between the websocket and the hub session: binary
-/// client frames (one 20 ms pcm frame each) flow into `pcm_in`, `mixed_out`
-/// frames flow back as binary, and text frames steer the fan-out set. either
-/// side closing ends the session — dropping the ends is the teardown signal
-/// the hub watches.
-async fn voice_session(mut socket: WebSocket, voice: CallLane, channel_id: String) {
+/// pump one huddle's audio, camera video, and call control between the webview
+/// websocket and the hub session. binary client frames are tag-dispatched:
+/// `0x01` audio → `pcm_in`, `0x02` captured video → `video_in`; the hub's
+/// `mixed_out`/`video_out`/`control_out` ends flow back as tagged binary + json
+/// text. text client frames steer fan-out and carry beacons/keyframe asks.
+/// either side closing ends the session — dropping the ends is the teardown
+/// signal the hub watches.
+async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String) {
     let (reply, opened) = tokio::sync::oneshot::channel();
     let request = CallSessionRequest {
         channel_id,
@@ -1853,8 +1888,8 @@ async fn voice_session(mut socket: WebSocket, voice: CallLane, channel_id: Strin
     };
     // every refusal path says WHY as a text frame before closing — the client
     // surfaces it as a session error instead of a silent no-op.
-    const NO_HUB: &str = "voice is not available on this node (no live voice hub)";
-    let session = match voice.send(request).await {
+    const NO_HUB: &str = "calls are not available on this node (no live call hub)";
+    let session = match call.send(request).await {
         Ok(()) => match opened.await {
             Ok(Ok(session)) => session,
             Ok(Err(refusal)) => {
@@ -1874,38 +1909,61 @@ async fn voice_session(mut socket: WebSocket, voice: CallLane, channel_id: Strin
             return;
         }
     };
-    // Task 6 replaces this endpoint with the WebRTC gateway that also pumps
-    // the video/control ends; today's audio-only voice socket ignores them.
     let CallSession {
         pcm_in,
         mut mixed_out,
         recipients,
-        ..
+        video_in,
+        mut video_out,
+        control_in,
+        mut control_out,
     } = session;
     loop {
         tokio::select! {
             inbound = socket.recv() => match inbound {
-                Some(Ok(Message::Binary(bytes))) => {
-                    if bytes.len() != PCM_FRAME_BYTES {
-                        continue; // not a whole frame — drop, stay alive
-                    }
-                    let frame: Vec<i16> = bytes
-                        .chunks_exact(2)
-                        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-                        .collect();
-                    // full lane = the hub is behind; late audio is dead audio,
-                    // so drop the frame rather than backpressure the socket.
-                    let _ = pcm_in.try_send(frame);
-                }
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(VoiceControl::Recipients { peers }) =
-                        serde_json::from_str::<VoiceControl>(&text)
-                    {
-                        let keys: Vec<[u8; 32]> = peers
-                            .iter()
-                            .filter_map(|hex| files::from_hex_32(hex))
+                Some(Ok(Message::Binary(bytes))) => match bytes.first() {
+                    Some(&WS_TAG_AUDIO) if bytes.len() == 1 + PCM_FRAME_BYTES => {
+                        let frame: Vec<i16> = bytes[1..]
+                            .chunks_exact(2)
+                            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
                             .collect();
-                        let _ = recipients.send(keys);
+                        // full lane = the hub is behind; late audio is dead
+                        // audio, so drop the frame rather than backpressure.
+                        let _ = pcm_in.try_send(frame);
+                    }
+                    Some(&WS_TAG_VIDEO_CAPTURED)
+                        if bytes.len() > WS_VIDEO_CAPTURED_HEADER =>
+                    {
+                        let _ = video_in.try_send(CapturedVideo {
+                            keyframe: bytes[1] & WS_FLAG_KEYFRAME != 0,
+                            ts_ms: u32::from_le_bytes(
+                                bytes[2..6].try_into().expect("4 bytes"),
+                            ),
+                            data: bytes[WS_VIDEO_CAPTURED_HEADER..].to_vec(),
+                        });
+                    }
+                    _ => {} // unknown/short frame — drop, stay alive
+                },
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<CallClientControl>(&text) {
+                        Ok(CallClientControl::Recipients { peers }) => {
+                            let keys: Vec<[u8; 32]> = peers
+                                .iter()
+                                .filter_map(|hex| files::from_hex_32(hex))
+                                .collect();
+                            let _ = recipients.send(keys);
+                        }
+                        Ok(CallClientControl::Beacon { muted, camera_on }) => {
+                            let _ = control_in
+                                .try_send(CallControlIn::Beacon { muted, camera_on });
+                        }
+                        Ok(CallClientControl::KeyframeRequest { peer }) => {
+                            if let Some(key) = files::from_hex_32(&peer) {
+                                let _ = control_in
+                                    .try_send(CallControlIn::KeyframeRequest { peer: key });
+                            }
+                        }
+                        Err(_) => {} // unknown control — ignore, stay alive
                     }
                 }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
@@ -1913,7 +1971,8 @@ async fn voice_session(mut socket: WebSocket, voice: CallLane, channel_id: Strin
             },
             mixed = mixed_out.recv() => match mixed {
                 Some(frame) => {
-                    let mut bytes = Vec::with_capacity(frame.len() * 2);
+                    let mut bytes = Vec::with_capacity(1 + frame.len() * 2);
+                    bytes.push(WS_TAG_AUDIO);
                     for sample in frame {
                         bytes.extend_from_slice(&sample.to_le_bytes());
                     }
@@ -1921,7 +1980,43 @@ async fn voice_session(mut socket: WebSocket, voice: CallLane, channel_id: Strin
                         break;
                     }
                 }
-                // the hub ended the session (replaced by a newer join).
+                None => break, // the hub ended the session (replaced by a newer join).
+            },
+            video = video_out.recv() => match video {
+                Some(frame) => {
+                    let mut bytes =
+                        Vec::with_capacity(WS_VIDEO_PEER_HEADER + frame.data.len());
+                    bytes.push(WS_TAG_VIDEO_PEER);
+                    bytes.push(if frame.keyframe { WS_FLAG_KEYFRAME } else { 0 });
+                    bytes.extend_from_slice(&frame.ts_ms.to_le_bytes());
+                    bytes.extend_from_slice(&frame.peer);
+                    bytes.extend_from_slice(&frame.data);
+                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            control = control_out.recv() => match control {
+                Some(out) => {
+                    let message = match out {
+                        CallControlOut::KeyframeRequest => CallServerControl::KeyframeRequest,
+                        CallControlOut::PeerBeacon { peer, muted, camera_on } => {
+                            CallServerControl::PeerBeacon {
+                                peer: hex_bytes(&peer),
+                                muted,
+                                camera_on,
+                            }
+                        }
+                        CallControlOut::RateHint { max_kbps } => {
+                            CallServerControl::RateHint { max_kbps }
+                        }
+                    };
+                    let text = serde_json::to_string(&message).expect("serializable control");
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
                 None => break,
             },
         }

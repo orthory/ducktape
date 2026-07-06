@@ -3947,7 +3947,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
-    // the voice hub's session lane: /v1/voice/ws handlers ask for huddle
+    // the voice hub's session lane: /v1/call/ws handlers ask for huddle
     // audio sessions here. created up front because the app-surface thread
     // starts before the mesh exists; only the validator path below spawns the
     // hub that drains it — on every other path the receiver just drops and
@@ -4119,7 +4119,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
             // the voice lane: a sync-only observer serves no huddle audio,
             // but the channel must exist — black-hole. dropping the session
-            // lane makes /v1/voice/ws refuse instead of hang (this branch
+            // lane makes /v1/call/ws refuse instead of hang (this branch
             // never reaches the validator hub below).
             drop(voice_requests);
             {
@@ -4292,7 +4292,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             };
             // the voice lane: a parked joiner serves no huddle audio, but the
             // channel must exist — black-hole. dropping the session lane makes
-            // /v1/voice/ws refuse instead of hang (this branch always ends in
+            // /v1/call/ws refuse instead of hang (this branch always ends in
             // the promotion reboot, never the validator hub below).
             drop(voice_requests);
             {
