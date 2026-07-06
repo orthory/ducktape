@@ -22,6 +22,8 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager as _;
@@ -108,16 +110,42 @@ fn registry_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(root(app)?.join("registry.json"))
 }
 
+fn empty_registry() -> Registry {
+    Registry {
+        version: 1,
+        active: None,
+        workspaces: Vec::new(),
+    }
+}
+
 fn load_registry(app: &tauri::AppHandle) -> Result<Registry, String> {
-    let path = registry_path(app)?;
-    match fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|err| format!("parse {path:?}: {err}")),
+    load_registry_at(&registry_path(app)?)
+}
+
+/// load + parse the registry, RECOVERING from a corrupt file instead of
+/// bricking. a truncated / malformed `registry.json` (a hand-edit, a partial
+/// pre-atomic save, a disk error) used to make every command fail — no list, no
+/// select, no onboarding — with the only recovery, deleting the file, never
+/// surfaced. here a parse error preserves the bad file as `registry.json.bak`
+/// and boots the empty first-run state, so the app stays usable and the
+/// workspace dirs still on disk can be re-added. a genuine READ error
+/// (permissions) still propagates — the boot path lands on the gate with it.
+pub(crate) fn load_registry_at(path: &Path) -> Result<Registry, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(reg) => Ok(reg),
+            Err(err) => {
+                let backup = path.with_extension("json.bak");
+                let _ = fs::rename(path, &backup);
+                eprintln!(
+                    "load_registry: {path:?} is corrupt ({err}); backed up to {backup:?}, \
+                     starting empty"
+                );
+                Ok(empty_registry())
+            }
+        },
         // a missing registry is the first-run empty state, not an error.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Registry {
-            version: 1,
-            active: None,
-            workspaces: Vec::new(),
-        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(empty_registry()),
         Err(err) => Err(format!("read {path:?}: {err}")),
     }
 }
@@ -125,9 +153,28 @@ fn load_registry(app: &tauri::AppHandle) -> Result<Registry, String> {
 fn save_registry(app: &tauri::AppHandle, reg: &Registry) -> Result<(), String> {
     let dir = root(app)?;
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
-    let path = registry_path(app)?;
+    save_registry_at(&registry_path(app)?, reg)
+}
+
+/// write the registry ATOMICALLY: serialize to a sibling temp, fsync it, then
+/// rename over the target. a crash / ENOSPC mid-write leaves the OLD registry
+/// intact rather than a half-written, unparseable file (the corrupt-registry
+/// brick this pairs with [`load_registry_at`]'s recovery to close). rename is
+/// atomic within a directory on one filesystem, so a concurrent second instance
+/// can at worst lose its own update — never corrupt the file. (A cross-process
+/// advisory lock to also prevent the lost update is a deliberate follow-up;
+/// same-$HOME multi-instance is an edge case and the fleet isolates $HOME.)
+pub(crate) fn save_registry_at(path: &Path, reg: &Registry) -> Result<(), String> {
     let text = serde_json::to_string_pretty(reg).map_err(|err| err.to_string())?;
-    fs::write(&path, text).map_err(|err| format!("write {path:?}: {err}"))
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write as _;
+        let mut file = fs::File::create(&tmp).map_err(|err| format!("create {tmp:?}: {err}"))?;
+        file.write_all(text.as_bytes())
+            .map_err(|err| format!("write {tmp:?}: {err}"))?;
+        file.sync_all().map_err(|err| format!("fsync {tmp:?}: {err}"))?;
+    }
+    fs::rename(&tmp, path).map_err(|err| format!("rename {tmp:?} -> {path:?}: {err}"))
 }
 
 // ── Helpers ─────────────────────────────────────────────
@@ -194,28 +241,77 @@ fn reserved_ports(reg: &Registry) -> Vec<u16> {
         .collect()
 }
 
-/// run a `ducktape-node` onboarding verb to completion and return its stdout
-/// (trimmed). the verbs print the datum (chain-id, pubkey, invite blob) to
-/// stdout and human guidance to stderr; a non-zero exit surfaces stderr.
+/// how long a single onboarding verb may run before we give up on a wedged
+/// node. generous enough for a slow admit round-trip, bounded so a hung node
+/// can't freeze forget/delete (and, on repeats, the whole Tauri worker pool).
+const VERB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// run a `ducktape-node` onboarding verb and return its stdout (trimmed). the
+/// verbs print the datum (chain-id, pubkey, invite blob) to stdout and human
+/// guidance to stderr; a non-zero exit surfaces stderr. bounded by
+/// [`VERB_TIMEOUT`]: a wedged node (one that accepts the rpc but never replies)
+/// used to make `.output()` block FOREVER — hanging forget/delete with the
+/// spinner stuck, and exhausting the worker pool on repeats until the whole UI
+/// stopped. now it is killed on the deadline and reported. stdout/stderr are
+/// drained on threads so a chatty verb can't fill a pipe and deadlock the wait.
 fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(node_bin)
+    let verb = args.first().copied().unwrap_or("");
+    let mut child = Command::new(node_bin)
         .args(args)
-        .output()
-        .map_err(|err| format!("run ducktape-node {}: {err}", args.first().unwrap_or(&"")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let detail = stderr.trim();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("run ducktape-node {verb}: {err}"))?;
+
+    let mut out_pipe = child.stdout.take().expect("stdout piped");
+    let mut err_pipe = child.stderr.take().expect("stderr piped");
+    let out_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + VERB_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "ducktape-node {verb} did not respond within {}s — the node may be \
+                         wedged; retry, or force if this is a teardown",
+                        VERB_TIMEOUT.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                return Err(format!("wait ducktape-node {verb}: {err}"));
+            }
+        }
+    };
+
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
+        let detail = detail.trim();
         return Err(if detail.is_empty() {
-            format!(
-                "ducktape-node {} exited {}",
-                args.first().unwrap_or(&""),
-                out.status
-            )
+            format!("ducktape-node {verb} exited {status}")
         } else {
             detail.to_string()
         });
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// the last non-empty line of a verb's stdout — the datum (verbs may print a
@@ -1008,7 +1104,6 @@ pub(crate) fn read_tail(path: &Path, max: u64) -> Result<String, String> {
 /// a liveness probe for an already-running workspace node.
 pub(crate) fn port_listening(port: u16) -> bool {
     use std::net::{SocketAddr, TcpStream};
-    use std::time::Duration;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
@@ -1310,6 +1405,41 @@ mod tests {
         let log = "[node ab] listening on 127.0.0.1:8844\n\
                    [node ab] indexed 12 blocks\n";
         assert_eq!(classify(log).phase, "starting");
+    }
+
+    #[test]
+    fn corrupt_registry_recovers_to_empty_and_backs_up() {
+        let dir = std::env::temp_dir().join(format!("dt-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        std::fs::write(&path, b"{ this is not valid json").unwrap();
+        let reg = load_registry_at(&path).unwrap();
+        assert!(reg.workspaces.is_empty(), "recovers to an empty registry");
+        assert!(reg.active.is_none());
+        assert!(
+            path.with_extension("json.bak").exists(),
+            "the corrupt file is preserved as .bak"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_registry_is_atomic_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("dt-reg2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        let reg = Registry {
+            version: 1,
+            active: Some("team".into()),
+            workspaces: Vec::new(),
+        };
+        save_registry_at(&path, &reg).unwrap();
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file is consumed by the rename"
+        );
+        assert_eq!(load_registry_at(&path).unwrap().active.as_deref(), Some("team"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
