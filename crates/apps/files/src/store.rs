@@ -4,9 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use sha2::{Digest as _, Sha256};
-
-use crate::objects::{Kind, ObjectId};
+use crate::objects::{Kind, ObjectId, object_id};
 use crate::state::Refs;
 
 pub trait ObjectStore {
@@ -21,15 +19,6 @@ pub trait RefsStore {
     /// None = fresh dir. Ok(Some((refs, height, gc_watermark))) otherwise.
     fn load(&self) -> Result<Option<(Refs, u64, u64)>, String>;
     fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String>;
-}
-
-/// derive an object id: sha256 over the kind tag byte followed by the body —
-/// the same preimage every receiver re-derives before trusting fetched bytes.
-pub(crate) fn object_id(kind: Kind, body: &[u8]) -> ObjectId {
-    let mut h = Sha256::new();
-    h.update([kind.tag()]);
-    h.update(body);
-    h.finalize().into()
 }
 
 /// in-memory object store — tests and the phase-1 glue.
