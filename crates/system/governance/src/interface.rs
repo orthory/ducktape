@@ -39,10 +39,9 @@ pub enum GovAction {
     CancelUpgrade { name: String },
     /// grant OBSERVER standing (mesh + statesync, no quorum seat — the
     /// staged-admission tier): emits `ValsetMsg::Grant { key }` on execution.
-    /// requires protocol version >= 3 (rejected at propose below it).
     AddObserver { key: Vec<u8> },
     /// revoke observer standing: emits `ValsetMsg::Revoke { key }` on
-    /// execution. protocol version >= 3, like `AddObserver`.
+    /// execution.
     RemoveObserver { key: Vec<u8> },
 }
 

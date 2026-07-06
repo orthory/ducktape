@@ -2404,6 +2404,7 @@ mod tests {
                                 receiver: "runs".into(),
                                 status: DispatchStatus::Delivered,
                                 outcome: Some(Ok(Vec::new())),
+                                assignee: None,
                                 created_at: 0,
                                 updated_at: 0,
                             }

@@ -54,6 +54,8 @@ interface MemberVM {
   isFounder: boolean;
   isLocal: boolean;
   searchText: string;
+  /** Executor tags this node announced to the capability registry. */
+  capabilities: string[];
 }
 
 const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
@@ -114,6 +116,7 @@ function makeMembers(
   observers: string[],
   authorNames: Record<string, string>,
   workspace: { pubkey: string; founder: boolean; member: boolean } | null,
+  capabilitiesByNode: Map<string, string[]>,
 ): MemberVM[] {
   const localKey = workspace?.pubkey ?? null;
   const toVM = (key: string, tier: MemberVM["tier"]): MemberVM => {
@@ -145,6 +148,7 @@ function makeMembers(
       isFounder,
       isLocal,
       searchText: `${displayName} ${key} ${role}`.toLowerCase(),
+      capabilities: capabilitiesByNode.get(keyNorm) ?? [],
     };
   };
   // Validators first (the seated quorum), then the warming observer tier.
@@ -464,6 +468,25 @@ function MemberRow({
           >
             {member.shortKey} · {member.status}
           </div>
+          {member.capabilities.length > 0 && (
+            <div style={{ marginTop: 5, display: "flex", flexWrap: "wrap", gap: 4 }}>
+              {member.capabilities.map((tag) => (
+                <span
+                  key={tag}
+                  style={{
+                    padding: "1px 6px",
+                    borderRadius: 4,
+                    background: color.paper,
+                    border: `1px solid ${color.borderStrong}`,
+                    font: `500 9.5px ${font.mono}`,
+                    color: color.muted2,
+                  }}
+                >
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
         <div
           style={{
@@ -956,6 +979,14 @@ function MemberDetailPane({
           <InfoRow label="genesis" value={member.isFounder ? "yes" : "no"} />
           <InfoRow label="this node" value={member.isLocal ? "yes" : "no"} />
           <InfoRow label="presence" value="not exposed by this node" />
+          <InfoRow
+            label="capabilities"
+            value={
+              member.capabilities.length
+                ? member.capabilities.join(", ")
+                : "none announced"
+            }
+          />
         </div>
       </div>
     </aside>
@@ -969,8 +1000,21 @@ export function MembersView() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   const rows = useMemo(
-    () => makeMembers(state.members, state.observers, state.authorNames, state.workspace),
-    [state.authorNames, state.members, state.observers, state.workspace],
+    () =>
+      makeMembers(
+        state.members,
+        state.observers,
+        state.authorNames,
+        state.workspace,
+        state.capabilitiesByNode,
+      ),
+    [
+      state.authorNames,
+      state.capabilitiesByNode,
+      state.members,
+      state.observers,
+      state.workspace,
+    ],
   );
   const queryText = query.trim().toLowerCase();
   const visibleRows = useMemo(

@@ -11,10 +11,11 @@
 //! every mutation shells out to the SAME onboarding verbs the CLI exposes
 //! (`init`/`join`/`invite`/`invite-accept`), so the registry never reimplements
 //! identity, descriptors, or governance — it only allocates ports, lays out
-//! directories, and remembers the result. a parked joiner serves no http/rpc
-//! surface (the node gates both off until it is a validator), so onboarding
-//! progress is read back from the stable marker lines the node prints to
-//! `daemon.log` — see [`workspace_phase`].
+//! directories, and remembers the result. NOTE a parked joiner may well serve
+//! its http/rpc surface (newer node builds do — every read just answers
+//! "parked: no state to serve"), so an answering port is NOT admission;
+//! onboarding progress is read back from the stable marker lines the node
+//! prints to `daemon.log` — see [`workspace_phase`].
 
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -223,8 +224,7 @@ fn last_line(stdout: &str) -> String {
     stdout
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .next_back()
+        .rfind(|l| !l.is_empty())
         .unwrap_or("")
         .to_string()
 }
@@ -776,16 +776,23 @@ pub fn workspace_forget(
         ForgetVerdict::ConfirmedInSet(msg) => return Err(msg),
     }
 
-    // stop the node so nothing keeps running or holds the storage dir open.
-    stop_node(ws.ports.http);
+    // stop the node FOR REAL before touching anything. the old best-effort
+    // http shutdown left parked joiners (no http surface) and wedged nodes
+    // running: the detached process survived the forget, kept its ports and
+    // its mesh presence, and RE-CREATED `storage/` under the just-deleted
+    // directory — the workspace haunted the registry it was removed from. a
+    // node that cannot be stopped now honestly refuses the forget instead of
+    // manufacturing a zombie.
+    stop_workspace_node(&dir, &ws.ports, std::time::Duration::from_secs(6))?;
 
     // delete the directory, then drop the registry entry and repoint active. a
     // failed rmdir (e.g. a still-open file on windows) must not block forgetting
     // the workspace — the registry entry removal is what matters.
-    if dir.exists() {
-        if let Err(err) = fs::remove_dir_all(&dir) {
-            eprintln!("workspace_forget: could not remove {dir:?}: {err}");
-        }
+    match fs::remove_dir_all(&dir) {
+        // an already-absent directory is a forgotten workspace's natural state.
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => eprintln!("workspace_forget: could not remove {dir:?}: {err}"),
     }
     reg.workspaces.retain(|w| w.id != ws.id);
     if reg.active.as_deref() == Some(&ws.id) {
@@ -818,10 +825,10 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
     }
 
     // already running? adopt it — never spawn a second process for one
-    // workspace. we probe the p2p LISTEN port, not http: a parked joiner serves
-    // no http yet but its mesh listener is bound the whole time, so this is the
-    // one port that is up in every phase (parked, promoting, validator). a
-    // second spawn would collide on exactly this port anyway.
+    // workspace. we probe the p2p LISTEN port, not http: the mesh listener is
+    // bound in every phase (parked, promoting, validator) on every node build,
+    // while http may lag behind, so this is the one dependable liveness port.
+    // a second spawn would collide on exactly this port anyway.
     if port_listening(ws.ports.listen) {
         return Ok(Selection {
             id: ws.id,
@@ -843,8 +850,15 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
         .stdout(log)
         .stderr(log_err);
     crate::daemon::detach(&mut cmd);
-    cmd.spawn()
+    let child = cmd
+        .spawn()
         .map_err(|err| format!("spawn ducktape-node: {err}"))?;
+    // record the detached pid so teardown can address the process directly —
+    // the http shutdown route alone can't reach a parked joiner (no surface).
+    // best-effort: a failed write only degrades stop back to the pgrep sweep.
+    if let Err(err) = fs::write(pidfile(&dir), child.id().to_string()) {
+        eprintln!("workspace_select: could not record node pid: {err}");
+    }
     Ok(Selection {
         id: ws.id,
         http_url,
@@ -933,20 +947,172 @@ fn port_listening(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
+// ── Stopping a workspace's node for real ────────────────
+
+/// the pidfile [`workspace_select`] records next to `daemon.log` after a spawn,
+/// so teardown can address the detached process directly.
+fn pidfile(dir: &Path) -> PathBuf {
+    dir.join("node.pid")
+}
+
+/// the full command line of a live process, or `None` when it is gone (or the
+/// platform can't tell). unix only — `ps` is the one portable-enough oracle.
+#[cfg(unix)]
+fn cmdline_of(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// pids of LIVE processes that are verifiably THIS workspace's node: the
+/// recorded pidfile pid plus a `pgrep -f` sweep for the workspace dir (a
+/// wiped-and-recreated registry loses pidfiles; the sweep still finds those
+/// zombies). every candidate is verified against its actual command line
+/// before it may be killed — a recycled pid must never take an innocent
+/// process down.
+#[cfg(unix)]
+fn workspace_node_pids(dir: &Path) -> Vec<u32> {
+    let marker = dir.to_string_lossy().to_string();
+    let mut candidates: Vec<u32> = Vec::new();
+    if let Some(pid) = fs::read_to_string(pidfile(dir))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+    {
+        candidates.push(pid);
+    }
+    if let Ok(out) = Command::new("pgrep").args(["-f", &marker]).output() {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                candidates.push(pid);
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    let ours = std::process::id();
+    candidates
+        .into_iter()
+        .filter(|pid| *pid != ours)
+        .filter(|pid| cmdline_of(*pid).is_some_and(|cmd| cmd.contains(&marker)))
+        .collect()
+}
+
+/// is `pid` a LIVE process? a zombie counts as dead: the shell never reaps its
+/// spawned nodes, so a killed child lingers as `Z` — and `kill -0` keeps
+/// succeeding on it, which would burn the whole TERM+KILL grace on an
+/// already-dead process. read the state instead of probing signalability.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(out) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+    else {
+        return false;
+    };
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    out.status.success() && !stat.is_empty() && !stat.starts_with('Z')
+}
+
+/// TERM then (after `grace`) KILL `pid`, waiting for it to exit. best-effort —
+/// the caller confirms the outcome by port, not by our signals landing.
+#[cfg(unix)]
+fn kill_pid(pid: u32, grace: std::time::Duration) {
+    let alive = process_alive;
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status();
+    let deadline = std::time::Instant::now() + grace;
+    while alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if alive(pid) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status();
+        let deadline = std::time::Instant::now() + grace;
+        while alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// stop this workspace's node FOR REAL: ask nicely over http first
+/// (/v1/shutdown), then kill every verified process of this workspace, then
+/// CONFIRM its ports are released. `Err` when something still holds a port —
+/// the caller must NOT delete state a live process would just re-create (the
+/// zombie-workspace resurrection this replaces).
+fn stop_workspace_node(
+    dir: &Path,
+    ports: &Ports,
+    grace: std::time::Duration,
+) -> Result<(), String> {
+    // graceful first: the node exits its whole process on this route. a node
+    // already down, or a parked joiner serving no http, just fails the connect.
+    post_shutdown(ports.http);
+
+    #[cfg(unix)]
+    {
+        // give the graceful exit a moment before reaching for signals.
+        let deadline = std::time::Instant::now() + grace;
+        while ports_held(ports) && std::time::Instant::now() < deadline {
+            let pids = workspace_node_pids(dir);
+            if pids.is_empty() {
+                break;
+            }
+            for pid in pids {
+                kill_pid(pid, grace);
+            }
+        }
+        // sweep any survivor once more even if the ports never showed as held
+        // (a parked joiner binds only its mesh listener; a fatal-looping node
+        // may hold nothing at all between restarts).
+        for pid in workspace_node_pids(dir) {
+            kill_pid(pid, grace);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir; // no pid oracle here — the port check below still gates.
+    }
+
+    // the honest gate: something still answering on this workspace's ports
+    // means the node is NOT stopped, whatever the signals claimed.
+    let deadline = std::time::Instant::now() + grace;
+    while ports_held(ports) {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "this workspace's node is still running (a listener still holds port {} or {}) \
+                 and could not be stopped — aborting so it can't haunt a deleted workspace. \
+                 stop the process manually, then try again.",
+                ports.listen, ports.http
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = fs::remove_file(pidfile(dir));
+    Ok(())
+}
+
+/// is anything still listening on the ports this workspace owns? the mesh
+/// listener is bound in every phase (parked included); http only once serving.
+fn ports_held(ports: &Ports) -> bool {
+    port_listening(ports.listen) || port_listening(ports.http)
+}
+
 /// best-effort "stop this node": POST /v1/shutdown to its http surface over a
-/// raw tcp write. the shell tracks no pid — the port IS the node's identity
-/// (mirroring the webview's `shutdownNode` in node-bootstrap.ts), and the node
-/// exits the whole process on this route. a node already down, or a parked
-/// joiner that serves no http, just fails the connect — which is fine, this is
-/// best-effort teardown.
-///
-/// TODO(identity): if this workspace's http port was recycled by an UNRELATED
-/// local process, this shuts down the wrong one. a proper guard would confirm
-/// the listener is this workspace's node before POSTing — but `/v1/status`
-/// (bin/noded NodeStatus) exposes no node identity today, only version/app_hash/
-/// height/modules. add a node-identity (pubkey) field to the status projection,
-/// then read `/v1/status` here and bail unless it matches `ws.pubkey`.
-fn stop_node(http_port: u16) {
+/// raw tcp write. the port addresses the node (mirroring the webview's
+/// `shutdownNode` in node-bootstrap.ts), and the node exits the whole process
+/// on this route. a node already down, or a parked joiner that serves no http,
+/// just fails the connect — [`stop_workspace_node`] escalates from here.
+fn post_shutdown(http_port: u16) {
     use std::io::Write as _;
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
@@ -1090,5 +1256,163 @@ mod tests {
         assert_ne!(p.listen, p.http);
         assert_ne!(p.http, p.rpc);
         assert_ne!(p.listen, p.rpc);
+    }
+
+    // ── stop_workspace_node: the forget teardown must be REAL ──
+    //
+    // the old best-effort http shutdown left parked/wedged nodes running after
+    // a forget; the detached survivor kept its ports and re-created `storage/`
+    // under the deleted directory. these pin the repaired contract: verified
+    // processes of the workspace die, innocents are never signalled, and a
+    // port still held after teardown refuses instead of lying.
+    #[cfg(unix)]
+    mod stop {
+        use super::*;
+        use std::time::Duration;
+
+        /// a scratch workspace dir; its path is what pid verification matches.
+        fn scratch_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("ducktape-stop-test-{}-{tag}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// a long-lived stand-in node whose command line embeds `dir` (the
+        /// trailing `$0` argument keeps `sh` from exec-replacing itself with
+        /// `sleep`, which would drop the marker from the command line).
+        fn spawn_fake_node(dir: &Path) -> std::process::Child {
+            Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30; : \"$0\"")
+                .arg(dir.join("node.toml"))
+                .spawn()
+                .unwrap()
+        }
+
+        /// wait for OUR child to be reaped dead (kill -0 lies for zombies).
+        fn died(child: &mut std::process::Child, within: Duration) -> bool {
+            let deadline = std::time::Instant::now() + within;
+            while std::time::Instant::now() < deadline {
+                if child.try_wait().unwrap().is_some() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        }
+
+        /// closed-at-probe-time ports — nothing should be listening on them.
+        fn closed_ports() -> Ports {
+            let listen = free_port(&[]).unwrap();
+            let http = free_port(&[listen]).unwrap();
+            Ports {
+                listen,
+                http,
+                rpc: 0,
+            }
+        }
+
+        #[test]
+        fn kills_the_recorded_pid() {
+            let dir = scratch_dir("pidfile");
+            let mut child = spawn_fake_node(&dir);
+            fs::write(pidfile(&dir), child.id().to_string()).unwrap();
+
+            stop_workspace_node(&dir, &closed_ports(), Duration::from_millis(600)).unwrap();
+
+            assert!(
+                died(&mut child, Duration::from_secs(2)),
+                "the pidfile-recorded node process must be stopped"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn sweeps_a_zombie_with_no_pidfile() {
+            // a wiped-and-recreated registry loses pidfiles; the command-line
+            // sweep must still find and stop the workspace's process.
+            let dir = scratch_dir("sweep");
+            let mut child = spawn_fake_node(&dir);
+
+            stop_workspace_node(&dir, &closed_ports(), Duration::from_millis(600)).unwrap();
+
+            assert!(
+                died(&mut child, Duration::from_secs(2)),
+                "a zombie found by command line must be stopped"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_term_killed_zombie_child_does_not_burn_the_grace() {
+            // the shell never reaps its spawned nodes, so a TERM-killed child
+            // lingers as a zombie — and `kill -0` keeps SUCCEEDING on zombies.
+            // liveness must read the process STATE, or every teardown burns
+            // the full TERM+KILL grace on an already-dead process (observed
+            // live: an 18s forget).
+            let dir = scratch_dir("zombie");
+            let mut child = spawn_fake_node(&dir);
+            fs::write(pidfile(&dir), child.id().to_string()).unwrap();
+
+            let started = std::time::Instant::now();
+            stop_workspace_node(&dir, &closed_ports(), Duration::from_secs(3)).unwrap();
+            let elapsed = started.elapsed();
+
+            assert!(
+                died(&mut child, Duration::from_secs(2)),
+                "the node must be stopped"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "teardown burned the kill grace on a zombie: {elapsed:?}"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn never_kills_an_unverified_pid() {
+            // a recycled pid recorded in a stale pidfile belongs to someone
+            // else now — its command line has no trace of this workspace, so
+            // it must survive the teardown untouched.
+            let dir = scratch_dir("innocent");
+            let mut innocent = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .unwrap();
+            fs::write(pidfile(&dir), innocent.id().to_string()).unwrap();
+
+            stop_workspace_node(&dir, &closed_ports(), Duration::from_millis(600)).unwrap();
+
+            assert!(
+                innocent.try_wait().unwrap().is_none(),
+                "an unverified pid must never be signalled"
+            );
+            innocent.kill().unwrap();
+            innocent.wait().unwrap();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn refuses_while_a_port_is_still_held() {
+            // something unstoppable still listening on the workspace's port
+            // means teardown MUST refuse — deleting state under a live process
+            // is exactly the zombie-resurrection bug this replaces.
+            let dir = scratch_dir("held");
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let held = listener.local_addr().unwrap().port();
+            let ports = Ports {
+                listen: held,
+                http: free_port(&[held]).unwrap(),
+                rpc: 0,
+            };
+
+            let err = stop_workspace_node(&dir, &ports, Duration::from_millis(400))
+                .expect_err("a held port must refuse the teardown");
+            assert!(err.contains("still running"), "{err}");
+            drop(listener);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }

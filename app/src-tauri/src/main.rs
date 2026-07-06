@@ -13,6 +13,7 @@
 
 mod daemon;
 mod forge_git;
+mod huddle;
 mod tray;
 mod workspaces;
 
@@ -41,6 +42,8 @@ fn main() {
             forge_git::forge_diff,
             tray::tray_open_console,
             tray::tray_quit,
+            huddle::huddle_pop_out,
+            huddle::huddle_pop_in,
         ])
         // Menu-bar icon + popover (macOS only; a no-op on other platforms).
         .setup(|app| {
