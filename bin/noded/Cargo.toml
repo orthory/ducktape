@@ -79,3 +79,6 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # daemon_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"
+# daemon_e2e registers agents with a live prompt doc: prompt_hash pins sha256
+# of the doc's canonical rendering, computed test-side.
+sha2 = { workspace = true }

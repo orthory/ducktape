@@ -4298,6 +4298,7 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "sha2",
  "tagging",
  "tasks",
  "tasks-index",
