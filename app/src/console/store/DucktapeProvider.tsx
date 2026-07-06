@@ -16,6 +16,7 @@ import type { ReactNode } from "react";
 import * as agentClient from "../../domain/agent-client";
 import * as capabilityClient from "../../domain/capability-client";
 import * as chatClient from "../../domain/chat-client";
+import * as dispatchClient from "../../domain/dispatch-client";
 import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
@@ -118,6 +119,11 @@ export function DucktapeProvider({
           // "Runs on" picker degrades to a text field) rather than a failed
           // refresh.
           capabilityClient.capabilities(live).catch((): string[] => []),
+          // the same registry, kept per-node so a member row can show what it
+          // runs — best-effort like everything else in the snapshot.
+          capabilityClient
+            .capabilitiesByNode(live)
+            .catch((): Map<string, string[]> => new Map()),
           runsClient.watches(live),
           // newest-first for the timeline; the wire orders by dispatch id.
           runsClient
@@ -144,6 +150,7 @@ export function DucktapeProvider({
         pageBlocks,
         agents,
         capabilities,
+        capabilitiesByNode,
         watches,
         pendingRuns,
         profiles,
@@ -180,37 +187,55 @@ export function DucktapeProvider({
           activePage =
             prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
         }
-        return Promise.resolve()
-          .then(() => (active ? chatClient.latestMessages(live, active) : []))
-          .then((messages) =>
-            dispatch({
-              type: "patch",
-              patch: {
-                ...applySnapshot({
-                  connected: true,
-                  status,
-                  channels,
-                  members,
-                  observers,
-                  proposals,
-                  forgeHead,
-                  activeChannel: active,
-                  messages,
-                  authorNames,
-                  pages,
-                  activePageBlocks: pageBlocks ?? [],
-                  agents,
-                  capabilities,
-                  watches,
-                  pendingRuns,
-                  files,
-                  blocks,
-                }),
-                openTabs,
-                activePage,
-              },
-            }),
-          );
+        return Promise.all([
+          active ? chatClient.latestMessages(live, active) : [],
+          // one dispatch read per in-flight run → its executor node. bounded by
+          // pendingRuns.length; each is best-effort so one miss never fails the
+          // refresh.
+          Promise.all(
+            pendingRuns.map((run) =>
+              dispatchClient
+                .dispatch(live, { dispatchId: run.dispatch_id })
+                .then(
+                  (view) =>
+                    [run.run_id, dispatchClient.assigneeHex(view)] as const,
+                )
+                .catch(() => [run.run_id, null] as const),
+            ),
+          ),
+        ]).then(([messages, assigneePairs]) => {
+          const runAssignee = new Map<string, string>();
+          for (const [runId, hex] of assigneePairs) if (hex) runAssignee.set(runId, hex);
+          return dispatch({
+            type: "patch",
+            patch: {
+              ...applySnapshot({
+                connected: true,
+                status,
+                channels,
+                members,
+                observers,
+                proposals,
+                forgeHead,
+                activeChannel: active,
+                messages,
+                authorNames,
+                pages,
+                activePageBlocks: pageBlocks ?? [],
+                agents,
+                capabilities,
+                capabilitiesByNode,
+                watches,
+                pendingRuns,
+                runAssignee,
+                files,
+                blocks,
+              }),
+              openTabs,
+              activePage,
+            },
+          });
+        });
       })
       .catch((err) => {
         dispatch({ type: "patch", patch: { connected: false } });
