@@ -81,6 +81,7 @@ use noded::{
     block_row, hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
+use comments::Comments;
 use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
@@ -400,6 +401,7 @@ fn run_sim(
         );
         let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
+        let comments = Comments::init(context.child("comments"), "comments").await;
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
         let files = Files::with_blobs("files", blobs.clone());
         let memory = Memory::new("memory", "files");
@@ -417,6 +419,7 @@ fn run_sim(
             Box::new(runs),
             Box::new(document),
             Box::new(pages),
+            Box::new(comments),
             Box::new(forge),
             Box::new(files),
             Box::new(memory),
