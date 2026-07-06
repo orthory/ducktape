@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rewrite the files module as the duckfs consensus core — split as pure `duckfs-core` (wasm-ready state machine) + `duckfs-store` (native disk backend) + thin `files` sdk glue + `duckfs-cap` (typed module capability): a content-addressed CoW filesystem (chunk/file/tree/snapshot objects on a disk odb, root over refs) with PutBlob staging, atomic Commit with per-path CAS, pins, watches, snapshot-addressable queries, deterministic GC, and an object-fetch sync lane — crate green in the workspace, old CAS wire deleted flag-day.
+**Goal:** Rewrite the files module as the duckfs consensus core — split as pure `duckfs` (wasm-ready state machine) + thin `files` sdk glue owning the native disk backend + `fscap` (typed module capability): a content-addressed CoW filesystem (chunk/file/tree/snapshot objects on a disk odb, root over refs) with PutBlob staging, atomic Commit with per-path CAS, pins, watches, snapshot-addressable queries, deterministic GC, and an object-fetch sync lane — crate green in the workspace, old CAS wire deleted flag-day.
 
-**Architecture:** Pure state machine (`duckfs-core`, no std::fs/sdk/async) over `ObjectStore`/`RefsStore` traits; native disk backend behind them; immutable content-addressed objects on a loose-object store; all mutable state (live head, pins, history window, staging, watches) in one small `Refs` struct whose canonical encoding is the `root()` preimage; execute stages into a pending block buffer, `commit_block` persists objects + refs file atomically (disk-cohort discipline).
+**Architecture:** Pure state machine (`duckfs`, no std::fs/sdk/async) over `ObjectStore`/`RefsStore` traits; native disk backend behind them; immutable content-addressed objects on a loose-object store; all mutable state (live head, pins, history window, staging, watches) in one small `Refs` struct whose canonical encoding is the `root()` preimage; execute stages into a pending block buffer, `commit_block` persists objects + refs file atomically (disk-cohort discipline).
 
 **Tech Stack:** Rust (workspace member), sha2, serde/serde_json (wire), unicode-normalization (NFC), base64 (wire bytes), tempfile (dev).
 
@@ -26,7 +26,7 @@
 - Every cap is enforced at execute time with **rejection** (`Error::Module`), so an oversized value never enters the root preimage.
 - Determinism: no wall clock, no `HashMap` iteration order in any consensus path (use `BTreeMap`/`BTreeSet`), no OS-filesystem semantics in state (the odb is a byte bucket only).
 - Comment style: lowercase, explain constraints not mechanics (match existing crate docblocks).
-- Gates per task: `cargo test -p duckfs-core -p duckfs-store -p files -p duckfs-cap` green (crates that exist yet), and `cargo check --workspace` green for tasks that touch anything outside these crates. `cargo fmt -p duckfs-core -p duckfs-store -p files -p duckfs-cap -- --check` clean.
+- Gates per task: `cargo test -p duckfs -p files -p fscap` green (crates that exist yet), and `cargo check --workspace` green for tasks that touch anything outside these crates. `cargo fmt -p duckfs -p files -p fscap -- --check` clean.
 - Network constants (from spec, verbatim): chunk size **1 MiB** fixed; name ≤ 255 B; path ≤ 4,096 B; depth ≤ 128; dir entries ≤ 65,536; inline commit bytes ≤ 256 KiB; changed paths/commit ≤ 4,096; message ≤ 4 KiB; meta ≤ 16×(64 B,256 B); staging quota 1 GiB/owner, TTL 4,096 blocks; pins ≤ 1,024; history window 1,024; GC every 1,024 blocks; query page ≤ 256 + cursor; chunks/file ≤ 4,194,304 (2²²).
 - Authority: `/home/<owner>/**` writable only by matching origin-derived owner (`Origin::Module(id)` → `id`, `Origin::External(b)` → `"ext:" + lowercase hex`, `Origin::System` → `"system"`); `/shared/**` writable by any origin; System writes anywhere; all other roots reject writes.
 
@@ -40,7 +40,7 @@ behind traits.
 
 **Crate layout:**
 
-- `crates/apps/duckfs-core` — pure state machine. Modules: `wire.rs` (the
+- `crates/apps/duckfs` — pure state machine. Modules: `wire.rs` (the
   Task 2 `interface.rs` content verbatim — constants, `FilesMsg`/`FilesQuery`/
   `FilesReply`/sync types, codecs, `encode_putblob`, `evidence_uri`, hex
   helpers), `objects.rs` (Task 3), `paths.rs` (Task 4 — but `owner_of` moves
@@ -48,25 +48,27 @@ behind traits.
   depend on sdk; core keeps `check_authority(owner, segs)`), `store.rs`
   (Task 5 traits + `MemStore`/`MemRefs`), `state.rs` (Task 6 — `Refs`,
   `encode_refs`/`decode_refs`, `root_bytes(&Refs) -> [u8; 32]`; the refs FILE
-  envelope moves to duckfs-store), `tree.rs` (Task 8), `fs.rs` (the `Fs<S>`
+  envelope moves to the files glue's `store.rs`), `tree.rs` (Task 8), `fs.rs` (the `Fs<S>`
   state machine — see below), `queries.rs` (Tasks 9/11/12 read side),
   `gc.rs` (Task 13 mark; sweep goes through the trait). Dependencies: sha2,
   serde, serde_json, base64, unicode-normalization ONLY (no sdk, no std::fs,
   no tokio, no async).
-- `crates/apps/duckfs-store` — native backend: `DiskStore` (Task 5 odb
-  semantics: loose objects, tmp→fsync→rename, verified reads, tmp sweep,
-  implements `duckfs_core::ObjectStore`) and `DiskRefs` (Task 6 refs-file
-  envelope `DUCKFS1\n ‖ height ‖ gc_watermark ‖ len ‖ payload ‖ sha256`,
-  implements `duckfs_core::RefsStore`).
+- the native disk backend lives INSIDE the files glue crate at
+  `crates/apps/files/src/store.rs`: `DiskStore` (Task 5 odb semantics: loose
+  objects, tmp→fsync→rename, verified reads, tmp sweep, implements
+  `duckfs::ObjectStore`) and `DiskRefs` (Task 6 refs-file envelope
+  `DUCKFS1\n ‖ height ‖ gc_watermark ‖ len ‖ payload ‖ sha256`, implements
+  `duckfs::RefsStore`). No separate store crate — native code lives with the
+  native glue.
 - `crates/apps/files` — thin sdk glue: `Files` implements `sdk::Module`,
   owns `Fs<DiskStore>` + `DiskRefs`, maps `Origin` → owner via `owner_of`
   (lives here), maps core `Result<_, String>` into `Error::Module("files: ..")`,
   emits core-returned watch notifications via `ctx.emit_msg`, answers
-  `serve_sync`/`query` by delegating, re-exports `duckfs_core::wire::*` so
+  `serve_sync`/`query` by delegating, re-exports `duckfs::wire::*` so
   existing-style imports (`files::FilesMsg`) keep working.
-- `crates/apps/duckfs-cap` — Task 16.
+- `crates/apps/fscap` — Task 16.
 
-**Core traits (in `duckfs-core/src/store.rs`; exact signatures):**
+**Core traits (in `duckfs/src/store.rs`; exact signatures):**
 
 ```rust
 pub trait ObjectStore {
@@ -88,7 +90,7 @@ pub trait RefsStore {
 (`Option<(Refs, u64, u64)>` cell) live beside the traits; core unit tests use
 them, and they are the wasm default later.
 
-**The core state machine (`duckfs-core/src/fs.rs`):**
+**The core state machine (`duckfs/src/fs.rs`):**
 
 ```rust
 pub struct Fs<S: ObjectStore> {
@@ -138,31 +140,31 @@ crate) since it is per-node bookkeeping.
 
 | Plan says | Build instead |
 | --- | --- |
-| `crates/apps/files/src/interface.rs` | `crates/apps/duckfs-core/src/wire.rs` (files crate re-exports) |
-| `crates/apps/files/src/objects.rs` (Task 3) | `crates/apps/duckfs-core/src/objects.rs`; tests `crates/apps/duckfs-core/tests/object_model.rs` (drop the sdk harness — pure crate) |
-| `crates/apps/files/src/paths.rs` (Task 4) | `crates/apps/duckfs-core/src/paths.rs` (`owner_of` → files glue); tests in duckfs-core |
-| `crates/apps/files/src/odb.rs` (Task 5) | `duckfs-core/src/store.rs` traits + Mem impls (+unit tests) AND `crates/apps/duckfs-store/src/lib.rs` `DiskStore` with the odb tests in `crates/apps/duckfs-store/tests/disk.rs` |
-| `crates/apps/files/src/state.rs` (Task 6) | `duckfs-core/src/state.rs` (Refs+codec+root); refs-file envelope → `duckfs-store` `DiskRefs` (its round-trip/corruption tests move to duckfs-store) |
-| `crates/apps/files/src/tree.rs` (Task 8) | `crates/apps/duckfs-core/src/tree.rs`; tests in duckfs-core (no `testkit` needed for these — core internals are testable in-crate; keep `files::testkit` only for the glue-level helpers Tasks 9/12/13 name) |
-| `exec_*` in files `lib.rs` (Tasks 7/9/10) | `Fs::{putblob, commit, pin, unpin, watch, unwatch}` in `duckfs-core/src/fs.rs`; the files glue `execute` maps origin/env and emits notifications. Integration tests stay in `crates/apps/files/tests/` exactly as written (they exercise the sdk surface). |
-| `queries.rs` (Tasks 11/12) | `duckfs-core/src/queries.rs` (`Fs::query`); glue delegates. Tests stay in `crates/apps/files/tests/`. |
-| `gc.rs` (Task 13) | `duckfs-core/src/gc.rs` + `Fs::gc`; watermark trigger in glue `commit_block`. Tests stay in files/tests via `testkit::force_gc`. |
+| `crates/apps/files/src/interface.rs` | `crates/apps/duckfs/src/wire.rs` (files crate re-exports) |
+| `crates/apps/files/src/objects.rs` (Task 3) | `crates/apps/duckfs/src/objects.rs`; tests `crates/apps/duckfs/tests/object_model.rs` (drop the sdk harness — pure crate) |
+| `crates/apps/files/src/paths.rs` (Task 4) | `crates/apps/duckfs/src/paths.rs` (`owner_of` → files glue); tests in duckfs |
+| `crates/apps/files/src/odb.rs` (Task 5) | `crates/apps/duckfs/src/store.rs` traits + Mem impls (+unit tests) AND `crates/apps/files/src/store.rs` `DiskStore`/`DiskRefs` with the odb tests in `crates/apps/files/tests/disk.rs` |
+| `crates/apps/files/src/state.rs` (Task 6) | `crates/apps/duckfs/src/state.rs` (Refs+codec+root); refs-file envelope → `DiskRefs` in `crates/apps/files/src/store.rs` (its round-trip/corruption tests live in `crates/apps/files/tests/disk.rs`) |
+| `crates/apps/files/src/tree.rs` (Task 8) | `crates/apps/duckfs/src/tree.rs`; tests in duckfs (no `testkit` needed for these — core internals are testable in-crate; keep `files::testkit` only for the glue-level helpers Tasks 9/12/13 name) |
+| `exec_*` in files `lib.rs` (Tasks 7/9/10) | `Fs::{putblob, commit, pin, unpin, watch, unwatch}` in `duckfs/src/fs.rs`; the files glue `execute` maps origin/env and emits notifications. Integration tests stay in `crates/apps/files/tests/` exactly as written (they exercise the sdk surface). |
+| `queries.rs` (Tasks 11/12) | `duckfs/src/queries.rs` (`Fs::query`); glue delegates. Tests stay in `crates/apps/files/tests/`. |
+| `gc.rs` (Task 13) | `duckfs/src/gc.rs` + `Fs::gc`; watermark trigger in glue `commit_block`. Tests stay in files/tests via `testkit::force_gc`. |
 | `sync.rs` (Task 14) | core `Fs` methods above; glue exposes `Files::{snapshot_refs, install_refs, missing_objects, ingest_object, possession_complete, durable_height}` delegating. Tests stay in files/tests. |
 
-Gates gain two crates: `cargo test -p duckfs-core -p duckfs-store -p files`
+Gates cover the new crates: `cargo test -p duckfs -p files -p fscap`
 and fmt/clippy cover all three.
 
 ---
 
-### Task 16: fs capability over the module-injected interface (`duckfs-cap`)
+### Task 16: fs capability over the module-injected interface (`fscap`)
 
 Modules read duckfs through `Ctx::query` and write through `emit_msg` — this
 crate makes that a typed capability (spec §"The fs capability").
 
 **Files:**
-- Create: `crates/apps/duckfs-cap/Cargo.toml` (deps: `sdk`, `duckfs-core`, `serde_json`, `base64`)
-- Create: `crates/apps/duckfs-cap/src/lib.rs`
-- Test: `crates/apps/duckfs-cap/tests/cap.rs`
+- Create: `crates/apps/fscap/Cargo.toml` (deps: `sdk`, `duckfs`, `serde_json`, `base64`)
+- Create: `crates/apps/fscap/src/lib.rs`
+- Test: `crates/apps/fscap/tests/cap.rs`
 - Modify: workspace `Cargo.toml` members
 
 **Interfaces:**
@@ -174,7 +176,7 @@ crate makes that a typed capability (spec §"The fs capability").
 //! come back as follow-up ops under the EMITTING module's origin, so
 //! /home/<module-id>/** authority applies naturally.
 
-use duckfs_core::wire::*;
+use duckfs::wire::*;
 use sdk::{Ctx, Error, Msg};
 
 pub struct FsCap<'a> {
@@ -211,13 +213,13 @@ pub struct Notify { pub prefix: String, pub path: String, pub snapshot: String }
   exist at the empty base AND does not exist at head (per-path CAS) — i.e. it
   is create-only sugar; document that mutation flows must `refs()` +
   `commit(base = head)`.
-- Consumes: `duckfs_core::wire`, `sdk::{Ctx, Msg, Error}`.
+- Consumes: `duckfs::wire`, `sdk::{Ctx, Msg, Error}`.
 
 - [ ] **Step 1: Failing test** — in-crate fake `Ctx` whose `query` routes to a real `Files` module (over a tempdir) and whose `emit_msg` collects: seed duckfs with two files via direct module execute; `FsCap::stat`/`ls`/`read_all`/`refs` round-trip typed values; `FsCap::commit` + `pin` emit correctly-shaped `FilesMsg` JSON to target `files`; `decode_notify` round-trips a Task 9-shaped `duckfs_notify` payload and returns `None` on foreign payloads.
-- [ ] **Step 2: Run to fail** → `cargo test -p duckfs-cap` FAIL.
+- [ ] **Step 2: Run to fail** → `cargo test -p fscap` FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** → PASS; `cargo check --workspace`.
-- [ ] **Step 5: Commit** — `feat(duckfs): typed fs capability over the module ctx (duckfs-cap)`.
+- [ ] **Step 5: Commit** — `feat(duckfs): typed fs capability over the module ctx (fscap)`.
 
 ---
 

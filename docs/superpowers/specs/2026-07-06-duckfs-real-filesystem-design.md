@@ -254,7 +254,7 @@ the root.
 duckfs is built as three crates plus one sdk surface, so the consensus state
 machine can later compile to wasm unchanged:
 
-- **`crates/apps/duckfs-core`** — the pure state machine: objects, canonical
+- **`crates/apps/duckfs`** — the pure state machine: objects, canonical
   paths, refs/root, CoW tree engine, verb execution, queries, GC marking.
   No `std::fs`, no tokio, no sdk dependency (its inputs are plain types:
   actor string, height, consensus time). All I/O goes through two traits it
@@ -262,27 +262,28 @@ machine can later compile to wasm unchanged:
   (load/save of the refs envelope). Ships `MemStore`/`MemRefs` in-memory
   implementations (tests today, the wasm default tomorrow). This crate is the
   wasm migration unit.
-- **`crates/apps/duckfs-store`** — the native disk backend: `DiskStore`
-  (loose-object odb, tmp→fsync→rename, verified reads, tmp sweep) and
-  `DiskRefs` (atomic refs file with height/gc-watermark envelope).
+- **`crates/apps/files`** also owns the native disk backend (`src/store.rs`):
+  `DiskStore` (loose-object odb, tmp→fsync→rename, verified reads, tmp sweep)
+  and `DiskRefs` (atomic refs file with height/gc-watermark envelope) — native
+  code lives with the native glue, no separate store crate.
 - **`crates/apps/files`** — the thin sdk glue: implements `sdk::Module` by
-  mapping `Ctx`/`Env`/`Origin` onto `duckfs-core` calls over `DiskStore`,
-  and emits the watch notifications core returns. Module id stays `files`.
-- **`crates/apps/duckfs-cap`** — the fs capability over the module-injected
+  mapping `Ctx`/`Env`/`Origin` onto `duckfs` calls over `DiskStore`, and
+  emits the watch notifications core returns. Module id stays `files`.
+- **`crates/apps/fscap`** — the fs capability over the module-injected
   interface (below).
 
 The determinism boundary gets a second enforcement layer from this split:
-`duckfs-core` cannot even name the OS filesystem.
+the `duckfs` crate cannot even name the OS filesystem.
 
 ## The fs capability (module-injected interface)
 
 Modules gain a typed filesystem capability through the interface they already
-receive, with no new host machinery. It ships as `duckfs-cap` (the kernel
+receive, with no new host machinery. It ships as `fscap` (the kernel
 `sdk` cannot depend on app wire types; the capability is still injected via
 `Ctx`, which is the interface every module already holds):
 
 - **Reads** are deterministic during execute today via `Ctx::query` routed to
-  the files module. `duckfs_cap::FsCap<'a>` wraps `&'a dyn Ctx` with typed
+  the files module. `fscap::FsCap<'a>` wraps `&'a dyn Ctx` with typed
   methods — `stat`, `ls`, `read`, `find`, `grep`, `history`, `refs` — that
   encode/decode the files wire internally. Committed state as of dispatch
   start, same as any cross-module query.
@@ -296,7 +297,7 @@ receive, with no new host machinery. It ships as `duckfs-cap` (the kernel
   path.
 
 Because `FsCap` is pure sugar over `Ctx`, it compiles anywhere `Ctx` exists —
-including a future wasm module ABI. Its wire types come from `duckfs-core`'s
+including a future wasm module ABI. Its wire types come from the `duckfs` crate's
 `wire` module, so no consumer ever depends on the files module crate itself.
 
 ## Client stack
@@ -394,8 +395,8 @@ Rust crate shared by CLI, daemon, and sandbox runner; TS mirror for the app.
 
 ## Implementation shape (for the planning step)
 
-New/changed surfaces: `crates/apps/duckfs-core` + `crates/apps/duckfs-store`
-+ `crates/apps/files` glue + `crates/apps/duckfs-cap` (per the modularization
+New/changed surfaces: `crates/apps/duckfs` + `crates/apps/files` glue
++ `crates/apps/fscap` (per the modularization
 section), `crates/apps/memory` (deleted), a new `duckfs-client` crate, noded (blob-receipt store internalized; duckfs HTTP
 endpoints; sandbox workspace RPC), bin/node + bin/demo registration sites,
 kernel statesync resolver wiring for `duckfs-odb`, app TS client + FilesView,
