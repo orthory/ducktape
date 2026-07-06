@@ -35,6 +35,13 @@ pub const MAX_PAGE: u64 = 256;
 pub const MAX_READ_BYTES: u64 = 1024 * 1024;
 pub const MAX_GREP_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_GREP_LINE_BYTES: usize = 256;
+/// hard ceiling on hits emitted by ONE grep call (MAX_PAGE * 16 — the same
+/// bounded-reply convention as the diff cap). the scan budget bounds bytes
+/// SCANNED, not hits EMITTED, so without this a single in-budget file of
+/// pathologically many matching lines could amplify into an unbounded reply;
+/// with it a reply is bounded at roughly 4096 hits x ~0.5 KiB each (path +
+/// capped line text + uri) — a couple of MiB worst case.
+pub const MAX_GREP_HITS_PER_CALL: usize = MAX_PAGE as usize * 16;
 /// first byte of the binary putblob op frame. json msgs start with b'{',
 /// so one leading byte disambiguates the whole op space.
 pub const PUTBLOB_FRAME_TAG: u8 = 0x00;
@@ -201,7 +208,8 @@ pub struct GrepHit {
     pub path: String,
     pub line: u64,
     pub text: String,
-    /// `duck://files/<path>@<snapshot>#L<line>`
+    /// `duck://files<path>@<snapshot>#L<line>` — the absolute path brings its
+    /// own leading slash (see [`evidence_uri`]).
     pub uri: String,
 }
 

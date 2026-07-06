@@ -23,8 +23,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::{
     CHUNK_SIZE, Change, Content, DiffEntry, DiffKind, EntryInfo, EntryKindWire, FilesMsg,
-    FilesQuery, FilesReply, GrepHit, MAX_GREP_LINE_BYTES, MAX_PAGE, SnapshotInfo, decode_reply,
-    encode_msg, encode_putblob, encode_query, to_hex,
+    FilesQuery, FilesReply, GrepHit, MAX_GREP_HITS_PER_CALL, MAX_GREP_LINE_BYTES, MAX_PAGE,
+    SnapshotInfo, decode_reply, encode_msg, encode_putblob, encode_query, to_hex,
 };
 
 // ---- drivers ----------------------------------------------------------------
@@ -509,6 +509,50 @@ fn grep_skips_a_file_larger_than_the_whole_budget() {
 }
 
 #[test]
+fn grep_caps_one_calls_hits_at_the_reply_ceiling() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    // 6000 matching lines in ONE small in-budget file: the scan budget bounds
+    // bytes SCANNED, not hits EMITTED, so without the ceiling this 12 KB file
+    // would amplify into a 6000-hit reply. a following needle file proves the
+    // resume continues past the pathological file without re-emission.
+    let many = "x\n".repeat(6000);
+    commit(
+        &mut f,
+        1,
+        None,
+        vec![
+            put_inline("/shared/gc/0many", many.as_bytes()),
+            put_inline("/shared/gc/1needle", b"x marks the spot\n"),
+        ],
+    )
+    .expect("ceiling seed");
+    commit_block(&mut f);
+
+    // call 1: exactly the ceiling, all from 0many, lines 1..=4096 in order; the
+    // remaining 1904 matching lines are dropped deterministically and the cursor
+    // advances PAST the file (file-atomic paging — no infinite resume loop).
+    let (h1, n1) = grep(&f, "x", "/shared/gc", None, None, MAX_PAGE);
+    assert_eq!(h1.len(), MAX_GREP_HITS_PER_CALL, "reply capped exactly");
+    assert!(h1.iter().all(|h| h.path == "/shared/gc/0many"));
+    assert_eq!(h1[0].line, 1);
+    assert_eq!(h1.last().unwrap().line, MAX_GREP_HITS_PER_CALL as u64);
+    assert_eq!(
+        n1,
+        Some("/shared/gc/0many".to_string()),
+        "cursor advances past the pathological file"
+    );
+
+    // call 2: resumes strictly after 0many — the later needle is found, none of
+    // 0many's dropped lines are re-emitted.
+    let (h2, n2) = grep(&f, "x", "/shared/gc", None, n1.as_deref(), MAX_PAGE);
+    assert_eq!(h2.len(), 1);
+    assert_eq!(h2[0].path, "/shared/gc/1needle");
+    assert_eq!(h2[0].line, 1);
+    assert_eq!(n2, None);
+}
+
+#[test]
 fn grep_rejects_empty_and_oversized_patterns() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
@@ -782,6 +826,62 @@ fn diff_of_a_snapshot_with_itself_is_empty() {
     assert!(
         diff(&f, &s1, &s1, "/").is_empty(),
         "identical roots prune to nothing"
+    );
+}
+
+#[test]
+fn diff_kind_flip_is_modified_plus_descendants() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    // S1 has a FILE at /shared/kf/x; S2 replaces it with a DIR holding a child
+    // (rm the file, then a put whose auto-created parent is the same path).
+    commit(&mut f, 1, None, vec![put_inline("/shared/kf/x", b"file")]).expect("s1");
+    commit_block(&mut f);
+    let s1 = head(&f);
+    commit(
+        &mut f,
+        2,
+        Some(&s1),
+        vec![
+            Change::Rm {
+                path: "/shared/kf/x".into(),
+            },
+            put_inline("/shared/kf/x/child", b"leaf"),
+        ],
+    )
+    .expect("s2");
+    commit_block(&mut f);
+    let s2 = head(&f);
+
+    // file→dir: Modified at the flipped path, plus the dir side's descendants
+    // as Added; the reverse direction reports the same descendants as Removed.
+    let forward = diff(&f, &s1, &s2, "/shared/kf");
+    assert_eq!(
+        forward,
+        vec![
+            DiffEntry {
+                path: "/shared/kf/x".into(),
+                kind: DiffKind::Modified
+            },
+            DiffEntry {
+                path: "/shared/kf/x/child".into(),
+                kind: DiffKind::Added
+            },
+        ]
+    );
+    let backward = diff(&f, &s2, &s1, "/shared/kf");
+    assert_eq!(
+        backward,
+        vec![
+            DiffEntry {
+                path: "/shared/kf/x".into(),
+                kind: DiffKind::Modified
+            },
+            DiffEntry {
+                path: "/shared/kf/x/child".into(),
+                kind: DiffKind::Removed
+            },
+        ]
     );
 }
 

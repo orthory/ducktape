@@ -17,8 +17,8 @@ use crate::store::ObjectStore;
 use crate::tree::{Store, entry_at, snapshot_root_tree};
 use crate::wire::{
     CHUNK_SIZE, DiffEntry, DiffKind, EntryInfo, EntryKindWire, FilesQuery, FilesReply, GrepHit,
-    MAX_GREP_LINE_BYTES, MAX_PAGE, MAX_READ_BYTES, RefsInfo, SnapshotInfo, evidence_uri,
-    from_hex_32, to_hex,
+    MAX_GREP_HITS_PER_CALL, MAX_GREP_LINE_BYTES, MAX_PAGE, MAX_READ_BYTES, RefsInfo, SnapshotInfo,
+    evidence_uri, from_hex_32, to_hex,
 };
 
 /// a diff reply is capped at MAX_PAGE * 16 entries: a bounded reply, no cursor —
@@ -252,10 +252,9 @@ fn refs<S: ObjectStore>(fs: &Fs<S>) -> Result<FilesReply, String> {
 /// subscription and fires on "/a/fo" only for "/a/fo" itself or "/a/fo/**".)
 ///
 /// the walk is bounded — a full-namespace scan per page would be O(everything).
-/// a subtree rooted at path P is descended only when it can still hold a match:
-/// P starts_with prefix (the whole subtree matches) OR prefix starts_with P (the
-/// prefix reaches into this subtree). every other subtree is pruned unread, so a
-/// narrow prefix never walks the whole tree.
+/// a subtree is descended only when it can still hold a match (see
+/// [`subtree_may_match`] for the rule and its soundness), so a narrow prefix
+/// never walks the whole tree.
 fn find<S: ObjectStore>(
     fs: &Fs<S>,
     prefix: &str,
@@ -322,9 +321,7 @@ fn find_walk(
             acc.out.push(entry_info(store, &child, entry)?);
         }
         // descend only into subtrees that can still hold a prefix match.
-        if entry.kind == EntryKind::Dir
-            && (child.starts_with(acc.prefix) || acc.prefix.starts_with(child.as_str()))
-        {
+        if entry.kind == EntryKind::Dir && subtree_may_match(&child, acc.prefix) {
             find_walk(store, Some(entry.id), &child, acc)?;
         }
     }
@@ -346,6 +343,15 @@ fn find_walk(
 /// never be scanned in one call — resuming at it would wall forever, so it is
 /// skipped deterministically (no hits, documented limitation) and the scan
 /// continues past it.
+///
+/// the reply itself is bounded too: the scan budget bounds bytes SCANNED, not
+/// hits EMITTED, so one in-budget file of pathologically many matching lines
+/// could otherwise amplify into an unbounded reply. hits are hard-capped at
+/// [`MAX_GREP_HITS_PER_CALL`] per call; a single file with pathologically many
+/// matches reports at most the remaining ceiling's worth of its lines — the
+/// rest are dropped deterministically (documented limitation, mirroring the
+/// oversized skip: narrow the pattern or Read the file) and the cursor still
+/// advances past that file, so paging stays file-atomic and loop-free.
 fn grep<S: ObjectStore>(
     fs: &Fs<S>,
     pattern: &str,
@@ -443,7 +449,7 @@ fn grep_walk(
             // a needle in a symlink TARGET is not a file hit — files only.
             EntryKind::Symlink => {}
             EntryKind::Dir => {
-                if child.starts_with(acc.prefix) || acc.prefix.starts_with(child.as_str()) {
+                if subtree_may_match(&child, acc.prefix) {
                     grep_walk(store, Some(entry.id), &child, acc)?;
                 }
             }
@@ -452,9 +458,11 @@ fn grep_walk(
     Ok(())
 }
 
-/// scan one candidate file against the budget, appending its hits. the three
-/// gates (hit-limit, oversized-single-file, budget-boundary) all end at a file
-/// boundary because the cursor is a whole-file path — never mid-file.
+/// scan one candidate file against the budget, appending its hits. the four
+/// gates (hit-limit, oversized-single-file, budget-boundary, reply ceiling) all
+/// resolve at a file boundary because the cursor is a whole-file path — never
+/// mid-file; the ceiling drops a boundary file's surplus lines rather than
+/// splitting the file across pages.
 fn grep_file(
     store: &Store,
     path: &str,
@@ -489,6 +497,14 @@ fn grep_file(
     for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
         let text = String::from_utf8_lossy(line);
         if text.contains(acc.pattern) {
+            if acc.hits.len() >= MAX_GREP_HITS_PER_CALL {
+                // reply ceiling: this file's REMAINING matching lines are dropped
+                // deterministically (like the oversized skip — narrow the pattern
+                // or Read the file), and `last_scanned` still advances below so
+                // the cursor moves PAST this file: file-atomic paging, no resume
+                // loop, no re-emission.
+                break;
+            }
             let line_no = i as u64 + 1; // 1-based
             acc.hits.push(GrepHit {
                 path: path.to_string(),
@@ -592,9 +608,8 @@ fn diff_walk(
     names.dedup();
     for name in names {
         let child = format!("{base}/{name}");
-        // prefix prune (mirrors find's descent rule): skip a subtree that cannot
-        // hold a prefix-matching path.
-        if !(child.starts_with(prefix) || prefix.starts_with(child.as_str())) {
+        // prefix prune — the shared find/grep/diff descent rule.
+        if !subtree_may_match(&child, prefix) {
             continue;
         }
         match (from.get(name), to.get(name)) {
@@ -656,7 +671,7 @@ fn emit_children(
 ) -> Result<(), String> {
     for (name, entry) in dir_entries(store, Some(dir_id))? {
         let child = format!("{base}/{name}");
-        if !(child.starts_with(prefix) || prefix.starts_with(child.as_str())) {
+        if !subtree_may_match(&child, prefix) {
             continue;
         }
         emit_side(store, &child, &entry, kind.clone(), prefix, out)?;
@@ -687,6 +702,18 @@ fn push_diff(
 }
 
 // ---- helpers ----------------------------------------------------------------
+
+/// the shared find/grep/diff descent prune: whether the subtree rooted at
+/// `child` can still hold a path matching the string `prefix`. sound because a
+/// descendant of `child` is `child` + "/" + more, so its path can start with
+/// `prefix` only when either the whole subtree already matches
+/// (`child.starts_with(prefix)`) or the prefix reaches INTO the subtree
+/// (`prefix.starts_with(child)`); every other subtree is pruned unread, which is
+/// what bounds these walks to the matching region instead of the whole
+/// namespace.
+fn subtree_may_match(child: &str, prefix: &str) -> bool {
+    child.starts_with(prefix) || prefix.starts_with(child)
+}
 
 /// strictly-after test in full-path order — the SAME order find/grep emit in, so
 /// paging never skips or repeats across the "/"-boundary. this is segment-wise
