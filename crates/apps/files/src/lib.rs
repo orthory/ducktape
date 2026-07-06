@@ -99,10 +99,16 @@ pub use state::{PinEntry, Refs, Staged, decode_refs, encode_refs, root_bytes};
 pub use store::{MemRefs, MemStore, ObjectStore, RefsStore};
 
 #[cfg(feature = "native")]
+mod cap;
+#[cfg(feature = "native")]
 mod disk;
 #[cfg(feature = "native")]
 mod module;
 
+// the typed fs capability: pure sugar over `sdk::Ctx` (reads ride `query`, writes
+// ride `emit_msg`), so it lives behind the same `native` gate as the sdk glue.
+#[cfg(feature = "native")]
+pub use cap::{FsCap, Notify, decode_notify};
 #[cfg(feature = "native")]
 pub use disk::{DiskRefs, DiskStore};
 #[cfg(feature = "native")]
