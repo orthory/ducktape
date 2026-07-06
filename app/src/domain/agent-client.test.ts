@@ -1,19 +1,22 @@
 // The agent client mirrors agent-interface: AgentMsg encoding (ownership from
 // the block origin, never in a payload; snake_case fields) + AgentReply
 // decoding for the Agents / Agent queries, including the null (absent agent)
-// case. The prompt-upload flow itself lives in the store; here we only prove
-// the wire shapes and the hex→bytes hash helper. The acting half (watches,
-// runs) is runs-client — see runs-client.test.
+// case. The prompt publish-then-pin flow itself lives in the store; here we
+// only prove the wire shapes and the PromptRef helpers. The acting half
+// (watches, runs) is runs-client — see runs-client.test.
 
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  RENDERER_MEMORY_GENERATION,
   agent,
   agents,
   hexToBytes,
+  memoryPromptRef,
   pauseAgent,
   registerAgent,
   resumeAgent,
+  tombstoneAgent,
   updateAgent,
 } from "./agent-client";
 import type { AgentRecord } from "./agent-client";
@@ -44,15 +47,35 @@ describe("hexToBytes", () => {
   });
 });
 
+describe("memoryPromptRef", () => {
+  it("builds the memory.generation ref with a byte pin", () => {
+    const ref = memoryPromptRef({
+      path: "/agents/prompts/helper",
+      generation: 3,
+      sha256Hex: "cd".repeat(32),
+    });
+    expect(ref).toEqual({
+      module: "memory",
+      target: "/agents/prompts/helper@3",
+      renderer: RENDERER_MEMORY_GENERATION,
+      sha256: hexToBytes("cd".repeat(32)),
+    });
+  });
+});
+
 describe("agent msgs", () => {
   it("encodes RegisterAgent, passing the origin for owner-gating", async () => {
     const transport = stubTransport();
-    const promptHash = hexToBytes("cd".repeat(32));
+    const prompt = memoryPromptRef({
+      path: "/agents/prompts/helper",
+      generation: 1,
+      sha256Hex: "cd".repeat(32),
+    });
     await registerAgent(transport, {
       agentId: "helper",
       displayName: "Helper",
       capability: "alpha",
-      promptHash,
+      prompt,
       allowedActions: ["chat.post"],
       origin: "operator",
     });
@@ -63,7 +86,7 @@ describe("agent msgs", () => {
           agent_id: "helper",
           display_name: "Helper",
           capability: "alpha",
-          prompt_hash: promptHash,
+          prompt,
           allowed_actions: ["chat.post"],
         },
       },
@@ -85,7 +108,7 @@ describe("agent msgs", () => {
           agent_id: "helper",
           display_name: "Helper 2",
           capability: null,
-          prompt_hash: null,
+          prompt: null,
           allowed_actions: null,
         },
       },
@@ -93,7 +116,7 @@ describe("agent msgs", () => {
     );
   });
 
-  it("encodes PauseAgent / ResumeAgent with the origin", async () => {
+  it("encodes PauseAgent / ResumeAgent / TombstoneAgent with the origin", async () => {
     const transport = stubTransport();
 
     await pauseAgent(transport, { agentId: "helper", origin: "operator" });
@@ -109,6 +132,13 @@ describe("agent msgs", () => {
       { resume_agent: { agent_id: "helper" } },
       "operator",
     );
+
+    await tombstoneAgent(transport, { agentId: "helper", origin: "operator" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "agent",
+      { tombstone_agent: { agent_id: "helper" } },
+      "operator",
+    );
   });
 });
 
@@ -118,7 +148,11 @@ describe("agent queries", () => {
     owner: { external: [1, 2, 3] },
     display_name: "Helper",
     capability: "alpha",
-    prompt_hash: hexToBytes("cd".repeat(32)),
+    prompt: memoryPromptRef({
+      path: "/agents/prompts/helper",
+      generation: 1,
+      sha256Hex: "cd".repeat(32),
+    }),
     allowed_actions: ["chat.post"],
     status: "active",
     created_at: 1,

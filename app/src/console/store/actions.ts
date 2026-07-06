@@ -34,6 +34,7 @@ import {
   defaultScreenForSection,
   sectionForScreen,
 } from "../modules/registry";
+import { replyVariant } from "../../domain/wire";
 import type { Action } from "./reducer";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
@@ -60,6 +61,37 @@ const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
   list.some((w) => w.id === next.id)
     ? list.map((w) => (w.id === next.id ? next : w))
     : [...list, next];
+
+/** Where an agent's prompt content lives in the memory namespace. */
+const promptPath = (agentId: string): string => `/agents/prompts/${agentId}`;
+
+/** Publish `text` as the next inline generation at `path` in the memory
+ *  module, then return the PromptRef pinning exactly that content: the
+ *  freshly-published `<path>@<generation>` plus sha256(text). The runs module
+ *  resolves and pin-verifies the ref at every compose. */
+const publishPromptRef = async (
+  live: NodeTransport,
+  path: string,
+  text: string,
+  origin: string,
+): Promise<agentClient.PromptRef> => {
+  await live.submit(
+    "memory",
+    { publish: { path, body: { kind: "inline", value: text }, meta: {} } },
+    origin,
+  );
+  const stat = replyVariant<{ latest_generation: number } | null>(
+    await live.query("memory", { stat: { path } }),
+    "stat",
+  );
+  if (!stat) throw new Error(`prompt publish did not land at ${path}`);
+  const sha256Hex = await filesClient.digestHex(new TextEncoder().encode(text));
+  return agentClient.memoryPromptRef({
+    path,
+    generation: stat.latest_generation,
+    sha256Hex,
+  });
+};
 
 export interface ConsoleActions {
   setScreen(screen: string): void;
@@ -193,8 +225,9 @@ export interface ConsoleActions {
   resolveThread(params: { threadId: string; resolved: boolean }): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
-  /** Upload the prompt text to the blob store, then RegisterAgent with the
-   *  resulting 32-byte digest as its prompt_hash. */
+  /** Publish the prompt text to the memory module (`/agents/prompts/<id>`),
+   *  then RegisterAgent with a PromptRef pinning that generation's sha256.
+   *  An empty prompt registers with `prompt: null` (the generic default). */
   registerAgent(params: {
     displayName: string;
     agentId: string;
@@ -212,9 +245,9 @@ export interface ConsoleActions {
   requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
-  /** Owner-gated edit of a registered agent. A provided `prompt` is staged in
-   *  the blob store and its digest committed as the new prompt_hash; every
-   *  omitted field keeps its current value. */
+  /** Owner-gated edit of a registered agent. A provided `prompt` is published
+   *  as a new memory generation and the record repinned to it; every omitted
+   *  field keeps its current value. */
   updateAgent(params: {
     agentId: string;
     displayName?: string;
@@ -1260,17 +1293,22 @@ export function createActions({
       const tag = capability.trim();
       if (!id || !name || !tag) return;
       submitTracked(opKey.agent(id), (live) =>
-        // stage the prompt in the node's blob store, then register with its
-        // digest as prompt_hash — the blob is keyed by sha256(bytes), which
-        // IS the hash the oracle worker fetches the prompt by.
+        // publish the prompt into the shared memory namespace, then register
+        // with a PromptRef pinning exactly that generation's sha256 — the
+        // runs module resolves and pin-verifies it at every compose. an
+        // empty prompt keeps the runs module's generic default (null).
         Promise.resolve()
-          .then(() => live.putBlob(new TextEncoder().encode(prompt)))
-          .then((digest) =>
+          .then(() =>
+            prompt.trim()
+              ? publishPromptRef(live, promptPath(id), prompt, getState().author)
+              : null,
+          )
+          .then((promptRef) =>
             agentClient.registerAgent(live, {
               agentId: id,
               displayName: name,
               capability: tag,
-              promptHash: agentClient.hexToBytes(digest),
+              prompt: promptRef,
               allowedActions,
               origin: getState().author,
             }),
@@ -1351,21 +1389,19 @@ export function createActions({
         opKey.agent(id),
         (live) =>
         Promise.resolve()
-          // a provided prompt is re-staged in the blob store; its digest becomes
-          // the new prompt_hash. An absent prompt leaves the hash untouched.
+          // a provided prompt is published as a NEW memory generation and the
+          // record repinned to it. An absent prompt keeps the current ref.
           .then(() =>
             prompt !== undefined && prompt.length > 0
-              ? live
-                  .putBlob(new TextEncoder().encode(prompt))
-                  .then((digest) => agentClient.hexToBytes(digest))
+              ? publishPromptRef(live, promptPath(id), prompt, getState().author)
               : null,
           )
-          .then((promptHash) =>
+          .then((promptRef) =>
             agentClient.updateAgent(live, {
               agentId: id,
               displayName: displayName?.trim() || null,
               capability: capability?.trim() || null,
-              promptHash,
+              prompt: promptRef,
               allowedActions: allowedActions ?? null,
               origin: getState().author,
             }),

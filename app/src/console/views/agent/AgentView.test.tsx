@@ -10,8 +10,6 @@ import type { Workspace } from "../../../domain/workspace-client";
 import { AgentView, runIsMine } from "./AgentView";
 import type { PendingRun } from "../../../domain/runs-client";
 
-const bytes = (value: number) => Array.from({ length: 32 }, () => value);
-
 const channels: Channel[] = [
   {
     id: "general",
@@ -45,7 +43,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         owner: "system" as const,
         display_name: "Summary Agent",
         capability: "alpha",
-        prompt_hash: bytes(0xab),
+        prompt: null,
         allowed_actions: ["chat.post", "tasks.create"],
         status: "active" as const,
         created_at: 10,
@@ -56,7 +54,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         owner: "system" as const,
         display_name: "QA Agent",
         capability: "beta",
-        prompt_hash: bytes(0xcd),
+        prompt: null,
         allowed_actions: ["chat.post"],
         status: "paused" as const,
         created_at: 11,
