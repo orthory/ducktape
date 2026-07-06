@@ -53,6 +53,7 @@ members = [
     "crates/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
+    "crates/examples/docs-harness",
     # testing — reusable test frameworks (depend on module impls; not modules)
     "crates/testing/quack-harness",
     # bin — runnable binaries
@@ -145,6 +146,9 @@ memory = { path = "crates/apps/memory" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
+# the reference Quack package's harness module (design D9): the docs package's
+# lifecycle owner, pages-event consumer, and pages.* action owner.
+docs-harness = { path = "crates/examples/docs-harness" }
 # the Quack package test framework (testbed + install driver + assertion kit +
 # golden runner) — consumed by package authors' test suites and the CLI's
 # `package test`.
