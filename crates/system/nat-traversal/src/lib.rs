@@ -5,6 +5,7 @@
 //! peer traffic, so no data path ever depends on it.
 
 pub mod advert;
+pub mod auth;
 pub mod client;
 pub mod coordinator;
 // `punch` depends on `simnat::SimNat` directly in its (non-test) API, so it is
@@ -17,6 +18,10 @@ pub mod simnat;
 pub mod wire;
 
 pub use advert::{AdvertBook, AdvertOutcome, ReflexiveAdvert};
+pub use auth::{
+    mint_coord_cap, now_secs, sign_authenticator, verify_request, AuthError, AuthPolicy,
+    Authenticator, CoordCap, COORD_CAP_NS, COORD_REQ_NS, DEFAULT_FRESHNESS_WINDOW_SECS,
+};
 pub use client::{NatClient, run_coordinator};
 pub use coordinator::Coordinator;
 #[cfg(any(test, feature = "simnat"))]
