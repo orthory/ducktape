@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use sdk::{Ctx, Effect, Env, Error, Event, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
 
+#[derive(Debug)]
 pub struct TestCtx {
     pub env: Env,
     /// follow-up msgs emitted during execute — watch fan-out assertions.

@@ -178,9 +178,64 @@ impl TreeEdit {
         Ok(())
     }
 
+    /// move the node at `from` to `to`, moving the [`Node`] ITSELF — a lazy `Ref`
+    /// or a mid-edit-materialized `Dir` — rather than composing get + rm + put.
+    /// this is load-bearing: `get` on a modified directory returns a COMPUTED id
+    /// whose tree object is only staged at `build`, so a get+rm+put move would
+    /// re-emit that id as a dangling reference (the modified subtree is never
+    /// encoded, because `rm` drops the Dir node before `build` sees it). moving
+    /// the node keeps the materialized subtree under the new name, so `build`
+    /// stages its objects there.
+    ///
+    /// rejection rules mirror `rm`/`put` but with a DELIBERATE asymmetry vs put:
+    /// `from` absent rejects; `to` present rejects; and `to`'s parent must ALREADY
+    /// exist as a directory — it is NOT auto-created. moving into a non-existent
+    /// directory is an error (POSIX `rename` semantics), unlike put which creates
+    /// missing parents. moving a path into its own subtree is rejected too (it
+    /// would orphan the moved tree).
+    pub fn mv(&mut self, store: &Store, from: &[String], to: &[String]) -> Result<(), String> {
+        let (from_name, from_dirs) = from
+            .split_last()
+            .ok_or_else(|| "files: cannot mv the root itself".to_string())?;
+        let (to_name, to_dirs) = to
+            .split_last()
+            .ok_or_else(|| "files: cannot mv onto the root itself".to_string())?;
+        // a path cannot move into its own subtree (from == to, or to under from):
+        // build would try to re-parent the tree under a node it just removed. this
+        // also subsumes the from == to no-op (to would be present anyway).
+        if to.len() >= from.len() && to[..from.len()] == *from {
+            return Err("files: cannot move a path into its own subtree".into());
+        }
+        // validate BEFORE mutating so a rejected mv leaves the overlay untouched:
+        // 1. source must exist under its (already-existing) parent.
+        {
+            let parent = navigate(&mut self.root, store, from_dirs, false)?;
+            if !parent.contains_key(from_name) {
+                return Err("files: mv source does not exist".into());
+            }
+        }
+        // 2. destination parent must already exist as a dir (no auto-create), and
+        //    the destination itself must be free.
+        {
+            let parent = navigate(&mut self.root, store, to_dirs, false)?;
+            if parent.contains_key(to_name) {
+                return Err("files: mv destination already exists".into());
+            }
+        }
+        // 3. lift the node out of its source parent and drop it under the dest
+        //    name — the whole Ref/Dir moves, so a modified subtree is re-encoded
+        //    under `to` at build (never a dangling id).
+        let node = {
+            let parent = navigate(&mut self.root, store, from_dirs, false)?;
+            parent.remove(from_name).expect("checked present above")
+        };
+        let parent = navigate(&mut self.root, store, to_dirs, false)?;
+        parent.insert(to_name.clone(), node);
+        Ok(())
+    }
+
     /// read the entry at `segs` as the edit currently sees it (overlay first,
     /// then decode on descent). `None` for an absent path or the root itself.
-    /// the commit executor composes `Mv` as get + rm + put on top of this.
     pub fn get(&self, store: &Store, segs: &[String]) -> Result<Option<TreeEntry>, String> {
         if segs.is_empty() {
             return Ok(None);

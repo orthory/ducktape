@@ -3,12 +3,23 @@
 //! the native glue (`module.rs`) maps origin/env in and notifications out.
 //! tasks 7-14 fill the op/query/sync semantics; this skeleton pins the shapes.
 
-use crate::objects::{Kind, ObjectId, object_id};
+use std::collections::{BTreeMap, BTreeSet};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+
+use crate::objects::{
+    EntryKind, FileObj, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj, object_id,
+};
+use crate::paths::{canonical, check_authority};
 use crate::state::{Refs, Staged, decode_refs, encode_refs, root_bytes};
 use crate::store::ObjectStore;
+use crate::tree::{Store, TreeEdit, entry_at, snapshot_root_tree};
 use crate::wire::{
-    CHUNK_SIZE, Change, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp, STAGING_QUOTA_BYTES,
-    STAGING_TTL_BLOCKS,
+    CHUNK_SIZE, Change, Content, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp,
+    HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_INLINE_COMMIT_BYTES,
+    MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES, MAX_META_VALUE_BYTES,
+    MAX_SYMLINK_TARGET_BYTES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, from_hex_32, to_hex,
 };
 
 pub struct Fs<S: ObjectStore> {
@@ -29,7 +40,25 @@ pub type StagedObjects = Vec<(Kind, Vec<u8>)>;
 pub(crate) struct Pending {
     pub refs: Refs,
     pub objects: StagedObjects,
+    /// per-block index over `objects` — the id of every object buffered this
+    /// block. maintained in lockstep with `objects` so availability checks
+    /// (commit step 6) and putblob's no-op dedup stay O(log n) instead of
+    /// re-hashing every buffered megabyte on each call. a chunk uploaded inline
+    /// by an earlier commit THIS block (in `objects`, not in `staging`) is thus
+    /// seen as available by a later commit and no-op'd by a later putblob.
+    pub object_ids: BTreeSet<ObjectId>,
     pub height: u64,
+}
+
+impl Pending {
+    /// buffer an object for this block's store flush and index its id. the id is
+    /// the content-addressed `object_id(kind, body)`; the index dedups so the
+    /// same bytes buffered twice cost one entry (the flush is idempotent anyway).
+    fn push_object(&mut self, kind: Kind, body: Vec<u8>) {
+        let id = object_id(kind, &body);
+        self.object_ids.insert(id);
+        self.objects.push((kind, body));
+    }
 }
 
 /// one watch hit produced by a commit; the glue turns each into an emitted
@@ -89,6 +118,7 @@ impl<S: ObjectStore> Fs<S> {
             self.pending = Some(Pending {
                 refs: self.refs.clone(),
                 objects: Vec::new(),
+                object_ids: BTreeSet::new(),
                 height,
             });
         }
@@ -118,11 +148,29 @@ impl<S: ObjectStore> Fs<S> {
     /// land. production staging happens inside the op methods.
     #[doc(hidden)]
     pub fn stage_pending(&mut self, refs: Refs, height: u64, objects: StagedObjects) {
+        let object_ids = objects.iter().map(|(k, b)| object_id(*k, b)).collect();
         self.pending = Some(Pending {
             refs,
             objects,
+            object_ids,
             height,
         });
+    }
+
+    /// `#[doc(hidden)]` test seam: insert a watch straight into COMMITTED refs so
+    /// commit-time watch fan-out can be exercised before the watch op semantics
+    /// (task 10) land. moves the committed root (watches are refs state) — that is
+    /// fine for a test that only asserts the emitted notifications.
+    #[doc(hidden)]
+    pub fn insert_watch_for_test(&mut self, prefix: String, module_id: String) {
+        self.refs.watches.insert((prefix, module_id));
+    }
+
+    /// `#[doc(hidden)]` test seam: the committed head snapshot as 64-char hex —
+    /// the base a per-path-CAS test threads into a follow-up commit.
+    #[doc(hidden)]
+    pub fn committed_head_for_test(&self) -> Option<String> {
+        self.refs.head.as_ref().map(|h| to_hex(h))
     }
 
     // ---- op surface (semantics land in tasks 7/9/10) ------------------------
@@ -154,11 +202,12 @@ impl<S: ObjectStore> Fs<S> {
         let digest = object_id(Kind::Chunk, bytes);
 
         // already durable → no-op, no quota charge. either the committed odb holds
-        // it, or an earlier op THIS block already staged it: every chunk putblob
-        // buffers into pending.objects it inserts into staging in the same breath,
-        // so this O(1) staging membership check subsumes a pending.objects scan
-        // (and avoids re-hashing every buffered megabyte on each call).
-        if store.has(&digest) || pending.refs.staging.contains_key(&digest) {
+        // it, or an earlier op THIS block already buffered it — whether a prior
+        // putblob (also in staging) OR a prior commit that chunked the same bytes
+        // inline (in objects, NOT in staging). the per-block object index covers
+        // both cases, so a putblob after an inline commit of the same chunk
+        // no-ops instead of double-staging.
+        if store.has(&digest) || pending.object_ids.contains(&digest) {
             return Ok(());
         }
 
@@ -185,20 +234,65 @@ impl<S: ObjectStore> Fs<S> {
                 expires_at: height.saturating_add(STAGING_TTL_BLOCKS),
             },
         );
-        pending.objects.push((Kind::Chunk, bytes.to_vec()));
+        pending.push_object(Kind::Chunk, bytes.to_vec());
         Ok(())
     }
 
+    /// the atomic write path. validates the whole op against the base + the
+    /// effective head (per-path CAS), applies every change through a single lazy
+    /// [`TreeEdit`], builds the new tree + snapshot, and merges the result into
+    /// this block's pending overlay — all-or-nothing: nothing touches
+    /// `self.pending` until full success, so a rejected commit leaves the block
+    /// exactly as it was. returns the watch notifications the glue emits.
     pub fn commit(
         &mut self,
-        _actor: &str,
-        _height: u64,
-        _time: u64,
-        _base: Option<String>,
-        _message: String,
-        _changes: Vec<Change>,
+        actor: &str,
+        height: u64,
+        time: u64,
+        base: Option<String>,
+        message: String,
+        changes: Vec<Change>,
     ) -> Result<Vec<Notification>, String> {
-        Err(unimplemented_err())
+        self.require_pending(height);
+        // the scratch refs every commit mutation lands in — a clone of the pending
+        // view, swept at the top. merged back into pending only on full success.
+        let scratch = self
+            .pending
+            .as_ref()
+            .expect("require_pending set it")
+            .refs
+            .clone();
+
+        // all reads run over the committed odb PLUS this block's prior pending
+        // objects (in-block chaining: a later commit reads a snapshot an earlier
+        // commit produced this block). all writes accumulate into `built`, which
+        // is discarded untouched on any reject.
+        let built = {
+            let pending = self.pending.as_ref().expect("require_pending set it");
+            let store = Store {
+                store: &self.store,
+                pending: &pending.objects,
+            };
+            commit_apply(
+                &store,
+                &pending.object_ids,
+                scratch,
+                actor,
+                height,
+                time,
+                base,
+                message,
+                &changes,
+            )?
+        };
+
+        // merge on success — the single mutation point.
+        let pending = self.pending.as_mut().expect("require_pending set it");
+        pending.refs = built.refs;
+        for (kind, body) in built.objects {
+            pending.push_object(kind, body);
+        }
+        Ok(built.notifications)
     }
 
     pub fn pin(&mut self, _actor: &str, _snapshot: String, _name: String) -> Result<(), String> {
@@ -269,9 +363,21 @@ impl<S: ObjectStore> Fs<S> {
 
     // ---- read + sync surface (tasks 11/12/14) --------------------------------
 
-    /// committed state only — never the pending overlay.
-    pub fn query(&self, _q: FilesQuery) -> Result<FilesReply, String> {
-        Err(unimplemented_err())
+    /// committed state only — never the pending overlay. delegates to the pure
+    /// read side in `queries.rs`.
+    pub fn query(&self, q: FilesQuery) -> Result<FilesReply, String> {
+        crate::queries::query(self, q)
+    }
+
+    /// the committed object store — the read side (`queries.rs`) opens a
+    /// committed-only [`Store`] over it (no pending overlay).
+    pub(crate) fn store_ref(&self) -> &S {
+        &self.store
+    }
+
+    /// committed refs — the read side resolves snapshots against this view.
+    pub(crate) fn refs_view(&self) -> &Refs {
+        &self.refs
     }
 
     pub fn serve_sync(&self, _req: FilesSyncReq) -> Result<FilesSyncResp, String> {
@@ -307,4 +413,492 @@ impl<S: ObjectStore> Fs<S> {
     pub fn gc(&mut self) -> Result<u64, String> {
         Err(unimplemented_err())
     }
+}
+
+// ---- commit internals -------------------------------------------------------
+
+/// whether `id` names a snapshot resolvable in `refs`: the head, anywhere in the
+/// bounded history window, or a pinned snapshot. shared by base resolution
+/// (commit) and snapshot resolution (the stat query) — same membership rule.
+pub(crate) fn refs_contains_snapshot(refs: &Refs, id: &ObjectId) -> bool {
+    refs.head.as_ref() == Some(id)
+        || refs.window.contains(id)
+        || refs.pins.values().any(|p| &p.snapshot == id)
+}
+
+/// the fully-built result of a successful commit validation+apply pass, held in
+/// locals until the single merge into pending (all-or-nothing).
+struct CommitBuilt {
+    refs: Refs,
+    objects: StagedObjects,
+    notifications: Vec<Notification>,
+}
+
+/// one planned tree edit: validated up front, replayed onto the effective head
+/// in apply order. `Put` also carries the symlink case (with `EntryKind::Symlink`).
+enum EditOp {
+    Put { segs: Vec<String>, entry: TreeEntry },
+    Mkdir { segs: Vec<String> },
+    Rm { segs: Vec<String> },
+    Mv { from: Vec<String>, to: Vec<String> },
+}
+
+/// the pure commit engine — steps 1-11 of the brief over a read `store`, this
+/// block's prior-object index `pending_ids`, and a swept scratch `refs`. every
+/// write accumulates into locals (`objects`, the returned refs), so the caller
+/// discards the whole thing untouched on any reject: all-or-nothing by
+/// construction — `self.pending` is never touched here.
+#[allow(clippy::too_many_arguments)]
+fn commit_apply(
+    store: &Store,
+    pending_ids: &BTreeSet<ObjectId>,
+    mut refs: Refs,
+    actor: &str,
+    height: u64,
+    time: u64,
+    base: Option<String>,
+    message: String,
+    changes: &[Change],
+) -> Result<CommitBuilt, String> {
+    // step 0: the deterministic staging sweep, over the scratch. a reject never
+    // persists a half-applied sweep — production aborts the whole block, and an
+    // idempotent later op re-sweeps if the block continues.
+    sweep_expired(&mut refs, height);
+
+    // step 1: message + change-count bounds.
+    if message.len() > MAX_MESSAGE_BYTES {
+        return Err("files: commit message exceeds the byte cap".into());
+    }
+    if changes.is_empty() {
+        return Err("files: commit must carry at least one change".into());
+    }
+    if changes.len() > MAX_CHANGES_PER_COMMIT {
+        return Err("files: commit exceeds the change cap".into());
+    }
+
+    // step 2: resolve base -> its root tree. None = the empty tree (first commit /
+    // create-only). Some(hex) must resolve in the PENDING refs view (in-block
+    // chaining can base onto a snapshot committed earlier this same block).
+    let base_root: Option<ObjectId> = match &base {
+        None => None,
+        Some(hex) => {
+            let id = from_hex_32(hex)
+                .ok_or_else(|| "files: base snapshot not resolvable".to_string())?;
+            if !refs_contains_snapshot(&refs, &id) {
+                return Err("files: base snapshot not resolvable".into());
+            }
+            Some(snapshot_root_tree(store, &id)?)
+        }
+    };
+
+    // effective head = the pending refs head (in-block chaining): the CAS-compare
+    // and apply target, and the parent of the new snapshot.
+    let effective_head: Option<ObjectId> = refs.head;
+    let effective_root: Option<ObjectId> = match effective_head {
+        Some(h) => Some(snapshot_root_tree(store, &h)?),
+        None => None,
+    };
+
+    // steps 3-6: validate + plan every change. new objects accumulate in
+    // `objects`/`staged_ids`; `touched` (canonical joined path + segments) drives
+    // dedup, CAS and watch fan-out; `chunk_refs` drives staged-quota reclaim.
+    let mut objects: StagedObjects = Vec::new();
+    let mut staged_ids: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut plan: Vec<EditOp> = Vec::with_capacity(changes.len());
+    let mut touched: Vec<(String, Vec<String>)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut chunk_refs: Vec<ObjectId> = Vec::new();
+    let mut chunks_to_check: Vec<ObjectId> = Vec::new();
+    let mut inline_bytes: usize = 0;
+
+    for change in changes {
+        match change {
+            Change::Put {
+                path,
+                exec,
+                meta,
+                content,
+            } => {
+                // step 3: canonicalize + authority-check the written path.
+                let segs = canon_authorized(actor, path)?;
+                let joined = join_segs(&segs);
+                dedup(&mut seen, &joined)?; // step 4
+                validate_meta(meta)?; // step 8 meta caps, enforced before staging
+                let (fileobj_id, chunk_ids, size) = match content {
+                    Content::Inline { b64 } => {
+                        // step 5: strict base64, budget-summed.
+                        let bytes = STANDARD
+                            .decode(b64.as_bytes())
+                            .map_err(|_| "files: inline content is not valid base64".to_string())?;
+                        inline_bytes = inline_bytes
+                            .checked_add(bytes.len())
+                            .ok_or_else(|| "files: inline commit budget overflows".to_string())?;
+                        if inline_bytes > MAX_INLINE_COMMIT_BYTES {
+                            return Err("files: inline commit budget exceeded".into());
+                        }
+                        let chunk_ids =
+                            chunk_bytes(&bytes, store, pending_ids, &mut objects, &mut staged_ids);
+                        let fileobj_id = stage_fileobj(
+                            bytes.len() as u64,
+                            &chunk_ids,
+                            meta,
+                            store,
+                            pending_ids,
+                            &mut objects,
+                            &mut staged_ids,
+                        );
+                        (fileobj_id, chunk_ids, bytes.len() as u64)
+                    }
+                    Content::Chunks { size, chunks } => {
+                        // step 6: size/chunk consistency + hex parse; availability
+                        // is checked below once all inline chunks are known.
+                        let ids = validate_chunks(*size, chunks)?;
+                        chunks_to_check.extend_from_slice(&ids);
+                        let fileobj_id = stage_fileobj(
+                            *size,
+                            &ids,
+                            meta,
+                            store,
+                            pending_ids,
+                            &mut objects,
+                            &mut staged_ids,
+                        );
+                        (fileobj_id, ids, *size)
+                    }
+                };
+                chunk_refs.extend(chunk_ids);
+                touched.push((joined, segs.clone()));
+                plan.push(EditOp::Put {
+                    segs,
+                    entry: TreeEntry {
+                        kind: EntryKind::File,
+                        id: fileobj_id,
+                        exec: *exec,
+                        size,
+                    },
+                });
+            }
+            Change::Mkdir { path } => {
+                let segs = canon_authorized(actor, path)?;
+                let joined = join_segs(&segs);
+                dedup(&mut seen, &joined)?;
+                touched.push((joined, segs.clone()));
+                plan.push(EditOp::Mkdir { segs });
+            }
+            Change::Rm { path } => {
+                let segs = canon_authorized(actor, path)?;
+                let joined = join_segs(&segs);
+                dedup(&mut seen, &joined)?;
+                touched.push((joined, segs.clone()));
+                plan.push(EditOp::Rm { segs });
+            }
+            Change::Mv { from, to } => {
+                // both endpoints are written paths: canonicalized, authority-checked
+                // and dedup'd, and both feed CAS + watch fan-out.
+                let from_segs = canon_authorized(actor, from)?;
+                let to_segs = canon_authorized(actor, to)?;
+                let from_joined = join_segs(&from_segs);
+                let to_joined = join_segs(&to_segs);
+                dedup(&mut seen, &from_joined)?;
+                dedup(&mut seen, &to_joined)?;
+                touched.push((from_joined, from_segs.clone()));
+                touched.push((to_joined, to_segs.clone()));
+                plan.push(EditOp::Mv {
+                    from: from_segs,
+                    to: to_segs,
+                });
+            }
+            Change::Symlink { path, target } => {
+                let segs = canon_authorized(actor, path)?;
+                let joined = join_segs(&segs);
+                dedup(&mut seen, &joined)?;
+                if target.len() > MAX_SYMLINK_TARGET_BYTES {
+                    return Err("files: symlink target exceeds the byte cap".into());
+                }
+                // one chunk holds the target bytes; the FileObj points at it with
+                // the symlink's entry kind and size = target length.
+                let chunk_id = stage_object(
+                    Kind::Chunk,
+                    target.as_bytes().to_vec(),
+                    store,
+                    pending_ids,
+                    &mut objects,
+                    &mut staged_ids,
+                );
+                let fileobj = FileObj {
+                    size: target.len() as u64,
+                    chunks: vec![chunk_id],
+                    meta: BTreeMap::new(),
+                };
+                let fileobj_id = stage_object(
+                    Kind::File,
+                    fileobj.encode(),
+                    store,
+                    pending_ids,
+                    &mut objects,
+                    &mut staged_ids,
+                );
+                chunk_refs.push(chunk_id);
+                touched.push((joined, segs.clone()));
+                plan.push(EditOp::Put {
+                    segs,
+                    entry: TreeEntry {
+                        kind: EntryKind::Symlink,
+                        id: fileobj_id,
+                        exec: false,
+                        size: target.len() as u64,
+                    },
+                });
+            }
+        }
+    }
+
+    // step 6 (availability): every referenced chunk must be reachable — staged
+    // via putblob, durable in the odb, produced by a prior commit this block, or
+    // produced inline by THIS commit. checked after the plan pass so an inline
+    // chunk in a later change is visible to an earlier `Chunks` reference.
+    for id in &chunks_to_check {
+        let available = refs.staging.contains_key(id)
+            || pending_ids.contains(id)
+            || staged_ids.contains(id)
+            || store.store.has(id);
+        if !available {
+            return Err("files: chunk not available".into());
+        }
+    }
+
+    // step 7 (per-path CAS): every touched path must be byte-identical between the
+    // base tree and the effective head tree (full `TreeEntry` compare), else a
+    // concurrent change moved it since base — reject the whole commit.
+    for (joined, segs) in &touched {
+        if entry_at(store, base_root, segs)? != entry_at(store, effective_root, segs)? {
+            return Err(format!("files: conflict: {joined} changed since base"));
+        }
+    }
+
+    // step 8 (apply): replay the plan onto ONE lazy edit over the effective head —
+    // intra-commit directory reads ride the overlay, so the store view (committed
+    // odb + prior-block pending) is enough.
+    let mut edit = TreeEdit::load(store, effective_root);
+    for op in &plan {
+        match op {
+            EditOp::Put { segs, entry } => edit.put(store, segs, *entry)?,
+            EditOp::Mkdir { segs } => edit.mkdir(store, segs)?,
+            EditOp::Rm { segs } => edit.rm(store, segs)?,
+            EditOp::Mv { from, to } => edit.mv(store, from, to)?,
+        }
+    }
+
+    // step 9 (build + snapshot): finalize the tree — a fully-empty filesystem
+    // still needs a hashable root, so stage the canonical empty tree for it.
+    let root = match edit.build(&mut objects)? {
+        Some(id) => id,
+        None => {
+            let body = TreeObj {
+                entries: BTreeMap::new(),
+            }
+            .encode();
+            let id = object_id(Kind::Tree, &body);
+            if !staged_ids.contains(&id) && !pending_ids.contains(&id) && !store.store.has(&id) {
+                objects.push((Kind::Tree, body));
+                staged_ids.insert(id);
+            }
+            id
+        }
+    };
+    let snapshot = SnapshotObj {
+        root,
+        parent: effective_head,
+        author: actor.to_string(),
+        consensus_time: time,
+        height,
+        message,
+    };
+    let snap_body = snapshot.encode();
+    let snap_id = object_id(Kind::Snapshot, &snap_body);
+    objects.push((Kind::Snapshot, snap_body));
+
+    // step 10 (refs): advance head, push into the bounded window, and reclaim
+    // staged quota for every referenced chunk that WAS staged — its bytes are now
+    // tree-reachable. a chunk referenced straight from the odb was never staged,
+    // so it reclaims nothing.
+    refs.head = Some(snap_id);
+    refs.window.push_back(snap_id);
+    while refs.window.len() > HISTORY_WINDOW {
+        refs.window.pop_front();
+    }
+    for id in &chunk_refs {
+        refs.staging.remove(id);
+    }
+
+    // step 11 (watch fan-out): one notification per (touched path, watch) where
+    // the path is under the watch prefix. deterministic: touched paths in change
+    // order, watches in the refs BTreeSet order.
+    let snapshot_hex = to_hex(&snap_id);
+    let mut notifications = Vec::new();
+    for (joined, _segs) in &touched {
+        for (prefix, module_id) in &refs.watches {
+            if joined.starts_with(prefix.as_str()) {
+                notifications.push(Notification {
+                    module_id: module_id.clone(),
+                    prefix: prefix.clone(),
+                    path: joined.clone(),
+                    snapshot: snapshot_hex.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(CommitBuilt {
+        refs,
+        objects,
+        notifications,
+    })
+}
+
+/// canonicalize a written path and authority-check it for `actor`.
+fn canon_authorized(actor: &str, path: &str) -> Result<Vec<String>, String> {
+    let segs = canonical(path)?;
+    check_authority(actor, &segs)?;
+    Ok(segs)
+}
+
+/// the canonical joined form of a path's segments — the CAS/dedup/watch key.
+fn join_segs(segs: &[String]) -> String {
+    format!("/{}", segs.join("/"))
+}
+
+/// record a touched path for dedup; a second touch of the same path rejects
+/// (order-independence for CAS and apply). Mv touches two paths.
+fn dedup(seen: &mut BTreeSet<String>, joined: &str) -> Result<(), String> {
+    if !seen.insert(joined.to_string()) {
+        return Err("files: duplicate path in commit".into());
+    }
+    Ok(())
+}
+
+/// enforce the meta caps BEFORE any object is staged — reject, never truncate
+/// (the objects codec would also reject at decode, but we fail early and loudly).
+fn validate_meta(meta: &BTreeMap<String, String>) -> Result<(), String> {
+    if meta.len() > MAX_META_ENTRIES {
+        return Err("files: commit meta entry count over cap".into());
+    }
+    for (key, value) in meta {
+        if key.len() > MAX_META_KEY_BYTES {
+            return Err("files: commit meta key over cap".into());
+        }
+        if value.len() > MAX_META_VALUE_BYTES {
+            return Err("files: commit meta value over cap".into());
+        }
+    }
+    Ok(())
+}
+
+/// validate a `Content::Chunks` size/list pair and hex-parse every digest. size 0
+/// requires an EMPTY chunk list (empty files are legal in duckfs); otherwise the
+/// list length is pinned to ceil(size / CHUNK_SIZE) by checked span bounds
+/// `(n-1)*CHUNK_SIZE < size <= n*CHUNK_SIZE`.
+fn validate_chunks(size: u64, chunks: &[String]) -> Result<Vec<ObjectId>, String> {
+    if chunks.len() > MAX_CHUNKS_PER_FILE {
+        return Err("files: file chunk count over cap".into());
+    }
+    if size == 0 {
+        if !chunks.is_empty() {
+            return Err("files: an empty file must reference no chunks".into());
+        }
+        return Ok(Vec::new());
+    }
+    let n = chunks.len() as u64;
+    if n == 0 {
+        return Err("files: a non-empty file must reference at least one chunk".into());
+    }
+    let lower = (n - 1)
+        .checked_mul(CHUNK_SIZE)
+        .ok_or_else(|| "files: chunk span overflows".to_string())?;
+    let upper = n
+        .checked_mul(CHUNK_SIZE)
+        .ok_or_else(|| "files: chunk span overflows".to_string())?;
+    if size <= lower || size > upper {
+        return Err("files: file size inconsistent with its chunk count".into());
+    }
+    chunks
+        .iter()
+        .map(|hex| {
+            from_hex_32(hex).ok_or_else(|| "files: chunk digest is not valid hex".to_string())
+        })
+        .collect()
+}
+
+/// chunk `bytes` at CHUNK_SIZE boundaries into staged chunk objects, returning the
+/// ordered chunk ids. an empty file yields NO chunks — the FileObj carries size 0
+/// and an empty chunk list (empty files are legal).
+fn chunk_bytes(
+    bytes: &[u8],
+    store: &Store,
+    pending_ids: &BTreeSet<ObjectId>,
+    objects: &mut StagedObjects,
+    staged_ids: &mut BTreeSet<ObjectId>,
+) -> Vec<ObjectId> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    bytes
+        .chunks(CHUNK_SIZE as usize)
+        .map(|c| {
+            stage_object(
+                Kind::Chunk,
+                c.to_vec(),
+                store,
+                pending_ids,
+                objects,
+                staged_ids,
+            )
+        })
+        .collect()
+}
+
+/// build + stage a FileObj over `chunks`, returning its id.
+fn stage_fileobj(
+    size: u64,
+    chunks: &[ObjectId],
+    meta: &BTreeMap<String, String>,
+    store: &Store,
+    pending_ids: &BTreeSet<ObjectId>,
+    objects: &mut StagedObjects,
+    staged_ids: &mut BTreeSet<ObjectId>,
+) -> ObjectId {
+    let fileobj = FileObj {
+        size,
+        chunks: chunks.to_vec(),
+        meta: meta.clone(),
+    };
+    stage_object(
+        Kind::File,
+        fileobj.encode(),
+        store,
+        pending_ids,
+        objects,
+        staged_ids,
+    )
+}
+
+/// stage a content-addressed object into the local buffer, returning its id.
+/// skips the push when the bytes are already reachable (odb, a prior block-pending
+/// object, or already staged by this commit) — so an inline chunk that matches a
+/// putblob'd or prior-committed chunk is never buffered twice. its quota is still
+/// reclaimed by the caller via `chunk_refs`.
+fn stage_object(
+    kind: Kind,
+    body: Vec<u8>,
+    store: &Store,
+    pending_ids: &BTreeSet<ObjectId>,
+    objects: &mut StagedObjects,
+    staged_ids: &mut BTreeSet<ObjectId>,
+) -> ObjectId {
+    let id = object_id(kind, &body);
+    if !staged_ids.contains(&id) && !pending_ids.contains(&id) && !store.store.has(&id) {
+        objects.push((kind, body));
+        staged_ids.insert(id);
+    }
+    id
 }

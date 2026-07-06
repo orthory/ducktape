@@ -180,6 +180,121 @@ fn build_reencodes_only_the_touched_spine() {
 }
 
 #[test]
+fn mv_modified_subtree_leaves_no_dangling_ids() {
+    // binding requirement 2: moving a mid-commit-modified directory must move the
+    // NODE itself, never `get`+`rm`+`put`. a naive get+rm+put reads the modified
+    // dir's COMPUTED id (whose tree object is only staged at build), then rms the
+    // node so build never encodes it — the moved entry re-emits a dangling id. the
+    // node-move primitive keeps the materialized Dir under the new name, so build
+    // stages its tree object under the new location and nothing dangles.
+    let mut odb = MemStore::new();
+    let mut out = Vec::new();
+
+    // v1: /a/x and /a/y under /a.
+    let root1 = {
+        let store = Store {
+            store: &odb,
+            pending: &[],
+        };
+        let mut e = TreeEdit::load(&store, None);
+        e.put(&store, &segs("/a/x"), leaf([1; 32])).unwrap();
+        e.put(&store, &segs("/a/y"), leaf([2; 32])).unwrap();
+        e.build(&mut out).unwrap().unwrap()
+    };
+    for (k, b) in out.drain(..) {
+        odb.put(k, &b).unwrap();
+    }
+
+    // v2: modify /a (add /a/z — this MATERIALIZES /a into a Dir node), THEN mv /a
+    // to /b in the SAME edit session.
+    let root2 = {
+        let store = Store {
+            store: &odb,
+            pending: &[],
+        };
+        let mut e = TreeEdit::load(&store, Some(root1));
+        e.put(&store, &segs("/a/z"), leaf([3; 32])).unwrap();
+        e.mv(&store, &segs("/a"), &segs("/b")).unwrap();
+        e.build(&mut out).unwrap().unwrap()
+    };
+    for (k, b) in out.drain(..) {
+        odb.put(k, &b).unwrap();
+    }
+
+    let store = Store {
+        store: &odb,
+        pending: &[],
+    };
+    // /a is gone; the modified subtree lives at /b with all three children.
+    assert!(
+        entry_at(&store, Some(root2), &segs("/a"))
+            .unwrap()
+            .is_none()
+    );
+    for child in ["/b/x", "/b/y", "/b/z"] {
+        assert!(
+            entry_at(&store, Some(root2), &segs(child))
+                .unwrap()
+                .is_some(),
+            "{child} present after move"
+        );
+    }
+    // the load-bearing no-dangling assertion: every directory id reachable from
+    // the built root must resolve to a stored tree object (walk the whole tree).
+    assert_no_dangling(&odb, root2);
+}
+
+/// walk every directory reachable from `root`, asserting each dir's tree object
+/// is present in the store — the direct "no dangling ids" check.
+fn assert_no_dangling(odb: &MemStore, root: ObjectId) {
+    let (kind, body) = odb.get(&root).unwrap().expect("root tree resolves");
+    assert_eq!(kind, Kind::Tree, "root is a tree object");
+    let tree = TreeObj::decode(&body).unwrap();
+    for entry in tree.entries.values() {
+        if entry.kind == EntryKind::Dir {
+            assert_no_dangling(odb, entry.id);
+        }
+    }
+}
+
+#[test]
+fn mv_rejects_absent_source_present_dest_and_missing_dest_parent() {
+    let mut odb = MemStore::new();
+    let mut out = Vec::new();
+    let root1 = {
+        let store = Store {
+            store: &odb,
+            pending: &[],
+        };
+        let mut e = TreeEdit::load(&store, None);
+        e.put(&store, &segs("/a/x"), leaf([1; 32])).unwrap();
+        e.put(&store, &segs("/c/y"), leaf([2; 32])).unwrap();
+        e.build(&mut out).unwrap().unwrap()
+    };
+    for (k, b) in out.drain(..) {
+        odb.put(k, &b).unwrap();
+    }
+    let store = Store {
+        store: &odb,
+        pending: &[],
+    };
+    let mut e = TreeEdit::load(&store, Some(root1));
+    // source absent → reject.
+    assert!(e.mv(&store, &segs("/nope"), &segs("/c/z")).is_err());
+    // destination already present → reject.
+    assert!(e.mv(&store, &segs("/a/x"), &segs("/c/y")).is_err());
+    // destination parent does not exist → reject (NO auto-create; the deliberate
+    // asymmetry with put — moving into a missing dir is an error, like POSIX).
+    assert!(e.mv(&store, &segs("/a/x"), &segs("/missing/z")).is_err());
+    // moving a path into its own subtree would orphan it → reject.
+    assert!(e.mv(&store, &segs("/a"), &segs("/a/sub")).is_err());
+    // a legal move still works after the rejects (overlay left consistent).
+    e.mv(&store, &segs("/a/x"), &segs("/c/z")).unwrap();
+    assert!(e.get(&store, &segs("/a/x")).unwrap().is_none());
+    assert!(e.get(&store, &segs("/c/z")).unwrap().is_some());
+}
+
+#[test]
 fn empty_root_builds_to_none_and_round_trips() {
     let odb = MemStore::new();
     let mut out = Vec::new();

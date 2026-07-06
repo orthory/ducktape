@@ -106,6 +106,25 @@ impl Files {
     pub fn set_staging_quota_for_tests(&mut self, quota: u64) {
         self.fs.set_staging_quota_for_tests(quota);
     }
+
+    /// `#[doc(hidden)]` test seam: register a watch directly in committed refs so
+    /// commit-time watch fan-out can be exercised before the watch op (task 10).
+    #[doc(hidden)]
+    pub fn insert_watch_for_test(
+        &mut self,
+        prefix: impl Into<String>,
+        module_id: impl Into<String>,
+    ) {
+        self.fs
+            .insert_watch_for_test(prefix.into(), module_id.into());
+    }
+
+    /// `#[doc(hidden)]` test seam: the committed head snapshot as hex — the base a
+    /// per-path-CAS test threads into a follow-up commit.
+    #[doc(hidden)]
+    pub fn committed_head_for_test(&self) -> Option<String> {
+        self.fs.committed_head_for_test()
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -145,9 +164,7 @@ impl Module for Files {
                     message,
                     changes,
                 } => {
-                    // watch fan-out (task 9) turns each returned notification
-                    // into an emitted follow-up msg here.
-                    let _notifications = self
+                    let notifications = self
                         .fs
                         .commit(
                             &actor,
@@ -158,6 +175,24 @@ impl Module for Files {
                             changes,
                         )
                         .map_err(Error::Module)?;
+                    // watch fan-out: each notification becomes a follow-up msg at
+                    // the watching module, re-dispatched after this execute returns
+                    // (never a reentrant call). the payload is the task-9 shape the
+                    // FsCap `decode_notify` reads back.
+                    for n in notifications {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "duckfs_notify": {
+                                "prefix": n.prefix,
+                                "path": n.path,
+                                "snapshot": n.snapshot,
+                            }
+                        }))
+                        .expect("serde_json::Value serializes");
+                        ctx.emit_msg(Msg {
+                            target: n.module_id,
+                            payload,
+                        });
+                    }
                     Ok(())
                 }
                 FilesMsg::Pin { snapshot, name } => {
