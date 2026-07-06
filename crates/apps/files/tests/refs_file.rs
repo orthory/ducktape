@@ -233,14 +233,22 @@ fn module_restart_preserves_root_via_disk_refs() {
         // durably), then drop (a clean stop).
         let mut f = open_files(&d);
         let snapshot = files::encode_refs(&a_refs());
-        f.install(&snapshot, StateRoot(root_bytes(&a_refs())))
+        // install at a non-zero sync-target height; the reopen below proves both
+        // the root AND that height persist (the task-14 replay contract).
+        f.install(&snapshot, StateRoot(root_bytes(&a_refs())), 9)
             .unwrap();
         expected = f.root();
         assert_ne!(expected, StateRoot::ZERO);
     }
-    // re-open over the same dir: Files::open loads the durable refs → same root.
+    // re-open over the same dir: Files::open loads the durable refs → same root,
+    // and the sync-target height survives too (the fix-1 replay contract).
     let f2 = open_files(&d);
     assert_eq!(f2.root(), expected, "durable restart preserves the root");
+    assert_eq!(
+        f2.durable_height(),
+        9,
+        "install persists the sync-target height across restart"
+    );
 }
 
 #[test]
@@ -276,11 +284,11 @@ fn install_round_trips_and_rejects_wrong_root() {
     let mut f = open_files(&d);
     let snapshot = files::encode_refs(&a_refs());
     // install against the correct root succeeds...
-    f.install(&snapshot, StateRoot(root_bytes(&a_refs())))
+    f.install(&snapshot, StateRoot(root_bytes(&a_refs())), 1)
         .unwrap();
     assert_eq!(f.root(), StateRoot(root_bytes(&a_refs())));
     // ...and against a mismatched root (ZERO) rejects — a colluding image can
     // never adopt under a root it does not hash to.
     let mut g = open_files(&d);
-    assert!(g.install(&snapshot, StateRoot::ZERO).is_err());
+    assert!(g.install(&snapshot, StateRoot::ZERO, 1).is_err());
 }

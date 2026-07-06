@@ -317,6 +317,40 @@ pub fn verify_chunk_len(file: &FileObj, index: usize, got_len: u64) -> Result<()
     Ok(())
 }
 
+/// the file size/chunk-COUNT invariant, shared by commit validation and sync
+/// ingest (single source of truth): size 0 requires no chunks; a non-empty file
+/// needs exactly ceil(size / [`CHUNK_SIZE`]) chunks, pinned by the checked span
+/// bounds `(n-1)*CHUNK_SIZE < size <= n*CHUNK_SIZE`.
+///
+/// this checks only the COUNT, never the chunk BODIES — at ingest time the
+/// chunks a peer-synced FileObj names may not have arrived yet, so their lengths
+/// cannot be verified here. [`verify_chunk_len`] (charged at read time, when the
+/// bytes are in hand) closes that remaining gap. the two together stop a
+/// self-consistent-but-lying FileObj from spoofing a hole: the shape check
+/// rejects a wrong count, the length check rejects a short interior chunk.
+pub fn verify_file_shape(size: u64, chunk_count: usize) -> Result<(), String> {
+    if size == 0 {
+        if chunk_count != 0 {
+            return Err("files: an empty file must reference no chunks".into());
+        }
+        return Ok(());
+    }
+    let n = chunk_count as u64;
+    if n == 0 {
+        return Err("files: a non-empty file must reference at least one chunk".into());
+    }
+    let lower = (n - 1)
+        .checked_mul(CHUNK_SIZE)
+        .ok_or_else(|| "files: chunk span overflows".to_string())?;
+    let upper = n
+        .checked_mul(CHUNK_SIZE)
+        .ok_or_else(|| "files: chunk span overflows".to_string())?;
+    if size <= lower || size > upper {
+        return Err("files: file size inconsistent with its chunk count".into());
+    }
+    Ok(())
+}
+
 // ---- canonical codec helpers ------------------------------------------------
 //
 // every read advances a cursor and bounds-checks against the input; a field

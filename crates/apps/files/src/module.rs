@@ -85,13 +85,25 @@ impl Files {
     }
 
     /// verify-then-adopt a peer's refs image against the expected root, and
-    /// persist it immediately so a restart right after sync recovers it. it is
-    /// saved at the current per-node (height, gc_watermark); the sync-height
-    /// refinement lands with the node integration (task 14).
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
+    /// persist the envelope at the SYNC-TARGET `height`.
+    ///
+    /// # why the height is load-bearing (the replay contract)
+    ///
+    /// the durable-refs envelope records the last height whose refs are durable,
+    /// and recovery replays the module's op stream forward FROM that height. a
+    /// freshly-synced node adopts a snapshot captured at some boundary height H —
+    /// so if it crashed before its first `commit_block` and had persisted the refs
+    /// at its stale local height (0 on a fresh node), the restart would try to
+    /// replay the files op stream from genesis. that is impossible once the peer
+    /// has pruned pre-H history, and even where it is not, it re-derives a root the
+    /// node already holds. so we persist at H: a restart right after sync resumes
+    /// replay exactly at the boundary. the caller threads H from the checkpoint /
+    /// statesync manifest (`restore_host` / the join path in bin/node).
+    pub fn install(&mut self, bytes: &[u8], expected: StateRoot, height: u64) -> Result<(), Error> {
         self.fs
             .install_refs(bytes, expected.0)
             .map_err(Error::Module)?;
+        self.durable_height = height;
         self.refs_store
             .save(self.fs.refs(), self.durable_height, self.gc_watermark)
             .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
@@ -99,9 +111,49 @@ impl Files {
     }
 
     /// last height whose refs are durable — glue surface for the node sync
-    /// integration (task 14).
+    /// integration; set by [`Files::install`] to the sync-target height and by
+    /// `commit_block` to each committed height.
     pub fn durable_height(&self) -> u64 {
         self.durable_height
+    }
+
+    /// the ids of up to `limit` objects reachable from the committed refs but not
+    /// yet in the odb — the fetch driver's worklist. see [`Fs::missing_objects`].
+    pub fn missing_objects(&self, limit: usize) -> Result<Vec<crate::ObjectId>, Error> {
+        self.fs.missing_objects(limit).map_err(Error::Module)
+    }
+
+    /// verify-then-store a batch of fetched objects, then fsync the odb dirs ONCE
+    /// so the whole batch is durable. sync is a bulk path — a fresh node ingests
+    /// its entire object set through this — so the durability barrier is amortized
+    /// over the batch rather than paid per object (the [`Fs::ingest_object`] seam
+    /// is pure; the batch fsync is the glue's job, mirroring `commit_block` step
+    /// 3). every object is re-hashed and (for files) shape-checked before it lands.
+    pub fn ingest_objects(
+        &mut self,
+        batch: &[(crate::ObjectId, u8, Vec<u8>)],
+    ) -> Result<(), Error> {
+        for (id, kind, body) in batch {
+            self.fs
+                .ingest_object(id, *kind, body)
+                .map_err(Error::Module)?;
+        }
+        self.fs
+            .store_mut()
+            .sync_dirs()
+            .map_err(|e| Error::Module(format!("files: odb sync: {e}")))?;
+        Ok(())
+    }
+
+    /// whether the node holds every object its committed refs reach — the sync
+    /// terminator. `missing_objects(1)` is enough: a single reachable-but-absent
+    /// object means possession is incomplete.
+    pub fn possession_complete(&self) -> Result<bool, Error> {
+        Ok(self
+            .fs
+            .missing_objects(1)
+            .map_err(Error::Module)?
+            .is_empty())
     }
 
     /// `#[doc(hidden)]` test seam: stage a pending block directly so the real

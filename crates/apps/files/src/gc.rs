@@ -69,6 +69,128 @@ pub(crate) fn mark(refs: &Refs, store: &dyn ObjectStore) -> Result<BTreeSet<Obje
     Ok(live)
 }
 
+/// the reachability walk's twin for the self-heal lane (task 14): the ids of
+/// every object reachable from the SAME committed roots (head/window/pins/
+/// staging) that is NOT present in the store. where [`mark`] treats a missing
+/// reachable object as corruption and errors, `collect_missing` records it and
+/// stops descending — an absent object's children live inside its not-yet-fetched
+/// body, so they are undiscoverable until it arrives. the caller loops
+/// install -> missing -> fetch -> ingest until this is empty. determinism falls
+/// out of the `BTreeSet`s: the same committed state yields the same set.
+///
+/// a PRESENT object that fails to decode (or is the wrong kind at a graph edge)
+/// is genuine corruption, not absence, so it still surfaces as an Err — the
+/// caller must not paper over a torn object as merely "missing".
+pub(crate) fn collect_missing(
+    refs: &Refs,
+    store: &dyn ObjectStore,
+) -> Result<BTreeSet<ObjectId>, String> {
+    let mut visited = BTreeSet::new();
+    let mut missing = BTreeSet::new();
+    if let Some(head) = &refs.head {
+        collect_snapshot(head, store, &mut visited, &mut missing)?;
+    }
+    for snapshot in &refs.window {
+        collect_snapshot(snapshot, store, &mut visited, &mut missing)?;
+    }
+    for pin in refs.pins.values() {
+        collect_snapshot(&pin.snapshot, store, &mut visited, &mut missing)?;
+    }
+    for digest in refs.staging.keys() {
+        collect_chunk(digest, store, &mut visited, &mut missing);
+    }
+    Ok(missing)
+}
+
+/// walk a snapshot root for [`collect_missing`]: absent -> record and stop;
+/// present -> decode and descend into its committed root tree (never its parent,
+/// per the gc edge rules above).
+fn collect_snapshot(
+    id: &ObjectId,
+    store: &dyn ObjectStore,
+    visited: &mut BTreeSet<ObjectId>,
+    missing: &mut BTreeSet<ObjectId>,
+) -> Result<(), String> {
+    if !visited.insert(*id) {
+        return Ok(());
+    }
+    if !store.has(id) {
+        missing.insert(*id);
+        return Ok(());
+    }
+    let body = fetch(store, id, Kind::Snapshot)?;
+    let snapshot = SnapshotObj::decode(&body)?;
+    collect_tree(&snapshot.root, store, visited, missing)
+}
+
+/// walk a tree for [`collect_missing`]: absent -> record and stop; present ->
+/// decode and recurse (dir entries into subtrees, file/symlink into FileObjs).
+fn collect_tree(
+    id: &ObjectId,
+    store: &dyn ObjectStore,
+    visited: &mut BTreeSet<ObjectId>,
+    missing: &mut BTreeSet<ObjectId>,
+) -> Result<(), String> {
+    if !visited.insert(*id) {
+        return Ok(());
+    }
+    if !store.has(id) {
+        missing.insert(*id);
+        return Ok(());
+    }
+    let body = fetch(store, id, Kind::Tree)?;
+    let tree = TreeObj::decode(&body)?;
+    for entry in tree.entries.values() {
+        match entry.kind {
+            EntryKind::Dir => collect_tree(&entry.id, store, visited, missing)?,
+            EntryKind::File | EntryKind::Symlink => {
+                collect_file(&entry.id, store, visited, missing)?
+            }
+        }
+    }
+    Ok(())
+}
+
+/// walk a FileObj for [`collect_missing`]: absent -> record and stop; present ->
+/// decode and record/descend each chunk it names.
+fn collect_file(
+    id: &ObjectId,
+    store: &dyn ObjectStore,
+    visited: &mut BTreeSet<ObjectId>,
+    missing: &mut BTreeSet<ObjectId>,
+) -> Result<(), String> {
+    if !visited.insert(*id) {
+        return Ok(());
+    }
+    if !store.has(id) {
+        missing.insert(*id);
+        return Ok(());
+    }
+    let body = fetch(store, id, Kind::File)?;
+    let file = FileObj::decode(&body)?;
+    for chunk in &file.chunks {
+        collect_chunk(chunk, store, visited, missing);
+    }
+    Ok(())
+}
+
+/// record a chunk leaf for [`collect_missing`] if it is absent. a chunk has no
+/// children, so a present chunk is nothing more to do — and its BYTES are not
+/// verified here (that is the read side's job), so this never errors.
+fn collect_chunk(
+    id: &ObjectId,
+    store: &dyn ObjectStore,
+    visited: &mut BTreeSet<ObjectId>,
+    missing: &mut BTreeSet<ObjectId>,
+) {
+    if !visited.insert(*id) {
+        return;
+    }
+    if !store.has(id) {
+        missing.insert(*id);
+    }
+}
+
 /// mark a snapshot root and walk its committed root tree (never its parent).
 fn mark_snapshot(
     id: &ObjectId,

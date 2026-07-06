@@ -32,6 +32,10 @@ pub const MAX_WATCH_MODULE_ID_BYTES: usize = 128;
 pub const HISTORY_WINDOW: usize = 1024;
 pub const GC_PERIOD_BLOCKS: u64 = 1024;
 pub const MAX_PAGE: u64 = 256;
+/// the `GetObjects` request id cap — a sync fetch beyond this rejects ("too many
+/// ids"). one batch is a page of ids, so it mirrors [`MAX_PAGE`]; the fetch loop
+/// pages through larger missing sets a batch at a time.
+pub const MAX_SYNC_IDS: usize = MAX_PAGE as usize;
 pub const MAX_READ_BYTES: u64 = 1024 * 1024;
 pub const MAX_GREP_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_GREP_LINE_BYTES: usize = 256;

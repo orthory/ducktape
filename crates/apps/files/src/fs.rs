@@ -10,6 +10,7 @@ use base64::engine::general_purpose::STANDARD;
 
 use crate::objects::{
     EntryKind, FileObj, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj, object_id,
+    verify_file_shape,
 };
 use crate::paths::{canonical, check_authority};
 use crate::state::{PinEntry, Refs, Staged, decode_refs, encode_refs, root_bytes};
@@ -19,9 +20,9 @@ use crate::wire::{
     CHUNK_SIZE, Change, Content, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp,
     HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_GREP_SCAN_BYTES,
     MAX_INLINE_COMMIT_BYTES, MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
-    MAX_META_VALUE_BYTES, MAX_PIN_NAME_BYTES, MAX_PINS, MAX_SYMLINK_TARGET_BYTES,
-    MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, from_hex_32,
-    to_hex,
+    MAX_META_VALUE_BYTES, MAX_PIN_NAME_BYTES, MAX_PINS, MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS,
+    MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, SyncObject,
+    from_hex_32, to_hex,
 };
 
 pub struct Fs<S: ObjectStore> {
@@ -79,10 +80,6 @@ pub struct Notification {
     pub prefix: String,
     pub path: String,
     pub snapshot: String,
-}
-
-fn unimplemented_err() -> String {
-    "files: unimplemented".into()
 }
 
 /// remove every staging entry whose ttl has elapsed at `height`. the condition
@@ -557,8 +554,45 @@ impl<S: ObjectStore> Fs<S> {
         &self.refs
     }
 
-    pub fn serve_sync(&self, _req: FilesSyncReq) -> Result<FilesSyncResp, String> {
-        Err(unimplemented_err())
+    /// answer an off-block object fetch from the COMMITTED odb. `GetObjects`
+    /// returns, in request order, a [`SyncObject`] per id: absent ids come back
+    /// `present: false` (the caller keeps them queued for a later round), present
+    /// ids carry the kind tag byte and the standard-base64 body. strictness is
+    /// uniform — beyond [`MAX_SYNC_IDS`] rejects, and any non-hex id rejects the
+    /// WHOLE request (a malformed batch is a client bug, not a per-id absence).
+    pub fn serve_sync(&self, req: FilesSyncReq) -> Result<FilesSyncResp, String> {
+        match req {
+            FilesSyncReq::GetObjects { ids } => {
+                if ids.len() > MAX_SYNC_IDS {
+                    return Err("files: too many ids".into());
+                }
+                let mut out = Vec::with_capacity(ids.len());
+                for hex in &ids {
+                    // one bad id rejects the batch — the same all-or-nothing
+                    // strictness the object/refs codecs use, so a caller can never
+                    // silently drop a mistyped id as a phantom "absent".
+                    let id =
+                        from_hex_32(hex).ok_or_else(|| "files: sync id is not hex".to_string())?;
+                    match self.store.get(&id)? {
+                        Some((kind, body)) => out.push(SyncObject {
+                            // re-render the id so the reply is canonical lowercase
+                            // hex regardless of how the request framed it.
+                            id: to_hex(&id),
+                            present: true,
+                            kind: kind.tag(),
+                            b64: STANDARD.encode(&body),
+                        }),
+                        None => out.push(SyncObject {
+                            id: to_hex(&id),
+                            present: false,
+                            kind: 0,
+                            b64: String::new(),
+                        }),
+                    }
+                }
+                Ok(FilesSyncResp::Objects(out))
+            }
+        }
     }
 
     /// the exact `root_bytes` preimage — what the snapshot lane ships.
@@ -578,12 +612,46 @@ impl<S: ObjectStore> Fs<S> {
         Ok(())
     }
 
-    pub fn missing_objects(&self, _limit: usize) -> Result<Vec<ObjectId>, String> {
-        Err(unimplemented_err())
+    /// the ids of up to `limit` objects reachable from the committed gc roots but
+    /// NOT yet in the odb, in deterministic (sorted) order. it is the exact gc
+    /// reachability walk (head/window/pins/staging), but it COLLECTS absent ids
+    /// instead of erroring on them — that is the point of the self-heal lane.
+    ///
+    /// children of a missing parent are undiscoverable this round (their ids live
+    /// inside the parent's not-yet-fetched body), so the caller iterates: install
+    /// refs, then loop { missing -> GetObjects -> ingest } until this returns
+    /// empty. each round fetches at least the newly-revealed layer, so the store
+    /// strictly grows and the loop cannot livelock. a present-but-corrupt object
+    /// is NOT absence — it surfaces as an Err (the same signal gc's mark raises),
+    /// never as a phantom "missing".
+    pub fn missing_objects(&self, limit: usize) -> Result<Vec<ObjectId>, String> {
+        let missing = crate::gc::collect_missing(&self.refs, &self.store)?;
+        // sorted (BTreeSet) then truncated: two calls over the same state return
+        // the identical prefix, so the caller never livelocks on order churn.
+        Ok(missing.into_iter().take(limit).collect())
     }
 
-    pub fn ingest_object(&mut self, _id: &ObjectId, _kind: u8, _body: &[u8]) -> Result<(), String> {
-        Err(unimplemented_err())
+    /// verify-then-store one fetched object. the id must re-derive from the bytes
+    /// (`object_id(kind, body) == *id`) or the object is rejected — the
+    /// dishonest-server rule: a peer cannot smuggle bytes under an id they do not
+    /// hash to. a `File` object's declared size/chunk-COUNT shape is validated
+    /// here too (fix 2a): content-addressing alone does NOT capture the
+    /// size/chunk-count invariant, so a self-consistent FileObj could otherwise
+    /// claim a size its chunk list cannot cover. chunk LENGTHS stay unvalidated
+    /// here (the chunks may not have arrived yet) — the read side closes that hole
+    /// per-chunk. pure: the caller (glue) fsyncs the batch for durability.
+    pub fn ingest_object(&mut self, id: &ObjectId, kind: u8, body: &[u8]) -> Result<(), String> {
+        let kind = Kind::from_u8(kind).ok_or_else(|| "files: ingest unknown kind".to_string())?;
+        if object_id(kind, body) != *id {
+            return Err("files: object id mismatch".into());
+        }
+        if kind == Kind::File {
+            let file = FileObj::decode(body)?;
+            verify_file_shape(file.size, file.chunks.len())
+                .map_err(|_| "ingest: file object size/chunk shape invalid".to_string())?;
+        }
+        self.store.put(kind, body)?;
+        Ok(())
     }
 
     /// mark + sweep over COMMITTED state now; the CALLER (the glue) decides WHEN
@@ -1043,25 +1111,9 @@ fn validate_chunks(size: u64, chunks: &[String]) -> Result<Vec<ObjectId>, String
     if chunks.len() > MAX_CHUNKS_PER_FILE {
         return Err("files: file chunk count over cap".into());
     }
-    if size == 0 {
-        if !chunks.is_empty() {
-            return Err("files: an empty file must reference no chunks".into());
-        }
-        return Ok(Vec::new());
-    }
-    let n = chunks.len() as u64;
-    if n == 0 {
-        return Err("files: a non-empty file must reference at least one chunk".into());
-    }
-    let lower = (n - 1)
-        .checked_mul(CHUNK_SIZE)
-        .ok_or_else(|| "files: chunk span overflows".to_string())?;
-    let upper = n
-        .checked_mul(CHUNK_SIZE)
-        .ok_or_else(|| "files: chunk span overflows".to_string())?;
-    if size <= lower || size > upper {
-        return Err("files: file size inconsistent with its chunk count".into());
-    }
+    // the size/chunk-count invariant is shared with sync ingest, so it lives in
+    // one place ([`verify_file_shape`]) rather than being duplicated here.
+    verify_file_shape(size, chunks.len())?;
     chunks
         .iter()
         .map(|hex| {

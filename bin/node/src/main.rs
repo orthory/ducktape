@@ -805,8 +805,12 @@ async fn restore_host(
     let mut files =
         Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
     let (bytes, root) = snapshot_of("files")?;
+    // duckfs persists its refs envelope at the checkpoint height so a crash right
+    // after restore resumes replay from the boundary, not genesis (an already-
+    // pruned op stream). `manifest.height` is None only at genesis (nothing
+    // applied) → height 0.
     files
-        .install(bytes, root)
+        .install(bytes, root, manifest.height.unwrap_or(0))
         .map_err(|e| format!("files install: {e}"))?;
 
     let mut memory = Memory::new("memory");
@@ -1062,8 +1066,10 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let (bytes, root) = snapshot_of("files").await?;
     let mut files =
         Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
+    // persist the refs envelope at the synced boundary height (see restore_host):
+    // a restart right after a state-sync join resumes replay from the boundary.
     files
-        .install(&bytes, root)
+        .install(&bytes, root, manifest.height)
         .map_err(|e| format!("files install: {e}"))?;
 
     let (bytes, root) = snapshot_of("memory").await?;

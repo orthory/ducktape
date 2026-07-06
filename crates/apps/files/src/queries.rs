@@ -11,7 +11,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
 use crate::fs::{Fs, refs_contains_snapshot};
-use crate::objects::{EntryKind, FileObj, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj};
+use crate::objects::{
+    EntryKind, FileObj, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj, verify_chunk_len,
+};
 use crate::paths::canonical;
 use crate::store::ObjectStore;
 use crate::tree::{Store, entry_at, snapshot_root_tree};
@@ -817,6 +819,14 @@ fn read_range(store: &Store, file: &FileObj, offset: u64, len: u64) -> Result<Ve
         if kind != Kind::Chunk {
             return Err("files: expected a chunk object".into());
         }
+        // fix 2b (silent-corruption defense): content-addressing pins a chunk's
+        // BYTES but not its LENGTH-in-context, so a peer-synced FileObj could name
+        // a short interior chunk that hashes correctly yet leaves a hole. reject it
+        // here, in hand of the bytes: an interior chunk must be exactly CHUNK_SIZE
+        // and the last exactly `size - (n-1)*CHUNK_SIZE`, so a misaligned read is
+        // an Err, never silently-wrong bytes.
+        verify_chunk_len(file, index, body.len() as u64)
+            .map_err(|_| format!("files: chunk length inconsistent: {}", to_hex(chunk_id)))?;
         // intersect the requested range with this chunk's byte span and copy it.
         let chunk_start = index as u64 * CHUNK_SIZE;
         let chunk_end = chunk_start + body.len() as u64;
