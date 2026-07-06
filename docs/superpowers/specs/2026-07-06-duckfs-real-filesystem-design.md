@@ -252,7 +252,7 @@ the root.
 ## Modularization and wasm readiness
 
 duckfs ships as ONE crate — `files` — whose pure core is enforced by a cargo
-feature rather than a crate boundary, plus the small `fscap` capability crate:
+feature rather than a crate boundary:
 
 - **`crates/apps/files`, always-compiled core** (the wasm migration unit):
   wire types, objects, canonical paths, refs/root, CoW tree engine, the
@@ -268,8 +268,8 @@ feature rather than a crate boundary, plus the small `fscap` capability crate:
   sdk glue — the `Files` type implementing `sdk::Module`, origin→owner
   mapping, watch-notification emission. The sdk/async-trait dependencies are
   optional and enabled only by this feature.
-- **`crates/apps/fscap`** — the fs capability over the module-injected
-  interface (below).
+- **`crates/apps/files`, `native` feature, `cap.rs`**: the fs capability over
+  the module-injected interface (below) — `files::FsCap`.
 
 The wasm-readiness proof is a standing build gate, not a promise:
 `cargo check -p files --no-default-features` must stay green — it compiles
@@ -279,12 +279,13 @@ leak into the core.
 ## The fs capability (module-injected interface)
 
 Modules gain a typed filesystem capability through the interface they already
-receive, with no new host machinery. It ships as `fscap` (the kernel
-`sdk` cannot depend on app wire types; the capability is still injected via
-`Ctx`, which is the interface every module already holds):
+receive, with no new host machinery. It ships as `files::FsCap` (native
+feature): the capability is injected via `Ctx` — the interface every module
+already holds — and consumer modules take a normal dependency on the files
+crate, the same way the capability module depends on valset:
 
 - **Reads** are deterministic during execute today via `Ctx::query` routed to
-  the files module. `fscap::FsCap<'a>` wraps `&'a dyn Ctx` with typed
+  the files module. `files::FsCap<'a>` wraps `&'a dyn Ctx` with typed
   methods — `stat`, `ls`, `read`, `find`, `grep`, `history`, `refs` — that
   encode/decode the files wire internally. Committed state as of dispatch
   start, same as any cross-module query.
@@ -297,9 +298,9 @@ receive, with no new host machinery. It ships as `fscap` (the kernel
   a watch through `FsCap::watch` and receives change ops on its own execute
   path.
 
-Because `FsCap` is pure sugar over `Ctx`, it compiles anywhere `Ctx` exists —
-including a future wasm module ABI. Its wire types come from the files crate compiled
-with `default-features = false` — exactly the pure core, nothing native.
+Because `FsCap` is pure sugar over `Ctx`, it moves unchanged onto whatever
+Ctx-shim a future wasm module ABI provides; today it rides the same `native`
+feature as the rest of the sdk-facing surface.
 
 ## Client stack
 
@@ -397,7 +398,7 @@ Rust crate shared by CLI, daemon, and sandbox runner; TS mirror for the app.
 ## Implementation shape (for the planning step)
 
 New/changed surfaces: `crates/apps/files` (single crate: pure core +
-`native` feature) + `crates/apps/fscap` (per the modularization section), `crates/apps/memory` (deleted), a new `duckfs-client` crate, noded (blob-receipt store internalized; duckfs HTTP
+`native` feature incl. `FsCap`, per the modularization section), `crates/apps/memory` (deleted), a new `duckfs-client` crate, noded (blob-receipt store internalized; duckfs HTTP
 endpoints; sandbox workspace RPC), bin/node + bin/demo registration sites,
 kernel statesync resolver wiring for `duckfs-odb`, app TS client + FilesView,
 docs (en+ko module pages). Branching per `.project/work.md`: worktree from

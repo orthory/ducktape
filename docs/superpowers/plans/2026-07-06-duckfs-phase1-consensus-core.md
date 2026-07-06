@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rewrite the files module as the duckfs consensus core — split as one `files` crate (pure wasm-ready core + default-on `native` feature for disk backend and sdk glue) + `fscap` (typed module capability): a content-addressed CoW filesystem (chunk/file/tree/snapshot objects on a disk odb, root over refs) with PutBlob staging, atomic Commit with per-path CAS, pins, watches, snapshot-addressable queries, deterministic GC, and an object-fetch sync lane — crate green in the workspace, old CAS wire deleted flag-day.
+**Goal:** Rewrite the files module as the duckfs consensus core — split as one `files` crate: pure wasm-ready core + default-on `native` feature carrying disk backend, sdk glue, and the typed `FsCap` module capability: a content-addressed CoW filesystem (chunk/file/tree/snapshot objects on a disk odb, root over refs) with PutBlob staging, atomic Commit with per-path CAS, pins, watches, snapshot-addressable queries, deterministic GC, and an object-fetch sync lane — crate green in the workspace, old CAS wire deleted flag-day.
 
 **Architecture:** Pure state machine (feature-gated core of `files`: no std::fs/sdk/async) over `ObjectStore`/`RefsStore` traits; native disk backend behind them; immutable content-addressed objects on a loose-object store; all mutable state (live head, pins, history window, staging, watches) in one small `Refs` struct whose canonical encoding is the `root()` preimage; execute stages into a pending block buffer, `commit_block` persists objects + refs file atomically (disk-cohort discipline).
 
@@ -26,11 +26,11 @@
 - Every cap is enforced at execute time with **rejection** (`Error::Module`), so an oversized value never enters the root preimage.
 - Determinism: no wall clock, no `HashMap` iteration order in any consensus path (use `BTreeMap`/`BTreeSet`), no OS-filesystem semantics in state (the odb is a byte bucket only).
 - Comment style: lowercase, explain constraints not mechanics (match existing crate docblocks).
-- Gates per task: `cargo test -p files -p fscap` green (crates that exist yet), `cargo check -p files --no-default-features` green (wasm-purity gate, from Task 2 on), and `cargo check --workspace` green for tasks that touch anything outside these crates. `cargo fmt -p files -p fscap -- --check` clean.
+- Gates per task: `cargo test -p files` green, `cargo check -p files --no-default-features` green (wasm-purity gate, from Task 2 on), and `cargo check --workspace` green for tasks that touch anything outside the crate. `cargo fmt -p files -- --check` clean.
 - Network constants (from spec, verbatim): chunk size **1 MiB** fixed; name ≤ 255 B; path ≤ 4,096 B; depth ≤ 128; dir entries ≤ 65,536; inline commit bytes ≤ 256 KiB; changed paths/commit ≤ 4,096; message ≤ 4 KiB; meta ≤ 16×(64 B,256 B); staging quota 1 GiB/owner, TTL 4,096 blocks; pins ≤ 1,024; history window 1,024; GC every 1,024 blocks; query page ≤ 256 + cursor; chunks/file ≤ 4,194,304 (2²²).
 - Authority: `/home/<owner>/**` writable only by matching origin-derived owner (`Origin::Module(id)` → `id`, `Origin::External(b)` → `"ext:" + lowercase hex`, `Origin::System` → `"system"`); `/shared/**` writable by any origin; System writes anywhere; all other roots reject writes.
 
-## REVISION C (binding; supersedes Revision B): one crate, feature-gated purity
+## REVISION D (binding; supersedes Revisions B/C): ONE crate, feature-gated purity
 
 This revision **overrides file paths and some struct shapes in Tasks 2–15**
 and adds Task 16. duckfs ships as ONE crate — `files` — with the pure core
@@ -65,15 +65,15 @@ and adds Task 16. duckfs ships as ONE crate — `files` — with the pure core
   (read side of Tasks 9/11/12), `gc.rs` (Task 13).
 
   Native-gated modules (`#[cfg(feature = "native")]`): `disk.rs` (Task 5 odb
-  semantics as `DiskStore` + Task 6 refs-file envelope as `DiskRefs`) and
-  `module.rs` (the `Files` type implementing `sdk::Module`, `owner_of`,
+  semantics as `DiskStore` + Task 6 refs-file envelope as `DiskRefs`),
+  `cap.rs` (Task 16 `FsCap`), and `module.rs` (the `Files` type implementing `sdk::Module`, `owner_of`,
   error mapping `String` → `Error::Module("files: ..")`, watch-notification
   emission via `ctx.emit_msg`, GC watermark trigger in `commit_block`).
   `lib.rs` wires it together and re-exports so `files::Files`,
   `files::FilesMsg`, `files::ObjectStore` etc. all resolve.
 
-- `crates/apps/fscap` — Task 16; depends on `sdk` + `files` with
-  `default-features = false` (pure wire only).
+- The fs capability (Task 16) is `files::FsCap` in `cap.rs`, gated by the
+  same `native` feature (it wraps `sdk::Ctx`). No separate crate.
 
 **Purity gate (add to every task's gates):**
 `cargo check -p files --no-default-features` green. Any `std::fs`, sdk, or
@@ -160,21 +160,19 @@ lives in the glue (`module.rs` `commit_block`) — per-node bookkeeping.
 | `gc.rs` (Task 13) | same path, pure (`Fs::gc`); watermark trigger in `module.rs`. Tests as written via `testkit::force_gc`. |
 | `sync.rs` (Task 14) | core `Fs` methods above (no separate sync.rs needed — fold into `fs.rs`); glue exposes `Files::{snapshot_refs, install_refs, missing_objects, ingest_object, possession_complete, durable_height}` delegating. Tests as written. |
 
-Gates: `cargo test -p files -p fscap` (crates that exist yet) + the purity
-gate above + `cargo check --workspace` when anything outside is touched.
+Gates: `cargo test -p files` + the purity gate above + `cargo check
+--workspace` when anything outside is touched.
 
 ---
 
-### Task 16: fs capability over the module-injected interface (`fscap`)
+### Task 16: fs capability over the module-injected interface (`files::FsCap`)
 
 Modules read duckfs through `Ctx::query` and write through `emit_msg` — this
 crate makes that a typed capability (spec §"The fs capability").
 
 **Files:**
-- Create: `crates/apps/fscap/Cargo.toml` (deps: `sdk`, `files` with `default-features = false`, `serde_json`, `base64`)
-- Create: `crates/apps/fscap/src/lib.rs`
-- Test: `crates/apps/fscap/tests/cap.rs`
-- Modify: workspace `Cargo.toml` members
+- Create: `crates/apps/files/src/cap.rs` (`#[cfg(feature = "native")]`, re-exported as `files::FsCap`)
+- Test: `crates/apps/files/tests/cap.rs`
 
 **Interfaces:**
 - Produces:
@@ -185,7 +183,7 @@ crate makes that a typed capability (spec §"The fs capability").
 //! come back as follow-up ops under the EMITTING module's origin, so
 //! /home/<module-id>/** authority applies naturally.
 
-use files::*;
+use crate::wire::*;
 use sdk::{Ctx, Error, Msg};
 
 pub struct FsCap<'a> {
@@ -222,13 +220,13 @@ pub struct Notify { pub prefix: String, pub path: String, pub snapshot: String }
   exist at the empty base AND does not exist at head (per-path CAS) — i.e. it
   is create-only sugar; document that mutation flows must `refs()` +
   `commit(base = head)`.
-- Consumes: `files` (pure core wire), `sdk::{Ctx, Msg, Error}`. The test needs the real module: use a path dev-dependency on `files` WITH default features for the tests only.
+- Consumes: the crate's own wire types and `sdk::{Ctx, Msg, Error}`. The test drives a real `Files` module over a tempdir through a fake `Ctx` — all in-crate.
 
 - [ ] **Step 1: Failing test** — in-crate fake `Ctx` whose `query` routes to a real `Files` module (over a tempdir) and whose `emit_msg` collects: seed duckfs with two files via direct module execute; `FsCap::stat`/`ls`/`read_all`/`refs` round-trip typed values; `FsCap::commit` + `pin` emit correctly-shaped `FilesMsg` JSON to target `files`; `decode_notify` round-trips a Task 9-shaped `duckfs_notify` payload and returns `None` on foreign payloads.
-- [ ] **Step 2: Run to fail** → `cargo test -p fscap` FAIL.
+- [ ] **Step 2: Run to fail** → `cargo test -p files --test cap` FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** → PASS; `cargo check --workspace`.
-- [ ] **Step 5: Commit** — `feat(duckfs): typed fs capability over the module ctx (fscap)`.
+- [ ] **Step 5: Commit** — `feat(duckfs): typed fs capability over the module ctx (files::FsCap)`.
 
 ---
 
