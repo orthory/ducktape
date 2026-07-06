@@ -5,13 +5,24 @@ import type { TargetThreads, ThreadView } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
 import { color, font, radius } from "../../theme/tokens";
 
+/** What the new-thread composer is aimed at: the target id the thread will
+ *  anchor to, plus a human label ("this page" / "this block") for the header. */
+export interface ComposerTarget {
+  target: string;
+  label: string;
+}
+
 /** The right-hand comments panel: every thread on the open page (grouped
  *  flat), each with its comments, a reply composer, resolve/reopen, and
- *  edit/delete (the module enforces author-only). */
+ *  edit/delete (the module enforces author-only). When `composer` is set, a
+ *  new-thread composer for that target renders above the thread list. */
 export function CommentsPanel({
   threads,
   authorNames,
+  composer,
   onClose,
+  onSubmitNew,
+  onCancelNew,
   onReply,
   onResolve,
   onEdit,
@@ -19,7 +30,10 @@ export function CommentsPanel({
 }: {
   threads: TargetThreads[];
   authorNames: AuthorNames;
+  composer: ComposerTarget | null;
   onClose: () => void;
+  onSubmitNew: (target: string, text: string) => void;
+  onCancelNew: () => void;
   onReply: (threadId: string, text: string) => void;
   onResolve: (threadId: string, resolved: boolean) => void;
   onEdit: (commentId: string, text: string) => void;
@@ -75,7 +89,15 @@ export function CommentsPanel({
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "10px 0" }}>
-        {flat.length === 0 ? (
+        {composer ? (
+          <NewThreadComposer
+            key={composer.target}
+            composer={composer}
+            onSubmit={onSubmitNew}
+            onCancel={onCancelNew}
+          />
+        ) : null}
+        {flat.length === 0 && !composer ? (
           <div
             style={{
               margin: "10px 16px",
@@ -104,6 +126,65 @@ export function CommentsPanel({
         )}
       </div>
     </aside>
+  );
+}
+
+/** Composer for opening a NEW thread on a block or the page. Autofocused so
+ *  the "Comment" affordances drop the user straight into typing; Enter
+ *  submits, Shift+Enter breaks a line (comments render pre-wrap). */
+function NewThreadComposer({
+  composer,
+  onSubmit,
+  onCancel,
+}: {
+  composer: ComposerTarget;
+  onSubmit: (target: string, text: string) => void;
+  onCancel: () => void;
+}) {
+  const [text, setText] = useState("");
+  const submit = () => {
+    if (text.trim()) onSubmit(composer.target, text);
+  };
+  return (
+    <div
+      role="form"
+      aria-label={`New comment on ${composer.label}`}
+      style={{
+        margin: "8px 12px",
+        padding: "10px 12px",
+        border: `1px solid ${color.borderStrong}`,
+        borderRadius: radius.md,
+        background: color.paper,
+      }}
+    >
+      <div style={{ font: `600 11.5px ${font.sans}`, color: color.ink, marginBottom: 6 }}>
+        New comment on {composer.label}
+      </div>
+      <textarea
+        aria-label="New comment text"
+        autoFocus
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            submit();
+          }
+          if (e.key === "Escape") onCancel();
+        }}
+        rows={3}
+        placeholder="Write a comment…"
+        style={composerStyle}
+      />
+      <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+        <button type="button" aria-label="Add comment" onClick={submit} style={primaryBtn}>
+          Comment
+        </button>
+        <button type="button" aria-label="Cancel new comment" onClick={onCancel} style={ghostBtn}>
+          Cancel
+        </button>
+      </div>
+    </div>
   );
 }
 
