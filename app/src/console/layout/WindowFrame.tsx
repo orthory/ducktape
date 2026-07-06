@@ -3,10 +3,88 @@
 // attribute is inert. The status dot reflects the last node round-trip and the
 // height ticks with finalized blocks.
 
+import { useState } from "react";
 import type { ReactNode } from "react";
 
-import { accentVar, color, font } from "../theme/tokens";
+import { Icon } from "../components/Icon";
+import { accentVar, color, font, radius } from "../theme/tokens";
 import { useDucktape } from "../store/use-ducktape";
+
+// The centered search affordance in the title bar: a compact field that opens
+// the ⌘K palette (see ConsoleShell / SearchModal). It sits in the middle cell
+// of the bar's `1fr auto 1fr` grid, so it tracks the window's true midpoint
+// (the two 1fr halves stay equal despite the left one carrying the traffic-light
+// inset) and reserves its own space — the brand/status halves are never
+// occluded. It is in flow rather than an overlay, so the surrounding halves keep
+// their drag regions; only the button footprint is non-draggable, as a control
+// should be.
+function SearchBar() {
+  const { actions } = useDucktape();
+  const [hover, setHover] = useState(false);
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: 0,
+      }}
+    >
+      <button
+        onClick={actions.openSearch}
+        title="Search (⌘K)"
+        aria-label="Search"
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
+        style={{
+          all: "unset",
+          boxSizing: "border-box",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          width: 340,
+          maxWidth: "100%",
+          height: 28,
+          padding: "0 10px",
+          borderRadius: radius.md,
+          background: hover ? color.hover : color.sunken,
+          border: `1px solid ${color.border}`,
+          transition: "background .12s",
+        }}
+      >
+        <Icon name="search" size={14} color={color.muted2} />
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            textAlign: "left",
+            font: `500 11.5px ${font.sans}`,
+            color: color.muted,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Search
+        </span>
+        <span
+          style={{
+            flexShrink: 0,
+            padding: "1px 5px",
+            borderRadius: 5,
+            border: `1px solid ${color.borderSoft}`,
+            font: `600 9.5px ${font.mono}`,
+            color: color.muted2,
+            background: color.paper,
+          }}
+        >
+          ⌘K
+        </span>
+      </button>
+    </div>
+  );
+}
 
 function TitleBar() {
   const { state } = useDucktape();
@@ -20,9 +98,12 @@ function TitleBar() {
         position: "relative",
         height: 44,
         flexShrink: 0,
-        display: "flex",
+        // `1fr auto 1fr`: the search bar (center cell) is window-centered because
+        // the two 1fr halves stay equal, while each half reserves its own track
+        // so the centered bar never overlaps the brand/status text.
+        display: "grid",
+        gridTemplateColumns: "1fr auto 1fr",
         alignItems: "center",
-        justifyContent: "space-between",
         gap: 13,
         padding: "0 13px",
         background: color.titlebar,
@@ -36,8 +117,8 @@ function TitleBar() {
           display: "flex",
           alignItems: "center",
           gap: 13,
-          flex: 1,
           minWidth: 0,
+          overflow: "hidden",
           // clear the macOS traffic lights on the desktop build
           paddingLeft: 69,
         }}
@@ -83,6 +164,8 @@ function TitleBar() {
         </div>
       </div>
 
+      <SearchBar />
+
       <div
         data-tauri-drag-region
         style={{
@@ -90,8 +173,8 @@ function TitleBar() {
           alignItems: "center",
           justifyContent: "flex-end",
           gap: 8,
-          flex: 1,
           minWidth: 0,
+          overflow: "hidden",
         }}
       >
         <span
