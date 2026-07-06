@@ -60,6 +60,9 @@ reactor = { workspace = true }
 reachability = { workspace = true }
 wireguard-upgrade = { workspace = true }
 wireguard-effect = { workspace = true }
+# the voice hub's transport seam: huddle audio rides data-plane datagrams over
+# the dedicated CHANNEL_VOICE mesh lane (src/voice.rs owns the mesh arm).
+data-plane = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).

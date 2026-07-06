@@ -245,6 +245,11 @@ pub struct NodeStatus {
     pub app_hash: String,
     pub height: u64,
     pub modules: Vec<ModuleStatus>,
+    /// this node's mesh identity (hex ed25519 key) — what a client stamps
+    /// into ops that route peer traffic to it (chat's `JoinHuddle.node`).
+    /// empty on daemons with no mesh identity (the embedded local daemon).
+    #[serde(default)]
+    pub public_key: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -305,6 +310,45 @@ pub struct QueryRequest {
     pub target: String,
     /// the module's `*Query` enum as a json value.
     pub query: serde_json::Value,
+}
+
+// ---- the voice lane ---------------------------------------------------------
+// the webview end of a huddle: GET /v1/voice/ws?channel=<id> upgrades to a
+// binary pcm socket (one 20 ms mono 48 kHz frame per message, i16 LE — see
+// `chat::voice::FRAME_SAMPLES`). the handler asks the node's voice hub for a
+// session over the request lane below; a binary client frame is one captured
+// mic frame, a binary server frame is one mixed playout frame, and text frames
+// carry json control (`VoiceControl`). the hub side lives with the mesh (only
+// the p2p validator runs one); a daemon without a hub answers 503.
+
+/// one live huddle session's channel ends, hub → websocket handler.
+pub struct VoiceSession {
+    /// captured mic frames, exactly [`chat::voice::FRAME_SAMPLES`] samples each.
+    pub pcm_in: tokio::sync::mpsc::Sender<Vec<i16>>,
+    /// mixed playout frames at the 20 ms tick, same shape.
+    pub mixed_out: tokio::sync::mpsc::Receiver<Vec<i16>>,
+    /// where this session's frames fan out: the huddle roster's node keys
+    /// (raw ed25519 bytes), steered by the client as consensus state changes.
+    pub recipients: tokio::sync::watch::Sender<Vec<[u8; 32]>>,
+}
+
+/// a websocket handler's ask: open (or replace) the voice session for a
+/// channel. the hub replies with the session's ends or a refusal string.
+pub struct VoiceSessionRequest {
+    pub channel_id: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<VoiceSession, String>>,
+}
+
+/// the request lane into the voice hub.
+pub type VoiceLane = tokio::sync::mpsc::Sender<VoiceSessionRequest>;
+
+/// client → server control messages on the voice socket (text frames).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum VoiceControl {
+    /// replace the fan-out set with these hex-encoded node keys. the client
+    /// tracks the consensus huddle roster and excludes its own node.
+    Recipients { peers: Vec<String> },
 }
 
 /// a ws frame. tagged so the stream can grow beyond block events without
@@ -374,6 +418,9 @@ pub struct NodeHandle {
     /// whose embedder configured no index (the router tests' fake actor) —
     /// index routes answer 503 there.
     index: Option<Arc<indexer::IndexStore>>,
+    /// the voice hub's session-request lane. `None` on daemons without a mesh
+    /// (the embedded daemon, router tests) — `/v1/voice/ws` answers 503 there.
+    voice: Option<VoiceLane>,
 }
 
 impl NodeHandle {
@@ -396,6 +443,7 @@ impl NodeHandle {
             telemetry: TelemetryRing::default(),
             forge_repo: None,
             index: None,
+            voice: None,
         };
         (handle, cmd_rx, event_tx)
     }
@@ -414,6 +462,14 @@ impl NodeHandle {
     /// actor feeds block-by-block.
     pub fn with_index_store(mut self, index: Arc<indexer::IndexStore>) -> Self {
         self.index = Some(index);
+        self
+    }
+
+    /// point this handle at a voice hub's session-request lane so
+    /// `/v1/voice/ws` can open huddle audio sessions. only the p2p validator
+    /// wires one — it owns the mesh the audio rides.
+    pub fn with_voice(mut self, voice: VoiceLane) -> Self {
+        self.voice = Some(voice);
         self
     }
 
@@ -486,6 +542,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
+        .route("/v1/voice/ws", get(voice_ws))
         .route(
             "/v1/files/blob",
             // one chunk per request, so the body cap IS the chunk cap. the
@@ -1688,6 +1745,116 @@ async fn stream_frames(mut socket: WebSocket, mut frames: broadcast::Receiver<Ws
             Err(broadcast::error::RecvError::Closed) => return,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoiceParams {
+    channel: String,
+}
+
+/// one pcm sample is an i16 — two wire bytes, little endian.
+const PCM_FRAME_BYTES: usize = chat::voice::FRAME_SAMPLES * 2;
+
+async fn voice_ws(
+    State(handle): State<NodeHandle>,
+    Query(params): Query<VoiceParams>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(voice) = handle.voice.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "voice is not available on this node (no mesh voice hub)",
+        );
+    };
+    if params.channel.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "channel must not be empty");
+    }
+    upgrade.on_upgrade(move |socket| voice_session(socket, voice, params.channel))
+}
+
+/// pump one huddle's audio between the websocket and the hub session: binary
+/// client frames (one 20 ms pcm frame each) flow into `pcm_in`, `mixed_out`
+/// frames flow back as binary, and text frames steer the fan-out set. either
+/// side closing ends the session — dropping the ends is the teardown signal
+/// the hub watches.
+async fn voice_session(mut socket: WebSocket, voice: VoiceLane, channel_id: String) {
+    let (reply, opened) = tokio::sync::oneshot::channel();
+    let request = VoiceSessionRequest {
+        channel_id,
+        reply,
+    };
+    let session = match voice.send(request).await {
+        Ok(()) => match opened.await {
+            Ok(Ok(session)) => session,
+            Ok(Err(refusal)) => {
+                let _ = socket.send(Message::Text(refusal.into())).await;
+                return;
+            }
+            Err(_) => return, // hub dropped the reply — shutting down
+        },
+        Err(_) => return, // hub gone
+    };
+    let VoiceSession {
+        pcm_in,
+        mut mixed_out,
+        recipients,
+    } = session;
+    loop {
+        tokio::select! {
+            inbound = socket.recv() => match inbound {
+                Some(Ok(Message::Binary(bytes))) => {
+                    if bytes.len() != PCM_FRAME_BYTES {
+                        continue; // not a whole frame — drop, stay alive
+                    }
+                    let frame: Vec<i16> = bytes
+                        .chunks_exact(2)
+                        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+                        .collect();
+                    // full lane = the hub is behind; late audio is dead audio,
+                    // so drop the frame rather than backpressure the socket.
+                    let _ = pcm_in.try_send(frame);
+                }
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(VoiceControl::Recipients { peers }) =
+                        serde_json::from_str::<VoiceControl>(&text)
+                    {
+                        let keys: Vec<[u8; 32]> = peers
+                            .iter()
+                            .filter_map(|hex| parse_node_key(hex))
+                            .collect();
+                        let _ = recipients.send(keys);
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            mixed = mixed_out.recv() => match mixed {
+                Some(frame) => {
+                    let mut bytes = Vec::with_capacity(frame.len() * 2);
+                    for sample in frame {
+                        bytes.extend_from_slice(&sample.to_le_bytes());
+                    }
+                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                // the hub ended the session (replaced by a newer join).
+                None => break,
+            },
+        }
+    }
+}
+
+/// decode a 64-char hex node key into raw ed25519 bytes.
+fn parse_node_key(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(key)
 }
 
 #[cfg(test)]

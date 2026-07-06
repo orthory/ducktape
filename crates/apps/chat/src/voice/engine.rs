@@ -73,6 +73,15 @@ pub struct VoiceEngine<T: DataPlaneTransport> {
     timestamp: u32,
     lanes: Lanes,
     malformed: Arc<AtomicU64>,
+    /// the pump task; aborted on drop so the pump's flow handle is released
+    /// and the (service, flow) slot can be registered again by a later engine.
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl<T: DataPlaneTransport> Drop for VoiceEngine<T> {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
 }
 
 impl<T: DataPlaneTransport> VoiceEngine<T> {
@@ -96,7 +105,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         let flow = Arc::new(flow);
         let lanes: Lanes = Arc::new(Mutex::new(HashMap::new()));
         let malformed = Arc::new(AtomicU64::new(0));
-        tokio::spawn(pump(
+        let pump = tokio::spawn(pump(
             flow.clone(),
             lanes.clone(),
             jitter_factory,
@@ -109,6 +118,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
             timestamp: 0,
             lanes,
             malformed,
+            pump,
         })
     }
 
