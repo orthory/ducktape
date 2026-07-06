@@ -19,7 +19,7 @@ export const authorKey = (author: AuthorRef): string => {
 };
 
 export const isAgentAuthor = (author: AuthorRef): boolean =>
-  typeof author === "object" && "Agent" in author;
+  typeof author === "object" && "agent" in author;
 
 /** The local author's key, in the same shape `authorKey` produces for a
  *  `User` author — the origin string crosses the wire as `Origin::External`

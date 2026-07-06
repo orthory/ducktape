@@ -730,7 +730,7 @@ export function createActions({
             author.user.every((byte, i) => byte === selfBytes[i]),
         );
       submitTracked(
-        opKey.messageSeq(channelId, seq),
+        opKey.reaction(channelId, seq, emoji),
         (live) =>
           mine
             ? chatClient.removeReaction(live, { channelId, seq, emoji, origin })
