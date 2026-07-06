@@ -27,6 +27,8 @@ fn main() {
             workspaces::workspace_invite_blob,
             workspaces::workspace_join_requests,
             workspaces::workspace_admit,
+            workspaces::workspace_promote,
+            workspaces::workspace_observer_remove,
             workspaces::workspace_demote,
             workspaces::workspace_request_leave,
             workspaces::workspace_forget,
