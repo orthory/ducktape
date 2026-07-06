@@ -89,11 +89,15 @@ pub fn forge_head(app: tauri::AppHandle, repo: String) -> Result<Option<String>,
     Ok(main_oid(&git)?.map(|oid| oid.to_string()))
 }
 
+/// Read the commit log of `refs/heads/main`, newest first. `limit` is optional:
+/// `None` walks the WHOLE history (the Forge view browses the full repo), `Some(n)`
+/// caps to the newest `n`. There is no built-in ceiling — a local git browser
+/// over a real repo (e.g. 740 commits) walks it all fine.
 #[tauri::command]
 pub fn forge_log(
     app: tauri::AppHandle,
     repo: String,
-    limit: usize,
+    limit: Option<usize>,
 ) -> Result<Vec<CommitInfo>, String> {
     let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(Vec::new());
@@ -107,11 +111,15 @@ pub fn forge_log(
     walk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)
         .map_err(err)?;
 
-    let limit = limit.clamp(1, 200);
     let mut commits = Vec::new();
-    for oid in walk.take(limit) {
+    for oid in walk {
         let commit = repo.find_commit(oid.map_err(err)?).map_err(err)?;
         commits.push(commit_info(&commit));
+        if let Some(limit) = limit {
+            if commits.len() >= limit {
+                break;
+            }
+        }
     }
     Ok(commits)
 }

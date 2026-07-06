@@ -228,7 +228,7 @@ export function ForgeView() {
     Promise.allSettled([
       readLocalHead(selectedRepo.name),
       forgeTree(selectedRepo.name, ""),
-      forgeLog(selectedRepo.name, 32),
+      forgeLog(selectedRepo.name),
     ])
       .then(([headResult, treeResult, logResult]) => {
         if (!alive || dirTokenRef.current !== token) return;
