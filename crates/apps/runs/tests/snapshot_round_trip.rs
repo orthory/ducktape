@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentQuery, AgentRecord, AgentReply, AgentStatus,
+    ACTION_CHAT_POST, AgentQuery, AgentRecord, AgentReply, AgentStatus,
     decode_query as agent_decode_query, encode_reply as agent_encode_reply,
 };
 use chat::{
@@ -165,7 +165,7 @@ fn module() -> RunsModule {
         "tagging",
         "dispatch",
         "agent",
-        Some("tasks".into()),
+        "package",
         Some("jobs".into()),
     )
 }
@@ -261,14 +261,14 @@ fn source() -> RunsModule {
     exec(
         &mut m,
         TestCtx::new(2, alice())
-            .with_agent("mod-bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])
+            .with_agent("mod-bot", &[ACTION_CHAT_POST, tasks::ACTION_TASKS_CREATE])
             .with_transcript("dev", dev.clone()),
         &request("mod-bot", "dev", 1),
     );
     exec_jobs_event(
         &mut m,
         TestCtx::new(2, Origin::System)
-            .with_agent("mod-bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE]),
+            .with_agent("mod-bot", &[ACTION_CHAT_POST, tasks::ACTION_TASKS_CREATE]),
         "job-1",
         "agent/mod-bot",
         "summarize",

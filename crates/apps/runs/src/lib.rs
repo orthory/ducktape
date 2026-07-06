@@ -17,7 +17,7 @@
 //! - **P2 — atomic causal cascades.** a user post, the tagging plane's
 //!   engagement delivery, the pending entry, and the dispatch commit in ONE
 //!   block; a watch and its plane subscription commit in one block; a
-//!   validated response's chat reply and task writes commit in the delivery
+//!   validated response's chat reply and action writes commit in the delivery
 //!   block. the registry hook extends this to registration: an agent's
 //!   registry record and its dispatch recipe land (or abort) as one unit.
 //! - **P4 — anchored generation.** the ENTIRE model input is composed in
@@ -70,10 +70,12 @@
 //!   module documents). malformed events and unknown dispatch ids are staged
 //!   no-ops (plus an observability event), and a response that fails
 //!   validation FAILS THE RUN, never the block. anything the emitted
-//!   follow-ups could make chat or tasks reject (a squatted reply message id,
-//!   an oversized reply, a duplicate task id, a full thread) is probed
-//!   deterministically first — an emitted follow-up must be valid by
-//!   construction.
+//!   follow-ups could make chat reject (a squatted reply message id, an
+//!   oversized reply, a full thread) is probed deterministically first, and
+//!   every requested action is probed against its OWNING module (grant ->
+//!   package route -> owner Probe) before its Apply exists — an emitted
+//!   follow-up must be valid by construction, and the owners' Apply arms are
+//!   no-fail by contract.
 //! - the engagement intake runs in the same block as the user's post. an
 //!   `Err` here would abort the post (and every other subscriber's delivery),
 //!   so a malformed event or a failed context pin is equally a staged no-op.
@@ -113,9 +115,9 @@ pub use interface::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent::{
-    ACTION_CHAT_POST, AgentAction, AgentEvent, AgentQuery, AgentRecord, AgentReply, AgentResponse,
-    AgentStatus, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RENDERER_MEMORY_GENERATION,
-    RESERVED_ID_SEPARATOR, ReplyBlock, decode_event as agent_decode_event,
+    ACTION_CHAT_POST, AgentEvent, AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus,
+    MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RENDERER_MEMORY_GENERATION, RESERVED_ID_SEPARATOR,
+    ReplyBlock, RequestedAction, decode_event as agent_decode_event,
     decode_reply as agent_decode_reply, encode_query as agent_encode_query, encode_response,
 };
 use chat::{
@@ -137,16 +139,17 @@ use memory::{
     Body, MemoryQuery, MemoryReply, decode_reply as memory_decode_reply,
     encode_query as memory_encode_query,
 };
+use package::{
+    PackageActionMsg, PackageActionQuery, PackageActionReply, PackageQuery, PackageReply,
+    decode_action_reply, decode_reply as package_decode_reply, encode_action_msg,
+    encode_action_query, encode_query as package_encode_query, validate_tag,
+};
 use saga::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use tagging::{
     EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
     encode_msg as tagging_encode_msg,
-};
-use tasks::{
-    TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_reply as tasks_decode_reply,
-    encode_msg as tasks_encode_msg, encode_query as tasks_encode_query,
 };
 
 /// how many transcript messages (newest-first, ending at the anchor) one run
@@ -223,7 +226,7 @@ const DEFAULT_PROMPT: &str =
 /// the [`AgentResponse`] wire shape.
 const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[]}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional; each entry is {"action_id":"<unique id>","tag":"<action tag>","payload":{...}} and may use only action tags granted to the agent. Do not include markdown fences around the JSON."#;
 
 /// the shared payload head: the agent's RESOLVED prompt (pin-verified at
 /// compose time) when it has one, then the generic instructions, then the
@@ -444,19 +447,19 @@ fn canonical_origin(origin: &Origin) -> SagaOrigin {
     }
 }
 
-/// the wire name of a task status an [`AgentAction::UpdateTaskStatus`] carries.
-fn task_status(name: &str) -> Option<TaskStatus> {
-    match name {
-        "open" => Some(TaskStatus::Open),
-        "in_progress" => Some(TaskStatus::InProgress),
-        "done" => Some(TaskStatus::Done),
-        _ => None,
-    }
-}
-
 /// whether the registry granted this agent an action name.
 fn allows(agent: &AgentRecord, action: &str) -> bool {
     agent.allowed_actions.iter().any(|a| a == action)
+}
+
+/// a response that survived validation: the kept response (dropped actions
+/// removed), the `Apply` follow-ups its accepted actions route to (one per
+/// kept action, in response order), and the per-action drop log — breadcrumb
+/// and finalize-summary fodder, never a block abort.
+struct ValidatedResponse {
+    response: AgentResponse,
+    applies: Vec<Msg>,
+    dropped: Vec<String>,
 }
 
 /// one in-flight dispatch's correlation entry. the dispatch id is the map
@@ -805,7 +808,9 @@ pub struct RunsModule {
     /// the agent registry — the record book this module reads by query, and
     /// the registry hook's trusted origin.
     agent: ModuleId,
-    tasks: Option<ModuleId>,
+    /// the package registry — the tag -> owner route table every requested
+    /// action resolves through before its owner is probed.
+    package: ModuleId,
     jobs: Option<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
     watches: BTreeMap<String, TurnPolicy>,
@@ -832,7 +837,7 @@ impl RunsModule {
         tagging: impl Into<ModuleId>,
         dispatch: impl Into<ModuleId>,
         agent: impl Into<ModuleId>,
-        tasks: Option<ModuleId>,
+        package: impl Into<ModuleId>,
         jobs: Option<ModuleId>,
     ) -> Self {
         let id = id.into();
@@ -841,6 +846,7 @@ impl RunsModule {
         let tagging = tagging.into();
         let dispatch = dispatch.into();
         let agent = agent.into();
+        let package = package.into();
         let mut ids = BTreeSet::from([
             id.clone(),
             chat.clone(),
@@ -848,13 +854,12 @@ impl RunsModule {
             tagging.clone(),
             dispatch.clone(),
             agent.clone(),
+            package.clone(),
         ]);
-        let mut expected = 6;
-        for optional in [&tasks, &jobs] {
-            if let Some(module) = optional {
-                ids.insert(module.clone());
-                expected += 1;
-            }
+        let mut expected = 7;
+        if let Some(module) = &jobs {
+            ids.insert(module.clone());
+            expected += 1;
         }
         assert_eq!(
             ids.len(),
@@ -868,7 +873,7 @@ impl RunsModule {
             tagging,
             dispatch,
             agent,
-            tasks,
+            package,
             jobs,
             watches: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -1572,10 +1577,27 @@ impl RunsModule {
                     .validate_response(&*ctx, &run_id, &entry, response)
                     .await
                 {
-                    Ok(response) => {
-                        let payload = String::from_utf8(encode_response(&response))
+                    Ok(validated) => {
+                        // dropped actions mutated nothing: each leaves a
+                        // breadcrumb, and the count rides a summary note —
+                        // the finalize payload below carries only what was
+                        // ACCEPTED (the finalize summary).
+                        let total = validated.response.actions.len() + validated.dropped.len();
+                        for reason in &validated.dropped {
+                            self.note(ctx, format!("run {run_id}: {reason}"));
+                        }
+                        if !validated.dropped.is_empty() {
+                            self.note(
+                                ctx,
+                                format!(
+                                    "run {run_id}: dropped {}/{total} requested actions",
+                                    validated.dropped.len()
+                                ),
+                            );
+                        }
+                        let payload = String::from_utf8(encode_response(&validated.response))
                             .expect("AgentResponse JSON is utf-8");
-                        self.emit_response(ctx, &run_id, &entry, response);
+                        self.emit_response(ctx, &run_id, &entry, validated);
                         self.emit_job_finalize_if_current_claimant(ctx, &entry, true, payload)
                             .await;
                     }
@@ -1598,19 +1620,24 @@ impl RunsModule {
         Ok(())
     }
 
-    /// deterministic response validation — THE safety boundary (design §5).
-    /// the response is data until every check here passes; only then do its
-    /// follow-ups exist. beyond grants and caps, this probes everything the
-    /// emitted follow-ups could make chat or tasks REJECT (which would abort
-    /// the delivery block — the no-fail rule): a squatted reply message id, a
-    /// full thread, a duplicate or unknown task id.
+    /// deterministic response validation — THE safety boundary (design §5,
+    /// D6). the response is data until every check here passes; only then do
+    /// its follow-ups exist. the REPLY side probes everything the emitted
+    /// chat post could make chat REJECT (which would abort the delivery
+    /// block — the no-fail rule): the chat.post grant, the size cap, a
+    /// squatted reply message id, a full thread — and a violation fails the
+    /// whole run. the ACTION side is the open pipeline: per action, tag
+    /// shape -> grant -> package route -> owner `Probe`; anything short of
+    /// `Accepted` DROPS that one action into the drop log (mutating nothing)
+    /// while the rest of the response proceeds. a response left with neither
+    /// a reply nor a single accepted action fails the run.
     async fn validate_response(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
         entry: &PendingState,
-        response: AgentResponse,
-    ) -> Result<AgentResponse, String> {
+        mut response: AgentResponse,
+    ) -> Result<ValidatedResponse, String> {
         let agent = self
             .agent_record(ctx, &entry.agent_id)
             .await?
@@ -1689,52 +1716,133 @@ impl RunsModule {
             }
         }
 
+        // the open-action pipeline (design D6): per action, tag shape ->
+        // grant -> package route -> owner Probe. drops are per-action and
+        // logged; only Accepted actions become Apply follow-ups. an owner's
+        // probe sees staged-or-committed state, NOT its sibling actions in
+        // this same response — an in-batch conflict (two creates of one id)
+        // passes both probes and is the owner Apply arm's late-conflict case.
+        let mut kept = Vec::new();
+        let mut applies = Vec::new();
+        let mut dropped = Vec::new();
         if !response.actions.is_empty() {
-            let Some(tasks) = self.tasks.clone() else {
-                return Err("no tasks module is configured".into());
-            };
-            let existing = self.task_ids(ctx, &tasks).await?;
-            let mut created: BTreeSet<&str> = BTreeSet::new();
-            for action in &response.actions {
-                let name = action.vocabulary_name();
-                if !allows(&agent, name) {
-                    return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
+            let run_context = serde_json::to_vec(&serde_json::json!({
+                "run_id": run_id,
+                "agent_id": entry.agent_id,
+            }))
+            .expect("run context serializes");
+            for action in std::mem::take(&mut response.actions) {
+                if let Err(e) = validate_tag(&action.tag) {
+                    dropped.push(format!("action {} dropped: {e}", action.action_id));
+                    continue;
                 }
-                match action {
-                    AgentAction::CreateTask { task_id, title } => {
-                        if task_id.is_empty() || title.is_empty() {
-                            return Err("task actions require a non-empty task_id and title".into());
-                        }
-                        // duplicates — committed or earlier in this very
-                        // response — would make tasks reject the follow-up.
-                        if existing.contains(task_id) || !created.insert(task_id) {
-                            return Err(format!("task already exists: {task_id}"));
-                        }
+                if !allows(&agent, &action.tag) {
+                    dropped.push(format!(
+                        "action {} dropped: agent {} is not allowed to {}",
+                        action.action_id, entry.agent_id, action.tag
+                    ));
+                    continue;
+                }
+                let owner = match self.action_owner(ctx, &action.tag).await {
+                    Ok(Some(owner)) => owner,
+                    Ok(None) => {
+                        dropped.push(format!(
+                            "action {} dropped: no module owns action {}",
+                            action.action_id, action.tag
+                        ));
+                        continue;
                     }
-                    AgentAction::UpdateTaskStatus { task_id, status } => {
-                        if task_status(status).is_none() {
-                            return Err(format!("unknown task status: {status}"));
-                        }
-                        if !existing.contains(task_id) && !created.contains(task_id.as_str()) {
-                            return Err(format!("unknown task: {task_id}"));
-                        }
+                    Err(reason) => {
+                        dropped.push(format!("action {} dropped: {reason}", action.action_id));
+                        continue;
+                    }
+                };
+                let payload = serde_json::to_vec(&action.payload).expect("a json value serializes");
+                match self
+                    .probe_action(ctx, &owner, &action, &payload, &run_context)
+                    .await
+                {
+                    Ok(PackageActionReply::Accepted) => {}
+                    Ok(PackageActionReply::Rejected { reason }) => {
+                        dropped.push(format!(
+                            "action {} dropped: rejected by {owner}: {reason}",
+                            action.action_id
+                        ));
+                        continue;
+                    }
+                    Err(reason) => {
+                        dropped.push(format!("action {} dropped: {reason}", action.action_id));
+                        continue;
                     }
                 }
+                applies.push(Msg {
+                    target: owner,
+                    payload: encode_action_msg(&PackageActionMsg::Apply {
+                        action_id: action.action_id.clone(),
+                        tag: action.tag.clone(),
+                        payload,
+                        run_context: run_context.clone(),
+                    }),
+                });
+                kept.push(action);
+            }
+            // a run that ends up with NOTHING to do failed: no reply posts
+            // and every requested action was dropped.
+            if kept.is_empty() && response.reply_blocks.is_empty() {
+                return Err(format!(
+                    "all requested actions were dropped: {}",
+                    dropped.join("; ")
+                ));
             }
         }
+        response.actions = kept;
 
-        Ok(response)
+        Ok(ValidatedResponse {
+            response,
+            applies,
+            dropped,
+        })
     }
 
-    async fn task_ids(&self, ctx: &dyn Ctx, tasks: &str) -> Result<BTreeSet<String>, String> {
+    /// the module id owning `tag`, per the package registry's route table —
+    /// `None` means the tag is unrouted and the action drops before any probe.
+    async fn action_owner(&self, ctx: &dyn Ctx, tag: &str) -> Result<Option<ModuleId>, String> {
         let reply = ctx
-            .query(tasks, &tasks_encode_query(&TaskQuery::List))
+            .query(
+                &self.package,
+                &package_encode_query(&PackageQuery::ActionOwner { tag: tag.into() }),
+            )
             .await
-            .map_err(|e| format!("tasks lookup failed: {e}"))?;
-        match tasks_decode_reply(&reply) {
-            Ok(TaskReply::Tasks(list)) => Ok(list.into_iter().map(|t| t.id).collect()),
-            Err(e) => Err(format!("undecodable tasks reply: {e}")),
+            .map_err(|e| format!("package route lookup failed: {e}"))?;
+        match package_decode_reply(&reply) {
+            Ok(PackageReply::Owner(owner)) => Ok(owner),
+            _ => Err("unexpected package reply for a route lookup".into()),
         }
+    }
+
+    /// one owner `Probe` — the read-only verdict an action needs before its
+    /// `Apply` may exist (the ADR action contract).
+    async fn probe_action(
+        &self,
+        ctx: &dyn Ctx,
+        owner: &str,
+        action: &RequestedAction,
+        payload: &[u8],
+        run_context: &[u8],
+    ) -> Result<PackageActionReply, String> {
+        let reply = ctx
+            .query(
+                owner,
+                &encode_action_query(&PackageActionQuery::Probe {
+                    action_id: action.action_id.clone(),
+                    tag: action.tag.clone(),
+                    payload: payload.to_vec(),
+                    run_context: run_context.to_vec(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("owner probe failed: {e}"))?;
+        decode_action_reply(&reply).map_err(|e| format!("undecodable probe verdict: {e}"))
     }
 
     fn truncate_job_payload(mut payload: String) -> String {
@@ -1824,44 +1932,31 @@ impl RunsModule {
     }
 
     /// hand a VALIDATED response its follow-ups: the chat reply (authored as
-    /// the agent, threaded like its anchor) and the task writes — all drained
-    /// in this same delivery block (P2, P6).
+    /// the agent, threaded like its anchor) and one `PackageActionMsg::Apply`
+    /// to each accepted action's owner — all drained in this same delivery
+    /// block (P2, P6). the owners' Apply arms are no-fail by contract, so an
+    /// emitted follow-up can never abort the block.
     fn emit_response(
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
         entry: &PendingState,
-        response: AgentResponse,
+        validated: ValidatedResponse,
     ) {
-        if !response.reply_blocks.is_empty() {
+        if !validated.response.reply_blocks.is_empty() {
             ctx.emit_msg(Msg {
                 target: self.chat.clone(),
                 payload: chat_encode_msg(&ChatMsg::PostMessage {
                     channel_id: entry.channel_id.clone(),
                     message_id: reply_message_id(run_id),
-                    blocks: to_chat_blocks(&response.reply_blocks),
+                    blocks: to_chat_blocks(&validated.response.reply_blocks),
                     thread: entry.thread_root,
                     as_agent: Some(entry.agent_id.clone()),
                 }),
             });
         }
-        for action in response.actions {
-            let target = self
-                .tasks
-                .clone()
-                .expect("actions were validated against a configured tasks module");
-            let payload = match action {
-                AgentAction::CreateTask { task_id, title } => {
-                    tasks_encode_msg(&TaskMsg::CreateTask { task_id, title })
-                }
-                AgentAction::UpdateTaskStatus { task_id, status } => {
-                    tasks_encode_msg(&TaskMsg::UpdateStatus {
-                        task_id,
-                        status: task_status(&status).expect("status was validated"),
-                    })
-                }
-            };
-            ctx.emit_msg(Msg { target, payload });
+        for apply in validated.applies {
+            ctx.emit_msg(apply);
         }
     }
 
@@ -2178,8 +2273,7 @@ mod tests {
     use super::*;
     use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
     use agent::{
-        ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, PromptRef,
-        encode_event as agent_encode_event, encode_reply as agent_encode_reply,
+        PromptRef, encode_event as agent_encode_event, encode_reply as agent_encode_reply,
     };
     use chat::{MessageHead, decode_msg as chat_decode_msg};
     use dispatch::{
@@ -2191,25 +2285,32 @@ mod tests {
         Claim as JobClaim, Job, encode_event as jobs_encode_event,
         encode_reply as jobs_encode_reply,
     };
+    use package::decode_action_msg;
     use sdk::{Effect, Env};
+    use serde_json::json;
     use tagging::{Author, encode_event as tagging_encode_event};
-    use tasks::{Task, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply};
+    use tasks::{ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS};
 
     /// a canned registry: agent id -> record, served by the ctx's "agent"
     /// query arm exactly like the live registry module would answer.
     type Registry = BTreeMap<String, AgentRecord>;
 
     /// a minimal `Ctx` that captures emitted msgs/effects/events and serves
-    /// a canned agent registry, chat transcripts, task lists, job records,
-    /// and dispatch records — enough to unit-test `execute` in isolation
-    /// (the host provides the real routing in integration).
+    /// a canned agent registry, chat transcripts, the package route table,
+    /// the tasks OWNER's probe verdicts, job records, and dispatch records —
+    /// enough to unit-test `execute` in isolation (the host provides the
+    /// real routing in integration).
     struct CaptureCtx {
         env: Env,
         /// agent id -> registry record served by the "agent" arm.
         agents: Registry,
         /// channel -> messages with contiguous seqs starting at 1.
         transcripts: BTreeMap<String, Vec<MessageView>>,
-        tasks: Vec<Task>,
+        /// existing task ids — what the canned tasks OWNER probes against.
+        tasks: BTreeSet<String>,
+        /// tag -> owner, served by the "package" arm; seeded with the
+        /// builtin task routes like the real genesis.
+        routes: BTreeMap<String, String>,
         /// dispatch ids the dispatch module already has a record for — the
         /// committed turn-claim layer the module probes.
         taken_dispatches: BTreeSet<String>,
@@ -2235,7 +2336,11 @@ mod tests {
                 },
                 agents: Registry::new(),
                 transcripts: BTreeMap::new(),
-                tasks: Vec::new(),
+                tasks: BTreeSet::new(),
+                routes: BTreeMap::from([
+                    (ACTION_TASKS_CREATE.to_string(), "tasks".to_string()),
+                    (ACTION_TASKS_UPDATE_STATUS.to_string(), "tasks".to_string()),
+                ]),
                 taken_dispatches: BTreeSet::new(),
                 jobs: BTreeMap::new(),
                 memory_files: BTreeMap::new(),
@@ -2274,13 +2379,12 @@ mod tests {
             self
         }
         fn with_task(mut self, id: &str) -> Self {
-            self.tasks.push(Task {
-                id: id.into(),
-                title: id.into(),
-                status: TaskStatus::Open,
-                created_at: 0,
-                updated_at: 0,
-            });
+            self.tasks.insert(id.into());
+            self
+        }
+        /// route `tag` to `owner` in the canned package route table.
+        fn with_route(mut self, tag: &str, owner: &str) -> Self {
+            self.routes.insert(tag.into(), owner.into());
             self
         }
         fn with_taken_dispatch(mut self, dispatch_id: &str) -> Self {
@@ -2332,13 +2436,63 @@ mod tests {
                 .map(|m| chat_decode_msg(&m.payload).expect("chat msg"))
                 .collect()
         }
-        /// decoded task msgs emitted this dispatch.
-        fn task_msgs(&self) -> Vec<TaskMsg> {
+        /// decoded package-action Apply msgs emitted to `target` this dispatch.
+        fn apply_msgs(&self, target: &str) -> Vec<PackageActionMsg> {
             self.msgs
                 .iter()
-                .filter(|m| m.target == "tasks")
-                .map(|m| tasks_decode_msg(&m.payload).expect("task msg"))
+                .filter(|m| m.target == target)
+                .map(|m| decode_action_msg(&m.payload).expect("apply msg"))
                 .collect()
+        }
+        /// the canned tasks OWNER's probe: the same existence / duplicate-id
+        /// / status-value checks the real tasks module serves (asserted in
+        /// the tasks crate's own suite), against this ctx's task-id set.
+        fn tasks_probe_verdict(&self, tag: &str, payload: &[u8]) -> PackageActionReply {
+            let Ok(payload) = serde_json::from_slice::<serde_json::Value>(payload) else {
+                return PackageActionReply::Rejected {
+                    reason: "malformed payload".into(),
+                };
+            };
+            let field = |key: &str| {
+                payload
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let task_id = field("task_id");
+            match tag {
+                ACTION_TASKS_CREATE => {
+                    if task_id.is_empty() || field("title").is_empty() {
+                        return PackageActionReply::Rejected {
+                            reason: "task actions require a non-empty task_id and title".into(),
+                        };
+                    }
+                    if self.tasks.contains(&task_id) {
+                        return PackageActionReply::Rejected {
+                            reason: format!("task already exists: {task_id}"),
+                        };
+                    }
+                    PackageActionReply::Accepted
+                }
+                ACTION_TASKS_UPDATE_STATUS => {
+                    let status = field("status");
+                    if !["open", "in_progress", "done"].contains(&status.as_str()) {
+                        return PackageActionReply::Rejected {
+                            reason: format!("unknown task status: {status}"),
+                        };
+                    }
+                    if !self.tasks.contains(&task_id) {
+                        return PackageActionReply::Rejected {
+                            reason: format!("unknown task: {task_id}"),
+                        };
+                    }
+                    PackageActionReply::Accepted
+                }
+                other => PackageActionReply::Rejected {
+                    reason: format!("tasks does not own action tag: {other}"),
+                },
+            }
         }
         /// decoded jobs msgs emitted this dispatch.
         fn job_msgs(&self) -> Vec<JobsMsg> {
@@ -2412,7 +2566,19 @@ mod tests {
                     }
                     _ => Err(Error::QueryUnsupported),
                 },
-                "tasks" => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
+                "tasks" => {
+                    let PackageActionQuery::Probe { tag, payload, .. } =
+                        package::decode_action_query(req).map_err(Error::Module)?;
+                    Ok(package::encode_action_reply(
+                        &self.tasks_probe_verdict(&tag, &payload),
+                    ))
+                }
+                "package" => match package::decode_query(req).map_err(Error::Module)? {
+                    PackageQuery::ActionOwner { tag } => Ok(package::encode_reply(
+                        &PackageReply::Owner(self.routes.get(&tag).cloned()),
+                    )),
+                    _ => Err(Error::QueryUnsupported),
+                },
                 "jobs" => match jobs::decode_query(req).map_err(Error::Module)? {
                     JobsQuery::Get { job_id } => Ok(jobs_encode_reply(&JobsReply::Job(
                         self.jobs.get(&job_id).cloned(),
@@ -2477,7 +2643,7 @@ mod tests {
             "tagging",
             "dispatch",
             "agent",
-            Some("tasks".into()),
+            "package",
             Some("jobs".into()),
         )
     }
@@ -2695,7 +2861,7 @@ mod tests {
         ctx
     }
 
-    fn response(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
+    fn response(reply: &[&str], actions: Vec<RequestedAction>) -> Vec<u8> {
         encode_response(&AgentResponse {
             reply_blocks: reply
                 .iter()
@@ -2707,6 +2873,31 @@ mod tests {
                 .collect(),
             actions,
         })
+    }
+
+    /// a `tasks.create` request under action id `a-<task_id>`.
+    fn create_action(task_id: &str, title: &str) -> RequestedAction {
+        RequestedAction {
+            action_id: format!("a-{task_id}"),
+            tag: ACTION_TASKS_CREATE.into(),
+            payload: json!({"task_id": task_id, "title": title}),
+        }
+    }
+
+    /// a `tasks.update_status` request under action id `u-<task_id>`.
+    fn update_action(task_id: &str, status: &str) -> RequestedAction {
+        RequestedAction {
+            action_id: format!("u-{task_id}"),
+            tag: ACTION_TASKS_UPDATE_STATUS.into(),
+            payload: json!({"task_id": task_id, "status": status}),
+        }
+    }
+
+    fn breadcrumbs(ctx: &CaptureCtx) -> Vec<String> {
+        ctx.events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect()
     }
 
     // ---- the registry hook ------------------------------------------------------
@@ -2947,14 +3138,7 @@ mod tests {
         commit(&mut m);
 
         let mut without_jobs = RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            None,
+            "runs", "chat", "saga", "tagging", "dispatch", "agent", "package", None,
         );
         let mut ctx = CaptureCtx::new().from_origin(user(9));
         let err = exec(
@@ -3623,7 +3807,7 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
+    fn a_valid_response_emits_the_reply_and_apply_follow_ups_and_prunes_the_entry() {
         let (mut m, registry, run_id) = awaiting_run(&[
             ACTION_CHAT_POST,
             ACTION_TASKS_CREATE,
@@ -3633,7 +3817,8 @@ mod tests {
             .at(8)
             .from_dispatch()
             .with_registry(&registry)
-            .with_transcript("general", transcript(2));
+            .with_transcript("general", transcript(2))
+            .with_task("t0");
         exec(
             &mut m,
             &mut ctx,
@@ -3642,16 +3827,8 @@ mod tests {
                 Ok(response(
                     &["on it"],
                     vec![
-                        AgentAction::CreateTask {
-                            task_id: "t1".into(),
-                            title: "ship it".into(),
-                        },
-                        // updating a task created earlier in this SAME response
-                        // is valid — tasks applies the follow-ups in order.
-                        AgentAction::UpdateTaskStatus {
-                            task_id: "t1".into(),
-                            status: "in_progress".into(),
-                        },
+                        create_action("t1", "ship it"),
+                        update_action("t0", "in_progress"),
                     ],
                 )),
             ),
@@ -3675,18 +3852,32 @@ mod tests {
             }],
             "the reply posts as the AGENT, under the run's message id"
         );
+        // both accepted actions ride to the OWNER as Apply follow-ups, in
+        // response order, carrying the run context.
+        let expected_run_context =
+            serde_json::to_vec(&json!({"run_id": run_id, "agent_id": "bot"})).expect("run context");
         assert_eq!(
-            ctx.task_msgs(),
+            ctx.apply_msgs("tasks"),
             vec![
-                TaskMsg::CreateTask {
-                    task_id: "t1".into(),
-                    title: "ship it".into(),
+                PackageActionMsg::Apply {
+                    action_id: "a-t1".into(),
+                    tag: ACTION_TASKS_CREATE.into(),
+                    payload: serde_json::to_vec(&json!({"task_id": "t1", "title": "ship it"}))
+                        .expect("payload"),
+                    run_context: expected_run_context.clone(),
                 },
-                TaskMsg::UpdateStatus {
-                    task_id: "t1".into(),
-                    status: TaskStatus::InProgress,
+                PackageActionMsg::Apply {
+                    action_id: "u-t0".into(),
+                    tag: ACTION_TASKS_UPDATE_STATUS.into(),
+                    payload: serde_json::to_vec(&json!({"task_id": "t0", "status": "in_progress"}))
+                        .expect("payload"),
+                    run_context: expected_run_context,
                 },
             ]
+        );
+        assert!(
+            breadcrumbs(&ctx).is_empty(),
+            "a fully accepted response leaves no drop crumbs"
         );
     }
 
@@ -3734,70 +3925,21 @@ mod tests {
     }
 
     #[test]
-    fn invalid_responses_fail_the_run_and_emit_no_follow_ups() {
+    fn probe_rejected_actions_drop_with_breadcrumbs_while_the_reply_posts() {
         // normalization already absorbed shape problems (prose, fences,
-        // oversize); what remains failable is POLICY: task validity and
-        // grants. every case still emits NOTHING, leaves a breadcrumb, and
-        // prunes the entry — never the block.
-        let cases: Vec<(&str, Vec<u8>)> = vec![
+        // oversize); what remains is per-action POLICY, judged by the OWNER's
+        // probe. a rejected action drops — breadcrumb, no Apply, nothing
+        // mutated — while the granted reply still posts and the entry prunes.
+        let cases: Vec<(&str, RequestedAction)> = vec![
             (
                 "task already exists: t0",
-                response(
-                    &["ok"],
-                    vec![AgentAction::CreateTask {
-                        task_id: "t0".into(),
-                        title: "dup of a committed task".into(),
-                    }],
-                ),
+                create_action("t0", "dup of a committed task"),
             ),
-            (
-                "task already exists: fresh",
-                response(
-                    &["ok"],
-                    vec![
-                        AgentAction::CreateTask {
-                            task_id: "fresh".into(),
-                            title: "one".into(),
-                        },
-                        AgentAction::CreateTask {
-                            task_id: "fresh".into(),
-                            title: "two".into(),
-                        },
-                    ],
-                ),
-            ),
-            (
-                "unknown task: ghost",
-                response(
-                    &["ok"],
-                    vec![AgentAction::UpdateTaskStatus {
-                        task_id: "ghost".into(),
-                        status: "done".into(),
-                    }],
-                ),
-            ),
-            (
-                "unknown task status",
-                response(
-                    &["ok"],
-                    vec![AgentAction::UpdateTaskStatus {
-                        task_id: "t0".into(),
-                        status: "shipped".into(),
-                    }],
-                ),
-            ),
-            (
-                "non-empty task_id",
-                response(
-                    &["ok"],
-                    vec![AgentAction::CreateTask {
-                        task_id: String::new(),
-                        title: "x".into(),
-                    }],
-                ),
-            ),
+            ("unknown task: ghost", update_action("ghost", "done")),
+            ("unknown task status", update_action("t0", "shipped")),
+            ("non-empty task_id", create_action("", "x")),
         ];
-        for (fragment, bytes) in cases {
+        for (fragment, action) in cases {
             let (mut m, registry, run_id) = awaiting_run(&[
                 ACTION_CHAT_POST,
                 ACTION_TASKS_CREATE,
@@ -3809,27 +3951,112 @@ mod tests {
                 .with_registry(&registry)
                 .with_transcript("general", transcript(2))
                 .with_task("t0");
-            exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes))).unwrap();
-            assert!(
-                ctx.msgs.is_empty(),
-                "an invalid response must emit NOTHING ({fragment})"
+            exec(
+                &mut m,
+                &mut ctx,
+                &result_event(&run_id, Ok(response(&["ok"], vec![action]))),
+            )
+            .unwrap();
+            assert_eq!(
+                ctx.chat_msgs().len(),
+                1,
+                "the granted reply still posts ({fragment})"
             );
-            let breadcrumbs: Vec<String> = ctx
-                .events
-                .iter()
-                .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
-                .collect();
             assert!(
-                breadcrumbs.iter().any(|b| b.contains(fragment)),
-                "breadcrumbs {breadcrumbs:?} must mention {fragment:?}"
+                ctx.apply_msgs("tasks").is_empty(),
+                "a rejected action emits NO Apply ({fragment})"
+            );
+            let crumbs = breadcrumbs(&ctx);
+            assert!(
+                crumbs.iter().any(|b| b.contains(fragment)),
+                "breadcrumbs {crumbs:?} must mention {fragment:?}"
+            );
+            assert!(
+                crumbs.iter().any(|b| b.contains("dropped 1/1")),
+                "the drop count rides a summary crumb: {crumbs:?}"
             );
             commit(&mut m);
             assert_eq!(
                 get_pending(&m, &run_id),
                 None,
-                "the failed run's entry pruned ({fragment})"
+                "the delivered entry pruned ({fragment})"
             );
         }
+    }
+
+    #[test]
+    fn an_actions_only_job_response_whose_actions_all_drop_fails_the_run() {
+        // chat runs always normalize a fallback reply block, so the
+        // nothing-left case is the JOB lane's: no reply channel, and the one
+        // requested action rejects — the run fails, finalized as failed.
+        let registry = job_registry();
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().at(3).from_jobs().with_registry(&registry);
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
+        commit(&mut m);
+        let run_id = job_run_id_for("job-1", "duck", 3);
+
+        let mut ctx = CaptureCtx::new()
+            .at(10)
+            .from_dispatch()
+            .with_registry(&registry)
+            .with_claimed_job("job-1", 3)
+            .with_task("t0");
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(response(&[], vec![create_action("t0", "dup")]))),
+        )
+        .unwrap();
+        assert!(
+            ctx.apply_msgs("tasks").is_empty() && ctx.chat_msgs().is_empty(),
+            "a run with nothing left to do emits no writes"
+        );
+        let crumbs = breadcrumbs(&ctx);
+        assert!(
+            crumbs
+                .iter()
+                .any(|b| b.contains("failed") && b.contains("all requested actions were dropped")),
+            "the run fails, never the block: {crumbs:?}"
+        );
+        let finalize = ctx.job_msgs();
+        assert_eq!(finalize.len(), 1);
+        let JobsMsg::Finalize { ok, payload, .. } = &finalize[0] else {
+            panic!("expected a finalize");
+        };
+        assert!(!*ok, "the job finalizes as failed");
+        assert!(payload.contains("all requested actions were dropped"));
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None);
+    }
+
+    #[test]
+    fn in_batch_conflicts_ride_to_the_owner_as_its_late_conflict_case() {
+        // two creates of ONE id in the same response: each probe sees only
+        // staged-or-committed state (not its sibling), so both are accepted
+        // and both Apply follow-ups are emitted — the owner's no-fail Apply
+        // arm breadcrumbs the second (asserted in the tasks crate's suite).
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .from_dispatch()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(response(
+                    &["ok"],
+                    vec![create_action("fresh", "one"), create_action("fresh", "two")],
+                )),
+            ),
+        )
+        .unwrap();
+        assert_eq!(ctx.apply_msgs("tasks").len(), 2);
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None);
     }
 
     #[test]
@@ -3890,33 +4117,69 @@ mod tests {
     }
 
     #[test]
-    fn responses_beyond_the_agents_grants_fail_the_run() {
-        // an agent granted ONLY chat.post must not create tasks...
-        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    fn ungranted_unrouted_and_misshapen_actions_drop_while_the_reply_posts() {
+        // an agent granted chat.post + a routed-but-unowned tag: per action,
+        // the pipeline drops at its own stage — grant, route table, tag
+        // shape — with a breadcrumb naming the reason. the reply survives.
+        let (mut m, registry, run_id) =
+            awaiting_run(&[ACTION_CHAT_POST, "pages.comment.add", ACTION_TASKS_CREATE]);
         let mut ctx = CaptureCtx::new()
             .from_dispatch()
             .with_registry(&registry)
-            .with_transcript("general", transcript(2));
+            .with_transcript("general", transcript(2))
+            // route tasks.create at a module the ctx cannot serve: the
+            // failed probe query drops the action, never the block.
+            .with_route(ACTION_TASKS_CREATE, "ghost-owner");
+        let actions = vec![
+            // ungranted: tasks.update_status is not in the grant set.
+            update_action("t0", "done"),
+            // granted but UNROUTED: no package route for the tag.
+            RequestedAction {
+                action_id: "a-pages".into(),
+                tag: "pages.comment.add".into(),
+                payload: json!({"page_id": "p1"}),
+            },
+            // misshapen tag: never reaches the route table.
+            RequestedAction {
+                action_id: "a-upper".into(),
+                tag: "UPPER".into(),
+                payload: json!({}),
+            },
+            // granted + routed, but the owner probe query fails.
+            create_action("t1", "unprobeable"),
+        ];
         exec(
             &mut m,
             &mut ctx,
-            &result_event(
-                &run_id,
-                Ok(response(
-                    &["look what i did"],
-                    vec![AgentAction::CreateTask {
-                        task_id: "t1".into(),
-                        title: "sneaky".into(),
-                    }],
-                )),
-            ),
+            &result_event(&run_id, Ok(response(&["ok"], actions))),
         )
         .unwrap();
-        assert!(ctx.msgs.is_empty(), "a disallowed action emits NOTHING");
+        assert_eq!(ctx.chat_msgs().len(), 1, "the granted reply still posts");
+        assert!(
+            ctx.apply_msgs("tasks").is_empty() && ctx.msgs.len() == 1,
+            "no Apply follow-up exists for any dropped action"
+        );
+        let crumbs = breadcrumbs(&ctx);
+        for fragment in [
+            "is not allowed to tasks.update_status",
+            "no module owns action pages.comment.add",
+            "invalid characters",
+            "owner probe failed",
+            "dropped 4/4",
+        ] {
+            assert!(
+                crumbs.iter().any(|b| b.contains(fragment)),
+                "breadcrumbs {crumbs:?} must mention {fragment:?}"
+            );
+        }
         commit(&mut m);
         assert_eq!(get_pending(&m, &run_id), None);
+    }
 
-        // ...and an agent granted only tasks.create must not post replies.
+    #[test]
+    fn a_reply_without_the_chat_post_grant_fails_the_run() {
+        // an agent granted only tasks.create must not post replies — the
+        // reply-block gate stays a whole-run failure.
         let (mut m, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
         let mut ctx = CaptureCtx::new()
             .from_dispatch()
@@ -3929,68 +4192,11 @@ mod tests {
         )
         .unwrap();
         assert!(ctx.msgs.is_empty());
-        let breadcrumbs: Vec<String> = ctx
-            .events
-            .iter()
-            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
-            .collect();
+        let crumbs = breadcrumbs(&ctx);
         assert!(
-            breadcrumbs.iter().any(|b| b.contains(ACTION_CHAT_POST)),
-            "the failure names the missing grant: {breadcrumbs:?}"
+            crumbs.iter().any(|b| b.contains(ACTION_CHAT_POST)),
+            "the failure names the missing grant: {crumbs:?}"
         );
-        commit(&mut m);
-        assert_eq!(get_pending(&m, &run_id), None);
-    }
-
-    #[test]
-    fn task_actions_without_a_configured_tasks_module_fail_the_run() {
-        let registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])]);
-        let mut m = RunsModule::new(
-            "runs", "chat", "saga", "tagging", "dispatch", "agent", None, None,
-        );
-        let mut ctx = CaptureCtx::new()
-            .from_origin(user(9))
-            .with_registry(&registry);
-        exec(
-            &mut m,
-            &mut ctx,
-            &admin(&RunsMsg::WatchChannel {
-                channel_id: "general".into(),
-                policy: TurnPolicy::All,
-            }),
-        )
-        .unwrap();
-        commit(&mut m);
-        engage_post(&mut m, &registry, 2, &[]);
-        commit(&mut m);
-        let run_id = run_id_for("general", 2, "bot");
-
-        let mut ctx = CaptureCtx::new()
-            .from_dispatch()
-            .with_registry(&registry)
-            .with_transcript("general", transcript(2));
-        exec(
-            &mut m,
-            &mut ctx,
-            &result_event(
-                &run_id,
-                Ok(response(
-                    &["ok"],
-                    vec![AgentAction::CreateTask {
-                        task_id: "t1".into(),
-                        title: "x".into(),
-                    }],
-                )),
-            ),
-        )
-        .unwrap();
-        assert!(ctx.msgs.is_empty());
-        let breadcrumbs: Vec<String> = ctx
-            .events
-            .iter()
-            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
-            .collect();
-        assert!(breadcrumbs.iter().any(|b| b.contains("no tasks module")));
         commit(&mut m);
         assert_eq!(get_pending(&m, &run_id), None);
     }
@@ -4176,13 +4382,7 @@ mod tests {
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
 
-        let bytes = response(
-            &[],
-            vec![AgentAction::CreateTask {
-                task_id: "job-task".into(),
-                title: "complete job".into(),
-            }],
-        );
+        let bytes = response(&[], vec![create_action("job-task", "complete job")]);
         let mut ctx = CaptureCtx::new()
             .at(10)
             .from_dispatch()
@@ -4192,13 +4392,10 @@ mod tests {
         commit(&mut m);
 
         assert_eq!(get_pending(&m, &run_id), None, "the job entry pruned");
-        assert_eq!(
-            ctx.task_msgs(),
-            vec![TaskMsg::CreateTask {
-                task_id: "job-task".into(),
-                title: "complete job".into(),
-            }]
-        );
+        let applies = ctx.apply_msgs("tasks");
+        assert_eq!(applies.len(), 1, "the accepted action rides to the owner");
+        let PackageActionMsg::Apply { tag, .. } = &applies[0];
+        assert_eq!(tag, ACTION_TASKS_CREATE);
         let finalize = ctx.job_msgs();
         assert_eq!(finalize.len(), 1);
         let JobsMsg::Finalize {
@@ -4309,13 +4506,7 @@ mod tests {
             &mut ctx,
             &result_event(
                 &run_id,
-                Ok(response(
-                    &[],
-                    vec![AgentAction::CreateTask {
-                        task_id: "stale".into(),
-                        title: "late".into(),
-                    }],
-                )),
+                Ok(response(&[], vec![create_action("stale", "late")])),
             ),
         )
         .unwrap();

@@ -705,7 +705,7 @@ async fn genesis_host(
             "tagging",
             "dispatch",
             "agent",
-            Some("tasks".into()),
+            "package",
             Some("jobs".into()),
         )),
         // the quack package registry: install lifecycle rows plus the
@@ -860,7 +860,7 @@ async fn restore_host(
         "tagging",
         "dispatch",
         "agent",
-        Some("tasks".into()),
+        "package",
         Some("jobs".into()),
     );
     let (bytes, root) = snapshot_of("runs")?;
@@ -1112,7 +1112,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "tagging",
         "dispatch",
         "agent",
-        Some("tasks".into()),
+        "package",
         Some("jobs".into()),
     );
     runs.install(&bytes, root)

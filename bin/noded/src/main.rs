@@ -190,7 +190,7 @@ fn run_node(
             "tagging",
             "dispatch",
             "agent",
-            Some("tasks".into()),
+            "package",
             Some("jobs".into()),
         );
         let pages = Pages::init(context.child("pages"), "pages").await;

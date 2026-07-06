@@ -14,7 +14,9 @@ chat = { workspace = true }
 saga = { workspace = true }
 tagging = { workspace = true }
 dispatch = { workspace = true }
-tasks = { workspace = true }
+# the package registry's route table + the generic action contract
+# (Probe/Apply) every accepted action rides — the open-action pipeline.
+package = { workspace = true }
 jobs = { workspace = true }
 memory = { workspace = true }
 sha2 = { workspace = true }
@@ -26,3 +28,6 @@ async-trait = { workspace = true }
 futures = "0.3"
 host = { workspace = true }
 commonware-runtime = { workspace = true }
+# the first built-in action owner — exercised end-to-end in tests only; the
+# lib routes actions generically and never names the tasks module.
+tasks = { workspace = true }

@@ -507,7 +507,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "tagging",
             "dispatch",
             "agent",
-            Some("tasks".into()),
+            "package",
             Some("jobs".into()),
         );
         commit_op_as(
@@ -744,7 +744,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "tagging",
             "dispatch",
             "agent",
-            Some("tasks".into()),
+            "package",
             Some("jobs".into()),
         );
         join_runs

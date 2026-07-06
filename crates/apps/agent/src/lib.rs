@@ -748,9 +748,7 @@ impl Module for AgentModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
-    };
+    use crate::{ACTION_CHAT_POST, decode_event, decode_reply, encode_msg, encode_query};
     use futures::executor::block_on;
     use sdk::{Effect, Env};
 
@@ -1108,7 +1106,7 @@ mod tests {
                 display_name: None,
                 capability: Some("model-2".into()),
                 prompt: None,
-                allowed_actions: Some(vec![ACTION_TASKS_CREATE.into()]),
+                allowed_actions: Some(vec!["tasks.create".into()]),
             }),
         )
         .unwrap();
@@ -1133,10 +1131,7 @@ mod tests {
         let record = get_agent(&m, "bot").unwrap();
         assert_eq!(record.capability, "model-2");
         assert_eq!(record.display_name, "BOT", "unset fields keep their value");
-        assert_eq!(
-            record.allowed_actions,
-            vec![ACTION_TASKS_CREATE.to_string()]
-        );
+        assert_eq!(record.allowed_actions, vec!["tasks.create".to_string()]);
         assert_eq!(record.status, AgentStatus::Paused);
         assert_eq!(record.updated_at, 5);
 
