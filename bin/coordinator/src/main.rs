@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use coordinator_bin::select_policy;
 use nat_traversal::run_coordinator;
 use tokio::net::UdpSocket;
 
@@ -26,12 +27,18 @@ async fn main() -> std::io::Result<()> {
         None => "0.0.0.0:3478".parse().expect("default addr parses"),
     };
 
+    // The per-network authorization policy, selected from CLI flags:
+    //   --genesis-set <network.toml>  => Private (PoP + pinned valset admission)
+    //   --allow-anonymous             => fully-open (legacy, no auth)
+    //   (no flag)                     => public with proof-of-possession
+    // A malformed --genesis-set path/file is a HARD error, never a silent
+    // fall-through to a weaker policy.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let policy = select_policy(&args)?;
+
     let sock = UdpSocket::bind(listen).await?;
     // the address line stays parseable (tooling/tests read its tail).
     eprintln!("coordinator listening on {}", sock.local_addr()?);
-    // Task 6 owns wiring the real per-network policy (public/private) from
-    // config. Until then the deployed binary stays fully-open — backwards
-    // compatible with every existing client and the deploy smoke test.
-    run_coordinator(sock, nat_traversal::AuthPolicy::Open { require_pop: false }).await;
+    run_coordinator(sock, policy).await;
     Ok(())
 }

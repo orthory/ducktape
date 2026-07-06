@@ -1,0 +1,106 @@
+//! Coordinator policy selection — the ONLY new decision the untrusted
+//! coordinator makes at boot: which [`nat_traversal::AuthPolicy`] to serve.
+//!
+//! Factored out of `main.rs` so it is unit-testable without spawning the
+//! process. The coordinator stays keyless: `--genesis-set` reads ONLY the
+//! PUBLIC validator pubkeys out of a `network.toml` (never a secret, never
+//! written back), and every other input is a bare CLI flag.
+
+use commonware_codec::DecodeExt as _;
+use commonware_cryptography::ed25519;
+use serde::Deserialize;
+
+/// The one field of `network.toml` the coordinator cares about: the genesis
+/// validators, as hex ed25519 public keys. Every other key (chain_id, scheme,
+/// bootstrap, reach, coordination, …) is ignored — serde drops unknown fields —
+/// so a full descriptor parses here without dragging in `bin/node`.
+#[derive(Debug, Deserialize)]
+struct GenesisPin {
+    #[serde(default)]
+    validators: Vec<String>,
+}
+
+/// Select the authorization policy from CLI flags:
+/// `--genesis-set <path>` => Private (pinned to that network.toml's valset);
+/// `--allow-anonymous`    => fully-open (legacy);
+/// otherwise              => public with proof-of-possession (deployed default).
+pub fn select_policy(args: &[String]) -> std::io::Result<nat_traversal::AuthPolicy> {
+    if args.iter().any(|a| a == "--allow-anonymous") {
+        return Ok(nat_traversal::AuthPolicy::Open { require_pop: false });
+    }
+    if let Some(path) = flag_value(args, "--genesis-set") {
+        let genesis_set = load_genesis_pubkeys(&path)?;
+        return Ok(nat_traversal::AuthPolicy::Private { genesis_set });
+    }
+    Ok(nat_traversal::AuthPolicy::Open { require_pop: true })
+}
+
+/// The value following `flag` in `args`, if present (`--flag <value>`).
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Parse the PUBLIC genesis validator pubkeys out of a `network.toml`. This is
+/// the ONLY new input the coordinator reads — public data, never a secret.
+/// Mirrors `NetworkDescriptor::validator_keys` (bin/node/src/config.rs) without
+/// depending on the node crate: decode each hex entry to an ed25519 pubkey and
+/// reject a duplicate (a repeat would otherwise be a silently smaller valset).
+fn load_genesis_pubkeys(path: &str) -> std::io::Result<Vec<ed25519::PublicKey>> {
+    let text = std::fs::read_to_string(path)?;
+    let pin: GenesisPin = toml::from_str(&text).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("network.toml: {e}"),
+        )
+    })?;
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+
+    let keys: Vec<ed25519::PublicKey> = pin
+        .validators
+        .iter()
+        .map(|h| decode_key(h))
+        .collect::<Result<_, _>>()
+        .map_err(invalid)?;
+
+    let mut seen = std::collections::BTreeSet::new();
+    for k in &keys {
+        if !seen.insert(k.as_ref().to_vec()) {
+            return Err(invalid(format!(
+                "duplicate validator {} in genesis set",
+                hex_bytes(k.as_ref())
+            )));
+        }
+    }
+    Ok(keys)
+}
+
+/// Decode one hex-encoded ed25519 public key. Dependency-free hex (the
+/// coordinator does not pull in bin/node's `unhex`); strict digits, even length.
+fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
+    let raw = unhex(hex.trim())?;
+    ed25519::PublicKey::decode(raw.as_slice())
+        .map_err(|e| format!("{hex:?} is not an ed25519 public key: {e}"))
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("hex string contains non-hex characters".into());
+    }
+    if !s.len().is_multiple_of(2) {
+        return Err("hex string has odd length".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
