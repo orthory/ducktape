@@ -1,19 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
 import { render } from "@testing-library/react";
 import { CommentsPanel } from "./CommentsPanel";
-import type { AnchorThreads } from "../../../domain/comments-client";
+import type { TargetThreads } from "../../../domain/pages-client";
 import type { AuthorRef } from "../../../domain/chat-client";
 
 const alice: AuthorRef = { user: [1] };
 
-const threads: AnchorThreads[] = [
+const threads: TargetThreads[] = [
   {
     target: "b1",
     threads: [
       {
         thread: {
           id: "t1",
-          anchor: { module: "pages", target: "b1" },
+          target: "b1",
           opener: alice,
           created_at: 1,
           resolved: false,

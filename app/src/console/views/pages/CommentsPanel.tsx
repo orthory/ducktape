@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames } from "../../../domain/chat-client";
-import type { AnchorThreads, ThreadView } from "../../../domain/comments-client";
+import type { TargetThreads, ThreadView } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
 import { color, font, radius } from "../../theme/tokens";
 
@@ -17,7 +17,7 @@ export function CommentsPanel({
   onEdit,
   onDelete,
 }: {
-  threads: AnchorThreads[];
+  threads: TargetThreads[];
   authorNames: AuthorNames;
   onClose: () => void;
   onReply: (threadId: string, text: string) => void;

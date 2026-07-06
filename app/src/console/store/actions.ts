@@ -3,7 +3,6 @@ import type { Dispatch } from "react";
 import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import * as commentsClient from "../../domain/comments-client";
 import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
@@ -127,12 +126,8 @@ export interface ConsoleActions {
   /** Load the open page's comment threads (page + every visible block). */
   loadPageThreads(): void;
   /** Add a comment: opens a new thread when `threadId` is omitted (a fresh id
-   *  is minted), else appends to that thread. */
-  addComment(params: {
-    threadId?: string;
-    anchor: { module: string; target: string };
-    text: string;
-  }): void;
+   *  is minted), else appends to that thread. `target` is a block or page id. */
+  addComment(params: { threadId?: string; target: string; text: string }): void;
   /** Edit own comment text. */
   editComment(params: { commentId: string; text: string }): void;
   /** Tombstone own comment (removes the thread if it was the last live one). */
@@ -365,8 +360,8 @@ export function createActions({
       return Promise.resolve();
     }
     const targets = [page, ...getState().activePageBlocks.map((b) => b.id)];
-    return commentsClient
-      .threadsForAnchors(live, { module: "pages", targets })
+    return pagesClient
+      .threadsForTargets(live, { targets })
       .then((pageThreads) => patch({ pageThreads }))
       .catch(fail);
   };
@@ -796,13 +791,13 @@ export function createActions({
       void loadPageThreads();
     },
 
-    addComment: ({ threadId, anchor, text }) => {
+    addComment: ({ threadId, target, text }) => {
       const clean = text.trim();
       if (!clean) return;
       const tid = threadId ?? crypto.randomUUID();
       const commentId = crypto.randomUUID();
       submitTracked(opKey.commentThread(tid), (live) =>
-        commentsClient.addComment(live, { threadId: tid, commentId, anchor, text: clean }),
+        pagesClient.addComment(live, { threadId: tid, commentId, target, text: clean }),
       ).then(() => loadPageThreads());
     },
 
@@ -810,19 +805,19 @@ export function createActions({
       const clean = text.trim();
       if (!clean) return;
       submitTracked(opKey.comment(commentId), (live) =>
-        commentsClient.editComment(live, { commentId, text: clean }),
+        pagesClient.editComment(live, { commentId, text: clean }),
       ).then(() => loadPageThreads());
     },
 
     deleteComment: (commentId) => {
       submitTracked(opKey.comment(commentId), (live) =>
-        commentsClient.deleteComment(live, commentId),
+        pagesClient.deleteComment(live, commentId),
       ).then(() => loadPageThreads());
     },
 
     resolveThread: ({ threadId, resolved }) => {
       submitTracked(opKey.commentThread(threadId), (live) =>
-        commentsClient.resolveThread(live, { threadId, resolved }),
+        pagesClient.resolveThread(live, { threadId, resolved }),
       ).then(() => loadPageThreads());
     },
 

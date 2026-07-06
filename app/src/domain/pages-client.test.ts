@@ -1,14 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { createPage, setPageParent, deletePage } from "./pages-client";
+import {
+  addComment,
+  createPage,
+  deletePage,
+  resolveThread,
+  setPageParent,
+  threadsForTargets,
+} from "./pages-client";
 import type { NodeTransport } from "./transport";
 
-function fakeTransport(sink: unknown[]): NodeTransport {
+function fakeTransport(sink: unknown[], reply: unknown = {}): NodeTransport {
   return {
     submit: (target: string, payload: unknown) => {
       sink.push({ target, payload });
       return Promise.resolve({ height: 1, opHash: "x" } as never);
     },
-    query: () => Promise.resolve({} as never),
+    query: (target: string, payload: unknown) => {
+      sink.push({ target, payload });
+      return Promise.resolve(reply as never);
+    },
     view: () => Promise.resolve({} as never),
   } as unknown as NodeTransport;
 }
@@ -30,5 +40,27 @@ describe("pages-client nesting", () => {
     await deletePage(fakeTransport(sink), "p2");
     expect(sink[0].payload).toEqual({ set_page_parent: { page_id: "p2", parent: null } });
     expect(sink[1].payload).toEqual({ delete_page: { page_id: "p2" } });
+  });
+});
+
+describe("pages-client comments", () => {
+  it("addComment targets the pages module with a bare target id", async () => {
+    const sink: { target: string; payload: unknown }[] = [];
+    await addComment(fakeTransport(sink), { threadId: "t1", commentId: "c1", target: "b1", text: "hi" });
+    expect(sink[0]).toEqual({
+      target: "pages",
+      payload: { add_comment: { thread_id: "t1", comment_id: "c1", target: "b1", text: "hi" } },
+    });
+  });
+  it("resolveThread wire shape", async () => {
+    const sink: { target: string; payload: unknown }[] = [];
+    await resolveThread(fakeTransport(sink), { threadId: "t1", resolved: true });
+    expect(sink[0].payload).toEqual({ resolve_thread: { thread_id: "t1", resolved: true } });
+  });
+  it("threadsForTargets decodes the comment_threads reply", async () => {
+    const sink: unknown[] = [];
+    const reply = { comment_threads: [{ target: "b1", threads: [] }] };
+    const out = await threadsForTargets(fakeTransport(sink, reply), { targets: ["b1"] });
+    expect(out).toEqual([{ target: "b1", threads: [] }]);
   });
 });

@@ -8,7 +8,10 @@
 // pure functions over an injected NodeTransport.
 
 import type { BlockEvent, NodeTransport } from "./transport";
+import type { AuthorRef } from "./chat-client";
 import { replyVariant } from "./wire";
+
+export type { AuthorRef };
 
 // ── Wire types (block records + PageReply payloads, verbatim) ─
 
@@ -206,3 +209,92 @@ export const searchPageBlocks = (
       }),
     )
     .then((reply) => replyVariant<PageSearchHit[]>(reply, "hits"));
+
+// ── Comments (threads anchored to a block/page, in the same module) ─────
+//
+// A comment thread anchors to a `target` — a block id or a page id in THIS
+// module. Authorship is derived by the module from the submit origin, so it
+// appears only in replies.
+
+export interface Comment {
+  id: string;
+  thread_id: string;
+  author: AuthorRef;
+  text: string;
+  created_at: number;
+  edited_at: number | null;
+  deleted: boolean;
+}
+
+export interface Thread {
+  id: string;
+  target: string;
+  opener: AuthorRef;
+  created_at: number;
+  resolved: boolean;
+  resolved_by: AuthorRef | null;
+  comment_ids: string[];
+}
+
+export interface ThreadView {
+  thread: Thread;
+  comments: Comment[];
+}
+
+export interface TargetThreads {
+  target: string;
+  threads: ThreadView[];
+}
+
+export const addComment = (
+  transport: NodeTransport,
+  params: { threadId: string; commentId: string; target: string; text: string },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    add_comment: {
+      thread_id: params.threadId,
+      comment_id: params.commentId,
+      target: params.target,
+      text: params.text,
+    },
+  });
+
+export const editComment = (
+  transport: NodeTransport,
+  params: { commentId: string; text: string },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    edit_comment: { comment_id: params.commentId, text: params.text },
+  });
+
+export const deleteComment = (
+  transport: NodeTransport,
+  commentId: string,
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, { delete_comment: { comment_id: commentId } });
+
+export const resolveThread = (
+  transport: NodeTransport,
+  params: { threadId: string; resolved: boolean },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    resolve_thread: { thread_id: params.threadId, resolved: params.resolved },
+  });
+
+/** Every thread anchored to any of `targets` (block/page ids), grouped by
+ *  target — one round-trip for a whole page's visible blocks. */
+export const threadsForTargets = (
+  transport: NodeTransport,
+  params: { targets: string[] },
+): Promise<TargetThreads[]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, { threads_for_targets: { targets: params.targets } }))
+    .then((reply) => replyVariant<TargetThreads[]>(reply, "comment_threads"));
+
+export const getThread = (
+  transport: NodeTransport,
+  threadId: string,
+): Promise<ThreadView | null> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, { comment_thread: { thread_id: threadId } }))
+    .then((reply) => replyVariant<ThreadView | null>(reply, "comment_thread"));

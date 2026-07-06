@@ -13,8 +13,12 @@ import type {
 } from "../../domain/chat-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
-import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
-import type { AnchorThreads } from "../../domain/comments-client";
+import type {
+  PageBlock,
+  PageMeta,
+  PageSearchHit,
+  TargetThreads,
+} from "../../domain/pages-client";
 import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
@@ -93,7 +97,7 @@ export interface ConsoleState {
   /** Comment threads for the open page's blocks + the page itself, grouped by
    *  target. Loaded on page open and after any comment op. Not per-block
    *  snapshot state. */
-  pageThreads: AnchorThreads[];
+  pageThreads: TargetThreads[];
 
   // ── Agents ──
   /** Every registered agent, re-queried per block like tasks. */

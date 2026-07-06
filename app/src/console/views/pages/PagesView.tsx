@@ -862,7 +862,7 @@ export function PagesView() {
     if (!has) {
       const text = window.prompt("Comment on this block");
       if (text && text.trim()) {
-        actions.addComment({ anchor: { module: "pages", target: blockId }, text });
+        actions.addComment({ target: blockId, text });
       }
     }
   };
@@ -872,7 +872,7 @@ export function PagesView() {
     setPanelOpen(true);
     const text = window.prompt("Comment on this page");
     if (text && text.trim()) {
-      actions.addComment({ anchor: { module: "pages", target: state.activePage }, text });
+      actions.addComment({ target: state.activePage, text });
     }
   };
 
@@ -1158,7 +1158,7 @@ export function PagesView() {
               onReply={(threadId, text) =>
                 actions.addComment({
                   threadId,
-                  anchor: { module: "pages", target: state.activePage ?? "" },
+                  target: state.activePage ?? "",
                   text,
                 })
               }
