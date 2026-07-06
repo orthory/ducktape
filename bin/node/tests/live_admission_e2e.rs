@@ -76,9 +76,10 @@ fn network_shape_joiner_parks_until_promote() {
 ///   1. while the friend holds resident standing, the valset's VALIDATOR set
 ///      still names only the founder — committed state proves the tier split;
 ///   2. the resident SERVES: local reads (rpc + http) answer from its own
-///      pre-synced boundary, a write is refused as reads-only, and a value the
-///      founder finalizes becomes readable through the resident's surface (the
-///      continuous follow);
+///      pre-synced boundary, a write lands through the submit relay (and the
+///      resident reads its own write back), and a value the founder finalizes
+///      becomes readable through the resident's surface (the continuous
+///      follow);
 ///   3. the chain keeps finalizing with the resident KILLED (under the old
 ///      one-step flow the friend would already hold a quorum seat here, and a
 ///      2-member quorum with one member down is a stall);
@@ -288,23 +289,39 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         assert!(raw.starts_with("HTTP/1.1 200"), "resident /v1/status must answer 200:\n{raw}");
         assert!(raw.contains("\"height\""), "resident /v1/status carries a height:\n{raw}");
     }
-    //     …a write is refused as reads-only…
-    let refused = cluster.rpc(
+    //     …a write LANDS through the submit relay: the resident signs with its
+    //     own key, ships the frame to the validator, and the rpc reply holds
+    //     until the frame finalizes (ok == Applied)…
+    let landed = cluster.rpc(
         1,
         serde_json::json!({
             "cmd": "submit",
             "target": "directory",
             "payload_hex": common::hex(&directory::encode_msg(&DirMsg::Set {
-                key: "resident-no-writes".into(),
-                value: "refused".into(),
+                key: "resident-writes".into(),
+                value: "landed".into(),
             })),
         }),
     );
-    assert_eq!(refused["ok"], serde_json::json!(false), "resident must refuse writes: {refused}");
-    assert!(
-        refused["error"].as_str().unwrap_or_default().contains("reads only"),
-        "the refusal names the reads-only contract: {refused}"
+    assert_eq!(
+        landed["ok"],
+        serde_json::json!(true),
+        "the resident submit should relay + finalize (ok == Applied): {landed}"
     );
+    //     …and the resident READS ITS OWN WRITE once its follow arm crosses
+    //     the boundary that carries it…
+    poll("the resident to serve its own relayed write", Box::new(|| {
+        cluster
+            .query(
+                1,
+                "directory",
+                &directory::encode_query(&DirQuery::Get {
+                    key: "resident-writes".into(),
+                }),
+            )
+            .and_then(|raw| directory::decode_reply(&raw).ok())
+            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "landed"))
+    }));
     //     …and the follow is CONTINUOUS: a value the founder finalizes now
     //     becomes readable through the resident within a few boundaries.
     cluster.submit(
