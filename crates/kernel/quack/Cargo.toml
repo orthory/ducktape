@@ -1,0 +1,17 @@
+[package]
+name = "quack"
+edition.workspace = true
+version.workspace = true
+
+# the Quack package toolkit — a pure library (no sdk, no consensus): parse and
+# validate a `quack.toml` manifest, pack/unpack the deterministic `.quack`
+# capsule (a reproducible ustar tar), verify content digests, and sign/verify
+# the manifest hash with the ed25519 shape shared across the platform.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+sha2 = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+thiserror = { workspace = true }

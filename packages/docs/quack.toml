@@ -1,0 +1,72 @@
+schema = 1
+package = "org.ducktape.docs"
+version = "0.1.0"
+
+[requires]
+protocol_min = 1
+modules = ["agent", "runs", "jobs", "dispatch", "capability"]
+capabilities = ["codex"]
+
+# v1 modules are `native`: the code ships in the node binary, so `artifact`/
+# `abi`/`hash` are omitted. `logical` ids map to concrete network module ids at
+# install; every cross-reference below is by logical id.
+[[modules]]
+logical = "pages"
+default_id = "pages"
+kind = "native"
+
+[[modules]]
+logical = "docs-harness"
+default_id = "docs-harness"
+kind = "native"
+
+[[prompts]]
+logical = "docs_editor_prompt"
+path = "prompts/docs-editor.md"
+hash = "sha256:4c959e34b57a174dd08e9b1fd6aaa431c22c5fb0ea82f0266ecc27dcd4594407"
+
+[[actions]]
+tag = "pages.comment.add"
+owner = "docs-harness"
+schema = "actions/pages.comment.add.schema.json"
+
+[[actions]]
+tag = "pages.block.update_text"
+owner = "docs-harness"
+schema = "actions/pages.block.update_text.schema.json"
+
+[[actions]]
+tag = "pages.thread.resolve"
+owner = "docs-harness"
+schema = "actions/pages.thread.resolve.schema.json"
+
+[[agents]]
+id = "docs.editor"
+display_name = "Docs Editor"
+prompt = "docs_editor_prompt"
+capability = "codex"
+actions = ["pages.comment.add", "pages.block.update_text"]
+status = "active"
+
+[[engagements]]
+source = "pages"
+event = "comment_added"
+agent = "docs.editor"
+policy = "mention_or_assigned"
+
+[install]
+register_modules = true
+seed_state = true
+register_agents = true
+register_actions = true
+wire_hooks = true
+enable_jobs = true
+run_harness = true
+
+[uninstall]
+remove_hooks = true
+pause_agents = true
+unregister_actions = true
+pending_runs = "drain"
+user_data = "preserve"
+package_state = "tombstone"

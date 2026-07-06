@@ -19,6 +19,7 @@ members = [
     "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/capability-host",
+    "crates/kernel/quack",
     # system — consensus infrastructure modules
     "crates/system/kv", 
     "crates/system/valset", 
@@ -110,6 +111,9 @@ statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
 capability-host = { path = "crates/kernel/capability-host" }
+# the Quack package toolkit (manifest + capsule + signatures) — a pure library
+# shared by the `ducktape-node package` CLI and, later, package-module tooling.
+quack = { path = "crates/kernel/quack" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates

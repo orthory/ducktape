@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "pages.comment.add",
+  "description": "Add a comment to a page, or reply within an existing thread.",
+  "type": "object",
+  "properties": {
+    "page_id": {
+      "type": "string",
+      "description": "The page the comment belongs to."
+    },
+    "thread_id": {
+      "type": "string",
+      "description": "Existing thread to reply in; omit to open a new thread."
+    },
+    "target": {
+      "type": "string",
+      "description": "Optional block or selection the comment is anchored to."
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "The comment body."
+    }
+  },
+  "required": ["page_id", "text"],
+  "additionalProperties": false
+}

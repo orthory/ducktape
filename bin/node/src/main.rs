@@ -68,6 +68,7 @@ use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of
 
 mod config;
 mod lobby;
+mod package;
 mod voice;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
@@ -2303,6 +2304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("member-status") => return cmd_member_status(&args[1..]),
         Some("join") => return cmd_join(&args[1..]),
         Some("upgrade-status") => return cmd_upgrade_status(&args[1..]),
+        Some("package") => return package::run(&args[1..]),
         _ => {}
     }
 
@@ -2321,7 +2323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "unexpected arg {other:?} (want a subcommand — \
                      keygen|init|invite|admit|invite-accept|promote|observer-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
-                     upgrade-status — or \
+                     upgrade-status|package — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
                 )
                 .into());
