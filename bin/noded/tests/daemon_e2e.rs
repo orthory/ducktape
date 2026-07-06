@@ -308,7 +308,7 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
                         "text": format!("@{agent_id}"),
                         "marks": [{
                             "Mention": {
-                                "Agent": { "module": "agent", "agent_id": agent_id }
+                                "Agent": { "module": "runs", "agent_id": agent_id }
                             }
                         }]
                     },
@@ -348,6 +348,7 @@ fn full_surface_blocks_authorship_and_ws() {
             "automations",
             "jobs",
             "agent",
+            "runs",
             "document",
             "pages",
             "forge",
@@ -476,7 +477,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     assert_eq!(code, 200, "register agent failed: {block}");
 
     let (code, block) = daemon.submit(
-        "agent",
+        "runs",
         serde_json::json!({
             "WatchChannel": {
                 "channel_id": "general",
@@ -509,9 +510,9 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     );
 
     let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
-    // the run's lifecycle lives in the dispatch module; the agent module's
+    // the run's lifecycle lives in the dispatch module; the runs module's
     // pending entry pruned when the delivery landed.
-    let pending = daemon.query("agent", serde_json::json!("PendingRuns"));
+    let pending = daemon.query("runs", serde_json::json!("PendingRuns"));
     assert_eq!(
         pending["PendingRuns"].as_array().map(Vec::len),
         Some(0),
@@ -521,8 +522,8 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
         "dispatch",
         serde_json::json!({
             "Dispatch": {
-                "receiver": "agent",
-                "dispatch_id": agent::dispatch_id_for(run_id),
+                "receiver": "runs",
+                "dispatch_id": runs::dispatch_id_for(run_id),
             }
         }),
     );
@@ -541,7 +542,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
     assert_eq!(
         agent_reply["author"],
-        serde_json::json!({ "Agent": { "module": "agent", "agent_id": "quackbot" } })
+        serde_json::json!({ "Agent": { "module": "runs", "agent_id": "quackbot" } })
     );
     let text = agent_reply["blocks"][0]["Paragraph"][0]["text"]
         .as_str()
@@ -549,7 +550,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     assert!(
         text.starts_with("echo: handling dispatch "),
         "the reply is the echo worker's dispatch-lane answer, normalized \
-         into a paragraph by the agent module: {text}"
+         into a paragraph by the runs module: {text}"
     );
 }
 
@@ -733,7 +734,7 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     );
     assert_eq!(code, 200, "register chat agent failed: {block}");
     let (code, block) = daemon.submit(
-        "agent",
+        "runs",
         serde_json::json!({ "WatchChannel": { "channel_id": "general", "policy": "Mention" } }),
         Some("owner"),
     );
@@ -762,7 +763,7 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     );
 
     // and the loop closed: the provider's stdout posted as the agent's reply.
-    let run_id = agent::run_id_for("general", 1, "duck-live");
+    let run_id = runs::run_id_for("general", 1, "duck-live");
     let reply = daemon.query(
         "chat",
         serde_json::json!({ "MessagesLatest": { "channel_id": "general", "limit": 16 } }),
@@ -793,7 +794,7 @@ fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
     );
     assert_eq!(code, 200, "register job agent failed: {block}");
     let (code, block) = daemon.submit(
-        "agent",
+        "runs",
         serde_json::json!({ "EnableJobWorker": { "enabled": true } }),
         Some("owner"),
     );

@@ -51,6 +51,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent::AgentModule;
+use runs::RunsModule;
 use automations::Automations;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -90,7 +91,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 15] = [
+const MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
     "dispatch",
@@ -100,6 +101,7 @@ const MODULE_IDS: [&str; 15] = [
     "automations",
     "jobs",
     "agent",
+    "runs",
     "document",
     "pages",
     "forge",
@@ -384,12 +386,14 @@ fn run_sim(
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let jobs = Jobs::new("jobs");
-        let agent = AgentModule::new(
-            "agent",
+        let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+        let runs = RunsModule::new(
+            "runs",
             "chat",
             "saga",
             "tagging",
             "dispatch",
+            "agent",
             Some("tasks".into()),
             Some("jobs".into()),
             Some("document".into()),
@@ -410,6 +414,7 @@ fn run_sim(
             Box::new(automations),
             Box::new(jobs),
             Box::new(agent),
+            Box::new(runs),
             Box::new(document),
             Box::new(pages),
             Box::new(forge),

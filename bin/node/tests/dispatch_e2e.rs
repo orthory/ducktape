@@ -28,7 +28,8 @@ mod common;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_interface::{ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, TurnPolicy};
+use agent_interface::{ACTION_CHAT_POST, AgentMsg};
+use runs_interface::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 use capability_interface::{CapabilityQuery, CapabilityReply};
 use chat_interface::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
 use common::{Cluster, poll_until, serial};
@@ -224,8 +225,8 @@ fn register_and_mention(
     );
     cluster.submit(
         idx,
-        "agent",
-        &agent_interface::encode_msg(&AgentMsg::WatchChannel {
+        "runs",
+        &runs_interface::encode_msg(&RunsMsg::WatchChannel {
             channel_id: channel.into(),
             policy: TurnPolicy::Mention,
         }),
@@ -235,11 +236,11 @@ fn register_and_mention(
     poll_until("the channel watch to commit", FINALIZE, || {
         let reply = cluster.query(
             idx,
-            "agent",
-            &agent_interface::encode_query(&AgentQuery::Watches),
+            "runs",
+            &runs_interface::encode_query(&RunsQuery::Watches),
         )?;
-        match agent_interface::decode_reply(&reply) {
-            Ok(AgentReply::Watches(w)) => {
+        match runs_interface::decode_reply(&reply) {
+            Ok(RunsReply::Watches(w)) => {
                 w.iter().any(|v| v.channel_id == channel).then_some(())
             }
             _ => None,
@@ -256,7 +257,7 @@ fn register_and_mention(
                 Span {
                     text: format!("@{agent_id}"),
                     marks: vec![Mark::Mention(AuthorRef::Agent {
-                        module: "agent".into(),
+                        module: "runs".into(),
                         agent_id: agent_id.into(),
                     })],
                 },
@@ -288,7 +289,7 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) ->
                 assert_eq!(
                     v.head.author,
                     AuthorRef::Agent {
-                        module: "agent".into(),
+                        module: "runs".into(),
                         agent_id: run_id.rsplit('\u{1f}').next().expect("run id agent").into(),
                     },
                     "the reply must be authored by the agent"
@@ -317,8 +318,8 @@ fn wait_for_delivered(cluster: &Cluster, idx: usize, run_id: &str) {
             idx,
             "dispatch",
             &dispatch_interface::encode_query(&DispatchQuery::Dispatch {
-                receiver: "agent".into(),
-                dispatch_id: agent::dispatch_id_for(run_id),
+                receiver: "runs".into(),
+                dispatch_id: runs::dispatch_id_for(run_id),
             }),
         )?;
         match dispatch_interface::decode_reply(&reply) {
@@ -397,7 +398,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // channel; the run executes on node 1 (the tag's only announced
     // provider) and replies once.
     register_and_mention(&cluster, 0, "dispatch", "quacker-text", &text_provider.tag, "m1");
-    let run_text = agent::run_id_for("dispatch", 1, "quacker-text");
+    let run_text = runs::run_id_for("dispatch", 1, "quacker-text");
     let reply = wait_for_reply(&cluster, 0, "dispatch", &run_text);
     assert_eq!(reply, "the word is quack", "the text provider's raw answer");
     wait_for_delivered(&cluster, 0, &run_text);
@@ -405,7 +406,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // beat 2: the json provider's agent, cross-checked from ANOTHER node.
     // the reply above was seq 2, so this mention anchors at seq 3.
     register_and_mention(&cluster, 0, "dispatch", "quacker-json", &json_provider.tag, "m2");
-    let run_json = agent::run_id_for("dispatch", 3, "quacker-json");
+    let run_json = runs::run_id_for("dispatch", 3, "quacker-json");
     let reply = wait_for_reply(&cluster, 2, "dispatch", &run_json);
     assert_eq!(
         reply, "the json word is quack",
@@ -440,12 +441,12 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     let reply = cluster
         .query(
             0,
-            "agent",
-            &agent_interface::encode_query(&AgentQuery::PendingRuns),
+            "runs",
+            &runs_interface::encode_query(&RunsQuery::PendingRuns),
         )
         .expect("pending runs query");
-    match agent_interface::decode_reply(&reply) {
-        Ok(AgentReply::PendingRuns(pending)) => {
+    match runs_interface::decode_reply(&reply) {
+        Ok(RunsReply::PendingRuns(pending)) => {
             assert!(pending.is_empty(), "delivered runs must prune: {pending:?}")
         }
         other => panic!("unexpected pending-runs reply: {other:?}"),
@@ -500,7 +501,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
         }),
     );
     register_and_mention(&cluster, 0, "race", "racer", "quack-race", "m1");
-    let run_id = agent::run_id_for("race", 1, "racer");
+    let run_id = runs::run_id_for("race", 1, "racer");
 
     // one winner executes, one reply posts — whichever node won the claim.
     let reply = wait_for_reply(&cluster, 0, "race", &run_id);

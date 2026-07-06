@@ -59,6 +59,7 @@ files = { workspace = true }
 memory = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
+runs = { workspace = true }
 reactor = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability orchestrator runs
 # on its own plain-tokio thread (mirroring the app-surface split) behind the
@@ -106,6 +107,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 async-trait = { workspace = true }
 agent-interface = { workspace = true }
+runs-interface = { workspace = true }
 chat-interface = { workspace = true }
 forge-interface = { workspace = true }
 tempfile = "3"

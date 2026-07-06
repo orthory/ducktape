@@ -3,21 +3,15 @@ name = "agent"
 edition.workspace = true
 version.workspace = true
 
-# the agent orchestrator: registry, channel watches (via the tagging plane),
-# run lifecycle over the dispatch plane, context pinning, in-consensus payload
-# composition, and deterministic model-output validation.
+# the agent registry: a self-contained record book (owner, capability tag,
+# prompt pin, granted actions, status). saga-interface supplies the canonical
+# origin mirror; capability-interface the shared capability-tag shape rule.
+# everything that ACTS on agents lives in the runs module.
 [dependencies]
 sdk = { workspace = true }
 agent-interface = { workspace = true }
-chat-interface = { workspace = true }
 saga-interface = { workspace = true }
-tagging-interface = { workspace = true }
-dispatch-interface = { workspace = true }
-document-interface = { workspace = true }
-# the shared capability-tag shape rule for AgentRecord.capability validation.
 capability-interface = { workspace = true }
-tasks-interface = { workspace = true }
-jobs-interface = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,12 +19,3 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"
-host = { workspace = true }
-reactor = { workspace = true }
-chat = { workspace = true }
-saga = { workspace = true }
-tagging = { workspace = true }
-dispatch = { workspace = true }
-tasks = { workspace = true }
-jobs = { workspace = true }
-commonware-runtime = { workspace = true }

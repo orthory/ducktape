@@ -13,11 +13,14 @@
 //!
 //! run: `cargo run -p demo`
 
-use agent::{AgentModule, run_id_for};
+use agent::AgentModule;
 use agent_interface::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, TurnPolicy,
-    decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
-    encode_query as agent_encode_query,
+    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg,
+};
+use runs::{RunsModule, run_id_for};
+use runs_interface::{
+    RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
+    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use automations::Automations;
 use chat::Chat;
@@ -90,12 +93,14 @@ fn main() {
         let files = Files::new("files");
         let memory = Memory::new("memory", "files");
         let jobs = Jobs::new("jobs");
-        let agent = AgentModule::new(
-            "agent",
+        let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+        let runs = RunsModule::new(
+            "runs",
             "chat",
             "saga",
             "tagging",
             "dispatch",
+            "agent",
             Some("tasks".into()),
             Some("jobs".into()),
             Some("document".into()),
@@ -119,11 +124,12 @@ fn main() {
             Box::new(memory),
             Box::new(jobs),
             Box::new(agent),
+            Box::new(runs),
             Box::new(automations),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 18 registered modules over one host ===");
+        println!("=== super-app demo — 19 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -469,8 +475,8 @@ fn main() {
         // block 8: the agent-collaboration loop (design §3). register an agent
         // (which model+prompt it runs is committed into the app-hash), watch
         // the chat channel under a Mention policy — the watch and chat's hook
-        // registration commit atomically — enable the agent module as the
-        // jobs-board worker by agent admin op (not genesis config), then post a message MENTIONING the
+        // registration commit atomically — enable the runs module as the
+        // jobs-board worker by admin op (not genesis config), then post a message MENTIONING the
         // agent: the very same block carries the post, the tagging plane's
         // engagement delivery, the pending entry, the dispatch, and its saga
         // trigger. the emitted WorkerRequest effect is the off-consensus LLM
@@ -495,8 +501,8 @@ fn main() {
         host.submit_at(
             as_demo_user(),
             Msg {
-                target: "agent".into(),
-                payload: agent_encode_msg(&AgentMsg::EnableJobWorker { enabled: true }),
+                target: "runs".into(),
+                payload: runs_encode_msg(&RunsMsg::EnableJobWorker { enabled: true }),
             },
         )
         .await
@@ -504,8 +510,8 @@ fn main() {
         host.submit_at(
             as_demo_user(),
             Msg {
-                target: "agent".into(),
-                payload: agent_encode_msg(&AgentMsg::WatchChannel {
+                target: "runs".into(),
+                payload: runs_encode_msg(&RunsMsg::WatchChannel {
                     channel_id: "general".into(),
                     policy: TurnPolicy::Mention,
                 }),
@@ -527,7 +533,7 @@ fn main() {
                                 text: "@quackbot".into(),
                                 marks: vec![chat_interface::Mark::Mention(
                                     chat_interface::AuthorRef::Agent {
-                                        module: "agent".into(),
+                                        module: "runs".into(),
                                         agent_id: "quackbot".into(),
                                     },
                                 )],
@@ -542,7 +548,7 @@ fn main() {
             .await
             .expect("submit block 8 mention");
         println!(
-            "\n[block 8] agent <- Register; agent <- EnableJobWorker(true); agent <- Watch(Mention); chat <- PostMessage(@quackbot)"
+            "\n[block 8] agent <- Register; runs <- EnableJobWorker(true); runs <- Watch(Mention); chat <- PostMessage(@quackbot)"
         );
         println!(
             "  effects        : {} WorkerRequest (the off-consensus LLM seam)",
@@ -550,10 +556,10 @@ fn main() {
         );
         let run_id = run_id_for("general", 3, "quackbot");
         let reply = host
-            .query("agent", &agent_encode_query(&AgentQuery::PendingRuns))
+            .query("runs", &runs_encode_query(&RunsQuery::PendingRuns))
             .await
-            .expect("query agent pending runs");
-        if let AgentReply::PendingRuns(pending) = agent_decode_reply(&reply).unwrap() {
+            .expect("query runs pending");
+        if let RunsReply::PendingRuns(pending) = runs_decode_reply(&reply).unwrap() {
             for entry in pending.iter().filter(|p| p.run_id == run_id) {
                 println!(
                     "  pending run    : {} (dispatch {}, anchored at seq {})",
@@ -565,8 +571,8 @@ fn main() {
             .query(
                 "dispatch",
                 &dispatch_interface::encode_query(&dispatch_interface::DispatchQuery::Dispatch {
-                    receiver: "agent".into(),
-                    dispatch_id: agent::dispatch_id_for(&run_id),
+                    receiver: "runs".into(),
+                    dispatch_id: runs::dispatch_id_for(&run_id),
                 }),
             )
             .await

@@ -24,6 +24,7 @@ inbox = { workspace = true }
 automations = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
+runs = { workspace = true }
 dispatch = { workspace = true }
 tagging = { workspace = true }
 saga = { workspace = true }

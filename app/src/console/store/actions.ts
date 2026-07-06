@@ -1,7 +1,6 @@
 import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
-import type { TurnPolicy } from "../../domain/agent-client";
 import * as automationsClient from "../../domain/automations-client";
 import type { Action as RuleAction, Trigger } from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
@@ -19,6 +18,8 @@ import type { Meta } from "../../domain/memory-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
+import * as runsClient from "../../domain/runs-client";
+import type { TurnPolicy } from "../../domain/runs-client";
 import * as tasksClient from "../../domain/tasks-client";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
@@ -971,7 +972,7 @@ export function createActions({
       submitTracked(
         opKey.watch(channelId),
         (live) =>
-          agentClient.watchChannel(live, {
+          runsClient.watchChannel(live, {
             channelId,
             policy,
             origin: getState().author,
@@ -985,7 +986,7 @@ export function createActions({
       submitTracked(
         opKey.watch(channelId),
         (live) =>
-          agentClient.unwatchChannel(live, {
+          runsClient.unwatchChannel(live, {
             channelId,
             origin: getState().author,
           }),
@@ -996,7 +997,7 @@ export function createActions({
     requestRun: ({ agentId, channelId, anchorSeq }) => {
       if (!agentId || !channelId) return;
       submitTracked(opKey.runRequest(agentId), (live) =>
-        agentClient.requestRun(live, {
+        runsClient.requestRun(live, {
           agentId,
           channelId,
           anchorSeq,
@@ -1009,7 +1010,7 @@ export function createActions({
       if (!runId) return;
       submitTracked(
         opKey.run(runId),
-        (live) => agentClient.cancelRun(live, { runId, origin: getState().author }),
+        (live) => runsClient.cancelRun(live, { runId, origin: getState().author }),
         (prev) => optimistic.runCancelled(prev, runId),
       );
     },
@@ -1050,7 +1051,7 @@ export function createActions({
 
     enableJobWorker: (enabled) => {
       submitTracked(opKey.jobWorker(), (live) =>
-        agentClient.enableJobWorker(live, { enabled, origin: getState().author }),
+        runsClient.enableJobWorker(live, { enabled, origin: getState().author }),
       );
     },
 

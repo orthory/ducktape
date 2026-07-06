@@ -3,7 +3,8 @@
 // state that must survive screen boundaries (screen, accent, author identity,
 // thread panel).
 
-import type { AgentRecord, PendingRun, WatchView } from "../../domain/agent-client";
+import type { AgentRecord } from "../../domain/agent-client";
+import type { PendingRun, WatchView } from "../../domain/runs-client";
 import type { Rule } from "../../domain/automations-client";
 import type {
   Channel,
