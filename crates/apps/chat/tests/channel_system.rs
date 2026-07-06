@@ -4,7 +4,7 @@
 //! two-instance determinism.
 
 use chat::Chat;
-use chat_interface::{
+use chat::{
     AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_HOOKS_PER_CHANNEL, Mark,
     PostPolicy, Span, decode_event, decode_reply, encode_msg, encode_query,
 };
@@ -743,7 +743,7 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
                 },
             )
             .await,
-            ChatReply::Reactions(vec![chat_interface::ReactionSummary {
+            ChatReply::Reactions(vec![chat::ReactionSummary {
                 emoji: "duck".into(),
                 reactors: [author_of(2)].into(),
             }])

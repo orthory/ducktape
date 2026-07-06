@@ -16,7 +16,7 @@
 //! does NOT carry is per-block coordinates — `height` and `time` collapse to
 //! the boundary, so ranking among rebuilt rows degrades to id order.
 
-use document_interface::{BlockKind, DocMsg, DocQuery, DocReply, decode_msg, decode_reply, encode_query};
+use crate::{BlockKind, DocMsg, DocQuery, DocReply, decode_msg, decode_reply, encode_query};
 use indexer::search::{self, DEFAULT_POSTING_CAP};
 use indexer::{
     ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, RebuildMeta, Result, StateReader,
@@ -278,7 +278,7 @@ impl ModuleIndexer for DocumentIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use document_interface::{Block, encode_msg};
+    use crate::{Block, encode_msg};
     use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
 
     fn store(dir: &std::path::Path) -> IndexStore {
@@ -390,7 +390,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl indexer::StateReader for CanonicalDocs {
         async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
-            let reply = match document_interface::decode_query(req).map_err(Error::State)? {
+            let reply = match crate::decode_query(req).map_err(Error::State)? {
                 DocQuery::ListDocs => {
                     DocReply::DocList(self.0.iter().map(|(id, _)| id.clone()).collect())
                 }
@@ -402,7 +402,7 @@ mod tests {
                 ),
                 other => return Err(Error::State(format!("unexpected query {other:?}"))),
             };
-            Ok(document_interface::encode_reply(&reply))
+            Ok(crate::encode_reply(&reply))
         }
     }
 

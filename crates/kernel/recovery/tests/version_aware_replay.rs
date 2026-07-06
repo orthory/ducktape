@@ -109,7 +109,7 @@ fn install_dual(bytes: &[u8], expected: StateRoot, active_version: u32) -> Dual 
 
 // ---- a static armed upgrade module ------------------------------------------
 // reports a fixed pending upgrade at H with the sole member already ready, so
-// `upgrade_interface::effective_version(height, ..)` returns V at/after H and 0
+// `upgrade::effective_version(height, ..)` returns V at/after H and 0
 // below it. `root()` is constant (the config never mutates), so it contributes an
 // identical, stable root on both the live and the recovered side. the injected
 // boundary `Advance` is accepted as a no-op (this mock does not model the flip —
@@ -141,17 +141,17 @@ impl Module for StaticUpgrade {
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         // the host injects exactly one System-origin `Advance` at each block >= H;
         // accept it as a no-op (this mock arms purely by height).
-        match upgrade_interface::decode_msg(&msg.payload).map_err(Error::Module)? {
-            upgrade_interface::UpgradeMsg::Advance => Ok(()),
+        match upgrade::decode_msg(&msg.payload).map_err(Error::Module)? {
+            upgrade::UpgradeMsg::Advance => Ok(()),
             other => Err(Error::Module(format!("static upgrade got {other:?}"))),
         }
     }
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let upgrade_interface::UpgradeQuery::Status =
-            upgrade_interface::decode_query(req).map_err(Error::Module)?;
-        let status = upgrade_interface::UpgradeStatus {
+        let upgrade::UpgradeQuery::Status =
+            upgrade::decode_query(req).map_err(Error::Module)?;
+        let status = upgrade::UpgradeStatus {
             current_version: 0,
-            pending: Some(upgrade_interface::Upgrade {
+            pending: Some(upgrade::ScheduledUpgrade {
                 name: self.name.clone(),
                 activation_height: self.activation_height,
                 to_version: self.to_version,
@@ -162,8 +162,8 @@ impl Module for StaticUpgrade {
             ready_count: 1,
             armed: true,
         };
-        Ok(upgrade_interface::encode_reply(
-            &upgrade_interface::UpgradeReply::Status(status),
+        Ok(upgrade::encode_reply(
+            &upgrade::UpgradeReply::Status(status),
         ))
     }
 }

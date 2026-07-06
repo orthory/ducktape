@@ -3,10 +3,10 @@ name = "greeter"
 edition.workspace = true
 version.workspace = true
 
-# a CONSUMER module: composes directory + kv purely through their *-interface
-# crates. note it depends on NEITHER the directory nor the kv impl crate.
+# a CONSUMER module: composes directory + kv purely through their crate-root
+# wire types — it never reaches their module internals.
 [dependencies]
 sdk = { workspace = true }
-directory-interface = { workspace = true }
-kv-interface = { workspace = true }
+directory = { workspace = true }
+kv = { workspace = true }
 async-trait = { workspace = true }

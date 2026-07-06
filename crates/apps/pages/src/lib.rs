@@ -7,7 +7,7 @@
 //! and the value is ONE serialized block — so the merkle root commits to every
 //! block individually, and a single block is readable (and one day provable)
 //! by id alone with no page context. that is the addressability contract that
-//! lets other modules hold a [`pages_interface::BlockRef`] today and resolve
+//! lets other modules hold a [`crate::BlockRef`] today and resolve
 //! it via `Ctx::query(pages, GetBlock { block_id })`.
 //!
 //! ## keys are hashed to a fixed width
@@ -44,6 +44,12 @@
 //! rebuilds a byte-identical root from an untrusted peer, merkle-verified
 //! against the target root.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+// the derived-tier materialized view; registered only by serving binaries.
+pub mod index;
+
 use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -62,10 +68,6 @@ use commonware_storage::{
 };
 use commonware_utils::range::NonEmptyRange;
 
-use pages_interface::{
-    Block, BlockKind, PageMeta, PageMsg, PageQuery, PageReply, decode_msg, decode_query,
-    encode_reply,
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, ResolverSyncTarget, StateRoot, StateSyncHandle};
 
 /// write-time cap on ONE serialized block record (and on the enumeration
@@ -784,7 +786,7 @@ where
 mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, deterministic};
-    use pages_interface::{NewBlock, decode_reply, encode_msg, encode_query};
+    use crate::{NewBlock, decode_reply, encode_msg, encode_query};
     use state::global_root;
 
     fn nb(id: &str, kind: BlockKind, text: &str) -> NewBlock {

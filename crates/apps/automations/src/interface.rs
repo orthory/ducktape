@@ -1,7 +1,7 @@
 //! the automations module's public wire surface -- types only.
 //!
 //! writes go via [`AutomationsMsg`]; reads via [`AutomationsQuery`] ->
-//! [`AutomationsReply`]. the chat hook seam delivers a `chat_interface::ChatEvent`
+//! [`AutomationsReply`]. the chat hook seam delivers a `chat::ChatEvent`
 //! payload; the automations module decodes it inside its origin-gated hook arm
 //! (see [`AutomationsMsg::HookEvent`]).
 
@@ -101,7 +101,7 @@ pub enum AutomationsMsg {
     DeleteRule {
         rule_id: String,
     },
-    /// the chat hook payload: the `chat_interface::ChatEvent` bytes chat delivers
+    /// the chat hook payload: the `chat::ChatEvent` bytes chat delivers
     /// as a follow-up. HONORED ONLY when the dispatch origin is the chat module;
     /// a non-chat origin claiming a hook event is rejected as a spoof.
     HookEvent(Vec<u8>),

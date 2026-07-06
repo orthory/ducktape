@@ -12,7 +12,7 @@ worker that drives `WGApi`, an `admission_root` producer that fails closed until
 the finalized admission commitment exists, and a responder-side install-plan
 constructor.
 
-The two mesh contracts (`valset-mesh-interface` and `wireguard-upgrade`) should
+The two mesh contracts (`valset::mesh` and `wireguard-upgrade`) should
 collapse onto one shape. A privileged Linux netns e2e that creates a real
 WireGuard interface is still deliberately descoped.
 

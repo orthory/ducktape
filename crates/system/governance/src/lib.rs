@@ -28,16 +28,16 @@
 //! sha256 over the canonical encoding of COMMITTED proposals, and
 //! `snapshot`/`install` ship exactly that root preimage (verify-then-adopt).
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::BTreeMap;
 
-use governance_interface::{
-    GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, ProposalView, decode_msg, decode_query,
-    encode_reply,
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use upgrade_interface::{UpgradeMsg, encode_msg as upgrade_encode_msg};
-use valset_interface::{
+use upgrade::{UpgradeMsg, encode_msg as upgrade_encode_msg};
+use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
 };

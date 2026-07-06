@@ -4,7 +4,7 @@ use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
 
 use files::Files;
-use files_interface::{
+use files::{
     FilesMsg, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp, MAX_MANIFESTS, Manifest,
     decode_reply, decode_sync_resp, encode_msg, encode_query, encode_sync_req, verify_chunk,
 };

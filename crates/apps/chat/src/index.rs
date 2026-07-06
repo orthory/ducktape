@@ -29,7 +29,7 @@
 //! `height` collapses to the boundary — but `created_at` survives, so `time`
 //! (and with it search ranking) stays exact.
 
-use chat_interface::{
+use crate::{
     AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, DEFAULT_CHAT_TARGET, MAX_QUERY_LIMIT, Span,
     decode_msg, decode_reply, encode_query,
 };
@@ -430,7 +430,7 @@ impl ModuleIndexer for ChatIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chat_interface::encode_msg;
+    use crate::encode_msg;
     use indexer::{AppliedOp, BlockOps, IndexStore};
 
     fn store(dir: &std::path::Path) -> IndexStore {
@@ -595,14 +595,14 @@ mod tests {
     /// `MessagesRange` TWO views at a time regardless of the asked limit, so
     /// the rebuild's pagination loop is exercised, not just its first lap.
     struct CanonicalChat {
-        channels: Vec<chat_interface::Channel>,
-        views: Vec<chat_interface::MessageView>,
+        channels: Vec<crate::Channel>,
+        views: Vec<crate::MessageView>,
     }
 
     #[async_trait::async_trait(?Send)]
     impl indexer::StateReader for CanonicalChat {
         async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
-            let reply = match chat_interface::decode_query(req).map_err(Error::State)? {
+            let reply = match crate::decode_query(req).map_err(Error::State)? {
                 ChatQuery::Channels => ChatReply::Channels(self.channels.clone()),
                 ChatQuery::MessagesRange {
                     channel_id,
@@ -618,17 +618,17 @@ mod tests {
                 ),
                 other => return Err(Error::State(format!("unexpected query {other:?}"))),
             };
-            Ok(chat_interface::encode_reply(&reply))
+            Ok(crate::encode_reply(&reply))
         }
     }
 
-    fn canonical_channel(id: &str, head_seq: u64) -> chat_interface::Channel {
-        chat_interface::Channel {
+    fn canonical_channel(id: &str, head_seq: u64) -> crate::Channel {
+        crate::Channel {
             id: id.into(),
             name: id.into(),
             created_at: 900,
             head_seq,
-            post_policy: chat_interface::PostPolicy::Open,
+            post_policy: crate::PostPolicy::Open,
             hooks: Vec::new(),
             pinned: Vec::new(),
         }
@@ -644,11 +644,11 @@ mod tests {
         created_at: u64,
         rev: u32,
         deleted: bool,
-    ) -> chat_interface::MessageView {
-        chat_interface::MessageView {
+    ) -> crate::MessageView {
+        crate::MessageView {
             channel_id: channel.into(),
             seq,
-            head: chat_interface::MessageHead {
+            head: crate::MessageHead {
                 message_id: message_id.into(),
                 author,
                 blocks: vec![Block::paragraph(text)],

@@ -5,7 +5,7 @@
 //! plane's engagement events, composes each engaged post's model input in
 //! consensus, dispatches it under the agent's recipe, and validates the
 //! model's response before any cross-module write happens. the agents it runs
-//! live in the agent REGISTRY (`agent-interface`) — this module reads them by
+//! live in the agent REGISTRY (`agent`) — this module reads them by
 //! query and never holds registry state. run LIFECYCLE is not this module's
 //! state either — a dispatched task's lifecycle lives in the dispatch module
 //! (and its saga); this surface only exposes the module's own correlation
@@ -16,7 +16,7 @@
 //! - [`RunsQuery`] -> [`RunsReply`] — reads over watches and the pending
 //!   (not-yet-delivered) runs.
 
-use saga_interface::SagaOrigin;
+use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_RUNS_TARGET: &str = "runs";

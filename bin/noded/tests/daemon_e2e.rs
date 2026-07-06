@@ -1066,7 +1066,7 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
     let digest = reply["digest"].as_str().expect("digest").to_string();
     assert_eq!(
         digest,
-        files_interface::digest_hex(&chunk),
+        files::digest_hex(&chunk),
         "the returned digest is sha256 of the exact uploaded bytes"
     );
 
@@ -1077,7 +1077,7 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
 
     // a well-formed digest nobody uploaded is a 404; a malformed digest
     // (uppercase hex included) is a 400, not a miss.
-    let absent = files_interface::digest_hex(b"never uploaded");
+    let absent = files::digest_hex(b"never uploaded");
     let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{absent}"), &[]);
     assert_eq!(code, 404, "absent chunk must be a 404");
     let upper = digest.to_uppercase();
@@ -1085,11 +1085,11 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
     assert_eq!(code, 400, "digest must be lowercase hex");
 
     // the cap is MAX_CHUNK_SIZE inclusive: exactly 4 MiB lands...
-    let max = vec![0xABu8; files_interface::MAX_CHUNK_SIZE as usize];
+    let max = vec![0xABu8; files::MAX_CHUNK_SIZE as usize];
     let (code, _) = daemon.request_bytes("POST", "/v1/files/blob", &max);
     assert_eq!(code, 200, "a chunk of exactly MAX_CHUNK_SIZE must land");
     // ...and one byte more is a 413 in the daemon's error envelope.
-    let over = vec![0xCDu8; files_interface::MAX_CHUNK_SIZE as usize + 1];
+    let over = vec![0xCDu8; files::MAX_CHUNK_SIZE as usize + 1];
     let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &over);
     assert_eq!(
         code,
@@ -1132,9 +1132,9 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
     assert_eq!(block["height"], 1, "the manifest IS a block");
 
     let reply = daemon.query("files", serde_json::json!({ "stat": { "file_id": "f1" } }));
-    let manifest: files_interface::Manifest =
+    let manifest: files::Manifest =
         serde_json::from_value(reply["stat"].clone()).expect("Stat carries the manifest");
-    files_interface::verify_chunk(&manifest, 0, &fetched)
+    files::verify_chunk(&manifest, 0, &fetched)
         .expect("fetched bytes verify against the committed manifest");
 }
 

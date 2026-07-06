@@ -15,9 +15,9 @@
 //! N-nodes-each-paying-for-the-same-call into one call.
 
 use capability_host::ProviderSet;
-use dispatch_interface::decode_work_spec;
+use dispatch::decode_work_spec;
 use reactor::{WorkOutcome, Worker};
-use saga_interface::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
+use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Effect, Msg};
 
 /// Production worker for dispatch `WorkSpec` saga effects.
@@ -127,8 +127,8 @@ fn clean_error(error: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch_interface::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
-    use saga_interface::encode_worker_request;
+    use dispatch::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
+    use saga::encode_worker_request;
 
     /// a provider surface with one loaded mock spec and NO installed
     /// binaries — enough for every non-live test; no executor is named.
@@ -205,7 +205,7 @@ format = "text"
         {
             WorkOutcome::Handled(Some(msg)) => {
                 let SagaMsg::OracleResult { outcome, .. } =
-                    saga_interface::decode_msg(&msg.payload).unwrap()
+                    saga::decode_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };
@@ -256,7 +256,7 @@ format = "text"
         let worker = DispatchWorker::new(providers, b"me".to_vec());
         match worker.run(&effect_for(work_spec(), None)).await.unwrap() {
             WorkOutcome::Handled(Some(msg)) => {
-                match saga_interface::decode_msg(&msg.payload).unwrap() {
+                match saga::decode_msg(&msg.payload).unwrap() {
                     SagaMsg::Accept { saga_id, attempt } => {
                         assert_eq!(saga_id, "s");
                         assert_eq!(attempt, 0);
@@ -313,7 +313,7 @@ format = "text"
         match worker.run(&effect_for(spec, Some(b"me"))).await.unwrap() {
             WorkOutcome::Handled(Some(msg)) => {
                 let SagaMsg::OracleResult { outcome, .. } =
-                    saga_interface::decode_msg(&msg.payload).unwrap()
+                    saga::decode_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };

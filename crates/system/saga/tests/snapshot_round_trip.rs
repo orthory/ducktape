@@ -10,12 +10,12 @@
 
 use futures::executor::block_on;
 use saga::SagaModule;
-use saga_interface::{
+use saga::{
     SagaMsg, SagaOrigin, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply, encode_msg,
     encode_query,
 };
 use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
-use valset_interface::{ValsetReply, encode_reply as valset_encode_reply};
+use valset::{ValsetReply, encode_reply as valset_encode_reply};
 
 /// a minimal `Ctx`: drives `execute` with a controllable env, resolves a
 /// known module for reply_to validation, and serves a canned validator set

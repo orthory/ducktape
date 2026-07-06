@@ -21,7 +21,7 @@
 //! generation. that is pin-at-publish semantics — removing the files manifest
 //! later does not rewrite or invalidate the memory generation. the generation's
 //! copied digest/size are its consensus truth; body bytes remain fetched over
-//! the files chunk lane and receiver-verified with `files_interface::verify_chunk`.
+//! the files chunk lane and receiver-verified with `files::verify_chunk`.
 //!
 //! ## snapshots & the retention mechanism (design decision)
 //!
@@ -42,19 +42,16 @@
 //! once a path is fully forgotten (deleted with nothing retained) does a fresh
 //! publish restart at generation 1.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use files_interface::{
+use files::{
     FilesQuery, FilesReply, MAX_FILE_ID_BYTES, decode_reply as decode_files_reply,
     encode_query as encode_files_query,
-};
-use memory_interface::{
-    Body, FileStat, Generation, GrepHit, LsEntry, MAX_BODY_BYTES, MAX_FILES,
-    MAX_GENERATIONS_PER_PATH, MAX_GREP_LINE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
-    MAX_META_VALUE_BYTES, MAX_MODULE_ID_BYTES, MAX_PATH_BYTES, MAX_QUERY_LIMIT, MAX_SEGMENT_BYTES,
-    MAX_SNAPSHOT_NAME_BYTES, MAX_SNAPSHOTS, MAX_WATCHES, MemoryEvent, MemoryMsg, MemoryQuery,
-    MemoryReply, Meta, PublishBody, decode_msg, decode_query, encode_event, encode_reply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};

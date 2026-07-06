@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::{Cluster, poll_until, serial};
-use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.

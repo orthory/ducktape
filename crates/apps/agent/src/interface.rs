@@ -7,7 +7,7 @@
 //! genesis-configured hook target) so the module that runs agents can keep
 //! each agent's dispatch-plane recipe in lockstep, atomically with the
 //! registration that changed it. engagement, run orchestration, and response
-//! delivery live in the runs module (`runs-interface`). three payload
+//! delivery live in the runs module (`runs`). three payload
 //! families cross this surface:
 //!
 //! - [`AgentMsg`] — writes: registry admin only.
@@ -19,7 +19,7 @@
 //!   the agent's allowed-action set.
 //! - [`AgentQuery`] -> [`AgentReply`] — reads over the registry.
 
-use saga_interface::SagaOrigin;
+use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_AGENT_TARGET: &str = "agent";
@@ -146,7 +146,7 @@ pub enum AgentAction {
         task_id: String,
         title: String,
     },
-    /// `status` is the wire name of a `tasks_interface::TaskStatus`:
+    /// `status` is the wire name of a `tasks::TaskStatus`:
     /// `"open"`, `"in_progress"`, or `"done"`.
     UpdateTaskStatus {
         task_id: String,

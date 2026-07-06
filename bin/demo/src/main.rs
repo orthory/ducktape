@@ -14,17 +14,17 @@
 //! run: `cargo run -p demo`
 
 use agent::AgentModule;
-use agent_interface::{
+use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg,
 };
 use runs::{RunsModule, run_id_for};
-use runs_interface::{
+use runs::{
     RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
     encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use automations::Automations;
 use chat::Chat;
-use chat_interface::{
+use chat::{
     Block as ChatBlock, ChatMsg, ChatQuery, ChatReply, PostPolicy,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
@@ -33,22 +33,22 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
-use directory_interface::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
+use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
 use document::Document;
-use document_interface::{
+use document::{
     Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
     encode_msg as doc_encode_msg, encode_query as doc_encode_query,
 };
 use files::Files;
 use forge::Forge;
-use forge_interface::{
+use forge::{
     ForgeMsg, ForgeQuery, ForgeReply, decode_reply as forge_decode_reply,
     encode_msg as forge_encode_msg, encode_query as forge_encode_query,
 };
 use greeter::Greeter;
 use host::{BlockContext, Host};
 use inbox::Inbox;
-use inbox_interface::{
+use inbox::{
     InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
@@ -56,13 +56,13 @@ use jobs::Jobs;
 use memory::Memory;
 use profiles::Profiles;
 use saga::SagaModule;
-use saga_interface::{
+use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
 use sdk::{Msg, Origin};
 use tasks::Tasks;
 use valset::Valset;
-use valset_interface::{
+use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
 };
@@ -228,14 +228,14 @@ fn main() {
         let kv_reply = host
             .query(
                 "kv",
-                &kv_interface::encode_query(&kv_interface::KvQuery::Get {
+                &kv::encode_query(&kv::KvQuery::Get {
                     key: b"greeting:name".to_vec(),
                 }),
             )
             .await
             .expect("query kv");
-        if let kv_interface::KvReply::Value(Some(v)) =
-            kv_interface::decode_reply(&kv_reply).unwrap()
+        if let kv::KvReply::Value(Some(v)) =
+            kv::decode_reply(&kv_reply).unwrap()
         {
             println!(
                 "kv[greeting:name]        = {:?}",
@@ -528,17 +528,17 @@ fn main() {
                         channel_id: "general".into(),
                         message_id: "m3".into(),
                         blocks: vec![ChatBlock::Paragraph(vec![
-                            chat_interface::Span::plain("hey "),
-                            chat_interface::Span {
+                            chat::Span::plain("hey "),
+                            chat::Span {
                                 text: "@quackbot".into(),
-                                marks: vec![chat_interface::Mark::Mention(
-                                    chat_interface::AuthorRef::Agent {
+                                marks: vec![chat::Mark::Mention(
+                                    chat::AuthorRef::Agent {
                                         module: "runs".into(),
                                         agent_id: "quackbot".into(),
                                     },
                                 )],
                             },
-                            chat_interface::Span::plain(" can you follow up?"),
+                            chat::Span::plain(" can you follow up?"),
                         ])],
                         thread: None,
                         as_agent: None,
@@ -570,19 +570,19 @@ fn main() {
         let reply = host
             .query(
                 "dispatch",
-                &dispatch_interface::encode_query(&dispatch_interface::DispatchQuery::Dispatch {
+                &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
                     receiver: "runs".into(),
                     dispatch_id: runs::dispatch_id_for(&run_id),
                 }),
             )
             .await
             .expect("query dispatch");
-        let dispatch_interface::DispatchReply::Dispatch(Some(dispatch_view)) =
-            dispatch_interface::decode_reply(&reply).unwrap()
+        let dispatch::DispatchReply::Dispatch(Some(dispatch_view)) =
+            dispatch::decode_reply(&reply).unwrap()
         else {
             panic!("the run's dispatch must exist");
         };
-        let dispatch_interface::DispatchStatus::AwaitingResult { saga_id } =
+        let dispatch::DispatchStatus::AwaitingResult { saga_id } =
             dispatch_view.status.clone()
         else {
             panic!("the dispatch awaits its saga");

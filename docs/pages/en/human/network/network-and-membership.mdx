@@ -26,7 +26,7 @@ transport happened to deliver.
 ## Valset State
 
 `crates/system/valset` stores validator membership as a module. It exposes typed
-messages and queries through `valset-interface`, and the demo applies a join
+messages and queries through valset's crate-root wire types, and the demo applies a join
 message carrying an ed25519 public key.
 
 The remaining membership work is live orchestration around consensus epochs: the

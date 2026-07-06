@@ -6,7 +6,7 @@
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
 use profiles::Profiles;
-use profiles_interface::{
+use profiles::{
     MAX_NAME_LEN, Profile, ProfileMsg, ProfileQuery, ProfileReply, decode_reply, encode_msg,
     encode_query,
 };

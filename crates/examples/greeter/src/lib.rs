@@ -2,11 +2,11 @@
 //! it READS the directory module (a live `ctx.query`) and, from what it finds,
 //! WRITES a greeting to both directory and kv (typed follow-up `emit_msg`s).
 //!
-//! it depends only on `directory-interface` and `kv-interface` — never on the
-//! directory or kv IMPL crates. that is the whole isolation thesis in one file.
+//! it touches only the `directory` and `kv` wire surfaces (crate-root types +
+//! codecs) — never their module internals. that is the whole isolation thesis in one file.
 
-use directory_interface::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
-use kv_interface::{KvMsg, encode as kv_encode};
+use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use kv::{KvMsg, encode as kv_encode};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
 pub struct Greeter {

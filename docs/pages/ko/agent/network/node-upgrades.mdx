@@ -76,7 +76,7 @@ binary로 구성된 network에서는 이 절차를 사용 가능한 것처럼 �
    최초 실행 height가 `>= H`인 node는 반드시 new binary로 실행해야 한다.
 3. **Governance를 통해 schedule한다.**
    `GovAction::ScheduleUpgrade { name, activation_height: H, to_version }`
-   (`crates/system/governance-interface/src/lib.rs:19-26`)를 담은 member-gated
+   (`crates/system/governance/src/interface.rs:19-26`)를 담은 member-gated
    proposal을 작성한다. `H`는 모든 node의 미래로 엄격히 정한다 — `MIN_UPGRADE_LEAD`를
    지나고, 최소한 orchestrator `cutover_delay` window
    (`crates/kernel/consensus/src/valset_orchestrator.rs:225-232`)만큼 이후로. tally-pass

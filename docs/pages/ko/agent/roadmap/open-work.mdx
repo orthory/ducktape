@@ -10,7 +10,7 @@
 reactor worker, finalized admission commitment가 생기기 전에는 fail-closed로
 동작하는 `admission_root` producer, responder-side install-plan constructor다.
 
-두 mesh contract(`valset-mesh-interface`, `wireguard-upgrade`)는 하나의 shape로
+두 mesh contract(`valset::mesh`, `wireguard-upgrade`)는 하나의 shape로
 합쳐져야 한다. 실제 WireGuard interface를 Linux netns에서 올리는 privileged e2e는
 아직 deliberately descoped다.
 

@@ -39,15 +39,18 @@
 //! whatever bytes arrived and refuses to adopt them unless it matches the
 //! expected root consensus already agreed on.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+// the (not-yet-consumed) valset mesh wire surface, kept as its own namespace.
+pub mod mesh;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use valset_interface::{
-    ValsetMsg, ValsetQuery, ValsetReply, decode_msg, decode_query, encode_reply,
-};
 
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
@@ -445,7 +448,7 @@ mod tests {
     use super::*;
     use commonware_cryptography::Signer as _;
     use commonware_cryptography::ed25519::PrivateKey;
-    use valset_interface::{encode_msg, encode_query};
+    use crate::{encode_msg, encode_query};
 
     // a minimal Ctx — valset's execute reads only env (origin + protocol_version).
     struct TestCtx {
@@ -508,7 +511,7 @@ mod tests {
     fn validators(v: &Valset) -> Vec<Vec<u8>> {
         let reply =
             futures::executor::block_on(v.query(&encode_query(&ValsetQuery::Validators))).unwrap();
-        match valset_interface::decode_reply(&reply).unwrap() {
+        match crate::decode_reply(&reply).unwrap() {
             ValsetReply::Validators(list) => list,
             other => panic!("expected Validators, got {other:?}"),
         }
@@ -516,7 +519,7 @@ mod tests {
     fn observers(v: &Valset) -> Vec<Vec<u8>> {
         let reply =
             futures::executor::block_on(v.query(&encode_query(&ValsetQuery::Observers))).unwrap();
-        match valset_interface::decode_reply(&reply).unwrap() {
+        match crate::decode_reply(&reply).unwrap() {
             ValsetReply::Observers(list) => list,
             other => panic!("expected Observers, got {other:?}"),
         }

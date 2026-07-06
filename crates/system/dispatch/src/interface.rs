@@ -19,7 +19,7 @@
 //! event to the receiver. the receiver consumes the result in its own block,
 //! its own failure domain — at least one block after the result committed.
 
-use saga_interface::SagaOrigin;
+use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
 /// the conventional module id dispatch registers under — shared by the host's
@@ -36,7 +36,7 @@ pub const MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 /// hard cap on an accepted result — saga's own result cap, restated here so
 /// contract validation and the mailbox agree with what saga can carry.
-pub const MAX_RESULT_BYTES: usize = saga_interface::MAX_RESULT_BYTES;
+pub const MAX_RESULT_BYTES: usize = saga::MAX_RESULT_BYTES;
 
 /// hard cap on a recipe / dispatch id.
 pub const MAX_ID_BYTES: usize = 128;

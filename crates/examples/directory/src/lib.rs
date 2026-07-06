@@ -5,9 +5,12 @@
 //! of it without opening the async-query question. its root is a state-based hash
 //! (order-independent + idempotent), the correct shape for a module commitment.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+
 use std::collections::BTreeMap;
 
-use directory_interface::{DirMsg, DirQuery, DirReply, decode_msg, decode_query, encode_reply};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
@@ -204,7 +207,7 @@ impl Module for Directory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use directory_interface::encode_query;
+    use crate::encode_query;
 
     #[test]
     fn set_query_and_state_based_root() {
@@ -218,7 +221,7 @@ mod tests {
             futures::executor::block_on(d.query(&encode_query(&DirQuery::Get { key: "a".into() })))
                 .unwrap();
         assert_eq!(
-            directory_interface::decode_reply(&reply).unwrap(),
+            crate::decode_reply(&reply).unwrap(),
             DirReply::Value(Some("1".into()))
         );
 

@@ -2,8 +2,8 @@
 
 Status: shipped — the fold/view contract (chat, tasks, document, pages), the
 from-state rebuild (§7 lane 1), and the consensus-validator wiring.
-Code: `crates/kernel/indexer` (the contract + store), `crates/apps/*-index`
-(per-module implementations), `bin/noded` (the feed, the HTTP lanes, and the
+Code: `crates/kernel/indexer` (the contract + store), the chat/tasks/document/
+pages modules' `src/index.rs` (per-module implementations), `bin/noded` (the feed, the HTTP lanes, and the
 shared store construction), `bin/node` (the validator: live fold, replay
 fold, boundary heals).
 
@@ -61,10 +61,10 @@ A mapper is one type implementing:
 
 ### 3.1 Placement
 
-A mapper lives in a dedicated `<module>-index` crate beside the module's
-`<module>-interface` crate, and depends on exactly two internal things: the
-`indexer` contract crate and the module's **types-only interface crate** —
-never the module implementation, never `sdk`/`host`. The indexer crate itself
+A mapper lives in the module crate's `index` submodule (`<module>::index`),
+and depends on exactly two internal things: the `indexer` contract crate and
+the module's **crate-root wire types** — never the module's state machinery,
+never `sdk`/`host`. The indexer crate itself
 is domain-agnostic and depends on no module code (the same layering rule that
 keeps hydration generic; break it and the dependency cycles return).
 
@@ -73,8 +73,8 @@ keeps hydration generic; break it and the dependency cycles return).
 1. **Applied ops only, all of them.** The fold sees exactly the dispatches
    consensus applied — root ops *and* follow-ups — in drain order. A failed op
    aborts its whole block and never reaches the index. Mirror module
-   semantics on that assumption (tasks-index files every `CreateTask` as
-   `Open` because a duplicate create would have aborted; chat-index mirrors
+   semantics on that assumption (`tasks::index` files every `CreateTask` as
+   `Open` because a duplicate create would have aborted; `chat::index` mirrors
    `head_seq` because every applied post assigned exactly the next sequence).
 2. **Deterministic data-in/data-out.** No IO, no clock, no randomness. Inputs
    are `OpMeta` (height, consensus time, block-wide seq, origin tag), the op

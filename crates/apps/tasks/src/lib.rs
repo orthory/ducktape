@@ -7,13 +7,16 @@
 //! `snapshot`/`install` use the exact canonical byte stream that `root()` hashes
 //! so a joiner can verify a peer-provided image before mutating local state.
 
+// the wire surface: this module's shared types, flattened at the crate root.
+mod interface;
+pub use interface::*;
+// the derived-tier materialized view; registered only by serving binaries.
+pub mod index;
+
 use std::collections::BTreeMap;
 
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use sha2::{Digest, Sha256};
-use tasks_interface::{
-    Task, TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_msg, decode_query, encode_reply,
-};
 
 pub struct Tasks {
     id: ModuleId,

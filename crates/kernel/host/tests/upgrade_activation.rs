@@ -16,7 +16,7 @@ use futures::executor::block_on;
 use host::{BASELINE_VERSION, BlockContext, Host, SubmitError};
 use sdk::{Msg, Origin};
 use upgrade::Upgrade;
-use upgrade_interface::{
+use upgrade::{
     UpgradeMsg, UpgradeQuery, UpgradeReply, UpgradeStatus, encode_msg, encode_query,
 };
 use valset::Valset;
@@ -72,7 +72,7 @@ fn signal_msg(name: &str, to_version: u32) -> Msg {
 fn status(host: &Host) -> UpgradeStatus {
     let reply = block_on(host.query("upgrade", &encode_query(&UpgradeQuery::Status)))
         .expect("status query");
-    match upgrade_interface::decode_reply(&reply).expect("decode status") {
+    match upgrade::decode_reply(&reply).expect("decode status") {
         UpgradeReply::Status(s) => s,
     }
 }

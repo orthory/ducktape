@@ -1,7 +1,7 @@
 //! the upgrade module's public wire surface — types only.
 //!
 //! the upgrade module holds the agreed `current_version`, the single pending
-//! `Upgrade { name, activation_height, to_version }`, and the per-validator
+//! `ScheduledUpgrade { name, activation_height, to_version }`, and the per-validator
 //! readiness set — all folded into the app-hash. governance authorizes a
 //! schedule/cancel by emitting a host-drained follow-up; each validator emits
 //! `SignalReady` once running the new binary; the boundary `Advance` tick arms
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// the coordinates of a scheduled upgrade. **at most one** is ever pending.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Upgrade {
+pub struct ScheduledUpgrade {
     pub name: String,
     pub activation_height: u64,
     pub to_version: u32,
@@ -58,7 +58,7 @@ pub enum UpgradeQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeStatus {
     pub current_version: u32,
-    pub pending: Option<Upgrade>,
+    pub pending: Option<ScheduledUpgrade>,
     /// the boundary member set the verdict was computed against, sorted. lets a
     /// caller (e.g. the host stamping seam) re-run the shared `effective_version`.
     pub members: Vec<Vec<u8>>,
@@ -107,7 +107,7 @@ pub fn decode_reply(b: &[u8]) -> Result<UpgradeReply, String> {
 pub fn effective_version(
     height: u64,
     current: u32,
-    pending: Option<&Upgrade>,
+    pending: Option<&ScheduledUpgrade>,
     boundary_members: &[Vec<u8>],
     ready: &BTreeMap<Vec<u8>, ()>,
 ) -> u32 {
@@ -158,7 +158,7 @@ mod tests {
 
         let r = UpgradeReply::Status(UpgradeStatus {
             current_version: 1,
-            pending: Some(Upgrade {
+            pending: Some(ScheduledUpgrade {
                 name: "n".into(),
                 activation_height: 9,
                 to_version: 2,
@@ -177,7 +177,7 @@ mod tests {
         let m1 = vec![1u8; 32];
         let m2 = vec![2u8; 32];
         let members = vec![m1.clone(), m2.clone()];
-        let up = Upgrade {
+        let up = ScheduledUpgrade {
             name: "n".into(),
             activation_height: 10,
             to_version: 2,

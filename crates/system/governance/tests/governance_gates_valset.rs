@@ -12,14 +12,14 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 use governance::Governance;
-use governance_interface::{
+use governance::{
     GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, decode_reply as gov_decode,
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Module as _, Msg, Origin};
 use valset::Valset;
-use valset_interface::{
+use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode,
     encode_msg as valset_encode, encode_query as valset_query,
 };

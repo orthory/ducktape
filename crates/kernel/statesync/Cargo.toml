@@ -30,7 +30,6 @@ futures = "0.3"
 
 [dev-dependencies]
 kv = { workspace = true }
-kv-interface = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }
 # the shipped-index lane's end-to-end proof: real fluent31 databases cut,

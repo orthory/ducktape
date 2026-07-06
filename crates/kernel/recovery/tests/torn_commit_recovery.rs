@@ -641,17 +641,17 @@ impl Module for StaticUpgrade {
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         // the host injects exactly one System-origin `Advance` at each block >= H;
         // accept it as a no-op (this mock arms purely by height).
-        match upgrade_interface::decode_msg(&msg.payload).map_err(Error::Module)? {
-            upgrade_interface::UpgradeMsg::Advance => Ok(()),
+        match upgrade::decode_msg(&msg.payload).map_err(Error::Module)? {
+            upgrade::UpgradeMsg::Advance => Ok(()),
             other => Err(Error::Module(format!("static upgrade got {other:?}"))),
         }
     }
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let upgrade_interface::UpgradeQuery::Status =
-            upgrade_interface::decode_query(req).map_err(Error::Module)?;
-        let status = upgrade_interface::UpgradeStatus {
+        let upgrade::UpgradeQuery::Status =
+            upgrade::decode_query(req).map_err(Error::Module)?;
+        let status = upgrade::UpgradeStatus {
             current_version: 0,
-            pending: Some(upgrade_interface::Upgrade {
+            pending: Some(upgrade::ScheduledUpgrade {
                 name: self.name.clone(),
                 activation_height: self.activation_height,
                 to_version: self.to_version,
@@ -662,8 +662,8 @@ impl Module for StaticUpgrade {
             ready_count: 1,
             armed: true,
         };
-        Ok(upgrade_interface::encode_reply(
-            &upgrade_interface::UpgradeReply::Status(status),
+        Ok(upgrade::encode_reply(
+            &upgrade::UpgradeReply::Status(status),
         ))
     }
 }

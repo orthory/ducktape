@@ -5,9 +5,10 @@ version.workspace = true
 
 [dependencies]
 sdk = { workspace = true }
+serde = { workspace = true }
+indexer = { workspace = true }
 # kernel state-sync platform surface: the shared qmdb serve/wire helpers.
 statesync = { workspace = true }
-pages-interface = { workspace = true }
 async-trait = "0.1"
 serde_json = "1"
 commonware-storage = { workspace = true }
@@ -19,3 +20,5 @@ commonware-utils = { workspace = true }
 
 [dev-dependencies]
 state = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }

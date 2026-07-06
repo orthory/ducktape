@@ -1,7 +1,7 @@
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use inbox::Inbox;
-use inbox_interface::{
+use inbox::{
     InboxMsg, InboxQuery, InboxReply, MAX_BODY_BYTES, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS,
     MAX_QUERY_LIMIT, Notification, decode_reply, encode_msg, encode_query,
 };

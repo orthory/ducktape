@@ -19,7 +19,7 @@
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use saga::{LeasePolicy, SagaModule};
-use saga_interface::{
+use saga::{
     SagaCallback, SagaMsg, SagaOutcome, SagaQuery, SagaReply, SagaStatus, SagaView,
     decode_callback, decode_reply, decode_worker_request, encode_callback, encode_msg,
     encode_query,

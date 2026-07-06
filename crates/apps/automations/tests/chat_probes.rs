@@ -4,13 +4,13 @@
 //! posts — all through chat's genuine hook fan-out, not a stand-in.
 
 use automations::Automations;
-use automations_interface::{
+use automations::{
     Action, AutomationsMsg, AutomationsQuery, AutomationsReply, RunRecord, Trigger,
     decode_reply as auto_decode_reply, encode_msg as auto_encode_msg,
     encode_query as auto_encode_query,
 };
 use chat::Chat;
-use chat_interface::{
+use chat::{
     AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, MessageView, PostPolicy,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,

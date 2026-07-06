@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
-use forge_interface::{
+use forge::{
     ForgeMsg, ForgeQuery, ForgeReply, RepoHead, decode_reply, encode_msg, encode_query,
 };
 use futures::executor::block_on;
