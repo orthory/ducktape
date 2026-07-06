@@ -3,15 +3,22 @@
 //! the native glue (`module.rs`) maps origin/env in and notifications out.
 //! tasks 7-14 fill the op/query/sync semantics; this skeleton pins the shapes.
 
-use crate::objects::{Kind, ObjectId};
-use crate::state::{Refs, decode_refs, encode_refs, root_bytes};
+use crate::objects::{Kind, ObjectId, object_id};
+use crate::state::{Refs, Staged, decode_refs, encode_refs, root_bytes};
 use crate::store::ObjectStore;
-use crate::wire::{Change, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp};
+use crate::wire::{
+    CHUNK_SIZE, Change, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp, STAGING_QUOTA_BYTES,
+    STAGING_TTL_BLOCKS,
+};
 
 pub struct Fs<S: ObjectStore> {
     pub(crate) store: S,
     pub(crate) refs: Refs,
     pub(crate) pending: Option<Pending>,
+    /// per-owner staging byte ceiling — [`STAGING_QUOTA_BYTES`] in production,
+    /// lowered only by the `#[doc(hidden)]` test override so the quota-boundary
+    /// logic can be exercised without staging a full gibibyte per owner.
+    pub(crate) quota: u64,
 }
 
 /// a block's staged objects — `(kind, body)` pairs the glue flushes into the
@@ -38,12 +45,52 @@ fn unimplemented_err() -> String {
     "files: unimplemented".into()
 }
 
+/// remove every staging entry whose ttl has elapsed at `height`. the condition
+/// is `expires_at <= height` (encoded as the `> height` retain predicate): a
+/// chunk staged at block h with ttl T (so `expires_at = h + T`) is swept the
+/// first time files is active at-or-after block h + T — never a block late.
+///
+/// this is the deterministic, op-stream-driven staging sweep. run at the top of
+/// every mutating verb, it makes expiry a pure function of the op stream: it
+/// lands at the first files-activity block at-or-after `expires_at`, identically
+/// on every validator (no wall clock, no per-node timer). swept chunks lose
+/// their staging root and fall to the next gc. `pub(crate)` so tasks 9/10 reuse
+/// it from commit/pin/unpin/watch/unwatch.
+pub(crate) fn sweep_expired(refs: &mut Refs, height: u64) {
+    refs.staging
+        .retain(|_digest, staged| staged.expires_at > height);
+}
+
 impl<S: ObjectStore> Fs<S> {
     pub fn new(store: S, refs: Refs) -> Self {
         Self {
             store,
             refs,
             pending: None,
+            quota: STAGING_QUOTA_BYTES,
+        }
+    }
+
+    /// `#[doc(hidden)]` test seam: shrink the per-owner staging quota so the
+    /// boundary logic is exercised without staging a full gibibyte. production
+    /// never calls this — the quota stays [`STAGING_QUOTA_BYTES`].
+    #[doc(hidden)]
+    pub fn set_staging_quota_for_tests(&mut self, quota: u64) {
+        self.quota = quota;
+    }
+
+    /// fork committed refs into this block's pending overlay on first touch, so a
+    /// mutating verb edits the pending view while the committed root stays put
+    /// until `commit_block` + `adopt_refs`. reused by every mutating verb (tasks
+    /// 9/10); callers grab `self.pending` afterward so the field borrow stays
+    /// disjoint from `self.store` (a `&mut Pending` return would alias `self`).
+    pub(crate) fn require_pending(&mut self, height: u64) {
+        if self.pending.is_none() {
+            self.pending = Some(Pending {
+                refs: self.refs.clone(),
+                objects: Vec::new(),
+                height,
+            });
         }
     }
 
@@ -80,8 +127,66 @@ impl<S: ObjectStore> Fs<S> {
 
     // ---- op surface (semantics land in tasks 7/9/10) ------------------------
 
-    pub fn putblob(&mut self, _actor: &str, _height: u64, _bytes: &[u8]) -> Result<(), String> {
-        Err(unimplemented_err())
+    /// stage a raw chunk for a later commit to reference. bytes are consensus
+    /// state: staged now, durable at THIS block's commit, gc-reachable via the
+    /// staging table until referenced or expired.
+    pub fn putblob(&mut self, actor: &str, height: u64, bytes: &[u8]) -> Result<(), String> {
+        // tick the deterministic staging sweep first, over the pending view, so
+        // same-block ops and the quota below see the post-sweep state.
+        self.require_pending(height);
+        let quota = self.quota;
+        // disjoint field borrows: the sweep/stage touch `pending`, the dedup
+        // reads `store` — held at once only because they are distinct fields.
+        let store = &self.store;
+        let pending = self.pending.as_mut().expect("require_pending set it");
+        sweep_expired(&mut pending.refs, height);
+
+        // a malformed frame is not a stageable object. (a rejected op aborts the
+        // whole block in production, so this never leaves the sweep half-applied;
+        // the direct-execute tests likewise keep earlier same-block stages.)
+        if bytes.is_empty() {
+            return Err("chunk must not be empty".into());
+        }
+        if bytes.len() as u64 > CHUNK_SIZE {
+            return Err("chunk exceeds CHUNK_SIZE".into());
+        }
+
+        let digest = object_id(Kind::Chunk, bytes);
+
+        // already durable → no-op, no quota charge. either the committed odb holds
+        // it, or an earlier op THIS block already staged it: every chunk putblob
+        // buffers into pending.objects it inserts into staging in the same breath,
+        // so this O(1) staging membership check subsumes a pending.objects scan
+        // (and avoids re-hashing every buffered megabyte on each call).
+        if store.has(&digest) || pending.refs.staging.contains_key(&digest) {
+            return Ok(());
+        }
+
+        // per-owner quota over the PENDING staging view (same-block stages count).
+        let len = bytes.len() as u64;
+        let used = pending
+            .refs
+            .staging
+            .values()
+            .filter(|s| s.owner == actor)
+            .fold(0u64, |acc, s| acc.saturating_add(s.len));
+        if used.saturating_add(len) > quota {
+            return Err("staging quota exceeded".into());
+        }
+
+        // stage: the entry makes the chunk gc-reachable (task 13 marks staging
+        // digests as roots), and the bytes ride pending.objects so they are
+        // durable at this block's commit.
+        pending.refs.staging.insert(
+            digest,
+            Staged {
+                owner: actor.to_string(),
+                len,
+                expires_at: height.saturating_add(STAGING_TTL_BLOCKS),
+            },
+        );
+        pending.objects.push((Kind::Chunk, bytes.to_vec()));
+        Ok(())
     }
 
     pub fn commit(

@@ -99,6 +99,13 @@ impl Files {
     pub fn stage_pending_for_test(&mut self, refs: Refs, height: u64, objects: StagedObjects) {
         self.fs.stage_pending(refs, height, objects);
     }
+
+    /// `#[doc(hidden)]` test seam: shrink the per-owner staging quota so the
+    /// quota-boundary logic is exercised without staging a full gibibyte.
+    #[doc(hidden)]
+    pub fn set_staging_quota_for_tests(&mut self, quota: u64) {
+        self.fs.set_staging_quota_for_tests(quota);
+    }
 }
 
 #[async_trait::async_trait(?Send)]

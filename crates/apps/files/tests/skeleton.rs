@@ -38,20 +38,16 @@ fn unknown_json_op_rejects_and_putblob_frame_routes() {
         assert!(matches!(err, sdk::Error::Module(_)));
 
         // the frame tag must route to the binary putblob lane, not the json
-        // decoder — the task-7 stub answers for now.
-        let err = f
-            .execute(
-                &mut TestCtx::new(sdk::Origin::System, 1),
-                &sdk::Msg {
-                    target: "files".into(),
-                    payload: files::encode_putblob(b"chunk bytes"),
-                },
-            )
-            .await
-            .expect_err("the putblob stub must reject");
-        match err {
-            sdk::Error::Module(why) => assert_eq!(why, "files: unimplemented"),
-            other => panic!("expected Error::Module, got {other:?}"),
-        }
+        // decoder: a well-formed chunk stages cleanly (task 7) — the json decoder
+        // would instead reject these raw bytes as invalid utf-8/json.
+        f.execute(
+            &mut TestCtx::new(sdk::Origin::System, 1),
+            &sdk::Msg {
+                target: "files".into(),
+                payload: files::encode_putblob(b"chunk bytes"),
+            },
+        )
+        .await
+        .expect("the putblob frame routes to staging");
     });
 }
