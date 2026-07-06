@@ -718,27 +718,40 @@ fn private_policy_admits_authorized_register_and_lookup_but_drops_unauthorized()
     let out = c.handle_auth(addr(2, 2222), AuthRequest { inner: oreg, auth: oauth }, now);
     assert!(out.is_empty());
     assert_eq!(c.rejects(), before + 1);
-    // The outsider's key never entered the book: a lookup finds nothing.
-    let none = c.handle_legacy(addr(3, 3), Msg::Lookup { key: osub });
-    // handle_legacy on a Private policy is itself rejected (see next test), so
-    // assert via a fresh authorized lookup path instead:
-    let _ = none;
+    // The outsider's key never entered the book: an AUTHORIZED lookup for it
+    // resolves to None (the dropped register created no mapping).
+    let lk = Msg::Lookup { key: osub };
+    let lauth = sign_authenticator(&node, &lk.encode(), now, Some(mint_coord_cap(&g, subject, now + 3600)));
+    let out = c.handle_auth(src, AuthRequest { inner: lk, auth: lauth }, now);
+    assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: None, .. })));
 }
 
 #[test]
 fn legacy_unauthenticated_request_rejected_unless_fully_open() {
     use crate::auth::AuthPolicy;
-    let mut open = Coordinator::new(); // Open { require_pop: false }
-    assert!(!open.handle_legacy(addr(1, 1), Msg::Register { key: NodeKey([1u8; 32]) }).is_empty()
-        || open.handle_legacy(addr(1, 1), Msg::Register { key: NodeKey([1u8; 32]) }).is_empty());
-    // (Register returns no datagrams; assert it does NOT count a reject.)
-    assert_eq!(open.rejects(), 0);
+    let key = NodeKey([1u8; 32]);
 
-    let mut priv_c = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
-    let before = priv_c.rejects();
-    let out = priv_c.handle_legacy(addr(1, 1), Msg::Register { key: NodeKey([1u8; 32]) });
+    // Fully-open: a bare Register is accepted (mapping created, nothing rejected).
+    let mut open = Coordinator::new(); // Open { require_pop: false }
+    assert!(open.handle_legacy(addr(1, 1111), Msg::Register { key }).is_empty());
+    assert_eq!(open.rejects(), 0, "fully-open never rejects");
+    let out = open.handle_legacy(addr(2, 2222), Msg::Lookup { key });
+    assert!(
+        out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: Some(_), .. })),
+        "the bare Register created a mapping under fully-open"
+    );
+
+    // require_pop: a bare, unauthenticated Register is dropped and counted.
+    let mut gated = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+    let before = gated.rejects();
+    assert!(gated.handle_legacy(addr(1, 1111), Msg::Register { key }).is_empty());
+    assert_eq!(gated.rejects(), before + 1);
+    // No mapping was created: a lookup for the same key resolves to None.
+    let out = gated.handle_legacy(addr(2, 2222), Msg::Lookup { key });
+    // (The lookup is itself a legacy request, also dropped under require_pop —
+    // so it too returns empty; the reject counter is the load-bearing assertion.)
     assert!(out.is_empty());
-    assert_eq!(priv_c.rejects(), before + 1);
+    assert_eq!(gated.rejects(), before + 2);
 }
 ```
 
