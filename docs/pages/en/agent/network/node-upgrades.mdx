@@ -80,7 +80,7 @@ Drive these steps in order. Do not skip the readiness confirmation before `H`.
    first executed height is `>= H` MUST run the new binary.
 3. **Schedule via governance.** Author a member-gated proposal carrying
    `GovAction::ScheduleUpgrade { name, activation_height: H, to_version }`
-   (`crates/system/governance-interface/src/lib.rs:19-26`). Choose `H` strictly
+   (`crates/system/governance/src/interface.rs:19-26`). Choose `H` strictly
    in every node's future — past `MIN_UPGRADE_LEAD`, at least the orchestrator
    `cutover_delay` window
    (`crates/kernel/consensus/src/valset_orchestrator.rs:225-232`). On tally-pass

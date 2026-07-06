@@ -20,7 +20,7 @@ The workspace is organized by platform layer.
 - `crates/system/valset`: ed25519 validator membership module.
 - `crates/system/saga`: deterministic continuation state for async workflows.
 - `crates/system/governance`: validator-set governance over valset.
-- `*-interface` crates: types-only payload and query surfaces.
+- wire surfaces: each module publishes its types-only payload and query shapes at its crate root (`src/interface.rs`).
 
 ## Apps
 
@@ -35,7 +35,7 @@ The workspace is organized by platform layer.
 - `crates/apps/files`: consensus file manifests over node-local chunk bytes.
 - `crates/apps/memory`: filesystem-shaped shared agent workspace.
 - `crates/apps/jobs`: consensus-native work board.
-- app `*-interface` crates: legal cross-module payload surfaces.
+- app wire surfaces: the crate-root types are the legal cross-module payload surface.
 
 ## Examples and Binaries
 
