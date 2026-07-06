@@ -1280,6 +1280,15 @@ pub struct Resolved {
     pub label: String,
     /// the chain-id (network shape) or legacy namespace bytes.
     pub namespace: Vec<u8>,
+    /// this network's chain id — the descriptor's own `chain_id` field (network
+    /// shape) or the raw configured namespace (dev shape, which has no
+    /// fingerprint appended). NOT `namespace`: the network shape's `namespace`
+    /// is `genesis_namespace()`, i.e. `chain_id@fingerprint` — a DIFFERENT
+    /// string. This is the exact string the desktop app records as
+    /// `Workspace.chain_id` (the `init` verb's last stdout line), so modules
+    /// that must agree with the app on "this network's id" (e.g. `identity`'s
+    /// certificate domain separation) use this field, never `namespace`.
+    pub chain_id: String,
     /// the authorized mesh set (unsorted here; the caller builds the ordered
     /// Set discovery tracks).
     pub mesh: Vec<ed25519::PublicKey>,
@@ -1432,6 +1441,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
         namespace: descriptor.genesis_namespace().into_bytes(),
+        chain_id: descriptor.chain_id.clone(),
         signer,
         mesh,
         validators,
@@ -1598,6 +1608,9 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
+        // the dev shape's namespace carries no fingerprint suffix (unlike the
+        // network shape's `genesis_namespace()`), so it IS the chain id here.
+        chain_id: namespace.clone(),
         namespace: namespace.into_bytes(),
         mesh,
         validators,
