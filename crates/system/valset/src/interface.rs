@@ -21,11 +21,9 @@ pub enum ValsetMsg {
     /// remove a validator by key. a no-op if the key is not in the set.
     Leave { key: Vec<u8> },
     /// grant OBSERVER standing: mesh + statesync access, no quorum seat.
-    /// requires protocol version >= 3 (the impl rejects below it, matching
-    /// an older binary's unknown-variant decode reject byte-for-byte).
     Grant { key: Vec<u8> },
     /// revoke observer standing by key. a no-op if the key is not an
-    /// observer. protocol version >= 3, like `Grant`.
+    /// observer.
     Revoke { key: Vec<u8> },
 }
 
