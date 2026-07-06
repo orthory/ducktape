@@ -94,6 +94,30 @@ describe("SearchModal", () => {
     expect(screen.getByText("shipping plan")).toBeInTheDocument();
   });
 
+  it("hides node-index results whose query does not match the current input", () => {
+    renderModal({
+      search: {
+        query: "old",
+        chat: [
+          { channelId: "general", seq: 1, author: "Alice", edited: false, text: "stale hit" } as ChatSearchHit,
+        ],
+        docs: [],
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "new" } });
+    // the seeded "old" results must not leak into the "new" query
+    expect(screen.queryByText("stale hit")).not.toBeInTheDocument();
+    expect(screen.getByText(/Searching/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Nothing matches/i)).not.toBeInTheDocument();
+  });
+
+  it("shows 'Searching…' — not a false empty state — while the query is unresolved", () => {
+    renderModal();
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "zzz" } });
+    expect(screen.getByText(/Searching/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Nothing matches/i)).not.toBeInTheDocument();
+  });
+
   it("closes on Escape", () => {
     const { spies } = renderModal();
     fireEvent.keyDown(document, { key: "Escape" });

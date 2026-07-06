@@ -256,6 +256,12 @@ export function createActions({
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
 
+  // Monotonic token gating the async search fan-out: each runSearch/clearSearch
+  // bumps it, and a resolving fan-out only writes results if its token is still
+  // current — so a slow or out-of-order response can never clobber a newer
+  // query's results (or repopulate a cleared palette).
+  let searchToken = 0;
+
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
   // key), submit, then settle the record from the node's receipt — finalized
@@ -913,6 +919,7 @@ export function createActions({
       const live = getNode();
       const query = text.trim();
       if (!live || !query) return;
+      const token = ++searchToken;
       patch({ searchPending: true });
       // per-module tolerance (deliberate granular catches): an older node
       // without the index tier 404s a view; that module contributes an empty
@@ -926,13 +933,21 @@ export function createActions({
             tolerant(pagesClient.searchPageBlocks(live, { text: query })),
           ]),
         )
-        .then(([chat, docs]) =>
-          patch({ search: { query, chat, docs }, searchPending: false }),
-        )
-        .catch(fail);
+        .then(([chat, docs]) => {
+          if (token !== searchToken) return; // a newer query superseded this one
+          patch({ search: { query, chat, docs }, searchPending: false });
+        })
+        .catch((err) => {
+          if (token !== searchToken) return;
+          patch({ searchPending: false });
+          fail(err);
+        });
     },
 
-    clearSearch: () => patch({ search: null, searchPending: false }),
+    clearSearch: () => {
+      searchToken += 1; // supersede any in-flight fan-out so it can't repopulate
+      patch({ search: null, searchPending: false });
+    },
 
     openSearch: () => patch({ searchOpen: true }),
 

@@ -158,13 +158,18 @@ export function SearchModal() {
   const query = text.trim();
   const results = state.search;
 
-  // Escape closes; the listener lives exactly as long as the open palette.
+  // Escape closes ONLY the palette. Capture-phase + stopPropagation so a
+  // background popover's own document Escape handler (emoji picker, message
+  // action menu — both bubble-phase on document) never fires alongside it.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") actions.closeSearch();
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        actions.closeSearch();
+      }
     };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
   }, [actions]);
 
   // Debounced fan-out to the node's derived index (chat + docs).
@@ -193,8 +198,15 @@ export function SearchModal() {
     return state.files.filter((f) => f.name.toLowerCase().includes(q)).slice(0, RESULT_CAP);
   }, [query, state.files]);
 
-  const chatHits: ChatSearchHit[] = results?.chat ?? [];
-  const docHits: PageSearchHit[] = results?.docs ?? [];
+  // Only surface node-index hits when they belong to the CURRENT input — a
+  // debounced or in-flight query means `results` still holds a prior query's
+  // groups, which must not show. `searching` is exactly that gap (debounce +
+  // round-trip), and drives the "Searching…" line instead of a false empty
+  // state. Client-side member/file hits are always live off the input.
+  const matched = query !== "" && results?.query === query;
+  const chatHits: ChatSearchHit[] = matched ? (results?.chat ?? []) : [];
+  const docHits: PageSearchHit[] = matched ? (results?.docs ?? []) : [];
+  const searching = query !== "" && !matched;
   const total = chatHits.length + docHits.length + memberHits.length + fileHits.length;
 
   const openChat = (channelId: string) => {
@@ -234,21 +246,21 @@ export function SearchModal() {
         </form>
 
         <div style={scroll}>
-          {query && state.searchPending && chatHits.length === 0 && docHits.length === 0 && (
+          {!query && (
+            <p style={{ margin: "4px 10px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
+              Type to search chat, docs, members, and files.
+            </p>
+          )}
+
+          {searching && chatHits.length === 0 && docHits.length === 0 && (
             <p style={{ margin: "4px 10px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
               Searching…
             </p>
           )}
 
-          {query && total === 0 && !state.searchPending && (
+          {!searching && query !== "" && total === 0 && (
             <p style={{ margin: "4px 10px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
               Nothing matches “{query}”.
-            </p>
-          )}
-
-          {!query && (
-            <p style={{ margin: "4px 10px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
-              Type to search chat, docs, members, and files.
             </p>
           )}
 

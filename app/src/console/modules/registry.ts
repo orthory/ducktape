@@ -24,7 +24,7 @@ import type { AppModule, NavSection } from "./module-def";
 export const MODULES: AppModule[] = [
   // ── User apps ──
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
-  { id: "pages", nav: { icon: "document", label: "Docs", order: 1, section: "user" }, Screen: PagesView },
+  { id: "pages", nav: { icon: "pages", label: "Docs", order: 1, section: "user" }, Screen: PagesView },
   { id: "files", nav: { icon: "files", label: "Files", order: 2, section: "user" }, Screen: FilesView },
   { id: "forge", nav: { icon: "forge", label: "Forge", order: 3, section: "user" }, Screen: ForgeView },
   { id: "agent", nav: { icon: "agent", label: "Agents", order: 4, section: "user" }, Screen: AgentView },
