@@ -6,6 +6,7 @@ import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import type { Channel } from "../../../domain/chat-client";
+import type { Workspace } from "../../../domain/workspace-client";
 import { AgentView, runIsMine } from "./AgentView";
 import type { PendingRun } from "../../../domain/runs-client";
 
@@ -283,6 +284,75 @@ describe("AgentView", () => {
       capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
     });
+  });
+
+  it("shows which node is executing an in-flight run", () => {
+    const nodeKey = "cd".repeat(32);
+    renderAgents({
+      runAssignee: new Map([["general/42/summarizer", nodeKey]]),
+      authorNames: { [nodeKey]: "Node Bob" },
+    });
+
+    openTab(/activity/i);
+    expect(screen.getByText("on Node Bob")).toBeInTheDocument();
+  });
+
+  it("filters the timeline to the runs I requested", () => {
+    const myKey = "ab".repeat(32); // 32 bytes of 0xab as hex
+    const mineRun: PendingRun = {
+      run_id: "general/50/summarizer",
+      dispatch_id: "aa".repeat(32),
+      agent_id: "summarizer",
+      channel_id: "general",
+      anchor_seq: 50,
+      thread_root: null,
+      job_id: null,
+      job_claim_height: 0,
+      requester: { external: Array.from({ length: 32 }, () => 0xab) },
+      created_at: 31,
+    };
+    const systemRun: PendingRun = {
+      run_id: "general/42/summarizer",
+      dispatch_id: "ef".repeat(32),
+      agent_id: "summarizer",
+      channel_id: "general",
+      anchor_seq: 42,
+      thread_root: null,
+      job_id: null,
+      job_claim_height: 0,
+      requester: "system" as const,
+      created_at: 30,
+    };
+    renderAgents({
+      workspace: {
+        id: "w",
+        name: "W",
+        chainId: "w#1",
+        pubkey: myKey,
+        founder: true,
+        member: true,
+        ports: { listen: 1, http: 2, rpc: 3 },
+      } as Workspace,
+      pendingRuns: [mineRun, systemRun],
+    });
+
+    openTab(/activity/i);
+    // Both runs show under the default "All" filter.
+    expect(
+      screen.getByRole("button", { name: /cancel run general\/50\/summarizer/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /requested by you/i }));
+    // Only the run I requested remains.
+    expect(
+      screen.getByRole("button", { name: /cancel run general\/50\/summarizer/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /cancel run general\/42\/summarizer/i }),
+    ).not.toBeInTheDocument();
   });
 });
 
