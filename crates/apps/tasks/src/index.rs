@@ -19,12 +19,12 @@
 //! empty and the two heights collapse to the boundary; the listing itself
 //! (id, title, status, created_at, updated_at) is exact.
 
+use crate::{TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_msg, decode_reply, encode_query};
 use indexer::{
     ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, RebuildMeta, Result, StateReader,
     ViewReader,
 };
 use serde::{Deserialize, Serialize};
-use crate::{TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_msg, decode_reply, encode_query};
 
 /// default and max page size for by-status listing.
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -249,8 +249,8 @@ impl ModuleIndexer for TasksIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
     use crate::encode_msg;
+    use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
 
     fn store(dir: &std::path::Path) -> IndexStore {
         IndexStore::open(dir, &["tasks"])
@@ -390,13 +390,8 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl indexer::StateReader for CanonicalTasks {
         async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
-            assert!(matches!(
-                crate::decode_query(req),
-                Ok(TaskQuery::List)
-            ));
-            Ok(crate::encode_reply(&TaskReply::Tasks(
-                self.0.clone(),
-            )))
+            assert!(matches!(crate::decode_query(req), Ok(TaskQuery::List)));
+            Ok(crate::encode_reply(&TaskReply::Tasks(self.0.clone())))
         }
     }
 
@@ -431,7 +426,14 @@ mod tests {
             },
         ]);
         let written = store
-            .rebuild_module("tasks", &state, indexer::RebuildMeta { height: 40, time: 0 })
+            .rebuild_module(
+                "tasks",
+                &state,
+                indexer::RebuildMeta {
+                    height: 40,
+                    time: 0,
+                },
+            )
             .await
             .expect("rebuild");
         assert_eq!(written, 4, "two rows, two entries each");

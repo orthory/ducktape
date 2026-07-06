@@ -13,9 +13,7 @@
 //! run: `cargo run -p demo`
 
 use agent::AgentModule;
-use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg,
-};
+use agent::{ACTION_CHAT_POST, AgentMsg, encode_msg as agent_encode_msg};
 use runs::{RunsModule, run_id_for};
 use runs::{
     RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
@@ -95,7 +93,7 @@ fn main() {
             "tagging",
             "dispatch",
             "agent",
-            Some("tasks".into()),
+            "package",
             Some("jobs".into()),
         );
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
@@ -415,7 +413,10 @@ fn main() {
                     display_name: "Quackbot".into(),
                     capability: "mock-llm-1".into(),
                     prompt: None,
-                    allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
+                    allowed_actions: vec![
+                        ACTION_CHAT_POST.into(),
+                        tasks::ACTION_TASKS_CREATE.into(),
+                    ],
                 }),
             },
         )

@@ -9,8 +9,8 @@
 
 use agent::AgentModule;
 use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, AgentStatus,
-    PROMPT_HASH_LEN, PromptRef, RENDERER_MEMORY_GENERATION, decode_reply, encode_msg, encode_query,
+    ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentStatus, PROMPT_HASH_LEN, PromptRef,
+    RENDERER_MEMORY_GENERATION, decode_reply, encode_msg, encode_query,
 };
 use futures::executor::block_on;
 use saga::SagaOrigin;
@@ -104,7 +104,7 @@ fn source() -> AgentModule {
     exec(
         &mut m,
         TestCtx::new(1, Origin::Module("orchestrator".into())),
-        &register("mod-bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE]),
+        &register("mod-bot", &[ACTION_CHAT_POST, "tasks.create"]),
     );
     exec(
         &mut m,

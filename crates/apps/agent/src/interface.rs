@@ -79,22 +79,15 @@ pub struct PromptRef {
 pub const RESERVED_ID_SEPARATOR: char = '\u{1f}';
 
 // ---- the action vocabulary ---------------------------------------------------
+// action grants are an OPEN set of shape-valid tags (`[a-z0-9._-]{1,64}`):
+// registration validates the shape only, and whether a granted tag means
+// anything is decided at delivery time by the package registry's tag -> owner
+// route table. exactly ONE tag stays special vocabulary here:
 
-/// permission to post reply blocks into chat.
+/// permission to post reply blocks into chat — the reply-block grant gate.
+/// replies are not actions (they never route through the package registry),
+/// so this is the one tag the acting module checks by name.
 pub const ACTION_CHAT_POST: &str = "chat.post";
-/// permission to create a task ([`AgentAction::CreateTask`]).
-pub const ACTION_TASKS_CREATE: &str = "tasks.create";
-/// permission to move a task ([`AgentAction::UpdateTaskStatus`]).
-pub const ACTION_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
-
-/// every action name the platform knows. `RegisterAgent`/`UpdateAgent` reject
-/// an `allowed_actions` entry outside this vocabulary, so a granted permission
-/// always means something.
-pub const KNOWN_ACTIONS: [&str; 3] = [
-    ACTION_CHAT_POST,
-    ACTION_TASKS_CREATE,
-    ACTION_TASKS_UPDATE_STATUS,
-];
 
 // ---- registry ----------------------------------------------------------------
 
@@ -150,42 +143,30 @@ pub struct ReplyBlock {
 }
 
 /// the formal agent response: reply blocks plus a bounded list of
-/// [`AgentAction`]s. lenient by construction — both fields default, unknown
-/// JSON fields are ignored — so a model answer either IS this shape or the
-/// consumer wraps it as one; validation (grants, caps, probes) is a separate,
-/// strict step.
+/// [`RequestedAction`]s. lenient by construction — both fields default,
+/// unknown JSON fields are ignored — so a model answer either IS this shape
+/// or the consumer wraps it as one; validation (grants, caps, owner probes)
+/// is a separate, strict step.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentResponse {
     #[serde(default)]
     pub reply_blocks: Vec<ReplyBlock>,
     #[serde(default)]
-    pub actions: Vec<AgentAction>,
+    pub actions: Vec<RequestedAction>,
 }
 
-/// one validated cross-module write an agent's response may request.
+/// one cross-module write an agent's response REQUESTS: an open action tag
+/// plus an opaque JSON payload only the tag's owning module understands. it
+/// is DATA until the acting module validates it — tag shape, grant, package
+/// route, and the owner's `Probe` verdict — and only then does it become a
+/// `PackageActionMsg::Apply` follow-up to the owner. `action_id` is the
+/// response's own correlation handle, echoed through probe, apply, and
+/// breadcrumbs.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentAction {
-    CreateTask {
-        task_id: String,
-        title: String,
-    },
-    /// `status` is the wire name of a `tasks::TaskStatus`:
-    /// `"open"`, `"in_progress"`, or `"done"`.
-    UpdateTaskStatus {
-        task_id: String,
-        status: String,
-    },
-}
-
-impl AgentAction {
-    /// the vocabulary name this action needs in the agent's `allowed_actions`.
-    pub fn vocabulary_name(&self) -> &'static str {
-        match self {
-            AgentAction::CreateTask { .. } => ACTION_TASKS_CREATE,
-            AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
-        }
-    }
+pub struct RequestedAction {
+    pub action_id: String,
+    pub tag: String,
+    pub payload: serde_json::Value,
 }
 
 // ---- ops ----------------------------------------------------------------------

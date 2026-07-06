@@ -19,9 +19,9 @@
 
 use agent::AgentModule;
 use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentQuery, AgentReply,
-    AgentResponse, AgentStatus, PromptRef, RENDERER_MEMORY_GENERATION, ReplyBlock, decode_reply,
-    encode_msg, encode_query, encode_response,
+    ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentResponse, AgentStatus, PromptRef,
+    RENDERER_MEMORY_GENERATION, ReplyBlock, RequestedAction, decode_reply, encode_msg,
+    encode_query, encode_response,
 };
 use chat::Chat;
 use chat::{
@@ -42,6 +42,7 @@ use jobs::{
     encode_msg as jobs_encode_msg, encode_query as jobs_encode_query,
 };
 use memory::{Memory, MemoryMsg, PublishBody, encode_msg as memory_encode_msg};
+use package::PackageModule;
 use runs::{
     PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
     encode_msg as runs_encode_msg, encode_query as runs_encode_query,
@@ -59,7 +60,8 @@ use sha2::{Digest, Sha256};
 use tagging::TaggingModule;
 use tasks::Tasks;
 use tasks::{
-    TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
+    ACTION_TASKS_CREATE, TaskQuery, TaskReply, decode_reply as tasks_decode_reply,
+    encode_query as tasks_encode_query,
 };
 
 /// the mock oracle's answer: RAW model text (here: a strict AgentResponse
@@ -71,9 +73,10 @@ fn canned_response(run_id: &str) -> Vec<u8> {
             text: format!("quack: handling {run_id}"),
             lang: None,
         }],
-        actions: vec![AgentAction::CreateTask {
-            task_id: "task-1".into(),
-            title: "follow up on the mention".into(),
+        actions: vec![RequestedAction {
+            action_id: "a1".into(),
+            tag: ACTION_TASKS_CREATE.into(),
+            payload: serde_json::json!({"task_id": "task-1", "title": "follow up on the mention"}),
         }],
     })
 }
@@ -82,9 +85,10 @@ fn canned_response(run_id: &str) -> Vec<u8> {
 fn job_response(task_id: &str, title: &str) -> Vec<u8> {
     encode_response(&AgentResponse {
         reply_blocks: Vec::new(),
-        actions: vec![AgentAction::CreateTask {
-            task_id: task_id.into(),
-            title: title.into(),
+        actions: vec![RequestedAction {
+            action_id: format!("a-{task_id}"),
+            tag: ACTION_TASKS_CREATE.into(),
+            payload: serde_json::json!({"task_id": task_id, "title": title}),
         }],
     })
 }
@@ -254,13 +258,23 @@ async fn genesis(context: deterministic::Context) -> Host {
             "tagging",
             "dispatch",
             "agent",
-            Some("tasks".into()),
+            "package",
             Some("jobs".into()),
         )),
         Box::new(Tasks::new("tasks")),
         Box::new(Jobs::new("jobs")),
         // the prompt source: inline publishes only, so no files module needed.
         Box::new(Memory::new("memory", "files")),
+        // the package registry: the builtin task-action routes every open
+        // action resolves through (the real genesis wiring).
+        Box::new(PackageModule::new(
+            "package",
+            "memory",
+            vec![
+                ("tasks.create".into(), "tasks".into()),
+                ("tasks.update_status".into(), "tasks".into()),
+            ],
+        )),
     ])
     .expect("genesis")
 }
@@ -1167,7 +1181,7 @@ fn a_tombstoned_agent_loses_its_recipe_and_never_engages_again() {
 }
 
 #[test]
-fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
+fn a_disallowed_action_is_dropped_while_the_granted_reply_posts() {
     deterministic::Runner::default().start(|context| async move {
         let mut host = genesis(context).await;
         // same script, but quackbot may ONLY post to chat — no task grants.
@@ -1183,9 +1197,10 @@ fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
         let saga_id = dispatch_saga_id(&host, &run_id).await;
 
         // the oracle answers with a response that includes a task action the
-        // agent was never granted: the delivery block commits (no-fail rule),
-        // the run fails deterministically, and NOTHING was written to chat
-        // or tasks.
+        // agent was never granted: the delivery block commits (no-fail
+        // rule), the UNGRANTED action drops without mutating anything, and
+        // the granted reply still posts (design D6 — drops are per-action,
+        // not per-run).
         host.submit_at(
             at(10, Origin::External(b"oracle".to_vec())),
             Msg {
@@ -1206,14 +1221,22 @@ fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
         assert_eq!(
             pending_run(&host, &run_id).await,
             None,
-            "the failed run's entry pruned"
+            "the delivered entry pruned"
         );
         assert_eq!(
             agent_dispatch(&host, &run_id).await.status,
-            DispatchStatus::Delivered,
-            "the dispatch itself delivered — the RUN failed, not the block"
+            DispatchStatus::Delivered
         );
-        assert_eq!(chat_message(&host, &reply_message_id(&run_id)).await, None);
-        assert_eq!(task_ids(&host).await, Vec::<String>::new());
+        assert!(
+            chat_message(&host, &reply_message_id(&run_id))
+                .await
+                .is_some(),
+            "the granted reply still posts"
+        );
+        assert_eq!(
+            task_ids(&host).await,
+            Vec::<String>::new(),
+            "the ungranted task action wrote NOTHING"
+        );
     });
 }

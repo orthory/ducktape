@@ -122,9 +122,7 @@ export interface NodeTransport {
   /**
    * Stage raw bytes in the node's content-addressed blob store and get their
    * sha256 digest back (64 lowercase hex). NOTHING is committed — a later
-   * `submit` references the digest. The agent flow uses this to upload a
-   * prompt's text so the oracle worker can fetch it by the registered
-   * `prompt_hash` (which IS this digest, since the store keys by sha256).
+   * `submit` references the digest (e.g. the files flow's chunk uploads).
    *
    * The bytes must be backed by a plain ArrayBuffer (what `TextEncoder.encode`
    * returns) so they go straight into the fetch body.

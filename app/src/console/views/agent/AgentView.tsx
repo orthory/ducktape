@@ -11,7 +11,7 @@ import { useEffect, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type { AgentRecord, PromptRef, SagaOrigin } from "../../../domain/agent-client";
-import { KNOWN_ACTIONS } from "../../../domain/agent-client";
+import { ACTION_TAG_PATTERN, KNOWN_ACTIONS } from "../../../domain/agent-client";
 import type { PendingRun, TurnPolicy, WatchView } from "../../../domain/runs-client";
 import { displayNameForKey, sameKey, shortKey } from "../../../domain/names";
 import type { Channel } from "../../../domain/chat-client";
@@ -721,6 +721,88 @@ function AgentDetail({
   );
 }
 
+/** Grant chips over the builtin defaults plus whatever open tags are already
+ *  granted, with a free-text add — grants are an open set of shape-valid
+ *  package-action tags, not a closed vocabulary. */
+function ActionGrantPicker({
+  allowedActions,
+  onToggle,
+  onAdd,
+  checkboxName,
+}: {
+  allowedActions: string[];
+  onToggle: (name: string) => void;
+  onAdd: (tag: string) => void;
+  checkboxName: string;
+}) {
+  const [customTag, setCustomTag] = useState("");
+  const options = [...new Set<string>([...KNOWN_ACTIONS, ...allowedActions])];
+  const trimmed = customTag.trim();
+  const valid = ACTION_TAG_PATTERN.test(trimmed);
+  const add = () => {
+    if (!valid) return;
+    onAdd(trimmed);
+    setCustomTag("");
+  };
+  return (
+    <>
+      <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+        {options.map((name) => {
+          const checked = allowedActions.includes(name);
+          return (
+            <label
+              key={name}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 7,
+                border: `1px solid ${checked ? statusTone.agent.border : color.border}`,
+                borderRadius: radius.sm,
+                background: checked ? statusTone.agent.bg : color.paper,
+                padding: "6px 9px",
+                cursor: "pointer",
+                font: `600 10.5px ${font.sans}`,
+                color: checked ? accentVar : color.muted3,
+              }}
+            >
+              <input
+                type="checkbox"
+                name={checkboxName}
+                checked={checked}
+                onChange={() => onToggle(name)}
+                style={{ margin: 0 }}
+              />
+              <span>{ACTION_HINT[name] ?? ACTION_LABEL[name] ?? name}</span>
+            </label>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 7, alignItems: "center" }}>
+        <input
+          type="text"
+          name={`${checkboxName}-custom`}
+          autoComplete="off"
+          spellCheck={false}
+          value={customTag}
+          onChange={(event) => setCustomTag(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              add();
+            }
+          }}
+          placeholder="custom.action.tag…"
+          aria-label="Custom action tag"
+          style={{ ...monoInputStyle, flex: 1, minWidth: 0 }}
+        />
+        <button type="button" onClick={add} disabled={!valid} style={secondaryButton}>
+          Add
+        </button>
+      </div>
+    </>
+  );
+}
+
 function AgentEditForm({
   agent,
   capabilities,
@@ -825,37 +907,14 @@ function AgentEditForm({
         >
           CAPABILITIES
         </legend>
-        <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
-          {KNOWN_ACTIONS.map((name) => {
-            const checked = allowedActions.includes(name);
-            return (
-              <label
-                key={name}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 7,
-                  border: `1px solid ${checked ? statusTone.agent.border : color.border}`,
-                  borderRadius: radius.sm,
-                  background: checked ? statusTone.agent.bg : color.paper,
-                  padding: "6px 9px",
-                  cursor: "pointer",
-                  font: `600 10.5px ${font.sans}`,
-                  color: checked ? accentVar : color.muted3,
-                }}
-              >
-                <input
-                  type="checkbox"
-                  name="agent-edit-capability"
-                  checked={checked}
-                  onChange={() => toggle(name)}
-                  style={{ margin: 0 }}
-                />
-                <span>{ACTION_HINT[name] ?? ACTION_LABEL[name] ?? name}</span>
-              </label>
-            );
-          })}
-        </div>
+        <ActionGrantPicker
+          allowedActions={allowedActions}
+          onToggle={toggle}
+          onAdd={(tag) =>
+            setAllowedActions((prev) => (prev.includes(tag) ? prev : [...prev, tag]))
+          }
+          checkboxName="agent-edit-capability"
+        />
       </fieldset>
 
       <div style={{ marginTop: 10 }}>
@@ -1180,37 +1239,14 @@ function RegisterAgentForm({
             >
               PERMISSIONS
             </legend>
-            <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
-              {KNOWN_ACTIONS.map((name) => {
-                const checked = allowedActions.includes(name);
-                return (
-                  <label
-                    key={name}
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 7,
-                      border: `1px solid ${checked ? statusTone.agent.border : color.border}`,
-                      borderRadius: radius.sm,
-                      background: checked ? statusTone.agent.bg : color.paper,
-                      padding: "6px 9px",
-                      cursor: "pointer",
-                      font: `600 10.5px ${font.sans}`,
-                      color: checked ? accentVar : color.muted3,
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      name="agent-capability"
-                      checked={checked}
-                      onChange={() => toggle(name)}
-                      style={{ margin: 0 }}
-                    />
-                    <span>{ACTION_HINT[name] ?? ACTION_LABEL[name] ?? name}</span>
-                  </label>
-                );
-              })}
-            </div>
+            <ActionGrantPicker
+              allowedActions={allowedActions}
+              onToggle={toggle}
+              onAdd={(tag) =>
+                setAllowedActions((prev) => (prev.includes(tag) ? prev : [...prev, tag]))
+              }
+              checkboxName="agent-capability"
+            />
           </fieldset>
 
           {showAdvanced && (

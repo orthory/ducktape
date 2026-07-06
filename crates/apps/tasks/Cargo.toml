@@ -10,9 +10,12 @@ serde_json = { workspace = true }
 indexer = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
+# the package action-owner contract this module serves (Probe/Apply).
+package = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"
 host = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+serde_json = { workspace = true }
