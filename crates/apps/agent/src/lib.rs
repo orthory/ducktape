@@ -8,14 +8,15 @@
 //! that ACTS on agents (engagement, composition, dispatch, response
 //! delivery) lives in the runs module, which reads this registry by query.
 //!
-//! the one seam left is the registry hook: a registration (and a capability
-//! change) emits an [`AgentEvent`] follow-up to a genesis-configured hook
-//! target — the runs module — which answers by registering/retuning the
-//! agent's dispatch-plane recipe IN THE SAME BLOCK. if the recipe cannot
-//! land (a squatted id), that follow-up errors, the block aborts, and the
-//! staged record vanishes with it: the agent and its recipe stay one atomic
-//! unit (P2) without this crate referencing the dispatch plane. the hook
-//! target is an opaque module id — config, not a reference.
+//! the one seam left is the registry hook: a registration, a capability
+//! change, and a tombstone each emit an [`AgentEvent`] follow-up to a
+//! genesis-configured hook target — the runs module — which answers by
+//! registering/retuning/removing the agent's dispatch-plane recipe IN THE
+//! SAME BLOCK. if the recipe cannot land (a squatted id), that follow-up
+//! errors, the block aborts, and the staged record vanishes with it: the
+//! agent and its recipe stay one atomic unit (P2) without this crate
+//! referencing the dispatch plane. the hook target is an opaque module id —
+//! config, not a reference.
 //!
 //! ## execute routing
 //!
@@ -62,14 +63,13 @@ struct AgentState {
     /// WHAT the run needs; how it executes (binary, flags, model) is host
     /// policy in each provider's spec, invisible to consensus.
     capability: String,
-    /// sha256 of the prompt content (exactly [`PROMPT_HASH_LEN`] bytes); the
-    /// content is content-addressed in the blob store under this digest and
-    /// resolved host-side, so consensus pins only the hash.
-    prompt_hash: Vec<u8>,
-    /// granted action names from the known vocabulary, deduped and sorted.
+    /// where the prompt content lives and the sha256 pin it must resolve to
+    /// (see [`PromptRef`]); `None` keeps the composing module's default.
+    prompt: Option<PromptRef>,
+    /// granted action names (shape-validated open-set tags), deduped and sorted.
     allowed_actions: BTreeSet<String>,
-    /// false = paused: the agent never engages new runs.
-    active: bool,
+    /// paused agents never engage new runs; tombstoned agents are terminal.
+    status: AgentStatus,
     created_at: u64,
     updated_at: u64,
 }
@@ -101,6 +101,19 @@ fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
     }
 }
 
+fn put_prompt(out: &mut Vec<u8>, prompt: &Option<PromptRef>) {
+    match prompt {
+        None => out.push(0),
+        Some(p) => {
+            out.push(1);
+            put_bytes(out, p.module.as_bytes());
+            put_bytes(out, p.target.as_bytes());
+            put_bytes(out, p.renderer.as_bytes());
+            put_bytes(out, &p.sha256);
+        }
+    }
+}
+
 fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(agents.len() as u64).to_le_bytes());
@@ -109,12 +122,16 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
         put_origin(&mut out, &a.owner);
         put_bytes(&mut out, a.display_name.as_bytes());
         put_bytes(&mut out, a.capability.as_bytes());
-        put_bytes(&mut out, &a.prompt_hash);
+        put_prompt(&mut out, &a.prompt);
         out.extend_from_slice(&(a.allowed_actions.len() as u64).to_le_bytes());
         for action in &a.allowed_actions {
             put_bytes(&mut out, action.as_bytes());
         }
-        out.push(if a.active { 0 } else { 1 });
+        out.push(match a.status {
+            AgentStatus::Active => 0,
+            AgentStatus::Paused => 1,
+            AgentStatus::Tombstoned => 2,
+        });
         out.extend_from_slice(&a.created_at.to_le_bytes());
         out.extend_from_slice(&a.updated_at.to_le_bytes());
     }
@@ -210,11 +227,24 @@ fn contains_reserved_separator(value: &str) -> bool {
     value.contains(RESERVED_ID_SEPARATOR)
 }
 
+fn take_prompt(buf: &mut &[u8]) -> Result<Option<PromptRef>, String> {
+    match take(buf, 1)?[0] {
+        0 => Ok(None),
+        1 => Ok(Some(PromptRef {
+            module: take_lp_string(buf)?,
+            target: take_lp_string(buf)?,
+            renderer: take_lp_string(buf)?,
+            sha256: take_lp_bytes(buf)?,
+        })),
+        t => Err(format!("snapshot has unknown prompt tag {t}")),
+    }
+}
+
 fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, String> {
     // per-entry minimum size: an agent costs its id prefix, one origin
-    // discriminant, three length prefixes, a prompt-doc tag, an action
+    // discriminant, two length prefixes, a prompt option tag, an action
     // count, a status byte, and two u64s.
-    const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
+    const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 1 + 8 + 1 + 8 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
@@ -226,7 +256,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
         let owner = take_origin(&mut buf)?;
         let display_name = take_lp_string(&mut buf)?;
         let capability = take_lp_string(&mut buf)?;
-        let prompt_hash = take_lp_bytes(&mut buf)?;
+        let prompt = take_prompt(&mut buf)?;
         let mut allowed_actions: BTreeSet<String> = BTreeSet::new();
         let actions = take_count(&mut buf, 8, "action")?;
         for _ in 0..actions {
@@ -238,9 +268,10 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
             }
             allowed_actions.insert(action);
         }
-        let active = match take(&mut buf, 1)?[0] {
-            0 => true,
-            1 => false,
+        let status = match take(&mut buf, 1)?[0] {
+            0 => AgentStatus::Active,
+            1 => AgentStatus::Paused,
+            2 => AgentStatus::Tombstoned,
             d => return Err(format!("snapshot has unknown agent status {d}")),
         };
         let created_at = take_u64(&mut buf)?;
@@ -252,9 +283,9 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
                 owner,
                 display_name,
                 capability,
-                prompt_hash,
+                prompt,
                 allowed_actions,
-                active,
+                status,
                 created_at,
                 updated_at,
             },
@@ -340,13 +371,9 @@ impl AgentModule {
             owner: a.owner.clone(),
             display_name: a.display_name.clone(),
             capability: a.capability.clone(),
-            prompt_hash: a.prompt_hash.clone(),
+            prompt: a.prompt.clone(),
             allowed_actions: a.allowed_actions.iter().cloned().collect(),
-            status: if a.active {
-                AgentStatus::Active
-            } else {
-                AgentStatus::Paused
-            },
+            status: a.status,
             created_at: a.created_at,
             updated_at: a.updated_at,
         }
@@ -361,24 +388,52 @@ impl AgentModule {
         Ok(())
     }
 
-    fn validate_prompt_hash(prompt_hash: &[u8]) -> Result<(), Error> {
-        if prompt_hash.len() != PROMPT_HASH_LEN {
+    /// a [`PromptRef`] is valid when its renderer is known, its pin is a
+    /// sha256, its source module exists in this composition (probed through
+    /// the deterministic snapshot roots), and — for the memory-generation
+    /// renderer — its target parses as `"<path>@<generation>"`, so a
+    /// registered prompt is resolvable by construction.
+    fn validate_prompt(ctx: &dyn Ctx, prompt: &PromptRef) -> Result<(), Error> {
+        if !KNOWN_PROMPT_RENDERERS.contains(&prompt.renderer.as_str()) {
             return Err(Error::Module(format!(
-                "prompt_hash must be exactly {PROMPT_HASH_LEN} bytes, got {}",
-                prompt_hash.len()
+                "unknown prompt renderer: {}",
+                prompt.renderer
             )));
+        }
+        if prompt.sha256.len() != PROMPT_HASH_LEN {
+            return Err(Error::Module(format!(
+                "prompt sha256 pin must be exactly {PROMPT_HASH_LEN} bytes, got {}",
+                prompt.sha256.len()
+            )));
+        }
+        if ctx.module_root(&prompt.module).is_none() {
+            return Err(Error::Module(format!(
+                "unknown prompt source module: {}",
+                prompt.module
+            )));
+        }
+        if prompt.renderer == RENDERER_MEMORY_GENERATION {
+            let parsed = prompt
+                .target
+                .rsplit_once('@')
+                .filter(|(path, generation)| !path.is_empty() && generation.parse::<u64>().is_ok());
+            if parsed.is_none() {
+                return Err(Error::Module(format!(
+                    "prompt target must be \"<path>@<generation>\": {}",
+                    prompt.target
+                )));
+            }
         }
         Ok(())
     }
 
-    /// every granted action must come from the known vocabulary, so a grant
-    /// always means something; duplicates collapse into the set.
+    /// grants are an OPEN set: any well-shaped action tag may be granted
+    /// (whether a module owns it is the acting module's compose-time
+    /// concern); duplicates collapse into the set.
     fn validate_actions(actions: Vec<String>) -> Result<BTreeSet<String>, Error> {
         let mut set = BTreeSet::new();
         for action in actions {
-            if !KNOWN_ACTIONS.contains(&action.as_str()) {
-                return Err(Error::Module(format!("unknown action: {action}")));
-            }
+            validate_tag(&action).map_err(|e| Error::Module(format!("invalid action tag: {e}")))?;
             set.insert(action);
         }
         Ok(set)
@@ -425,6 +480,17 @@ impl AgentModule {
         Ok(agent)
     }
 
+    /// the owner capability PLUS the terminal gate: a tombstoned record is
+    /// audit state, not a mutable agent — every mutation (resume included)
+    /// is rejected.
+    fn owned_live_agent(&self, ctx: &dyn Ctx, agent_id: &str) -> Result<&AgentState, Error> {
+        let agent = self.owned_agent(ctx, agent_id)?;
+        if agent.status == AgentStatus::Tombstoned {
+            return Err(Error::Module(format!("agent is tombstoned: {agent_id}")));
+        }
+        Ok(agent)
+    }
+
     /// notify the registry hook — same block, so whatever the hook stages
     /// (the agent's dispatch recipe) commits or aborts WITH the registry
     /// write that caused it.
@@ -454,7 +520,7 @@ impl AgentModule {
                 agent_id,
                 display_name,
                 capability,
-                prompt_hash,
+                prompt,
                 allowed_actions,
             } => {
                 let owner = Self::admin_origin(&ctx.env().origin)?;
@@ -466,7 +532,9 @@ impl AgentModule {
                 }
                 Self::validate_non_empty("display_name", &display_name)?;
                 validate_tag(&capability).map_err(Error::Module)?;
-                Self::validate_prompt_hash(&prompt_hash)?;
+                if let Some(prompt) = &prompt {
+                    Self::validate_prompt(&*ctx, prompt)?;
+                }
                 let allowed_actions = Self::validate_actions(allowed_actions)?;
                 if self.agent(&agent_id).is_some() {
                     return Err(Error::Module(format!("agent already exists: {agent_id}")));
@@ -475,9 +543,9 @@ impl AgentModule {
                     owner,
                     display_name,
                     capability: capability.clone(),
-                    prompt_hash,
+                    prompt,
                     allowed_actions,
-                    active: true,
+                    status: AgentStatus::Active,
                     created_at: now,
                     updated_at: now,
                 };
@@ -499,10 +567,10 @@ impl AgentModule {
                 agent_id,
                 display_name,
                 capability,
-                prompt_hash,
+                prompt,
                 allowed_actions,
             } => {
-                let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
+                let mut state = self.owned_live_agent(&*ctx, &agent_id)?.clone();
                 if let Some(display_name) = display_name {
                     Self::validate_non_empty("display_name", &display_name)?;
                     state.display_name = display_name;
@@ -522,9 +590,9 @@ impl AgentModule {
                     }
                     state.capability = capability;
                 }
-                if let Some(prompt_hash) = prompt_hash {
-                    Self::validate_prompt_hash(&prompt_hash)?;
-                    state.prompt_hash = prompt_hash;
+                if let Some(prompt) = prompt {
+                    Self::validate_prompt(&*ctx, &prompt)?;
+                    state.prompt = Some(prompt);
                 }
                 if let Some(allowed_actions) = allowed_actions {
                     state.allowed_actions = Self::validate_actions(allowed_actions)?;
@@ -534,25 +602,49 @@ impl AgentModule {
                 self.pending_agents.insert(agent_id, state);
                 Ok(())
             }
-            AgentMsg::PauseAgent { agent_id } => self.stage_active(ctx, agent_id, false, now),
-            AgentMsg::ResumeAgent { agent_id } => self.stage_active(ctx, agent_id, true, now),
+            AgentMsg::PauseAgent { agent_id } => {
+                self.stage_status(ctx, agent_id, AgentStatus::Paused, now)
+            }
+            AgentMsg::ResumeAgent { agent_id } => {
+                self.stage_status(ctx, agent_id, AgentStatus::Active, now)
+            }
+            AgentMsg::TombstoneAgent { agent_id } => {
+                // owner-gated and terminal: a second tombstone is rejected,
+                // so the hook (which removes the dispatch recipe) fires
+                // exactly once per agent.
+                self.owned_live_agent(&*ctx, &agent_id)?;
+                self.emit_hook(
+                    ctx,
+                    &AgentEvent::Tombstoned {
+                        agent_id: agent_id.clone(),
+                    },
+                );
+                let mut state = self
+                    .agent(&agent_id)
+                    .expect("owned_live_agent proved existence")
+                    .clone();
+                state.status = AgentStatus::Tombstoned;
+                state.updated_at = now;
+                self.pending_agents.insert(agent_id, state);
+                Ok(())
+            }
         }
     }
 
-    fn stage_active(
+    fn stage_status(
         &mut self,
         ctx: &dyn Ctx,
         agent_id: String,
-        active: bool,
+        status: AgentStatus,
         now: u64,
     ) -> Result<(), Error> {
-        let state = self.owned_agent(ctx, &agent_id)?;
-        if state.active == active {
+        let state = self.owned_live_agent(ctx, &agent_id)?;
+        if state.status == status {
             // idempotent: staging nothing keeps the root byte-identical.
             return Ok(());
         }
         let mut state = state.clone();
-        state.active = active;
+        state.status = status;
         state.updated_at = now;
         self.pending_agents.insert(agent_id, state);
         Ok(())
@@ -657,8 +749,7 @@ impl Module for AgentModule {
 mod tests {
     use super::*;
     use crate::{
-        ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg,
-        encode_query,
+        ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
     };
     use futures::executor::block_on;
     use sdk::{Effect, Env};
@@ -711,8 +802,10 @@ mod tests {
         fn env(&self) -> &Env {
             &self.env
         }
-        fn module_root(&self, _target: &str) -> Option<StateRoot> {
-            None
+        /// "memory" is the one known sibling module — the PromptRef
+        /// validation probes source-module existence through this.
+        fn module_root(&self, target: &str) -> Option<StateRoot> {
+            (target == "memory").then_some(StateRoot::ZERO)
         }
         async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
             Err(Error::UnknownModule(target.into()))
@@ -743,8 +836,27 @@ mod tests {
             agent_id: agent_id.into(),
             display_name: agent_id.to_uppercase(),
             capability: "model-1".into(),
-            prompt_hash: vec![7u8; PROMPT_HASH_LEN],
+            prompt: None,
             allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn prompt_ref() -> PromptRef {
+        PromptRef {
+            module: "memory".into(),
+            target: "/agents/prompts/bot@3".into(),
+            renderer: RENDERER_MEMORY_GENERATION.into(),
+            sha256: vec![7u8; PROMPT_HASH_LEN],
+        }
+    }
+
+    fn register_with_prompt(agent_id: &str, prompt: PromptRef) -> AgentMsg {
+        AgentMsg::RegisterAgent {
+            agent_id: agent_id.into(),
+            display_name: agent_id.to_uppercase(),
+            capability: "model-1".into(),
+            prompt: Some(prompt),
+            allowed_actions: Vec::new(),
         }
     }
 
@@ -836,26 +948,69 @@ mod tests {
             (Origin::External(Vec::new()), register("a", &[])),
             // system is not an ownable origin (spec: external or module).
             (Origin::System, register("a", &[])),
-            // a prompt hash that is not exactly 32 bytes.
+            // a prompt pin that is not exactly 32 bytes.
             (
                 user(9),
-                AgentMsg::RegisterAgent {
-                    agent_id: "a".into(),
-                    display_name: "A".into(),
-                    capability: "m".into(),
-                    prompt_hash: vec![7u8; 31],
-                    allowed_actions: Vec::new(),
-                },
+                register_with_prompt(
+                    "a",
+                    PromptRef {
+                        sha256: vec![7u8; 31],
+                        ..prompt_ref()
+                    },
+                ),
             ),
-            // an action outside the known vocabulary.
+            // a renderer outside the known set.
+            (
+                user(9),
+                register_with_prompt(
+                    "a",
+                    PromptRef {
+                        renderer: "blob.digest".into(),
+                        ..prompt_ref()
+                    },
+                ),
+            ),
+            // a prompt source module this composition does not run.
+            (
+                user(9),
+                register_with_prompt(
+                    "a",
+                    PromptRef {
+                        module: "ghost".into(),
+                        ..prompt_ref()
+                    },
+                ),
+            ),
+            // memory-generation targets must parse as "<path>@<generation>".
+            (
+                user(9),
+                register_with_prompt(
+                    "a",
+                    PromptRef {
+                        target: "/agents/prompts/bot".into(),
+                        ..prompt_ref()
+                    },
+                ),
+            ),
+            (
+                user(9),
+                register_with_prompt(
+                    "a",
+                    PromptRef {
+                        target: "/agents/prompts/bot@latest".into(),
+                        ..prompt_ref()
+                    },
+                ),
+            ),
+            // an action tag outside the shape rule ([a-z0-9._-]{1,64}).
             (
                 user(9),
                 AgentMsg::RegisterAgent {
                     agent_id: "a".into(),
                     display_name: "A".into(),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 32],
-                    allowed_actions: vec!["forge.push".into()],
+                    prompt: None,
+                    allowed_actions: vec!["Forge Push!".into()],
                 },
             ),
             // empty required fields.
@@ -865,7 +1020,7 @@ mod tests {
                     agent_id: String::new(),
                     display_name: "A".into(),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 32],
+                    prompt: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -875,7 +1030,7 @@ mod tests {
                     agent_id: "bad\u{1f}id".into(),
                     display_name: "A".into(),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 32],
+                    prompt: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -885,7 +1040,7 @@ mod tests {
                     agent_id: "a".into(),
                     display_name: "A".into(),
                     capability: String::new(),
-                    prompt_hash: vec![7u8; 32],
+                    prompt: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -896,7 +1051,7 @@ mod tests {
                     agent_id: "a".into(),
                     display_name: "x".repeat(MAX_AGENT_RECORD_BYTES),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 32],
+                    prompt: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -927,7 +1082,7 @@ mod tests {
                 agent_id: "bot".into(),
                 display_name: Some("Stolen".into()),
                 capability: None,
-                prompt_hash: None,
+                prompt: None,
                 allowed_actions: None,
             },
             AgentMsg::PauseAgent {
@@ -952,7 +1107,7 @@ mod tests {
                 agent_id: "bot".into(),
                 display_name: None,
                 capability: Some("model-2".into()),
-                prompt_hash: None,
+                prompt: None,
                 allowed_actions: Some(vec![ACTION_TASKS_CREATE.into()]),
             }),
         )
@@ -994,7 +1149,7 @@ mod tests {
                 agent_id: "bot".into(),
                 display_name: Some("Bot".into()),
                 capability: Some("model-2".into()),
-                prompt_hash: None,
+                prompt: None,
                 allowed_actions: None,
             }),
         )
@@ -1027,6 +1182,158 @@ mod tests {
         .unwrap();
         commit(&mut m);
         assert_eq!(get_agent(&m, "bot").unwrap().status, AgentStatus::Active);
+    }
+
+    #[test]
+    fn register_with_a_prompt_ref_commits_it_and_update_replaces_it() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().at(3).from_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register_with_prompt("bot", prompt_ref())),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get_agent(&m, "bot").unwrap().prompt, Some(prompt_ref()));
+
+        // the owner re-pins the prompt to a new generation; unset fields keep
+        // their value, and a bad replacement pin is rejected outright.
+        let repinned = PromptRef {
+            target: "/agents/prompts/bot@4".into(),
+            sha256: vec![8u8; PROMPT_HASH_LEN],
+            ..prompt_ref()
+        };
+        let mut ctx = CaptureCtx::new().at(5).from_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::UpdateAgent {
+                agent_id: "bot".into(),
+                display_name: None,
+                capability: None,
+                prompt: Some(repinned.clone()),
+                allowed_actions: None,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get_agent(&m, "bot").unwrap().prompt, Some(repinned));
+
+        let mut ctx = CaptureCtx::new().at(6).from_origin(user(9));
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::UpdateAgent {
+                agent_id: "bot".into(),
+                display_name: None,
+                capability: None,
+                prompt: Some(PromptRef {
+                    module: "ghost".into(),
+                    ..prompt_ref()
+                }),
+                allowed_actions: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(reason) if reason.contains("prompt source module")));
+        abort(&mut m);
+    }
+
+    #[test]
+    fn open_set_action_tags_are_accepted_when_well_shaped() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        // "forge.push" is nobody's vocabulary today — grants are an open set,
+        // gated only by the tag shape rule.
+        exec(&mut m, &mut ctx, &admin(&register("bot", &["forge.push"]))).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get_agent(&m, "bot").unwrap().allowed_actions,
+            vec!["forge.push".to_string()]
+        );
+    }
+
+    #[test]
+    fn tombstone_is_owner_gated_terminal_and_notifies_the_hook_once() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().at(1).from_origin(user(9));
+        exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
+        commit(&mut m);
+
+        // a foreign origin cannot tombstone.
+        let mut intruder = CaptureCtx::new().at(2).from_origin(user(2));
+        let err = exec(
+            &mut m,
+            &mut intruder,
+            &admin(&AgentMsg::TombstoneAgent {
+                agent_id: "bot".into(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        assert!(intruder.hook_events().is_empty());
+        abort(&mut m);
+
+        // the owner tombstones: the hook is notified in the same block so
+        // the dispatch recipe teardown rides the retirement atomically.
+        let mut ctx = CaptureCtx::new().at(3).from_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::TombstoneAgent {
+                agent_id: "bot".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.hook_events(),
+            vec![AgentEvent::Tombstoned {
+                agent_id: "bot".into(),
+            }]
+        );
+        commit(&mut m);
+        let record = get_agent(&m, "bot").unwrap();
+        assert_eq!(record.status, AgentStatus::Tombstoned);
+        assert_eq!(record.updated_at, 3);
+
+        // terminal: every later owner mutation is rejected — resume, pause,
+        // update, and a second tombstone (the hook must fire exactly once).
+        let tombstoned_root = m.root();
+        for op in [
+            AgentMsg::ResumeAgent {
+                agent_id: "bot".into(),
+            },
+            AgentMsg::PauseAgent {
+                agent_id: "bot".into(),
+            },
+            AgentMsg::UpdateAgent {
+                agent_id: "bot".into(),
+                display_name: Some("Back".into()),
+                capability: None,
+                prompt: None,
+                allowed_actions: None,
+            },
+            AgentMsg::TombstoneAgent {
+                agent_id: "bot".into(),
+            },
+        ] {
+            let mut ctx = CaptureCtx::new().at(4).from_origin(user(9));
+            let err = exec(&mut m, &mut ctx, &admin(&op)).unwrap_err();
+            assert!(
+                matches!(err, Error::Module(reason) if reason.contains("tombstoned")),
+                "{op:?}"
+            );
+            assert!(ctx.hook_events().is_empty(), "no second hook: {op:?}");
+            abort(&mut m);
+            assert_eq!(m.root(), tombstoned_root);
+        }
+
+        // the id stays reserved: re-registration is rejected.
+        let mut ctx = CaptureCtx::new().at(5).from_origin(user(9));
+        let err = exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap_err();
+        assert!(matches!(err, Error::Module(reason) if reason.contains("already exists")));
+        abort(&mut m);
     }
 
     #[test]
@@ -1097,13 +1404,14 @@ mod tests {
         let ops = [
             (user(9), register("alpha", &[ACTION_CHAT_POST])),
             (user(9), register("beta", &[])),
+            (user(9), register_with_prompt("gamma", prompt_ref())),
             (
                 user(9),
                 AgentMsg::UpdateAgent {
                     agent_id: "alpha".into(),
                     display_name: None,
                     capability: Some("model-2".into()),
-                    prompt_hash: None,
+                    prompt: None,
                     allowed_actions: None,
                 },
             ),
@@ -1113,11 +1421,19 @@ mod tests {
                     agent_id: "beta".into(),
                 },
             ),
+            (
+                user(9),
+                AgentMsg::TombstoneAgent {
+                    agent_id: "gamma".into(),
+                },
+            ),
         ];
         let run = || {
             let mut m = module();
             for (i, (origin, op)) in ops.iter().enumerate() {
-                let mut ctx = CaptureCtx::new().at(i as u64 + 1).from_origin(origin.clone());
+                let mut ctx = CaptureCtx::new()
+                    .at(i as u64 + 1)
+                    .from_origin(origin.clone());
                 exec(&mut m, &mut ctx, &admin(op)).unwrap();
                 commit(&mut m);
             }
@@ -1132,7 +1448,12 @@ mod tests {
     fn snapshots_install_only_under_their_own_root() {
         let mut m = module();
         let mut ctx = CaptureCtx::new().at(1).from_origin(user(9));
-        exec(&mut m, &mut ctx, &admin(&register("alpha", &[ACTION_CHAT_POST]))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register("alpha", &[ACTION_CHAT_POST])),
+        )
+        .unwrap();
         exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
         commit(&mut m);
 

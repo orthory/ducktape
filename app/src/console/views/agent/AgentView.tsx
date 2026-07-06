@@ -10,7 +10,7 @@
 import { useEffect, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
-import type { AgentRecord, SagaOrigin } from "../../../domain/agent-client";
+import type { AgentRecord, PromptRef, SagaOrigin } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
 import type { PendingRun, TurnPolicy, WatchView } from "../../../domain/runs-client";
 import { displayNameForKey, sameKey, shortKey } from "../../../domain/names";
@@ -151,6 +151,11 @@ const ownerText = (origin: SagaOrigin): string => {
   if ("module" in origin) return `module:${origin.module}`;
   return `external:${shortHex(origin.external)}`;
 };
+
+/** Where the agent's prompt lives — the memory coordinate its PromptRef pins,
+ *  or the runs module's built-in default when none is registered. */
+const promptText = (prompt: PromptRef | null): string =>
+  prompt ? `${prompt.module}:${prompt.target}` : "default";
 
 const channelLabel = (channels: Channel[], channelId: string): string =>
   channels.find((channel) => channel.id === channelId)?.name ?? channelId;
@@ -541,12 +546,16 @@ function AgentListButton({
               width: 6,
               height: 6,
               borderRadius: "50%",
-              background: active ? color.green : color.amber,
+              background: active
+                ? color.green
+                : agent.status === "paused"
+                  ? color.amber
+                  : color.muted3,
               flexShrink: 0,
             }}
           />
           <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted3 }}>
-            {active ? "Active" : "Paused"}
+            {active ? "Active" : agent.status === "paused" ? "Paused" : "Retired"}
           </span>
           <FinalizationMark op={op} />
         </span>
@@ -596,6 +605,7 @@ function AgentDetail({
   }
 
   const active = agent.status === "active";
+  const tombstoned = agent.status === "tombstoned";
   return (
     <section aria-label="Agent detail" style={{ minWidth: 0 }}>
       <SectionLabel>AGENT DETAIL</SectionLabel>
@@ -620,7 +630,7 @@ function AgentDetail({
                 </h2>
                 <StatusPill label="AGENT" tone={statusTone.agent} />
                 <StatusPill
-                  label={active ? "ACTIVE" : "PAUSED"}
+                  label={active ? "ACTIVE" : tombstoned ? "RETIRED" : "PAUSED"}
                   tone={active ? statusTone.success : statusTone.warning}
                 />
               </div>
@@ -637,24 +647,28 @@ function AgentDetail({
               </div>
             </div>
             <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-              <button
-                type="button"
-                onClick={() => setEditing((open) => !open)}
-                aria-expanded={editing}
-                style={secondaryButton}
-              >
-                {editing ? "Close edit" : "Edit"}
-              </button>
-              <button
-                type="button"
-                onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
-                style={{
-                  ...secondaryButton,
-                  color: active ? color.amber : color.green,
-                }}
-              >
-                {active ? "Pause agent" : "Resume agent"}
-              </button>
+              {!tombstoned && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setEditing((open) => !open)}
+                    aria-expanded={editing}
+                    style={secondaryButton}
+                  >
+                    {editing ? "Close edit" : "Edit"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
+                    style={{
+                      ...secondaryButton,
+                      color: active ? color.amber : color.green,
+                    }}
+                  >
+                    {active ? "Pause agent" : "Resume agent"}
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
@@ -668,7 +682,7 @@ function AgentDetail({
           >
             <InfoRow label="runs on" value={titleCase(agent.capability)} />
             <InfoRow label="owner" value={ownerText(agent.owner)} />
-            <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
+            <InfoRow label="prompt" value={promptText(agent.prompt)} />
             <InfoRow label="updated" value={String(agent.updated_at)} />
           </div>
 

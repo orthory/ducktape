@@ -20,13 +20,8 @@
 use agent::AgentModule;
 use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentQuery, AgentReply,
-    AgentResponse, AgentStatus, ReplyBlock, decode_reply, encode_msg, encode_query,
-    encode_response,
-};
-use runs::{RunsModule, dispatch_id_for, job_run_id_for, reply_message_id, run_id_for};
-use runs::{
-    PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
-    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
+    AgentResponse, AgentStatus, PromptRef, RENDERER_MEMORY_GENERATION, ReplyBlock, decode_reply,
+    encode_msg, encode_query, encode_response,
 };
 use chat::Chat;
 use chat::{
@@ -46,12 +41,21 @@ use jobs::{
     Job, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_reply as jobs_decode_reply,
     encode_msg as jobs_encode_msg, encode_query as jobs_encode_query,
 };
+use memory::{Memory, MemoryMsg, PublishBody, encode_msg as memory_encode_msg};
+use runs::{
+    PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
+    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
+};
+use runs::{
+    RunsModule, dispatch_id_for, job_run_id_for, recipe_id_for, reply_message_id, run_id_for,
+};
 use saga::SagaModule;
 use saga::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
     decode_worker_request, encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
 use sdk::{Effect, Msg, Origin, StateRoot};
+use sha2::{Digest, Sha256};
 use tagging::TaggingModule;
 use tasks::Tasks;
 use tasks::{
@@ -140,14 +144,41 @@ fn noop_block(n: u64) -> Msg {
 }
 
 fn register_quackbot(actions: Vec<String>) -> Msg {
+    register_quackbot_with_prompt(actions, None)
+}
+
+fn register_quackbot_with_prompt(actions: Vec<String>, prompt: Option<PromptRef>) -> Msg {
     Msg {
         target: "agent".into(),
         payload: encode_msg(&AgentMsg::RegisterAgent {
             agent_id: "quackbot".into(),
             display_name: "Quackbot".into(),
             capability: "mock-llm-1".into(),
-            prompt_hash: vec![7u8; 32],
+            prompt,
             allowed_actions: actions,
+        }),
+    }
+}
+
+/// a memory-generation PromptRef pinned to sha256(`pinned_text`) at
+/// `<path>@<generation>` — what the console registers after publishing.
+fn memory_prompt_ref(path: &str, generation: u64, pinned_text: &str) -> PromptRef {
+    PromptRef {
+        module: "memory".into(),
+        target: format!("{path}@{generation}"),
+        renderer: RENDERER_MEMORY_GENERATION.into(),
+        sha256: Sha256::digest(pinned_text.as_bytes()).to_vec(),
+    }
+}
+
+/// publish `text` as the next inline generation at `path`.
+fn publish_prompt(path: &str, text: &str) -> Msg {
+    Msg {
+        target: "memory".into(),
+        payload: memory_encode_msg(&MemoryMsg::Publish {
+            path: path.into(),
+            body: PublishBody::Inline(text.into()),
+            meta: Default::default(),
         }),
     }
 }
@@ -228,6 +259,8 @@ async fn genesis(context: deterministic::Context) -> Host {
         )),
         Box::new(Tasks::new("tasks")),
         Box::new(Jobs::new("jobs")),
+        // the prompt source: inline publishes only, so no files module needed.
+        Box::new(Memory::new("memory", "files")),
     ])
     .expect("genesis")
 }
@@ -383,14 +416,19 @@ fn register_duck() -> Msg {
             agent_id: "duck".into(),
             display_name: "Duck".into(),
             capability: "mock-llm-1".into(),
-            prompt_hash: vec![9u8; 32],
+            prompt: None,
             allowed_actions: vec![ACTION_TASKS_CREATE.into()],
         }),
     }
 }
 
 /// feed an oracle result to a run's dispatch saga — the off-consensus seam.
-async fn oracle_result(host: &mut Host, run_id: &str, height: u64, outcome: Result<Vec<u8>, String>) {
+async fn oracle_result(
+    host: &mut Host,
+    run_id: &str,
+    height: u64,
+    outcome: Result<Vec<u8>, String>,
+) {
     let saga_id = dispatch_saga_id(host, run_id).await;
     host.submit_at(
         at(height, Origin::External(b"oracle".to_vec())),
@@ -611,7 +649,10 @@ fn an_agent_job_is_claimed_and_dispatched_in_the_submit_cascade() {
         let work = decode_work_spec(&request.spec).unwrap();
         assert_eq!(work.dispatch_id, dispatch_id_for(&run_id));
         let payload_text = String::from_utf8(work.payload).unwrap();
-        assert!(payload_text.contains(spec), "the job spec rides the payload");
+        assert!(
+            payload_text.contains(spec),
+            "the job spec rides the payload"
+        );
     });
 }
 
@@ -657,7 +698,10 @@ fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_response() {
 
         // the oracle block only committed the mailbox; the NEXT block's
         // delivery finalizes the board and emits the task action.
-        assert_eq!(job_view(&host, "job-1").await.unwrap().status, JobStatus::Processing);
+        assert_eq!(
+            job_view(&host, "job-1").await.unwrap().status,
+            JobStatus::Processing
+        );
         host.submit_at(at(11, alice()), noop_block(11))
             .await
             .expect("delivery block");
@@ -883,6 +927,242 @@ fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
             Vec::<String>::new(),
             "no task either"
         );
+    });
+}
+
+/// the dispatch plane's recipe record for `recipe_id`, if it still exists.
+async fn dispatch_recipe(host: &Host, recipe_id: &str) -> Option<dispatch::Recipe> {
+    let reply = host
+        .query(
+            "dispatch",
+            &dispatch_encode_query(&DispatchQuery::Recipe {
+                recipe_id: recipe_id.into(),
+            }),
+        )
+        .await
+        .unwrap();
+    match dispatch::decode_reply(&reply).unwrap() {
+        DispatchReply::Recipe(recipe) => recipe,
+        other => panic!("expected a recipe reply, got {other:?}"),
+    }
+}
+
+fn tombstone_quackbot() -> Msg {
+    Msg {
+        target: "agent".into(),
+        payload: encode_msg(&AgentMsg::TombstoneAgent {
+            agent_id: "quackbot".into(),
+        }),
+    }
+}
+
+#[test]
+fn a_memory_seeded_prompt_is_pin_verified_and_leads_the_dispatched_payload() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        let ops = scripted_ops();
+        let prompt_text = "You are QUACKBOT. Be terse, be kind, cite your sources.";
+        let path = "/agents/prompts/quackbot";
+
+        // block 1: the channel. block 2: the prompt content lands in memory
+        // (generation 1). block 3: registration pins that exact generation.
+        // block 4: the watch.
+        host.submit_at(at(1, alice()), ops[0].2.clone())
+            .await
+            .expect("channel block");
+        host.submit_at(at(2, alice()), publish_prompt(path, prompt_text))
+            .await
+            .expect("publish block");
+        host.submit_at(
+            at(3, alice()),
+            register_quackbot_with_prompt(
+                vec![ACTION_CHAT_POST.into()],
+                Some(memory_prompt_ref(path, 1, prompt_text)),
+            ),
+        )
+        .await
+        .expect("register block");
+        host.submit_at(at(4, alice()), ops[2].2.clone())
+            .await
+            .expect("watch block");
+
+        // block 5: the mention. the composed payload rides the dispatch as
+        // committed data — and the RESOLVED prompt leads it (P4).
+        let outcome = host
+            .submit_at(at(5, alice()), ops[3].2.clone())
+            .await
+            .expect("post block");
+        assert_eq!(outcome.effects.len(), 1, "one WorkerRequest effect");
+        let request = decode_worker_request(&outcome.effects[0].0).unwrap();
+        let work = decode_work_spec(&request.spec).unwrap();
+        let payload_text = String::from_utf8(work.payload).unwrap();
+        assert!(
+            payload_text.starts_with(prompt_text),
+            "the memory-seeded prompt leads the payload: {payload_text:.120}"
+        );
+        assert!(
+            payload_text.contains("Return ONLY a JSON object"),
+            "the strict output contract still rides the payload"
+        );
+        assert!(
+            pending_run(&host, &run_id_for("general", 1, "quackbot"))
+                .await
+                .is_some(),
+            "the run dispatched normally"
+        );
+    });
+}
+
+#[test]
+fn a_prompt_that_does_not_hash_to_its_pin_skips_the_run_never_the_block() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        let ops = scripted_ops();
+        let path = "/agents/prompts/quackbot";
+
+        host.submit_at(at(1, alice()), ops[0].2.clone())
+            .await
+            .expect("channel block");
+        // what memory holds and what the registration pins DISAGREE.
+        host.submit_at(
+            at(2, alice()),
+            publish_prompt(path, "what memory actually holds"),
+        )
+        .await
+        .expect("publish block");
+        host.submit_at(
+            at(3, alice()),
+            register_quackbot_with_prompt(
+                vec![ACTION_CHAT_POST.into()],
+                Some(memory_prompt_ref(path, 1, "what the owner THOUGHT it held")),
+            ),
+        )
+        .await
+        .expect("registration validates the pin's shape, not its content");
+        host.submit_at(at(4, alice()), ops[2].2.clone())
+            .await
+            .expect("watch block");
+
+        // the mention's block COMMITS (no-fail engagement intake), but the
+        // run is skipped deterministically: no pending entry, no dispatch,
+        // no worker effect — the ADR rule ("a run fails or skips if the
+        // prompt source does not hash to the registered pin").
+        let outcome = host
+            .submit_at(at(5, alice()), ops[3].2.clone())
+            .await
+            .expect("the pin mismatch must NOT abort the posting block");
+        assert_eq!(outcome.effects.len(), 0, "no worker effect");
+        assert_eq!(
+            pending_run(&host, &run_id_for("general", 1, "quackbot")).await,
+            None,
+            "no run was staged"
+        );
+
+        // an explicit RequestRun is its own block's root op, so the same
+        // compose failure REJECTS loudly instead of skipping silently.
+        let err = host
+            .submit_at(
+                at(6, alice()),
+                Msg {
+                    target: "runs".into(),
+                    payload: runs_encode_msg(&RunsMsg::RequestRun {
+                        agent_id: "quackbot".into(),
+                        channel_id: "general".into(),
+                        anchor_seq: 1,
+                    }),
+                },
+            )
+            .await;
+        assert!(err.is_err(), "an explicit request surfaces the mismatch");
+    });
+}
+
+#[test]
+fn a_tombstoned_agent_loses_its_recipe_and_never_engages_again() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = genesis(context).await;
+        let ops = scripted_ops();
+
+        // channel, registration (+ recipe), watch — the normal setup.
+        for (height, origin, op) in &ops[..3] {
+            host.submit_at(at(*height, origin.clone()), op.clone())
+                .await
+                .expect("setup block");
+        }
+        assert!(
+            dispatch_recipe(&host, &recipe_id_for("quackbot"))
+                .await
+                .is_some(),
+            "registration created the dispatch recipe"
+        );
+
+        // the owner tombstones: the registry write and the recipe removal
+        // commit in ONE block (the hook seam).
+        host.submit_at(at(4, alice()), tombstone_quackbot())
+            .await
+            .expect("tombstone block");
+        assert!(
+            dispatch_recipe(&host, &recipe_id_for("quackbot"))
+                .await
+                .is_none(),
+            "the tombstone tore the recipe down in the same block"
+        );
+
+        // a mention no longer engages: the block commits, nothing dispatches.
+        let outcome = host
+            .submit_at(at(5, alice()), ops[3].2.clone())
+            .await
+            .expect("the post block still commits");
+        assert_eq!(outcome.effects.len(), 0);
+        assert_eq!(
+            pending_run(&host, &run_id_for("general", 1, "quackbot")).await,
+            None
+        );
+
+        // an explicit run request is rejected outright…
+        let err = host
+            .submit_at(
+                at(6, alice()),
+                Msg {
+                    target: "runs".into(),
+                    payload: runs_encode_msg(&RunsMsg::RequestRun {
+                        agent_id: "quackbot".into(),
+                        channel_id: "general".into(),
+                        anchor_seq: 1,
+                    }),
+                },
+            )
+            .await;
+        assert!(err.is_err(), "a tombstoned agent cannot be run explicitly");
+
+        // …and so is a resume: the tombstone is terminal.
+        let err = host
+            .submit_at(
+                at(7, alice()),
+                Msg {
+                    target: "agent".into(),
+                    payload: encode_msg(&AgentMsg::ResumeAgent {
+                        agent_id: "quackbot".into(),
+                    }),
+                },
+            )
+            .await;
+        assert!(err.is_err(), "resume after tombstone is rejected");
+
+        // the registry still serves the record — audit-preserving.
+        let record = host
+            .query(
+                "agent",
+                &encode_query(&AgentQuery::Agent {
+                    agent_id: "quackbot".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let AgentReply::Agent(Some(record)) = decode_reply(&record).unwrap() else {
+            panic!("the tombstoned record must survive");
+        };
+        assert_eq!(record.status, AgentStatus::Tombstoned);
     });
 }
 
