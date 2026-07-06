@@ -13,10 +13,10 @@
 //             → VideoFrame → VideoEncoder(vp8) → `encodeCapturedVideo` (0x02) → ws.
 //   decode:   ws binary (0x03) → `decodeServerFrame` → per-peer VideoDecoder →
 //             draw onto the peer's bound <canvas> tile.
-// Control (text json, camelCase VARIANT tags but snake_case fields — the node's
-//   serde enum only renames variants, so `camera_on` / `max_kbps` stay snake):
+// Control (text json, camelCase tags AND fields — the node's serde enums carry
+//   `rename_all` + `rename_all_fields`):
 //   out: `{type:"recipients",peers}` on open + roster change; `{type:"beacon",
-//        muted,camera_on}` on every mute/camera toggle; `{type:"keyframeRequest",
+//        muted,cameraOn}` on every mute/camera toggle; `{type:"keyframeRequest",
 //        peer}` when a decoder loses sync.
 //   in:  `keyframeRequest` → force the encoder's next frame to be a key;
 //        `rateHint` → reconfigure the encoder bitrate; `peerBeacon` → a CallEvent.
@@ -86,14 +86,14 @@ export const supportsVideoCalls = (): boolean =>
     .requestVideoFrameCallback === "function" &&
   !!navigator.mediaDevices?.getUserMedia;
 
-/** A hub → webview control frame. Variant tags are camelCase; the payload
- *  fields keep the node's snake_case (serde renames variants, not fields). */
+/** A hub → webview control frame — camelCase tags and fields, mirroring the
+ *  node's `CallServerControl` serde attributes. */
 interface ServerControl {
   type?: string;
   peer?: string;
   muted?: boolean;
-  camera_on?: boolean;
-  max_kbps?: number;
+  cameraOn?: boolean;
+  maxKbps?: number;
 }
 
 /** Create a call session. `onEvent` receives status transitions and peer
@@ -230,7 +230,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
 
   const sendBeacon = () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "beacon", muted, camera_on: cameraOn }));
+      socket.send(JSON.stringify({ type: "beacon", muted, cameraOn }));
     }
   };
 
@@ -340,8 +340,8 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
         forceKeyframe = true;
         break;
       case "rateHint":
-        if (typeof msg.max_kbps === "number" && msg.max_kbps > 0) {
-          bitrateKbps = msg.max_kbps;
+        if (typeof msg.maxKbps === "number" && msg.maxKbps > 0) {
+          bitrateKbps = msg.maxKbps;
           if (encoder && encoder.state === "configured") configureEncoder();
         }
         break;
@@ -351,7 +351,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
             kind: "peerBeacon",
             peer: msg.peer.toLowerCase(),
             muted: !!msg.muted,
-            cameraOn: !!msg.camera_on,
+            cameraOn: !!msg.cameraOn,
             atMs: Date.now(),
           });
         }

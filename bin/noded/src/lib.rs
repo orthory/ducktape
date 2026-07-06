@@ -463,7 +463,7 @@ const WS_FLAG_KEYFRAME: u8 = 0b0000_0001;
 
 /// client → server control messages on the call socket (text frames).
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum CallClientControl {
     /// replace the fan-out set with these hex node keys (self excluded —
     /// the client tracks the consensus huddle roster).
@@ -476,7 +476,7 @@ pub enum CallClientControl {
 
 /// server → client control messages on the call socket (text frames).
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum CallServerControl {
     /// a peer lost sync with US: encode the next frame as a keyframe.
     KeyframeRequest,
