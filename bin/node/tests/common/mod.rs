@@ -267,8 +267,6 @@ impl NetworkShapeCluster {
         self.nodes[idx] = None;
     }
 
-    /// drive the DIRECT admission ceremony (`promote` — the pre-staged
-    /// `invite-accept` semantics) from node 0's config.
     /// one json-lines rpc against node `idx` — the NetworkShapeCluster
     /// mirror of [`Cluster::rpc`] (same wire, same ports array).
     pub fn rpc(&self, idx: usize, req: serde_json::Value) -> serde_json::Value {
@@ -343,14 +341,22 @@ impl NetworkShapeCluster {
         reply["status"].clone()
     }
 
-    pub fn run_promote(&self, pubkey_hex: &str) -> (bool, String) {
+    /// drive a membership ceremony verb (`promote`, `invite-accept`,
+    /// `observer-remove`) against node 0's running rpc, from node 0's config.
+    pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args(["promote", pubkey_hex, "--config"])
+            .args([verb, pubkey_hex, "--config"])
             .arg(cfg)
             .output()
-            .expect("run promote");
+            .unwrap_or_else(|e| panic!("run {verb}: {e}"));
         (out.status.success(), command_output(&out))
+    }
+
+    /// drive the DIRECT admission ceremony (`promote` — the pre-staged
+    /// `invite-accept` semantics) from node 0's config.
+    pub fn run_promote(&self, pubkey_hex: &str) -> (bool, String) {
+        self.run_membership_verb("promote", pubkey_hex)
     }
 
     pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {

@@ -85,7 +85,12 @@ fn network_shape_joiner_parks_until_promote() {
 ///   4. a restarted observer parks straight back into observer mode (the
 ///      pre-sync writes no checkpoint manifest — a reboot is clean) and serves
 ///      again;
-///   5. `promote` then seats a WARM validator through the normal path.
+///   5. `observer-remove` REVOKES standing through the same ceremony: committed
+///      observers empty, the node falls back to a parked joiner, and a second
+///      run is an honest no-op;
+///   6. `invite-accept` re-grants, and the observer resumes the follow (a
+///      post-re-grant write becomes readable through its surface);
+///   7. `promote` then seats a WARM validator through the normal path.
 ///
 /// observer ops are protocol-v3-gated, so the leg first drives the upgrade
 /// ceremony to v3 on the solo founder (schedule → auto-signal → activate).
@@ -212,18 +217,8 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode: parking", Duration::from_secs(60));
 
-    let cfg = cluster.config_file(0);
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-        .args(["invite-accept", &friend_key, "--config"])
-        .arg(&cfg)
-        .output()
-        .expect("run invite-accept");
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(out.status.success(), "invite-accept failed:\n{text}");
+    let (ok, text) = cluster.run_membership_verb("invite-accept", &friend_key);
+    assert!(ok, "invite-accept failed:\n{text}");
     assert!(
         text.contains("granted observer standing"),
         "unexpected invite-accept output:\n{text}"
@@ -395,7 +390,72 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             == serde_json::json!(true)
     }));
 
-    // (5) promote: the warm observer becomes a validator through the normal
+    // (5) observer-remove: the ceremony verb revokes standing. committed
+    //     state clears, and the observer — whose respawned log is fresh, so
+    //     the parked marker is unambiguously post-revoke — falls back to a
+    //     parked joiner at the boundary whose manifest drops it.
+    let (ok, out) = cluster.run_membership_verb("observer-remove", &friend_key);
+    assert!(ok, "observer-remove failed:\n{out}");
+    assert!(
+        out.contains("revoked observer standing"),
+        "unexpected observer-remove output:\n{out}"
+    );
+    poll("the revoke to clear observer standing", Box::new(|| {
+        cluster
+            .query(0, "valset", &valset_interface::encode_query(&ValsetQuery::Observers))
+            .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+            .is_some_and(|r| matches!(r, ValsetReply::Observers(v) if v.is_empty()))
+    }));
+    cluster.wait_marker(1, "parked: awaiting admission", CONVERGE);
+    //     a second run is an honest no-op — the inverted guard, end to end.
+    let (ok, out) = cluster.run_membership_verb("observer-remove", &friend_key);
+    assert!(ok, "observer-remove (no standing) failed:\n{out}");
+    assert!(
+        out.contains("holds no observer standing"),
+        "unexpected no-op observer-remove output:\n{out}"
+    );
+
+    // (6) re-grant: invite-accept restores standing and the observer resumes
+    //     the follow — a write finalized AFTER the re-grant becomes readable
+    //     through the observer's own surface (stale serves can't fake this:
+    //     the revoked node never synced a boundary carrying this key).
+    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
+    assert!(ok, "re-grant invite-accept failed:\n{out}");
+    assert!(
+        out.contains("granted observer standing"),
+        "unexpected re-grant output:\n{out}"
+    );
+    poll("the re-grant to restore observer standing", Box::new(|| {
+        cluster
+            .query(0, "valset", &valset_interface::encode_query(&ValsetQuery::Observers))
+            .and_then(|raw| valset_interface::decode_reply(&raw).ok())
+            .is_some_and(|r| matches!(
+                r,
+                ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
+            ))
+    }));
+    cluster.submit(
+        0,
+        "directory",
+        &directory_interface::encode_msg(&DirMsg::Set {
+            key: "post-revoke-follow".into(),
+            value: "back".into(),
+        }),
+    );
+    poll("the re-granted observer to resume the follow", Box::new(|| {
+        cluster
+            .query(
+                1,
+                "directory",
+                &directory_interface::encode_query(&DirQuery::Get {
+                    key: "post-revoke-follow".into(),
+                }),
+            )
+            .and_then(|raw| directory_interface::decode_reply(&raw).ok())
+            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
+    }));
+
+    // (7) promote: the warm observer becomes a validator through the normal
     //     promotion path; valset Join clears its observer standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
