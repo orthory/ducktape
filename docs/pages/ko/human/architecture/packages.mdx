@@ -14,8 +14,9 @@ deterministic ustar tar(경로 정렬, timestamp 0)라서 같은 source는 항�
 만든다. manifest는 필요한 platform module과 capability tag, package의 module(v1은
 `kind = "native"`, 코드는 node binary에 포함), hash-pinned prompt, owner module이
 지정된 action tag, agent 정의, engagement rule, install/uninstall policy를 선언한다.
-모든 파일 참조는 sha256 pin을 갖고, manifest 자체는 domain-separated namespace로
-hash되며, `signatures/package.sig`는 그 hash에 대한 ed25519 signature다.
+module artifact와 prompt는 sha256 pin을 갖고, manifest 자체는 domain-separated
+namespace로 hash되며, `signatures/package.sig`는 그 hash에 대한 ed25519
+signature다.
 
 package-local module id는 logical이다. install이 실제 network module id로 매핑하므로
 package가 `pages`나 `agent` 같은 기존 id를 몰래 차지할 수 없다.
@@ -25,8 +26,9 @@ package가 `pages`나 `agent` 같은 기존 id를 몰래 차지할 수 없다.
 lifecycle과 routing은 `package` system module의 consensus state에 있다.
 
 - 설치된 package당 한 row: version, manifest hash, module map, harness id,
-  installer, lifecycle status (`Installing → Active → Suspended → Unplugging →
-  Inactive`);
+  installer, lifecycle status (commit되는 row는 `Installing → Active ⇄
+  Suspended → Inactive`로 움직인다; `Unplugging`은 wire 전용 transitional
+  vocabulary다 — unplug는 자기 block 안에서 끝나므로 row에 commit되는 일이 없다);
 - action route table: open tag → owner module. built-in route
   (`tasks.create`, `tasks.update_status` → `tasks`)도 여기 포함된다.
 
@@ -57,7 +59,9 @@ grant를 검증하고, `package` module에서 tag의 owner를 조회하고, owne
 (`Probe`는 read-only query: schema, target 존재, cap, idempotency), 수락된 action에
 대해서만 `Apply` follow-up을 emit한다. `Apply` arm은 delivery block에 실려 no-fail로
 동작한다: 늦은 conflict는 block을 오염시키는 대신 action failure row로 기록된다.
-수락된 action을 실제 module write로 바꾸는 것은 model도 `runs`도 아닌 harness다.
+수락된 action을 실제 module write로 바꾸는 것은 model도 `runs`도 아닌 owner
+module이다: package tag는 package harness가, built-in tag는 platform module이
+맡는다 (`tasks.*`의 owner는 `tasks`다).
 
 ## Proving a Package
 

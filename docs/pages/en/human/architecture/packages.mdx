@@ -15,9 +15,9 @@ the same source always produces the same bytes. The manifest declares required
 platform modules and capability tags, the package's modules (v1: `kind =
 "native"`, code ships in the node binary), hash-pinned prompts, action tags with
 their owner module, agent definitions, engagement rules, and install/uninstall
-policy. Every file reference carries a sha256 pin, the manifest itself is hashed
-under a domain-separated namespace, and `signatures/package.sig` is an ed25519
-signature over that hash.
+policy. Module artifacts and prompts carry sha256 pins, the manifest itself is
+hashed under a domain-separated namespace, and `signatures/package.sig` is an
+ed25519 signature over that hash.
 
 Package-local module ids are logical. Install maps them to concrete network
 module ids, so a package can never silently squat `pages` or `agent`.
@@ -27,8 +27,9 @@ module ids, so a package can never silently squat `pages` or `agent`.
 Lifecycle and routing live in consensus state, in the `package` system module:
 
 - one row per installed package: version, manifest hash, module map, harness id,
-  installer, lifecycle status (`Installing → Active → Suspended → Unplugging →
-  Inactive`);
+  installer, lifecycle status (committed rows move `Installing → Active ⇄
+  Suspended → Inactive`; `Unplugging` is transitional wire vocabulary only —
+  unplug completes within its block, so it is never committed to a row);
 - the action route table: open tag → owner module, including the built-in routes
   (`tasks.create`, `tasks.update_status` → `tasks`).
 
@@ -61,8 +62,10 @@ validates the agent's grant, looks up the tag's owner in the `package` module,
 probes the owner (`Probe` is a read-only query: schema, target existence, caps,
 idempotency), and emits `Apply` follow-ups only for accepted actions. `Apply`
 arms ride the delivery block and are no-fail: a late conflict records an action
-failure row instead of poisoning the block. The harness — not the model, not
-`runs` — turns accepted actions into real module writes.
+failure row instead of poisoning the block. The owner module — not the model,
+not `runs` — turns accepted actions into real module writes: a package harness
+for package tags, or a platform module for built-in tags (`tasks.*` is owned by
+`tasks`).
 
 ## Proving a Package
 
