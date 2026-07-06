@@ -1,6 +1,11 @@
-// Validator directory over the committed `valset` module. The node exposes
-// validator keys plus profile display names; liveness/presence is intentionally
-// shown as unavailable until the backing data exists.
+// Membership directory over the committed `valset` module — BOTH tiers:
+// validators (the consensus quorum) and observers (staged admission — mesh +
+// statesync standing, no quorum seat). Approving a join request grants
+// observer standing; the deliberate second step, Promote, seats the warm
+// observer as a validator, and Revoke drops its standing (its node parks
+// again). The node exposes the keys plus profile display names;
+// liveness/presence is intentionally shown as unavailable until the backing
+// data exists.
 
 import {
   useEffect,
@@ -41,9 +46,11 @@ interface MemberVM {
   profileName: string | null;
   initials: string;
   shortKey: string;
-  role: "genesis validator" | "member validator" | "validator";
-  kind: "validator key";
-  status: "in validator set";
+  /** Which valset tier the key sits in — the tiers never overlap. */
+  tier: "validator" | "observer";
+  role: "genesis validator" | "member validator" | "validator" | "observer";
+  kind: "validator key" | "observer key";
+  status: "in validator set" | "observer standing";
   isFounder: boolean;
   isLocal: boolean;
   searchText: string;
@@ -58,6 +65,8 @@ const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
 
 const STATUS_PILLS = {
   validator: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
+  // amber: standing granted but not seated — the warming, in-between tier.
+  observer: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
   genesis: { text: color.onDark, bg: color.dark, border: color.dark },
   local: { text: color.accentAlt2, bg: "#eef5f0", border: "#cfe3d7" },
   muted: { text: color.muted3, bg: color.paper, border: color.borderStrong },
@@ -99,20 +108,25 @@ const sectionLabel: CSSProperties = {
 
 function makeMembers(
   members: string[],
+  observers: string[],
   authorNames: Record<string, string>,
   workspace: { pubkey: string; founder: boolean; member: boolean } | null,
 ): MemberVM[] {
   const localKey = workspace?.pubkey ?? null;
-  return members.map((key) => {
+  const toVM = (key: string, tier: MemberVM["tier"]): MemberVM => {
     const keyNorm = normalizeKey(key);
     const profileName = displayNameForKey(key, authorNames);
     const isLocal = sameKey(key, localKey);
+    // A founder is by definition seated — observer standing never applies.
     const isFounder = Boolean(workspace?.founder && isLocal);
-    const role = isFounder
-      ? "genesis validator"
-      : isLocal && workspace?.member
-        ? "member validator"
-        : "validator";
+    const role =
+      tier === "observer"
+        ? "observer"
+        : isFounder
+          ? "genesis validator"
+          : isLocal && workspace?.member
+            ? "member validator"
+            : "validator";
     const displayName = profileName ?? shortKey(key);
     return {
       key,
@@ -121,21 +135,28 @@ function makeMembers(
       profileName,
       initials: initialsOf(displayName),
       shortKey: shortKey(key),
+      tier,
       role,
-      kind: "validator key",
-      status: "in validator set",
+      kind: tier === "observer" ? "observer key" : "validator key",
+      status: tier === "observer" ? "observer standing" : "in validator set",
       isFounder,
       isLocal,
       searchText: `${displayName} ${key} ${role}`.toLowerCase(),
     };
-  });
+  };
+  // Validators first (the seated quorum), then the warming observer tier.
+  return [
+    ...members.map((key) => toVM(key, "validator")),
+    ...observers.map((key) => toVM(key, "observer")),
+  ];
 }
 
 function roleForFilter(member: MemberVM, filter: FilterId): boolean {
   switch (filter) {
     case "all":
-    case "validators":
       return true;
+    case "validators":
+      return member.tier === "validator";
     case "genesis":
       return member.isFounder;
     case "local":
@@ -277,6 +298,9 @@ function MemberRow({
   onOpen,
   canRemove,
   onRemove,
+  canGovernObserver,
+  onPromote,
+  onRevoke,
 }: {
   member: MemberVM;
   selected: boolean;
@@ -284,6 +308,10 @@ function MemberRow({
   /** Show the removal control for this row (admin, and not this node itself). */
   canRemove: boolean;
   onRemove: () => void;
+  /** Show the observer controls for this row (admin, observer-tier row). */
+  canGovernObserver: boolean;
+  onPromote: () => void;
+  onRevoke: () => void;
 }) {
   const [hover, setHover] = useState(false);
   // A container div (not a button) so the removal control is a SIBLING of the
@@ -373,10 +401,33 @@ function MemberRow({
           {member.isFounder ? (
             <Pill label="Genesis" pill={STATUS_PILLS.genesis} mono title={GENESIS_TOOLTIP} />
           ) : null}
-          <Pill label="Validator" pill={STATUS_PILLS.validator} />
+          {member.tier === "observer" ? (
+            <Pill label="Observer" pill={STATUS_PILLS.observer} />
+          ) : (
+            <Pill label="Validator" pill={STATUS_PILLS.validator} />
+          )}
         </div>
       </button>
-      {canRemove ? (
+      {canGovernObserver ? (
+        <div style={{ flexShrink: 0, paddingRight: 12, display: "flex", gap: 7 }}>
+          <HoverButton
+            variant="dark"
+            ariaLabel={`Promote ${member.displayName} into the validator set`}
+            onClick={onPromote}
+          >
+            <Icon name="check" size={13} />
+            Promote
+          </HoverButton>
+          <HoverButton
+            variant="outline"
+            ariaLabel={`Revoke observer standing from ${member.displayName}`}
+            onClick={onRevoke}
+          >
+            <Icon name="close" size={13} />
+            Revoke
+          </HoverButton>
+        </div>
+      ) : canRemove ? (
         <div style={{ flexShrink: 0, paddingRight: 12 }}>
           <HoverButton
             variant="outline"
@@ -449,7 +500,7 @@ function PendingJoinRequests({
           {requests.length}
         </span>
         <span style={{ marginLeft: "auto", font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-          Approving casts this node&apos;s governance ballot (majority admits).
+          Approving grants observer standing by majority ballot — Promote seats it in the quorum.
         </span>
       </div>
       {requests.map((request) => (
@@ -785,7 +836,11 @@ function MemberDetailPane({
               marginTop: 7,
             }}
           >
-            <Pill label="In validator set" pill={STATUS_PILLS.validator} />
+            {member.tier === "observer" ? (
+              <Pill label="Observer standing" pill={STATUS_PILLS.observer} />
+            ) : (
+              <Pill label="In validator set" pill={STATUS_PILLS.validator} />
+            )}
             {member.isFounder ? (
               <Pill label="Genesis" pill={STATUS_PILLS.genesis} mono title={GENESIS_TOOLTIP} />
             ) : null}
@@ -823,8 +878,8 @@ export function MembersView() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   const rows = useMemo(
-    () => makeMembers(state.members, state.authorNames, state.workspace),
-    [state.authorNames, state.members, state.workspace],
+    () => makeMembers(state.members, state.observers, state.authorNames, state.workspace),
+    [state.authorNames, state.members, state.observers, state.workspace],
   );
   const queryText = query.trim().toLowerCase();
   const visibleRows = useMemo(
@@ -881,6 +936,33 @@ export function MembersView() {
     );
     if (!ok) return;
     actions.demoteMember(member.key);
+    if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
+      setSelectedKey(null);
+    }
+  };
+
+  const requestPromote = (member: MemberVM): void => {
+    const ok = window.confirm(
+      `Promote ${member.displayName} into the validator set?\n\n` +
+        `This opens an AddValidator proposal and casts THIS node's yes-ballot. ` +
+        `It only takes effect once a strict majority of members (n / 2 + 1) ` +
+        `approve — every other member must run the same promotion. The ` +
+        `pre-synced observer then joins the quorum at the next epoch cutover.`,
+    );
+    if (!ok) return;
+    actions.promoteMember(member.key);
+  };
+
+  const requestRevoke = (member: MemberVM): void => {
+    const ok = window.confirm(
+      `Revoke observer standing from ${member.displayName}?\n\n` +
+        `This opens a RemoveObserver proposal and casts THIS node's yes-ballot. ` +
+        `Once a strict majority of members approve, the key drops off the mesh ` +
+        `at the next epoch cutover and its node parks again — approving a new ` +
+        `join request re-grants.`,
+    );
+    if (!ok) return;
+    actions.removeObserver(member.key);
     if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
       setSelectedKey(null);
     }
@@ -1015,8 +1097,11 @@ export function MembersView() {
                   member={member}
                   selected={selected?.keyNorm === member.keyNorm}
                   onOpen={() => setSelectedKey(member.key)}
-                  canRemove={canAdmin && !member.isLocal}
+                  canRemove={canAdmin && !member.isLocal && member.tier === "validator"}
                   onRemove={() => requestRemove(member)}
+                  canGovernObserver={canAdmin && member.tier === "observer"}
+                  onPromote={() => requestPromote(member)}
+                  onRevoke={() => requestRevoke(member)}
                 />
               ))}
             </div>
