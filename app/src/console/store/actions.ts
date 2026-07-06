@@ -916,7 +916,10 @@ export function createActions({
           settled.voice.channelId === channelId
         ) {
           stopVoice();
-          update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+          // the session is gone — camera/beacon state must not outlive it.
+          update((prev) => ({
+            voice: { ...prev.voice, status: "error", cameraOn: false, peers: {} },
+          }));
         }
       });
       // start the audio session and reflect "connecting"; push whatever roster
