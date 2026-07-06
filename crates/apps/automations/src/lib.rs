@@ -1542,6 +1542,7 @@ mod tests {
                             post_policy: PostPolicy::Open,
                             hooks: Vec::new(),
                             pinned: Vec::new(),
+                            huddle: Vec::new(),
                         });
                         Ok(chat_encode_reply(&ChatReply::Channel(channel)))
                     }

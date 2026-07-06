@@ -343,6 +343,15 @@ export function DucktapeProvider({
     return () => clearInterval(timer);
   }, [node, state.needsOnboarding, state.onboardingPhase, refresh]);
 
+  // 2c. Keep a live huddle's voice fan-out in step with the consensus roster:
+  //     every refresh that lands a new channel snapshot may add/remove members,
+  //     so re-derive the recipient set and push it into the audio session. A
+  //     no-op when not huddling; keyed on the roster source + which huddle
+  //     we're in so it only fires on real changes.
+  useEffect(() => {
+    actions.syncHuddleRecipients();
+  }, [state.channels, state.voice.channelId, actions]);
+
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {
     document.documentElement.style.setProperty("--accent", state.accent);

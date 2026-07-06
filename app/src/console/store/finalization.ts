@@ -60,6 +60,9 @@ export const opKey = {
    *  reaction chip is its own optimistic feedback). */
   reaction: (channelId: string, seq: number, emoji: string) =>
     `chat/${channelId}/seq/${seq}/react/${emoji}`,
+  /** A join/leave of a channel's voice huddle — keyed by channel so the pill's
+   *  optimistic roster change carries a finalization record. */
+  huddle: (channelId: string) => `chat/huddle/${channelId}`,
   forgeHead: () => "forge/head",
   page: (pageId: string) => `page/${pageId}`,
   /** Page block ids are module-global — no page qualifier needed. */

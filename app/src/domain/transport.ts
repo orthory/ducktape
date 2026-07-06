@@ -43,6 +43,10 @@ export interface NodeStatus {
   appHash: string;
   height: number;
   modules: ModuleStatus[];
+  /** This node's mesh identity as 64-char hex — the voice fan-out address and
+   *  the `node` key a join_huddle op carries. Empty string / absent on a legacy
+   *  daemon that can't do voice; the ui hides every huddle affordance then. */
+  publicKey?: string;
 }
 
 // ── Telemetry ───────────────────────────────────────────
@@ -201,6 +205,16 @@ const postJson = <T>(url: string, body: unknown): Promise<T> =>
         .catch(() => "");
       throw new Error(detail || `node replied ${res.status}`);
     });
+
+/** The voice websocket url for a channel on the node at `baseUrl` — same
+ *  host/port as the daemon's http/ws surface, http→ws scheme swap, matching the
+ *  block stream's `/v1/ws` derivation. The audio session (voice-session.ts)
+ *  dials this; kept here because this is where the base url and its ws form
+ *  live. */
+export const voiceSocketUrl = (baseUrl: string, channel: string): string => {
+  const ws = baseUrl.replace(/\/$/, "").replace(/^http/, "ws");
+  return `${ws}/v1/voice/ws?channel=${encodeURIComponent(channel)}`;
+};
 
 export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
