@@ -2279,6 +2279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
         Some("promote") => return cmd_promote(&args[1..]),
+        Some("observer-remove") => return cmd_observer_remove(&args[1..]),
         Some("join-requests") => return cmd_join_requests(&args[1..]),
         Some("member-remove") => return cmd_member_remove(&args[1..]),
         Some("member-leave") => return cmd_member_leave(&args[1..]),
@@ -2301,8 +2302,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|join-requests|member-remove|\
-                     member-leave|member-status|join — or \
+                     keygen|init|invite|admit|invite-accept|promote|observer-remove|\
+                     join-requests|member-remove|member-leave|member-status|join|\
+                     upgrade-status — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
                 )
                 .into());
@@ -2760,8 +2762,8 @@ enum CeremonyOutcome {
 /// for exactly this action (else mint an unused `<id_prefix><key>:<n>` id and
 /// propose), cast a yes ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
-/// executes. shared by `invite-accept` (AddObserver) and `promote`
-/// (AddValidator).
+/// executes. shared by `invite-accept` (AddObserver), `promote`
+/// (AddValidator), and `observer-remove` (RemoveObserver).
 fn drive_membership_ceremony(
     rpc_addr: &str,
     me_bytes: &[u8],
@@ -2988,6 +2990,74 @@ fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "admitted {pubkey_hex} as STANDBY: the joiner's parked node will verify a \
                  state sync, announce itself online, and join the consensus quorum at the \
                  activation cutover — no quorum slot is spent until the node is actually up"
+            );
+            Ok(())
+        }
+        CeremonyOutcome::AwaitingBallots => Ok(()),
+    }
+}
+
+/// `observer-remove <hex pubkey> [--config node.toml]` — revoke observer
+/// standing: drive a governance RemoveObserver proposal through this member's
+/// own RUNNING node. the mirror of `invite-accept` with inverted guards — a
+/// no-op when the key holds no observer standing, and only members may drive
+/// it. the passing proposal's valset Revoke schedules the epoch cutover that
+/// drops the key from the mesh; its node falls back to a parked joiner, and
+/// `invite-accept` re-grants. a seated validator is `member-remove`'s job —
+/// standing never overlaps (Grant refuses validators, Join clears standing).
+fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use governance_interface::GovAction;
+
+    let (pos, flags) = parse_flags(args)?;
+    let [pubkey_hex] = pos.as_slice() else {
+        return Err("observer-remove needs exactly one <hex pubkey>".into());
+    };
+    let key = config::decode_key(pubkey_hex)?;
+    let key_bytes = key.as_ref().to_vec();
+    let cfg_path = config_path(&flags)?;
+    // full config resolution so the verb derives the SAME identity the running
+    // node signs with — the ballots this verb casts are signed by the NODE, and
+    // that key must be a current member.
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("observer-remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
+    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+
+    let members = read_members(&rpc_addr)?;
+    if members.contains(&key_bytes) {
+        eprintln!(
+            "{pubkey_hex} is a seated validator, not an observer — remove it with \
+             `ducktape-node member-remove {pubkey_hex}`"
+        );
+        return Ok(());
+    }
+    if !read_observers(&rpc_addr)?.contains(&key_bytes) {
+        eprintln!("{pubkey_hex} holds no observer standing — nothing to do");
+        return Ok(());
+    }
+    if !members.contains(&me_bytes) {
+        return Err(
+            "this node's identity is not a current member — only members remove \
+                    observers"
+                .into(),
+        );
+    }
+
+    match drive_membership_ceremony(
+        &rpc_addr,
+        &me_bytes,
+        pubkey_hex,
+        "observer-remove",
+        "revoke:",
+        GovAction::RemoveObserver { key: key_bytes },
+    )? {
+        CeremonyOutcome::Passed => {
+            eprintln!(
+                "revoked observer standing from {pubkey_hex}: the mesh drops it at the next \
+                 epoch cutover and its node parks again. a member re-grants with:\n    \
+                 ducktape-node invite-accept {pubkey_hex}"
             );
             Ok(())
         }
