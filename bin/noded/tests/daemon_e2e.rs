@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256};
 
 /// a running daemon, killed on drop so failures never leak an orphan (the
@@ -917,7 +919,9 @@ fn state_persists_across_restart() {
     assert_eq!(post["hash"], "");
     assert_eq!(post["proposer"], "65646479");
     assert!(
-        post["operations"].as_array().is_some_and(|ops| !ops.is_empty()),
+        post["operations"]
+            .as_array()
+            .is_some_and(|ops| !ops.is_empty()),
         "the dispatch trace rides the row: {post}"
     );
 }
@@ -940,7 +944,11 @@ fn per_module_index_serves_ops_and_views() {
             None,
         );
         assert_eq!(code, 200);
-        let (code, _) = daemon.submit("chat", post_message("eng", "m1", "fluent index demo"), Some("eddy"));
+        let (code, _) = daemon.submit(
+            "chat",
+            post_message("eng", "m1", "fluent index demo"),
+            Some("eddy"),
+        );
         assert_eq!(code, 200);
         let (code, _) = daemon.submit(
             "tasks",
@@ -1029,7 +1037,11 @@ fn per_module_index_serves_ops_and_views() {
     assert_eq!(code, 200);
     assert_eq!(hits_of(&reply).len(), 1, "index survives a restart");
 
-    let (code, _) = daemon.submit("chat", post_message("eng", "m2", "fresh after restart"), Some("eddy"));
+    let (code, _) = daemon.submit(
+        "chat",
+        post_message("eng", "m2", "fresh after restart"),
+        Some("eddy"),
+    );
     assert_eq!(code, 200);
     let (code, reply) = daemon.request(
         "POST",
@@ -1117,6 +1129,202 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
         Some(genesis_hash.as_str()),
         "blob puts must not move the app hash"
     );
+}
+
+// ============================================================================
+// duckfs product surface: the stage -> commit -> read round trip against a real
+// daemon. two chunks staged over POST /v1/files/stage, a commit that references
+// them (Chunks content) alongside an inline file, then ls/read/stat/history read
+// it all back — read byte-exact. a rejected op (dangling chunk, oversized stage)
+// is a clean 4xx, never a 500/panic. distinct from the op-receipt /v1/files/blob
+// lane, which its own test above keeps green.
+// ============================================================================
+
+#[test]
+fn duckfs_surface_stage_commit_and_reads_round_trip() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let genesis_hash = daemon.status()["appHash"]
+        .as_str()
+        .expect("appHash")
+        .to_string();
+
+    // a duckfs chunk digest is the chunk object id: sha256 over the chunk kind
+    // tag byte (0x00) followed by the bytes — what the module stages under and a
+    // commit references. the stage endpoint returns it; we recompute it here to
+    // prove the returned digest is exactly that.
+    let chunk_digest = |bytes: &[u8]| -> String {
+        let mut h = Sha256::new();
+        h.update([0u8]);
+        h.update(bytes);
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+
+    // ---- stage two chunks -> digests ----
+    let chunk_a: Vec<u8> = (0..64u32).map(|i| (i * 7 % 256) as u8).collect();
+    let chunk_b: Vec<u8> = (0..48u32).map(|i| (200 - i) as u8).collect();
+
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_a);
+    assert_eq!(
+        code,
+        200,
+        "stage a failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let digest_a =
+        serde_json::from_slice::<serde_json::Value>(&body).expect("stage a json")["digest"]
+            .as_str()
+            .expect("digest a")
+            .to_string();
+    assert_eq!(
+        digest_a,
+        chunk_digest(&chunk_a),
+        "stage returns the chunk object id"
+    );
+
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_b);
+    assert_eq!(
+        code,
+        200,
+        "stage b failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let digest_b =
+        serde_json::from_slice::<serde_json::Value>(&body).expect("stage b json")["digest"]
+            .as_str()
+            .expect("digest b")
+            .to_string();
+    assert_eq!(digest_b, chunk_digest(&chunk_b));
+
+    // a stage is a real block: staging IS consensus state, so two stages commit
+    // two blocks and the module root moves off genesis.
+    let after_stage = daemon.status();
+    assert_eq!(after_stage["height"], 2, "two stages committed two blocks");
+    assert_ne!(
+        after_stage["appHash"].as_str(),
+        Some(genesis_hash.as_str()),
+        "staging moves the module root"
+    );
+
+    // ---- commit: two chunk-backed files referencing the digests + an inline
+    // file, all under /shared (auto-created parent) ----
+    let inline_bytes: &[u8] = b"hello duckfs";
+    let commit_body = serde_json::json!({
+        "base_snapshot": null,
+        "message": "seed duckfs",
+        "changes": [
+            { "put": { "path": "/shared/a.bin", "exec": false,
+                "content": { "chunks": { "size": chunk_a.len() as u64, "chunks": [digest_a] } } } },
+            { "put": { "path": "/shared/b.bin", "exec": false,
+                "content": { "chunks": { "size": chunk_b.len() as u64, "chunks": [digest_b] } } } },
+            { "put": { "path": "/shared/hello.txt", "exec": false,
+                "content": { "inline": { "b64": STANDARD.encode(inline_bytes) } } } },
+        ],
+    });
+    let (code, block) = daemon.request("POST", "/v1/files/commit", Some(&commit_body));
+    assert_eq!(code, 200, "commit failed: {block}");
+    assert_eq!(block["height"], 3, "commit is the third block");
+
+    // ---- ls shows all three, in name order ----
+    let (code, ls) = daemon.request("GET", "/v1/files/ls?path=/shared", None);
+    assert_eq!(code, 200, "ls failed: {ls}");
+    let names: Vec<&str> = ls["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|e| e["path"].as_str().expect("entry path"))
+        .collect();
+    assert_eq!(
+        names,
+        ["/shared/a.bin", "/shared/b.bin", "/shared/hello.txt"]
+    );
+
+    // ---- read returns the exact bytes (b64-decoded), eof set for a whole-file
+    // read ----
+    let read_bytes = |path: &str| -> Vec<u8> {
+        let (code, r) = daemon.request("GET", &format!("/v1/files/read?path={path}"), None);
+        assert_eq!(code, 200, "read {path} failed: {r}");
+        assert_eq!(r["eof"], true, "a whole-file read reaches eof: {r}");
+        STANDARD
+            .decode(r["b64"].as_str().expect("read b64"))
+            .expect("read b64 decodes")
+    };
+    assert_eq!(
+        read_bytes("/shared/a.bin"),
+        chunk_a,
+        "chunk file a round-trips byte-exact"
+    );
+    assert_eq!(
+        read_bytes("/shared/b.bin"),
+        chunk_b,
+        "chunk file b round-trips byte-exact"
+    );
+    assert_eq!(
+        read_bytes("/shared/hello.txt"),
+        inline_bytes,
+        "inline file round-trips byte-exact"
+    );
+
+    // ---- stat shows the right kind + size ----
+    let (code, st) = daemon.request("GET", "/v1/files/stat?path=/shared/a.bin", None);
+    assert_eq!(code, 200, "stat failed: {st}");
+    assert_eq!(st["kind"], "file");
+    assert_eq!(st["size"].as_u64(), Some(chunk_a.len() as u64));
+    assert_eq!(st["exec"], false);
+    let (code, st) = daemon.request("GET", "/v1/files/stat?path=/shared", None);
+    assert_eq!(code, 200);
+    assert_eq!(st["kind"], "dir", "a directory stats as a dir");
+    // an absent path is the natural 404.
+    let (code, _) = daemon.request("GET", "/v1/files/stat?path=/shared/nope", None);
+    assert_eq!(code, 404, "an absent path stats 404");
+
+    // ---- history shows the commit ----
+    let (code, hist) = daemon.request("GET", "/v1/files/history", None);
+    assert_eq!(code, 200, "history failed: {hist}");
+    let snaps = hist["snapshots"].as_array().expect("snapshots array");
+    assert_eq!(snaps.len(), 1, "one commit lands in history: {hist}");
+    assert_eq!(snaps[0]["message"], "seed duckfs");
+
+    // ---- a rejected op is a clean 4xx carrying the error, not a 500/panic ----
+    // a commit referencing a never-staged chunk digest: the module cannot
+    // resolve the bytes, so it rejects with a 400.
+    let bogus = "11".repeat(32); // 64 hex chars, valid shape, never staged
+    let bad_commit = serde_json::json!({
+        "base_snapshot": null,
+        "message": "dangling chunk",
+        "changes": [
+            { "put": { "path": "/shared/dangling.bin", "exec": false,
+                "content": { "chunks": { "size": 10, "chunks": [bogus] } } } },
+        ],
+    });
+    let (code, err) = daemon.request("POST", "/v1/files/commit", Some(&bad_commit));
+    assert_eq!(code, 400, "a dangling-chunk commit must reject: {err}");
+    assert!(
+        err["error"].is_string(),
+        "the reject carries the module error: {err}"
+    );
+
+    // an oversized stage trips the single-chunk body cap: one byte past
+    // CHUNK_SIZE is a 413 in the daemon's error envelope, not a panic.
+    let over = vec![0u8; 1024 * 1024 + 1]; // CHUNK_SIZE + 1
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &over);
+    assert_eq!(
+        code,
+        413,
+        "an oversized stage is a 413: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: serde_json::Value = serde_json::from_slice(&body).expect("413 body is json");
+    assert!(
+        err["error"].is_string(),
+        "413 uses the error envelope: {err}"
+    );
+
+    // the daemon is still alive and answering after the rejections.
+    daemon.status();
 }
 
 #[test]
@@ -1436,7 +1644,9 @@ fn git_clone_over_http_round_trips_full_history() {
 #[test]
 fn git_push_larger_than_post_buffer_uses_the_probe_path() {
     if !have_git() {
-        eprintln!("skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH");
+        eprintln!(
+            "skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH"
+        );
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
