@@ -159,6 +159,11 @@ pub struct NetworkDescriptor {
     /// synthesises all-`Direct` hints from `bootstrap`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reach: Vec<String>,
+    /// Coordination privacy for the reachability plane. `None` => `Private`
+    /// (the safer default). Operational policy, parsed like the reach hints —
+    /// NOT part of `genesis_namespace` (validator identity only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination: Option<String>,
 }
 
 impl NetworkDescriptor {
@@ -356,6 +361,25 @@ impl NetworkDescriptor {
     }
 }
 
+/// coordination privacy for the reachability plane — per-network operational
+/// policy (like `checkpoint_blocks`), NOT part of the genesis fingerprint.
+/// `Public` = the coordinator admits any proof-of-possession request;
+/// `Private` (the default) also requires a genesis-issued `CoordCap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coordination {
+    Public,
+    Private,
+}
+
+impl NetworkDescriptor {
+    pub fn coordination(&self) -> Coordination {
+        match self.coordination.as_deref() {
+            Some("public") => Coordination::Public,
+            _ => Coordination::Private,
+        }
+    }
+}
+
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
 /// dials the ingress and authenticates `expected_key` end-to-end (a fronted
 /// path is transparent, so it looks the same to the dialer); `Coordinated`
@@ -510,6 +534,63 @@ pub fn load_invite_token(dir: &Path) -> Result<Option<InviteToken>, String> {
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
     let raw = unhex(text.trim()).map_err(|e| format!("{path:?}: {e}"))?;
     unpack_invite_token(&raw).map(Some)
+}
+
+// ============================================================================
+// coordinator capability — the private-mode admission token a node presents on
+// each rendezvous request. Minted by a genesis validator (`mint_coord_cap`),
+// persisted 0600 beside the descriptor like `invite.token`. Genesis validators
+// need none (the coordinator's pinned set covers them).
+// ============================================================================
+
+const COORD_CAP_FILE: &str = "coord.cap";
+const COORD_CAP_LEN: usize = 32 + 8 + 64;
+
+pub fn pack_coord_cap(cap: &nat_traversal::CoordCap) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COORD_CAP_LEN);
+    out.extend_from_slice(cap.issuer.as_ref());
+    out.extend_from_slice(&cap.not_after.to_be_bytes());
+    out.extend_from_slice(cap.issuer_sig.encode().as_ref());
+    out
+}
+
+pub fn unpack_coord_cap(bytes: &[u8]) -> Result<nat_traversal::CoordCap, String> {
+    if bytes.len() != COORD_CAP_LEN {
+        return Err(format!(
+            "coord cap must be {COORD_CAP_LEN} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let issuer =
+        ed25519::PublicKey::decode(&bytes[..32]).map_err(|e| format!("coord cap issuer: {e}"))?;
+    let mut na = [0u8; 8];
+    na.copy_from_slice(&bytes[32..40]);
+    let not_after = u64::from_be_bytes(na);
+    let issuer_sig =
+        ed25519::Signature::decode(&bytes[40..]).map_err(|e| format!("coord cap sig: {e}"))?;
+    Ok(nat_traversal::CoordCap { issuer, not_after, issuer_sig })
+}
+
+pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), String> {
+    use std::io::Write as _;
+    let path = dir.join(COORD_CAP_FILE);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).map_err(|e| format!("create {path:?}: {e}"))?;
+    f.write_all(format!("{}\n", hex_bytes(&pack_coord_cap(cap))).as_bytes())
+        .map_err(|e| format!("write {path:?}: {e}"))
+}
+
+pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
+    let path = dir.join(COORD_CAP_FILE);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let bytes = unhex(raw.trim()).ok()?;
+    unpack_coord_cap(&bytes).ok()
 }
 
 // ============================================================================
@@ -876,6 +957,7 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
             // stays empty and both feed one dial source via `reach_hints`.
             bootstrap: Vec::new(),
             reach,
+            coordination: None,
         },
         token,
     ))
@@ -1499,6 +1581,41 @@ mod tests {
     }
 
     #[test]
+    fn coord_cap_roundtrips_through_pack_and_files() {
+        use commonware_cryptography::{Signer as _, ed25519};
+        use nat_traversal::{NodeKey, mint_coord_cap};
+        let g = ed25519::PrivateKey::from_seed(7);
+        let subject = NodeKey([0x11; 32]);
+        let cap = mint_coord_cap(&g, subject, 4_000_000);
+        let bytes = pack_coord_cap(&cap);
+        assert_eq!(bytes.len(), 32 + 8 + 64);
+        assert_eq!(unpack_coord_cap(&bytes).unwrap(), cap);
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_coord_cap(dir.path()).is_none());
+        save_coord_cap(dir.path(), &cap).unwrap();
+        assert_eq!(load_coord_cap(dir.path()).unwrap(), cap);
+    }
+
+    #[test]
+    fn coordination_defaults_to_private_and_parses_public() {
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        // default (field unset) -> Private
+        assert_eq!(d.coordination(), Coordination::Private);
+        d.coordination = Some("public".to_string());
+        assert_eq!(d.coordination(), Coordination::Public);
+        d.coordination = Some("private".to_string());
+        assert_eq!(d.coordination(), Coordination::Private);
+    }
+
+    #[test]
     fn identity_roundtrips_and_reuses() {
         let dir = tmp("identity");
         let path = dir.join("identity.key");
@@ -1521,6 +1638,7 @@ mod tests {
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         // token-less blob is the v2 manual flow. decode NORMALISES bootstrap
@@ -1558,6 +1676,7 @@ mod tests {
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         let binding = d.genesis_namespace();
         let token = mint_invite_token(&issuer, binding.as_bytes());
@@ -1614,6 +1733,7 @@ mod tests {
                 hex_bytes(me.public_key().as_ref())
             )],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1652,6 +1772,7 @@ mod tests {
                 )],
                 bootstrap: vec![],
                 reach: vec![],
+                coordination: None,
             };
             d.save(&dir.join("network.toml")).expect("save");
         }
@@ -1695,6 +1816,7 @@ mod tests {
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1721,6 +1843,7 @@ mod tests {
             validators: vec![],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.admit(&a);
         d.admit(&b);
@@ -1746,6 +1869,7 @@ mod tests {
             ],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -1781,6 +1905,7 @@ mod tests {
             validators: vec![hex_bytes(other.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1815,6 +1940,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1832,6 +1958,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         let founder_only = d.genesis_namespace();
         assert!(founder_only.starts_with("net#00000000@"));
@@ -1904,6 +2031,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // empty dir: anything goes.
         assert!(guard_join_descriptor(&dir, &ours).is_ok());
@@ -1978,6 +2106,7 @@ mod tests {
             validators: vec![lower, upper],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1995,6 +2124,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(b.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a hand-edited twin: uppercase, whitespace, different order.
         let messy = NetworkDescriptor {
@@ -2006,6 +2136,7 @@ mod tests {
             ],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // identical decoded sets MUST run under the identical namespace.
         assert_eq!(messy.genesis_namespace(), canonical.genesis_namespace());
@@ -2036,6 +2167,7 @@ mod tests {
                 format!("{}@127.0.0.1:52200", hex_bytes(b.as_ref())),
             ],
             reach: vec![],
+            coordination: None,
         };
         let entries = d.bootstrap_entries().expect("well-formed hints parse");
         assert_eq!(
@@ -2048,6 +2180,7 @@ mod tests {
         let bad = NetworkDescriptor {
             bootstrap: vec!["nope".into()],
             reach: vec![],
+            coordination: None,
             ..d
         };
         assert!(bad.bootstrap_entries().is_err());
@@ -2252,6 +2385,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // an existing network.toml without a [reach] array still parses (serde default),
         // and an empty reach is not serialised (skip_serializing_if).
@@ -2270,6 +2404,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&a, "127.0.0.1:52200");
         let hints = d.reach_hints().expect("hints");
@@ -2287,6 +2422,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("1.1.1.1:1".into()) });
         // same expected_key, different reach — replaces, never duplicates.
@@ -2311,6 +2447,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(v.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         let ns0 = base.genesis_namespace();
 
@@ -2341,6 +2478,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(target.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a coordinated hint routes through the coordinator, but the identity
         // we expect end-to-end is the TARGET; the coordinator's own ingress and
@@ -2370,6 +2508,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a bootstrap hint alone synthesises a Direct reach ingress...
         d.add_bootstrap(&a, "127.0.0.1:52200");
