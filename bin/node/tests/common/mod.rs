@@ -91,6 +91,11 @@ pub struct Cluster {
     /// would not survive a respawn). set before the first spawn; empty by
     /// default so existing tests are byte-for-byte unchanged.
     pub extra_toml: Vec<String>,
+    /// extra environment variables for node `idx`'s process, index-aligned
+    /// with `peer_ids` (what gives each node its own capability-provider
+    /// surface: `DUCKTAPE_CAPABILITY_DIR`, spec `detect.env` overrides).
+    /// empty per node by default; set before spawn — a respawn re-applies.
+    pub env: Vec<Vec<(String, String)>>,
     /// declared BEFORE `dir` so drop order kills + reaps every child first —
     /// removing the tempdir under live processes races their qmdb/journal
     /// writes and silently leaks the subtree.
@@ -412,6 +417,7 @@ impl Cluster {
             bootstrap_addr_override: None,
             wireguard: false,
             extra_toml: Vec::new(),
+            env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
         }
@@ -482,6 +488,7 @@ impl Cluster {
         let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .arg("--config")
             .arg(&cfg)
+            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -581,9 +588,10 @@ impl Cluster {
         self.p2p_ports.push(ports[0]);
         self.rpc_ports.push(ports[1]);
         self.http_ports.push(ports[2]);
-        // keep `advertised` index-aligned with the extended index space so a
-        // later `config_path(joiner_idx)` (e.g. `run_sync_only`) never panics.
+        // keep `advertised`/`env` index-aligned with the extended index space
+        // so a later `config_path(joiner_idx)` / `spawn` never panics.
         self.advertised.push(None);
+        self.env.push(Vec::new());
         self.nodes.push(Some(NodeProc { id, child, log }));
         self.peer_ids.len() - 1
     }
