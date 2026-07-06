@@ -65,8 +65,11 @@ pub fn daemon_spawn(app: tauri::AppHandle, listen: String) -> Result<String, Str
     };
     cmd.stdin(Stdio::null()).stdout(log).stderr(log_err);
     detach(&mut cmd);
-    cmd.spawn()
-        .map_err(|err| format!("spawn {:?}: {err}", cmd.get_program()))?;
+    // verify the node survived instead of returning the log path over a corpse.
+    // `listen` is the http surface, so its port is the readiness signal.
+    let ready_port = listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+    spawn_verified(cmd, &log_path, ready_port)
+        .map_err(|failure| format!("the node exited on start: {failure}"))?;
 
     Ok(log_path.display().to_string())
 }

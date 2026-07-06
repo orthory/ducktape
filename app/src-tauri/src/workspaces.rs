@@ -819,17 +819,13 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
     let dir = workspaces_dir(&app)?.join(&ws.id);
     let http_url = format!("http://127.0.0.1:{}", ws.ports.http);
 
-    if reg.active.as_deref() != Some(&ws.id) {
-        reg.active = Some(ws.id.clone());
-        save_registry(&app, &reg)?;
-    }
-
     // already running? adopt it — never spawn a second process for one
     // workspace. we probe the p2p LISTEN port, not http: the mesh listener is
     // bound in every phase (parked, promoting, validator) on every node build,
     // while http may lag behind, so this is the one dependable liveness port.
     // a second spawn would collide on exactly this port anyway.
     if port_listening(ws.ports.listen) {
+        commit_active(&app, &mut reg, &ws.id)?;
         return Ok(Selection {
             id: ws.id,
             http_url,
@@ -850,19 +846,40 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
         .stdout(log)
         .stderr(log_err);
     crate::daemon::detach(&mut cmd);
-    let child = cmd
-        .spawn()
-        .map_err(|err| format!("spawn ducktape-node: {err}"))?;
+    // spawn AND verify the node survived. a bind conflict, an unparseable
+    // node.toml, or a boot panic dies in milliseconds — and used to return Ok
+    // with a dead http_url the webview would poll for 10s before giving a
+    // generic timeout. spawn_verified reads the real reason back out of
+    // daemon.log instead. http is the readiness signal for a member/founder; a
+    // parking joiner never serves it, so "still alive after the grace" carries.
+    let child = crate::daemon::spawn_verified(cmd, &log_path, Some(ws.ports.http))
+        .map_err(|failure| format!("the node for \"{}\" exited on start: {failure}", ws.name))?;
     // record the detached pid so teardown can address the process directly —
     // the http shutdown route alone can't reach a parked joiner (no surface).
     // best-effort: a failed write only degrades stop back to the pgrep sweep.
     if let Err(err) = fs::write(pidfile(&dir), child.id().to_string()) {
         eprintln!("workspace_select: could not record node pid: {err}");
     }
+    // commit `active` ONLY now the node is confirmed up: a select that fails to
+    // start the node must not repoint `active` at a workspace the next boot
+    // then can't launch (which would strand the app on that dead workspace).
+    commit_active(&app, &mut reg, &ws.id)?;
     Ok(Selection {
         id: ws.id,
         http_url,
     })
+}
+
+/// set `id` as the registry's active workspace, persisting only on a change.
+/// pulled out of [`workspace_select`] so both the adopt and the fresh-spawn
+/// success paths commit `active` at the same point — after the node is known
+/// to be up, never before.
+fn commit_active(app: &tauri::AppHandle, reg: &mut Registry, id: &str) -> Result<(), String> {
+    if reg.active.as_deref() != Some(id) {
+        reg.active = Some(id.to_string());
+        save_registry(app, reg)?;
+    }
+    Ok(())
 }
 
 /// read this workspace's onboarding phase back from `daemon.log`. a parked
