@@ -11,26 +11,23 @@ import { accentVar, color, font, radius } from "../theme/tokens";
 import { useDucktape } from "../store/use-ducktape";
 
 // The centered search affordance in the title bar: a compact field that opens
-// the ⌘K palette (see ConsoleShell / SearchModal). Absolutely centered in the
-// bar (like ErrorStrip) so it tracks the window's true midpoint regardless of
-// the asymmetric brand/status halves — the left half carries the traffic-light
-// inset. The button is interactive, so the click reaches it rather than dragging.
+// the ⌘K palette (see ConsoleShell / SearchModal). It sits in the middle cell
+// of the bar's `1fr auto 1fr` grid, so it tracks the window's true midpoint
+// (the two 1fr halves stay equal despite the left one carrying the traffic-light
+// inset) and reserves its own space — the brand/status halves are never
+// occluded. It is in flow rather than an overlay, so the surrounding halves keep
+// their drag regions; only the button footprint is non-draggable, as a control
+// should be.
 function SearchBar() {
   const { actions } = useDucktape();
   const [hover, setHover] = useState(false);
   return (
     <div
       style={{
-        position: "absolute",
-        left: "50%",
-        top: 0,
-        transform: "translateX(-50%)",
-        height: "100%",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        maxWidth: "60%",
-        zIndex: 1,
+        minWidth: 0,
       }}
     >
       <button
@@ -101,9 +98,12 @@ function TitleBar() {
         position: "relative",
         height: 44,
         flexShrink: 0,
-        display: "flex",
+        // `1fr auto 1fr`: the search bar (center cell) is window-centered because
+        // the two 1fr halves stay equal, while each half reserves its own track
+        // so the centered bar never overlaps the brand/status text.
+        display: "grid",
+        gridTemplateColumns: "1fr auto 1fr",
         alignItems: "center",
-        justifyContent: "space-between",
         gap: 13,
         padding: "0 13px",
         background: color.titlebar,
@@ -117,8 +117,8 @@ function TitleBar() {
           display: "flex",
           alignItems: "center",
           gap: 13,
-          flex: 1,
           minWidth: 0,
+          overflow: "hidden",
           // clear the macOS traffic lights on the desktop build
           paddingLeft: 69,
         }}
@@ -173,8 +173,8 @@ function TitleBar() {
           alignItems: "center",
           justifyContent: "flex-end",
           gap: 8,
-          flex: 1,
           minWidth: 0,
+          overflow: "hidden",
         }}
       >
         <span
