@@ -109,6 +109,22 @@ existing native voice engine (`chat::voice` — Opus, jitter, mixer, PR #172).
 - macOS mic permission: `NSMicrophoneUsageDescription` in the Tauri bundle
   Info.plist.
 
+## Known limitations (v1)
+
+- **No roster TTL/liveness**: the roster is pure consensus state and only a
+  `LeaveHuddle` op removes a member. Clients reconcile aggressively — any
+  terminal session end (socket drop, hub refusal, replacement) auto-submits a
+  leave, and a `pagehide` keepalive beacon covers quit/reload — but a client
+  that hard-crashes leaves a phantom entry until that user rejoins or leaves.
+  A consensus-side expiry (e.g. re-join heartbeats + block-time pruning) is
+  the follow-up if this bites.
+- **Roster gating is client-side**: peer hubs admit voice datagrams for any
+  locally-live flow from any mesh peer (the mesh is already
+  members-only-authenticated); a modified client could stream into a huddle
+  it did not join on consensus. Acceptable at the current trust model
+  (workspace = trusted small team); flow-level roster admission is the
+  hardening seam.
+
 ## Non-goals (v1)
 
 - No speaking indicators / per-speaker volume (engine `speaker_stats()` is the

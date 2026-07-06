@@ -346,11 +346,37 @@ export function DucktapeProvider({
   // 2c. Keep a live huddle's voice fan-out in step with the consensus roster:
   //     every refresh that lands a new channel snapshot may add/remove members,
   //     so re-derive the recipient set and push it into the audio session. A
-  //     no-op when not huddling; keyed on the roster source + which huddle
-  //     we're in so it only fires on real changes.
+  //     no-op when not huddling; the push itself dedupes by value (refresh
+  //     patches a fresh channels array every block).
   useEffect(() => {
     actions.syncHuddleRecipients();
   }, [state.channels, state.voice.channelId, actions]);
+
+  // 2d. Best-effort roster reconciliation on the way out: quitting or
+  //     reloading mid-huddle can't run the normal leave path, so fire a
+  //     keepalive leave_huddle beacon — otherwise peers keep showing a
+  //     participant whose client is gone (the roster has no TTL).
+  useEffect(() => {
+    const channelId = state.voice.channelId;
+    const url = state.nodeUrl;
+    if (!channelId || !url) return;
+    const origin = state.author;
+    const leaveOnHide = () => {
+      const body = new Blob(
+        [
+          JSON.stringify({
+            target: "chat",
+            payload: { leave_huddle: { channel_id: channelId } },
+            origin,
+          }),
+        ],
+        { type: "application/json" },
+      );
+      navigator.sendBeacon(`${url.replace(/\/$/, "")}/v1/submit`, body);
+    };
+    window.addEventListener("pagehide", leaveOnHide);
+    return () => window.removeEventListener("pagehide", leaveOnHide);
+  }, [state.voice.channelId, state.nodeUrl, state.author]);
 
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {

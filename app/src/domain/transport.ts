@@ -206,19 +206,22 @@ const postJson = <T>(url: string, body: unknown): Promise<T> =>
       throw new Error(detail || `node replied ${res.status}`);
     });
 
+/** A node base url in its websocket form: trailing slash stripped, http→ws
+ *  scheme swap — the ONE derivation both the block stream and the voice
+ *  socket dial through. */
+const wsBase = (baseUrl: string): string =>
+  baseUrl.replace(/\/$/, "").replace(/^http/, "ws");
+
 /** The voice websocket url for a channel on the node at `baseUrl` — same
- *  host/port as the daemon's http/ws surface, http→ws scheme swap, matching the
- *  block stream's `/v1/ws` derivation. The audio session (voice-session.ts)
- *  dials this; kept here because this is where the base url and its ws form
- *  live. */
-export const voiceSocketUrl = (baseUrl: string, channel: string): string => {
-  const ws = baseUrl.replace(/\/$/, "").replace(/^http/, "ws");
-  return `${ws}/v1/voice/ws?channel=${encodeURIComponent(channel)}`;
-};
+ *  host/port as the daemon's http/ws surface. The audio session
+ *  (voice-session.ts) dials this; kept here because this is where the base
+ *  url and its ws form live. */
+export const voiceSocketUrl = (baseUrl: string, channel: string): string =>
+  `${wsBase(baseUrl)}/v1/voice/ws?channel=${encodeURIComponent(channel)}`;
 
 export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
-  const wsUrl = `${base.replace(/^http/, "ws")}/v1/ws`;
+  const wsUrl = `${wsBase(baseUrl)}/v1/ws`;
 
   // One shared socket for every subscriber (blocks + telemetry); reconnects
   // while any remain, closes once all unsubscribe.

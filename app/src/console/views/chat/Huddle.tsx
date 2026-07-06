@@ -90,7 +90,9 @@ function AvatarPile({
   return (
     <div style={{ display: "flex", alignItems: "center" }}>
       {shown.map((member, i) => (
-        <span key={keyHex(member.node)} style={{ marginLeft: i === 0 ? 0 : -8, zIndex: shown.length - i }}>
+        // keyed by USER, not node: two users huddling from one daemon share a
+        // node key, while the roster is unique per user.
+        <span key={keyHex(member.user)} style={{ marginLeft: i === 0 ? 0 : -8, zIndex: shown.length - i }}>
           <ParticipantAvatar name={memberName(member, names)} size={size} ring={ring} />
         </span>
       ))}

@@ -15,7 +15,7 @@ import { color, font, radius } from "../../theme/tokens";
 import { selfAuthorKeyOf } from "./chat-helpers";
 import { Composer } from "./Composer";
 import { HoverButton } from "./HoverButton";
-import { HuddleDock, HuddleHeaderButton, HuddleRailBadge } from "./Huddle";
+import { HuddleHeaderButton, HuddleRailBadge } from "./Huddle";
 import { MessageList } from "./MessageList";
 import { ThreadPanel } from "./ThreadPanel";
 
@@ -199,8 +199,6 @@ function ChannelRail() {
           </div>
         )}
       </div>
-
-      <HuddleDock />
     </div>
   );
 }

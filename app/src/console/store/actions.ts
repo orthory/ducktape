@@ -294,28 +294,45 @@ export function createActions({
    *  that can't do voice. */
   const selfNodeHex = (): string => getState().status?.publicKey ?? "";
 
+  // The last fan-out set pushed into the live session — refresh() lands a new
+  // channels array every block, so pushes are deduped by value here rather
+  // than by effect identity upstream.
+  let lastRecipients: string | null = null;
+
   /** Recompute + push the fan-out set for `channelId` (default: the active
-   *  huddle) into the live session. No-op when not huddling. */
+   *  huddle) into the live session. No-op when not huddling or unchanged. */
   const pushRecipients = (channelId = getState().voice.channelId): void => {
     if (!voice || !channelId) return;
     const channel = getState().channels.find((c) => c.id === channelId);
-    voice.setRecipients(huddleRecipients(channel?.huddle ?? [], selfNodeHex()));
+    const recipients = huddleRecipients(channel?.huddle ?? [], selfNodeHex());
+    const fingerprint = recipients.join(",");
+    if (fingerprint === lastRecipients) return;
+    lastRecipients = fingerprint;
+    voice.setRecipients(recipients);
   };
 
   /** Stop + drop the live audio session (no consensus write). Idempotent. */
   const stopVoice = (): void => {
     voice?.stop();
     voice = null;
+    lastRecipients = null;
   };
 
-  // Session lifecycle → the voice slice. A server-initiated close ('closed':
-  // the session was replaced, or refused with a 503) ends everything and clears
-  // the slice; 'connecting'/'live'/'error' just reflect the status (channelId
-  // kept so the dock stays up on a transient error).
+  // Session lifecycle → the voice slice. Any terminal end reconciles the
+  // consensus roster (submit leave) so peers never keep showing a dead
+  // participant: 'closed' (the session was replaced) clears the slice
+  // entirely; 'error' (hub refusal, socket failure, mic denial) keeps the dock
+  // up in its error state so the failure is visible — Leave dismisses it.
   const onVoiceStatus = (status: VoiceStatus): void => {
-    if (status === "closed") {
+    if (status === "closed" || status === "error") {
+      const channelId = getState().voice.channelId;
       stopVoice();
-      patch({ voice: { channelId: null, muted: false, status: "idle" } });
+      if (channelId) submitLeaveHuddle(channelId);
+      if (status === "closed") {
+        patch({ voice: { channelId: null, muted: false, status: "idle" } });
+      } else {
+        update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+      }
       return;
     }
     update((prev) => ({ voice: { ...prev.voice, status } }));
@@ -740,7 +757,7 @@ export function createActions({
       // submit the join carrying our node key bytes; optimistically add us to
       // the roster so the pill/dock react instantly.
       const node = keyBytes(publicKey);
-      submitTracked(
+      void submitTracked(
         opKey.huddle(channelId),
         (live) => chatClient.joinHuddle(live, { channelId, node, origin: getState().author }),
         (prev) =>
@@ -750,7 +767,18 @@ export function createActions({
             author: prev.author,
             at: Math.floor(Date.now() / 1000),
           }),
-      );
+      ).then(() => {
+        // consensus refused the join (members-only, roster full): the audio
+        // session must not keep streaming into a huddle we are not in.
+        const settled = getState();
+        if (
+          settled.ops[opKey.huddle(channelId)]?.phase === "failed" &&
+          settled.voice.channelId === channelId
+        ) {
+          stopVoice();
+          update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+        }
+      });
       // start the audio session and reflect "connecting"; push whatever roster
       // we already know (others may be huddling), self excluded. joins start
       // MUTED — joining a room must never be a hot-mic moment; unmuting is the

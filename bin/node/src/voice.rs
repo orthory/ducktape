@@ -212,7 +212,8 @@ async fn open_session<T: DataPlaneTransport>(
     let flow = channel_flow(channel_id);
     // a torn-down predecessor's engine pump releases its flow registration
     // asynchronously (task abort), so a same-channel rejoin can transiently
-    // collide — retry briefly instead of refusing the join.
+    // collide — retry for up to ~1 s (a loaded runtime can take a while to
+    // actually drop the aborted pump) instead of refusing the join.
     let mut attempts = 0;
     let datagram_flow = loop {
         match plane.datagram_flow(
@@ -223,12 +224,12 @@ async fn open_session<T: DataPlaneTransport>(
             },
         ) {
             Ok(datagram_flow) => break datagram_flow,
-            Err(e) if attempts >= 20 => {
+            Err(e) if attempts >= 40 => {
                 return Err(format!("voice flow unavailable for {channel_id}: {e}"));
             }
             Err(_) => {
                 attempts += 1;
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     };

@@ -1783,6 +1783,9 @@ async fn voice_session(mut socket: WebSocket, voice: VoiceLane, channel_id: Stri
         channel_id,
         reply,
     };
+    // every refusal path says WHY as a text frame before closing — the client
+    // surfaces it as a session error instead of a silent no-op.
+    const NO_HUB: &str = "voice is not available on this node (no live voice hub)";
     let session = match voice.send(request).await {
         Ok(()) => match opened.await {
             Ok(Ok(session)) => session,
@@ -1790,9 +1793,18 @@ async fn voice_session(mut socket: WebSocket, voice: VoiceLane, channel_id: Stri
                 let _ = socket.send(Message::Text(refusal.into())).await;
                 return;
             }
-            Err(_) => return, // hub dropped the reply — shutting down
+            Err(_) => {
+                // hub dropped the reply — shutting down.
+                let _ = socket.send(Message::Text(NO_HUB.into())).await;
+                return;
+            }
         },
-        Err(_) => return, // hub gone
+        Err(_) => {
+            // the request lane is closed: a mode that never runs a hub
+            // (parked joiner, sync-only observer) or a dead hub thread.
+            let _ = socket.send(Message::Text(NO_HUB.into())).await;
+            return;
+        }
     };
     let VoiceSession {
         pcm_in,
@@ -1820,7 +1832,7 @@ async fn voice_session(mut socket: WebSocket, voice: VoiceLane, channel_id: Stri
                     {
                         let keys: Vec<[u8; 32]> = peers
                             .iter()
-                            .filter_map(|hex| parse_node_key(hex))
+                            .filter_map(|hex| files::from_hex_32(hex))
                             .collect();
                         let _ = recipients.send(keys);
                     }
@@ -1845,17 +1857,6 @@ async fn voice_session(mut socket: WebSocket, voice: VoiceLane, channel_id: Stri
     }
 }
 
-/// decode a 64-char hex node key into raw ed25519 bytes.
-fn parse_node_key(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    for (i, byte) in key.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(key)
-}
 
 #[cfg(test)]
 mod tests {

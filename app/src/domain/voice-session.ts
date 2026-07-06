@@ -56,15 +56,16 @@ export const pcm16ToFloat = (input: Int16Array): Float32Array<ArrayBuffer> => {
 };
 
 /** The fan-out set for a huddle: every member's node key as hex, EXCLUDING our
- *  own node key (status.publicKey). Case-insensitive on the self key. */
+ *  own node key (status.publicKey) and deduplicated — two users huddling from
+ *  the same daemon share one node, which must receive each frame once. */
 export const huddleRecipients = (
   huddle: HuddleMember[],
   selfNodeHex: string,
 ): string[] => {
   const self = selfNodeHex.toLowerCase();
-  return huddle
-    .map((m) => keyHex(m.node))
-    .filter((hex) => hex !== self);
+  return Array.from(
+    new Set(huddle.map((m) => keyHex(m.node)).filter((hex) => hex !== self)),
+  );
 };
 
 // ── The session ─────────────────────────────────────────
@@ -112,6 +113,10 @@ export const createVoiceSession = (
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     socket = ws;
+    // a refusal text frame or a socket error is a FAILURE end: report 'error'
+    // once and suppress the browser's follow-up close event, so the caller can
+    // keep a visible error state instead of having it wiped by 'closed'.
+    let failed = false;
     ws.onopen = () => {
       if (stopped) return;
       onStatus("live");
@@ -121,19 +126,24 @@ export const createVoiceSession = (
       }
     };
     ws.onmessage = (event) => {
-      // a text frame is only ever the server's refusal note before it closes —
-      // the close handler ends the session, so nothing to do here.
-      if (typeof event.data === "string") return;
+      if (typeof event.data === "string") {
+        // the server's refusal note (hub unavailable, flow busy) — the socket
+        // closes right after; surface it as a failure, not a clean end.
+        failed = true;
+        onStatus("error");
+        return;
+      }
       if (stopped || !playback) return;
       const frame = pcm16ToFloat(new Int16Array(event.data as ArrayBuffer));
       playback.port.postMessage(frame, [frame.buffer]);
     };
     ws.onclose = () => {
-      if (stopped) return;
+      if (stopped || failed) return;
       onStatus("closed");
     };
     ws.onerror = () => {
       if (stopped) return;
+      failed = true;
       onStatus("error");
     };
   };

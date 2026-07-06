@@ -113,11 +113,9 @@ export const keyHex = (bytes: number[]): string =>
 
 /** Inverse of `keyHex` — a hex key string back to its raw bytes. Used to turn
  *  status.publicKey (64-char hex mesh identity) into the `node` byte array a
- *  join_huddle op carries. Odd trailing nibble is dropped. */
-export const keyBytes = (hex: string): number[] =>
-  Array.from({ length: Math.floor(hex.length / 2) }, (_, i) =>
-    parseInt(hex.slice(i * 2, i * 2 + 2), 16),
-  );
+ *  join_huddle op carries. One converter for the whole domain layer: this is
+ *  agent-client's `hexToBytes` under the roster's vocabulary. */
+export { hexToBytes as keyBytes } from "./agent-client";
 
 /** A display name for an author. A User author's bytes are the submitter
  *  identity the daemon stamped; when the `profiles` registry (`names`) resolves
