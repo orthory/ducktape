@@ -93,9 +93,14 @@ function FrameRow({ frame }: { frame: TelemetryFrame }) {
 }
 
 export function TelemetryView() {
-  const { state } = useDucktape();
+  const { state, actions } = useDucktape();
   // State keeps frames oldest-first; the timeline reads newest-first.
   const frames = [...state.telemetry].reverse();
+  // Telemetry is an in-memory, live stream; the Explorer holds the durable
+  // block history. So an empty timeline has three honest causes we tell apart
+  // below: disconnected, connected-but-no-committed-history-yet, or history
+  // exists but no telemetry has streamed on this connection.
+  const hasHistory = state.blocks.length > 0;
 
   return (
     <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
@@ -117,7 +122,31 @@ export function TelemetryView() {
       <div style={{ padding: 17, display: "flex", flexDirection: "column", gap: 9, overflowY: "auto" }}>
         {frames.length === 0 ? (
           <div style={{ font: `400 12px ${font.sans}`, color: color.muted2 }}>
-            No telemetry yet — frames stream in as the node commits blocks.
+            {!state.connected ? (
+              "Not connected. Telemetry is a live stream — it resumes once the node is reachable again."
+            ) : !hasHistory ? (
+              "Waiting for the first block. Telemetry streams in live as the node commits blocks."
+            ) : (
+              <>
+                No live telemetry on this connection yet. This node's committed blocks are in the{" "}
+                <button
+                  type="button"
+                  onClick={() => actions.setScreen("explorer")}
+                  style={{
+                    font: "inherit",
+                    color: color.accent,
+                    background: "none",
+                    border: "none",
+                    padding: 0,
+                    cursor: "pointer",
+                    textDecoration: "underline",
+                  }}
+                >
+                  Explorer
+                </button>{" "}
+                — frames appear here as new blocks commit, if the node streams telemetry.
+              </>
+            )}
           </div>
         ) : (
           frames.map((frame) => <FrameRow key={frame.height} frame={frame} />)

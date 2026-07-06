@@ -3942,6 +3942,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone());
     let blobs = http_handle.blob_handle();
+    // share the ring the app-surface's GET /v1/telemetry handler reads, so the
+    // pump can push a telemetry frame per applied block (mirrors the noded
+    // daemon lane). the `async move` pump closure below captures this clone.
+    let telemetry = http_handle.telemetry_ring();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
@@ -6050,6 +6054,37 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             (node::Disposition::Applied, Some(op)) => &op.dispatches,
                             _ => &[],
                         };
+                        // telemetry: one frame per applied, non-heartbeat block —
+                        // the applied subset of the explorer's rows below (the
+                        // explorer also records rejected rows), decorated with
+                        // this node's apply latency. push-then-fan, both
+                        // best-effort (a full ring evicts oldest; a
+                        // subscriber-less send errs) — mirrors the noded lane. a
+                        // rejected op is a deterministic no-op with no trace, and
+                        // the nop heartbeat is filtered like the explorer's row,
+                        // so an idle chain streams nothing here (the empty-state
+                        // copy covers it) and the ring keeps real activity.
+                        if let (node::Disposition::Applied, Some(op)) = (&d.disposition, &d.op)
+                            && op.target != NOP_TARGET
+                        {
+                            let frame = noded::TelemetryFrame {
+                                height: d.height,
+                                // this lane's agreed clock IS the height (the
+                                // drain stamps BlockContext { consensus_time:
+                                // height }); never this node's wall clock.
+                                consensus_time: d.height,
+                                latency_us: op.latency_us,
+                                dispatches: dispatches
+                                    .iter()
+                                    .map(noded::DispatchInfo::from)
+                                    .collect(),
+                                // DrainedOp drops BlockOutcome.events and no
+                                // module emits events yet — honestly empty.
+                                events: Vec::new(),
+                            };
+                            telemetry.push(frame.clone());
+                            let _ = http_events.send(noded::WsFrame::Telemetry(frame));
+                        }
                         let record = match &d.op {
                             Some(op) if op.target != NOP_TARGET => {
                                 let disposition = match d.disposition {
@@ -6136,10 +6171,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                     // publish each newly-applied boundary to ws subscribers
-                    // (send only errs when nobody is subscribed — fine). the
-                    // validator serves block frames only — telemetry frames come
-                    // from the local `noded` daemon, which owns the dispatch
-                    // trace this finalized-boundary seam does not carry.
+                    // (send only errs when nobody is subscribed — fine).
+                    // telemetry frames are emitted per applied block in the drain
+                    // loop above; this tip seam carries the block summary only —
+                    // it fires once per drain and holds no dispatch trace.
                     if let Some(f) = node.finalized() {
                         if last_published != Some(f.height) {
                             let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
