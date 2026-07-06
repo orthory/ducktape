@@ -9,12 +9,21 @@ import type { ReactNode } from "react";
 import { Icon } from "../components/Icon";
 import { accentVar, color, font, radius } from "../theme/tokens";
 import { useDucktape } from "../store/use-ducktape";
+import { isMacDesktop } from "../../domain/node-bootstrap";
+
+// Left inset that clears the macOS traffic lights. Only the macOS desktop build
+// overlays them on the content (see isMacDesktop); on Linux/Windows desktop and
+// on web the brand sits flush at the bar's normal 13px edge, symmetric with the
+// status half. The platform is fixed for the process lifetime, so this is
+// resolved once at module load rather than per TitleBar render (which re-renders
+// on every finalized block).
+const TRAFFIC_LIGHT_INSET = isMacDesktop() ? 69 : 0;
 
 // The centered search affordance in the title bar: a compact field that opens
 // the ⌘K palette (see ConsoleShell / SearchModal). It sits in the middle cell
 // of the bar's `1fr auto 1fr` grid, so it tracks the window's true midpoint
-// (the two 1fr halves stay equal despite the left one carrying the traffic-light
-// inset) and reserves its own space — the brand/status halves are never
+// (the two 1fr halves stay equal even when the left one carries the macOS
+// traffic-light inset) and reserves its own space — the brand/status halves are never
 // occluded. It is in flow rather than an overlay, so the surrounding halves keep
 // their drag regions; only the button footprint is non-draggable, as a control
 // should be.
@@ -119,8 +128,8 @@ function TitleBar() {
           gap: 13,
           minWidth: 0,
           overflow: "hidden",
-          // clear the macOS traffic lights on the desktop build
-          paddingLeft: 69,
+          // clear the macOS traffic lights (macOS desktop only; 0 elsewhere)
+          paddingLeft: TRAFFIC_LIGHT_INSET,
         }}
       >
         <div
