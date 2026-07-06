@@ -476,6 +476,26 @@ where
         Ok(Some(ThreadView { thread, comments }))
     }
 
+    /// remove every comment thread (its comments + the target index) anchored
+    /// to `target` — called when the target block/page is deleted so comment
+    /// records never dangle in the reserved keyspace with no reachable target.
+    async fn purge_comments_for_target(&mut self, target: &str) -> Result<(), PageError> {
+        let thread_ids = self.load_target_index(target).await?;
+        if thread_ids.is_empty() {
+            return Ok(());
+        }
+        for tid in &thread_ids {
+            if let Some(thread) = self.load_thread(tid).await? {
+                for cid in &thread.comment_ids {
+                    self.delete_block(&comment_key(cid));
+                }
+            }
+            self.delete_block(&thread_key(tid));
+        }
+        self.delete_block(&target_index_key(target));
+        Ok(())
+    }
+
     /// load a block that MUST exist (`missing` names the error when it does
     /// not) — the shared shape of every "look up then edit" op.
     async fn require_block(&self, block_id: &str, missing: PageError) -> Result<Block, PageError> {
@@ -759,6 +779,7 @@ where
                     for child in &cur.children {
                         stack.push(self.require_block(child, PageError::Corrupt).await?);
                     }
+                    self.purge_comments_for_target(&cur.id).await?;
                     self.delete_block(&cur.id);
                 }
                 Ok(())
@@ -787,6 +808,7 @@ where
                     for child in &cur.children {
                         stack.push(self.require_block(child, PageError::Corrupt).await?);
                     }
+                    self.purge_comments_for_target(&cur.id).await?;
                     self.delete_block(&cur.id);
                 }
                 Ok(())
@@ -2320,6 +2342,30 @@ mod tests {
             // the block tree is untouched by the comment.
             assert_eq!(ids(&get_page(&p, "p1").await.unwrap()), ["p1", "b1", "b2", "b3"]);
             assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
+        });
+    }
+
+    // deleting a block (or page) must purge the comment threads anchored to it,
+    // so no comment records dangle in the reserved keyspace forever.
+    #[test]
+    fn deleting_a_block_purges_its_comment_threads() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
+            apply_commit_as(&mut p, &add("t1", "m1", "b1", "on b1"), user("alice")).await;
+            apply_commit_as(&mut p, &add("t2", "m2", "p1", "on the page"), user("alice")).await;
+            assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
+
+            // remove b1 → its thread t1 (+ comment m1 + target index) is gone.
+            apply_commit(&mut p, &PageMsg::RemoveBlock { block_id: "b1".into() }).await;
+            assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+            assert!(query_thread(&p, "t1").await.is_none());
+
+            // delete the page → the page-anchored thread t2 is purged too.
+            apply_commit(&mut p, &PageMsg::CreatePage { page_id: "p2".into(), title: "keep".into(), parent: None }).await;
+            apply_commit(&mut p, &PageMsg::DeletePage { page_id: "p1".into() }).await;
+            assert!(query_thread(&p, "t2").await.is_none());
+            assert!(query_threads(&p, &["p1"]).await[0].threads.is_empty());
         });
     }
 }

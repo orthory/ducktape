@@ -36,9 +36,13 @@ export function PageTree({
       {rows.map((row) => {
         const active = row.id === activeId;
         const isCollapsed = collapsed.has(row.id);
-        // every page except this one's own subtree is a legal move target.
-        const forbidden = subtreeIds(nodes, row.id);
-        const moveTargets = rows.filter((r) => !forbidden.has(r.id));
+        // legal move targets (every page outside this row's own subtree) are
+        // only needed when THIS row's menu is open — computing the O(N) subtree
+        // DFS + filter for every row on every render is O(N^2) and wasted.
+        const menuOpen = menuFor === row.id;
+        const moveTargets = menuOpen
+          ? rows.filter((r) => !subtreeIds(nodes, row.id).has(r.id))
+          : [];
         const rowStyle: CSSProperties = {
           display: "flex",
           alignItems: "center",

@@ -1155,13 +1155,18 @@ export function PagesView() {
               threads={state.pageThreads}
               authorNames={state.authorNames}
               onClose={() => setPanelOpen(false)}
-              onReply={(threadId, text) =>
-                actions.addComment({
-                  threadId,
-                  target: state.activePage ?? "",
-                  text,
-                })
-              }
+              onReply={(threadId, text) => {
+                // a reply must carry the THREAD's target (a block id or the
+                // page id) — the module rejects an append whose target differs
+                // from the thread's. Never assume the page here.
+                const target =
+                  state.pageThreads
+                    .flatMap((g) => g.threads)
+                    .find((v) => v.thread.id === threadId)?.thread.target ??
+                  state.activePage ??
+                  "";
+                actions.addComment({ threadId, target, text });
+              }}
               onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
               onEdit={(commentId, text) => actions.editComment({ commentId, text })}
               onDelete={(commentId) => actions.deleteComment(commentId)}

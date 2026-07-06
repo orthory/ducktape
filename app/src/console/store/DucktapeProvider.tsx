@@ -161,14 +161,22 @@ export function DucktapeProvider({
             : (channels[0]?.id ?? null);
         // reconcile doc tabs against the live enumeration: a tab whose page no
         // longer exists (deleted here or elsewhere) drops, and a now-dead
-        // active page falls back to the first surviving tab.
-        const liveIds = new Set(pages.map((p) => p.id));
+        // active page falls back to the first surviving tab. CRITICAL: only
+        // reconcile when we actually got an enumeration — `listPages` is
+        // best-effort (`.catch(() => [])`), and an empty result may be a
+        // transient failure (node busy, module absent). Evicting open tabs on
+        // that would blank the editor mid-edit, so an empty result is a no-op.
         const prevTabs = stateRef.current.openTabs;
-        const openTabs = prevTabs.filter((id) => liveIds.has(id));
-        if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
         const prevActive = stateRef.current.activePage;
-        const activePage =
-          prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
+        let openTabs = prevTabs;
+        let activePage = prevActive;
+        if (pages.length > 0) {
+          const liveIds = new Set(pages.map((p) => p.id));
+          openTabs = prevTabs.filter((id) => liveIds.has(id));
+          if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
+          activePage =
+            prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
+        }
         return Promise.resolve()
           .then(() => (active ? chatClient.latestMessages(live, active) : []))
           .then((messages) =>

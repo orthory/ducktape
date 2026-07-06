@@ -8,7 +8,7 @@ import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as pagesClient from "../../domain/pages-client";
-import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
+import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
@@ -352,23 +352,46 @@ export function createActions({
 
   // load the comment threads for the open page (the page id + every visible
   // block id) in one batch; refreshed on open and after any comment op.
-  const loadPageThreads = (): Promise<void> => {
+  const loadPageThreads = (blocksOverride?: PageBlock[]): Promise<void> => {
+    // `blocks` is passed by callers that JUST fetched the tree, because
+    // getState().activePageBlocks lags a dispatch (stateRef updates on render);
+    // reading it here would ship only the page target and miss every block.
     const live = getNode();
     const page = getState().activePage;
     if (!live || !page) {
       patch({ pageThreads: [] });
       return Promise.resolve();
     }
-    const targets = [page, ...getState().activePageBlocks.map((b) => b.id)];
-    return pagesClient
-      .threadsForTargets(live, { targets })
-      .then((pageThreads) => patch({ pageThreads }))
+    const blocks = blocksOverride ?? getState().activePageBlocks;
+    const targets = [page, ...blocks.map((b) => b.id)];
+    // the module rejects a ThreadsForTargets over MAX_QUERY_TARGETS (512), so a
+    // large page must chunk its targets across several queries.
+    const CHUNK = 512;
+    const batches: string[][] = [];
+    for (let i = 0; i < targets.length; i += CHUNK) batches.push(targets.slice(i, i + CHUNK));
+    return Promise.all(batches.map((b) => pagesClient.threadsForTargets(live, { targets: b })))
+      .then((results) => patch({ pageThreads: results.flat() }))
       .catch(fail);
   };
 
-  // the single entry point into a page: make it active (opening a tab), load
-  // its preorder block tree, then its comment threads — every path into a page
-  // (new-page, a rail click, a tab click) goes here.
+  // load the active page's block tree + its comment threads (threads keyed off
+  // the freshly-fetched blocks, not the lagging store copy). shared by every
+  // activation path; does NOT touch the tab list.
+  const loadActivePage = (pageId: string) => {
+    const live = getNode();
+    if (!live) return;
+    Promise.resolve()
+      .then(() => pagesClient.getPage(live, pageId))
+      .then((blocks) => {
+        patch({ activePageBlocks: blocks ?? [] });
+        return loadPageThreads(blocks ?? []);
+      })
+      .catch(fail);
+  };
+
+  // the single entry point into a page: make it active (opening a tab), then
+  // load its tree + threads — every path into a page (new-page, a rail click,
+  // a tab click) goes here.
   const enterPage = (pageId: string) => {
     const live = getNode();
     if (!live || !pageId) return;
@@ -380,21 +403,20 @@ export function createActions({
       openTabs: tabs,
       pageThreads: [],
     });
-    Promise.resolve()
-      .then(() => pagesClient.getPage(live, pageId))
-      .then((blocks) => patch({ activePageBlocks: blocks ?? [] }))
-      .then(() => loadPageThreads())
-      .catch(fail);
+    loadActivePage(pageId);
   };
 
   // close a document tab; if it was active, activate a neighbor (loading its
-  // tree) so the editor never lands on a closed page.
+  // tree) so the editor never lands on a closed page. Activation here patches
+  // the already-reduced tab list directly — it must NOT go through enterPage,
+  // whose addTab(getState().openTabs, …) reads the stale pre-close list and
+  // would re-stage the just-closed id.
   const closeTabLocal = (pageId: string) => {
     const { tabs, active } = removeTab(getState().openTabs, getState().activePage, pageId);
     saveDocTabs(tabs);
     if (active && active !== getState().activePage) {
-      patch({ openTabs: tabs });
-      enterPage(active);
+      patch({ openTabs: tabs, activePage: active, activePageBlocks: [], pageThreads: [] });
+      loadActivePage(active);
       return;
     }
     patch({
@@ -754,7 +776,7 @@ export function createActions({
       submitTracked(
         opKey.page(pageId),
         (live) => pagesClient.createPage(live, { pageId, title: "", parent }),
-        (prev) => optimistic.pageCreated(prev, { pageId, title: "" }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: "", parent }),
       ).then(() => enterPage(pageId));
     },
 
