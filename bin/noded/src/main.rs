@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
+use runs::RunsModule;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
@@ -57,7 +58,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 15] = [
+const MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
     "dispatch",
@@ -67,6 +68,7 @@ const MODULE_IDS: [&str; 15] = [
     "automations",
     "jobs",
     "agent",
+    "runs",
     "document",
     "pages",
     "forge",
@@ -263,12 +265,14 @@ fn run_node(
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
         let jobs = Jobs::new("jobs");
-        let agent = AgentModule::new(
-            "agent",
+        let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+        let runs = RunsModule::new(
+            "runs",
             "chat",
             "saga",
             "tagging",
             "dispatch",
+            "agent",
             Some("tasks".into()),
             Some("jobs".into()),
             Some("document".into()),
@@ -299,6 +303,7 @@ fn run_node(
             Box::new(automations),
             Box::new(jobs),
             Box::new(agent),
+            Box::new(runs),
             Box::new(document),
             Box::new(pages),
             Box::new(forge),

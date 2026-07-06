@@ -25,27 +25,12 @@ dependencies = [
  "agent-interface",
  "async-trait",
  "capability-interface",
- "chat",
- "chat-interface",
- "commonware-runtime",
- "dispatch",
- "dispatch-interface",
- "document-interface",
  "futures",
- "host",
- "jobs",
- "jobs-interface",
- "reactor",
- "saga",
  "saga-interface",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
- "tagging",
- "tagging-interface",
- "tasks",
- "tasks-interface",
 ]
 
 [[package]]
@@ -1933,6 +1918,8 @@ dependencies = [
  "kv-interface",
  "memory",
  "profiles",
+ "runs",
+ "runs-interface",
  "saga",
  "saga-interface",
  "sdk",
@@ -4237,6 +4224,8 @@ dependencies = [
  "reachability",
  "reactor",
  "recovery",
+ "runs",
+ "runs-interface",
  "saga",
  "saga-interface",
  "sdk",
@@ -4293,6 +4282,7 @@ dependencies = [
  "pages-index",
  "profiles",
  "reactor",
+ "runs",
  "saga",
  "saga-interface",
  "sdk",
@@ -5629,6 +5619,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "runs"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "agent-interface",
+ "async-trait",
+ "chat",
+ "chat-interface",
+ "commonware-runtime",
+ "dispatch",
+ "dispatch-interface",
+ "document-interface",
+ "futures",
+ "host",
+ "jobs",
+ "jobs-interface",
+ "runs-interface",
+ "saga",
+ "saga-interface",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tagging",
+ "tagging-interface",
+ "tasks",
+ "tasks-interface",
+]
+
+[[package]]
+name = "runs-interface"
+version = "0.1.0"
+dependencies = [
+ "saga-interface",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6100,6 +6129,7 @@ dependencies = [
  "pages-index",
  "profiles",
  "reactor",
+ "runs",
  "saga",
  "saga-interface",
  "sdk",

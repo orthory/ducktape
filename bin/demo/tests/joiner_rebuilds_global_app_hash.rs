@@ -16,9 +16,14 @@
 
 use agent::AgentModule;
 use agent_interface::{
-    ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentStatus, TurnPolicy,
+    ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentStatus,
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
     encode_query as agent_encode_query,
+};
+use runs::RunsModule;
+use runs_interface::{
+    RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
+    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use chat::Chat;
 use chat_interface::{
@@ -171,11 +176,12 @@ fn joiner_app_hash(
     valset: &dyn Module,
     saga: &dyn Module,
     agent: &dyn Module,
+    runs: &dyn Module,
 ) -> StateRoot {
     let kv_entry = RegistryEntry::of("kv", kv);
     let document_entry = RegistryEntry::of("document", document);
     let chat_entry = RegistryEntry::of("chat", chat);
-    let mods: [&dyn Module; 9] = [
+    let mods: [&dyn Module; 10] = [
         &kv_entry,
         directory,
         greeter,
@@ -185,6 +191,7 @@ fn joiner_app_hash(
         valset,
         saga,
         agent,
+        runs,
     ];
     global_root(&mods)
 }
@@ -501,16 +508,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // the agent crate's own snapshot suite; this leg pins the joiner
         // path. admin ops are owner-gated, so they carry an external origin.
         let owner = sdk::Origin::External(b"agent-owner".to_vec());
-        let mut src_agent = AgentModule::new(
-            "agent",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            Some("tasks".into()),
-            Some("jobs".into()),
-            None,
-        );
+        let mut src_agent = AgentModule::new("agent", "saga", Some("runs".into()));
         commit_op_as(
             &mut src_agent,
             30,
@@ -548,11 +546,25 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             }),
         )
         .await;
+        // the runs module: the channel watch — the run machinery is exercised
+        // by the runs crate's own snapshot suite; this leg pins the joiner
+        // path.
+        let mut src_runs = RunsModule::new(
+            "runs",
+            "chat",
+            "saga",
+            "tagging",
+            "dispatch",
+            "agent",
+            Some("tasks".into()),
+            Some("jobs".into()),
+            None,
+        );
         commit_op_as(
-            &mut src_agent,
+            &mut src_runs,
             33,
             owner.clone(),
-            agent_encode_msg(&AgentMsg::WatchChannel {
+            runs_encode_msg(&RunsMsg::WatchChannel {
                 channel_id: "general".into(),
                 policy: TurnPolicy::Mention,
             }),
@@ -570,6 +582,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let src_valset_root = src_valset.root();
         let src_saga_root = src_saga.root();
         let src_agent_root = src_agent.root();
+        let src_runs_root = src_runs.root();
         for (id, root) in [
             ("kv", src_kv_root),
             ("document", src_document_root),
@@ -579,6 +592,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             ("valset", src_valset_root),
             ("saga", src_saga_root),
             ("agent", src_agent_root),
+            ("runs", src_runs_root),
         ] {
             assert_ne!(
                 root,
@@ -588,7 +602,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         }
 
         let src_global = {
-            let mods: [&dyn Module; 9] = [
+            let mods: [&dyn Module; 10] = [
                 &src_kv,
                 &src_directory,
                 &src_greeter,
@@ -598,6 +612,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &src_valset,
                 &src_saga,
                 &src_agent,
+                &src_runs,
             ];
             global_root(&mods)
         };
@@ -612,6 +627,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let valset_bytes = src_valset.snapshot();
         let saga_bytes = src_saga.snapshot();
         let agent_bytes = src_agent.snapshot();
+        let runs_bytes = src_runs.snapshot();
         let forge_bytes = src_forge.snapshot().expect("forge snapshot");
         let src_validators = validators(&src_valset).await;
         let src_chat_messages = chat_messages(&src_chat, "general").await;
@@ -726,19 +742,24 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         join_saga
             .install(&saga_bytes, src_saga_root)
             .expect("saga install");
-        let mut join_agent = AgentModule::new(
-            "agent",
+        let mut join_agent = AgentModule::new("agent", "saga", Some("runs".into()));
+        join_agent
+            .install(&agent_bytes, src_agent_root)
+            .expect("agent install");
+        let mut join_runs = RunsModule::new(
+            "runs",
             "chat",
             "saga",
             "tagging",
             "dispatch",
+            "agent",
             Some("tasks".into()),
             Some("jobs".into()),
             None,
         );
-        join_agent
-            .install(&agent_bytes, src_agent_root)
-            .expect("agent install");
+        join_runs
+            .install(&runs_bytes, src_runs_root)
+            .expect("runs install");
         let mut join_forge = Forge::init("forge", joiner_dir.clone()).expect("joiner forge init");
         join_forge
             .install(&forge_bytes, src_forge_root)
@@ -786,6 +807,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             src_agent_root,
             "agent: installed root != source root"
         );
+        assert_eq!(
+            join_runs.root(),
+            src_runs_root,
+            "runs: installed root != source root"
+        );
 
         // ...and the composed app-hash over the same canonical ids is the exact
         // digest consensus committed on the source — THE joiner property.
@@ -800,6 +826,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &join_valset,
                 &join_saga,
                 &join_agent,
+                &join_runs,
             ),
             src_global,
             "the joiner must land on the exact source app-hash"
@@ -881,11 +908,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 ("sleepy", AgentStatus::Paused),
             ]
         );
-        let reply = join_agent
-            .query(&agent_encode_query(&AgentQuery::Watches))
+        let reply = join_runs
+            .query(&runs_encode_query(&RunsQuery::Watches))
             .await
             .unwrap();
-        let AgentReply::Watches(watches) = agent_decode_reply(&reply).unwrap() else {
+        let RunsReply::Watches(watches) = runs_decode_reply(&reply).unwrap() else {
             panic!("watches reply expected");
         };
         assert_eq!(watches.len(), 1);
@@ -954,6 +981,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 &join_valset,
                 &join_saga,
                 &join_agent,
+                &join_runs,
             ),
             src_global
         );
