@@ -2,9 +2,12 @@
 
 Date: 2026-07-06 · Status: **Built** (2026-07-07, `feat/video-calls`) — see
 `docs/superpowers/specs/2026-07-06-video-call-build.md` for what shipped vs
-this text. The one structural deviation: the webview↔node leg is the huddle
-build's typed websocket + WebCodecs, not the §4 str0m WebRTC gateway — the
-inter-node wire below shipped as written.
+this text. Structural deviations: the webview↔node leg is the huddle build's
+typed websocket + WebCodecs, not the §4 str0m WebRTC gateway (the inter-node
+wire below shipped as written); admission is the huddle build's locally-live-
+flows posture, not §3's consensus-roster policy (still the hardening seam);
+and media rides the authenticated TCP mesh arm rather than waiting on the
+slice-0 overlay socket, which remains a drop-in behind the same trait.
 
 Original status: Accepted as direction, build not scheduled —
 recorded so the architecture is not re-litigated when calls become current.
